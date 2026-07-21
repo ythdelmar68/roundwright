@@ -7,13 +7,31 @@
 - Read and use [Conventional Branch](https://conventional-branch.github.io/) to create descriptive branch names.
 - Update `.gitignore` for new build artifacts or dependencies.
 
-<!-- phase0-automation-policy:start -->
-## Repository Automation Policy
+<!-- roundlet-bootstrap-policy:start -->
+## Temporary Roundlet Bootstrap Policy
 
-- Draft PR creation is allowed only after deterministic identity, coverage, privacy, and independent-review gates pass.
-- Ready-for-review transition additionally requires an owner receipt bound to the reviewed owner-bundle digest and exact candidate commit SHA.
-- Merge, release, tag, publish, version bump, visibility changes, destructive cleanup, branch deletion, force push, reset, and rebase require explicit owner approval.
-- Model-backed workers and reviewers are advisory, read-only, credential-isolated, and cannot bypass the repository-scoped Orchestrator.
-- GitHub trace text must be curated and public-safe. Never post raw run artifacts, private evidence, credentials, internal owner reasoning, or confidential source context.
-- Missing, stale, conflicting, or unverifiable evidence fails closed.
-<!-- phase0-automation-policy:end -->
+Until Roundwright completes its Phase 2 vertical slice, passes shadow/read-only comparison, and is externally promoted as the active immutable runtime, Roundlet is this repository's sole mutation-capable development orchestrator.
+
+The authority block below is standing, repository-scoped owner authorization for Roundlet only. It authorizes the enumerated Roundlet actions without separate per-pull-request approval. It grants no runtime activation, self-promotion, release, or publication authority to Roundwright N, Roundwright N+1, task candidates, Workers, or Supervisors.
+
+A candidate branch may propose changes to this policy, but those changes have no effect until they are reviewed, merged to authoritative `origin/main`, and explicitly acknowledged by the allowlisted owner.
+
+Before an immutable Roundwright N becomes mutation-capable, a separate owner-reviewed policy transition must stop and reconcile Roundlet, disable its active authority, and establish the external promotion boundary. After that transition, Roundlet may remain installed only as a dormant Stage 0 and recovery tool; it must never dispatch concurrently with Roundwright.
+
+Release, tag, publish, version bump, repository visibility changes, force push, reset, rebase, and destruction of unique unmerged work remain prohibited.
+
+GitHub trace text must be curated and public-safe. Never post raw run artifacts, private evidence, credentials, internal owner reasoning, confidential source context, or private migration provenance. Missing, stale, conflicting, or unverifiable identity, authority, review, check, or read-back evidence fails closed.
+
+Roundlet runtime state remains local-only under `.roundlet/` in the authoritative checkout and must be excluded through local `.git/info/exclude`, not committed or added to repository-wide ignore rules.
+
+# roundlet:repository-authority
+roundlet:
+  enabled: true
+  allow_mark_pr_ready: true
+  allow_merge_pr: true
+  allow_close_leaf_issue: true
+  allow_delete_remote_branch: true
+  allow_delete_local_branch: true
+  allow_remove_worktree: true
+# roundlet:end-repository-authority
+<!-- roundlet-bootstrap-policy:end -->

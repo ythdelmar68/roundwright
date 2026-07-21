@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -210,6 +212,25 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "together"):
                 load_configuration(cwd=workspace, cli_values={"model": "gpt-5.6-sol"})
 
+    def test_model_configuration_rejects_partial_none_pairs_from_environment_and_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            partial_pairs = (
+                {"model": "gpt-5.6-sol", "reasoning_effort": None},
+                {"model": None, "reasoning_effort": "high"},
+            )
+            for values in partial_pairs:
+                with self.assertRaisesRegex(ConfigurationError, "together"):
+                    load_configuration(
+                        cwd=workspace,
+                        environment={
+                            "ROUNDWRIGHT_MODEL": values["model"],
+                            "ROUNDWRIGHT_REASONING_EFFORT": values["reasoning_effort"],
+                        },
+                    )  # type: ignore[arg-type]
+                with self.assertRaisesRegex(ConfigurationError, "together"):
+                    load_configuration(cwd=workspace, cli_values=values)
+
     def test_each_higher_configuration_source_overrides_each_lower_source(self) -> None:
         sources = ("default", "user", "repository", "environment", "command")
         with tempfile.TemporaryDirectory() as temporary:
@@ -289,6 +310,50 @@ class ConfigurationTests(unittest.TestCase):
             config = load_configuration(cwd=root, environment={})
             report = preflight(config, PreflightMode.DISPATCH_CAPABLE)
             self.assertTrue(report.repository_ready)
+
+    def test_repository_identity_rejects_reparse_metadata_and_git_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            external = self.make_repository(workspace / "external")
+            reparse_root = workspace / "reparse-root"
+            reparse_root.mkdir()
+            try:
+                (reparse_root / ".git").symlink_to(external / ".git", target_is_directory=True)
+            except OSError:
+                self.skipTest("linked metadata is unavailable on this platform")
+            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
+                RepositoryIdentity.from_root(reparse_root)
+
+    def test_repository_identity_rejects_repository_selecting_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.make_repository(Path(temporary))
+            for environment in (
+                {"GIT_DIR": str(repository / ".git")},
+                {"GIT_WORK_TREE": str(repository)},
+                {"GIT_COMMON_DIR": str(repository / ".git")},
+            ):
+                with mock.patch.dict(os.environ, environment):
+                    with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
+                        RepositoryIdentity.from_root(repository)
+
+    @unittest.skipUnless(os.name == "nt", "junctions are a Windows-specific fixture")
+    def test_repository_identity_rejects_junction_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            external = self.make_repository(workspace / "external")
+            junction_root = workspace / "junction-root"
+            junction_root.mkdir()
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction_root / ".git"), str(external / ".git")],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode:
+                self.skipTest("junction creation is unavailable on this platform")
+            self.assertTrue((junction_root / ".git").is_junction())
+            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
+                RepositoryIdentity.from_root(junction_root)
 
     def test_preflight_rejects_serialized_and_malformed_capability_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

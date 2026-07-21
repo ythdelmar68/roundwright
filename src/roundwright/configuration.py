@@ -153,6 +153,8 @@ def _is_git_worktree_marker(root: Path, marker: Path) -> bool:
     """Accept only a complete Git directory or a bound linked worktree."""
 
     try:
+        if _has_repository_selecting_git_environment() or _is_reparse_point(marker):
+            return False
         if marker.is_dir():
             return _is_complete_git_directory(marker) and _git_confirms_worktree(root)
         if not marker.is_file():
@@ -180,10 +182,26 @@ def _git_confirms_worktree(root: Path) -> bool:
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0 and result.stdout.strip().casefold() == "true"
+
+
+def _has_repository_selecting_git_environment() -> bool:
+    """Refuse ambient selectors that can bind a root to unrelated metadata."""
+
+    return any(
+        name in os.environ
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+    )
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Reject linked metadata directories while allowing a linked worktree file."""
+
+    return path.is_symlink() or path.is_junction()
 
 
 def _is_complete_git_directory(directory: Path) -> bool:
@@ -204,6 +222,8 @@ def _is_bound_linked_worktree(root: Path, marker: Path, git_directory: Path) -> 
 
     commondir = git_directory / "commondir"
     backlink = git_directory / "gitdir"
+    if _is_reparse_point(git_directory):
+        return False
     if not git_directory.is_dir() or not (git_directory / "HEAD").is_file():
         return False
     if not commondir.is_file() or not backlink.is_file():
@@ -408,8 +428,10 @@ def _apply_layer(
     unknown = set(updates) - _KEYS
     if unknown:
         raise ConfigurationError("configuration contains an unknown setting")
-    configured_model_keys = set(updates) & _MODEL_KEYS
-    if configured_model_keys and configured_model_keys != _MODEL_KEYS:
+    usable_model_keys = {
+        key for key in _MODEL_KEYS if updates.get(key) is not None
+    }
+    if usable_model_keys and usable_model_keys != _MODEL_KEYS:
         raise ConfigurationError("model and reasoning effort must be configured together")
     for key, raw_value in updates.items():
         if raw_value is None:

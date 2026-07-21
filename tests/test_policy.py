@@ -138,6 +138,30 @@ class TrustedPolicyTests(unittest.TestCase):
         self.assertIn("unavailable", missing.reason)
         self.assertIn("replayed", replayed.reason)
 
+    def test_missing_or_invalid_policy_and_receipt_evidence_deny_safely(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        calls = (
+            (None, None, "trusted policy evidence is unavailable"),
+            (None, receipt, "trusted policy evidence is unavailable"),
+            (snapshot, None, "activation receipt evidence is unavailable"),
+            (object(), object(), "trusted policy evidence is unavailable"),
+        )
+        for policy, activation_receipt, reason in calls:
+            with self.subTest(policy=policy is None, receipt=activation_receipt is None):
+                decision = evaluate_policy(
+                    policy,  # type: ignore[arg-type]
+                    activation_receipt,  # type: ignore[arg-type]
+                    task_fingerprint=fingerprint("e"),
+                    candidate_sha=CURRENT_CANDIDATE_SHA,
+                    standing_authority=StandingAuthority(frozenset(PolicyAction)),
+                    now=self.now,
+                    receipt_status=ReceiptStatus.FRESH,
+                )
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, reason)
+                self.assertNotIn("path", str(decision.diagnostic()).casefold())
+
     def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
         snapshot = self.snapshot()
         with self.assertRaisesRegex(PolicyError, "commit identity"):

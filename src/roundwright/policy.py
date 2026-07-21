@@ -204,8 +204,8 @@ def parse_policy_document(contents: bytes | str) -> PolicyDocument:
 
 
 def evaluate_policy(
-    snapshot: TrustedPolicySnapshot,
-    receipt: ActivationReceipt,
+    snapshot: TrustedPolicySnapshot | None,
+    receipt: ActivationReceipt | None,
     *,
     task_fingerprint: str,
     candidate_sha: str,
@@ -220,6 +220,11 @@ def evaluate_policy(
     variable.  Any inconsistency returns a deny decision rather than a partial
     authorization.
     """
+
+    if not isinstance(snapshot, TrustedPolicySnapshot):
+        return _denied("trusted policy evidence is unavailable", snapshot, receipt)
+    if not isinstance(receipt, ActivationReceipt):
+        return _denied("activation receipt evidence is unavailable", snapshot, receipt)
 
     source = snapshot.source
     document = snapshot.document
@@ -259,16 +264,20 @@ def evaluate_policy(
 
 
 def _denied(
-    reason: str, snapshot: TrustedPolicySnapshot, receipt: ActivationReceipt
+    reason: str,
+    snapshot: TrustedPolicySnapshot | None,
+    receipt: ActivationReceipt | None,
 ) -> PolicyDecision:
+    source = snapshot.source if isinstance(snapshot, TrustedPolicySnapshot) else None
+    document = snapshot.document if isinstance(snapshot, TrustedPolicySnapshot) else None
     return PolicyDecision(
         authorized=False,
         reason=reason,
-        schema_version=snapshot.document.schema_version,
-        source_fingerprint=snapshot.source.source_fingerprint,
-        policy_digest=snapshot.policy_digest,
-        receipt_fingerprint=receipt.receipt_fingerprint,
-        activated_at=receipt.activated_at,
+        schema_version=document.schema_version if document else None,
+        source_fingerprint=source.source_fingerprint if source else None,
+        policy_digest=snapshot.policy_digest if isinstance(snapshot, TrustedPolicySnapshot) else None,
+        receipt_fingerprint=receipt.receipt_fingerprint if isinstance(receipt, ActivationReceipt) else None,
+        activated_at=receipt.activated_at if isinstance(receipt, ActivationReceipt) else None,
         allowed_actions=frozenset(),
     )
 

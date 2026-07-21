@@ -162,6 +162,26 @@ class TrustedPolicyTests(unittest.TestCase):
                 self.assertEqual(decision.reason, reason)
                 self.assertNotIn("path", str(decision.diagnostic()).casefold())
 
+    def test_malformed_snapshot_source_and_document_deny_safely(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        malformed_snapshots = (
+            (
+                TrustedPolicySnapshot(None, snapshot.document),  # type: ignore[arg-type]
+                "trusted policy source evidence is unavailable",
+            ),
+            (
+                TrustedPolicySnapshot(snapshot.source, None),  # type: ignore[arg-type]
+                "trusted policy document evidence is unavailable",
+            ),
+        )
+        for malformed, reason in malformed_snapshots:
+            with self.subTest(reason=reason):
+                decision = self.evaluate(malformed, receipt)
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, reason)
+                self.assertNotIn("path", str(decision.diagnostic()).casefold())
+
     def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
         snapshot = self.snapshot()
         with self.assertRaisesRegex(PolicyError, "commit identity"):

@@ -223,8 +223,16 @@ def evaluate_policy(
 
     if not isinstance(snapshot, TrustedPolicySnapshot):
         return _denied("trusted policy evidence is unavailable", snapshot, receipt)
+    if not isinstance(snapshot.source, TrustedControlSource):
+        return _denied("trusted policy source evidence is unavailable", snapshot, receipt)
+    if not isinstance(snapshot.document, PolicyDocument):
+        return _denied("trusted policy document evidence is unavailable", snapshot, receipt)
+    if not _snapshot_is_structurally_valid(snapshot):
+        return _denied("trusted policy evidence is invalid", snapshot, receipt)
     if not isinstance(receipt, ActivationReceipt):
         return _denied("activation receipt evidence is unavailable", snapshot, receipt)
+    if not _receipt_is_structurally_valid(receipt):
+        return _denied("activation receipt evidence is invalid", snapshot, receipt)
 
     source = snapshot.source
     document = snapshot.document
@@ -268,18 +276,57 @@ def _denied(
     snapshot: TrustedPolicySnapshot | None,
     receipt: ActivationReceipt | None,
 ) -> PolicyDecision:
-    source = snapshot.source if isinstance(snapshot, TrustedPolicySnapshot) else None
-    document = snapshot.document if isinstance(snapshot, TrustedPolicySnapshot) else None
+    source = (
+        snapshot.source
+        if isinstance(snapshot, TrustedPolicySnapshot)
+        and isinstance(snapshot.source, TrustedControlSource)
+        else None
+    )
+    document = (
+        snapshot.document
+        if isinstance(snapshot, TrustedPolicySnapshot)
+        and isinstance(snapshot.document, PolicyDocument)
+        else None
+    )
     return PolicyDecision(
         authorized=False,
         reason=reason,
         schema_version=document.schema_version if document else None,
         source_fingerprint=source.source_fingerprint if source else None,
-        policy_digest=snapshot.policy_digest if isinstance(snapshot, TrustedPolicySnapshot) else None,
+        policy_digest=_safe_policy_digest(snapshot) if source and document else None,
         receipt_fingerprint=receipt.receipt_fingerprint if isinstance(receipt, ActivationReceipt) else None,
         activated_at=receipt.activated_at if isinstance(receipt, ActivationReceipt) else None,
         allowed_actions=frozenset(),
     )
+
+
+def _snapshot_is_structurally_valid(snapshot: TrustedPolicySnapshot) -> bool:
+    """Check nested trusted policy values without leaking malformed contents."""
+
+    try:
+        snapshot.source.__post_init__()
+        snapshot.document.__post_init__()
+        snapshot.policy_digest
+    except (AttributeError, TypeError, PolicyError):
+        return False
+    return True
+
+
+def _receipt_is_structurally_valid(receipt: ActivationReceipt) -> bool:
+    """Revalidate receipt fields at the untrusted evaluation boundary."""
+
+    try:
+        receipt.__post_init__()
+    except (AttributeError, TypeError, PolicyError):
+        return False
+    return True
+
+
+def _safe_policy_digest(snapshot: TrustedPolicySnapshot) -> str | None:
+    try:
+        return snapshot.policy_digest
+    except (AttributeError, TypeError, PolicyError):
+        return None
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:

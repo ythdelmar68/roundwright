@@ -21,7 +21,8 @@ path-free decision and never performs mutations; task-worktree edits cannot
 become active policy. Verified receipt lifecycle evidence is mandatory: absent,
 unknown, replayed, stale, conflicting, or revoked evidence denies activation.
 Absent or invalid policy and activation-receipt evidence also returns a
-path-free denial rather than an implementation exception.
+path-free denial rather than an implementation exception, including malformed
+trusted source and policy-document structures.
 
 ## Development check
 

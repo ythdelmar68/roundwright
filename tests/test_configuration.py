@@ -236,6 +236,13 @@ class ConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             roots = {source: self.make_repository(workspace / source) for source in sources}
+            caches = {source: workspace / f"{source}-cache" for source in sources}
+            source_names = {
+                "user": ConfigurationSource.USER,
+                "repository": ConfigurationSource.REPOSITORY,
+                "environment": ConfigurationSource.ENVIRONMENT,
+                "command": ConfigurationSource.COMMAND_LINE,
+            }
             for lower_index, lower in enumerate(sources):
                 for higher in sources[lower_index + 1 :]:
                     user_config = workspace / f"{lower}-{higher}.toml"
@@ -245,19 +252,19 @@ class ConfigurationTests(unittest.TestCase):
                     if includes_repository:
                         self.write_config(
                             repository_host / ".roundwright.toml",
-                            f"[roundwright]\nrepository_root = {str(roots['repository'])!r}\n",
+                            f"[roundwright]\ncache_directory = {str(caches['repository'])!r}\n",
                         )
                     if includes_user:
                         self.write_config(
                             user_config,
-                            f"[roundwright]\nrepository_root = {str(roots['user'])!r}\n",
+                            f"[roundwright]\nrepository_root = {str(repository_host)!r}\ncache_directory = {str(caches['user'])!r}\n",
                         )
                     environment = {}
                     if lower == "environment" or higher == "environment":
-                        environment["ROUNDWRIGHT_REPOSITORY_ROOT"] = str(roots["environment"])
+                        environment["ROUNDWRIGHT_CACHE_DIRECTORY"] = str(caches["environment"])
                     cli_values = {}
                     if lower == "command" or higher == "command":
-                        cli_values["repository_root"] = roots["command"]
+                        cli_values["cache_directory"] = caches["command"]
                     config = load_configuration(
                         cwd=roots["default"],
                         environment=environment,
@@ -265,8 +272,38 @@ class ConfigurationTests(unittest.TestCase):
                         user_config=user_config if includes_user else None,
                         home=workspace / "home",
                     )
-                    expected = roots[higher]
-                    self.assertEqual(config.repository.root, expected.resolve(), f"{higher} should override {lower}")
+                    expected = caches[higher]
+                    self.assertEqual(config.cache_directory.value, expected, f"{higher} should override {lower}")
+                    self.assertEqual(config.cache_directory.source, source_names[higher])
+
+    def test_repository_configuration_cannot_rebind_or_mix_repository_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            source = self.make_repository(workspace / "source")
+            target = self.make_repository(workspace / "target")
+            self.write_config(
+                source / ".roundwright.toml",
+                f"[roundwright]\nrepository_root = {str(target)!r}\n",
+            )
+            with self.assertRaises(ConfigurationError) as raised:
+                load_configuration(cwd=source, environment={})
+            self.assertIn("must not rebind", str(raised.exception))
+            self.assertNotIn(str(source), str(raised.exception))
+            self.assertNotIn(str(target), str(raised.exception))
+
+            self.write_config(
+                source / ".roundwright.toml",
+                f"[roundwright]\ncache_directory = {str(workspace / 'cache')!r}\n",
+            )
+            configuration = load_configuration(
+                cwd=source,
+                environment={"ROUNDWRIGHT_REPOSITORY_ROOT": str(target)},
+            )
+            with self.assertRaises(ConfigurationError) as raised:
+                preflight(configuration, PreflightMode.DISPATCH_CAPABLE)
+            self.assertIn("does not match", str(raised.exception))
+            self.assertNotIn(str(source), str(raised.exception))
+            self.assertNotIn(str(target), str(raised.exception))
 
     def test_repository_toml_overrides_user_file_when_user_selects_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

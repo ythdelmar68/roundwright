@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Generic, Mapping, TypeVar
@@ -108,6 +108,7 @@ class Configuration:
     cache_directory: EffectiveValue[Path]
     model: EffectiveValue[str]
     reasoning_effort: EffectiveValue[ReasoningEffort]
+    repository_configuration_root: Path | None = field(default=None, repr=False)
 
     @property
     def repository(self) -> RepositoryIdentity | None:
@@ -363,11 +364,18 @@ def load_configuration(
     )
 
     repository_path = values["repository_root"].value
+    repository_configuration_root: Path | None = None
     if repository_path is not None:
         repository = RepositoryIdentity.from_root(repository_path)
+        repository_values = _read_toml(
+            repository.root / _REPOSITORY_CONFIG, required=False
+        )
+        _validate_repository_configuration_root(repository, repository_values)
+        if repository_values:
+            repository_configuration_root = repository.root
         _apply_layer(
             values,
-            _read_toml(repository.root / _REPOSITORY_CONFIG, required=False),
+            repository_values,
             ConfigurationSource.REPOSITORY,
         )
 
@@ -380,7 +388,9 @@ def load_configuration(
 
     if values["repository_root"].value is not None:
         RepositoryIdentity.from_root(values["repository_root"].value)
-    return Configuration(**values)
+    return Configuration(
+        **values, repository_configuration_root=repository_configuration_root
+    )
 
 
 def preflight(
@@ -395,6 +405,15 @@ def preflight(
     repository = configuration.repository
     if validated_mode is PreflightMode.DISPATCH_CAPABLE and repository is None:
         raise ConfigurationError("dispatch-capable commands require a repository root")
+    if (
+        validated_mode is PreflightMode.DISPATCH_CAPABLE
+        and configuration.repository_configuration_root is not None
+        and repository is not None
+        and repository.root != configuration.repository_configuration_root
+    ):
+        raise ConfigurationError(
+            "repository configuration does not match the effective repository root"
+        )
     return PreflightReport(mode=validated_mode, repository_ready=repository is not None)
 
 
@@ -454,3 +473,24 @@ def _apply_layer(
             except (TypeError, ValueError) as error:
                 raise ConfigurationError("the configured reasoning effort is unsupported") from error
         current[key] = EffectiveValue(value, source)
+
+
+def _validate_repository_configuration_root(
+    repository: RepositoryIdentity, updates: Mapping[str, str]
+) -> None:
+    """Keep a repository TOML file bound to the root that supplied it."""
+
+    configured_root = updates.get("repository_root")
+    if configured_root is None:
+        return
+    candidate = Path(configured_root).expanduser()
+    if not candidate.is_absolute():
+        raise ConfigurationError("configuration paths must be absolute")
+    try:
+        normalized = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ConfigurationError("the repository configuration root is unavailable") from error
+    if normalized != repository.root:
+        raise ConfigurationError(
+            "repository configuration must not rebind the repository root"
+        )

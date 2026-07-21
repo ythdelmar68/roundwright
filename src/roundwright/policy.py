@@ -73,7 +73,10 @@ class PolicyDocument:
             or self.schema_version != POLICY_SCHEMA_VERSION
         ):
             raise PolicyError("the policy schema version is unsupported")
-        if not all(isinstance(action, PolicyAction) for action in self.allowed_actions):
+        if (
+            not isinstance(self.allowed_actions, frozenset)
+            or not all(isinstance(action, PolicyAction) for action in self.allowed_actions)
+        ):
             raise PolicyError("the policy actions are invalid")
 
     def canonical_bytes(self) -> bytes:

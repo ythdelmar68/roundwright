@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.policy import (
     ActivationReceipt,
     PolicyAction,
+    PolicyDocument,
     PolicyError,
     ReceiptStatus,
     StandingAuthority,
@@ -165,6 +166,10 @@ class TrustedPolicyTests(unittest.TestCase):
     def test_malformed_snapshot_source_and_document_deny_safely(self) -> None:
         snapshot = self.snapshot()
         receipt = self.receipt(snapshot)
+        with self.assertRaises(PolicyError):
+            PolicyDocument(1, [PolicyAction.ISSUE_COMMENT])  # type: ignore[arg-type]
+        malformed_document = self.snapshot().document
+        object.__setattr__(malformed_document, "allowed_actions", [PolicyAction.ISSUE_COMMENT])
         malformed_snapshots = (
             (
                 TrustedPolicySnapshot(None, snapshot.document),  # type: ignore[arg-type]
@@ -181,6 +186,10 @@ class TrustedPolicyTests(unittest.TestCase):
             (
                 TrustedPolicySnapshot(snapshot.source, StandingAuthority(frozenset())),  # type: ignore[arg-type]
                 "trusted policy document evidence is unavailable",
+            ),
+            (
+                TrustedPolicySnapshot(snapshot.source, malformed_document),
+                "trusted policy evidence is invalid",
             ),
         )
         for malformed, reason in malformed_snapshots:

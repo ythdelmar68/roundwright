@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roundwright"
+version = "0.0.0"
+description = "Read-only package and diagnostics substrate for Roundwright"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = []
+
+[project.scripts]
+roundwright = "roundwright.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["roundwright*"]

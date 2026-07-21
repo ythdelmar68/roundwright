@@ -1,0 +1,141 @@
+"""Hermetic contract tests for trusted policy activation."""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from roundwright.policy import (
+    ActivationReceipt,
+    PolicyAction,
+    PolicyError,
+    ReceiptStatus,
+    StandingAuthority,
+    TrustedControlSource,
+    TrustedPolicySnapshot,
+    evaluate_policy,
+    parse_policy_document,
+)
+
+
+def fingerprint(character: str) -> str:
+    return character * 64
+
+
+class TrustedPolicyTests(unittest.TestCase):
+    now = datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc)
+
+    def snapshot(self, contents: str = '{"schema_version":1,"allowed_actions":["issue-comment"]}') -> TrustedPolicySnapshot:
+        return TrustedPolicySnapshot(
+            source=TrustedControlSource(fingerprint("a"), fingerprint("b")),
+            document=parse_policy_document(contents),
+        )
+
+    def receipt(self, snapshot: TrustedPolicySnapshot, **changes: object) -> ActivationReceipt:
+        values: dict[str, object] = {
+            "owner_fingerprint": fingerprint("c"),
+            "receipt_fingerprint": fingerprint("d"),
+            "source_fingerprint": snapshot.source.source_fingerprint,
+            "revision_fingerprint": snapshot.source.revision_fingerprint,
+            "policy_digest": snapshot.policy_digest,
+            "schema_version": 1,
+            "task_fingerprint": fingerprint("e"),
+            "candidate_sha": fingerprint("f"),
+            "activated_at": self.now - timedelta(minutes=1),
+            "expires_at": self.now + timedelta(minutes=1),
+        }
+        values.update(changes)
+        return ActivationReceipt(**values)  # type: ignore[arg-type]
+
+    def evaluate(self, snapshot: TrustedPolicySnapshot, receipt: ActivationReceipt, **changes: object):
+        values: dict[str, object] = {
+            "task_fingerprint": fingerprint("e"),
+            "candidate_sha": fingerprint("f"),
+            "standing_authority": StandingAuthority(frozenset(PolicyAction)),
+            "now": self.now,
+            "receipt_status": ReceiptStatus.FRESH,
+        }
+        values.update(changes)
+        return evaluate_policy(snapshot, receipt, **values)  # type: ignore[arg-type]
+
+    def test_policy_schema_is_versioned_exact_and_canonical(self) -> None:
+        policy = parse_policy_document('{"allowed_actions":["issue-comment"],"schema_version":1}')
+        reordered = parse_policy_document('{"schema_version":1,"allowed_actions":["issue-comment"]}')
+        self.assertEqual(policy.digest, reordered.digest)
+        for contents in (
+            '{"schema_version":1,"allowed_actions":[],"unknown":true}',
+            '{"schema_version":2,"allowed_actions":[]}',
+            '{"schema_version":1,"allowed_actions":["unknown"]}',
+            '{"schema_version":1,"allowed_actions":["issue-comment","issue-comment"]}',
+        ):
+            with self.assertRaises(PolicyError):
+                parse_policy_document(contents)
+
+    def test_policy_can_narrow_but_cannot_widen_standing_authority(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        allowed = self.evaluate(snapshot, receipt, standing_authority=StandingAuthority(frozenset({PolicyAction.ISSUE_COMMENT})))
+        denied = self.evaluate(snapshot, receipt, standing_authority=StandingAuthority(frozenset()))
+        self.assertTrue(allowed.authorized)
+        self.assertFalse(denied.authorized)
+        self.assertIn("widen", denied.reason)
+
+    def test_activation_rejects_tamper_source_schema_digest_and_conflicts(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        for changes in (
+            {"source_fingerprint": fingerprint("0")},
+            {"revision_fingerprint": fingerprint("0")},
+            {"policy_digest": fingerprint("0")},
+            {"task_fingerprint": fingerprint("0")},
+        ):
+            with self.subTest(changes=changes):
+                changed = self.receipt(snapshot, **changes)
+                self.assertFalse(self.evaluate(snapshot, changed).authorized)
+        with self.assertRaises(PolicyError):
+            self.receipt(snapshot, schema_version=0)
+
+    def test_receipt_replay_staleness_and_candidate_drift_fail_closed(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        self.assertFalse(self.evaluate(snapshot, receipt, candidate_sha=fingerprint("0")).authorized)
+        stale = self.receipt(snapshot, expires_at=self.now)
+        self.assertFalse(self.evaluate(snapshot, stale).authorized)
+        future = self.receipt(snapshot, activated_at=self.now + timedelta(seconds=1), expires_at=self.now + timedelta(minutes=1))
+        self.assertFalse(self.evaluate(snapshot, future).authorized)
+        self.assertFalse(
+            self.evaluate(snapshot, receipt, receipt_status=ReceiptStatus.CONSUMED).authorized
+        )
+
+    def test_candidate_policy_edit_cannot_authorize_its_own_task(self) -> None:
+        trusted = self.snapshot('{"schema_version":1,"allowed_actions":[]}')
+        receipt = self.receipt(trusted)
+        candidate_edited = self.snapshot('{"schema_version":1,"allowed_actions":["issue-comment"]}')
+        decision = self.evaluate(candidate_edited, receipt)
+        self.assertFalse(decision.authorized)
+        self.assertIn("digest", decision.reason)
+
+    def test_owner_safe_diagnostic_contains_no_private_source_or_receipt_contents(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        decision = self.evaluate(snapshot, receipt)
+        diagnostic = decision.diagnostic()
+        rendered = str(diagnostic)
+        self.assertTrue(decision.authorized)
+        self.assertIn(snapshot.policy_digest, rendered)
+        self.assertNotIn("path", rendered.casefold())
+        self.assertNotIn("credential", rendered.casefold())
+
+    def test_evaluation_is_deterministic_and_has_no_filesystem_side_effects(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        with mock.patch("builtins.open", side_effect=AssertionError("filesystem access")):
+            first = self.evaluate(snapshot, receipt)
+            second = self.evaluate(snapshot, receipt)
+        self.assertEqual(first, second)

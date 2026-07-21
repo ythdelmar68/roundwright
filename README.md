@@ -14,6 +14,12 @@ cannot rebind repository identity or make a different repository dispatch-ready.
 Model and reasoning-effort defaults are typed configuration values with the
 same precedence; configured values must be supplied as a validated pair.
 
+The policy boundary is also pure and typed. A later Orchestrator must supply an
+externally verified immutable control-source snapshot plus an owner activation
+receipt bound to the exact task candidate. Policy evaluation returns only a
+path-free decision and never performs mutations; task-worktree edits cannot
+become active policy.
+
 ## Development check
 
 Use Python 3.12:

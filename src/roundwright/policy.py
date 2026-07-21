@@ -18,6 +18,7 @@ from typing import Any, Mapping
 
 POLICY_SCHEMA_VERSION = 1
 _FINGERPRINT_LENGTH = 64
+_COMMIT_SHA_LENGTHS = frozenset({40, 64})
 
 
 class PolicyError(ValueError):
@@ -136,9 +137,9 @@ class ActivationReceipt:
             (self.revision_fingerprint, "receipt revision"),
             (self.policy_digest, "receipt policy digest"),
             (self.task_fingerprint, "receipt task"),
-            (self.candidate_sha, "receipt candidate"),
         ):
             _require_fingerprint(value, description)
+        _require_commit_sha(self.candidate_sha, "receipt candidate")
         if (
             not isinstance(self.schema_version, int)
             or isinstance(self.schema_version, bool)
@@ -210,7 +211,7 @@ def evaluate_policy(
     candidate_sha: str,
     standing_authority: StandingAuthority,
     now: datetime,
-    receipt_status: ReceiptStatus = ReceiptStatus.FRESH,
+    receipt_status: ReceiptStatus | None = None,
 ) -> PolicyDecision:
     """Evaluate one receipt-bound policy without performing any mutation.
 
@@ -224,10 +225,10 @@ def evaluate_policy(
     document = snapshot.document
     try:
         _require_fingerprint(task_fingerprint, "candidate task")
-        _require_fingerprint(candidate_sha, "candidate")
+        _require_commit_sha(candidate_sha, "candidate")
         _require_utc(now, "evaluation timestamp")
         if not isinstance(receipt_status, ReceiptStatus):
-            raise PolicyError("the activation receipt status is invalid")
+            raise PolicyError("verified activation receipt status is unavailable")
     except PolicyError as error:
         return _denied(str(error), snapshot, receipt)
 
@@ -283,6 +284,17 @@ def _require_fingerprint(value: str, description: str) -> None:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise PolicyError(f"the {description} fingerprint is invalid")
+
+
+def _require_commit_sha(value: str, description: str) -> None:
+    """Accept only exact Git object identities, never generic fingerprints."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) not in _COMMIT_SHA_LENGTHS
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise PolicyError(f"the {description} commit identity is invalid")
 
 
 def _require_utc(value: datetime, description: str) -> None:

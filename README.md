@@ -18,7 +18,8 @@ The policy boundary is also pure and typed. A later Orchestrator must supply an
 externally verified immutable control-source snapshot plus an owner activation
 receipt bound to the exact task candidate. Policy evaluation returns only a
 path-free decision and never performs mutations; task-worktree edits cannot
-become active policy.
+become active policy. Verified receipt lifecycle evidence is mandatory: absent,
+unknown, replayed, stale, conflicting, or revoked evidence denies activation.
 
 ## Development check
 

@@ -28,6 +28,9 @@ def fingerprint(character: str) -> str:
     return character * 64
 
 
+CURRENT_CANDIDATE_SHA = "e76c621213d0001f766bdb92ba07d2a9e1d7b894"
+
+
 class TrustedPolicyTests(unittest.TestCase):
     now = datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc)
 
@@ -46,7 +49,7 @@ class TrustedPolicyTests(unittest.TestCase):
             "policy_digest": snapshot.policy_digest,
             "schema_version": 1,
             "task_fingerprint": fingerprint("e"),
-            "candidate_sha": fingerprint("f"),
+            "candidate_sha": CURRENT_CANDIDATE_SHA,
             "activated_at": self.now - timedelta(minutes=1),
             "expires_at": self.now + timedelta(minutes=1),
         }
@@ -56,7 +59,7 @@ class TrustedPolicyTests(unittest.TestCase):
     def evaluate(self, snapshot: TrustedPolicySnapshot, receipt: ActivationReceipt, **changes: object):
         values: dict[str, object] = {
             "task_fingerprint": fingerprint("e"),
-            "candidate_sha": fingerprint("f"),
+            "candidate_sha": CURRENT_CANDIDATE_SHA,
             "standing_authority": StandingAuthority(frozenset(PolicyAction)),
             "now": self.now,
             "receipt_status": ReceiptStatus.FRESH,
@@ -104,7 +107,8 @@ class TrustedPolicyTests(unittest.TestCase):
     def test_receipt_replay_staleness_and_candidate_drift_fail_closed(self) -> None:
         snapshot = self.snapshot()
         receipt = self.receipt(snapshot)
-        self.assertFalse(self.evaluate(snapshot, receipt, candidate_sha=fingerprint("0")).authorized)
+        self.assertTrue(self.evaluate(snapshot, receipt).authorized)
+        self.assertFalse(self.evaluate(snapshot, receipt, candidate_sha="0" * 40).authorized)
         stale = self.receipt(snapshot, expires_at=self.now)
         self.assertFalse(self.evaluate(snapshot, stale).authorized)
         future = self.receipt(snapshot, activated_at=self.now + timedelta(seconds=1), expires_at=self.now + timedelta(minutes=1))
@@ -112,6 +116,34 @@ class TrustedPolicyTests(unittest.TestCase):
         self.assertFalse(
             self.evaluate(snapshot, receipt, receipt_status=ReceiptStatus.CONSUMED).authorized
         )
+
+    def test_receipt_lifecycle_evidence_is_required_and_replay_is_denied(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        first = self.evaluate(snapshot, receipt, receipt_status=ReceiptStatus.FRESH)
+        missing = evaluate_policy(
+            snapshot,
+            receipt,
+            task_fingerprint=fingerprint("e"),
+            candidate_sha=CURRENT_CANDIDATE_SHA,
+            standing_authority=StandingAuthority(frozenset(PolicyAction)),
+            now=self.now,
+        )
+        unknown = self.evaluate(snapshot, receipt, receipt_status="fresh")
+        replayed = self.evaluate(snapshot, receipt, receipt_status=ReceiptStatus.CONSUMED)
+        self.assertTrue(first.authorized)
+        self.assertFalse(missing.authorized)
+        self.assertFalse(unknown.authorized)
+        self.assertFalse(replayed.authorized)
+        self.assertIn("unavailable", missing.reason)
+        self.assertIn("replayed", replayed.reason)
+
+    def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
+        snapshot = self.snapshot()
+        with self.assertRaisesRegex(PolicyError, "commit identity"):
+            self.receipt(snapshot, candidate_sha="f" * 64 + "0")
+        with self.assertRaisesRegex(PolicyError, "commit identity"):
+            self.receipt(snapshot, candidate_sha="F" * 40)
 
     def test_candidate_policy_edit_cannot_authorize_its_own_task(self) -> None:
         trusted = self.snapshot('{"schema_version":1,"allowed_actions":[]}')

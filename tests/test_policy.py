@@ -171,7 +171,15 @@ class TrustedPolicyTests(unittest.TestCase):
                 "trusted policy source evidence is unavailable",
             ),
             (
+                TrustedPolicySnapshot(StandingAuthority(frozenset()), snapshot.document),  # type: ignore[arg-type]
+                "trusted policy source evidence is unavailable",
+            ),
+            (
                 TrustedPolicySnapshot(snapshot.source, None),  # type: ignore[arg-type]
+                "trusted policy document evidence is unavailable",
+            ),
+            (
+                TrustedPolicySnapshot(snapshot.source, StandingAuthority(frozenset())),  # type: ignore[arg-type]
                 "trusted policy document evidence is unavailable",
             ),
         )
@@ -181,6 +189,8 @@ class TrustedPolicyTests(unittest.TestCase):
                 self.assertFalse(decision.authorized)
                 self.assertEqual(decision.reason, reason)
                 self.assertNotIn("path", str(decision.diagnostic()).casefold())
+                self.assertIsNone(decision.source_fingerprint)
+                self.assertIsNone(decision.policy_digest)
 
     def test_malformed_receipt_fields_deny_without_leaking_or_raising(self) -> None:
         snapshot = self.snapshot()

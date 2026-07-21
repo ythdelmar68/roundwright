@@ -225,9 +225,9 @@ def evaluate_policy(
 
     if not isinstance(snapshot, TrustedPolicySnapshot):
         return _denied("trusted policy evidence is unavailable", snapshot, receipt)
-    if not isinstance(snapshot.source, TrustedControlSource):
+    if not isinstance(getattr(snapshot, "source", None), TrustedControlSource):
         return _denied("trusted policy source evidence is unavailable", snapshot, receipt)
-    if not isinstance(snapshot.document, PolicyDocument):
+    if not isinstance(getattr(snapshot, "document", None), PolicyDocument):
         return _denied("trusted policy document evidence is unavailable", snapshot, receipt)
     if not _snapshot_is_structurally_valid(snapshot):
         return _denied("trusted policy evidence is invalid", snapshot, receipt)
@@ -298,8 +298,12 @@ def _snapshot_is_structurally_valid(snapshot: TrustedPolicySnapshot) -> bool:
     """Check nested trusted policy values without leaking malformed contents."""
 
     try:
-        snapshot.source.__post_init__()
-        snapshot.document.__post_init__()
+        source = snapshot.source
+        document = snapshot.document
+        if not isinstance(source, TrustedControlSource) or not isinstance(document, PolicyDocument):
+            return False
+        source.__post_init__()
+        document.__post_init__()
         snapshot.policy_digest
     except (AttributeError, TypeError, PolicyError):
         return False

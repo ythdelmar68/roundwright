@@ -175,7 +175,9 @@ class PolicyDecision:
             "source_fingerprint": self.source_fingerprint,
             "policy_digest": self.policy_digest,
             "receipt_fingerprint": self.receipt_fingerprint,
-            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
+            "activated_at": self.activated_at.isoformat()
+            if isinstance(self.activated_at, datetime)
+            else None,
         }
 
 
@@ -276,26 +278,18 @@ def _denied(
     snapshot: TrustedPolicySnapshot | None,
     receipt: ActivationReceipt | None,
 ) -> PolicyDecision:
-    source = (
-        snapshot.source
-        if isinstance(snapshot, TrustedPolicySnapshot)
-        and isinstance(snapshot.source, TrustedControlSource)
-        else None
-    )
-    document = (
-        snapshot.document
-        if isinstance(snapshot, TrustedPolicySnapshot)
-        and isinstance(snapshot.document, PolicyDocument)
-        else None
-    )
+    valid_snapshot = isinstance(snapshot, TrustedPolicySnapshot) and _snapshot_is_structurally_valid(snapshot)
+    valid_receipt = isinstance(receipt, ActivationReceipt) and _receipt_is_structurally_valid(receipt)
+    source = snapshot.source if valid_snapshot else None
+    document = snapshot.document if valid_snapshot else None
     return PolicyDecision(
         authorized=False,
         reason=reason,
         schema_version=document.schema_version if document else None,
         source_fingerprint=source.source_fingerprint if source else None,
-        policy_digest=_safe_policy_digest(snapshot) if source and document else None,
-        receipt_fingerprint=receipt.receipt_fingerprint if isinstance(receipt, ActivationReceipt) else None,
-        activated_at=receipt.activated_at if isinstance(receipt, ActivationReceipt) else None,
+        policy_digest=_safe_policy_digest(snapshot) if valid_snapshot else None,
+        receipt_fingerprint=receipt.receipt_fingerprint if valid_receipt else None,
+        activated_at=receipt.activated_at if valid_receipt else None,
         allowed_actions=frozenset(),
     )
 

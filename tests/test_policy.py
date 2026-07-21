@@ -182,6 +182,20 @@ class TrustedPolicyTests(unittest.TestCase):
                 self.assertEqual(decision.reason, reason)
                 self.assertNotIn("path", str(decision.diagnostic()).casefold())
 
+    def test_malformed_receipt_fields_deny_without_leaking_or_raising(self) -> None:
+        snapshot = self.snapshot()
+        missing_field = object.__new__(ActivationReceipt)
+        invalid_timestamp = self.receipt(snapshot)
+        object.__setattr__(invalid_timestamp, "activated_at", "not-a-timestamp")
+        for malformed in (missing_field, invalid_timestamp):
+            with self.subTest(receipt=type(malformed).__name__):
+                decision = self.evaluate(snapshot, malformed)
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, "activation receipt evidence is invalid")
+                self.assertIsNone(decision.receipt_fingerprint)
+                self.assertIsNone(decision.activated_at)
+                self.assertIsNone(decision.diagnostic()["activated_at"])
+
     def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
         snapshot = self.snapshot()
         with self.assertRaisesRegex(PolicyError, "commit identity"):

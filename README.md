@@ -22,7 +22,8 @@ become active policy. Verified receipt lifecycle evidence is mandatory: absent,
 unknown, replayed, stale, conflicting, or revoked evidence denies activation.
 Absent or invalid policy and activation-receipt evidence also returns a
 path-free denial rather than an implementation exception, including malformed
-trusted source and policy-document structures.
+trusted source, policy-document, and activation-receipt structures. Invalid
+receipt fields are not copied into owner-facing diagnostics.
 
 ## Development check
 

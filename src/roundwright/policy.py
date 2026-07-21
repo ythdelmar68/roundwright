@@ -241,7 +241,7 @@ def evaluate_policy(
         return _denied("activation receipt evidence is unavailable", snapshot, receipt)
     if not _receipt_is_structurally_valid(receipt):
         return _denied("activation receipt evidence is invalid", snapshot, receipt)
-    if not isinstance(standing_authority, StandingAuthority):
+    if type(standing_authority) is not StandingAuthority:
         return _denied("standing authority evidence is unavailable", snapshot, receipt)
     if not _standing_authority_is_structurally_valid(standing_authority):
         return _denied("standing authority evidence is invalid", snapshot, receipt)
@@ -331,13 +331,15 @@ def _receipt_is_structurally_valid(receipt: ActivationReceipt) -> bool:
 
 
 def _standing_authority_is_structurally_valid(authority: StandingAuthority) -> bool:
-    """Revalidate the no-widening ceiling at the untrusted boundary."""
+    """Validate the no-widening ceiling without calling evidence methods."""
 
     try:
-        authority.__post_init__()
+        allowed_actions = authority.allowed_actions
     except (AttributeError, TypeError, PolicyError):
         return False
-    return True
+    return isinstance(allowed_actions, frozenset) and all(
+        isinstance(action, PolicyAction) for action in allowed_actions
+    )
 
 
 def _safe_policy_digest(snapshot: TrustedPolicySnapshot) -> str | None:

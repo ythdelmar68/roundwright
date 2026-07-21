@@ -91,15 +91,21 @@ class TrustedPolicyTests(unittest.TestCase):
         self.assertIn("widen", denied.reason)
 
     def test_missing_or_malformed_standing_authority_denies_safely(self) -> None:
+        class ForgedStandingAuthority(StandingAuthority):
+            def __post_init__(self) -> None:
+                pass
+
         snapshot = self.snapshot()
         receipt = self.receipt(snapshot)
         with self.assertRaises(PolicyError):
             StandingAuthority([PolicyAction.ISSUE_COMMENT])  # type: ignore[arg-type]
         malformed = StandingAuthority(frozenset())
         object.__setattr__(malformed, "allowed_actions", [PolicyAction.ISSUE_COMMENT])
+        forged = ForgedStandingAuthority([PolicyAction.ISSUE_COMMENT])  # type: ignore[arg-type]
         for authority, reason in (
             (None, "standing authority evidence is unavailable"),
             (object(), "standing authority evidence is unavailable"),
+            (forged, "standing authority evidence is unavailable"),
             (malformed, "standing authority evidence is invalid"),
         ):
             with self.subTest(authority=type(authority).__name__):

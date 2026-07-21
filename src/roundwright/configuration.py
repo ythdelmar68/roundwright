@@ -8,12 +8,13 @@ dispatch authority.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Mapping
+from typing import Generic, Mapping, TypeVar
 
 
 class ConfigurationError(ValueError):
@@ -37,11 +38,25 @@ class PreflightMode(str, Enum):
     DISPATCH_CAPABLE = "dispatch-capable"
 
 
+class ReasoningEffort(str, Enum):
+    """Supported deterministic reasoning budgets, without provider probing."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+    ULTRA = "ultra"
+
+
+T = TypeVar("T")
+
+
 @dataclass(frozen=True)
-class EffectiveValue:
+class EffectiveValue(Generic[T]):
     """A typed setting together with a non-sensitive source label."""
 
-    value: Path | None
+    value: T
     source: ConfigurationSource
 
 
@@ -61,7 +76,7 @@ class RepositoryIdentity:
             normalized = root.expanduser().resolve(strict=True)
         except OSError as error:
             raise ConfigurationError("the repository root is unavailable") from error
-        if not normalized.is_dir() or not _is_git_worktree_marker(normalized / ".git"):
+        if not normalized.is_dir() or not _is_git_worktree_marker(normalized, normalized / ".git"):
             raise ConfigurationError("the repository root is not a Git worktree")
         return cls(root=normalized)
 
@@ -89,8 +104,10 @@ class RepositoryIdentity:
 class Configuration:
     """The effective typed settings required by the early runtime boundary."""
 
-    repository_root: EffectiveValue
-    cache_directory: EffectiveValue
+    repository_root: EffectiveValue[Path | None]
+    cache_directory: EffectiveValue[Path]
+    model: EffectiveValue[str]
+    reasoning_effort: EffectiveValue[ReasoningEffort]
 
     @property
     def repository(self) -> RepositoryIdentity | None:
@@ -105,6 +122,8 @@ class Configuration:
         return {
             "repository_root": self.repository_root.source,
             "cache_directory": self.cache_directory.source,
+            "model": self.model.source,
+            "reasoning_effort": self.reasoning_effort.source,
         }
 
 
@@ -116,20 +135,26 @@ class PreflightReport:
     repository_ready: bool
 
 
-_KEYS = frozenset({"repository_root", "cache_directory"})
+_PATH_KEYS = frozenset({"repository_root", "cache_directory"})
+_MODEL_KEYS = frozenset({"model", "reasoning_effort"})
+_KEYS = _PATH_KEYS | _MODEL_KEYS
 _ENVIRONMENT_KEYS = {
     "repository_root": "ROUNDWRIGHT_REPOSITORY_ROOT",
     "cache_directory": "ROUNDWRIGHT_CACHE_DIRECTORY",
+    "model": "ROUNDWRIGHT_MODEL",
+    "reasoning_effort": "ROUNDWRIGHT_REASONING_EFFORT",
 }
 _REPOSITORY_CONFIG = ".roundwright.toml"
+_DEFAULT_MODEL = "gpt-5.6-terra"
+_SUPPORTED_MODELS = frozenset({_DEFAULT_MODEL, "gpt-5.6-sol"})
 
 
-def _is_git_worktree_marker(marker: Path) -> bool:
-    """Accept only a Git directory or a valid linked-worktree marker."""
+def _is_git_worktree_marker(root: Path, marker: Path) -> bool:
+    """Accept only a complete Git directory or a bound linked worktree."""
 
     try:
         if marker.is_dir():
-            return (marker / "HEAD").is_file()
+            return _is_complete_git_directory(marker) and _git_confirms_worktree(root)
         if not marker.is_file():
             return False
         pointer = marker.read_text(encoding="utf-8").strip()
@@ -139,9 +164,74 @@ def _is_git_worktree_marker(marker: Path) -> bool:
         if not target.is_absolute():
             target = marker.parent / target
         normalized_target = target.resolve(strict=True)
-        return normalized_target.is_dir() and (normalized_target / "HEAD").is_file()
+        return _is_bound_linked_worktree(root, marker, normalized_target) and _git_confirms_worktree(root)
     except (OSError, ValueError):
         return False
+
+
+def _git_confirms_worktree(root: Path) -> bool:
+    """Use Git's own read-only identity check after structural validation."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", os.fspath(root), "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip().casefold() == "true"
+
+
+def _is_complete_git_directory(directory: Path) -> bool:
+    """Reject partial filesystem structures that merely resemble Git metadata."""
+
+    return all(
+        (
+            (directory / "HEAD").is_file(),
+            (directory / "config").is_file(),
+            (directory / "objects").is_dir(),
+            (directory / "refs").is_dir(),
+        )
+    )
+
+
+def _is_bound_linked_worktree(root: Path, marker: Path, git_directory: Path) -> bool:
+    """Verify both directions of a linked-worktree identity binding."""
+
+    commondir = git_directory / "commondir"
+    backlink = git_directory / "gitdir"
+    if not git_directory.is_dir() or not (git_directory / "HEAD").is_file():
+        return False
+    if not commondir.is_file() or not backlink.is_file():
+        return False
+    common_directory = _read_git_pointer(commondir, git_directory)
+    bound_marker = _read_git_pointer(backlink, git_directory)
+    if common_directory is None or bound_marker is None:
+        return False
+    return (
+        _is_complete_git_directory(common_directory)
+        and bound_marker == marker.resolve(strict=True)
+        and root == marker.parent
+    )
+
+
+def _read_git_pointer(pointer: Path, relative_to: Path) -> Path | None:
+    """Read one Git pointer file without exposing its private filesystem value."""
+
+    try:
+        raw_value = pointer.read_text(encoding="utf-8").strip()
+        if not raw_value:
+            return None
+        target = Path(raw_value)
+        if not target.is_absolute():
+            target = relative_to / target
+        return target.resolve(strict=True)
+    except (OSError, ValueError):
+        return None
 
 
 def user_config_path(
@@ -217,7 +307,7 @@ def load_configuration(
     *,
     cwd: Path | None = None,
     environment: Mapping[str, str] | None = None,
-    cli_values: Mapping[str, str | Path | None] | None = None,
+    cli_values: Mapping[str, str | Path | ReasoningEffort | None] | None = None,
     user_config: Path | None = None,
     platform: str | None = None,
     home: Path | None = None,
@@ -231,13 +321,17 @@ def load_configuration(
 
     env = os.environ if environment is None else environment
     discovered = discover_repository(cwd)
-    values: dict[str, EffectiveValue] = {
+    values: dict[str, EffectiveValue[object]] = {
         "repository_root": EffectiveValue(
             discovered.root if discovered is not None else None, ConfigurationSource.DEFAULT
         ),
         "cache_directory": EffectiveValue(
             user_cache_path(platform=platform, environment=env, home=home),
             ConfigurationSource.DEFAULT,
+        ),
+        "model": EffectiveValue(_DEFAULT_MODEL, ConfigurationSource.DEFAULT),
+        "reasoning_effort": EffectiveValue(
+            ReasoningEffort.MEDIUM, ConfigurationSource.DEFAULT
         ),
     }
 
@@ -269,13 +363,19 @@ def load_configuration(
     return Configuration(**values)
 
 
-def preflight(configuration: Configuration, mode: PreflightMode) -> PreflightReport:
+def preflight(
+    configuration: Configuration, mode: PreflightMode | str
+) -> PreflightReport:
     """Validate only the requirements appropriate to the requested capability."""
 
+    try:
+        validated_mode = PreflightMode(mode)
+    except (TypeError, ValueError) as error:
+        raise ConfigurationError("the capability preflight mode is unsupported") from error
     repository = configuration.repository
-    if mode is PreflightMode.DISPATCH_CAPABLE and repository is None:
+    if validated_mode is PreflightMode.DISPATCH_CAPABLE and repository is None:
         raise ConfigurationError("dispatch-capable commands require a repository root")
-    return PreflightReport(mode=mode, repository_ready=repository is not None)
+    return PreflightReport(mode=validated_mode, repository_ready=repository is not None)
 
 
 def _read_toml(path: Path, *, required: bool) -> Mapping[str, str]:
@@ -302,20 +402,33 @@ def _read_toml(path: Path, *, required: bool) -> Mapping[str, str]:
 
 def _apply_layer(
     current: dict[str, EffectiveValue],
-    updates: Mapping[str, str | Path | None],
+    updates: Mapping[str, str | Path | ReasoningEffort | None],
     source: ConfigurationSource,
 ) -> None:
     unknown = set(updates) - _KEYS
     if unknown:
         raise ConfigurationError("configuration contains an unknown setting")
+    configured_model_keys = set(updates) & _MODEL_KEYS
+    if configured_model_keys and configured_model_keys != _MODEL_KEYS:
+        raise ConfigurationError("model and reasoning effort must be configured together")
     for key, raw_value in updates.items():
         if raw_value is None:
             continue
-        if not isinstance(raw_value, (str, Path)):
-            raise ConfigurationError("configuration values must be paths")
-        if isinstance(raw_value, str) and not raw_value.strip():
-            raise ConfigurationError("configuration values must be non-empty")
-        value = Path(raw_value).expanduser()
-        if not value.is_absolute():
-            raise ConfigurationError("configuration paths must be absolute")
+        if key in _PATH_KEYS:
+            if not isinstance(raw_value, (str, Path)):
+                raise ConfigurationError("configuration path values must be paths")
+            if isinstance(raw_value, str) and not raw_value.strip():
+                raise ConfigurationError("configuration path values must be non-empty")
+            value = Path(raw_value).expanduser()
+            if not value.is_absolute():
+                raise ConfigurationError("configuration paths must be absolute")
+        elif key == "model":
+            if not isinstance(raw_value, str) or raw_value not in _SUPPORTED_MODELS:
+                raise ConfigurationError("the configured model is unsupported")
+            value = raw_value
+        else:
+            try:
+                value = ReasoningEffort(raw_value)
+            except (TypeError, ValueError) as error:
+                raise ConfigurationError("the configured reasoning effort is unsupported") from error
         current[key] = EffectiveValue(value, source)

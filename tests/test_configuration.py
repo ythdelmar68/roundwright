@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from roundwright.configuration import (
     ConfigurationError,
     ConfigurationSource,
     PreflightMode,
+    ReasoningEffort,
     RepositoryIdentity,
     discover_repository,
     load_configuration,
@@ -26,8 +28,14 @@ from roundwright.configuration import (
 class ConfigurationTests(unittest.TestCase):
     def make_repository(self, parent: Path) -> Path:
         root = parent / "repository"
-        (root / ".git").mkdir(parents=True)
-        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        result = subprocess.run(
+            ["git", "init", "--quiet", str(root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            self.fail(result.stderr or result.stdout)
         return root
 
     def write_config(self, path: Path, contents: str) -> None:
@@ -87,6 +95,41 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
                 RepositoryIdentity.from_root(invalid)
 
+    def test_repository_discovery_rejects_head_only_and_mismatched_gitfile_spoofs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            spoof = workspace / "head-only"
+            (spoof / ".git").mkdir(parents=True)
+            (spoof / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
+                RepositoryIdentity.from_root(spoof)
+            target = self.make_repository(workspace / "target")
+            mismatched = workspace / "mismatched"
+            mismatched.mkdir()
+            (mismatched / ".git").write_text(
+                f"gitdir: {target / '.git'}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
+                RepositoryIdentity.from_root(mismatched)
+
+    def test_repository_discovery_accepts_a_real_linked_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            repository = self.make_repository(workspace)
+            (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            for command in (
+                ["git", "-C", str(repository), "add", "tracked.txt"],
+                ["git", "-C", str(repository), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial"],
+                ["git", "-C", str(repository), "worktree", "add", "--detach", str(workspace / "linked")],
+            ):
+                result = subprocess.run(command, check=False, capture_output=True, text=True)
+                if result.returncode:
+                    self.fail(result.stderr or result.stdout)
+            self.assertEqual(
+                RepositoryIdentity.from_root(workspace / "linked").root,
+                (workspace / "linked").resolve(),
+            )
+
     def test_precedence_and_source_attribution_are_deterministic_and_path_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -112,6 +155,60 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(config.sources["repository_root"], ConfigurationSource.COMMAND_LINE)
             self.assertEqual(config.sources["cache_directory"], ConfigurationSource.COMMAND_LINE)
             self.assertNotIn(str(cli_repository), str(config.sources))
+
+    def test_model_defaults_are_typed_and_follow_every_configuration_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            repository = self.make_repository(workspace)
+            user = workspace / "user.toml"
+            self.write_config(
+                user,
+                "[roundwright]\nmodel = 'gpt-5.6-sol'\nreasoning_effort = 'high'\n",
+            )
+            self.write_config(
+                repository / ".roundwright.toml",
+                "[roundwright]\nmodel = 'gpt-5.6-terra'\nreasoning_effort = 'low'\n",
+            )
+            configured = load_configuration(
+                cwd=repository,
+                user_config=user,
+                environment={
+                    "ROUNDWRIGHT_MODEL": "gpt-5.6-sol",
+                    "ROUNDWRIGHT_REASONING_EFFORT": "max",
+                },
+                cli_values={"model": "gpt-5.6-terra", "reasoning_effort": "ultra"},
+            )
+            defaults = load_configuration(cwd=workspace, environment={}, home=workspace / "home")
+        self.assertEqual(defaults.model.value, "gpt-5.6-terra")
+        self.assertEqual(defaults.reasoning_effort.value, "medium")
+        self.assertEqual(defaults.model.source, ConfigurationSource.DEFAULT)
+        self.assertEqual(configured.model.value, "gpt-5.6-terra")
+        self.assertEqual(configured.reasoning_effort.value, ReasoningEffort.ULTRA)
+        self.assertEqual(configured.sources["model"], ConfigurationSource.COMMAND_LINE)
+        self.assertEqual(configured.sources["reasoning_effort"], ConfigurationSource.COMMAND_LINE)
+
+    def test_model_configuration_rejects_missing_invalid_unsupported_and_secret_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            incomplete = workspace / "incomplete.toml"
+            self.write_config(incomplete, "[roundwright]\nmodel = 'gpt-5.6-terra'\n")
+            with self.assertRaisesRegex(ConfigurationError, "together"):
+                load_configuration(cwd=workspace, user_config=incomplete, environment={})
+            invalid = workspace / "invalid.toml"
+            self.write_config(invalid, "[roundwright]\nmodel = 'gpt-5.6-terra'\nreasoning_effort = 'unknown'\n")
+            with self.assertRaisesRegex(ConfigurationError, "reasoning effort"):
+                load_configuration(cwd=workspace, user_config=invalid, environment={})
+            with self.assertRaises(ConfigurationError) as raised:
+                load_configuration(
+                    cwd=workspace,
+                    environment={
+                        "ROUNDWRIGHT_MODEL": "private-model-token",
+                        "ROUNDWRIGHT_REASONING_EFFORT": "medium",
+                    },
+                )
+            self.assertNotIn("private-model-token", str(raised.exception))
+            with self.assertRaisesRegex(ConfigurationError, "together"):
+                load_configuration(cwd=workspace, cli_values={"model": "gpt-5.6-sol"})
 
     def test_each_higher_configuration_source_overrides_each_lower_source(self) -> None:
         sources = ("default", "user", "repository", "environment", "command")
@@ -192,3 +289,14 @@ class ConfigurationTests(unittest.TestCase):
             config = load_configuration(cwd=root, environment={})
             report = preflight(config, PreflightMode.DISPATCH_CAPABLE)
             self.assertTrue(report.repository_ready)
+
+    def test_preflight_rejects_serialized_and_malformed_capability_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            configuration = load_configuration(
+                cwd=Path(temporary), environment={}, home=Path(temporary) / "home"
+            )
+        with self.assertRaisesRegex(ConfigurationError, "repository root"):
+            preflight(configuration, "dispatch-capable")
+        for mode in ("read write", "", None, object()):
+            with self.assertRaisesRegex(ConfigurationError, "unsupported"):
+                preflight(configuration, mode)  # type: ignore[arg-type]

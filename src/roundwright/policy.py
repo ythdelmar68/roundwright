@@ -113,7 +113,10 @@ class StandingAuthority:
     allowed_actions: frozenset[PolicyAction]
 
     def __post_init__(self) -> None:
-        if not all(isinstance(action, PolicyAction) for action in self.allowed_actions):
+        if (
+            not isinstance(self.allowed_actions, frozenset)
+            or not all(isinstance(action, PolicyAction) for action in self.allowed_actions)
+        ):
             raise PolicyError("the standing authority actions are invalid")
 
 
@@ -238,6 +241,10 @@ def evaluate_policy(
         return _denied("activation receipt evidence is unavailable", snapshot, receipt)
     if not _receipt_is_structurally_valid(receipt):
         return _denied("activation receipt evidence is invalid", snapshot, receipt)
+    if not isinstance(standing_authority, StandingAuthority):
+        return _denied("standing authority evidence is unavailable", snapshot, receipt)
+    if not _standing_authority_is_structurally_valid(standing_authority):
+        return _denied("standing authority evidence is invalid", snapshot, receipt)
 
     source = snapshot.source
     document = snapshot.document
@@ -318,6 +325,16 @@ def _receipt_is_structurally_valid(receipt: ActivationReceipt) -> bool:
 
     try:
         receipt.__post_init__()
+    except (AttributeError, TypeError, PolicyError):
+        return False
+    return True
+
+
+def _standing_authority_is_structurally_valid(authority: StandingAuthority) -> bool:
+    """Revalidate the no-widening ceiling at the untrusted boundary."""
+
+    try:
+        authority.__post_init__()
     except (AttributeError, TypeError, PolicyError):
         return False
     return True

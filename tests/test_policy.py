@@ -90,6 +90,25 @@ class TrustedPolicyTests(unittest.TestCase):
         self.assertFalse(denied.authorized)
         self.assertIn("widen", denied.reason)
 
+    def test_missing_or_malformed_standing_authority_denies_safely(self) -> None:
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        with self.assertRaises(PolicyError):
+            StandingAuthority([PolicyAction.ISSUE_COMMENT])  # type: ignore[arg-type]
+        malformed = StandingAuthority(frozenset())
+        object.__setattr__(malformed, "allowed_actions", [PolicyAction.ISSUE_COMMENT])
+        for authority, reason in (
+            (None, "standing authority evidence is unavailable"),
+            (object(), "standing authority evidence is unavailable"),
+            (malformed, "standing authority evidence is invalid"),
+        ):
+            with self.subTest(authority=type(authority).__name__):
+                decision = self.evaluate(snapshot, receipt, standing_authority=authority)
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, reason)
+                self.assertEqual(decision.allowed_actions, frozenset())
+                self.assertNotIn("path", str(decision.diagnostic()).casefold())
+
     def test_activation_rejects_tamper_source_schema_digest_and_conflicts(self) -> None:
         snapshot = self.snapshot()
         receipt = self.receipt(snapshot)

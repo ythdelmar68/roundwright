@@ -61,9 +61,15 @@ class RepositoryIdentity:
             normalized = root.expanduser().resolve(strict=True)
         except OSError as error:
             raise ConfigurationError("the repository root is unavailable") from error
-        if not normalized.is_dir() or not (normalized / ".git").exists():
+        if not normalized.is_dir() or not _is_git_worktree_marker(normalized / ".git"):
             raise ConfigurationError("the repository root is not a Git worktree")
         return cls(root=normalized)
+
+    @property
+    def state_directory(self) -> Path:
+        """Return the normalized repository-local state location without creating it."""
+
+        return self.resolve_path(".roundwright")
 
     def resolve_path(self, relative_path: str | Path) -> Path:
         """Resolve one repository-relative path without permitting escape."""
@@ -118,6 +124,26 @@ _ENVIRONMENT_KEYS = {
 _REPOSITORY_CONFIG = ".roundwright.toml"
 
 
+def _is_git_worktree_marker(marker: Path) -> bool:
+    """Accept only a Git directory or a valid linked-worktree marker."""
+
+    try:
+        if marker.is_dir():
+            return (marker / "HEAD").is_file()
+        if not marker.is_file():
+            return False
+        pointer = marker.read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir:"):
+            return False
+        target = Path(pointer.removeprefix("gitdir:").strip())
+        if not target.is_absolute():
+            target = marker.parent / target
+        normalized_target = target.resolve(strict=True)
+        return normalized_target.is_dir() and (normalized_target / "HEAD").is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def user_config_path(
     *,
     platform: str | None = None,
@@ -130,11 +156,11 @@ def user_config_path(
     env = os.environ if environment is None else environment
     base_home = Path.home() if home is None else home
     if system.startswith("win"):
-        return Path(env.get("APPDATA", base_home / "AppData" / "Roaming")) / "Roundwright" / "config.toml"
+        return _environment_directory(env, "APPDATA", base_home / "AppData" / "Roaming") / "Roundwright" / "config.toml"
     if system == "darwin":
         return base_home / "Library" / "Application Support" / "roundwright" / "config.toml"
     if system.startswith("linux"):
-        return Path(env.get("XDG_CONFIG_HOME", base_home / ".config")) / "roundwright" / "config.toml"
+        return _environment_directory(env, "XDG_CONFIG_HOME", base_home / ".config") / "roundwright" / "config.toml"
     raise ConfigurationError("the platform is unsupported")
 
 
@@ -150,12 +176,26 @@ def user_cache_path(
     env = os.environ if environment is None else environment
     base_home = Path.home() if home is None else home
     if system.startswith("win"):
-        return Path(env.get("LOCALAPPDATA", base_home / "AppData" / "Local")) / "Roundwright" / "Cache"
+        return _environment_directory(env, "LOCALAPPDATA", base_home / "AppData" / "Local") / "Roundwright" / "Cache"
     if system == "darwin":
         return base_home / "Library" / "Caches" / "roundwright"
     if system.startswith("linux"):
-        return Path(env.get("XDG_CACHE_HOME", base_home / ".cache")) / "roundwright"
+        return _environment_directory(env, "XDG_CACHE_HOME", base_home / ".cache") / "roundwright"
     raise ConfigurationError("the platform is unsupported")
+
+
+def _environment_directory(
+    environment: Mapping[str, str], name: str, fallback: Path
+) -> Path:
+    raw_value = environment.get(name)
+    if raw_value is None:
+        return fallback
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ConfigurationError("a platform configuration directory is invalid")
+    directory = Path(raw_value).expanduser()
+    if not directory.is_absolute():
+        raise ConfigurationError("a platform configuration directory is invalid")
+    return directory
 
 
 def discover_repository(start: Path | None = None) -> RepositoryIdentity | None:

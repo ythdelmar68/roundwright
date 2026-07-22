@@ -229,15 +229,15 @@ def evaluate_policy(
     authorization.
     """
 
-    if not isinstance(snapshot, TrustedPolicySnapshot):
+    if type(snapshot) is not TrustedPolicySnapshot:
         return _denied("trusted policy evidence is unavailable", snapshot, receipt)
-    if not isinstance(getattr(snapshot, "source", None), TrustedControlSource):
+    if type(getattr(snapshot, "source", None)) is not TrustedControlSource:
         return _denied("trusted policy source evidence is unavailable", snapshot, receipt)
-    if not isinstance(getattr(snapshot, "document", None), PolicyDocument):
+    if type(getattr(snapshot, "document", None)) is not PolicyDocument:
         return _denied("trusted policy document evidence is unavailable", snapshot, receipt)
     if not _snapshot_is_structurally_valid(snapshot):
         return _denied("trusted policy evidence is invalid", snapshot, receipt)
-    if not isinstance(receipt, ActivationReceipt):
+    if type(receipt) is not ActivationReceipt:
         return _denied("activation receipt evidence is unavailable", snapshot, receipt)
     if not _receipt_is_structurally_valid(receipt):
         return _denied("activation receipt evidence is invalid", snapshot, receipt)
@@ -288,8 +288,8 @@ def _denied(
     snapshot: TrustedPolicySnapshot | None,
     receipt: ActivationReceipt | None,
 ) -> PolicyDecision:
-    valid_snapshot = isinstance(snapshot, TrustedPolicySnapshot) and _snapshot_is_structurally_valid(snapshot)
-    valid_receipt = isinstance(receipt, ActivationReceipt) and _receipt_is_structurally_valid(receipt)
+    valid_snapshot = type(snapshot) is TrustedPolicySnapshot and _snapshot_is_structurally_valid(snapshot)
+    valid_receipt = type(receipt) is ActivationReceipt and _receipt_is_structurally_valid(receipt)
     source = snapshot.source if valid_snapshot else None
     document = snapshot.document if valid_snapshot else None
     return PolicyDecision(
@@ -310,10 +310,12 @@ def _snapshot_is_structurally_valid(snapshot: TrustedPolicySnapshot) -> bool:
     try:
         source = snapshot.source
         document = snapshot.document
-        if not isinstance(source, TrustedControlSource) or not isinstance(document, PolicyDocument):
+        if type(source) is not TrustedControlSource or type(document) is not PolicyDocument:
             return False
-        source.__post_init__()
-        document.__post_init__()
+        if not _trusted_control_source_is_structurally_valid(source):
+            return False
+        if not _policy_document_is_structurally_valid(document):
+            return False
         snapshot.policy_digest
     except (AttributeError, TypeError, PolicyError):
         return False
@@ -324,10 +326,55 @@ def _receipt_is_structurally_valid(receipt: ActivationReceipt) -> bool:
     """Revalidate receipt fields at the untrusted evaluation boundary."""
 
     try:
-        receipt.__post_init__()
+        for value, description in (
+            (receipt.owner_fingerprint, "owner receipt"),
+            (receipt.receipt_fingerprint, "activation receipt"),
+            (receipt.source_fingerprint, "receipt source"),
+            (receipt.revision_fingerprint, "receipt revision"),
+            (receipt.policy_digest, "receipt policy digest"),
+            (receipt.task_fingerprint, "receipt task"),
+        ):
+            _require_fingerprint(value, description)
+        _require_commit_sha(receipt.candidate_sha, "receipt candidate")
+        if (
+            not isinstance(receipt.schema_version, int)
+            or isinstance(receipt.schema_version, bool)
+            or receipt.schema_version != POLICY_SCHEMA_VERSION
+        ):
+            return False
+        _require_utc(receipt.activated_at, "activation timestamp")
+        _require_utc(receipt.expires_at, "receipt expiry")
+        if receipt.expires_at <= receipt.activated_at:
+            return False
     except (AttributeError, TypeError, PolicyError):
         return False
     return True
+
+
+def _trusted_control_source_is_structurally_valid(source: TrustedControlSource) -> bool:
+    """Validate exact trusted-source fields without invoking source methods."""
+
+    try:
+        _require_fingerprint(source.source_fingerprint, "control source")
+        _require_fingerprint(source.revision_fingerprint, "control revision")
+    except (AttributeError, TypeError, PolicyError):
+        return False
+    return True
+
+
+def _policy_document_is_structurally_valid(document: PolicyDocument) -> bool:
+    """Validate exact policy fields without invoking document methods."""
+
+    try:
+        return (
+            isinstance(document.schema_version, int)
+            and not isinstance(document.schema_version, bool)
+            and document.schema_version == POLICY_SCHEMA_VERSION
+            and isinstance(document.allowed_actions, frozenset)
+            and all(isinstance(action, PolicyAction) for action in document.allowed_actions)
+        )
+    except (AttributeError, TypeError):
+        return False
 
 
 def _standing_authority_is_structurally_valid(authority: StandingAuthority) -> bool:

@@ -240,6 +240,52 @@ class TrustedPolicyTests(unittest.TestCase):
                 self.assertIsNone(decision.activated_at)
                 self.assertIsNone(decision.diagnostic()["activated_at"])
 
+    def test_forged_trusted_evidence_subclasses_deny_safely(self) -> None:
+        class ForgedSource(TrustedControlSource):
+            def __post_init__(self) -> None:
+                pass
+
+        class ForgedDocument(PolicyDocument):
+            def __post_init__(self) -> None:
+                pass
+
+        class ForgedReceipt(ActivationReceipt):
+            def __post_init__(self) -> None:
+                pass
+
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        forged_source = ForgedSource("invalid", "invalid")
+        forged_document = ForgedDocument(1, [PolicyAction.ISSUE_COMMENT])  # type: ignore[arg-type]
+        forged_receipt = ForgedReceipt(
+            "invalid", "invalid", "invalid", "invalid", "invalid", 1,
+            "invalid", "invalid", self.now, self.now,
+        )
+        cases = (
+            (
+                TrustedPolicySnapshot(forged_source, snapshot.document),
+                receipt,
+                "trusted policy source evidence is unavailable",
+            ),
+            (
+                TrustedPolicySnapshot(snapshot.source, forged_document),
+                receipt,
+                "trusted policy document evidence is unavailable",
+            ),
+            (snapshot, forged_receipt, "activation receipt evidence is unavailable"),
+        )
+        for policy, activation_receipt, reason in cases:
+            with self.subTest(reason=reason):
+                decision = self.evaluate(policy, activation_receipt)
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, reason)
+                self.assertEqual(decision.allowed_actions, frozenset())
+                if type(activation_receipt) is ActivationReceipt:
+                    self.assertEqual(decision.receipt_fingerprint, receipt.receipt_fingerprint)
+                else:
+                    self.assertIsNone(decision.receipt_fingerprint)
+                self.assertNotIn("path", str(decision.diagnostic()).casefold())
+
     def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
         snapshot = self.snapshot()
         with self.assertRaisesRegex(PolicyError, "commit identity"):

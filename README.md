@@ -1,7 +1,17 @@
 # roundwright
 
-`roundwright` currently provides only a config-free, read-only `doctor` command.
-It does not dispatch work, access providers, or mutate repositories.
+`roundwright` provides config-free, read-only `doctor` and `status` commands,
+plus `run-once` and `run-daemon` command shells. The shells never dispatch
+work in Phase 1: they fail closed before state, Git, network, provider, or
+GitHub mutation unless a future caller supplies one exact, repo-external
+authority receipt bound to the repository, canonical checkout, state UUID,
+deployment identity, and validity window. The scheduler or service manager may
+wake a shell but cannot grant authority or own workflow state.
+
+Read-only and test-only modes require no receipt. Authoritative mode requires
+one fresh external designation; missing, expired, copied, conflicting, or
+drifted evidence becomes the explicit `blocked` mode. No Worker, Supervisor,
+daemon lifecycle, credentials, or multi-host runtime exists here.
 
 Its typed configuration boundary is available to later commands but creates no
 files and requires no optional configuration for read-only startup. Effective

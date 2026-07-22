@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from unittest import mock
 
@@ -320,6 +320,42 @@ class TrustedPolicyTests(unittest.TestCase):
         self.assertEqual(decision.reason, "trusted policy evidence is invalid")
         self.assertEqual(decision.allowed_actions, frozenset())
         self.assertNotIn("path", str(decision.diagnostic()).casefold())
+
+    def test_timezone_and_document_hooks_deny_without_dispatch(self) -> None:
+        class RaisingTimezone(tzinfo):
+            def utcoffset(self, value: datetime | None) -> timedelta:
+                raise AssertionError("timezone behavior was invoked")
+
+            def dst(self, value: datetime | None) -> timedelta:
+                raise AssertionError("timezone behavior was invoked")
+
+            def tzname(self, value: datetime | None) -> str:
+                raise AssertionError("timezone behavior was invoked")
+
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        object.__setattr__(
+            receipt,
+            "activated_at",
+            datetime(2026, 7, 21, 7, 59, tzinfo=RaisingTimezone()),
+        )
+        timestamp_decision = self.evaluate(snapshot, receipt)
+        self.assertFalse(timestamp_decision.authorized)
+        self.assertEqual(timestamp_decision.reason, "activation receipt evidence is invalid")
+
+        shadowed_snapshot = self.snapshot()
+        shadowed_receipt = self.receipt(shadowed_snapshot)
+
+        def raising_canonical_bytes() -> bytes:
+            raise AssertionError("document method was invoked")
+
+        object.__setattr__(shadowed_snapshot.document, "canonical_bytes", raising_canonical_bytes)
+        digest_decision = self.evaluate(shadowed_snapshot, shadowed_receipt)
+        self.assertFalse(digest_decision.authorized)
+        self.assertEqual(digest_decision.reason, "trusted policy evidence is invalid")
+        self.assertIsNone(digest_decision.source_fingerprint)
+        self.assertIsNone(digest_decision.policy_digest)
+        self.assertNotIn("path", str(digest_decision.diagnostic()).casefold())
 
     def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
         snapshot = self.snapshot()

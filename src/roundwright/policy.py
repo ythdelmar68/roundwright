@@ -81,16 +81,11 @@ class PolicyDocument:
     def canonical_bytes(self) -> bytes:
         """Return the stable representation used for the content digest."""
 
-        return _canonical_json(
-            {
-                "allowed_actions": sorted(action.value for action in self.allowed_actions),
-                "schema_version": self.schema_version,
-            }
-        )
+        return _canonical_policy_bytes(self)
 
     @property
     def digest(self) -> str:
-        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+        return _policy_digest(self)
 
 
 @dataclass(frozen=True)
@@ -102,7 +97,7 @@ class TrustedPolicySnapshot:
 
     @property
     def policy_digest(self) -> str:
-        return self.document.digest
+        return _policy_digest(self.document)
 
 
 @dataclass(frozen=True)
@@ -247,6 +242,7 @@ def evaluate_policy(
     source = snapshot.source
     document = snapshot.document
     try:
+        policy_digest = _policy_digest(document)
         _require_fingerprint(task_fingerprint, "candidate task")
         _require_commit_sha(candidate_sha, "candidate")
         _require_utc(now, "evaluation timestamp")
@@ -258,7 +254,7 @@ def evaluate_policy(
     checks = (
         (receipt.source_fingerprint == source.source_fingerprint, "the control source does not match the activation receipt"),
         (receipt.revision_fingerprint == source.revision_fingerprint, "the control revision does not match the activation receipt"),
-        (receipt.policy_digest == snapshot.policy_digest, "the policy digest does not match the activation receipt"),
+        (receipt.policy_digest == policy_digest, "the policy digest does not match the activation receipt"),
         (receipt.schema_version == document.schema_version, "the policy schema does not match the activation receipt"),
         (receipt.task_fingerprint == task_fingerprint, "the activation receipt is not bound to this task"),
         (receipt.candidate_sha == candidate_sha, "the activation receipt is not bound to this candidate"),
@@ -274,7 +270,7 @@ def evaluate_policy(
         reason="policy activation is valid",
         schema_version=document.schema_version,
         source_fingerprint=source.source_fingerprint,
-        policy_digest=snapshot.policy_digest,
+        policy_digest=policy_digest,
         receipt_fingerprint=receipt.receipt_fingerprint,
         activated_at=receipt.activated_at,
         allowed_actions=document.allowed_actions,
@@ -314,7 +310,7 @@ def _snapshot_is_structurally_valid(snapshot: TrustedPolicySnapshot) -> bool:
             return False
         if not _policy_document_is_structurally_valid(document):
             return False
-        snapshot.policy_digest
+        _policy_digest(document)
     except (AttributeError, TypeError, PolicyError):
         return False
     return True
@@ -364,6 +360,8 @@ def _policy_document_is_structurally_valid(document: PolicyDocument) -> bool:
 
     try:
         return (
+            set(document.__dict__) == {"schema_version", "allowed_actions"}
+            and
             type(document.schema_version) is int
             and document.schema_version == POLICY_SCHEMA_VERSION
             and type(document.allowed_actions) is frozenset
@@ -387,13 +385,33 @@ def _standing_authority_is_structurally_valid(authority: StandingAuthority) -> b
 
 def _safe_policy_digest(snapshot: TrustedPolicySnapshot) -> str | None:
     try:
-        return snapshot.policy_digest
+        document = snapshot.document
+        if not _policy_document_is_structurally_valid(document):
+            return None
+        return _policy_digest(document)
     except (AttributeError, TypeError, PolicyError):
         return None
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _canonical_policy_bytes(document: PolicyDocument) -> bytes:
+    """Render independently validated policy fields without instance dispatch."""
+
+    return _canonical_json(
+        {
+            "allowed_actions": sorted(action.value for action in document.allowed_actions),
+            "schema_version": document.schema_version,
+        }
+    )
+
+
+def _policy_digest(document: PolicyDocument) -> str:
+    """Compute a policy digest without calling an evidence-instance method."""
+
+    return hashlib.sha256(_canonical_policy_bytes(document)).hexdigest()
 
 
 def _require_fingerprint(value: str, description: str) -> None:
@@ -417,5 +435,5 @@ def _require_commit_sha(value: str, description: str) -> None:
 
 
 def _require_utc(value: datetime, description: str) -> None:
-    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
         raise PolicyError(f"the {description} must use UTC")

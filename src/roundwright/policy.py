@@ -68,13 +68,12 @@ class PolicyDocument:
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.schema_version, int)
-            or isinstance(self.schema_version, bool)
+            type(self.schema_version) is not int
             or self.schema_version != POLICY_SCHEMA_VERSION
         ):
             raise PolicyError("the policy schema version is unsupported")
         if (
-            not isinstance(self.allowed_actions, frozenset)
+            type(self.allowed_actions) is not frozenset
             or not all(isinstance(action, PolicyAction) for action in self.allowed_actions)
         ):
             raise PolicyError("the policy actions are invalid")
@@ -114,7 +113,7 @@ class StandingAuthority:
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.allowed_actions, frozenset)
+            type(self.allowed_actions) is not frozenset
             or not all(isinstance(action, PolicyAction) for action in self.allowed_actions)
         ):
             raise PolicyError("the standing authority actions are invalid")
@@ -147,8 +146,7 @@ class ActivationReceipt:
             _require_fingerprint(value, description)
         _require_commit_sha(self.candidate_sha, "receipt candidate")
         if (
-            not isinstance(self.schema_version, int)
-            or isinstance(self.schema_version, bool)
+            type(self.schema_version) is not int
             or self.schema_version != POLICY_SCHEMA_VERSION
         ):
             raise PolicyError("the receipt schema version is unsupported")
@@ -182,7 +180,7 @@ class PolicyDecision:
             "policy_digest": self.policy_digest,
             "receipt_fingerprint": self.receipt_fingerprint,
             "activated_at": self.activated_at.isoformat()
-            if isinstance(self.activated_at, datetime)
+            if type(self.activated_at) is datetime
             else None,
         }
 
@@ -337,8 +335,7 @@ def _receipt_is_structurally_valid(receipt: ActivationReceipt) -> bool:
             _require_fingerprint(value, description)
         _require_commit_sha(receipt.candidate_sha, "receipt candidate")
         if (
-            not isinstance(receipt.schema_version, int)
-            or isinstance(receipt.schema_version, bool)
+            type(receipt.schema_version) is not int
             or receipt.schema_version != POLICY_SCHEMA_VERSION
         ):
             return False
@@ -367,10 +364,9 @@ def _policy_document_is_structurally_valid(document: PolicyDocument) -> bool:
 
     try:
         return (
-            isinstance(document.schema_version, int)
-            and not isinstance(document.schema_version, bool)
+            type(document.schema_version) is int
             and document.schema_version == POLICY_SCHEMA_VERSION
-            and isinstance(document.allowed_actions, frozenset)
+            and type(document.allowed_actions) is frozenset
             and all(isinstance(action, PolicyAction) for action in document.allowed_actions)
         )
     except (AttributeError, TypeError):
@@ -384,7 +380,7 @@ def _standing_authority_is_structurally_valid(authority: StandingAuthority) -> b
         allowed_actions = authority.allowed_actions
     except (AttributeError, TypeError, PolicyError):
         return False
-    return isinstance(allowed_actions, frozenset) and all(
+    return type(allowed_actions) is frozenset and all(
         isinstance(action, PolicyAction) for action in allowed_actions
     )
 
@@ -402,7 +398,7 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
 
 def _require_fingerprint(value: str, description: str) -> None:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) != _FINGERPRINT_LENGTH
         or any(character not in "0123456789abcdef" for character in value)
     ):
@@ -413,7 +409,7 @@ def _require_commit_sha(value: str, description: str) -> None:
     """Accept only exact Git object identities, never generic fingerprints."""
 
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) not in _COMMIT_SHA_LENGTHS
         or any(character not in "0123456789abcdef" for character in value)
     ):
@@ -421,5 +417,5 @@ def _require_commit_sha(value: str, description: str) -> None:
 
 
 def _require_utc(value: datetime, description: str) -> None:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
         raise PolicyError(f"the {description} must use UTC")

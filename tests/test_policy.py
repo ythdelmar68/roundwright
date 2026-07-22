@@ -286,6 +286,41 @@ class TrustedPolicyTests(unittest.TestCase):
                     self.assertIsNone(decision.receipt_fingerprint)
                 self.assertNotIn("path", str(decision.diagnostic()).casefold())
 
+    def test_subtype_valued_fields_deny_before_comparison(self) -> None:
+        class FingerprintSubtype(str):
+            pass
+
+        class CommitSubtype(str):
+            pass
+
+        class TimestampSubtype(datetime):
+            pass
+
+        class ComparisonForgingActions(frozenset[PolicyAction]):
+            def __le__(self, other: object) -> bool:
+                raise AssertionError("the policy action collection was compared")
+
+        snapshot = self.snapshot()
+        receipt = self.receipt(snapshot)
+        with self.assertRaises(PolicyError):
+            TrustedControlSource(FingerprintSubtype(fingerprint("a")), fingerprint("b"))
+        with self.assertRaises(PolicyError):
+            self.receipt(snapshot, candidate_sha=CommitSubtype(CURRENT_CANDIDATE_SHA))
+        with self.assertRaises(PolicyError):
+            self.receipt(
+                snapshot,
+                activated_at=TimestampSubtype(2026, 7, 21, 7, 59, tzinfo=timezone.utc),
+            )
+        with self.assertRaises(PolicyError):
+            StandingAuthority(ComparisonForgingActions({PolicyAction.RELEASE}))
+
+        object.__setattr__(snapshot.document, "allowed_actions", ComparisonForgingActions({PolicyAction.RELEASE}))
+        decision = self.evaluate(snapshot, receipt, standing_authority=StandingAuthority(frozenset()))
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, "trusted policy evidence is invalid")
+        self.assertEqual(decision.allowed_actions, frozenset())
+        self.assertNotIn("path", str(decision.diagnostic()).casefold())
+
     def test_candidate_commit_identity_rejects_malformed_values(self) -> None:
         snapshot = self.snapshot()
         with self.assertRaisesRegex(PolicyError, "commit identity"):

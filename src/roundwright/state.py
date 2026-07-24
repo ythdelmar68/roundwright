@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import stat
 import sqlite3
 import uuid
@@ -62,7 +63,7 @@ def database_path(repository: RepositoryIdentity) -> Path:
     if state_directory.exists() and not state_directory.is_dir():
         raise StateError("state directory is unavailable")
     path = state_directory / "state.sqlite3"
-    if path.exists():
+    if os.path.lexists(path):
         if _is_reparse_point(path) or not path.is_file():
             raise StateError("state database path is unsafe")
         try:
@@ -216,9 +217,14 @@ def _state_identity_fingerprint(value: object) -> str:
 
 def _is_reparse_point(path: Path) -> bool:
     try:
-        return path.is_symlink() or bool(path.stat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-    except (AttributeError, OSError):
+        entry = path.lstat()
+    except OSError as error:
+        raise StateError("state database path is unsafe") from error
+    if stat.S_ISLNK(entry.st_mode):
         return True
+    attributes = getattr(entry, "st_file_attributes", None)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes is not None and reparse_flag and attributes & reparse_flag)
 
 
 def _read_applied(connection: sqlite3.Connection) -> dict[int, str]:

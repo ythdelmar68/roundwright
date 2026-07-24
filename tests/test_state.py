@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright import cli
-from roundwright.state import DatabaseStatus, Migration, StateError, _apply_migrations, check_database, database_path, initialize
+from roundwright.state import DatabaseStatus, Migration, StateError, _apply_migrations, _is_reparse_point, check_database, database_path, initialize
 
 
 class StateTests(unittest.TestCase):
@@ -198,6 +198,25 @@ class StateTests(unittest.TestCase):
                 self.skipTest(f"symlinks are unavailable: {error}")
             self.assertEqual(check_database(repository).state, "incompatible")
             self.assertEqual(target.read_bytes(), b"outside")
+
+    def test_ordinary_database_entry_is_not_a_reparse_point(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            path.write_bytes(b"ordinary")
+            self.assertFalse(_is_reparse_point(path))
+
+    def test_dangling_database_symlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            repository.state_directory.mkdir()
+            link = repository.state_directory / "state.sqlite3"
+            try:
+                os.symlink(Path(temporary) / "missing.sqlite3", link)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            self.assertEqual(check_database(repository).state, "incompatible")
+            with self.assertRaises(StateError):
+                initialize(repository)
 
     def test_status_renders_schema_identity_and_detail_for_each_state(self) -> None:
         for status, code in (

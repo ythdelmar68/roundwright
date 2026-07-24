@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -152,6 +153,29 @@ class StateTests(unittest.TestCase):
             self.assertEqual(cli._initialize(output), 2)
         self.assertIn("result: blocked", output.getvalue())
         self.assertNotIn("result: ready", output.getvalue())
+
+    def test_init_refuses_unsafe_entrypoint_before_state_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            output = io.StringIO()
+            configuration = mock.Mock(repository=repository)
+            with mock.patch("roundwright.cli.require_safe_entrypoint_identity", side_effect=cli.UnsafeEntrypointIdentityError("more than one command executable was discovered")), mock.patch("roundwright.cli.load_configuration", return_value=configuration):
+                self.assertEqual(cli._initialize(output), 2)
+            self.assertFalse(database_path(repository).exists())
+            self.assertIn("result: blocked", output.getvalue())
+
+    def test_local_state_is_ignored_but_repository_toml_is_trackable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / ".gitignore").write_text(".roundwright/\n", encoding="utf-8")
+            repository = self.repository(root)
+            initialize(repository)
+            (root / ".roundwright.toml").write_text("[roundwright]\n", encoding="utf-8")
+            ignored = subprocess.run(["git", "check-ignore", ".roundwright/state.sqlite3"], cwd=root, capture_output=True, text=True)
+            tracked = subprocess.run(["git", "check-ignore", ".roundwright.toml"], cwd=root, capture_output=True, text=True)
+            self.assertEqual(ignored.returncode, 0)
+            self.assertEqual(tracked.returncode, 1)
 
     def test_missing_or_malformed_identity_never_remints(self) -> None:
         for value in (None, "malformed"):

@@ -27,6 +27,22 @@ def smoke(command: Path, *, cwd: Path, environment: dict[str, str]) -> None:
     run([str(command), "db", "check"], cwd=cwd, environment=environment, allowed=(0, 2))
 
 
+def pipx_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Keep pipx on pip when uv is installed for its separate smoke test."""
+
+    configured = environment.copy()
+    configured.pop("PIP_NO_INDEX", None)
+    configured.pop("PIP_NO_DEPS", None)
+    configured["PIPX_USE_UV"] = "0"
+    return configured
+
+
+def pipx_install_command(wheel: Path) -> list[str]:
+    """Install only the local wheel with pip's offline, no-dependency flags."""
+
+    return ["pipx", "install", "--force", "--pip-args=--no-index --no-deps", str(wheel)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dist", type=Path)
@@ -48,8 +64,9 @@ def main() -> int:
 
         environment["PIPX_HOME"] = str(root / "pipx-home")
         environment["PIPX_BIN_DIR"] = str(root / "pipx-bin")
-        run(["pipx", "install", "--force", "--pip-args=--no-index --no-deps", str(wheel)], cwd=root, environment=environment)
-        smoke(executable(Path(environment["PIPX_BIN_DIR"]), "roundwright"), cwd=root, environment=environment)
+        pipx_environment_variables = pipx_environment(environment)
+        run(pipx_install_command(wheel), cwd=root, environment=pipx_environment_variables)
+        smoke(executable(Path(environment["PIPX_BIN_DIR"]), "roundwright"), cwd=root, environment=pipx_environment_variables)
 
         environment["UV_TOOL_DIR"] = str(root / "uv-tools")
         environment["UV_TOOL_BIN_DIR"] = str(root / "uv-bin")

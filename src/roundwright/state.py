@@ -77,6 +77,7 @@ def initialize(repository: RepositoryIdentity) -> DatabaseStatus:
     """Create or migrate the local database transactionally and idempotently."""
 
     path = database_path(repository)
+    path_was_absent = not os.path.lexists(path)
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as error:
@@ -84,7 +85,7 @@ def initialize(repository: RepositoryIdentity) -> DatabaseStatus:
     try:
         connection = sqlite3.connect(path)
         try:
-            _apply_migrations(connection, MIGRATIONS)
+            _apply_migrations(connection, MIGRATIONS, allow_new_identity=path_was_absent)
         finally:
             connection.close()
     except sqlite3.DatabaseError as error:
@@ -116,7 +117,7 @@ def check_database(repository: RepositoryIdentity) -> DatabaseStatus:
     return DatabaseStatus("healthy", version, "migration checksums verified", identity)
 
 
-def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration]) -> None:
+def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration], *, allow_new_identity: bool = True) -> None:
     ordered = _validate_definitions(migrations)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -124,6 +125,8 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
         ).fetchone()
         if not exists:
+            if not allow_new_identity:
+                raise StateError("existing database is unrecognized")
             unmanaged = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table'"
             ).fetchone()
@@ -141,7 +144,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
             )
-        _ensure_state_identity(connection, allow_create=not exists)
+        _ensure_state_identity(connection, allow_create=allow_new_identity and not exists)
         _validate_schema(connection, ordered)
         connection.commit()
     except Exception:

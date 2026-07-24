@@ -174,6 +174,18 @@ class StateTests(unittest.TestCase):
                     initialize(repository)
                 self.assertEqual(before, path.read_bytes())
 
+    def test_truncated_existing_database_never_remints_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            path = database_path(repository)
+            path.write_bytes(b"")
+            before = path.read_bytes()
+            self.assertEqual(check_database(repository).state, "incompatible")
+            with self.assertRaises(StateError):
+                initialize(repository)
+            self.assertEqual(before, path.read_bytes())
+
     def test_state_directory_collision_is_owner_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))

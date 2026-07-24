@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from .deployment import blocked_command_shell_preflight
 from .doctor import collect_diagnostics, render_diagnostics
+from .identity import UnsafeEntrypointIdentityError, require_safe_entrypoint_identity
 from .configuration import ConfigurationError, RepositoryIdentity, discover_repository, load_configuration, preflight, PreflightMode
 from .state import StateError, check_database, initialize
 
@@ -62,13 +63,14 @@ def _repository() -> RepositoryIdentity:
 
 def _initialize(output: object) -> int:
     try:
+        require_safe_entrypoint_identity(sys.argv[0])
         configuration = load_configuration(cwd=Path.cwd())
         preflight(configuration, PreflightMode.READ_ONLY)
         repository = configuration.repository
         if repository is None:
             raise ConfigurationError("repository-local state requires a repository root")
         status = initialize(repository)
-    except (ConfigurationError, StateError) as error:
+    except (ConfigurationError, StateError, UnsafeEntrypointIdentityError) as error:
         output.write(f"roundwright init\nresult: blocked\ndetail: {error}\n")  # type: ignore[attr-defined]
         return 2
     if not status.healthy:

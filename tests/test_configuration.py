@@ -46,10 +46,10 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_platform_user_locations_follow_conventions(self) -> None:
         home = Path("/home/example")
-        self.assertEqual(user_config_path(platform="linux", home=home), home / ".config/roundwright/config.toml")
-        self.assertEqual(user_cache_path(platform="linux", home=home), home / ".cache/roundwright")
-        self.assertEqual(user_config_path(platform="darwin", home=home), home / "Library/Application Support/roundwright/config.toml")
-        self.assertEqual(user_cache_path(platform="darwin", home=home), home / "Library/Caches/roundwright")
+        self.assertEqual(user_config_path(platform="linux", environment={}, home=home), home / ".config/roundwright/config.toml")
+        self.assertEqual(user_cache_path(platform="linux", environment={}, home=home), home / ".cache/roundwright")
+        self.assertEqual(user_config_path(platform="darwin", environment={}, home=home), home / "Library/Application Support/roundwright/config.toml")
+        self.assertEqual(user_cache_path(platform="darwin", environment={}, home=home), home / "Library/Caches/roundwright")
         with tempfile.TemporaryDirectory() as temporary:
             windows_root = Path(temporary)
             environment = {

@@ -56,11 +56,26 @@ def uv_tool_install_command(wheel: Path) -> list[str]:
     return ["uv", "tool", "install", "--python", sys.executable, "--offline", "--no-cache", "--force", "--from", str(wheel), "roundwright"]
 
 
+def select_wheel(dist: Path) -> Path:
+    """Resolve exactly one locally built wheel before changing execution cwd."""
+
+    try:
+        directory = dist.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ValueError("distribution directory is unavailable") from error
+    if not directory.is_dir():
+        raise ValueError("distribution directory is unavailable")
+    wheels = tuple(path for path in sorted(directory.glob("roundwright-*.whl")) if path.is_file())
+    if len(wheels) != 1:
+        raise ValueError("expected exactly one roundwright wheel")
+    return wheels[0].resolve(strict=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dist", type=Path)
     arguments = parser.parse_args()
-    wheel = next(arguments.dist.glob("roundwright-*.whl"))
+    wheel = select_wheel(arguments.dist)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         environment = os.environ.copy()

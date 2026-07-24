@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -50,3 +52,23 @@ class CiVerificationTests(unittest.TestCase):
         verifier = load_install_verifier()
         environment = verifier.command_environment({"PATH": "parent"}, Path("isolated-bin"))
         self.assertEqual(environment["PATH"], f"isolated-bin{verifier.os.pathsep}parent")
+
+    def test_relative_distribution_path_selects_one_absolute_wheel_before_cwd_changes(self) -> None:
+        verifier = load_install_verifier()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dist = root / "dist"
+            dist.mkdir()
+            wheel = dist / "roundwright-0.0.0-py3-none-any.whl"
+            wheel.write_bytes(b"wheel")
+            original = Path.cwd()
+            try:
+                os.chdir(root)
+                self.assertEqual(verifier.select_wheel(Path("dist")), wheel.resolve())
+            finally:
+                os.chdir(original)
+            (dist / "roundwright-extra.whl").write_bytes(b"wheel")
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                verifier.select_wheel(dist)
+            with self.assertRaisesRegex(ValueError, "distribution directory is unavailable"):
+                verifier.select_wheel(root / "missing")

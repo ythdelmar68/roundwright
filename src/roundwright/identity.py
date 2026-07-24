@@ -77,11 +77,20 @@ def inspect_entrypoint_identity(
         requested = Path(runtime_executable).parent / requested.name
     active = requested.resolve()
     selected = candidates[0]
-    if selected != active and not _is_windows_console_wrapper(
+    if not _same_file(active, selected) and not _is_windows_console_wrapper(
         active, selected, command=command, is_windows=windows
-    ):
+    ) and not _is_windows_pipx_launcher_pair(active, selected, command=command, is_windows=windows):
         return EntrypointIdentity(False, "the selected command does not match this executable")
     return EntrypointIdentity(True, "one matching executable was discovered")
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    """Compare file identity so Windows short-name aliases remain equivalent."""
+
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return first == second
 
 
 def _is_windows_console_wrapper(
@@ -99,6 +108,73 @@ def _is_windows_console_wrapper(
         return False
     wrapper_names = {command, f"{command}-script.py", f"{command}.py"}
     return active.name.casefold() in {name.casefold() for name in wrapper_names}
+
+
+def _is_windows_pipx_launcher_pair(
+    active: Path,
+    selected: Path,
+    *,
+    command: str,
+    is_windows: bool,
+) -> bool:
+    """Accept only pipx's verified exposed-copy and managed-venv launcher pair."""
+
+    if not is_windows or Path(command).name != command:
+        return False
+    try:
+        home_path, bin_path = _windows_pipx_paths()
+        home = home_path.resolve(strict=True)
+        bin_directory = bin_path.resolve(strict=True)
+    except OSError:
+        return False
+    if not home.is_dir() or not bin_directory.is_dir():
+        return False
+    launcher_name = f"{command}.exe"
+    try:
+        exposed = (bin_directory / launcher_name).resolve(strict=True)
+        managed = (home / "venvs" / command / "Scripts" / launcher_name).resolve(strict=True)
+    except OSError:
+        return False
+    if not _same_file(selected, exposed):
+        return False
+    if not (_same_file(active, managed) or _is_windows_console_wrapper(active, managed, command=command, is_windows=True)):
+        return False
+    return _same_file_content(exposed, managed)
+
+
+def _windows_pipx_paths() -> tuple[Path, Path]:
+    """Mirror pipx's local Windows override, fallback, and default path selection."""
+
+    profile = Path.home()
+    home_override = _pipx_path_override("PIPX_HOME")
+    bin_override = _pipx_path_override("PIPX_BIN_DIR")
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", profile / "AppData" / "Local"))
+    default_home = local_app_data / "pipx" / "pipx"
+    fallbacks = (profile / ".local" / "pipx", profile / "pipx")
+    home = home_override or next((fallback for fallback in fallbacks if fallback.exists()), default_home)
+    return home, bin_override or profile / ".local" / "bin"
+
+
+def _pipx_path_override(name: str) -> Path | None:
+    """Use the same non-empty environment override contract as pipx."""
+
+    value = os.environ.get(name)
+    return Path(value).expanduser().absolute() if value else None
+
+
+def _same_file_content(first: Path, second: Path) -> bool:
+    """Require copied pipx launchers to have the same complete byte content."""
+
+    try:
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        with first.open("rb") as first_file, second.open("rb") as second_file:
+            while first_chunk := first_file.read(64 * 1024):
+                if first_chunk != second_file.read(64 * 1024):
+                    return False
+            return second_file.read(1) == b""
+    except OSError:
+        return False
 
 
 def require_safe_entrypoint_identity(

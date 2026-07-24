@@ -52,6 +52,7 @@ class HostedEvidenceTests(unittest.TestCase):
         for artifacts in (
             (("wheel", "b" * 64), ("wheel", "c" * 64)),
             (("wheel", "not-a-digest"),),
+            (("roundwright-0.0.0-py3-none-any.whl", "b" * 64),),
         ):
             with self.subTest(artifacts=artifacts), self.assertRaisesRegex(HostedEvidenceError, "artifact"):
                 self.validate(self.record(artifacts=artifacts))

@@ -64,4 +64,6 @@ def validate_hosted_evidence(
         if not isinstance(name, str) or not name or not isinstance(digest, str) or not _SHA256.fullmatch(digest) or name in names:
             raise HostedEvidenceError("hosted artifact evidence is invalid")
         names.add(name)
+    if not any(name.endswith(".whl") for name in names) or not any(name.endswith(".tar.gz") for name in names):
+        raise HostedEvidenceError("hosted artifact evidence is incomplete")
     return record

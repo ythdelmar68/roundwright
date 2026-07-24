@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -47,6 +48,7 @@ class DatabaseStatus:
     state: str
     version: int | None
     detail: str
+    identity: str | None = None
 
     @property
     def healthy(self) -> bool:
@@ -84,16 +86,16 @@ def check_database(repository: RepositoryIdentity) -> DatabaseStatus:
     if not path.is_file():
         return DatabaseStatus("incompatible", None, "state path is not a regular file")
     try:
-        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            version = _verify_migrations(connection, MIGRATIONS)
+            version, identity = _verify_migrations(connection, MIGRATIONS)
         finally:
             connection.close()
     except StateError as error:
         return DatabaseStatus("incompatible", None, str(error))
     except sqlite3.DatabaseError:
         return DatabaseStatus("corrupt", None, "local database is corrupt or unreadable")
-    return DatabaseStatus("healthy", version, "migration checksums verified")
+    return DatabaseStatus("healthy", version, "migration checksums verified", identity)
 
 
 def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration]) -> None:
@@ -121,6 +123,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
             )
+        _ensure_state_identity(connection)
         _validate_schema(connection, ordered)
         connection.commit()
     except Exception:
@@ -128,7 +131,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
         raise
 
 
-def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration]) -> int:
+def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration]) -> tuple[int, str]:
     ordered = _validate_definitions(migrations)
     exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
@@ -140,7 +143,7 @@ def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migr
     if len(applied) != len(ordered):
         raise StateError("database schema is not fully migrated")
     _validate_schema(connection, ordered)
-    return ordered[-1].version if ordered else 0
+    return ordered[-1].version if ordered else 0, _read_state_identity(connection)
 
 
 def _validate_definitions(migrations: Iterable[Migration]) -> tuple[Migration, ...]:
@@ -153,12 +156,43 @@ def _validate_definitions(migrations: Iterable[Migration]) -> tuple[Migration, .
 
 def _validate_schema(connection: sqlite3.Connection, migrations: Iterable[Migration]) -> None:
     expected = {name: statement for migration in migrations for name, statement in migration.schema}
+    observed = connection.execute(
+        "SELECT type, name FROM sqlite_master "
+        "WHERE type IN ('table', 'view', 'index', 'trigger') AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    if set(observed) != {('table', name) for name in expected}:
+        raise StateError("database contains unmanaged or missing application schema")
     for name, statement in expected.items():
         row = connection.execute(
             "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
         ).fetchone()
         if row != ("table", statement):
             raise StateError("database schema does not match recorded migration")
+
+
+def _ensure_state_identity(connection: sqlite3.Connection) -> None:
+    row = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
+    if row is None:
+        connection.execute("INSERT INTO state_metadata(key, value) VALUES ('state_id', ?)", (str(uuid.uuid4()),))
+        return
+    _state_identity_fingerprint(row[0])
+
+
+def _read_state_identity(connection: sqlite3.Connection) -> str:
+    row = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
+    if row is None:
+        raise StateError("state identity is missing")
+    return _state_identity_fingerprint(row[0])
+
+
+def _state_identity_fingerprint(value: object) -> str:
+    if not isinstance(value, str):
+        raise StateError("state identity is malformed")
+    try:
+        state_id = uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise StateError("state identity is malformed") from error
+    return hashlib.sha256(state_id.bytes).hexdigest()[:16]
 
 
 def _read_applied(connection: sqlite3.Connection) -> dict[int, str]:

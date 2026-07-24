@@ -71,6 +71,9 @@ def _initialize(output: object) -> int:
     except (ConfigurationError, StateError) as error:
         output.write(f"roundwright init\nresult: blocked\ndetail: {error}\n")  # type: ignore[attr-defined]
         return 2
+    if not status.healthy:
+        output.write(f"roundwright init\nstate: {status.state}\nresult: blocked\n")  # type: ignore[attr-defined]
+        return 2
     output.write(f"roundwright init\nstate: {status.state}\nschema: {status.version}\nresult: ready\n")  # type: ignore[attr-defined]
     return 0
 
@@ -81,7 +84,7 @@ def _check_database(output: object) -> int:
     except ConfigurationError as error:
         output.write(f"roundwright db check\nstate: unavailable\ndetail: {error}\n")  # type: ignore[attr-defined]
         return 2
-    output.write(f"roundwright db check\nstate: {status.state}\nschema: {status.version if status.version is not None else 'none'}\ndetail: {status.detail}\n")  # type: ignore[attr-defined]
+    output.write(f"roundwright db check\nstate: {status.state}\nschema: {status.version if status.version is not None else 'none'}\nidentity: {status.identity if status.identity is not None else 'none'}\ndetail: {status.detail}\n")  # type: ignore[attr-defined]
     return 0 if status.healthy else 2
 
 
@@ -96,6 +99,7 @@ def _render_status(output: object) -> int:
     try:
         status = check_database(_repository())
         output.write(f"local state: {status.state}\n")  # type: ignore[attr-defined]
+        output.write(f"state identity: {status.identity if status.identity is not None else 'none'}\n")  # type: ignore[attr-defined]
         return 0 if status.healthy or status.state == "missing" else 2
     except ConfigurationError:
         output.write("local state: unavailable\n")  # type: ignore[attr-defined]

@@ -27,20 +27,33 @@ def smoke(command: Path, *, cwd: Path, environment: dict[str, str]) -> None:
     run([str(command), "db", "check"], cwd=cwd, environment=environment, allowed=(0, 2))
 
 
+def command_environment(environment: dict[str, str], directory: Path) -> dict[str, str]:
+    """Make one installed console command discoverable without source checkout paths."""
+
+    configured = environment.copy()
+    configured["PATH"] = str(directory) + os.pathsep + configured.get("PATH", "")
+    return configured
+
+
 def pipx_environment(environment: dict[str, str]) -> dict[str, str]:
-    """Keep pipx on pip when uv is installed for its separate smoke test."""
+    """Prevent inherited pip flags from duplicating the explicit pipx pair."""
 
     configured = environment.copy()
     configured.pop("PIP_NO_INDEX", None)
     configured.pop("PIP_NO_DEPS", None)
-    configured["PIPX_USE_UV"] = "0"
     return configured
 
 
 def pipx_install_command(wheel: Path) -> list[str]:
     """Install only the local wheel with pip's offline, no-dependency flags."""
 
-    return ["pipx", "install", "--force", "--pip-args=--no-index --no-deps", str(wheel)]
+    return ["pipx", "install", "--backend", "pip", "--force", "--pip-args=--no-index --no-deps", str(wheel)]
+
+
+def uv_tool_install_command(wheel: Path) -> list[str]:
+    """Use the active Python 3.12 interpreter without an offline download."""
+
+    return ["uv", "tool", "install", "--python", sys.executable, "--offline", "--no-cache", "--force", "--from", str(wheel), "roundwright"]
 
 
 def main() -> int:
@@ -59,19 +72,21 @@ def main() -> int:
         venv = root / "pip"
         run([sys.executable, "-m", "venv", str(venv)], cwd=root, environment=environment)
         scripts = venv / ("Scripts" if os.name == "nt" else "bin")
-        run([str(executable(scripts, "python")), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=root, environment=environment)
-        smoke(executable(scripts, "roundwright"), cwd=root, environment=environment)
+        pip_environment_variables = command_environment(environment, scripts)
+        run([str(executable(scripts, "python")), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=root, environment=pip_environment_variables)
+        smoke(executable(scripts, "roundwright"), cwd=root, environment=pip_environment_variables)
 
         environment["PIPX_HOME"] = str(root / "pipx-home")
         environment["PIPX_BIN_DIR"] = str(root / "pipx-bin")
-        pipx_environment_variables = pipx_environment(environment)
+        pipx_environment_variables = command_environment(pipx_environment(environment), Path(environment["PIPX_BIN_DIR"]))
         run(pipx_install_command(wheel), cwd=root, environment=pipx_environment_variables)
         smoke(executable(Path(environment["PIPX_BIN_DIR"]), "roundwright"), cwd=root, environment=pipx_environment_variables)
 
         environment["UV_TOOL_DIR"] = str(root / "uv-tools")
         environment["UV_TOOL_BIN_DIR"] = str(root / "uv-bin")
-        run(["uv", "tool", "install", "--offline", "--no-cache", "--force", "--from", str(wheel), "roundwright"], cwd=root, environment=environment)
-        smoke(executable(Path(environment["UV_TOOL_BIN_DIR"]), "roundwright"), cwd=root, environment=environment)
+        uv_environment_variables = command_environment(environment, Path(environment["UV_TOOL_BIN_DIR"]))
+        run(uv_tool_install_command(wheel), cwd=root, environment=uv_environment_variables)
+        smoke(executable(Path(environment["UV_TOOL_BIN_DIR"]), "roundwright"), cwd=root, environment=uv_environment_variables)
     return 0
 
 

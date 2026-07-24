@@ -32,8 +32,21 @@ class CiVerificationTests(unittest.TestCase):
         verifier = load_install_verifier()
         environment = verifier.pipx_environment({"PIP_NO_INDEX": "1", "PIP_NO_DEPS": "1"})
         command = verifier.pipx_install_command(Path("candidate.whl"))
-        self.assertEqual(environment["PIPX_USE_UV"], "0")
+        self.assertNotIn("PIPX_USE_UV", environment)
         self.assertNotIn("PIP_NO_INDEX", environment)
         self.assertNotIn("PIP_NO_DEPS", environment)
+        self.assertEqual(command[2:4], ["--backend", "pip"])
         self.assertEqual(command.count("--pip-args=--no-index --no-deps"), 1)
         self.assertEqual(command[-1], "candidate.whl")
+
+    def test_uv_route_uses_the_active_python_without_an_offline_download(self) -> None:
+        verifier = load_install_verifier()
+        command = verifier.uv_tool_install_command(Path("candidate.whl"))
+        self.assertEqual(command[:5], ["uv", "tool", "install", "--python", verifier.sys.executable])
+        self.assertIn("--offline", command)
+        self.assertEqual(command[-2:], ["candidate.whl", "roundwright"])
+
+    def test_installed_command_environment_precedes_the_inherited_path(self) -> None:
+        verifier = load_install_verifier()
+        environment = verifier.command_environment({"PATH": "parent"}, Path("isolated-bin"))
+        self.assertEqual(environment["PATH"], f"isolated-bin{verifier.os.pathsep}parent")

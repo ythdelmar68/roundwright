@@ -19,6 +19,7 @@ class StateError(RuntimeError):
 class Migration:
     version: int
     statements: tuple[str, ...]
+    schema: tuple[tuple[str, str], ...]
 
     @property
     def checksum(self) -> str:
@@ -32,6 +33,10 @@ MIGRATIONS = (
         (
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)",
             "CREATE TABLE state_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        ),
+        (
+            ("schema_migrations", "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)"),
+            ("state_metadata", "CREATE TABLE state_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
         ),
     ),
 )
@@ -108,6 +113,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
         else:
             applied = _read_applied(connection)
         _validate_applied(applied, ordered)
+        _validate_schema(connection, ordered[:len(applied)])
         for migration in ordered[len(applied):]:
             for statement in migration.statements:
                 connection.execute(statement)
@@ -115,6 +121,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
             )
+        _validate_schema(connection, ordered)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -132,6 +139,7 @@ def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migr
     _validate_applied(applied, ordered)
     if len(applied) != len(ordered):
         raise StateError("database schema is not fully migrated")
+    _validate_schema(connection, ordered)
     return ordered[-1].version if ordered else 0
 
 
@@ -141,6 +149,16 @@ def _validate_definitions(migrations: Iterable[Migration]) -> tuple[Migration, .
     if not ordered or any(version < 1 for version in versions) or versions != tuple(range(1, len(ordered) + 1)):
         raise StateError("migration definitions are invalid or duplicate")
     return ordered
+
+
+def _validate_schema(connection: sqlite3.Connection, migrations: Iterable[Migration]) -> None:
+    expected = {name: statement for migration in migrations for name, statement in migration.schema}
+    for name, statement in expected.items():
+        row = connection.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone()
+        if row != ("table", statement):
+            raise StateError("database schema does not match recorded migration")
 
 
 def _read_applied(connection: sqlite3.Connection) -> dict[int, str]:

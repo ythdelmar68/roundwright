@@ -6,13 +6,16 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import io
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
-from roundwright.state import check_database, database_path, initialize
+from roundwright import cli
+from roundwright.state import Migration, StateError, _apply_migrations, check_database, database_path, initialize
 
 
 class StateTests(unittest.TestCase):
@@ -50,6 +53,43 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual(check_database(repository).state, "incompatible")
+
+    def test_partial_schema_cannot_be_accepted_or_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            path = database_path(repository)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("DROP TABLE state_metadata")
+                connection.commit()
+            finally:
+                connection.close()
+            before = path.read_bytes()
+            self.assertEqual(check_database(repository).state, "incompatible")
+            with self.assertRaises(StateError):
+                initialize(repository)
+            self.assertEqual(before, path.read_bytes())
+
+    def test_failed_migration_rolls_back_every_schema_change(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            broken = Migration(1, ("CREATE TABLE transient (id INTEGER)", "not valid SQL"), ())
+            with self.assertRaises(sqlite3.DatabaseError):
+                _apply_migrations(connection, (broken,))
+            self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'transient'").fetchone())
+
+    def test_cli_db_check_and_status_are_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            before = database_path(repository).read_bytes()
+            output = io.StringIO()
+            with mock.patch("roundwright.cli._repository", return_value=repository), mock.patch("subprocess.run") as subprocess_run:
+                self.assertEqual(cli._check_database(output), 0)
+                self.assertEqual(cli._render_status(output), 0)
+            self.assertIn("state: healthy", output.getvalue())
+            self.assertEqual(before, database_path(repository).read_bytes())
+            subprocess_run.assert_not_called()
 
     def test_corrupt_database_is_reported_without_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

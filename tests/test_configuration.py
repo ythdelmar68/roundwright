@@ -50,9 +50,14 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(user_cache_path(platform="linux", home=home), home / ".cache/roundwright")
         self.assertEqual(user_config_path(platform="darwin", home=home), home / "Library/Application Support/roundwright/config.toml")
         self.assertEqual(user_cache_path(platform="darwin", home=home), home / "Library/Caches/roundwright")
-        environment = {"APPDATA": "C:/Users/example/AppData/Roaming", "LOCALAPPDATA": "C:/Users/example/AppData/Local"}
-        self.assertEqual(user_config_path(platform="win32", environment=environment, home=home), Path(environment["APPDATA"]) / "Roundwright/config.toml")
-        self.assertEqual(user_cache_path(platform="win32", environment=environment, home=home), Path(environment["LOCALAPPDATA"]) / "Roundwright/Cache")
+        with tempfile.TemporaryDirectory() as temporary:
+            windows_root = Path(temporary)
+            environment = {
+                "APPDATA": str(windows_root / "roaming"),
+                "LOCALAPPDATA": str(windows_root / "local"),
+            }
+            self.assertEqual(user_config_path(platform="win32", environment=environment, home=home), windows_root / "roaming/Roundwright/config.toml")
+            self.assertEqual(user_cache_path(platform="win32", environment=environment, home=home), windows_root / "local/Roundwright/Cache")
         with self.assertRaisesRegex(ConfigurationError, "unsupported"):
             user_config_path(platform="freebsd", home=home)
         with self.assertRaisesRegex(ConfigurationError, "invalid"):
@@ -74,8 +79,8 @@ class ConfigurationTests(unittest.TestCase):
             nested.mkdir(parents=True)
             repository = discover_repository(nested)
             self.assertEqual(repository, RepositoryIdentity.from_root(root))
-            self.assertEqual(repository.resolve_path("nested/file.txt"), root / "nested/file.txt")
-            self.assertEqual(repository.state_directory, root / ".roundwright")
+            self.assertEqual(repository.resolve_path("nested/file.txt"), repository.root / "nested/file.txt")
+            self.assertEqual(repository.state_directory, repository.root / ".roundwright")
             with self.assertRaisesRegex(ConfigurationError, "escapes"):
                 repository.resolve_path("../outside.txt")
             with self.assertRaisesRegex(ConfigurationError, "must not be absolute"):

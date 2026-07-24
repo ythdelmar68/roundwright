@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 import sys
 import tempfile
 import unittest
@@ -89,6 +90,30 @@ class StateTests(unittest.TestCase):
                 initialize(repository)
             self.assertEqual(before, path.read_bytes())
 
+    def test_sqliteevil_and_non_table_schema_fail_without_repair(self) -> None:
+        statements = (
+            "CREATE TABLE sqliteevil (id INTEGER)",
+            "CREATE VIEW unexpected_view AS SELECT 1 AS value",
+            "CREATE INDEX unexpected_index ON state_metadata(value)",
+            "CREATE TRIGGER unexpected_trigger AFTER INSERT ON state_metadata BEGIN SELECT 1; END",
+        )
+        for statement in statements:
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                initialize(repository)
+                path = database_path(repository)
+                connection = sqlite3.connect(path)
+                try:
+                    connection.execute(statement)
+                    connection.commit()
+                finally:
+                    connection.close()
+                before = path.read_bytes()
+                self.assertEqual(check_database(repository).state, "incompatible")
+                with self.assertRaises(StateError):
+                    initialize(repository)
+                self.assertEqual(before, path.read_bytes())
+
     def test_unmanaged_non_table_schema_fails_without_repair(self) -> None:
         statements = (
             "CREATE VIEW unexpected_view AS SELECT 1 AS value",
@@ -127,6 +152,68 @@ class StateTests(unittest.TestCase):
             self.assertEqual(cli._initialize(output), 2)
         self.assertIn("result: blocked", output.getvalue())
         self.assertNotIn("result: ready", output.getvalue())
+
+    def test_missing_or_malformed_identity_never_remints(self) -> None:
+        for value in (None, "malformed"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                initialize(repository)
+                path = database_path(repository)
+                connection = sqlite3.connect(path)
+                try:
+                    if value is None:
+                        connection.execute("DELETE FROM state_metadata WHERE key = 'state_id'")
+                    else:
+                        connection.execute("UPDATE state_metadata SET value = ? WHERE key = 'state_id'", (value,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                before = path.read_bytes()
+                self.assertEqual(check_database(repository).state, "incompatible")
+                with self.assertRaises(StateError):
+                    initialize(repository)
+                self.assertEqual(before, path.read_bytes())
+
+    def test_state_directory_collision_is_owner_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            repository.state_directory.write_text("collision", encoding="utf-8")
+            self.assertEqual(check_database(repository).state, "incompatible")
+            configuration = mock.Mock(repository=repository)
+            output = io.StringIO()
+            with mock.patch("roundwright.cli.load_configuration", return_value=configuration), mock.patch("roundwright.cli.preflight"):
+                self.assertEqual(cli._initialize(output), 2)
+            self.assertIn("result: blocked", output.getvalue())
+
+    def test_database_symlink_is_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as outside:
+            repository = self.repository(Path(temporary))
+            target = Path(outside) / "outside.sqlite3"
+            target.write_bytes(b"outside")
+            repository.state_directory.mkdir()
+            link = repository.state_directory / "state.sqlite3"
+            try:
+                os.symlink(target, link)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            self.assertEqual(check_database(repository).state, "incompatible")
+            self.assertEqual(target.read_bytes(), b"outside")
+
+    def test_status_renders_schema_identity_and_detail_for_each_state(self) -> None:
+        for status, code in (
+            (DatabaseStatus("healthy", 1, "verified", "identity"), 0),
+            (DatabaseStatus("missing", None, "run roundwright init"), 0),
+            (DatabaseStatus("incompatible", None, "schema changed"), 2),
+            (DatabaseStatus("corrupt", None, "database unreadable"), 2),
+        ):
+            with self.subTest(state=status.state):
+                output = io.StringIO()
+                with mock.patch("roundwright.cli._repository"), mock.patch("roundwright.cli.check_database", return_value=status):
+                    self.assertEqual(cli._render_status(output), code)
+                rendered = output.getvalue()
+                self.assertIn("schema:", rendered)
+                self.assertIn("state identity:", rendered)
+                self.assertIn("detail:", rendered)
 
     def test_failed_migration_rolls_back_every_schema_change(self) -> None:
         with sqlite3.connect(":memory:") as connection:

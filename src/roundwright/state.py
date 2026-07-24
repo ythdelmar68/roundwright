@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -57,15 +58,28 @@ class DatabaseStatus:
 
 def database_path(repository: RepositoryIdentity) -> Path:
     """Return the sole repository-local database path without creating it."""
-
-    return repository.state_directory / "state.sqlite3"
+    state_directory = repository.state_directory
+    if state_directory.exists() and not state_directory.is_dir():
+        raise StateError("state directory is unavailable")
+    path = state_directory / "state.sqlite3"
+    if path.exists():
+        if _is_reparse_point(path) or not path.is_file():
+            raise StateError("state database path is unsafe")
+        try:
+            path.resolve(strict=True).relative_to(repository.root.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise StateError("state database path escapes the repository") from error
+    return path
 
 
 def initialize(repository: RepositoryIdentity) -> DatabaseStatus:
     """Create or migrate the local database transactionally and idempotently."""
 
     path = database_path(repository)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as error:
+        raise StateError("state directory is unavailable") from error
     try:
         connection = sqlite3.connect(path)
         try:
@@ -80,7 +94,10 @@ def initialize(repository: RepositoryIdentity) -> DatabaseStatus:
 def check_database(repository: RepositoryIdentity) -> DatabaseStatus:
     """Inspect local state without creating, repairing, or modifying it."""
 
-    path = database_path(repository)
+    try:
+        path = database_path(repository)
+    except StateError as error:
+        return DatabaseStatus("incompatible", None, str(error))
     if not path.exists():
         return DatabaseStatus("missing", None, "run roundwright init")
     if not path.is_file():
@@ -123,7 +140,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
             )
-        _ensure_state_identity(connection)
+        _ensure_state_identity(connection, allow_create=not exists)
         _validate_schema(connection, ordered)
         connection.commit()
     except Exception:
@@ -158,7 +175,7 @@ def _validate_schema(connection: sqlite3.Connection, migrations: Iterable[Migrat
     expected = {name: statement for migration in migrations for name, statement in migration.schema}
     observed = connection.execute(
         "SELECT type, name FROM sqlite_master "
-        "WHERE type IN ('table', 'view', 'index', 'trigger') AND name NOT LIKE 'sqlite_%'"
+        "WHERE type IN ('table', 'view', 'index', 'trigger') AND name NOT GLOB 'sqlite_*'"
     ).fetchall()
     if set(observed) != {('table', name) for name in expected}:
         raise StateError("database contains unmanaged or missing application schema")
@@ -170,9 +187,11 @@ def _validate_schema(connection: sqlite3.Connection, migrations: Iterable[Migrat
             raise StateError("database schema does not match recorded migration")
 
 
-def _ensure_state_identity(connection: sqlite3.Connection) -> None:
+def _ensure_state_identity(connection: sqlite3.Connection, *, allow_create: bool) -> None:
     row = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
     if row is None:
+        if not allow_create:
+            raise StateError("state identity is missing")
         connection.execute("INSERT INTO state_metadata(key, value) VALUES ('state_id', ?)", (str(uuid.uuid4()),))
         return
     _state_identity_fingerprint(row[0])
@@ -193,6 +212,13 @@ def _state_identity_fingerprint(value: object) -> str:
     except (TypeError, ValueError, AttributeError) as error:
         raise StateError("state identity is malformed") from error
     return hashlib.sha256(state_id.bytes).hexdigest()[:16]
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        return path.is_symlink() or bool(path.stat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except (AttributeError, OSError):
+        return True
 
 
 def _read_applied(connection: sqlite3.Connection) -> dict[int, str]:

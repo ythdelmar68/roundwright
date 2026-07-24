@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,42 @@ class CliTests(unittest.TestCase):
                 str(wrapper), path=str(root), is_windows=True
             )
         self.assertTrue(identity.safe)
+
+    def test_windows_pipx_exposed_copy_matches_its_managed_venv_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "pipx-home"
+            bin_directory = root / "pipx-bin"
+            managed_directory = home / "venvs" / "roundwright" / "Scripts"
+            managed_directory.mkdir(parents=True)
+            bin_directory.mkdir()
+            managed = managed_directory / "roundwright.exe"
+            exposed = bin_directory / "roundwright.exe"
+            managed.write_bytes(b"same pipx launcher")
+            exposed.write_bytes(b"same pipx launcher")
+            with mock.patch.dict(os.environ, {"PIPX_HOME": str(home), "PIPX_BIN_DIR": str(bin_directory)}):
+                identity = inspect_entrypoint_identity(
+                    str(managed), path=str(bin_directory), is_windows=True
+                )
+        self.assertTrue(identity.safe)
+
+    def test_windows_pipx_rejects_a_different_exposed_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "pipx-home"
+            bin_directory = root / "pipx-bin"
+            managed_directory = home / "venvs" / "roundwright" / "Scripts"
+            managed_directory.mkdir(parents=True)
+            bin_directory.mkdir()
+            managed = managed_directory / "roundwright.exe"
+            exposed = bin_directory / "roundwright.exe"
+            managed.write_bytes(b"managed launcher")
+            exposed.write_bytes(b"different launcher")
+            with mock.patch.dict(os.environ, {"PIPX_HOME": str(home), "PIPX_BIN_DIR": str(bin_directory)}):
+                identity = inspect_entrypoint_identity(
+                    str(managed), path=str(bin_directory), is_windows=True
+                )
+        self.assertFalse(identity.safe)
 
     def test_bare_launcher_name_uses_the_current_runtime_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

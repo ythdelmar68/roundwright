@@ -53,7 +53,7 @@ def pipx_managed_command(pipx_home: Path, application: str = "roundwright") -> P
 
 
 def pipx_commands(pipx_home: Path, pipx_bin_directory: Path) -> tuple[Path, Path]:
-    """Keep the exposed application check separate from the managed-venv smoke route."""
+    """Validate both pipx routes before testing its public exposed launcher."""
 
     return (
         required_executable(pipx_bin_directory, "roundwright", label="pipx exposed command"),
@@ -66,6 +66,12 @@ def smoke(command: Path, *, cwd: Path, environment: dict[str, str]) -> None:
     run([str(command), "doctor"], cwd=cwd, environment=environment)
     run([str(command), "status"], cwd=cwd, environment=environment)
     run([str(command), "db", "check"], cwd=cwd, environment=environment, allowed=(0, 2))
+
+
+def pipx_smoke(command: Path, *, cwd: Path, environment: dict[str, str]) -> None:
+    """Exercise every installed command through pipx's public launcher."""
+
+    smoke(command, cwd=cwd, environment=environment)
 
 
 def command_environment(environment: dict[str, str], directory: Path) -> dict[str, str]:
@@ -138,10 +144,8 @@ def main() -> int:
         environment["PIPX_BIN_DIR"] = str(pipx_bin_directory)
         pipx_environment_variables = command_environment(pipx_environment(environment), pipx_bin_directory)
         run(pipx_install_command(wheel), cwd=root, environment=pipx_environment_variables)
-        pipx_exposed_command, pipx_managed_command_path = pipx_commands(pipx_home, pipx_bin_directory)
-        run([str(pipx_exposed_command), "--help"], cwd=root, environment=pipx_environment_variables)
-        pipx_managed_environment = command_environment(pipx_environment(environment), pipx_managed_command_path.parent)
-        smoke(pipx_managed_command_path, cwd=root, environment=pipx_managed_environment)
+        pipx_exposed_command, _pipx_managed_command = pipx_commands(pipx_home, pipx_bin_directory)
+        pipx_smoke(pipx_exposed_command, cwd=root, environment=pipx_environment_variables)
 
         environment["UV_TOOL_DIR"] = str(root / "uv-tools")
         environment["UV_TOOL_BIN_DIR"] = str(root / "uv-bin")

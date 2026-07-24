@@ -6,6 +6,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +54,7 @@ class CiVerificationTests(unittest.TestCase):
         environment = verifier.command_environment({"PATH": "parent"}, Path("isolated-bin"))
         self.assertEqual(environment["PATH"], f"isolated-bin{verifier.os.pathsep}parent")
 
-    def test_pipx_checks_the_exposed_launcher_but_smokes_the_managed_venv(self) -> None:
+    def test_pipx_validates_the_exposed_and_managed_launchers(self) -> None:
         verifier = load_install_verifier()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -83,6 +84,26 @@ class CiVerificationTests(unittest.TestCase):
                 verifier.pipx_managed_command(home)
             with self.assertRaisesRegex(ValueError, "application path is invalid"):
                 verifier.pipx_managed_command(home, "../outside")
+
+    def test_pipx_smoke_runs_every_command_through_the_exposed_launcher(self) -> None:
+        verifier = load_install_verifier()
+        exposed = Path("pipx-bin") / verifier.executable(Path(), "roundwright").name
+        commands: list[list[str]] = []
+
+        def record(command: list[str], **_kwargs: object) -> None:
+            commands.append(command)
+
+        with mock.patch.object(verifier, "run", side_effect=record):
+            verifier.pipx_smoke(exposed, cwd=Path("isolated"), environment={})
+        self.assertEqual(
+            commands,
+            [
+                [str(exposed), "--help"],
+                [str(exposed), "doctor"],
+                [str(exposed), "status"],
+                [str(exposed), "db", "check"],
+            ],
+        )
 
     def test_relative_distribution_path_selects_one_absolute_wheel_before_cwd_changes(self) -> None:
         verifier = load_install_verifier()

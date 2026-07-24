@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from collections.abc import Sequence
 
 from .deployment import blocked_command_shell_preflight
 from .doctor import collect_diagnostics, render_diagnostics
+from .identity import UnsafeEntrypointIdentityError, require_safe_entrypoint_identity
+from .configuration import ConfigurationError, RepositoryIdentity, discover_repository, load_configuration, preflight, PreflightMode
+from .state import StateError, check_database, initialize
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,6 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
     subcommands.add_parser("doctor", help="report read-only package diagnostics")
     subcommands.add_parser("status", help="report deployment modes without dispatching")
+    subcommands.add_parser("init", help="create or verify repository-local state")
+    database = subcommands.add_parser("db", help="inspect repository-local database state")
+    database.add_subparsers(dest="database_command").add_parser("check", help="read-only database migration check")
     subcommands.add_parser("run-once", help="fail-closed dispatch shell; does not dispatch work")
     subcommands.add_parser("run-daemon", help="fail-closed daemon shell; does not start a daemon")
     return parser
@@ -33,8 +40,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         render_diagnostics(report, sys.stdout)
         return report.exit_code
     if arguments.command == "status":
-        _render_status(sys.stdout)
-        return 0
+        return _render_status(sys.stdout)
+    if arguments.command == "init":
+        return _initialize(sys.stdout)
+    if arguments.command == "db" and arguments.database_command == "check":
+        return _check_database(sys.stdout)
     if arguments.command in {"run-once", "run-daemon"}:
         decision = blocked_command_shell_preflight()
         _render_blocked_shell(arguments.command, decision.reason, sys.stdout)
@@ -44,7 +54,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
 
-def _render_status(output: object) -> None:
+def _repository() -> RepositoryIdentity:
+    repository = discover_repository(Path.cwd())
+    if repository is None:
+        raise ConfigurationError("repository-local state requires a repository root")
+    return repository
+
+
+def _initialize(output: object) -> int:
+    try:
+        require_safe_entrypoint_identity(sys.argv[0])
+        configuration = load_configuration(cwd=Path.cwd())
+        preflight(configuration, PreflightMode.READ_ONLY)
+        repository = configuration.repository
+        if repository is None:
+            raise ConfigurationError("repository-local state requires a repository root")
+        status = initialize(repository)
+    except (ConfigurationError, StateError, UnsafeEntrypointIdentityError) as error:
+        output.write(f"roundwright init\nresult: blocked\ndetail: {error}\n")  # type: ignore[attr-defined]
+        return 2
+    if not status.healthy:
+        output.write(f"roundwright init\nstate: {status.state}\ndetail: {status.detail}\nresult: blocked\n")  # type: ignore[attr-defined]
+        return 2
+    output.write(f"roundwright init\nstate: {status.state}\nschema: {status.version}\nresult: ready\n")  # type: ignore[attr-defined]
+    return 0
+
+
+def _check_database(output: object) -> int:
+    try:
+        status = check_database(_repository())
+    except ConfigurationError as error:
+        output.write(f"roundwright db check\nstate: unavailable\ndetail: {error}\n")  # type: ignore[attr-defined]
+        return 2
+    output.write(f"roundwright db check\nstate: {status.state}\nschema: {status.version if status.version is not None else 'none'}\nidentity: {status.identity if status.identity is not None else 'none'}\ndetail: {status.detail}\n")  # type: ignore[attr-defined]
+    return 0 if status.healthy else 2
+
+
+def _render_status(output: object) -> int:
     """Render deployment status without reading state or authority receipts."""
 
     output.write("roundwright status\n")  # type: ignore[attr-defined]
@@ -52,6 +98,16 @@ def _render_status(output: object) -> None:
     output.write("test-only: available (no dispatch authority)\n")  # type: ignore[attr-defined]
     output.write("authoritative: unavailable (requires an exact external receipt)\n")  # type: ignore[attr-defined]
     output.write("blocked: active for dispatch command shells\n")  # type: ignore[attr-defined]
+    try:
+        status = check_database(_repository())
+        output.write(f"local state: {status.state}\n")  # type: ignore[attr-defined]
+        output.write(f"schema: {status.version if status.version is not None else 'none'}\n")  # type: ignore[attr-defined]
+        output.write(f"state identity: {status.identity if status.identity is not None else 'none'}\n")  # type: ignore[attr-defined]
+        output.write(f"detail: {status.detail}\n")  # type: ignore[attr-defined]
+        return 0 if status.healthy or status.state == "missing" else 2
+    except ConfigurationError:
+        output.write("local state: unavailable\n")  # type: ignore[attr-defined]
+        return 0
 
 
 def _render_blocked_shell(command: str, reason: str, output: object) -> None:

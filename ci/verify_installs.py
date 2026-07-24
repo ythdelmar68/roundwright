@@ -20,6 +20,47 @@ def executable(directory: Path, name: str) -> Path:
     return directory / (f"{name}.exe" if os.name == "nt" else name)
 
 
+def required_executable(directory: Path, name: str, *, label: str) -> Path:
+    """Return an existing launcher without accepting a missing installation."""
+
+    try:
+        command = executable(directory, name).resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ValueError(f"{label} is unavailable") from error
+    if not command.is_file():
+        raise ValueError(f"{label} is unavailable")
+    return command
+
+
+def pipx_managed_command(pipx_home: Path, application: str = "roundwright") -> Path:
+    """Find pipx's application launcher inside its isolated managed venv."""
+
+    if Path(application).name != application or application in {".", ".."}:
+        raise ValueError("pipx application path is invalid")
+    try:
+        home = pipx_home.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ValueError("pipx home is unavailable") from error
+    if not home.is_dir():
+        raise ValueError("pipx home is unavailable")
+    scripts = home / "venvs" / application / ("Scripts" if os.name == "nt" else "bin")
+    command = required_executable(scripts, application, label="pipx managed command")
+    try:
+        command.relative_to(home)
+    except ValueError as error:
+        raise ValueError("pipx managed command escapes its home") from error
+    return command
+
+
+def pipx_commands(pipx_home: Path, pipx_bin_directory: Path) -> tuple[Path, Path]:
+    """Keep the exposed application check separate from the managed-venv smoke route."""
+
+    return (
+        required_executable(pipx_bin_directory, "roundwright", label="pipx exposed command"),
+        pipx_managed_command(pipx_home),
+    )
+
+
 def smoke(command: Path, *, cwd: Path, environment: dict[str, str]) -> None:
     run([str(command), "--help"], cwd=cwd, environment=environment)
     run([str(command), "doctor"], cwd=cwd, environment=environment)
@@ -91,11 +132,16 @@ def main() -> int:
         run([str(executable(scripts, "python")), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=root, environment=pip_environment_variables)
         smoke(executable(scripts, "roundwright"), cwd=root, environment=pip_environment_variables)
 
-        environment["PIPX_HOME"] = str(root / "pipx-home")
-        environment["PIPX_BIN_DIR"] = str(root / "pipx-bin")
-        pipx_environment_variables = command_environment(pipx_environment(environment), Path(environment["PIPX_BIN_DIR"]))
+        pipx_home = root / "pipx-home"
+        pipx_bin_directory = root / "pipx-bin"
+        environment["PIPX_HOME"] = str(pipx_home)
+        environment["PIPX_BIN_DIR"] = str(pipx_bin_directory)
+        pipx_environment_variables = command_environment(pipx_environment(environment), pipx_bin_directory)
         run(pipx_install_command(wheel), cwd=root, environment=pipx_environment_variables)
-        smoke(executable(Path(environment["PIPX_BIN_DIR"]), "roundwright"), cwd=root, environment=pipx_environment_variables)
+        pipx_exposed_command, pipx_managed_command_path = pipx_commands(pipx_home, pipx_bin_directory)
+        run([str(pipx_exposed_command), "--help"], cwd=root, environment=pipx_environment_variables)
+        pipx_managed_environment = command_environment(pipx_environment(environment), pipx_managed_command_path.parent)
+        smoke(pipx_managed_command_path, cwd=root, environment=pipx_managed_environment)
 
         environment["UV_TOOL_DIR"] = str(root / "uv-tools")
         environment["UV_TOOL_BIN_DIR"] = str(root / "uv-bin")

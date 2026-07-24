@@ -53,6 +53,37 @@ class CiVerificationTests(unittest.TestCase):
         environment = verifier.command_environment({"PATH": "parent"}, Path("isolated-bin"))
         self.assertEqual(environment["PATH"], f"isolated-bin{verifier.os.pathsep}parent")
 
+    def test_pipx_checks_the_exposed_launcher_but_smokes_the_managed_venv(self) -> None:
+        verifier = load_install_verifier()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "pipx-home"
+            exposed_directory = root / "pipx-bin"
+            scripts = home / "venvs" / "roundwright" / ("Scripts" if verifier.os.name == "nt" else "bin")
+            scripts.mkdir(parents=True)
+            exposed_directory.mkdir()
+            managed = verifier.executable(scripts, "roundwright")
+            exposed = verifier.executable(exposed_directory, "roundwright")
+            managed.write_bytes(b"managed")
+            exposed.write_bytes(b"exposed")
+            exposed_command, managed_command = verifier.pipx_commands(home, exposed_directory)
+            self.assertEqual(exposed_command, exposed.resolve())
+            self.assertEqual(managed_command, managed.resolve())
+            self.assertEqual(
+                verifier.command_environment({"PATH": "parent"}, managed_command.parent)["PATH"],
+                f"{managed_command.parent}{verifier.os.pathsep}parent",
+            )
+
+    def test_pipx_managed_command_rejects_absent_and_traversal_paths(self) -> None:
+        verifier = load_install_verifier()
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "pipx-home"
+            home.mkdir()
+            with self.assertRaisesRegex(ValueError, "managed command is unavailable"):
+                verifier.pipx_managed_command(home)
+            with self.assertRaisesRegex(ValueError, "application path is invalid"):
+                verifier.pipx_managed_command(home, "../outside")
+
     def test_relative_distribution_path_selects_one_absolute_wheel_before_cwd_changes(self) -> None:
         verifier = load_install_verifier()
         with tempfile.TemporaryDirectory() as temporary:

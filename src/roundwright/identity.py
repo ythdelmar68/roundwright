@@ -122,9 +122,10 @@ def _is_windows_pipx_launcher_pair(
     if not is_windows or Path(command).name != command:
         return False
     try:
-        home = Path(os.environ["PIPX_HOME"]).resolve(strict=True)
-        bin_directory = Path(os.environ["PIPX_BIN_DIR"]).resolve(strict=True)
-    except (KeyError, OSError):
+        home_path, bin_path = _windows_pipx_paths()
+        home = home_path.resolve(strict=True)
+        bin_directory = bin_path.resolve(strict=True)
+    except OSError:
         return False
     if not home.is_dir() or not bin_directory.is_dir():
         return False
@@ -139,6 +140,26 @@ def _is_windows_pipx_launcher_pair(
     if not (_same_file(active, managed) or _is_windows_console_wrapper(active, managed, command=command, is_windows=True)):
         return False
     return _same_file_content(exposed, managed)
+
+
+def _windows_pipx_paths() -> tuple[Path, Path]:
+    """Mirror pipx's local Windows override, fallback, and default path selection."""
+
+    profile = Path.home()
+    home_override = _pipx_path_override("PIPX_HOME")
+    bin_override = _pipx_path_override("PIPX_BIN_DIR")
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", profile / "AppData" / "Local"))
+    default_home = local_app_data / "pipx" / "pipx"
+    fallbacks = (profile / ".local" / "pipx", profile / "pipx")
+    home = home_override or next((fallback for fallback in fallbacks if fallback.exists()), default_home)
+    return home, bin_override or profile / ".local" / "bin"
+
+
+def _pipx_path_override(name: str) -> Path | None:
+    """Use the same non-empty environment override contract as pipx."""
+
+    value = os.environ.get(name)
+    return Path(value).expanduser().absolute() if value else None
 
 
 def _same_file_content(first: Path, second: Path) -> bool:

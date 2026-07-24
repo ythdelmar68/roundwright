@@ -61,6 +61,31 @@ def pipx_commands(pipx_home: Path, pipx_bin_directory: Path) -> tuple[Path, Path
     )
 
 
+def pipx_default_paths(profile: Path) -> tuple[Path, Path]:
+    """Return the fresh profile paths pipx uses when its two overrides are absent."""
+
+    if os.name == "nt":
+        home = profile / ".local" / "pipx"
+    elif sys.platform == "darwin":
+        home = profile / "Library" / "Application Support" / "pipx"
+    else:
+        home = profile / ".local" / "share" / "pipx"
+    return home, profile / ".local" / "bin"
+
+
+def pipx_default_environment(environment: dict[str, str], profile: Path) -> dict[str, str]:
+    """Isolate pipx defaults under a temporary profile without setting pipx overrides."""
+
+    configured = pipx_environment(environment)
+    configured.pop("PIPX_HOME", None)
+    configured.pop("PIPX_BIN_DIR", None)
+    configured["HOME"] = str(profile)
+    if os.name == "nt":
+        configured["USERPROFILE"] = str(profile)
+        configured["LOCALAPPDATA"] = str(profile / "AppData" / "Local")
+    return configured
+
+
 def smoke(command: Path, *, cwd: Path, environment: dict[str, str]) -> None:
     run([str(command), "--help"], cwd=cwd, environment=environment)
     run([str(command), "doctor"], cwd=cwd, environment=environment)
@@ -146,6 +171,17 @@ def main() -> int:
         run(pipx_install_command(wheel), cwd=root, environment=pipx_environment_variables)
         pipx_exposed_command, _pipx_managed_command = pipx_commands(pipx_home, pipx_bin_directory)
         pipx_smoke(pipx_exposed_command, cwd=root, environment=pipx_environment_variables)
+
+        pipx_default_profile = root / "pipx-default-profile"
+        pipx_default_home, pipx_default_bin_directory = pipx_default_paths(pipx_default_profile)
+        pipx_default_home.mkdir(parents=True)
+        pipx_default_environment_variables = pipx_default_environment(environment, pipx_default_profile)
+        pipx_default_environment_variables = command_environment(pipx_default_environment_variables, pipx_default_bin_directory)
+        run(pipx_install_command(wheel), cwd=root, environment=pipx_default_environment_variables)
+        pipx_default_exposed_command, _pipx_default_managed_command = pipx_commands(
+            pipx_default_home, pipx_default_bin_directory
+        )
+        pipx_smoke(pipx_default_exposed_command, cwd=root, environment=pipx_default_environment_variables)
 
         environment["UV_TOOL_DIR"] = str(root / "uv-tools")
         environment["UV_TOOL_BIN_DIR"] = str(root / "uv-bin")

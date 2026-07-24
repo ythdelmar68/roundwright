@@ -85,6 +85,21 @@ class CiVerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "application path is invalid"):
                 verifier.pipx_managed_command(home, "../outside")
 
+    def test_pipx_default_environment_clears_overrides_for_a_temporary_profile(self) -> None:
+        verifier = load_install_verifier()
+        profile = Path("temporary-profile")
+        environment = verifier.pipx_default_environment(
+            {"PIPX_HOME": "override-home", "PIPX_BIN_DIR": "override-bin"}, profile
+        )
+        home, bin_directory = verifier.pipx_default_paths(profile)
+        self.assertNotIn("PIPX_HOME", environment)
+        self.assertNotIn("PIPX_BIN_DIR", environment)
+        self.assertEqual(environment["HOME"], str(profile))
+        if verifier.os.name == "nt":
+            self.assertEqual(home, profile / ".local" / "pipx")
+        self.assertEqual(bin_directory, profile / ".local" / "bin")
+        self.assertNotEqual(home, Path("override-home"))
+
     def test_pipx_smoke_runs_every_command_through_the_exposed_launcher(self) -> None:
         verifier = load_install_verifier()
         exposed = Path("pipx-bin") / verifier.executable(Path(), "roundwright").name

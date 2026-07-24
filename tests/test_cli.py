@@ -97,6 +97,48 @@ class CliTests(unittest.TestCase):
                 )
         self.assertTrue(identity.safe)
 
+    def test_windows_pipx_default_paths_match_its_managed_venv_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "profile"
+            home = profile / ".local" / "pipx"
+            bin_directory = profile / ".local" / "bin"
+            managed_directory = home / "venvs" / "roundwright" / "Scripts"
+            managed_directory.mkdir(parents=True)
+            bin_directory.mkdir(parents=True)
+            managed = managed_directory / "roundwright.exe"
+            exposed = bin_directory / "roundwright.exe"
+            managed.write_bytes(b"same default pipx launcher")
+            exposed.write_bytes(b"same default pipx launcher")
+            with mock.patch.object(Path, "home", return_value=profile), mock.patch.dict(
+                os.environ, {"LOCALAPPDATA": str(profile / "AppData" / "Local")}, clear=True
+            ):
+                identity = inspect_entrypoint_identity(
+                    str(managed), path=str(bin_directory), is_windows=True
+                )
+        self.assertTrue(identity.safe)
+
+    def test_windows_pipx_default_paths_reject_a_different_exposed_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "profile"
+            home = profile / ".local" / "pipx"
+            bin_directory = profile / ".local" / "bin"
+            managed_directory = home / "venvs" / "roundwright" / "Scripts"
+            managed_directory.mkdir(parents=True)
+            bin_directory.mkdir(parents=True)
+            managed = managed_directory / "roundwright.exe"
+            exposed = bin_directory / "roundwright.exe"
+            managed.write_bytes(b"managed default pipx launcher")
+            exposed.write_bytes(b"different default pipx launcher")
+            with mock.patch.object(Path, "home", return_value=profile), mock.patch.dict(
+                os.environ, {"LOCALAPPDATA": str(profile / "AppData" / "Local")}, clear=True
+            ):
+                identity = inspect_entrypoint_identity(
+                    str(managed), path=str(bin_directory), is_windows=True
+                )
+        self.assertFalse(identity.safe)
+
     def test_windows_pipx_rejects_a_different_exposed_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

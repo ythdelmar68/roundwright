@@ -6,6 +6,7 @@ import contextlib
 import io
 import sys
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 from uuid import UUID
@@ -24,6 +25,7 @@ from roundwright.deployment import (
     DeploymentMode,
     evaluate_deployment_authority,
 )
+from roundwright.deployment import _receipt_binding_fingerprint
 
 
 def fingerprint(character: str) -> str:
@@ -50,7 +52,8 @@ class DeploymentAuthorityTests(unittest.TestCase):
         deployment: str | None = None, status: AuthorityReceiptStatus = AuthorityReceiptStatus.FRESH,
     ) -> AuthorityReceiptVerification:
         return AuthorityReceiptVerification(
-            receipt.receipt_fingerprint, identity.repository_fingerprint, identity.state_id,
+            receipt.receipt_fingerprint, _receipt_binding_fingerprint(receipt),
+            identity.repository_fingerprint, identity.state_id,
             identity.deployment_fingerprint if deployment is None else fingerprint(deployment), status,
         )
 
@@ -116,6 +119,44 @@ class DeploymentAuthorityTests(unittest.TestCase):
         )
         decision = evaluate_deployment_authority(identity, receipt, self.verification(identity, receipt), now=self.now)
         self.assertFalse(decision.authorized)
+
+    def test_external_verification_cannot_be_replayed_with_a_changed_receipt(self) -> None:
+        identity = self.identity()
+        receipt = self.receipt(identity)
+        verification = self.verification(identity, receipt)
+        changed_receipts = (
+            replace(
+                receipt,
+                identity=DeploymentIdentity(
+                    identity.repository_fingerprint, fingerprint("0"), identity.state_fingerprint,
+                    identity.state_id, identity.deployment_fingerprint,
+                ),
+            ),
+            replace(
+                receipt,
+                identity=DeploymentIdentity(
+                    identity.repository_fingerprint, identity.canonical_checkout_fingerprint, fingerprint("0"),
+                    identity.state_id, identity.deployment_fingerprint,
+                ),
+            ),
+            replace(
+                receipt,
+                identity=DeploymentIdentity(
+                    identity.repository_fingerprint, identity.canonical_checkout_fingerprint,
+                    identity.state_fingerprint, UUID("87654321-4321-8765-4321-876543218765"),
+                    identity.deployment_fingerprint,
+                ),
+            ),
+            replace(receipt, issued_at=receipt.issued_at - timedelta(seconds=1)),
+            replace(receipt, expires_at=receipt.expires_at + timedelta(seconds=1)),
+        )
+        for changed_receipt in changed_receipts:
+            with self.subTest(receipt=changed_receipt):
+                decision = evaluate_deployment_authority(
+                    changed_receipt.identity, changed_receipt, verification, now=self.now,
+                )
+                self.assertFalse(decision.authorized)
+                self.assertIn("binding", decision.reason)
 
     def test_command_shells_stop_without_filesystem_git_network_or_dispatch(self) -> None:
         for command in ("run-once", "run-daemon"):

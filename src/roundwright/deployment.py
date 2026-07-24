@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
+import json
 from typing import Mapping
 from uuid import UUID
 
@@ -81,6 +83,7 @@ class AuthorityReceiptVerification:
     """
 
     receipt_fingerprint: str
+    receipt_binding_fingerprint: str
     repository_fingerprint: str
     state_id: UUID
     authoritative_deployment_fingerprint: str
@@ -150,6 +153,8 @@ def evaluate_deployment_authority(
         return _blocked("the repository-external authority receipt is not fresh", receipt)
     if verification.receipt_fingerprint != receipt.receipt_fingerprint:
         return _blocked("the repository-external receipt identity does not match", receipt)
+    if verification.receipt_binding_fingerprint != _receipt_binding_fingerprint(receipt):
+        return _blocked("the repository-external receipt binding does not match", receipt)
     if verification.repository_fingerprint != identity.repository_fingerprint:
         return _blocked("the repository-external repository identity does not match", receipt)
     if verification.state_id != identity.state_id:
@@ -246,6 +251,7 @@ def _validate_receipt(receipt: DeploymentAuthorityReceipt) -> None:
 def _validate_verification(verification: AuthorityReceiptVerification) -> None:
     for value, description in (
         (verification.receipt_fingerprint, "verified receipt"),
+        (verification.receipt_binding_fingerprint, "verified receipt binding"),
         (verification.repository_fingerprint, "verified repository"),
         (verification.authoritative_deployment_fingerprint, "verified deployment"),
     ):
@@ -254,6 +260,26 @@ def _validate_verification(verification: AuthorityReceiptVerification) -> None:
         raise DeploymentAuthorityError("the verified state UUID is invalid")
     if type(verification.status) is not AuthorityReceiptStatus:
         raise DeploymentAuthorityError("the verified authority receipt status is invalid")
+
+
+def _receipt_binding_fingerprint(receipt: DeploymentAuthorityReceipt) -> str:
+    """Hash every authority-bearing receipt field in one canonical encoding."""
+
+    canonical_receipt = {
+        "expires_at": receipt.expires_at.isoformat(),
+        "identity": {
+            "canonical_checkout_fingerprint": receipt.identity.canonical_checkout_fingerprint,
+            "deployment_fingerprint": receipt.identity.deployment_fingerprint,
+            "repository_fingerprint": receipt.identity.repository_fingerprint,
+            "state_fingerprint": receipt.identity.state_fingerprint,
+            "state_id": str(receipt.identity.state_id),
+        },
+        "issued_at": receipt.issued_at.isoformat(),
+        "mode": receipt.mode.value,
+        "receipt_fingerprint": receipt.receipt_fingerprint,
+    }
+    encoded = json.dumps(canonical_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _require_fingerprint(value: str, description: str) -> None:

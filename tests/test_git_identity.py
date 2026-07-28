@@ -79,7 +79,7 @@ class GitIdentityTests(unittest.TestCase):
             repository = self.repository(Path(temporary) / "repository")
             initialize(repository)
             first = acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-a", ttl_seconds=10, now=100)
-            self.assertEqual(first.generation, 1)
+            self.assertGreaterEqual(first.generation, 3)
             with self.assertRaises(GitIdentityError):
                 acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-b", ttl_seconds=10, now=101)
             renewed = renew_transition_lease(repository, first, ttl_seconds=20, now=105)
@@ -124,6 +124,18 @@ class GitIdentityTests(unittest.TestCase):
             self.run_git(location, "checkout", "--detach")
             with self.assertRaises(GitIdentityError):
                 seal_candidate(repository, binding, lease=lease)
+
+    def test_provision_and_revalidation_preserve_unicode_worktree_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repository = self.repository(parent / "repository")
+            base = resolve_canonical_base(repository, "main")
+            location = parent / "isolated" / "任務"
+            identity = self.identity(base, branch="codex/unicode-worktree", worktree=location)
+            self.admit(repository, identity)
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=self.lease(repository))
+            self.assertTrue(location.is_dir())
+            self.assertEqual(revalidate_worktree(repository, binding), binding)
 
     def test_repository_bound_lease_and_metadata_descendant_paths_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

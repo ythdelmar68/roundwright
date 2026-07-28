@@ -109,6 +109,18 @@ MIGRATIONS = (
             ("task_branch_ownership", "CREATE TABLE task_branch_ownership (branch TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))"),
         ),
     ),
+    Migration(
+        7,
+        (
+            "INSERT INTO transition_lease_generations(lease_scope, generation) "
+            "SELECT 'repository-state', CASE "
+            "WHEN COALESCE((SELECT MAX(generation) FROM transition_leases WHERE lease_scope = 'repository-state'), 0) >= 2 "
+            "THEN (SELECT MAX(generation) + 1 FROM transition_leases WHERE lease_scope = 'repository-state') "
+            "ELSE 2 END "
+            "ON CONFLICT(lease_scope) DO UPDATE SET generation = MAX(transition_lease_generations.generation, excluded.generation)",
+        ),
+        (),
+    ),
 )
 
 

@@ -423,7 +423,7 @@ def _is_ancestor(worktree: Path, base: str, candidate: str) -> bool:
 
 
 def _common_git_directory(worktree: Path) -> Path:
-    raw = Path(_git(worktree, "rev-parse", "--git-common-dir"))
+    raw = _git_path(worktree, "rev-parse", "--git-common-dir")
     if not raw.is_absolute():
         raw = worktree / raw
     try:
@@ -436,11 +436,9 @@ def _registered_worktree_paths(root: Path) -> frozenset[str]:
     """Parse Git's porcelain records into exact local path identities."""
 
     paths: set[str] = set()
-    for record in _git(root, "worktree", "list", "--porcelain").split("\n\n"):
-        for line in record.splitlines():
-            if line.startswith("worktree "):
-                paths.add(_local_path_key(Path(line.removeprefix("worktree "))))
-                break
+    for entry in _git_bytes(root, "worktree", "list", "--porcelain", "-z").split(b"\0"):
+        if entry.startswith(b"worktree "):
+            paths.add(_local_path_key(Path(os.fsdecode(entry[len(b"worktree ") :]))))
     return frozenset(paths)
 
 
@@ -448,7 +446,7 @@ def _require_worktree_backlink(worktree: Path) -> None:
     """Prove the linked-worktree Git directory points back to this exact path."""
 
     common = _common_git_directory(worktree)
-    git_directory = Path(_git(worktree, "rev-parse", "--absolute-git-dir"))
+    git_directory = _git_path(worktree, "rev-parse", "--absolute-git-dir")
     try:
         git_directory = git_directory.resolve(strict=True)
         expected_parent = (common / "worktrees").resolve(strict=True)
@@ -478,11 +476,27 @@ def _git_commit(worktree: Path, *arguments: str) -> str:
     return value
 
 
+def _git_path(worktree: Path, *arguments: str) -> Path:
+    """Read Git path output as bytes so locale cannot alter a valid filename."""
+
+    output = _git_bytes(worktree, *arguments)
+    if not output.endswith(b"\n"):
+        raise GitIdentityError("Git did not return a readable path")
+    return Path(os.fsdecode(output[:-1]))
+
+
 def _git(worktree: Path, *arguments: str) -> str:
     result = _git_result(worktree, *arguments)
     if result.returncode != 0:
         raise GitIdentityError("Git identity verification failed")
     return result.stdout.strip()
+
+
+def _git_bytes(worktree: Path, *arguments: str) -> bytes:
+    result = _git_bytes_result(worktree, *arguments)
+    if result.returncode != 0:
+        raise GitIdentityError("Git identity verification failed")
+    return result.stdout
 
 
 def _git_result(worktree: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -494,6 +508,21 @@ def _git_result(worktree: Path, *arguments: str) -> subprocess.CompletedProcess[
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=10,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GitIdentityError("Git identity verification is unavailable") from error
+
+
+def _git_bytes_result(worktree: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        return subprocess.run(
+            ["git", "-C", os.fspath(worktree), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             timeout=10,
             env=environment,
         )

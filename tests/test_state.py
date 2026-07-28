@@ -38,7 +38,12 @@ from roundwright.state import (
     task_projection,
     transition_task as _transition_task,
 )
-from roundwright.git_identity import acquire_transition_lease
+from roundwright.git_identity import (
+    GitIdentityError,
+    TransitionLease,
+    acquire_transition_lease,
+    release_transition_lease,
+)
 
 
 def transition_task(repository: RepositoryIdentity, identity: TaskIdentity, **kwargs: object):
@@ -409,6 +414,42 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual(initialize(repository), check_database(repository))
+
+    def test_version_three_lease_handles_cannot_reappear_after_upgrade(self) -> None:
+        for active in (False, True):
+            with self.subTest(active=active), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                path = database_path(repository)
+                path.parent.mkdir()
+                connection = sqlite3.connect(path)
+                try:
+                    _apply_migrations(connection, MIGRATIONS[:3])
+                    state_identity = connection.execute(
+                        "SELECT value FROM state_metadata WHERE key = 'state_id'"
+                    ).fetchone()[0]
+                    stale = TransitionLease("ythdelmar68/roundwright", state_identity, "legacy-owner", 1, 110)
+                    if active:
+                        connection.execute(
+                            "INSERT INTO transition_leases(lease_scope, repository_id, state_identity, owner, generation, expires_at) VALUES ('repository-state', ?, ?, ?, ?, ?)",
+                            (stale.repository_id, stale.state_identity, stale.owner, stale.generation, stale.expires_at),
+                        )
+                    connection.commit()
+                finally:
+                    connection.close()
+                initialize(repository)
+                if active:
+                    release_transition_lease(repository, stale, now=100)
+                reacquired = acquire_transition_lease(
+                    repository,
+                    repository_id=stale.repository_id,
+                    owner=stale.owner,
+                    ttl_seconds=10,
+                    now=100,
+                )
+                self.assertNotEqual(reacquired, stale)
+                self.assertGreater(reacquired.generation, stale.generation)
+                with self.assertRaises(GitIdentityError):
+                    release_transition_lease(repository, stale, now=100)
 
     def test_failed_v2_upgrade_leaves_the_valid_v1_state_unchanged(self) -> None:
         with sqlite3.connect(":memory:") as connection:

@@ -19,12 +19,14 @@ from roundwright.configuration import RepositoryIdentity
 from roundwright import cli
 from roundwright.state import (
     DatabaseStatus,
+    MIGRATIONS,
     Migration,
     SourceSnapshot,
     StateError,
     TaskIdentity,
     _apply_migrations,
     _is_reparse_point,
+    _verify_migrations,
     admit_task,
     check_database,
     database_path,
@@ -355,6 +357,60 @@ class StateTests(unittest.TestCase):
             self.assertNotIn("private", repr(projection))
             self.assertNotIn("worktree", repr(projection))
             self.assertEqual(projection, task_projection(repository, self.task_identity()))
+
+    def test_v1_database_upgrades_to_v2_without_reminting_identity_and_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, (MIGRATIONS[0],))
+                state_id = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()[0]
+            finally:
+                connection.close()
+            upgraded = initialize(repository)
+            self.assertEqual(upgraded.version, 2)
+            self.assertEqual(upgraded.identity, check_database(repository).identity)
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()[0], state_id)
+                self.assertEqual(
+                    connection.execute("SELECT version, checksum FROM schema_migrations ORDER BY version").fetchall(),
+                    [(migration.version, migration.checksum) for migration in MIGRATIONS],
+                )
+            finally:
+                connection.close()
+            self.assertEqual(initialize(repository), check_database(repository))
+
+    def test_failed_v2_upgrade_leaves_the_valid_v1_state_unchanged(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            _apply_migrations(connection, (MIGRATIONS[0],))
+            before = _verify_migrations(connection, (MIGRATIONS[0],))
+            broken = Migration(2, ("CREATE TABLE v2_transient (id INTEGER)", "not valid SQL"), ())
+            with self.assertRaises(sqlite3.DatabaseError):
+                _apply_migrations(connection, (MIGRATIONS[0], broken), allow_new_identity=False)
+            self.assertEqual(_verify_migrations(connection, (MIGRATIONS[0],)), before)
+            self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'v2_transient'").fetchone())
+
+    def test_task_projection_rejects_checksum_drift_and_incompatible_schema(self) -> None:
+        for mutation in ("checksum", "schema"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                initialize(repository)
+                identity = self.task_identity()
+                admit_task(repository, identity, (self.source_snapshot(),))
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    if mutation == "checksum":
+                        connection.execute("UPDATE schema_migrations SET checksum = 'drifted' WHERE version = 2")
+                    else:
+                        connection.execute("CREATE TABLE incompatible_projection_schema (id INTEGER)")
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(StateError):
+                    task_projection(repository, identity)
 
     def test_lifecycle_rejects_invalid_regressive_duplicate_and_mismatched_transitions_transactionally(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

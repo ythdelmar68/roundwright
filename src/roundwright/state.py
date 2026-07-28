@@ -345,6 +345,7 @@ def task_projection(repository: RepositoryIdentity, identity: TaskIdentity) -> T
     try:
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
+            _verify_migrations(connection, MIGRATIONS)
             row = _require_matching_task(connection, identity)
             source = connection.execute(
                 "SELECT source_digest FROM source_snapshots WHERE source_id = ?", (identity.source_id,)

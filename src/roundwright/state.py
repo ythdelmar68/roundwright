@@ -130,6 +130,15 @@ MIGRATIONS = (
             ("gate_evidence", "CREATE TABLE gate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, gate_key TEXT NOT NULL, outcome TEXT NOT NULL, evaluator_id TEXT NOT NULL, evaluated_at INTEGER NOT NULL CHECK(evaluated_at > 0), evidence_fingerprint TEXT NOT NULL, changed_boundary TEXT, reason TEXT, PRIMARY KEY(task_id, candidate_sha, gate_key, evaluator_id, evidence_fingerprint))"),
         ),
     ),
+    Migration(
+        9,
+        (
+            "CREATE TABLE gate_contexts (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)))",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE gate_contexts (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)))"),
+        ),
+    ),
 )
 
 
@@ -292,7 +301,6 @@ def transition_task(
     next_state: str,
     evidence_fingerprint: str,
     lease: object | None = None,
-    gate_decision: object | None = None,
 ) -> TaskProjection:
     """Advance one task through the explicit Phase 2 state sequence atomically."""
 
@@ -300,20 +308,16 @@ def transition_task(
     _require_state(expected_state)
     _require_state(next_state)
     _require_fingerprint(evidence_fingerprint)
-    if expected_state == "diff-review" and next_state == "ready-for-owner":
-        from .gates import GATE_REGISTRY, GateDecision, GateOutcome
-
-        if not isinstance(gate_decision, GateDecision) or gate_decision.outcome is not GateOutcome.PASS:
-            raise StateError("ready-for-owner requires an aggregate PASS gate decision")
-        if tuple(result.gate_key for result in gate_decision.results) != tuple(requirement.key.value for requirement in GATE_REGISTRY):
-            raise StateError("ready-for-owner requires evidence for every registered gate")
-        if any(result.outcome is not GateOutcome.PASS for result in gate_decision.results):
-            raise StateError("ready-for-owner requires every registered gate to pass")
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity, expected_state)
+        if expected_state == "diff-review" and next_state == "ready-for-owner":
+            from .gates import GateOutcome, _decision_from_connection
+
+            if _decision_from_connection(connection, identity).outcome is not GateOutcome.PASS:
+                raise StateError("ready-for-owner requires persisted aggregate PASS gate evidence")
         blocked_from = connection.execute(
             "SELECT blocked_from_state FROM tasks WHERE task_id = ?", (identity.task_id,)
         ).fetchone()[0]

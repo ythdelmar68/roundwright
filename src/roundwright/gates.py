@@ -39,6 +39,7 @@ class EvidenceOutcome(StrEnum):
     FINDINGS = "FINDINGS"
     UNKNOWN = "UNKNOWN"
     STALE = "STALE"
+    CONFLICT = "CONFLICT"
 
 
 class GateOutcome(StrEnum):
@@ -111,6 +112,8 @@ class GateDecision:
 def decide_gates(context: GateContext, evidence: tuple[GateEvidence, ...]) -> GateDecision:
     """Purely aggregate structured gate evidence into one fail-closed decision."""
 
+    if not _is_well_formed_context(context):
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "invalid gate context"),))
     registry = {requirement.key.value: requirement for requirement in GATE_REGISTRY}
     grouped: dict[str, list[GateEvidence]] = {key: [] for key in registry}
     unsupported = False
@@ -151,14 +154,21 @@ def record_gate_evidence(
     repository: RepositoryIdentity,
     binding: WorktreeBinding,
     seal: CandidateSeal,
+    context: GateContext,
     evidence: GateEvidence,
     *,
     lease: TransitionLease | None = None,
 ) -> None:
     """Persist one exact-candidate gate record and bind its fingerprint to that candidate."""
 
+    _validate_context(context)
     _validate_evidence(evidence)
-    if evidence.task_id != binding.task_id or evidence.candidate_sha != seal.candidate_sha:
+    if (
+        context.task_id != binding.task_id
+        or context.candidate_sha != seal.candidate_sha
+        or evidence.task_id != binding.task_id
+        or evidence.candidate_sha != seal.candidate_sha
+    ):
         raise GateError("gate evidence does not match the active task candidate")
     bind_candidate_evidence(
         repository, binding, seal, evidence_fingerprint=evidence.evidence_fingerprint, lease=lease
@@ -172,21 +182,52 @@ def record_gate_evidence(
         ).fetchone()
         if row != (seal.candidate_sha,):
             raise GateError("candidate seal is no longer current")
-        connection.execute(
-            "INSERT OR IGNORE INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                evidence.task_id,
-                evidence.candidate_sha,
-                _value(evidence.gate_key),
-                _value(evidence.outcome),
-                evidence.evaluator_id,
-                evidence.evaluated_at,
-                evidence.evidence_fingerprint,
-                evidence.changed_boundary,
-                evidence.reason,
-            ),
-        )
+        source_count = connection.execute(
+            "SELECT COUNT(*) FROM tasks JOIN source_snapshots ON source_snapshots.source_id = tasks.source_id WHERE tasks.task_id = ?",
+            (binding.task_id,),
+        ).fetchone()[0]
+        if context.source_count != source_count:
+            raise GateError("gate context source count does not match committed task state")
+        persisted_context = connection.execute(
+            "SELECT source_count, isolated_local_task FROM gate_contexts WHERE task_id = ?", (binding.task_id,)
+        ).fetchone()
+        context_values = (context.source_count, int(context.isolated_local_task))
+        if persisted_context is None:
+            connection.execute(
+                "INSERT INTO gate_contexts(task_id, source_count, isolated_local_task) VALUES (?, ?, ?)",
+                (binding.task_id, *context_values),
+            )
+        elif persisted_context != context_values:
+            raise GateError("gate context conflicts with committed task state")
+        existing = connection.execute(
+            "SELECT outcome, evaluated_at, changed_boundary, reason FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? AND gate_key = ? AND evaluator_id = ? AND evidence_fingerprint = ?",
+            (evidence.task_id, evidence.candidate_sha, _value(evidence.gate_key), evidence.evaluator_id, evidence.evidence_fingerprint),
+        ).fetchone()
+        expected = (_value(evidence.outcome), evidence.evaluated_at, evidence.changed_boundary, evidence.reason)
+        conflict = existing is not None and existing != expected
+        if conflict:
+            connection.execute(
+                "UPDATE gate_evidence SET outcome = ?, reason = ? WHERE task_id = ? AND candidate_sha = ? AND gate_key = ? AND evaluator_id = ? AND evidence_fingerprint = ?",
+                (EvidenceOutcome.CONFLICT.value, "conflicting evidence replay", evidence.task_id, evidence.candidate_sha, _value(evidence.gate_key), evidence.evaluator_id, evidence.evidence_fingerprint),
+            )
+        elif existing is None:
+            connection.execute(
+                "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    evidence.task_id,
+                    evidence.candidate_sha,
+                    _value(evidence.gate_key),
+                    _value(evidence.outcome),
+                    evidence.evaluator_id,
+                    evidence.evaluated_at,
+                    evidence.evidence_fingerprint,
+                    evidence.changed_boundary,
+                    evidence.reason,
+                ),
+            )
         connection.commit()
+        if conflict:
+            raise GateError("conflicting gate evidence was recorded")
     except Exception:
         connection.rollback()
         raise
@@ -223,31 +264,32 @@ def evaluate_gates(
     repository: RepositoryIdentity,
     binding: WorktreeBinding,
     seal: CandidateSeal,
-    context: GateContext,
+    context: GateContext | None = None,
     *,
     lease: TransitionLease | None = None,
 ) -> GateDecision:
     """Load SQLite-backed evidence then apply the pure centralized decision API."""
 
-    if context.task_id != binding.task_id or context.candidate_sha != seal.candidate_sha:
+    decision = _read_persisted_decision(repository, binding, seal, lease=lease)
+    if context is not None and context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate identity mismatch"),))
-    return decide_gates(context, read_gate_evidence(repository, binding, seal, lease=lease))
+    return decision
 
 
 def transition_ready_for_owner(
     repository: RepositoryIdentity,
     binding: WorktreeBinding,
     seal: CandidateSeal,
-    context: GateContext,
+    context: GateContext | None = None,
     *,
     evidence_fingerprint: str,
     lease: TransitionLease | None = None,
 ):
     """Permit only an aggregate PASS to perform the final lifecycle transition."""
 
-    decision = evaluate_gates(repository, binding, seal, context, lease=lease)
-    if decision.outcome is not GateOutcome.PASS:
-        raise GateError("ready-for-owner requires an aggregate PASS gate decision")
+    candidate_evidence(repository, binding, seal, lease=lease)
+    if context is not None and context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
+        raise GateError("gate context does not match committed task state")
     return transition_task(
         repository,
         _task_identity(repository, binding.task_id),
@@ -255,8 +297,61 @@ def transition_ready_for_owner(
         next_state="ready-for-owner",
         evidence_fingerprint=evidence_fingerprint,
         lease=lease,
-        gate_decision=decision,
     )
+
+
+def _read_persisted_decision(
+    repository: RepositoryIdentity,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    lease: TransitionLease | None,
+) -> GateDecision:
+    candidate_evidence(repository, binding, seal, lease=lease)
+    connection = _open_writable_connection(repository)
+    try:
+        decision = _decision_from_connection(connection, _task_identity(repository, binding.task_id))
+    finally:
+        connection.close()
+    return decision
+
+
+def _persisted_gate_context(repository: RepositoryIdentity, task_id: str, candidate_sha: str) -> GateContext | None:
+    connection = _open_writable_connection(repository)
+    try:
+        return _read_gate_context(connection, task_id, candidate_sha)
+    finally:
+        connection.close()
+
+
+def _decision_from_connection(connection, identity) -> GateDecision:
+    """Derive readiness from the exact persisted task, seal, context, and evidence rows."""
+
+    seal = connection.execute(
+        "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (identity.task_id,)
+    ).fetchone()
+    lease = connection.execute(
+        "SELECT state_identity FROM transition_leases WHERE lease_scope = 'repository-state'"
+    ).fetchone()
+    if seal is None or lease is None or seal[0] != identity.base_sha or seal[2] != lease[0]:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate seal is unavailable or stale"),))
+    context = _read_gate_context(connection, identity.task_id, seal[1])
+    if context is None:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "gate context is unavailable"),))
+    rows = connection.execute(
+        "SELECT gates.task_id, gates.candidate_sha, gates.gate_key, gates.outcome, gates.evaluator_id, gates.evaluated_at, gates.evidence_fingerprint, gates.changed_boundary, gates.reason FROM gate_evidence AS gates JOIN candidate_evidence AS candidate ON candidate.task_id = gates.task_id AND candidate.candidate_sha = gates.candidate_sha AND candidate.evidence_fingerprint = gates.evidence_fingerprint WHERE gates.task_id = ? AND gates.candidate_sha = ? ORDER BY gates.gate_key, gates.evaluator_id, gates.evidence_fingerprint",
+        (identity.task_id, seal[1]),
+    ).fetchall()
+    return decide_gates(context, tuple(GateEvidence(*row) for row in rows))
+
+
+def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:
+    row = connection.execute(
+        "SELECT source_count, isolated_local_task FROM gate_contexts WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return GateContext(task_id, candidate_sha, row[0], row[1])
 
 
 def _decide_requirement(context: GateContext, requirement: GateRequirement, entries: list[GateEvidence]) -> GateResult:
@@ -293,6 +388,23 @@ def _validate_evidence(evidence: GateEvidence) -> None:
         raise GateError("gate evidence is invalid")
 
 
+def _validate_context(context: GateContext) -> None:
+    if not _is_well_formed_context(context):
+        raise GateError("gate context is invalid")
+
+
+def _is_well_formed_context(context: GateContext) -> bool:
+    return (
+        isinstance(context.task_id, str)
+        and bool(_TOKEN.fullmatch(context.task_id))
+        and isinstance(context.candidate_sha, str)
+        and bool(_COMMIT.fullmatch(context.candidate_sha))
+        and type(context.source_count) is int
+        and context.source_count > 0
+        and type(context.isolated_local_task) is bool
+    )
+
+
 def _is_well_formed(evidence: GateEvidence) -> bool:
     return (
         isinstance(evidence.task_id, str)
@@ -302,10 +414,12 @@ def _is_well_formed(evidence: GateEvidence) -> bool:
         and _value(evidence.outcome) in {entry.value for entry in EvidenceOutcome}
         and isinstance(evidence.evaluator_id, str)
         and bool(_TOKEN.fullmatch(evidence.evaluator_id))
-        and isinstance(evidence.evaluated_at, int)
+        and type(evidence.evaluated_at) is int
         and evidence.evaluated_at > 0
         and isinstance(evidence.evidence_fingerprint, str)
         and bool(_FINGERPRINT.fullmatch(evidence.evidence_fingerprint))
+        and (evidence.changed_boundary is None or isinstance(evidence.changed_boundary, str))
+        and (evidence.reason is None or isinstance(evidence.reason, str))
     )
 
 

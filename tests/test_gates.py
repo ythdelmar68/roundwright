@@ -141,6 +141,22 @@ class GateDecisionTests(unittest.TestCase):
         self.assertTrue(pending_render.startswith("decision=PENDING\n"))
         self.assertTrue(blocked_render.startswith("decision=BLOCKED\n"))
 
+    def test_boolean_context_and_timestamp_values_are_invalid(self) -> None:
+        accepted = list(self.accepted_evidence())
+        accepted[-1] = GateEvidence(
+            accepted[-1].task_id,
+            accepted[-1].candidate_sha,
+            accepted[-1].gate_key,
+            accepted[-1].outcome,
+            accepted[-1].evaluator_id,
+            True,
+            accepted[-1].evidence_fingerprint,
+            accepted[-1].changed_boundary,
+            accepted[-1].reason,
+        )
+        self.assertEqual(decide_gates(self.context(), tuple(accepted)).outcome, GateOutcome.BLOCKED)
+        self.assertEqual(decide_gates(GateContext(self.task_id, self.candidate, True, "yes"), self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
+
 
 class SQLiteGateEvidenceTests(unittest.TestCase):
     def repository(self, root: Path) -> RepositoryIdentity:
@@ -166,15 +182,50 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True)
             evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             with mock.patch("roundwright.gates.bind_candidate_evidence") as bind:
-                record_gate_evidence(repository, binding, seal, evidence, lease=lease)
+                record_gate_evidence(repository, binding, seal, context, evidence, lease=lease)
             bind.assert_called_once()
             with mock.patch("roundwright.gates.candidate_evidence", return_value=(evidence.evidence_fingerprint,)):
                 self.assertEqual(read_gate_evidence(repository, binding, seal, lease=lease), (evidence,))
             moved = CandidateSeal(identity.task_id, identity.base_sha, "c" * 40, lease.state_identity)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=(evidence.evidence_fingerprint,)):
                 self.assertEqual(read_gate_evidence(repository, binding, moved, lease=lease), ())
+
+    def test_conflicting_replay_is_durable_and_detached_decisions_cannot_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = TaskIdentity("issue-21", "source-21", "ythdelmar68/roundwright", "codex/issue-21", "C:/private/issue-21", "a" * 40)
+            lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="gate-tests", ttl_seconds=60)
+            admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "1" * 64),), lease=lease)
+            binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, Path(identity.worktree), identity.base_sha, lease.state_identity)
+            seal = CandidateSeal(identity.task_id, identity.base_sha, "b" * 40, lease.state_identity)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)", (seal.task_id, seal.base_sha, seal.candidate_sha, seal.state_identity))
+                connection.commit()
+            finally:
+                connection.close()
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True)
+            passed = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
+            findings = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.FINDINGS, "validator", 1, "2" * 64)
+            with mock.patch("roundwright.gates.bind_candidate_evidence"):
+                record_gate_evidence(repository, binding, seal, context, passed, lease=lease)
+                with self.assertRaisesRegex(Exception, "conflicting gate evidence"):
+                    record_gate_evidence(repository, binding, seal, context, findings, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT outcome FROM gate_evidence").fetchone(), ("CONFLICT",))
+            finally:
+                connection.close()
+            from roundwright.state import StateError, transition_task
+
+            for before, after, fingerprint in (("queued", "planning", "3"), ("planning", "plan-review", "4"), ("plan-review", "implementing", "5"), ("implementing", "diff-review", "6")):
+                transition_task(repository, identity, expected_state=before, next_state=after, evidence_fingerprint=fingerprint * 64, lease=lease)
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="diff-review", next_state="ready-for-owner", evidence_fingerprint="7" * 64, lease=lease)
 
 
 if __name__ == "__main__":

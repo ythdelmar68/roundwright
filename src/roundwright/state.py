@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import sqlite3
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -488,7 +489,7 @@ def _require_token(value: str, name: str) -> None:
 
 
 def _require_worktree(value: str) -> None:
-    if not isinstance(value, str) or not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if not isinstance(value, str) or not value or any(unicodedata.category(character) == "Cc" for character in value):
         raise StateError("task worktree is invalid")
 
 

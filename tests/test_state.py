@@ -502,6 +502,22 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 task_projection(repository, mismatched)
 
+    def test_worktree_identity_rejects_c1_control_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = TaskIdentity(
+                task_id="task-with-control",
+                source_id="source-with-control",
+                repository_id="ythdelmar68/roundwright",
+                branch="codex/issue-19-control",
+                worktree="C:/valid\u0085path/worktree",
+                base_sha="b" * 40,
+            )
+            snapshot = SourceSnapshot("source-with-control", "ythdelmar68/roundwright", "a" * 64)
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (snapshot,))
+
     def test_blocked_recovery_returns_only_to_the_interrupted_stage(self) -> None:
         origins = (
             ("queued", ()),

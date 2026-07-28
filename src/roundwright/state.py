@@ -87,6 +87,17 @@ MIGRATIONS = (
             ("candidate_seals", "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, state_identity TEXT NOT NULL DEFAULT '')"),
         ),
     ),
+    Migration(
+        5,
+        (
+            "ALTER TABLE tasks ADD COLUMN worktree_key TEXT NOT NULL DEFAULT ''",
+            "CREATE TABLE task_worktree_ownership (worktree_key TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))",
+        ),
+        (
+            ("tasks", "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, blocked_from_state TEXT, worktree_key TEXT NOT NULL DEFAULT '', CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')), CHECK((state = 'blocked' AND blocked_from_state IS NOT NULL) OR (state != 'blocked' AND blocked_from_state IS NULL)))"),
+            ("task_worktree_ownership", "CREATE TABLE task_worktree_ownership (worktree_key TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))"),
+        ),
+    ),
 )
 
 
@@ -257,7 +268,7 @@ def transition_task(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_transition_lease(connection, lease)
+        _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity, expected_state)
         blocked_from = connection.execute(
             "SELECT blocked_from_state FROM tasks WHERE task_id = ?", (identity.task_id,)
@@ -442,20 +453,28 @@ def _mutate_task(repository: RepositoryIdentity, identity: TaskIdentity, snapsho
             )
         elif existing_source != (snapshot.repository_id, snapshot.source_digest):
             raise StateError("source snapshot identity does not match replayed input")
+        worktree_key = _canonical_worktree_key(identity.worktree)
         existing_task = connection.execute(
             "SELECT source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?", (identity.task_id,)
         ).fetchone()
         expected = (identity.source_id, identity.repository_id, identity.branch, identity.worktree, identity.base_sha)
         collision = connection.execute(
-            "SELECT task_id FROM tasks WHERE (branch = ? OR worktree = ?) AND task_id != ?",
-            (identity.branch, identity.worktree, identity.task_id),
+            "SELECT task_id FROM tasks WHERE branch = ? AND task_id != ?",
+            (identity.branch, identity.task_id),
         ).fetchone()
-        if collision is not None:
+        owner = connection.execute(
+            "SELECT task_id FROM task_worktree_ownership WHERE worktree_key = ?", (worktree_key,)
+        ).fetchone()
+        if collision is not None or (owner is not None and owner[0] != identity.task_id):
             raise StateError("an active task already owns the branch or worktree")
         if existing_task is None:
             connection.execute(
-                "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
-                (identity.task_id, *expected),
+                "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state, worktree_key) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (identity.task_id, *expected, worktree_key),
+            )
+            connection.execute(
+                "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?)",
+                (worktree_key, identity.task_id),
             )
         elif existing_task != expected:
             raise StateError("task identity does not match replayed input")
@@ -499,7 +518,7 @@ def _require_matching_task(
     return (row[0],)
 
 
-def _require_current_transition_lease(connection: sqlite3.Connection, lease: object | None) -> None:
+def _require_current_transition_lease(connection: sqlite3.Connection, lease: object | None, repository_id: str) -> None:
     """Require the exact unexpired lease row for every state transition."""
 
     required = ("repository_id", "state_identity", "owner", "generation", "expires_at")
@@ -510,6 +529,8 @@ def _require_current_transition_lease(connection: sqlite3.Connection, lease: obj
     ).fetchone()
     if row is None or tuple(getattr(lease, attribute) for attribute in required) != tuple(row):
         raise StateError("transition lease ownership has drifted")
+    if getattr(lease, "repository_id") != repository_id:
+        raise StateError("transition lease does not match the task repository")
     state = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
     if state is None or state[0] != getattr(lease, "state_identity"):
         raise StateError("transition lease state identity has drifted")
@@ -530,6 +551,7 @@ def _validate_task_identity(identity: TaskIdentity) -> None:
     _require_token(identity.repository_id, "repository identity")
     _require_token(identity.branch, "task branch")
     _require_worktree(identity.worktree)
+    _canonical_worktree_key(identity.worktree)
     if len(identity.base_sha) != 40 or any(character not in "0123456789abcdef" for character in identity.base_sha):
         raise StateError("base commit is not a full lowercase SHA")
 
@@ -542,6 +564,21 @@ def _require_token(value: str, name: str) -> None:
 def _require_worktree(value: str) -> None:
     if not isinstance(value, str) or not value or any(unicodedata.category(character) == "Cc" for character in value):
         raise StateError("task worktree is invalid")
+
+
+def _canonical_worktree_key(value: str) -> str:
+    """Return one platform-aware, absolute ownership key without exposing it."""
+
+    _require_worktree(value)
+    path = Path(value)
+    if not path.is_absolute():
+        raise StateError("task worktree must be an absolute path")
+    try:
+        normalized = path.resolve(strict=False)
+    except OSError as error:
+        raise StateError("task worktree is unavailable") from error
+    key = os.path.normpath(os.fspath(normalized))
+    return key.casefold() if os.name == "nt" else key
 
 
 def _require_fingerprint(value: str) -> None:
@@ -594,6 +631,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
             )
+        _backfill_task_worktree_ownership(connection)
         _ensure_state_identity(connection, allow_create=allow_new_identity and not exists)
         _validate_schema(connection, ordered)
         connection.commit()
@@ -615,6 +653,29 @@ def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migr
         raise StateError("database schema is not fully migrated")
     _validate_schema(connection, ordered)
     return ordered[-1].version if ordered else 0, _read_state_identity(connection)
+
+
+def _backfill_task_worktree_ownership(connection: sqlite3.Connection) -> None:
+    """Normalize legacy task paths before the new ownership invariant is accepted."""
+
+    has_ownership = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_worktree_ownership'"
+    ).fetchone()
+    if not has_ownership:
+        return
+    for task_id, worktree in connection.execute("SELECT task_id, worktree FROM tasks ORDER BY task_id"):
+        key = _canonical_worktree_key(worktree)
+        existing = connection.execute(
+            "SELECT task_id FROM task_worktree_ownership WHERE worktree_key = ?", (key,)
+        ).fetchone()
+        if existing is not None and existing[0] != task_id:
+            raise StateError("active task worktree ownership is ambiguous")
+        connection.execute("UPDATE tasks SET worktree_key = ? WHERE task_id = ?", (key, task_id))
+        connection.execute(
+            "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?) "
+            "ON CONFLICT(worktree_key) DO UPDATE SET task_id = excluded.task_id",
+            (key, task_id),
+        )
 
 
 def _validate_definitions(migrations: Iterable[Migration]) -> tuple[Migration, ...]:

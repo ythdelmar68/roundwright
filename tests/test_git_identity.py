@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sqlite3
 import sys
@@ -60,7 +61,8 @@ class GitIdentityTests(unittest.TestCase):
 
     def admit(self, repository: RepositoryIdentity, identity: TaskIdentity) -> None:
         initialize(repository)
-        admit_task(repository, identity, (SourceSnapshot("fixture-source", identity.repository_id, "a" * 64),))
+        digest = hashlib.sha256(identity.source_id.encode("utf-8")).hexdigest()
+        admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, digest),))
 
     def lease(self, repository: RepositoryIdentity):
         return acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-a", ttl_seconds=60)
@@ -115,6 +117,32 @@ class GitIdentityTests(unittest.TestCase):
             self.run_git(location, "checkout", "--detach")
             with self.assertRaises(GitIdentityError):
                 seal_candidate(repository, binding, lease=lease)
+
+    def test_repository_bound_lease_and_metadata_descendant_paths_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repository = self.repository(parent / "repository")
+            base = resolve_canonical_base(repository, "main")
+            initialize(repository)
+            wrong_lease = acquire_transition_lease(repository, repository_id="other/repository", owner="orchestrator-a", ttl_seconds=60)
+            normal = parent / "isolated" / "wrong-repository"
+            normal_identity = self.identity(base, branch="codex/wrong-repository", worktree=normal)
+            self.admit(repository, normal_identity)
+            with self.assertRaises(GitIdentityError):
+                provision_worktree(repository, normal_identity, default_branch="main", worktree=normal, lease=wrong_lease)
+            for name in (".git/nested-worktree", ".roundwright/nested-worktree"):
+                location = repository.root / name
+                identity = TaskIdentity(
+                    task_id=f"issue-20-{name.replace('/', '-')}",
+                    source_id=f"fixture-{name.replace('/', '-')}",
+                    repository_id="ythdelmar68/roundwright",
+                    branch=f"codex/{name.replace('/', '-')}",
+                    worktree=str(location),
+                    base_sha=base,
+                )
+                self.admit(repository, identity)
+                with self.subTest(path=name), self.assertRaises(GitIdentityError):
+                    provision_worktree(repository, identity, default_branch="main", worktree=location, lease=wrong_lease)
 
     def test_candidate_seal_is_idempotent_and_movement_invalidates_bound_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

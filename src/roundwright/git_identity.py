@@ -132,7 +132,7 @@ def renew_transition_lease(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, observed)
+        _require_current_lease(connection, lease, lease.repository_id, observed)
         renewed = TransitionLease(lease.repository_id, lease.state_identity, lease.owner, lease.generation, observed + ttl_seconds)
         connection.execute(
             "UPDATE transition_leases SET expires_at = ? WHERE lease_scope = 'repository-state'",
@@ -153,7 +153,7 @@ def release_transition_lease(repository: RepositoryIdentity, lease: TransitionLe
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, _clock(now))
+        _require_current_lease(connection, lease, lease.repository_id, _clock(now))
         connection.execute("DELETE FROM transition_leases WHERE lease_scope = 'repository-state'")
         connection.commit()
     except Exception:
@@ -204,7 +204,7 @@ def provision_worktree(
     requested = _validated_worktree_path(repository.root, worktree)
     if Path(identity.worktree).resolve(strict=False) != requested:
         raise GitIdentityError("task worktree path does not match committed task identity")
-    _verify_lease(repository, lease)
+    _verify_lease(repository, lease, identity.repository_id)
     binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, requested, identity.base_sha, _read_state_identity(repository))
     if requested.exists():
         return revalidate_worktree(repository, binding)
@@ -247,7 +247,7 @@ def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, *, 
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, None)
+        _require_current_lease(connection, lease, binding.repository_id, None)
         row = connection.execute(
             "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (verified.task_id,)
         ).fetchone()
@@ -276,7 +276,7 @@ def bind_candidate_evidence(repository: RepositoryIdentity, binding: WorktreeBin
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, None)
+        _require_current_lease(connection, lease, binding.repository_id, None)
         row = connection.execute(
             "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (seal.task_id,)
         ).fetchone()
@@ -330,12 +330,12 @@ def _read_state_identity(repository: RepositoryIdentity) -> str:
         connection.close()
 
 
-def _verify_lease(repository: RepositoryIdentity, lease: TransitionLease | None, now: int | None = None) -> None:
+def _verify_lease(repository: RepositoryIdentity, lease: TransitionLease | None, repository_id: str, now: int | None = None) -> None:
     if not isinstance(lease, TransitionLease):
         raise GitIdentityError("a current transition lease is required")
     connection = _open_writable_connection(repository)
     try:
-        _require_current_lease(connection, lease, _clock(now))
+        _require_current_lease(connection, lease, repository_id, _clock(now))
     finally:
         connection.close()
 
@@ -376,7 +376,7 @@ def _require_task_binding(repository: RepositoryIdentity, binding: WorktreeBindi
         raise GitIdentityError("task worktree path does not match committed task identity")
 
 
-def _require_current_lease(connection: sqlite3.Connection, lease: TransitionLease, observed: int | None) -> None:
+def _require_current_lease(connection: sqlite3.Connection, lease: TransitionLease, repository_id: str, observed: int | None) -> None:
     if not isinstance(lease, TransitionLease):
         raise GitIdentityError("a current transition lease is required")
     row = connection.execute(
@@ -384,6 +384,8 @@ def _require_current_lease(connection: sqlite3.Connection, lease: TransitionLeas
     ).fetchone()
     if row is None or TransitionLease(*row) != lease:
         raise GitIdentityError("transition lease ownership has drifted")
+    if lease.repository_id != repository_id:
+        raise GitIdentityError("transition lease does not match the task repository")
     if _state_identity(connection) != lease.state_identity:
         raise GitIdentityError("transition lease state identity has drifted")
     if lease.expires_at <= _clock(observed):
@@ -402,9 +404,18 @@ def _validated_worktree_path(root: Path, worktree: Path) -> Path:
         normalized = worktree.resolve(strict=False)
     except OSError as error:
         raise GitIdentityError("task worktree path is unavailable") from error
-    if normalized == root or normalized == root / ".git" or normalized.name in {".git", ".roundwright"}:
+    protected = (root, root / ".git", root / ".roundwright")
+    if any(_is_within(normalized, directory) for directory in protected):
         raise GitIdentityError("task worktree path is unsafe")
     return normalized
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+        return True
+    except ValueError:
+        return False
 
 
 def _is_ancestor(worktree: Path, base: str, candidate: str) -> bool:

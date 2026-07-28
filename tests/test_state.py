@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.configuration import RepositoryIdentity
 from roundwright import cli
 from roundwright.state import (
+    ArtifactReference,
     DatabaseStatus,
     MIGRATIONS,
     Migration,
@@ -446,6 +447,7 @@ class StateTests(unittest.TestCase):
             record_artifact(repository, identity, artifact_kind="plan", artifact_fingerprint="f" * 64)
             set_blocker(repository, identity, blocker_class="evidence-incomplete", evidence_fingerprint="1" * 64)
             projection = set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint="2" * 64)
+            self.assertEqual(projection.artifacts, (ArtifactReference("plan", "f" * 64),))
             self.assertEqual(projection.blockers, ("evidence-incomplete",))
             self.assertEqual(projection.next_action, "review-plan")
             connection = sqlite3.connect(database_path(repository))
@@ -454,6 +456,51 @@ class StateTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM artifact_references WHERE task_id = 'task-19'").fetchone()[0], 1)
             finally:
                 connection.close()
+            initialize(repository)
+            self.assertEqual(task_projection(repository, identity), projection)
+
+    def test_recovery_resolves_current_blockers_and_next_action_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            transition_task(repository, identity, expected_state="queued", next_state="blocked", evidence_fingerprint="1" * 64)
+            set_blocker(repository, identity, blocker_class="evidence-incomplete", evidence_fingerprint="2" * 64)
+            set_next_action(repository, identity, action_kind="provide-evidence", evidence_fingerprint="3" * 64)
+            recovered = transition_task(repository, identity, expected_state="blocked", next_state="queued", evidence_fingerprint="4" * 64)
+            self.assertEqual(recovered.state, "queued")
+            self.assertEqual(recovered.blockers, ())
+            self.assertIsNone(recovered.next_action)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT resolution_fingerprint FROM blockers").fetchone()[0], "4" * 64)
+                self.assertEqual(connection.execute("SELECT resolution_fingerprint FROM next_actions").fetchone()[0], "4" * 64)
+            finally:
+                connection.close()
+            initialize(repository)
+            self.assertEqual(task_projection(repository, identity), recovered)
+
+    def test_worktree_paths_with_spaces_remain_exact_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = TaskIdentity(
+                task_id="task-with-spaces",
+                source_id="source-with-spaces",
+                repository_id="ythdelmar68/roundwright",
+                branch="codex/issue-19-spaces",
+                worktree="C:/valid path/worktree",
+                base_sha="b" * 40,
+            )
+            snapshot = SourceSnapshot("source-with-spaces", "ythdelmar68/roundwright", "a" * 64)
+            admitted = admit_task(repository, identity, (snapshot,))
+            self.assertEqual(admitted, task_projection(repository, identity))
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (snapshot,))
+            mismatched = TaskIdentity(**{**identity.__dict__, "worktree": "C:/other path/worktree"})
+            with self.assertRaises(StateError):
+                task_projection(repository, mismatched)
 
     def test_blocked_recovery_returns_only_to_the_interrupted_stage(self) -> None:
         origins = (

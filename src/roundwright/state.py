@@ -49,16 +49,16 @@ MIGRATIONS = (
             "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, blocked_from_state TEXT, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')), CHECK((state = 'blocked' AND blocked_from_state IS NOT NULL) OR (state != 'blocked' AND blocked_from_state IS NULL)))",
             "CREATE TABLE transition_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, sequence), UNIQUE(task_id, evidence_fingerprint), CHECK(from_state != to_state))",
             "CREATE TABLE artifact_references (task_id TEXT NOT NULL REFERENCES tasks(task_id), artifact_kind TEXT NOT NULL, artifact_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, artifact_kind, artifact_fingerprint))",
-            "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, blocker_class))",
-            "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL)",
+            "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT, PRIMARY KEY(task_id, blocker_class))",
+            "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT)",
         ),
         (
             ("source_snapshots", "CREATE TABLE source_snapshots (source_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, source_digest TEXT NOT NULL, UNIQUE(repository_id, source_digest))"),
             ("tasks", "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, blocked_from_state TEXT, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')), CHECK((state = 'blocked' AND blocked_from_state IS NOT NULL) OR (state != 'blocked' AND blocked_from_state IS NULL)))"),
             ("transition_events", "CREATE TABLE transition_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, sequence), UNIQUE(task_id, evidence_fingerprint), CHECK(from_state != to_state))"),
             ("artifact_references", "CREATE TABLE artifact_references (task_id TEXT NOT NULL REFERENCES tasks(task_id), artifact_kind TEXT NOT NULL, artifact_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, artifact_kind, artifact_fingerprint))"),
-            ("blockers", "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, blocker_class))"),
-            ("next_actions", "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL)"),
+            ("blockers", "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT, PRIMARY KEY(task_id, blocker_class))"),
+            ("next_actions", "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT)"),
         ),
     ),
 )
@@ -78,6 +78,7 @@ _ALLOWED_TRANSITIONS = {
 }
 BLOCKER_CLASSES = frozenset({"evidence-ambiguous", "evidence-incomplete", "identity-mismatch", "policy-denied"})
 NEXT_ACTION_KINDS = frozenset({"provide-evidence", "reconcile-identity", "resolve-policy", "review-plan"})
+ARTIFACT_KINDS = frozenset({"diff", "plan", "review", "status"})
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,14 @@ class TaskIdentity:
 
 
 @dataclass(frozen=True)
+class ArtifactReference:
+    """Path-free artifact projection bound to a committed opaque fingerprint."""
+
+    kind: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
 class TaskProjection:
     """Owner-safe projection of committed task state; it deliberately omits paths."""
 
@@ -110,6 +119,7 @@ class TaskProjection:
     state: str
     base_sha: str
     source_fingerprint: str
+    artifacts: tuple[ArtifactReference, ...]
     blockers: tuple[str, ...]
     next_action: str | None
 
@@ -245,6 +255,15 @@ def transition_task(
                 "UPDATE tasks SET state = ?, blocked_from_state = NULL WHERE task_id = ? AND state = ?",
                 (next_state, identity.task_id, expected_state),
             )
+        if expected_state == "blocked":
+            connection.execute(
+                "UPDATE blockers SET resolution_fingerprint = ? WHERE task_id = ? AND resolution_fingerprint IS NULL",
+                (evidence_fingerprint, identity.task_id),
+            )
+            connection.execute(
+                "UPDATE next_actions SET resolution_fingerprint = ? WHERE task_id = ? AND resolution_fingerprint IS NULL",
+                (evidence_fingerprint, identity.task_id),
+            )
         connection.execute(
             "INSERT INTO transition_events(task_id, sequence, from_state, to_state, evidence_fingerprint) VALUES (?, ?, ?, ?, ?)",
             (identity.task_id, sequence, expected_state, next_state, evidence_fingerprint),
@@ -264,7 +283,7 @@ def record_artifact(
     """Persist an opaque artifact reference without making it the source of truth."""
 
     _validate_task_identity(identity)
-    _require_token(artifact_kind, "artifact kind")
+    _require_classification(artifact_kind, ARTIFACT_KINDS, "artifact kind")
     _require_fingerprint(artifact_fingerprint)
     connection = _open_writable_connection(repository)
     try:
@@ -296,8 +315,8 @@ def set_blocker(
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
         connection.execute(
-            "INSERT INTO blockers(task_id, blocker_class, evidence_fingerprint) VALUES (?, ?, ?) "
-            "ON CONFLICT(task_id, blocker_class) DO UPDATE SET evidence_fingerprint = excluded.evidence_fingerprint",
+            "INSERT INTO blockers(task_id, blocker_class, evidence_fingerprint, resolution_fingerprint) VALUES (?, ?, ?, NULL) "
+            "ON CONFLICT(task_id, blocker_class) DO UPDATE SET evidence_fingerprint = excluded.evidence_fingerprint, resolution_fingerprint = NULL",
             (identity.task_id, blocker_class, evidence_fingerprint),
         )
         connection.commit()
@@ -322,8 +341,8 @@ def set_next_action(
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
         connection.execute(
-            "INSERT INTO next_actions(task_id, action_kind, evidence_fingerprint) VALUES (?, ?, ?) "
-            "ON CONFLICT(task_id) DO UPDATE SET action_kind = excluded.action_kind, evidence_fingerprint = excluded.evidence_fingerprint",
+            "INSERT INTO next_actions(task_id, action_kind, evidence_fingerprint, resolution_fingerprint) VALUES (?, ?, ?, NULL) "
+            "ON CONFLICT(task_id) DO UPDATE SET action_kind = excluded.action_kind, evidence_fingerprint = excluded.evidence_fingerprint, resolution_fingerprint = NULL",
             (identity.task_id, action_kind, evidence_fingerprint),
         )
         connection.commit()
@@ -350,11 +369,18 @@ def task_projection(repository: RepositoryIdentity, identity: TaskIdentity) -> T
             source = connection.execute(
                 "SELECT source_digest FROM source_snapshots WHERE source_id = ?", (identity.source_id,)
             ).fetchone()
+            artifacts = tuple(
+                ArtifactReference(kind=row[0], fingerprint=row[1])
+                for row in connection.execute(
+                    "SELECT artifact_kind, artifact_fingerprint FROM artifact_references WHERE task_id = ? ORDER BY artifact_kind, artifact_fingerprint",
+                    (identity.task_id,),
+                )
+            )
             blockers = tuple(row[0] for row in connection.execute(
-                "SELECT blocker_class FROM blockers WHERE task_id = ? ORDER BY blocker_class", (identity.task_id,)
+                "SELECT blocker_class FROM blockers WHERE task_id = ? AND resolution_fingerprint IS NULL ORDER BY blocker_class", (identity.task_id,)
             ))
             next_action = connection.execute(
-                "SELECT action_kind FROM next_actions WHERE task_id = ?", (identity.task_id,)
+                "SELECT action_kind FROM next_actions WHERE task_id = ? AND resolution_fingerprint IS NULL", (identity.task_id,)
             ).fetchone()
         finally:
             connection.close()
@@ -368,6 +394,7 @@ def task_projection(repository: RepositoryIdentity, identity: TaskIdentity) -> T
         state=row[0],
         base_sha=identity.base_sha,
         source_fingerprint=hashlib.sha256(source[0].encode("ascii")).hexdigest()[:16],
+        artifacts=artifacts,
         blockers=blockers,
         next_action=None if next_action is None else next_action[0],
     )
@@ -450,7 +477,7 @@ def _validate_task_identity(identity: TaskIdentity) -> None:
     _require_token(identity.source_id, "source identity")
     _require_token(identity.repository_id, "repository identity")
     _require_token(identity.branch, "task branch")
-    _require_token(identity.worktree, "task worktree")
+    _require_worktree(identity.worktree)
     if len(identity.base_sha) != 40 or any(character not in "0123456789abcdef" for character in identity.base_sha):
         raise StateError("base commit is not a full lowercase SHA")
 
@@ -458,6 +485,11 @@ def _validate_task_identity(identity: TaskIdentity) -> None:
 def _require_token(value: str, name: str) -> None:
     if not isinstance(value, str) or not value or any(character.isspace() or ord(character) < 32 for character in value):
         raise StateError(f"{name} is invalid")
+
+
+def _require_worktree(value: str) -> None:
+    if not isinstance(value, str) or not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise StateError("task worktree is invalid")
 
 
 def _require_fingerprint(value: str) -> None:

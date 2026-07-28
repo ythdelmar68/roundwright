@@ -385,6 +385,7 @@ def _invalidate_candidate(repository: RepositoryIdentity, binding: WorktreeBindi
         if not isinstance(lease, TransitionLease) or binding.state_identity != lease.state_identity:
             raise GitIdentityError("candidate state identity has drifted")
         connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (binding.task_id,))
+        connection.execute("DELETE FROM gate_evidence WHERE task_id = ?", (binding.task_id,))
         connection.execute("DELETE FROM candidate_seals WHERE task_id = ?", (binding.task_id,))
         connection.commit()
     except Exception:

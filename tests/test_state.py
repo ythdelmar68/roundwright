@@ -615,3 +615,40 @@ class StateTests(unittest.TestCase):
             relative = TaskIdentity("task-relative", "source-relative", first.repository_id, "codex/relative", "private/worktree", first.base_sha)
             with self.assertRaises(StateError):
                 admit_task(repository, relative, (SourceSnapshot(relative.source_id, first.repository_id, "1" * 64),))
+            posix = TaskIdentity(
+                "task-posix",
+                "source-posix",
+                first.repository_id,
+                "codex/posix",
+                "/private/worktree",
+                first.base_sha,
+            )
+            admit_task(repository, posix, (SourceSnapshot(posix.source_id, first.repository_id, "2" * 64),))
+            posix_dot_alias = TaskIdentity(
+                "task-posix-dot",
+                "source-posix-dot",
+                first.repository_id,
+                "codex/posix-dot",
+                "/private/./worktree",
+                first.base_sha,
+            )
+            posix_separator_alias = TaskIdentity(
+                "task-posix-separator",
+                "source-posix-separator",
+                first.repository_id,
+                "codex/posix-separator",
+                "/private//worktree",
+                first.base_sha,
+            )
+            for identity, digest in ((posix_dot_alias, "3" * 64), (posix_separator_alias, "4" * 64)):
+                with self.subTest(identity=identity.task_id), self.assertRaises(StateError):
+                    admit_task(repository, identity, (SourceSnapshot(identity.source_id, first.repository_id, digest),))
+            posix_case_variant = TaskIdentity(
+                "task-posix-case",
+                "source-posix-case",
+                first.repository_id,
+                "codex/posix-case",
+                "/PRIVATE/worktree",
+                first.base_sha,
+            )
+            admit_task(repository, posix_case_variant, (SourceSnapshot(posix_case_variant.source_id, first.repository_id, "5" * 64),))

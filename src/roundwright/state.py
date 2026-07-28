@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import ntpath
 import os
+import posixpath
 import stat
 import sqlite3
 import time
@@ -570,15 +572,18 @@ def _canonical_worktree_key(value: str) -> str:
     """Return one platform-aware, absolute ownership key without exposing it."""
 
     _require_worktree(value)
-    path = Path(value)
-    if not path.is_absolute():
-        raise StateError("task worktree must be an absolute path")
-    try:
-        normalized = path.resolve(strict=False)
-    except OSError as error:
-        raise StateError("task worktree is unavailable") from error
-    key = os.path.normpath(os.fspath(normalized))
-    return key.casefold() if os.name == "nt" else key
+    if (
+        len(value) >= 3
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in ("/", "\\")
+    ):
+        return ntpath.normcase(ntpath.normpath(value)).replace("\\", "/")
+    if value.startswith("\\\\"):
+        return ntpath.normcase(ntpath.normpath(value)).replace("\\", "/")
+    if value.startswith("/"):
+        return posixpath.normpath(value)
+    raise StateError("task worktree must be an absolute path")
 
 
 def _require_fingerprint(value: str) -> None:

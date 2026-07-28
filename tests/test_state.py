@@ -17,7 +17,27 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright import cli
-from roundwright.state import DatabaseStatus, Migration, StateError, _apply_migrations, _is_reparse_point, check_database, database_path, initialize
+from roundwright.state import (
+    ArtifactReference,
+    DatabaseStatus,
+    MIGRATIONS,
+    Migration,
+    SourceSnapshot,
+    StateError,
+    TaskIdentity,
+    _apply_migrations,
+    _is_reparse_point,
+    _verify_migrations,
+    admit_task,
+    check_database,
+    database_path,
+    initialize,
+    record_artifact,
+    set_blocker,
+    set_next_action,
+    task_projection,
+    transition_task,
+)
 
 
 class StateTests(unittest.TestCase):
@@ -51,7 +71,7 @@ class StateTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             try:
                 connection.execute("UPDATE schema_migrations SET checksum = 'changed' WHERE version = 1")
-                connection.execute("INSERT INTO schema_migrations VALUES (2, 'future')")
+                connection.execute("INSERT INTO schema_migrations VALUES (3, 'future')")
                 connection.commit()
             finally:
                 connection.close()
@@ -297,3 +317,261 @@ class StateTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_bytes(b"not sqlite")
             self.assertEqual(check_database(repository).state, "corrupt")
+
+    def task_identity(self) -> TaskIdentity:
+        return TaskIdentity(
+            task_id="task-19",
+            source_id="local-fixture",
+            repository_id="ythdelmar68/roundwright",
+            branch="codex/issue-19",
+            worktree="C:/private/worktree",
+            base_sha="b" * 40,
+        )
+
+    def source_snapshot(self) -> SourceSnapshot:
+        return SourceSnapshot(
+            source_id="local-fixture",
+            repository_id="ythdelmar68/roundwright",
+            source_digest="a" * 64,
+        )
+
+    def identity_for(self, suffix: str) -> TaskIdentity:
+        return TaskIdentity(
+            task_id=f"task-19-{suffix}",
+            source_id=f"local-fixture-{suffix}",
+            repository_id="ythdelmar68/roundwright",
+            branch=f"codex/issue-19-{suffix}",
+            worktree=f"C:/private/worktree-{suffix}",
+            base_sha="b" * 40,
+        )
+
+    def source_for(self, suffix: str) -> SourceSnapshot:
+        return SourceSnapshot(f"local-fixture-{suffix}", "ythdelmar68/roundwright", (suffix * 64)[:64])
+
+    def test_phase_two_migration_persists_one_source_task_and_owner_safe_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            self.assertEqual(initialize(repository).version, 2)
+            projection = admit_task(repository, self.task_identity(), (self.source_snapshot(),))
+            self.assertEqual(projection.state, "queued")
+            self.assertEqual(projection.base_sha, "b" * 40)
+            self.assertNotIn("private", repr(projection))
+            self.assertNotIn("worktree", repr(projection))
+            self.assertEqual(projection, task_projection(repository, self.task_identity()))
+
+    def test_v1_database_upgrades_to_v2_without_reminting_identity_and_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, (MIGRATIONS[0],))
+                state_id = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()[0]
+            finally:
+                connection.close()
+            upgraded = initialize(repository)
+            self.assertEqual(upgraded.version, 2)
+            self.assertEqual(upgraded.identity, check_database(repository).identity)
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()[0], state_id)
+                self.assertEqual(
+                    connection.execute("SELECT version, checksum FROM schema_migrations ORDER BY version").fetchall(),
+                    [(migration.version, migration.checksum) for migration in MIGRATIONS],
+                )
+            finally:
+                connection.close()
+            self.assertEqual(initialize(repository), check_database(repository))
+
+    def test_failed_v2_upgrade_leaves_the_valid_v1_state_unchanged(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            _apply_migrations(connection, (MIGRATIONS[0],))
+            before = _verify_migrations(connection, (MIGRATIONS[0],))
+            broken = Migration(2, ("CREATE TABLE v2_transient (id INTEGER)", "not valid SQL"), ())
+            with self.assertRaises(sqlite3.DatabaseError):
+                _apply_migrations(connection, (MIGRATIONS[0], broken), allow_new_identity=False)
+            self.assertEqual(_verify_migrations(connection, (MIGRATIONS[0],)), before)
+            self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'v2_transient'").fetchone())
+
+    def test_task_projection_rejects_checksum_drift_and_incompatible_schema(self) -> None:
+        for mutation in ("checksum", "schema"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                initialize(repository)
+                identity = self.task_identity()
+                admit_task(repository, identity, (self.source_snapshot(),))
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    if mutation == "checksum":
+                        connection.execute("UPDATE schema_migrations SET checksum = 'drifted' WHERE version = 2")
+                    else:
+                        connection.execute("CREATE TABLE incompatible_projection_schema (id INTEGER)")
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(StateError):
+                    task_projection(repository, identity)
+
+    def test_lifecycle_rejects_invalid_regressive_duplicate_and_mismatched_transitions_transactionally(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="queued", next_state="implementing", evidence_fingerprint="c" * 64)
+            self.assertEqual(task_projection(repository, identity).state, "queued")
+            transitioned = transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="c" * 64)
+            self.assertEqual(transitioned.state, "planning")
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="planning", next_state="plan-review", evidence_fingerprint="c" * 64)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="planning", next_state="planning", evidence_fingerprint="d" * 64)
+            mismatched = TaskIdentity(**{**identity.__dict__, "branch": "codex/other"})
+            with self.assertRaises(StateError):
+                transition_task(repository, mismatched, expected_state="planning", next_state="plan-review", evidence_fingerprint="e" * 64)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+
+    def test_blocked_recovery_and_committed_projection_references_are_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="c" * 64)
+            transition_task(repository, identity, expected_state="planning", next_state="blocked", evidence_fingerprint="d" * 64)
+            blocked = transition_task(repository, identity, expected_state="blocked", next_state="planning", evidence_fingerprint="e" * 64)
+            self.assertEqual(blocked.state, "planning")
+            record_artifact(repository, identity, artifact_kind="plan", artifact_fingerprint="f" * 64)
+            set_blocker(repository, identity, blocker_class="evidence-incomplete", evidence_fingerprint="1" * 64)
+            projection = set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint="2" * 64)
+            self.assertEqual(projection.artifacts, (ArtifactReference("plan", "f" * 64),))
+            self.assertEqual(projection.blockers, ("evidence-incomplete",))
+            self.assertEqual(projection.next_action, "review-plan")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT state FROM tasks WHERE task_id = 'task-19'").fetchone()[0], projection.state)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM artifact_references WHERE task_id = 'task-19'").fetchone()[0], 1)
+            finally:
+                connection.close()
+            initialize(repository)
+            self.assertEqual(task_projection(repository, identity), projection)
+
+    def test_recovery_resolves_current_blockers_and_next_action_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            transition_task(repository, identity, expected_state="queued", next_state="blocked", evidence_fingerprint="1" * 64)
+            set_blocker(repository, identity, blocker_class="evidence-incomplete", evidence_fingerprint="2" * 64)
+            set_next_action(repository, identity, action_kind="provide-evidence", evidence_fingerprint="3" * 64)
+            recovered = transition_task(repository, identity, expected_state="blocked", next_state="queued", evidence_fingerprint="4" * 64)
+            self.assertEqual(recovered.state, "queued")
+            self.assertEqual(recovered.blockers, ())
+            self.assertIsNone(recovered.next_action)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT resolution_fingerprint FROM blockers").fetchone()[0], "4" * 64)
+                self.assertEqual(connection.execute("SELECT resolution_fingerprint FROM next_actions").fetchone()[0], "4" * 64)
+            finally:
+                connection.close()
+            initialize(repository)
+            self.assertEqual(task_projection(repository, identity), recovered)
+
+    def test_worktree_paths_with_spaces_remain_exact_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = TaskIdentity(
+                task_id="task-with-spaces",
+                source_id="source-with-spaces",
+                repository_id="ythdelmar68/roundwright",
+                branch="codex/issue-19-spaces",
+                worktree="C:/valid path/worktree",
+                base_sha="b" * 40,
+            )
+            snapshot = SourceSnapshot("source-with-spaces", "ythdelmar68/roundwright", "a" * 64)
+            admitted = admit_task(repository, identity, (snapshot,))
+            self.assertEqual(admitted, task_projection(repository, identity))
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (snapshot,))
+            mismatched = TaskIdentity(**{**identity.__dict__, "worktree": "C:/other path/worktree"})
+            with self.assertRaises(StateError):
+                task_projection(repository, mismatched)
+
+    def test_worktree_identity_rejects_c1_control_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = TaskIdentity(
+                task_id="task-with-control",
+                source_id="source-with-control",
+                repository_id="ythdelmar68/roundwright",
+                branch="codex/issue-19-control",
+                worktree="C:/valid\u0085path/worktree",
+                base_sha="b" * 40,
+            )
+            snapshot = SourceSnapshot("source-with-control", "ythdelmar68/roundwright", "a" * 64)
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (snapshot,))
+
+    def test_blocked_recovery_returns_only_to_the_interrupted_stage(self) -> None:
+        origins = (
+            ("queued", ()),
+            ("planning", ("planning",)),
+            ("plan-review", ("planning", "plan-review")),
+            ("implementing", ("planning", "plan-review", "implementing")),
+            ("diff-review", ("planning", "plan-review", "implementing", "diff-review")),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            for index, (origin, path) in enumerate(origins, start=1):
+                with self.subTest(origin=origin):
+                    suffix = str(index)
+                    identity = self.identity_for(suffix)
+                    admit_task(repository, identity, (self.source_for(suffix),))
+                    current = "queued"
+                    for step, next_state in enumerate(path, start=1):
+                        transition_task(repository, identity, expected_state=current, next_state=next_state, evidence_fingerprint=(f"{index:x}{step:x}" * 64)[:64])
+                        current = next_state
+                    transition_task(repository, identity, expected_state=origin, next_state="blocked", evidence_fingerprint=(f"{index:x}a" * 64)[:64])
+                    for skipped in {"queued", "planning", "plan-review", "implementing", "diff-review"} - {origin}:
+                        with self.assertRaises(StateError):
+                            transition_task(repository, identity, expected_state="blocked", next_state=skipped, evidence_fingerprint=(f"{index:x}b" * 64)[:64])
+                    recovered = transition_task(repository, identity, expected_state="blocked", next_state=origin, evidence_fingerprint=(f"{index:x}c" * 64)[:64])
+                    self.assertEqual(recovered.state, origin)
+
+    def test_owner_visible_classifications_reject_paths_and_raw_provider_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                set_blocker(repository, identity, blocker_class="C:\\private\\worktree", evidence_fingerprint="1" * 64)
+            with self.assertRaises(StateError):
+                set_next_action(repository, identity, action_kind="provider-output-" + "x" * 100, evidence_fingerprint="2" * 64)
+            projection = task_projection(repository, identity)
+            self.assertEqual(projection.blockers, ())
+            self.assertIsNone(projection.next_action)
+
+    def test_multi_source_and_replayed_task_admission_are_rejected_without_partial_task_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            alternate = SourceSnapshot("other-fixture", "ythdelmar68/roundwright", "c" * 64)
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (self.source_snapshot(), alternate))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            finally:
+                connection.close()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (self.source_snapshot(),))

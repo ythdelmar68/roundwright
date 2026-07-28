@@ -163,6 +163,15 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha))"),
         ),
     ),
+    Migration(
+        12,
+        (
+            "ALTER TABLE gate_contexts ADD COLUMN policy_activated_at TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
 )
 
 

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +23,7 @@ from roundwright.gates import (
     GateError,
     GateKey,
     GateOutcome,
+    TrustedGatePolicyEvidence,
     decide_gates,
     evaluate_gates,
     render_gate_decision,
@@ -31,6 +33,7 @@ from roundwright.gates import (
 )
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease
+from roundwright.policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.state import SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, transition_task
 
 
@@ -188,12 +191,49 @@ class GateDecisionTests(unittest.TestCase):
 
 
 class SQLiteGateEvidenceTests(unittest.TestCase):
+    def policy_snapshot(self) -> TrustedPolicySnapshot:
+        return TrustedPolicySnapshot(
+            TrustedControlSource("a" * 64, "b" * 64),
+            PolicyDocument(1, frozenset({PolicyAction.ISSUE_COMMENT})),
+        )
+
+    def policy_evidence(
+        self,
+        context: GateContext,
+        *,
+        activated_at: datetime | None = None,
+        status: ReceiptStatus = ReceiptStatus.FRESH,
+    ) -> TrustedGatePolicyEvidence:
+        snapshot = self.policy_snapshot()
+        activated_at = datetime(2026, 7, 29, tzinfo=timezone.utc) if activated_at is None else activated_at
+        now = activated_at + timedelta(minutes=1)
+        receipt = ActivationReceipt(
+            "c" * 64,
+            context.receipt_fingerprint,
+            snapshot.source.source_fingerprint,
+            snapshot.source.revision_fingerprint,
+            snapshot.policy_digest,
+            1,
+            "e" * 64,
+            context.candidate_sha,
+            activated_at,
+            now + timedelta(minutes=1),
+        )
+        return TrustedGatePolicyEvidence(
+            snapshot,
+            receipt,
+            "e" * 64,
+            StandingAuthority(frozenset(PolicyAction)),
+            now,
+            status,
+        )
+
     def repository(self, root: Path) -> RepositoryIdentity:
         repository = object.__new__(RepositoryIdentity)
         object.__setattr__(repository, "root", root.resolve())
         return repository
 
-    def complete_persisted_pass(self, root: Path):
+    def complete_persisted_pass(self, root: Path, *, receipt_fingerprint: str = "d" * 64):
         repository = self.repository(root)
         initialize(repository)
         identity = TaskIdentity("issue-21", "source-21", "ythdelmar68/roundwright", "codex/issue-21", "C:/private/issue-21", "a" * 40)
@@ -207,14 +247,15 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
-        context = GateContext(identity.task_id, seal.candidate_sha, 1, True, "c" * 64, "d" * 64)
+        context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, receipt_fingerprint)
+        policy_evidence = self.policy_evidence(context)
         evidence = []
         for number, requirement in enumerate(GATE_REGISTRY, 1):
             outcome = EvidenceOutcome.NOT_APPLICABLE if requirement.permits_phase_two_local_na else EvidenceOutcome.PASS
             evidence.append(GateEvidence(identity.task_id, seal.candidate_sha, requirement.key, outcome, "validator", number, f"{number:064x}", "isolated local boundary" if outcome is EvidenceOutcome.NOT_APPLICABLE else None, "no external adapter in Phase 2" if outcome is EvidenceOutcome.NOT_APPLICABLE else None))
         with mock.patch("roundwright.gates.bind_candidate_evidence"):
             for item in evidence:
-                record_gate_evidence(repository, binding, seal, context, item, lease=lease)
+                record_gate_evidence(repository, binding, seal, context, item, policy_evidence=policy_evidence, lease=lease)
         connection = sqlite3.connect(database_path(repository))
         try:
             connection.executemany("INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)", [(identity.task_id, seal.candidate_sha, item.evidence_fingerprint) for item in evidence])
@@ -243,10 +284,11 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, "c" * 64, "d" * 64)
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64)
+            policy_evidence = self.policy_evidence(context)
             evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             with mock.patch("roundwright.gates.bind_candidate_evidence") as bind:
-                record_gate_evidence(repository, binding, seal, context, evidence, lease=lease)
+                record_gate_evidence(repository, binding, seal, context, evidence, policy_evidence=policy_evidence, lease=lease)
             bind.assert_called_once()
             with mock.patch("roundwright.gates.candidate_evidence", return_value=(evidence.evidence_fingerprint,)):
                 self.assertEqual(read_gate_evidence(repository, binding, seal, lease=lease), (evidence,))
@@ -269,13 +311,14 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, "c" * 64, "d" * 64)
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64)
+            policy_evidence = self.policy_evidence(context)
             passed = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             findings = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.FINDINGS, "validator", 1, "2" * 64)
             with mock.patch("roundwright.gates.bind_candidate_evidence"):
-                record_gate_evidence(repository, binding, seal, context, passed, lease=lease)
+                record_gate_evidence(repository, binding, seal, context, passed, policy_evidence=policy_evidence, lease=lease)
                 with self.assertRaisesRegex(Exception, "conflicting gate evidence"):
-                    record_gate_evidence(repository, binding, seal, context, findings, lease=lease)
+                    record_gate_evidence(repository, binding, seal, context, findings, policy_evidence=policy_evidence, lease=lease)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT outcome FROM gate_evidence").fetchone(), ("CONFLICT",))
@@ -289,10 +332,11 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
     def test_persisted_all_gates_pass_decodes_context_and_allows_final_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            policy_evidence = self.policy_evidence(context)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
-                self.assertEqual(evaluate_gates(repository, binding, seal, context, lease=lease).outcome, GateOutcome.PASS)
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.PASS)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
-                transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
+                transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, policy_evidence=policy_evidence, lease=lease)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone(), ("ready-for-owner",))
@@ -304,13 +348,14 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
                 repository, identity, binding, seal, context, lease, _ = self.complete_persisted_pass(Path(temporary))
                 with self.assertRaisesRegex(GitIdentityError, message), mock.patch("roundwright.gates.candidate_evidence", side_effect=GitIdentityError(message)):
-                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, policy_evidence=self.policy_evidence(context), lease=lease)
                 with self.assertRaises(StateError):
                     transition_task(repository, identity, expected_state="diff-review", next_state="ready-for-owner", evidence_fingerprint="8" * 64, lease=lease)
 
     def test_persisted_follow_up_and_policy_movement_block_without_candidate_movement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            policy_evidence = self.policy_evidence(context)
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute(
@@ -321,19 +366,148 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             finally:
                 connection.close()
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
-                self.assertEqual(evaluate_gates(repository, binding, seal, context, lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
             moved_policy = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, "e" * 64, context.receipt_fingerprint)
             moved_receipt = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, context.policy_digest, "f" * 64)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
-                self.assertEqual(evaluate_gates(repository, binding, seal, moved_policy, lease=lease).outcome, GateOutcome.BLOCKED)
-                self.assertEqual(evaluate_gates(repository, binding, seal, moved_receipt, lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal, moved_policy, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal, moved_receipt, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
                 with self.assertRaises(GateError):
-                    transition_ready_for_owner(repository, binding, seal, moved_policy, evidence_fingerprint="7" * 64, lease=lease)
+                    transition_ready_for_owner(repository, binding, seal, moved_policy, evidence_fingerprint="7" * 64, policy_evidence=policy_evidence, lease=lease)
+
+    def test_superseded_receipt_replay_cannot_replace_current_context_or_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, old_context, lease, _ = self.complete_persisted_pass(Path(temporary))
+            fresh_context = GateContext(
+                old_context.task_id,
+                old_context.candidate_sha,
+                old_context.source_count,
+                old_context.isolated_local_task,
+                old_context.policy_digest,
+                "f" * 64,
+            )
+            fresh_policy = self.policy_evidence(
+                fresh_context,
+                activated_at=datetime(2026, 7, 29, 1, tzinfo=timezone.utc),
+            )
+            fresh_evidence = []
+            for number, requirement in enumerate(GATE_REGISTRY, 1):
+                outcome = EvidenceOutcome.NOT_APPLICABLE if requirement.permits_phase_two_local_na else EvidenceOutcome.PASS
+                fresh_evidence.append(
+                    GateEvidence(
+                        identity.task_id,
+                        seal.candidate_sha,
+                        requirement.key,
+                        outcome,
+                        "validator",
+                        number,
+                        f"{number + 64:064x}",
+                        "isolated local boundary" if outcome is EvidenceOutcome.NOT_APPLICABLE else None,
+                        "no external adapter in Phase 2" if outcome is EvidenceOutcome.NOT_APPLICABLE else None,
+                    )
+                )
+            with mock.patch("roundwright.gates.bind_candidate_evidence"):
+                for entry in fresh_evidence:
+                    record_gate_evidence(
+                        repository,
+                        binding,
+                        seal,
+                        fresh_context,
+                        entry,
+                        policy_evidence=fresh_policy,
+                        lease=lease,
+                    )
+            fingerprints = tuple(entry.evidence_fingerprint for entry in fresh_evidence)
+            stale_context = GateContext(
+                fresh_context.task_id,
+                fresh_context.candidate_sha,
+                fresh_context.source_count,
+                fresh_context.isolated_local_task,
+                fresh_context.policy_digest,
+                "d" * 64,
+            )
+            stale_evidence = GateEvidence(
+                identity.task_id,
+                seal.candidate_sha,
+                GateKey.BUILD,
+                EvidenceOutcome.PASS,
+                "validator",
+                99,
+                "f" * 64,
+            )
+            with mock.patch("roundwright.gates.bind_candidate_evidence"):
+                with self.assertRaisesRegex(GateError, "gate context conflicts"):
+                    record_gate_evidence(
+                        repository,
+                        binding,
+                        seal,
+                        stale_context,
+                        stale_evidence,
+                        policy_evidence=self.policy_evidence(stale_context),
+                        lease=lease,
+                    )
+                with self.assertRaisesRegex(GateError, "current trusted policy evidence"):
+                    record_gate_evidence(
+                        repository,
+                        binding,
+                        seal,
+                        stale_context,
+                        stale_evidence,
+                        policy_evidence=self.policy_evidence(stale_context, status=ReceiptStatus.CONSUMED),
+                        lease=lease,
+                    )
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(
+                    evaluate_gates(
+                        repository,
+                        binding,
+                        seal,
+                        stale_context,
+                        policy_evidence=self.policy_evidence(stale_context, status=ReceiptStatus.CONSUMED),
+                        lease=lease,
+                    ).outcome,
+                    GateOutcome.BLOCKED,
+                )
+                self.assertEqual(
+                    evaluate_gates(
+                        repository,
+                        binding,
+                        seal,
+                        fresh_context,
+                        policy_evidence=fresh_policy,
+                        lease=lease,
+                    ).outcome,
+                    GateOutcome.PASS,
+                )
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(
+                        repository,
+                        binding,
+                        seal,
+                        stale_context,
+                        evidence_fingerprint="7" * 64,
+                        policy_evidence=self.policy_evidence(stale_context, status=ReceiptStatus.CONSUMED),
+                        lease=lease,
+                    )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    ("diff-review",),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, seal.candidate_sha)).fetchone(),
+                    (fresh_context.receipt_fingerprint,),
+                )
+            finally:
+                connection.close()
 
     def test_every_na_gate_with_an_unresolved_follow_up_cannot_complete_final_transition(self) -> None:
         for requirement in (item for item in GATE_REGISTRY if item.permits_phase_two_local_na):
             with self.subTest(gate=requirement.key), tempfile.TemporaryDirectory() as temporary:
                 repository, _, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+                policy_evidence = self.policy_evidence(context)
                 connection = sqlite3.connect(database_path(repository))
                 try:
                     connection.execute(
@@ -350,7 +524,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                     connection.close()
                 with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
                     with self.assertRaises(StateError):
-                        transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
+                        transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, policy_evidence=policy_evidence, lease=lease)
 
     def test_receipt_context_is_rebound_for_each_candidate_and_rejects_stale_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -387,23 +561,23 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                     )
                 with mock.patch("roundwright.gates.bind_candidate_evidence"):
                     for entry in entries:
-                        record_gate_evidence(repository, binding, candidate_seal, context, entry, lease=lease)
+                        record_gate_evidence(repository, binding, candidate_seal, context, entry, policy_evidence=self.policy_evidence(context), lease=lease)
                 return tuple(entry.evidence_fingerprint for entry in entries)
 
             seal_b = reseal("e" * 40)
             context_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, "f" * 64)
             stale_receipt_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, context_a.receipt_fingerprint)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=()):
-                self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, policy_evidence=self.policy_evidence(stale_receipt_b, status=ReceiptStatus.CONSUMED), lease=lease).outcome, GateOutcome.BLOCKED)
             fingerprints_b = record_complete(seal_b, context_b)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints_b):
-                self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, lease=lease).outcome, GateOutcome.BLOCKED)
-                self.assertEqual(evaluate_gates(repository, binding, seal_b, context_b, lease=lease).outcome, GateOutcome.PASS)
+                self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, policy_evidence=self.policy_evidence(stale_receipt_b, status=ReceiptStatus.CONSUMED), lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal_b, context_b, policy_evidence=self.policy_evidence(context_b), lease=lease).outcome, GateOutcome.PASS)
 
             restored_a = reseal(seal_a.candidate_sha)
             restored_fingerprints = record_complete(restored_a, context_a)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=restored_fingerprints):
-                self.assertEqual(evaluate_gates(repository, binding, restored_a, context_a, lease=lease).outcome, GateOutcome.PASS)
+                self.assertEqual(evaluate_gates(repository, binding, restored_a, context_a, policy_evidence=self.policy_evidence(context_a), lease=lease).outcome, GateOutcome.PASS)
 
 
 if __name__ == "__main__":

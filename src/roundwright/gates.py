@@ -5,10 +5,12 @@ from __future__ import annotations
 import re
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence
+from .policy import ActivationReceipt, ReceiptStatus, StandingAuthority, TrustedPolicySnapshot, evaluate_policy
 from .state import StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner
 
 
@@ -84,6 +86,18 @@ class GateContext:
     isolated_local_task: bool
     policy_digest: str
     receipt_fingerprint: str
+
+
+@dataclass(frozen=True)
+class TrustedGatePolicyEvidence:
+    """Externally verified policy material for the current gate evaluation."""
+
+    snapshot: TrustedPolicySnapshot
+    receipt: ActivationReceipt
+    task_fingerprint: str
+    standing_authority: StandingAuthority
+    evaluated_at: datetime
+    receipt_status: ReceiptStatus
 
 
 @dataclass(frozen=True)
@@ -178,12 +192,16 @@ def record_gate_evidence(
     context: GateContext,
     evidence: GateEvidence,
     *,
+    policy_evidence: TrustedGatePolicyEvidence,
     lease: TransitionLease | None = None,
 ) -> None:
     """Persist one exact-candidate gate record and bind its fingerprint to that candidate."""
 
     _validate_context(context)
     _validate_evidence(evidence)
+    policy_activated_at = _current_trusted_policy_activation(context, policy_evidence)
+    if policy_activated_at is None:
+        raise GateError("gate context does not match current trusted policy evidence")
     if (
         context.task_id != binding.task_id
         or context.candidate_sha != seal.candidate_sha
@@ -210,19 +228,18 @@ def record_gate_evidence(
         if context.source_count != source_count:
             raise GateError("gate context source count does not match committed task state")
         persisted_context = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
             (binding.task_id, seal.candidate_sha),
         ).fetchone()
         context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint)
         if persisted_context is None:
             connection.execute(
-                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?)",
-                (binding.task_id, seal.candidate_sha, *context_values),
+                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, policy_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at),
             )
-        elif persisted_context != context_values:
-            # Policy and receipt evidence are candidate-bound.  Replacing either
-            # one invalidates every decision component for this candidate, then
-            # records the fresh fingerprint below in the same transaction.
+        elif persisted_context[:4] != context_values:
+            if type(persisted_context[4]) is not str or policy_activated_at <= persisted_context[4]:
+                raise GateError("gate context conflicts with committed task state")
             connection.execute(
                 "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",
                 (binding.task_id, seal.candidate_sha),
@@ -232,9 +249,11 @@ def record_gate_evidence(
                 (binding.task_id, seal.candidate_sha),
             )
             connection.execute(
-                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ? WHERE task_id = ? AND candidate_sha = ?",
-                (*context_values, binding.task_id, seal.candidate_sha),
+                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, policy_activated_at = ? WHERE task_id = ? AND candidate_sha = ?",
+                (*context_values, policy_activated_at, binding.task_id, seal.candidate_sha),
             )
+        elif persisted_context[4] != policy_activated_at:
+            raise GateError("gate context conflicts with committed task state")
         connection.execute(
             "INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)",
             (binding.task_id, seal.candidate_sha, evidence.evidence_fingerprint),
@@ -308,13 +327,19 @@ def evaluate_gates(
     seal: CandidateSeal,
     context: GateContext,
     *,
+    policy_evidence: TrustedGatePolicyEvidence,
     lease: TransitionLease | None = None,
 ) -> GateDecision:
     """Load SQLite-backed evidence then apply the pure centralized decision API."""
 
+    policy_activated_at = _current_trusted_policy_activation(context, policy_evidence)
+    if policy_activated_at is None:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "current trusted policy evidence is unavailable"),))
     decision = _read_persisted_decision(repository, binding, seal, lease=lease)
     if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate identity mismatch"),))
+    if policy_activated_at != _persisted_policy_activation(repository, binding.task_id, seal.candidate_sha):
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "trusted policy receipt is stale"),))
     return decision
 
 
@@ -325,13 +350,19 @@ def transition_ready_for_owner(
     context: GateContext,
     *,
     evidence_fingerprint: str,
+    policy_evidence: TrustedGatePolicyEvidence,
     lease: TransitionLease | None = None,
 ):
     """Permit only an aggregate PASS to perform the final lifecycle transition."""
 
+    policy_activated_at = _current_trusted_policy_activation(context, policy_evidence)
+    if policy_activated_at is None:
+        raise GateError("gate context does not match current trusted policy evidence")
     candidate_evidence(repository, binding, seal, lease=lease)
     if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         raise GateError("gate context does not match committed task state")
+    if policy_activated_at != _persisted_policy_activation(repository, binding.task_id, seal.candidate_sha):
+        raise GateError("trusted policy receipt is stale")
     return _transition_ready_for_owner(
         repository,
         _task_identity(repository, binding.task_id),
@@ -364,6 +395,18 @@ def _persisted_gate_context(repository: RepositoryIdentity, task_id: str, candid
         return _read_gate_context(connection, task_id, candidate_sha)
     finally:
         connection.close()
+
+
+def _persisted_policy_activation(repository: RepositoryIdentity, task_id: str, candidate_sha: str) -> str | None:
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+            (task_id, candidate_sha),
+        ).fetchone()
+    finally:
+        connection.close()
+    return row[0] if row is not None and isinstance(row[0], str) and row[0] else None
 
 
 def _decision_from_connection(connection, identity) -> GateDecision:
@@ -436,6 +479,36 @@ def _validate_evidence(evidence: GateEvidence) -> None:
 def _validate_context(context: GateContext) -> None:
     if not _is_well_formed_context(context):
         raise GateError("gate context is invalid")
+
+
+def _current_trusted_policy_activation(context: GateContext, evidence: object) -> str | None:
+    """Require the policy module to independently validate this exact binding."""
+
+    if type(evidence) is not TrustedGatePolicyEvidence:
+        return None
+    try:
+        decision = evaluate_policy(
+            evidence.snapshot,
+            evidence.receipt,
+            task_fingerprint=evidence.task_fingerprint,
+            candidate_sha=context.candidate_sha,
+            standing_authority=evidence.standing_authority,
+            now=evidence.evaluated_at,
+            receipt_status=evidence.receipt_status,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (
+        decision.authorized
+        and decision.policy_digest == context.policy_digest
+        and decision.receipt_fingerprint == context.receipt_fingerprint
+    ):
+        return None
+    try:
+        activated_at = evidence.receipt.activated_at
+        return activated_at.isoformat() if type(activated_at) is datetime else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _is_well_formed_context(context: GateContext) -> bool:

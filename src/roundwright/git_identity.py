@@ -230,10 +230,9 @@ def revalidate_worktree(repository: RepositoryIdentity, binding: WorktreeBinding
     head = _git_commit(worktree, "rev-parse", "--verify", "HEAD^{commit}")
     if head != binding.base_sha and not _is_ancestor(worktree, binding.base_sha, head):
         raise GitIdentityError("task worktree does not descend from its base")
-    registered = _git(root, "worktree", "list", "--porcelain")
-    registered_path = os.fspath(worktree).replace("\\", "/")
-    if f"worktree {registered_path}" not in registered.replace("\\", "/"):
+    if _local_path_key(worktree) not in _registered_worktree_paths(root):
         raise GitIdentityError("task worktree is not an active registered worktree")
+    _require_worktree_backlink(worktree)
     return WorktreeBinding(binding.task_id, binding.repository_id, binding.branch, worktree, binding.base_sha, binding.state_identity)
 
 
@@ -431,6 +430,45 @@ def _common_git_directory(worktree: Path) -> Path:
         return raw.resolve(strict=True)
     except OSError as error:
         raise GitIdentityError("Git common directory is unavailable") from error
+
+
+def _registered_worktree_paths(root: Path) -> frozenset[str]:
+    """Parse Git's porcelain records into exact local path identities."""
+
+    paths: set[str] = set()
+    for record in _git(root, "worktree", "list", "--porcelain").split("\n\n"):
+        for line in record.splitlines():
+            if line.startswith("worktree "):
+                paths.add(_local_path_key(Path(line.removeprefix("worktree "))))
+                break
+    return frozenset(paths)
+
+
+def _require_worktree_backlink(worktree: Path) -> None:
+    """Prove the linked-worktree Git directory points back to this exact path."""
+
+    common = _common_git_directory(worktree)
+    git_directory = Path(_git(worktree, "rev-parse", "--absolute-git-dir"))
+    try:
+        git_directory = git_directory.resolve(strict=True)
+        expected_parent = (common / "worktrees").resolve(strict=True)
+        if git_directory.parent != expected_parent:
+            raise GitIdentityError("task worktree metadata is not a linked worktree")
+        backlink = git_directory / "gitdir"
+        target = Path(backlink.read_text(encoding="utf-8").strip()).resolve(strict=True)
+        expected = (worktree / ".git").resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise GitIdentityError("task worktree metadata is unavailable") from error
+    if target != expected:
+        raise GitIdentityError("task worktree metadata does not bind its exact path")
+
+
+def _local_path_key(path: Path) -> str:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as error:
+        raise GitIdentityError("task worktree path is unavailable") from error
+    return os.path.normcase(os.path.normpath(os.fspath(resolved)))
 
 
 def _git_commit(worktree: Path, *arguments: str) -> str:

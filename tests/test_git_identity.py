@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 import sqlite3
 import sys
@@ -22,6 +23,7 @@ from roundwright.git_identity import (
     bind_candidate_evidence,
     candidate_evidence,
     provision_worktree,
+    revalidate_worktree,
     release_transition_lease,
     renew_transition_lease,
     resolve_canonical_base,
@@ -62,7 +64,12 @@ class GitIdentityTests(unittest.TestCase):
     def admit(self, repository: RepositoryIdentity, identity: TaskIdentity) -> None:
         initialize(repository)
         digest = hashlib.sha256(identity.source_id.encode("utf-8")).hexdigest()
-        admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, digest),))
+        admit_task(
+            repository,
+            identity,
+            (SourceSnapshot(identity.source_id, identity.repository_id, digest),),
+            lease=self.lease(repository),
+        )
 
     def lease(self, repository: RepositoryIdentity):
         return acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-a", ttl_seconds=60)
@@ -124,10 +131,11 @@ class GitIdentityTests(unittest.TestCase):
             repository = self.repository(parent / "repository")
             base = resolve_canonical_base(repository, "main")
             initialize(repository)
-            wrong_lease = acquire_transition_lease(repository, repository_id="other/repository", owner="orchestrator-a", ttl_seconds=60)
             normal = parent / "isolated" / "wrong-repository"
             normal_identity = self.identity(base, branch="codex/wrong-repository", worktree=normal)
             self.admit(repository, normal_identity)
+            current = self.lease(repository)
+            wrong_lease = TransitionLease("other/repository", current.state_identity, current.owner, current.generation, current.expires_at)
             with self.assertRaises(GitIdentityError):
                 provision_worktree(repository, normal_identity, default_branch="main", worktree=normal, lease=wrong_lease)
             for name in (".git/nested-worktree", ".roundwright/nested-worktree"):
@@ -143,6 +151,28 @@ class GitIdentityTests(unittest.TestCase):
                 self.admit(repository, identity)
                 with self.subTest(path=name), self.assertRaises(GitIdentityError):
                     provision_worktree(repository, identity, default_branch="main", worktree=location, lease=wrong_lease)
+
+    def test_revalidate_rejects_registered_path_prefix_collisions_and_copied_gitfiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repository = self.repository(parent / "repository")
+            base = resolve_canonical_base(repository, "main")
+            requested = parent / "isolated" / "task"
+            registered = parent / "isolated" / "task-copy"
+            identity = self.identity(base, worktree=requested)
+            self.admit(repository, identity)
+            self.run_git(repository.root, "worktree", "add", "-b", identity.branch, str(registered), base)
+            shutil.copytree(registered, requested)
+            binding = WorktreeBinding(
+                identity.task_id,
+                identity.repository_id,
+                identity.branch,
+                requested,
+                identity.base_sha,
+                self.lease(repository).state_identity,
+            )
+            with self.assertRaises(GitIdentityError):
+                revalidate_worktree(repository, binding)
 
     def test_candidate_seal_is_idempotent_and_movement_invalidates_bound_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

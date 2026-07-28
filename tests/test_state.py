@@ -17,7 +17,24 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright import cli
-from roundwright.state import DatabaseStatus, Migration, StateError, _apply_migrations, _is_reparse_point, check_database, database_path, initialize
+from roundwright.state import (
+    DatabaseStatus,
+    Migration,
+    SourceSnapshot,
+    StateError,
+    TaskIdentity,
+    _apply_migrations,
+    _is_reparse_point,
+    admit_task,
+    check_database,
+    database_path,
+    initialize,
+    record_artifact,
+    set_blocker,
+    set_next_action,
+    task_projection,
+    transition_task,
+)
 
 
 class StateTests(unittest.TestCase):
@@ -51,7 +68,7 @@ class StateTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             try:
                 connection.execute("UPDATE schema_migrations SET checksum = 'changed' WHERE version = 1")
-                connection.execute("INSERT INTO schema_migrations VALUES (2, 'future')")
+                connection.execute("INSERT INTO schema_migrations VALUES (3, 'future')")
                 connection.commit()
             finally:
                 connection.close()
@@ -297,3 +314,91 @@ class StateTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_bytes(b"not sqlite")
             self.assertEqual(check_database(repository).state, "corrupt")
+
+    def task_identity(self) -> TaskIdentity:
+        return TaskIdentity(
+            task_id="task-19",
+            source_id="local-fixture",
+            repository_id="ythdelmar68/roundwright",
+            branch="codex/issue-19",
+            worktree="C:/private/worktree",
+            base_sha="b" * 40,
+        )
+
+    def source_snapshot(self) -> SourceSnapshot:
+        return SourceSnapshot(
+            source_id="local-fixture",
+            repository_id="ythdelmar68/roundwright",
+            source_digest="a" * 64,
+        )
+
+    def test_phase_two_migration_persists_one_source_task_and_owner_safe_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            self.assertEqual(initialize(repository).version, 2)
+            projection = admit_task(repository, self.task_identity(), (self.source_snapshot(),))
+            self.assertEqual(projection.state, "queued")
+            self.assertEqual(projection.base_sha, "b" * 40)
+            self.assertNotIn("private", repr(projection))
+            self.assertNotIn("worktree", repr(projection))
+            self.assertEqual(projection, task_projection(repository, self.task_identity()))
+
+    def test_lifecycle_rejects_invalid_regressive_duplicate_and_mismatched_transitions_transactionally(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="queued", next_state="implementing", evidence_fingerprint="c" * 64)
+            self.assertEqual(task_projection(repository, identity).state, "queued")
+            transitioned = transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="c" * 64)
+            self.assertEqual(transitioned.state, "planning")
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="planning", next_state="plan-review", evidence_fingerprint="c" * 64)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+            with self.assertRaises(StateError):
+                transition_task(repository, identity, expected_state="planning", next_state="planning", evidence_fingerprint="d" * 64)
+            mismatched = TaskIdentity(**{**identity.__dict__, "branch": "codex/other"})
+            with self.assertRaises(StateError):
+                transition_task(repository, mismatched, expected_state="planning", next_state="plan-review", evidence_fingerprint="e" * 64)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+
+    def test_blocked_recovery_and_committed_projection_references_are_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="c" * 64)
+            transition_task(repository, identity, expected_state="planning", next_state="blocked", evidence_fingerprint="d" * 64)
+            blocked = transition_task(repository, identity, expected_state="blocked", next_state="planning", evidence_fingerprint="e" * 64)
+            self.assertEqual(blocked.state, "planning")
+            record_artifact(repository, identity, artifact_kind="plan", artifact_fingerprint="f" * 64)
+            set_blocker(repository, identity, blocker_class="evidence-incomplete", evidence_fingerprint="1" * 64)
+            projection = set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint="2" * 64)
+            self.assertEqual(projection.blockers, ("evidence-incomplete",))
+            self.assertEqual(projection.next_action, "review-plan")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT state FROM tasks WHERE task_id = 'task-19'").fetchone()[0], projection.state)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM artifact_references WHERE task_id = 'task-19'").fetchone()[0], 1)
+            finally:
+                connection.close()
+
+    def test_multi_source_and_replayed_task_admission_are_rejected_without_partial_task_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            alternate = SourceSnapshot("other-fixture", "ythdelmar68/roundwright", "c" * 64)
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (self.source_snapshot(), alternate))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            finally:
+                connection.close()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                admit_task(repository, identity, (self.source_snapshot(),))

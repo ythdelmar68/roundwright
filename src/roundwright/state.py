@@ -42,7 +42,74 @@ MIGRATIONS = (
             ("state_metadata", "CREATE TABLE state_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        2,
+        (
+            "CREATE TABLE source_snapshots (source_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, source_digest TEXT NOT NULL, UNIQUE(repository_id, source_digest))",
+            "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')))",
+            "CREATE TABLE transition_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, sequence), UNIQUE(task_id, evidence_fingerprint), CHECK(from_state != to_state))",
+            "CREATE TABLE artifact_references (task_id TEXT NOT NULL REFERENCES tasks(task_id), artifact_kind TEXT NOT NULL, artifact_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, artifact_kind, artifact_fingerprint))",
+            "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, blocker_class))",
+            "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL)",
+        ),
+        (
+            ("source_snapshots", "CREATE TABLE source_snapshots (source_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, source_digest TEXT NOT NULL, UNIQUE(repository_id, source_digest))"),
+            ("tasks", "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')))"),
+            ("transition_events", "CREATE TABLE transition_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, sequence), UNIQUE(task_id, evidence_fingerprint), CHECK(from_state != to_state))"),
+            ("artifact_references", "CREATE TABLE artifact_references (task_id TEXT NOT NULL REFERENCES tasks(task_id), artifact_kind TEXT NOT NULL, artifact_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, artifact_kind, artifact_fingerprint))"),
+            ("blockers", "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, blocker_class))"),
+            ("next_actions", "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL)"),
+        ),
+    ),
 )
+
+
+LIFECYCLE_STATES = frozenset(
+    {"queued", "planning", "plan-review", "implementing", "diff-review", "ready-for-owner", "blocked"}
+)
+_ALLOWED_TRANSITIONS = {
+    "queued": frozenset({"planning", "blocked"}),
+    "planning": frozenset({"plan-review", "blocked"}),
+    "plan-review": frozenset({"implementing", "blocked"}),
+    "implementing": frozenset({"diff-review", "blocked"}),
+    "diff-review": frozenset({"ready-for-owner", "blocked"}),
+    "ready-for-owner": frozenset(),
+    "blocked": frozenset({"planning", "plan-review", "implementing", "diff-review"}),
+}
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    """One immutable local source snapshot eligible for a Phase 2 task."""
+
+    source_id: str
+    repository_id: str
+    source_digest: str
+
+
+@dataclass(frozen=True)
+class TaskIdentity:
+    """Exact durable identity that binds a task to its sole source snapshot."""
+
+    task_id: str
+    source_id: str
+    repository_id: str
+    branch: str
+    worktree: str
+    base_sha: str
+
+
+@dataclass(frozen=True)
+class TaskProjection:
+    """Owner-safe projection of committed task state; it deliberately omits paths."""
+
+    task_id: str
+    repository_id: str
+    state: str
+    base_sha: str
+    source_fingerprint: str
+    blockers: tuple[str, ...]
+    next_action: str | None
 
 
 @dataclass(frozen=True)
@@ -115,6 +182,280 @@ def check_database(repository: RepositoryIdentity) -> DatabaseStatus:
     except sqlite3.DatabaseError:
         return DatabaseStatus("corrupt", None, "local database is corrupt or unreadable")
     return DatabaseStatus("healthy", version, "migration checksums verified", identity)
+
+
+def admit_task(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    snapshots: tuple[SourceSnapshot, ...],
+) -> TaskProjection:
+    """Durably admit exactly one immutable local source into the runnable pool."""
+
+    _validate_task_identity(identity)
+    if len(snapshots) != 1:
+        raise StateError("a runnable task must have exactly one source snapshot")
+    snapshot = snapshots[0]
+    _validate_source_snapshot(snapshot)
+    if snapshot.source_id != identity.source_id or snapshot.repository_id != identity.repository_id:
+        raise StateError("task identity does not match its source snapshot")
+    return _mutate_task(repository, identity, snapshot)
+
+
+def transition_task(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    *,
+    expected_state: str,
+    next_state: str,
+    evidence_fingerprint: str,
+) -> TaskProjection:
+    """Advance one task through the explicit Phase 2 state sequence atomically."""
+
+    _validate_task_identity(identity)
+    _require_state(expected_state)
+    _require_state(next_state)
+    _require_fingerprint(evidence_fingerprint)
+    if next_state not in _ALLOWED_TRANSITIONS[expected_state]:
+        raise StateError("task transition is invalid or regressive")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity, expected_state)
+        if connection.execute(
+            "SELECT 1 FROM transition_events WHERE task_id = ? AND evidence_fingerprint = ?",
+            (identity.task_id, evidence_fingerprint),
+        ).fetchone() is not None:
+            raise StateError("task transition evidence has already been committed")
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM transition_events WHERE task_id = ?",
+            (identity.task_id,),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE tasks SET state = ? WHERE task_id = ? AND state = ?",
+            (next_state, identity.task_id, expected_state),
+        )
+        connection.execute(
+            "INSERT INTO transition_events(task_id, sequence, from_state, to_state, evidence_fingerprint) VALUES (?, ?, ?, ?, ?)",
+            (identity.task_id, sequence, expected_state, next_state, evidence_fingerprint),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return task_projection(repository, identity)
+
+
+def record_artifact(
+    repository: RepositoryIdentity, identity: TaskIdentity, *, artifact_kind: str, artifact_fingerprint: str
+) -> TaskProjection:
+    """Persist an opaque artifact reference without making it the source of truth."""
+
+    _validate_task_identity(identity)
+    _require_token(artifact_kind, "artifact kind")
+    _require_fingerprint(artifact_fingerprint)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        connection.execute(
+            "INSERT OR IGNORE INTO artifact_references(task_id, artifact_kind, artifact_fingerprint) VALUES (?, ?, ?)",
+            (identity.task_id, artifact_kind, artifact_fingerprint),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return task_projection(repository, identity)
+
+
+def set_blocker(
+    repository: RepositoryIdentity, identity: TaskIdentity, *, blocker_class: str, evidence_fingerprint: str
+) -> TaskProjection:
+    """Store a bounded blocker classification while retaining raw evidence outside owner views."""
+
+    _validate_task_identity(identity)
+    _require_token(blocker_class, "blocker class")
+    _require_fingerprint(evidence_fingerprint)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        connection.execute(
+            "INSERT INTO blockers(task_id, blocker_class, evidence_fingerprint) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id, blocker_class) DO UPDATE SET evidence_fingerprint = excluded.evidence_fingerprint",
+            (identity.task_id, blocker_class, evidence_fingerprint),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return task_projection(repository, identity)
+
+
+def set_next_action(
+    repository: RepositoryIdentity, identity: TaskIdentity, *, action_kind: str, evidence_fingerprint: str
+) -> TaskProjection:
+    """Persist the one bounded next action associated with committed task state."""
+
+    _validate_task_identity(identity)
+    _require_token(action_kind, "next action")
+    _require_fingerprint(evidence_fingerprint)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        connection.execute(
+            "INSERT INTO next_actions(task_id, action_kind, evidence_fingerprint) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET action_kind = excluded.action_kind, evidence_fingerprint = excluded.evidence_fingerprint",
+            (identity.task_id, action_kind, evidence_fingerprint),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return task_projection(repository, identity)
+
+
+def task_projection(repository: RepositoryIdentity, identity: TaskIdentity) -> TaskProjection:
+    """Read a path-free rendering projection derived only from committed SQLite state."""
+
+    _validate_task_identity(identity)
+    path = database_path(repository)
+    if not path.exists():
+        raise StateError("local database is missing")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = _require_matching_task(connection, identity)
+            source = connection.execute(
+                "SELECT source_digest FROM source_snapshots WHERE source_id = ?", (identity.source_id,)
+            ).fetchone()
+            blockers = tuple(row[0] for row in connection.execute(
+                "SELECT blocker_class FROM blockers WHERE task_id = ? ORDER BY blocker_class", (identity.task_id,)
+            ))
+            next_action = connection.execute(
+                "SELECT action_kind FROM next_actions WHERE task_id = ?", (identity.task_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as error:
+        raise StateError("local database is corrupt or unreadable") from error
+    if source is None:
+        raise StateError("task source snapshot is missing")
+    return TaskProjection(
+        task_id=identity.task_id,
+        repository_id=identity.repository_id,
+        state=row[0],
+        base_sha=identity.base_sha,
+        source_fingerprint=hashlib.sha256(source[0].encode("ascii")).hexdigest()[:16],
+        blockers=blockers,
+        next_action=None if next_action is None else next_action[0],
+    )
+
+
+def _mutate_task(repository: RepositoryIdentity, identity: TaskIdentity, snapshot: SourceSnapshot) -> TaskProjection:
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        existing_source = connection.execute(
+            "SELECT repository_id, source_digest FROM source_snapshots WHERE source_id = ?", (snapshot.source_id,)
+        ).fetchone()
+        if existing_source is None:
+            connection.execute(
+                "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                (snapshot.source_id, snapshot.repository_id, snapshot.source_digest),
+            )
+        elif existing_source != (snapshot.repository_id, snapshot.source_digest):
+            raise StateError("source snapshot identity does not match replayed input")
+        existing_task = connection.execute(
+            "SELECT source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?", (identity.task_id,)
+        ).fetchone()
+        expected = (identity.source_id, identity.repository_id, identity.branch, identity.worktree, identity.base_sha)
+        if existing_task is None:
+            connection.execute(
+                "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
+                (identity.task_id, *expected),
+            )
+        elif existing_task != expected:
+            raise StateError("task identity does not match replayed input")
+        else:
+            raise StateError("task has already been admitted")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return task_projection(repository, identity)
+
+
+def _open_writable_connection(repository: RepositoryIdentity) -> sqlite3.Connection:
+    path = database_path(repository)
+    if not path.exists():
+        raise StateError("local database is missing")
+    try:
+        connection = sqlite3.connect(path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        _verify_migrations(connection, MIGRATIONS)
+        return connection
+    except Exception:
+        connection.close() if "connection" in locals() else None
+        raise
+
+
+def _require_matching_task(
+    connection: sqlite3.Connection, identity: TaskIdentity, expected_state: str | None = None
+) -> tuple[str]:
+    row = connection.execute(
+        "SELECT state, source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?",
+        (identity.task_id,),
+    ).fetchone()
+    expected = (identity.source_id, identity.repository_id, identity.branch, identity.worktree, identity.base_sha)
+    if row is None or tuple(row[1:]) != expected:
+        raise StateError("task identity does not match committed state")
+    if expected_state is not None and row[0] != expected_state:
+        raise StateError("task state does not match the requested transition")
+    return (row[0],)
+
+
+def _validate_source_snapshot(snapshot: SourceSnapshot) -> None:
+    _require_token(snapshot.source_id, "source identity")
+    _require_token(snapshot.repository_id, "repository identity")
+    if len(snapshot.source_digest) != 64 or any(character not in "0123456789abcdef" for character in snapshot.source_digest):
+        raise StateError("source digest is not a lowercase SHA-256 value")
+
+
+def _validate_task_identity(identity: TaskIdentity) -> None:
+    _require_token(identity.task_id, "task identity")
+    _require_token(identity.source_id, "source identity")
+    _require_token(identity.repository_id, "repository identity")
+    _require_token(identity.branch, "task branch")
+    _require_token(identity.worktree, "task worktree")
+    if len(identity.base_sha) != 40 or any(character not in "0123456789abcdef" for character in identity.base_sha):
+        raise StateError("base commit is not a full lowercase SHA")
+
+
+def _require_token(value: str, name: str) -> None:
+    if not isinstance(value, str) or not value or any(character.isspace() or ord(character) < 32 for character in value):
+        raise StateError(f"{name} is invalid")
+
+
+def _require_fingerprint(value: str) -> None:
+    if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise StateError("evidence fingerprint is not a lowercase SHA-256 value")
+
+
+def _require_state(value: str) -> None:
+    if value not in LIFECYCLE_STATES:
+        raise StateError("task state is invalid")
 
 
 def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration], *, allow_new_identity: bool = True) -> None:

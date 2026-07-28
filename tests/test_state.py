@@ -36,8 +36,14 @@ from roundwright.state import (
     set_blocker,
     set_next_action,
     task_projection,
-    transition_task,
+    transition_task as _transition_task,
 )
+from roundwright.git_identity import acquire_transition_lease
+
+
+def transition_task(repository: RepositoryIdentity, identity: TaskIdentity, **kwargs: object):
+    lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="state-tests", ttl_seconds=60)
+    return _transition_task(repository, identity, lease=lease, **kwargs)
 
 
 class StateTests(unittest.TestCase):
@@ -71,7 +77,7 @@ class StateTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             try:
                 connection.execute("UPDATE schema_migrations SET checksum = 'changed' WHERE version = 1")
-                connection.execute("INSERT INTO schema_migrations VALUES (4, 'future')")
+                connection.execute("INSERT INTO schema_migrations VALUES (5, 'future')")
                 connection.commit()
             finally:
                 connection.close()
@@ -351,7 +357,7 @@ class StateTests(unittest.TestCase):
     def test_phase_two_migration_persists_one_source_task_and_owner_safe_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
-            self.assertEqual(initialize(repository).version, 3)
+            self.assertEqual(initialize(repository).version, 4)
             projection = admit_task(repository, self.task_identity(), (self.source_snapshot(),))
             self.assertEqual(projection.state, "queued")
             self.assertEqual(projection.base_sha, "b" * 40)
@@ -371,7 +377,7 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
             upgraded = initialize(repository)
-            self.assertEqual(upgraded.version, 3)
+            self.assertEqual(upgraded.version, 4)
             self.assertEqual(upgraded.identity, check_database(repository).identity)
             connection = sqlite3.connect(path)
             try:
@@ -433,6 +439,15 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 transition_task(repository, mismatched, expected_state="planning", next_state="plan-review", evidence_fingerprint="e" * 64)
             self.assertEqual(task_projection(repository, identity).state, "planning")
+
+    def test_lifecycle_transition_requires_the_current_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                _transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="d" * 64)
 
     def test_blocked_recovery_and_committed_projection_references_are_consistent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -575,3 +590,16 @@ class StateTests(unittest.TestCase):
             admit_task(repository, identity, (self.source_snapshot(),))
             with self.assertRaises(StateError):
                 admit_task(repository, identity, (self.source_snapshot(),))
+
+    def test_active_tasks_cannot_reuse_a_branch_or_normalized_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            first = self.task_identity()
+            admit_task(repository, first, (self.source_snapshot(),))
+            same_branch = TaskIdentity("task-other-branch", "source-other-branch", first.repository_id, first.branch, "C:/other/worktree", first.base_sha)
+            same_worktree = TaskIdentity("task-other-worktree", "source-other-worktree", first.repository_id, "codex/other", first.worktree, first.base_sha)
+            with self.assertRaises(StateError):
+                admit_task(repository, same_branch, (SourceSnapshot(same_branch.source_id, first.repository_id, "b" * 64),))
+            with self.assertRaises(StateError):
+                admit_task(repository, same_worktree, (SourceSnapshot(same_worktree.source_id, first.repository_id, "c" * 64),))

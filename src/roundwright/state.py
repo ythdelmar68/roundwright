@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import sqlite3
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -73,6 +74,17 @@ MIGRATIONS = (
             ("transition_leases", "CREATE TABLE transition_leases (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), repository_id TEXT NOT NULL, state_identity TEXT NOT NULL, owner TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0), expires_at INTEGER NOT NULL CHECK(expires_at >= 0))"),
             ("candidate_seals", "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL)"),
             ("candidate_evidence", "CREATE TABLE candidate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, evidence_fingerprint))"),
+        ),
+    ),
+    Migration(
+        4,
+        (
+            "CREATE TABLE transition_lease_generations (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), generation INTEGER NOT NULL CHECK(generation > 0))",
+            "ALTER TABLE candidate_seals ADD COLUMN state_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("transition_lease_generations", "CREATE TABLE transition_lease_generations (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), generation INTEGER NOT NULL CHECK(generation > 0))"),
+            ("candidate_seals", "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, state_identity TEXT NOT NULL DEFAULT '')"),
         ),
     ),
 )
@@ -234,6 +246,7 @@ def transition_task(
     expected_state: str,
     next_state: str,
     evidence_fingerprint: str,
+    lease: object | None = None,
 ) -> TaskProjection:
     """Advance one task through the explicit Phase 2 state sequence atomically."""
 
@@ -244,6 +257,7 @@ def transition_task(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease)
         _require_matching_task(connection, identity, expected_state)
         blocked_from = connection.execute(
             "SELECT blocked_from_state FROM tasks WHERE task_id = ?", (identity.task_id,)
@@ -432,6 +446,12 @@ def _mutate_task(repository: RepositoryIdentity, identity: TaskIdentity, snapsho
             "SELECT source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?", (identity.task_id,)
         ).fetchone()
         expected = (identity.source_id, identity.repository_id, identity.branch, identity.worktree, identity.base_sha)
+        collision = connection.execute(
+            "SELECT task_id FROM tasks WHERE (branch = ? OR worktree = ?) AND task_id != ?",
+            (identity.branch, identity.worktree, identity.task_id),
+        ).fetchone()
+        if collision is not None:
+            raise StateError("an active task already owns the branch or worktree")
         if existing_task is None:
             connection.execute(
                 "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
@@ -477,6 +497,24 @@ def _require_matching_task(
     if expected_state is not None and row[0] != expected_state:
         raise StateError("task state does not match the requested transition")
     return (row[0],)
+
+
+def _require_current_transition_lease(connection: sqlite3.Connection, lease: object | None) -> None:
+    """Require the exact unexpired lease row for every state transition."""
+
+    required = ("repository_id", "state_identity", "owner", "generation", "expires_at")
+    if lease is None or any(not hasattr(lease, attribute) for attribute in required):
+        raise StateError("a current transition lease is required")
+    row = connection.execute(
+        "SELECT repository_id, state_identity, owner, generation, expires_at FROM transition_leases WHERE lease_scope = 'repository-state'"
+    ).fetchone()
+    if row is None or tuple(getattr(lease, attribute) for attribute in required) != tuple(row):
+        raise StateError("transition lease ownership has drifted")
+    state = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
+    if state is None or state[0] != getattr(lease, "state_identity"):
+        raise StateError("transition lease state identity has drifted")
+    if not isinstance(getattr(lease, "expires_at"), int) or getattr(lease, "expires_at") <= int(time.time()):
+        raise StateError("transition lease is stale and requires owner recovery")
 
 
 def _validate_source_snapshot(snapshot: SourceSnapshot) -> None:

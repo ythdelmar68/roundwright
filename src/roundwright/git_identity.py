@@ -49,6 +49,7 @@ class WorktreeBinding:
     branch: str
     worktree: Path
     base_sha: str
+    state_identity: str
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class CandidateSeal:
     task_id: str
     base_sha: str
     candidate_sha: str
+    state_identity: str
 
 
 def acquire_transition_lease(
@@ -83,7 +85,16 @@ def acquire_transition_lease(
             "SELECT repository_id, state_identity, owner, generation, expires_at FROM transition_leases WHERE lease_scope = 'repository-state'"
         ).fetchone()
         if row is None:
-            lease = TransitionLease(repository_id, state_identity, owner, 1, observed + ttl_seconds)
+            generation = connection.execute(
+                "SELECT generation FROM transition_lease_generations WHERE lease_scope = 'repository-state'"
+            ).fetchone()
+            next_generation = 1 if generation is None else generation[0] + 1
+            lease = TransitionLease(repository_id, state_identity, owner, next_generation, observed + ttl_seconds)
+            connection.execute(
+                "INSERT INTO transition_lease_generations(lease_scope, generation) VALUES ('repository-state', ?) "
+                "ON CONFLICT(lease_scope) DO UPDATE SET generation = excluded.generation",
+                (next_generation,),
+            )
             connection.execute(
                 "INSERT INTO transition_leases(lease_scope, repository_id, state_identity, owner, generation, expires_at) VALUES ('repository-state', ?, ?, ?, ?, ?)",
                 (lease.repository_id, lease.state_identity, lease.owner, lease.generation, lease.expires_at),
@@ -178,6 +189,7 @@ def provision_worktree(
     *,
     default_branch: str,
     worktree: Path,
+    lease: TransitionLease | None = None,
 ) -> WorktreeBinding:
     """Create or revalidate one task-owned branch/worktree at the canonical base.
 
@@ -192,7 +204,8 @@ def provision_worktree(
     requested = _validated_worktree_path(repository.root, worktree)
     if Path(identity.worktree).resolve(strict=False) != requested:
         raise GitIdentityError("task worktree path does not match committed task identity")
-    binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, requested, identity.base_sha)
+    _verify_lease(repository, lease)
+    binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, requested, identity.base_sha, _read_state_identity(repository))
     if requested.exists():
         return revalidate_worktree(repository, binding)
     _git(repository.root, "worktree", "add", "-b", identity.branch, os.fspath(requested), base_sha)
@@ -205,6 +218,8 @@ def revalidate_worktree(repository: RepositoryIdentity, binding: WorktreeBinding
     root = repository.root.resolve(strict=True)
     worktree = _validated_worktree_path(root, binding.worktree)
     _require_task_binding(repository, binding, worktree)
+    if binding.state_identity != _read_state_identity(repository):
+        raise GitIdentityError("task worktree state identity has drifted")
     if not worktree.exists() or not worktree.is_dir():
         raise GitIdentityError("task worktree is unavailable")
     if _common_git_directory(worktree) != _common_git_directory(root):
@@ -219,10 +234,10 @@ def revalidate_worktree(repository: RepositoryIdentity, binding: WorktreeBinding
     registered_path = os.fspath(worktree).replace("\\", "/")
     if f"worktree {registered_path}" not in registered.replace("\\", "/"):
         raise GitIdentityError("task worktree is not an active registered worktree")
-    return WorktreeBinding(binding.task_id, binding.repository_id, binding.branch, worktree, binding.base_sha)
+    return WorktreeBinding(binding.task_id, binding.repository_id, binding.branch, worktree, binding.base_sha, binding.state_identity)
 
 
-def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding) -> CandidateSeal:
+def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, *, lease: TransitionLease | None = None) -> CandidateSeal:
     """Seal a clean full commit HEAD and invalidate evidence for a moved candidate."""
 
     verified = revalidate_worktree(repository, binding)
@@ -232,15 +247,16 @@ def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding) -> 
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, None)
         row = connection.execute(
-            "SELECT base_sha, candidate_sha FROM candidate_seals WHERE task_id = ?", (verified.task_id,)
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (verified.task_id,)
         ).fetchone()
-        if row is not None and tuple(row) != (verified.base_sha, candidate):
+        if row is not None and tuple(row) != (verified.base_sha, candidate, verified.state_identity):
             connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (verified.task_id,))
         connection.execute(
-            "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha) VALUES (?, ?, ?) "
-            "ON CONFLICT(task_id) DO UPDATE SET base_sha = excluded.base_sha, candidate_sha = excluded.candidate_sha",
-            (verified.task_id, verified.base_sha, candidate),
+            "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET base_sha = excluded.base_sha, candidate_sha = excluded.candidate_sha, state_identity = excluded.state_identity",
+            (verified.task_id, verified.base_sha, candidate, verified.state_identity),
         )
         connection.commit()
     except Exception:
@@ -248,21 +264,23 @@ def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding) -> 
         raise
     finally:
         connection.close()
-    return CandidateSeal(verified.task_id, verified.base_sha, candidate)
+    return CandidateSeal(verified.task_id, verified.base_sha, candidate, verified.state_identity)
 
 
-def bind_candidate_evidence(repository: RepositoryIdentity, seal: CandidateSeal, *, evidence_fingerprint: str) -> None:
+def bind_candidate_evidence(repository: RepositoryIdentity, binding: WorktreeBinding, seal: CandidateSeal, *, evidence_fingerprint: str, lease: TransitionLease | None = None) -> None:
     """Bind opaque evidence only to the currently sealed exact candidate."""
 
     if not isinstance(evidence_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", evidence_fingerprint):
         raise GitIdentityError("candidate evidence fingerprint is invalid")
+    _require_live_candidate(repository, binding, seal, lease)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, None)
         row = connection.execute(
-            "SELECT base_sha, candidate_sha FROM candidate_seals WHERE task_id = ?", (seal.task_id,)
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (seal.task_id,)
         ).fetchone()
-        if row != (seal.base_sha, seal.candidate_sha):
+        if row != (seal.base_sha, seal.candidate_sha, seal.state_identity):
             raise GitIdentityError("candidate seal is no longer current")
         connection.execute(
             "INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)",
@@ -276,15 +294,16 @@ def bind_candidate_evidence(repository: RepositoryIdentity, seal: CandidateSeal,
         connection.close()
 
 
-def candidate_evidence(repository: RepositoryIdentity, seal: CandidateSeal) -> tuple[str, ...]:
+def candidate_evidence(repository: RepositoryIdentity, binding: WorktreeBinding, seal: CandidateSeal, *, lease: TransitionLease | None = None) -> tuple[str, ...]:
     """Return evidence only if the caller still holds the current candidate seal."""
 
+    _require_live_candidate(repository, binding, seal, lease)
     connection = _open_writable_connection(repository)
     try:
         row = connection.execute(
-            "SELECT base_sha, candidate_sha FROM candidate_seals WHERE task_id = ?", (seal.task_id,)
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (seal.task_id,)
         ).fetchone()
-        if row != (seal.base_sha, seal.candidate_sha):
+        if row != (seal.base_sha, seal.candidate_sha, seal.state_identity):
             raise GitIdentityError("candidate seal is no longer current")
         return tuple(
             entry[0] for entry in connection.execute(
@@ -301,6 +320,40 @@ def _state_identity(connection: sqlite3.Connection) -> str:
     if row is None or not isinstance(row[0], str):
         raise GitIdentityError("repository state identity is unavailable")
     return row[0]
+
+
+def _read_state_identity(repository: RepositoryIdentity) -> str:
+    connection = _open_writable_connection(repository)
+    try:
+        return _state_identity(connection)
+    finally:
+        connection.close()
+
+
+def _verify_lease(repository: RepositoryIdentity, lease: TransitionLease | None, now: int | None = None) -> None:
+    if not isinstance(lease, TransitionLease):
+        raise GitIdentityError("a current transition lease is required")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_current_lease(connection, lease, _clock(now))
+    finally:
+        connection.close()
+
+
+def _require_live_candidate(
+    repository: RepositoryIdentity, binding: WorktreeBinding, seal: CandidateSeal, lease: TransitionLease | None
+) -> None:
+    """Invalidate evidence on live head/state drift before it can be consumed."""
+
+    verified = revalidate_worktree(repository, binding)
+    if verified.task_id != seal.task_id or verified.base_sha != seal.base_sha or verified.state_identity != seal.state_identity:
+        raise GitIdentityError("candidate seal identity has drifted")
+    if _git(verified.worktree, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise GitIdentityError("candidate worktree is dirty")
+    head = _git_commit(verified.worktree, "rev-parse", "--verify", "HEAD^{commit}")
+    if head != seal.candidate_sha:
+        seal_candidate(repository, verified, lease=lease)
+        raise GitIdentityError("candidate head moved and prior evidence was invalidated")
 
 
 def _require_task_binding(repository: RepositoryIdentity, binding: WorktreeBinding, worktree: Path) -> None:
@@ -323,13 +376,17 @@ def _require_task_binding(repository: RepositoryIdentity, binding: WorktreeBindi
         raise GitIdentityError("task worktree path does not match committed task identity")
 
 
-def _require_current_lease(connection: sqlite3.Connection, lease: TransitionLease, observed: int) -> None:
+def _require_current_lease(connection: sqlite3.Connection, lease: TransitionLease, observed: int | None) -> None:
+    if not isinstance(lease, TransitionLease):
+        raise GitIdentityError("a current transition lease is required")
     row = connection.execute(
         "SELECT repository_id, state_identity, owner, generation, expires_at FROM transition_leases WHERE lease_scope = 'repository-state'"
     ).fetchone()
     if row is None or TransitionLease(*row) != lease:
         raise GitIdentityError("transition lease ownership has drifted")
-    if lease.expires_at <= observed:
+    if _state_identity(connection) != lease.state_identity:
+        raise GitIdentityError("transition lease state identity has drifted")
+    if lease.expires_at <= _clock(observed):
         raise GitIdentityError("transition lease is stale and requires owner recovery")
 
 

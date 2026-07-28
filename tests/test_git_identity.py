@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import (
     GitIdentityError,
+    TransitionLease,
     WorktreeBinding,
     acquire_transition_lease,
     bind_candidate_evidence,
@@ -25,6 +27,7 @@ from roundwright.git_identity import (
     seal_candidate,
 )
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize
+from roundwright.state import database_path
 
 
 class GitIdentityTests(unittest.TestCase):
@@ -59,6 +62,9 @@ class GitIdentityTests(unittest.TestCase):
         initialize(repository)
         admit_task(repository, identity, (SourceSnapshot("fixture-source", identity.repository_id, "a" * 64),))
 
+    def lease(self, repository: RepositoryIdentity):
+        return acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-a", ttl_seconds=60)
+
     def test_transition_lease_is_atomic_owner_scoped_and_stale_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary) / "repository")
@@ -72,11 +78,13 @@ class GitIdentityTests(unittest.TestCase):
             with self.assertRaises(GitIdentityError):
                 release_transition_lease(repository, first, now=106)
             release_transition_lease(repository, renewed, now=106)
-            stale = acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-a", ttl_seconds=1, now=200)
+            reacquired = acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-a", ttl_seconds=10, now=200)
+            self.assertGreater(reacquired.generation, renewed.generation)
             with self.assertRaises(GitIdentityError):
-                acquire_transition_lease(repository, repository_id="ythdelmar68/roundwright", owner="orchestrator-b", ttl_seconds=10, now=201)
+                release_transition_lease(repository, renewed, now=201)
+            stale = renew_transition_lease(repository, reacquired, ttl_seconds=1, now=205)
             with self.assertRaises(GitIdentityError):
-                renew_transition_lease(repository, stale, ttl_seconds=10, now=201)
+                renew_transition_lease(repository, stale, ttl_seconds=10, now=206)
 
     def test_base_comes_from_origin_default_branch_not_current_checkout_head(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -96,11 +104,17 @@ class GitIdentityTests(unittest.TestCase):
             location = parent / "isolated" / "task-20"
             identity = self.identity(base, worktree=location)
             self.admit(repository, identity)
-            binding = provision_worktree(repository, identity, default_branch="main", worktree=location)
-            self.assertEqual(provision_worktree(repository, identity, default_branch="main", worktree=location), binding)
+            lease = self.lease(repository)
+            with self.assertRaises(GitIdentityError):
+                provision_worktree(repository, identity, default_branch="main", worktree=location)
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
+            wrong_owner = TransitionLease(lease.repository_id, lease.state_identity, "orchestrator-b", lease.generation, lease.expires_at)
+            with self.assertRaises(GitIdentityError):
+                seal_candidate(repository, binding, lease=wrong_owner)
+            self.assertEqual(provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease), binding)
             self.run_git(location, "checkout", "--detach")
             with self.assertRaises(GitIdentityError):
-                seal_candidate(repository, binding)
+                seal_candidate(repository, binding, lease=lease)
 
     def test_candidate_seal_is_idempotent_and_movement_invalidates_bound_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,20 +124,31 @@ class GitIdentityTests(unittest.TestCase):
             location = parent / "isolated" / "task-20"
             identity = self.identity(base, worktree=location)
             self.admit(repository, identity)
-            binding = provision_worktree(repository, identity, default_branch="main", worktree=location)
-            seal = seal_candidate(repository, binding)
-            bind_candidate_evidence(repository, seal, evidence_fingerprint="b" * 64)
-            self.assertEqual(candidate_evidence(repository, seal), ("b" * 64,))
-            self.assertEqual(seal_candidate(repository, binding), seal)
-            self.assertEqual(candidate_evidence(repository, seal), ("b" * 64,))
+            lease = self.lease(repository)
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
+            seal = seal_candidate(repository, binding, lease=lease)
+            bind_candidate_evidence(repository, binding, seal, evidence_fingerprint="b" * 64, lease=lease)
+            self.assertEqual(candidate_evidence(repository, binding, seal, lease=lease), ("b" * 64,))
+            self.assertEqual(seal_candidate(repository, binding, lease=lease), seal)
+            self.assertEqual(candidate_evidence(repository, binding, seal, lease=lease), ("b" * 64,))
             (binding.worktree / "candidate.txt").write_text("moved\n", encoding="utf-8")
             self.run_git(binding.worktree, "add", "candidate.txt")
             self.run_git(binding.worktree, "commit", "-m", "test: move candidate")
-            moved = seal_candidate(repository, binding)
-            self.assertNotEqual(moved.candidate_sha, seal.candidate_sha)
-            self.assertEqual(candidate_evidence(repository, moved), ())
             with self.assertRaises(GitIdentityError):
-                candidate_evidence(repository, seal)
+                candidate_evidence(repository, binding, seal, lease=lease)
+            moved = seal_candidate(repository, binding, lease=lease)
+            self.assertNotEqual(moved.candidate_sha, seal.candidate_sha)
+            self.assertEqual(candidate_evidence(repository, binding, moved, lease=lease), ())
+            with self.assertRaises(GitIdentityError):
+                candidate_evidence(repository, binding, seal, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE state_metadata SET value = ? WHERE key = 'state_id'", ("87654321-4321-8765-4321-876543218765",))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(GitIdentityError):
+                candidate_evidence(repository, binding, moved, lease=lease)
 
     def test_wrong_base_foreign_repository_and_path_collision_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -133,12 +158,13 @@ class GitIdentityTests(unittest.TestCase):
             collision = parent / "isolated" / "collision"
             identity = self.identity(base, worktree=collision)
             self.admit(repository, identity)
+            lease = self.lease(repository)
             with self.assertRaises(GitIdentityError):
-                provision_worktree(repository, self.identity("f" * 40, worktree=parent / "isolated" / "wrong-base"), default_branch="main", worktree=parent / "isolated" / "wrong-base")
+                provision_worktree(repository, self.identity("f" * 40, worktree=parent / "isolated" / "wrong-base"), default_branch="main", worktree=parent / "isolated" / "wrong-base", lease=lease)
             collision.mkdir(parents=True)
             with self.assertRaises(GitIdentityError):
-                provision_worktree(repository, identity, default_branch="main", worktree=collision)
+                provision_worktree(repository, identity, default_branch="main", worktree=collision, lease=lease)
             foreign = self.repository(parent / "foreign")
-            binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, foreign.root, base)
+            binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, foreign.root, base, lease.state_identity)
             with self.assertRaises(GitIdentityError):
-                seal_candidate(repository, binding)
+                seal_candidate(repository, binding, lease=lease)

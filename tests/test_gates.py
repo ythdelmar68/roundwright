@@ -169,6 +169,19 @@ class GateDecisionTests(unittest.TestCase):
         evidence = [item for item in self.accepted_evidence() if item.gate_key != GateKey.SUPERVISOR_DIFF_REVIEW]
         evidence.append(self.evidence(GateKey.SUPERVISOR_DIFF_REVIEW, follow_ups=(FollowUp("follow-up-1", False),)))
         self.assertEqual(decide_gates(self.context(), tuple(evidence)).outcome, GateOutcome.BLOCKED)
+        for requirement in (item for item in GATE_REGISTRY if item.permits_phase_two_local_na):
+            with self.subTest(gate=requirement.key):
+                evidence = [item for item in self.accepted_evidence() if item.gate_key != requirement.key]
+                evidence.append(
+                    self.evidence(
+                        requirement.key,
+                        EvidenceOutcome.NOT_APPLICABLE,
+                        boundary="phase-2 isolated local task",
+                        reason="the provider-neutral local slice has no external adapter",
+                        follow_ups=(FollowUp(f"{requirement.key.value}-follow-up", False),),
+                    )
+                )
+                self.assertEqual(decide_gates(self.context(), tuple(evidence)).outcome, GateOutcome.BLOCKED)
         malformed = GateEvidence(self.task_id, self.candidate, [], EvidenceOutcome.PASS, "validator", 1, "1" * 64)
         self.assertEqual(decide_gates(self.context(), (malformed,)).outcome, GateOutcome.BLOCKED)
         self.assertEqual(decide_gates(self.context(), list(self.accepted_evidence())).outcome, GateOutcome.BLOCKED)
@@ -204,7 +217,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 record_gate_evidence(repository, binding, seal, context, item, lease=lease)
         connection = sqlite3.connect(database_path(repository))
         try:
-            connection.executemany("INSERT INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)", [(identity.task_id, seal.candidate_sha, item.evidence_fingerprint) for item in evidence])
+            connection.executemany("INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)", [(identity.task_id, seal.candidate_sha, item.evidence_fingerprint) for item in evidence])
             connection.commit()
         finally:
             connection.close()
@@ -316,6 +329,81 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 self.assertEqual(evaluate_gates(repository, binding, seal, moved_receipt, lease=lease).outcome, GateOutcome.BLOCKED)
                 with self.assertRaises(GateError):
                     transition_ready_for_owner(repository, binding, seal, moved_policy, evidence_fingerprint="7" * 64, lease=lease)
+
+    def test_every_na_gate_with_an_unresolved_follow_up_cannot_complete_final_transition(self) -> None:
+        for requirement in (item for item in GATE_REGISTRY if item.permits_phase_two_local_na):
+            with self.subTest(gate=requirement.key), tempfile.TemporaryDirectory() as temporary:
+                repository, _, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute(
+                        "UPDATE gate_evidence SET follow_ups = ? WHERE task_id = ? AND candidate_sha = ? AND gate_key = ?",
+                        (
+                            f'[{{"identifier":"{requirement.key.value}-follow-up","resolution_fingerprint":null,"resolved":false}}]',
+                            binding.task_id,
+                            seal.candidate_sha,
+                            requirement.key.value,
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                    with self.assertRaises(StateError):
+                        transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
+
+    def test_receipt_context_is_rebound_for_each_candidate_and_rejects_stale_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal_a, context_a, lease, _ = self.complete_persisted_pass(Path(temporary))
+
+            def reseal(candidate_sha: str) -> CandidateSeal:
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute("UPDATE candidate_seals SET candidate_sha = ? WHERE task_id = ?", (candidate_sha, identity.task_id))
+                    connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (identity.task_id,))
+                    connection.execute("DELETE FROM gate_evidence WHERE task_id = ?", (identity.task_id,))
+                    connection.execute("DELETE FROM gate_contexts WHERE task_id = ?", (identity.task_id,))
+                    connection.commit()
+                finally:
+                    connection.close()
+                return CandidateSeal(identity.task_id, identity.base_sha, candidate_sha, lease.state_identity)
+
+            def record_complete(candidate_seal: CandidateSeal, context: GateContext) -> tuple[str, ...]:
+                entries = []
+                for number, requirement in enumerate(GATE_REGISTRY, 1):
+                    outcome = EvidenceOutcome.NOT_APPLICABLE if requirement.permits_phase_two_local_na else EvidenceOutcome.PASS
+                    entries.append(
+                        GateEvidence(
+                            identity.task_id,
+                            candidate_seal.candidate_sha,
+                            requirement.key,
+                            outcome,
+                            "validator",
+                            number,
+                            f"{number + 32:064x}",
+                            "isolated local boundary" if outcome is EvidenceOutcome.NOT_APPLICABLE else None,
+                            "no external adapter in Phase 2" if outcome is EvidenceOutcome.NOT_APPLICABLE else None,
+                        )
+                    )
+                with mock.patch("roundwright.gates.bind_candidate_evidence"):
+                    for entry in entries:
+                        record_gate_evidence(repository, binding, candidate_seal, context, entry, lease=lease)
+                return tuple(entry.evidence_fingerprint for entry in entries)
+
+            seal_b = reseal("e" * 40)
+            context_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, "f" * 64)
+            stale_receipt_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, context_a.receipt_fingerprint)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=()):
+                self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, lease=lease).outcome, GateOutcome.BLOCKED)
+            fingerprints_b = record_complete(seal_b, context_b)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints_b):
+                self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal_b, context_b, lease=lease).outcome, GateOutcome.PASS)
+
+            restored_a = reseal(seal_a.candidate_sha)
+            restored_fingerprints = record_complete(restored_a, context_a)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=restored_fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, restored_a, context_a, lease=lease).outcome, GateOutcome.PASS)
 
 
 if __name__ == "__main__":

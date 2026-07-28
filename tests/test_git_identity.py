@@ -204,6 +204,10 @@ class GitIdentityTests(unittest.TestCase):
                     "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason, follow_ups) VALUES (?, ?, 'build', 'PASS', 'validator', 1, ?, NULL, NULL, '[]')",
                     (identity.task_id, seal.candidate_sha, "b" * 64),
                 )
+                connection.execute(
+                    "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint) VALUES (?, ?, 1, 1, ?, ?)",
+                    (identity.task_id, seal.candidate_sha, "c" * 64, "d" * 64),
+                )
                 connection.commit()
             finally:
                 connection.close()
@@ -221,6 +225,7 @@ class GitIdentityTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM gate_evidence WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM gate_contexts WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
             finally:
                 connection.close()
             bind_candidate_evidence(repository, binding, moved, evidence_fingerprint="c" * 64, lease=lease)
@@ -229,6 +234,10 @@ class GitIdentityTests(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason, follow_ups) VALUES (?, ?, 'build', 'PASS', 'validator', 1, ?, NULL, NULL, '[]')",
                     (identity.task_id, moved.candidate_sha, "c" * 64),
+                )
+                connection.execute(
+                    "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint) VALUES (?, ?, 1, 1, ?, ?)",
+                    (identity.task_id, moved.candidate_sha, "c" * 64, "e" * 64),
                 )
                 connection.commit()
             finally:
@@ -239,6 +248,7 @@ class GitIdentityTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM gate_evidence WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM gate_contexts WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
             finally:
                 connection.close()
             self.assertEqual(candidate_evidence(repository, binding, restored, lease=lease), ())

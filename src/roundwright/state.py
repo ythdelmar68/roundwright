@@ -151,6 +151,18 @@ MIGRATIONS = (
             ("gate_evidence", "CREATE TABLE gate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, gate_key TEXT NOT NULL, outcome TEXT NOT NULL, evaluator_id TEXT NOT NULL, evaluated_at INTEGER NOT NULL CHECK(evaluated_at > 0), evidence_fingerprint TEXT NOT NULL, changed_boundary TEXT, reason TEXT, follow_ups TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(task_id, candidate_sha, gate_key, evaluator_id, evidence_fingerprint))"),
         ),
     ),
+    Migration(
+        11,
+        (
+            "CREATE TABLE gate_contexts_v2 (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha))",
+            "INSERT INTO gate_contexts_v2(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint) SELECT contexts.task_id, seals.candidate_sha, contexts.source_count, contexts.isolated_local_task, contexts.policy_digest, contexts.receipt_fingerprint FROM gate_contexts AS contexts JOIN candidate_seals AS seals ON seals.task_id = contexts.task_id",
+            "DROP TABLE gate_contexts",
+            "ALTER TABLE gate_contexts_v2 RENAME TO gate_contexts",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
 )
 
 

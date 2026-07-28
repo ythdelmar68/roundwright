@@ -210,16 +210,35 @@ def record_gate_evidence(
         if context.source_count != source_count:
             raise GateError("gate context source count does not match committed task state")
         persisted_context = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ?", (binding.task_id,)
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+            (binding.task_id, seal.candidate_sha),
         ).fetchone()
         context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint)
         if persisted_context is None:
             connection.execute(
-                "INSERT INTO gate_contexts(task_id, source_count, isolated_local_task, policy_digest, receipt_fingerprint) VALUES (?, ?, ?, ?, ?)",
-                (binding.task_id, *context_values),
+                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?)",
+                (binding.task_id, seal.candidate_sha, *context_values),
             )
         elif persisted_context != context_values:
-            raise GateError("gate context conflicts with committed task state")
+            # Policy and receipt evidence are candidate-bound.  Replacing either
+            # one invalidates every decision component for this candidate, then
+            # records the fresh fingerprint below in the same transaction.
+            connection.execute(
+                "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",
+                (binding.task_id, seal.candidate_sha),
+            )
+            connection.execute(
+                "DELETE FROM candidate_evidence WHERE task_id = ? AND candidate_sha = ?",
+                (binding.task_id, seal.candidate_sha),
+            )
+            connection.execute(
+                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ? WHERE task_id = ? AND candidate_sha = ?",
+                (*context_values, binding.task_id, seal.candidate_sha),
+            )
+        connection.execute(
+            "INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)",
+            (binding.task_id, seal.candidate_sha, evidence.evidence_fingerprint),
+        )
         existing = connection.execute(
             "SELECT outcome, evaluated_at, changed_boundary, reason, follow_ups FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? AND gate_key = ? AND evaluator_id = ? AND evidence_fingerprint = ?",
             (evidence.task_id, evidence.candidate_sha, _value(evidence.gate_key), evidence.evaluator_id, evidence.evidence_fingerprint),
@@ -370,7 +389,8 @@ def _decision_from_connection(connection, identity) -> GateDecision:
 
 def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:
     row = connection.execute(
-        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ?", (task_id,)
+        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+        (task_id, candidate_sha),
     ).fetchone()
     if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1) or not _is_fingerprint(row[2]) or not _is_fingerprint(row[3]):
         return None
@@ -383,13 +403,13 @@ def _decide_requirement(context: GateContext, requirement: GateRequirement, entr
         return GateResult(key, GateOutcome.BLOCKED, "candidate identity mismatch")
     if any(not _is_well_formed(entry) for entry in entries):
         return GateResult(key, GateOutcome.BLOCKED, "invalid structured evidence")
+    if any(not follow_up.resolved for entry in entries for follow_up in entry.follow_ups):
+        return GateResult(key, GateOutcome.BLOCKED, "unresolved follow-up remains")
     outcomes = {_value(entry.outcome) for entry in entries}
     if len(outcomes) != 1:
         return GateResult(key, GateOutcome.BLOCKED, "conflicting evidence")
     outcome = next(iter(outcomes))
     if outcome == EvidenceOutcome.PASS.value:
-        if any(not follow_up.resolved for entry in entries for follow_up in entry.follow_ups):
-            return GateResult(key, GateOutcome.BLOCKED, "unresolved follow-up remains")
         return GateResult(key, GateOutcome.PASS, "accepted")
     if outcome == EvidenceOutcome.NOT_APPLICABLE.value:
         if not requirement.permits_phase_two_local_na:

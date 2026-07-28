@@ -254,6 +254,7 @@ def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, *, 
         if row is not None and tuple(row) != (verified.base_sha, candidate, verified.state_identity):
             connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (verified.task_id,))
             connection.execute("DELETE FROM gate_evidence WHERE task_id = ?", (verified.task_id,))
+            connection.execute("DELETE FROM gate_contexts WHERE task_id = ?", (verified.task_id,))
         connection.execute(
             "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(task_id) DO UPDATE SET base_sha = excluded.base_sha, candidate_sha = excluded.candidate_sha, state_identity = excluded.state_identity",
@@ -387,6 +388,7 @@ def _invalidate_candidate(repository: RepositoryIdentity, binding: WorktreeBindi
             raise GitIdentityError("candidate state identity has drifted")
         connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (binding.task_id,))
         connection.execute("DELETE FROM gate_evidence WHERE task_id = ?", (binding.task_id,))
+        connection.execute("DELETE FROM gate_contexts WHERE task_id = ?", (binding.task_id,))
         connection.execute("DELETE FROM candidate_seals WHERE task_id = ?", (binding.task_id,))
         connection.commit()
     except Exception:

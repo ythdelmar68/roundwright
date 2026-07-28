@@ -46,7 +46,7 @@ MIGRATIONS = (
         2,
         (
             "CREATE TABLE source_snapshots (source_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, source_digest TEXT NOT NULL, UNIQUE(repository_id, source_digest))",
-            "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')))",
+            "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, blocked_from_state TEXT, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')), CHECK((state = 'blocked' AND blocked_from_state IS NOT NULL) OR (state != 'blocked' AND blocked_from_state IS NULL)))",
             "CREATE TABLE transition_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, sequence), UNIQUE(task_id, evidence_fingerprint), CHECK(from_state != to_state))",
             "CREATE TABLE artifact_references (task_id TEXT NOT NULL REFERENCES tasks(task_id), artifact_kind TEXT NOT NULL, artifact_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, artifact_kind, artifact_fingerprint))",
             "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, blocker_class))",
@@ -54,7 +54,7 @@ MIGRATIONS = (
         ),
         (
             ("source_snapshots", "CREATE TABLE source_snapshots (source_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL, source_digest TEXT NOT NULL, UNIQUE(repository_id, source_digest))"),
-            ("tasks", "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')))"),
+            ("tasks", "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, blocked_from_state TEXT, CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')), CHECK((state = 'blocked' AND blocked_from_state IS NOT NULL) OR (state != 'blocked' AND blocked_from_state IS NULL)))"),
             ("transition_events", "CREATE TABLE transition_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, sequence), UNIQUE(task_id, evidence_fingerprint), CHECK(from_state != to_state))"),
             ("artifact_references", "CREATE TABLE artifact_references (task_id TEXT NOT NULL REFERENCES tasks(task_id), artifact_kind TEXT NOT NULL, artifact_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, artifact_kind, artifact_fingerprint))"),
             ("blockers", "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, blocker_class))"),
@@ -74,8 +74,10 @@ _ALLOWED_TRANSITIONS = {
     "implementing": frozenset({"diff-review", "blocked"}),
     "diff-review": frozenset({"ready-for-owner", "blocked"}),
     "ready-for-owner": frozenset(),
-    "blocked": frozenset({"planning", "plan-review", "implementing", "diff-review"}),
+    "blocked": frozenset({"queued", "planning", "plan-review", "implementing", "diff-review"}),
 }
+BLOCKER_CLASSES = frozenset({"evidence-ambiguous", "evidence-incomplete", "identity-mismatch", "policy-denied"})
+NEXT_ACTION_KINDS = frozenset({"provide-evidence", "reconcile-identity", "resolve-policy", "review-plan"})
 
 
 @dataclass(frozen=True)
@@ -215,12 +217,15 @@ def transition_task(
     _require_state(expected_state)
     _require_state(next_state)
     _require_fingerprint(evidence_fingerprint)
-    if next_state not in _ALLOWED_TRANSITIONS[expected_state]:
-        raise StateError("task transition is invalid or regressive")
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity, expected_state)
+        blocked_from = connection.execute(
+            "SELECT blocked_from_state FROM tasks WHERE task_id = ?", (identity.task_id,)
+        ).fetchone()[0]
+        if not _transition_is_allowed(expected_state, next_state, blocked_from):
+            raise StateError("task transition is invalid, regressive, or skips blocked recovery")
         if connection.execute(
             "SELECT 1 FROM transition_events WHERE task_id = ? AND evidence_fingerprint = ?",
             (identity.task_id, evidence_fingerprint),
@@ -230,10 +235,16 @@ def transition_task(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM transition_events WHERE task_id = ?",
             (identity.task_id,),
         ).fetchone()[0]
-        connection.execute(
-            "UPDATE tasks SET state = ? WHERE task_id = ? AND state = ?",
-            (next_state, identity.task_id, expected_state),
-        )
+        if next_state == "blocked":
+            connection.execute(
+                "UPDATE tasks SET state = ?, blocked_from_state = ? WHERE task_id = ? AND state = ?",
+                (next_state, expected_state, identity.task_id, expected_state),
+            )
+        else:
+            connection.execute(
+                "UPDATE tasks SET state = ?, blocked_from_state = NULL WHERE task_id = ? AND state = ?",
+                (next_state, identity.task_id, expected_state),
+            )
         connection.execute(
             "INSERT INTO transition_events(task_id, sequence, from_state, to_state, evidence_fingerprint) VALUES (?, ?, ?, ?, ?)",
             (identity.task_id, sequence, expected_state, next_state, evidence_fingerprint),
@@ -278,7 +289,7 @@ def set_blocker(
     """Store a bounded blocker classification while retaining raw evidence outside owner views."""
 
     _validate_task_identity(identity)
-    _require_token(blocker_class, "blocker class")
+    _require_classification(blocker_class, BLOCKER_CLASSES, "blocker class")
     _require_fingerprint(evidence_fingerprint)
     connection = _open_writable_connection(repository)
     try:
@@ -304,7 +315,7 @@ def set_next_action(
     """Persist the one bounded next action associated with committed task state."""
 
     _validate_task_identity(identity)
-    _require_token(action_kind, "next action")
+    _require_classification(action_kind, NEXT_ACTION_KINDS, "next action")
     _require_fingerprint(evidence_fingerprint)
     connection = _open_writable_connection(repository)
     try:
@@ -456,6 +467,19 @@ def _require_fingerprint(value: str) -> None:
 def _require_state(value: str) -> None:
     if value not in LIFECYCLE_STATES:
         raise StateError("task state is invalid")
+
+
+def _transition_is_allowed(current: str, next_state: str, blocked_from: object) -> bool:
+    if next_state not in _ALLOWED_TRANSITIONS[current]:
+        return False
+    if current != "blocked":
+        return True
+    return isinstance(blocked_from, str) and blocked_from == next_state
+
+
+def _require_classification(value: str, allowed: frozenset[str], name: str) -> None:
+    if value not in allowed:
+        raise StateError(f"{name} is not an owner-safe classification")
 
 
 def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migration], *, allow_new_identity: bool = True) -> None:

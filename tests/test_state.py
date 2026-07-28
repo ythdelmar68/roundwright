@@ -332,6 +332,19 @@ class StateTests(unittest.TestCase):
             source_digest="a" * 64,
         )
 
+    def identity_for(self, suffix: str) -> TaskIdentity:
+        return TaskIdentity(
+            task_id=f"task-19-{suffix}",
+            source_id=f"local-fixture-{suffix}",
+            repository_id="ythdelmar68/roundwright",
+            branch=f"codex/issue-19-{suffix}",
+            worktree=f"C:/private/worktree-{suffix}",
+            base_sha="b" * 40,
+        )
+
+    def source_for(self, suffix: str) -> SourceSnapshot:
+        return SourceSnapshot(f"local-fixture-{suffix}", "ythdelmar68/roundwright", (suffix * 64)[:64])
+
     def test_phase_two_migration_persists_one_source_task_and_owner_safe_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
@@ -385,6 +398,47 @@ class StateTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM artifact_references WHERE task_id = 'task-19'").fetchone()[0], 1)
             finally:
                 connection.close()
+
+    def test_blocked_recovery_returns_only_to_the_interrupted_stage(self) -> None:
+        origins = (
+            ("queued", ()),
+            ("planning", ("planning",)),
+            ("plan-review", ("planning", "plan-review")),
+            ("implementing", ("planning", "plan-review", "implementing")),
+            ("diff-review", ("planning", "plan-review", "implementing", "diff-review")),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            for index, (origin, path) in enumerate(origins, start=1):
+                with self.subTest(origin=origin):
+                    suffix = str(index)
+                    identity = self.identity_for(suffix)
+                    admit_task(repository, identity, (self.source_for(suffix),))
+                    current = "queued"
+                    for step, next_state in enumerate(path, start=1):
+                        transition_task(repository, identity, expected_state=current, next_state=next_state, evidence_fingerprint=(f"{index:x}{step:x}" * 64)[:64])
+                        current = next_state
+                    transition_task(repository, identity, expected_state=origin, next_state="blocked", evidence_fingerprint=(f"{index:x}a" * 64)[:64])
+                    for skipped in {"queued", "planning", "plan-review", "implementing", "diff-review"} - {origin}:
+                        with self.assertRaises(StateError):
+                            transition_task(repository, identity, expected_state="blocked", next_state=skipped, evidence_fingerprint=(f"{index:x}b" * 64)[:64])
+                    recovered = transition_task(repository, identity, expected_state="blocked", next_state=origin, evidence_fingerprint=(f"{index:x}c" * 64)[:64])
+                    self.assertEqual(recovered.state, origin)
+
+    def test_owner_visible_classifications_reject_paths_and_raw_provider_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                set_blocker(repository, identity, blocker_class="C:\\private\\worktree", evidence_fingerprint="1" * 64)
+            with self.assertRaises(StateError):
+                set_next_action(repository, identity, action_kind="provider-output-" + "x" * 100, evidence_fingerprint="2" * 64)
+            projection = task_projection(repository, identity)
+            self.assertEqual(projection.blockers, ())
+            self.assertIsNone(projection.next_action)
 
     def test_multi_source_and_replayed_task_admission_are_rejected_without_partial_task_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

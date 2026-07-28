@@ -71,7 +71,7 @@ class StateTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             try:
                 connection.execute("UPDATE schema_migrations SET checksum = 'changed' WHERE version = 1")
-                connection.execute("INSERT INTO schema_migrations VALUES (3, 'future')")
+                connection.execute("INSERT INTO schema_migrations VALUES (4, 'future')")
                 connection.commit()
             finally:
                 connection.close()
@@ -351,7 +351,7 @@ class StateTests(unittest.TestCase):
     def test_phase_two_migration_persists_one_source_task_and_owner_safe_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
-            self.assertEqual(initialize(repository).version, 2)
+            self.assertEqual(initialize(repository).version, 3)
             projection = admit_task(repository, self.task_identity(), (self.source_snapshot(),))
             self.assertEqual(projection.state, "queued")
             self.assertEqual(projection.base_sha, "b" * 40)
@@ -371,7 +371,7 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
             upgraded = initialize(repository)
-            self.assertEqual(upgraded.version, 2)
+            self.assertEqual(upgraded.version, 3)
             self.assertEqual(upgraded.identity, check_database(repository).identity)
             connection = sqlite3.connect(path)
             try:

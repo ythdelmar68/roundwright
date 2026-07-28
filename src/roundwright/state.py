@@ -62,6 +62,19 @@ MIGRATIONS = (
             ("next_actions", "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT)"),
         ),
     ),
+    Migration(
+        3,
+        (
+            "CREATE TABLE transition_leases (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), repository_id TEXT NOT NULL, state_identity TEXT NOT NULL, owner TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0), expires_at INTEGER NOT NULL CHECK(expires_at >= 0))",
+            "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL)",
+            "CREATE TABLE candidate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, evidence_fingerprint))",
+        ),
+        (
+            ("transition_leases", "CREATE TABLE transition_leases (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), repository_id TEXT NOT NULL, state_identity TEXT NOT NULL, owner TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0), expires_at INTEGER NOT NULL CHECK(expires_at >= 0))"),
+            ("candidate_seals", "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL)"),
+            ("candidate_evidence", "CREATE TABLE candidate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, evidence_fingerprint))"),
+        ),
+    ),
 )
 
 

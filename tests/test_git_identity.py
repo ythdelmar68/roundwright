@@ -220,6 +220,28 @@ class GitIdentityTests(unittest.TestCase):
             with self.assertRaises(GitIdentityError):
                 candidate_evidence(repository, binding, moved, lease=lease)
 
+    def test_detached_candidate_drift_cannot_restore_prior_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repository = self.repository(parent / "repository")
+            base = resolve_canonical_base(repository, "main")
+            location = parent / "isolated" / "task-20"
+            identity = self.identity(base, worktree=location)
+            self.admit(repository, identity)
+            lease = self.lease(repository)
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
+            seal = seal_candidate(repository, binding, lease=lease)
+            bind_candidate_evidence(repository, binding, seal, evidence_fingerprint="b" * 64, lease=lease)
+            self.run_git(location, "checkout", "--detach", base)
+            with self.assertRaises(GitIdentityError):
+                candidate_evidence(repository, binding, seal, lease=lease)
+            self.run_git(location, "checkout", identity.branch)
+            with self.assertRaises(GitIdentityError):
+                candidate_evidence(repository, binding, seal, lease=lease)
+            refreshed = seal_candidate(repository, binding, lease=lease)
+            bind_candidate_evidence(repository, binding, refreshed, evidence_fingerprint="c" * 64, lease=lease)
+            self.assertEqual(candidate_evidence(repository, binding, refreshed, lease=lease), ("c" * 64,))
+
     def test_wrong_base_foreign_repository_and_path_collision_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)

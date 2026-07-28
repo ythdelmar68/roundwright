@@ -239,8 +239,9 @@ def revalidate_worktree(repository: RepositoryIdentity, binding: WorktreeBinding
 def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, *, lease: TransitionLease | None = None) -> CandidateSeal:
     """Seal a clean full commit HEAD and invalidate evidence for a moved candidate."""
 
-    verified = revalidate_worktree(repository, binding)
+    verified = _revalidate_live_candidate_binding(repository, binding, lease)
     if _git(verified.worktree, "status", "--porcelain=v1", "--untracked-files=all"):
+        _invalidate_candidate(repository, verified, lease)
         raise GitIdentityError("candidate worktree is dirty")
     candidate = _git_commit(verified.worktree, "rev-parse", "--verify", "HEAD^{commit}")
     connection = _open_writable_connection(repository)
@@ -344,15 +345,53 @@ def _require_live_candidate(
 ) -> None:
     """Invalidate evidence on live head/state drift before it can be consumed."""
 
-    verified = revalidate_worktree(repository, binding)
+    verified = _revalidate_live_candidate_binding(repository, binding, lease)
     if verified.task_id != seal.task_id or verified.base_sha != seal.base_sha or verified.state_identity != seal.state_identity:
         raise GitIdentityError("candidate seal identity has drifted")
     if _git(verified.worktree, "status", "--porcelain=v1", "--untracked-files=all"):
+        _invalidate_candidate(repository, verified, lease)
         raise GitIdentityError("candidate worktree is dirty")
     head = _git_commit(verified.worktree, "rev-parse", "--verify", "HEAD^{commit}")
     if head != seal.candidate_sha:
-        seal_candidate(repository, verified, lease=lease)
-        raise GitIdentityError("candidate head moved and prior evidence was invalidated")
+        _invalidate_candidate(repository, verified, lease)
+        raise GitIdentityError("candidate head moved and candidate sealing is required")
+
+
+def _revalidate_live_candidate_binding(
+    repository: RepositoryIdentity, binding: WorktreeBinding, lease: TransitionLease | None
+) -> WorktreeBinding:
+    """Invalidate candidate state after leased, exact task worktree drift."""
+
+    _verify_lease(repository, lease, binding.repository_id)
+    root = repository.root.resolve(strict=True)
+    worktree = _validated_worktree_path(root, binding.worktree)
+    _require_task_binding(repository, binding, worktree)
+    if not isinstance(lease, TransitionLease) or binding.state_identity != lease.state_identity:
+        raise GitIdentityError("candidate state identity has drifted")
+    try:
+        return revalidate_worktree(repository, binding)
+    except GitIdentityError:
+        _invalidate_candidate(repository, binding, lease)
+        raise
+
+
+def _invalidate_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, lease: TransitionLease | None) -> None:
+    """Atomically remove evidence that can no longer prove the live candidate."""
+
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, binding.repository_id, None)
+        if not isinstance(lease, TransitionLease) or binding.state_identity != lease.state_identity:
+            raise GitIdentityError("candidate state identity has drifted")
+        connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (binding.task_id,))
+        connection.execute("DELETE FROM candidate_seals WHERE task_id = ?", (binding.task_id,))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _require_task_binding(repository: RepositoryIdentity, binding: WorktreeBinding, worktree: Path) -> None:

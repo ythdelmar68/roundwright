@@ -28,16 +28,47 @@ from roundwright.state import (
     _apply_migrations,
     _is_reparse_point,
     _verify_migrations,
-    admit_task,
+    admit_task as _admit_task,
     check_database,
     database_path,
     initialize,
-    record_artifact,
-    set_blocker,
-    set_next_action,
+    record_artifact as _record_artifact,
+    set_blocker as _set_blocker,
+    set_next_action as _set_next_action,
     task_projection,
-    transition_task,
+    transition_task as _transition_task,
 )
+from roundwright.git_identity import (
+    GitIdentityError,
+    TransitionLease,
+    acquire_transition_lease,
+    release_transition_lease,
+)
+
+
+def transition_task(repository: RepositoryIdentity, identity: TaskIdentity, **kwargs: object):
+    lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="state-tests", ttl_seconds=60)
+    return _transition_task(repository, identity, lease=lease, **kwargs)
+
+
+def _lease(repository: RepositoryIdentity, identity: TaskIdentity):
+    return acquire_transition_lease(repository, repository_id=identity.repository_id, owner="state-tests", ttl_seconds=60)
+
+
+def admit_task(repository: RepositoryIdentity, identity: TaskIdentity, snapshots: tuple[SourceSnapshot, ...], *, lease: object | None = None):
+    return _admit_task(repository, identity, snapshots, lease=_lease(repository, identity) if lease is None else lease)
+
+
+def record_artifact(repository: RepositoryIdentity, identity: TaskIdentity, **kwargs: object):
+    return _record_artifact(repository, identity, lease=_lease(repository, identity), **kwargs)
+
+
+def set_blocker(repository: RepositoryIdentity, identity: TaskIdentity, **kwargs: object):
+    return _set_blocker(repository, identity, lease=_lease(repository, identity), **kwargs)
+
+
+def set_next_action(repository: RepositoryIdentity, identity: TaskIdentity, **kwargs: object):
+    return _set_next_action(repository, identity, lease=_lease(repository, identity), **kwargs)
 
 
 class StateTests(unittest.TestCase):
@@ -71,7 +102,7 @@ class StateTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             try:
                 connection.execute("UPDATE schema_migrations SET checksum = 'changed' WHERE version = 1")
-                connection.execute("INSERT INTO schema_migrations VALUES (3, 'future')")
+                connection.execute("INSERT INTO schema_migrations VALUES (?, 'future')", (len(MIGRATIONS) + 1,))
                 connection.commit()
             finally:
                 connection.close()
@@ -351,7 +382,7 @@ class StateTests(unittest.TestCase):
     def test_phase_two_migration_persists_one_source_task_and_owner_safe_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
-            self.assertEqual(initialize(repository).version, 2)
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
             projection = admit_task(repository, self.task_identity(), (self.source_snapshot(),))
             self.assertEqual(projection.state, "queued")
             self.assertEqual(projection.base_sha, "b" * 40)
@@ -371,7 +402,7 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
             upgraded = initialize(repository)
-            self.assertEqual(upgraded.version, 2)
+            self.assertEqual(upgraded.version, len(MIGRATIONS))
             self.assertEqual(upgraded.identity, check_database(repository).identity)
             connection = sqlite3.connect(path)
             try:
@@ -384,6 +415,42 @@ class StateTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(initialize(repository), check_database(repository))
 
+    def test_version_three_lease_handles_cannot_reappear_after_upgrade(self) -> None:
+        for active in (False, True):
+            with self.subTest(active=active), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                path = database_path(repository)
+                path.parent.mkdir()
+                connection = sqlite3.connect(path)
+                try:
+                    _apply_migrations(connection, MIGRATIONS[:3])
+                    state_identity = connection.execute(
+                        "SELECT value FROM state_metadata WHERE key = 'state_id'"
+                    ).fetchone()[0]
+                    stale = TransitionLease("ythdelmar68/roundwright", state_identity, "legacy-owner", 1, 110)
+                    if active:
+                        connection.execute(
+                            "INSERT INTO transition_leases(lease_scope, repository_id, state_identity, owner, generation, expires_at) VALUES ('repository-state', ?, ?, ?, ?, ?)",
+                            (stale.repository_id, stale.state_identity, stale.owner, stale.generation, stale.expires_at),
+                        )
+                    connection.commit()
+                finally:
+                    connection.close()
+                initialize(repository)
+                if active:
+                    release_transition_lease(repository, stale, now=100)
+                reacquired = acquire_transition_lease(
+                    repository,
+                    repository_id=stale.repository_id,
+                    owner=stale.owner,
+                    ttl_seconds=10,
+                    now=100,
+                )
+                self.assertNotEqual(reacquired, stale)
+                self.assertGreater(reacquired.generation, stale.generation)
+                with self.assertRaises(GitIdentityError):
+                    release_transition_lease(repository, stale, now=100)
+
     def test_failed_v2_upgrade_leaves_the_valid_v1_state_unchanged(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             _apply_migrations(connection, (MIGRATIONS[0],))
@@ -393,6 +460,107 @@ class StateTests(unittest.TestCase):
                 _apply_migrations(connection, (MIGRATIONS[0], broken), allow_new_identity=False)
             self.assertEqual(_verify_migrations(connection, (MIGRATIONS[0],)), before)
             self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'v2_transient'").fetchone())
+
+    def test_legacy_duplicate_branch_ownership_fails_closed_during_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, MIGRATIONS[:4])
+                for task_id, source_id, worktree, digest in (
+                    ("legacy-one", "legacy-source-one", "C:/private/legacy-one", "a" * 64),
+                    ("legacy-two", "legacy-source-two", "C:/private/legacy-two", "b" * 64),
+                ):
+                    connection.execute(
+                        "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                        (source_id, "ythdelmar68/roundwright", digest),
+                    )
+                    connection.execute(
+                        "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
+                        (task_id, source_id, "ythdelmar68/roundwright", "codex/shared", worktree, "b" * 40),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            before = path.read_bytes()
+            with self.assertRaises(StateError):
+                initialize(repository)
+            self.assertEqual(before, path.read_bytes())
+
+    def test_legacy_unc_worktree_aliases_fail_closed_during_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, MIGRATIONS[:4])
+                for task_id, source_id, branch, worktree, digest in (
+                    ("legacy-unc-one", "legacy-unc-source-one", "codex/unc-one", "\\\\SERVER\\Share\\Task", "a" * 64),
+                    ("legacy-unc-two", "legacy-unc-source-two", "codex/unc-two", "//server/share/task", "b" * 64),
+                ):
+                    connection.execute(
+                        "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                        (source_id, "ythdelmar68/roundwright", digest),
+                    )
+                    connection.execute(
+                        "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
+                        (task_id, source_id, "ythdelmar68/roundwright", branch, worktree, "b" * 40),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            before = path.read_bytes()
+            with self.assertRaises(StateError):
+                initialize(repository)
+            self.assertEqual(before, path.read_bytes())
+
+    def test_version_five_forward_unc_ownership_rekeys_during_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, MIGRATIONS[:5])
+                connection.execute(
+                    "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                    ("legacy-unc-source", "ythdelmar68/roundwright", "a" * 64),
+                )
+                connection.execute(
+                    "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state, worktree_key) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+                    (
+                        "legacy-unc-task",
+                        "legacy-unc-source",
+                        "ythdelmar68/roundwright",
+                        "codex/legacy-unc",
+                        "//SERVER/Share/Task",
+                        "b" * 40,
+                        "//SERVER/Share/Task",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?)",
+                    ("//SERVER/Share/Task", "legacy-unc-task"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT worktree_key FROM tasks WHERE task_id = ?", ("legacy-unc-task",)).fetchone(),
+                    ("//server/share/task",),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT worktree_key, task_id FROM task_worktree_ownership").fetchone(),
+                    ("//server/share/task", "legacy-unc-task"),
+                )
+            finally:
+                connection.close()
 
     def test_task_projection_rejects_checksum_drift_and_incompatible_schema(self) -> None:
         for mutation in ("checksum", "schema"):
@@ -433,6 +601,61 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 transition_task(repository, mismatched, expected_state="planning", next_state="plan-review", evidence_fingerprint="e" * 64)
             self.assertEqual(task_projection(repository, identity).state, "planning")
+
+    def test_lifecycle_transition_requires_the_current_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            with self.assertRaises(StateError):
+                _admit_task(repository, identity, (self.source_snapshot(),))
+            wrong_repository_lease = acquire_transition_lease(repository, repository_id="other/repository", owner="state-tests", ttl_seconds=60)
+            with self.assertRaises(StateError):
+                _admit_task(repository, identity, (self.source_snapshot(),), lease=wrong_repository_lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("DELETE FROM transition_leases")
+                connection.commit()
+            finally:
+                connection.close()
+            admit_task(repository, identity, (self.source_snapshot(),))
+            with self.assertRaises(StateError):
+                _transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="d" * 64)
+            current = _lease(repository, identity)
+            wrong_repository_lease = type(current)("other/repository", current.state_identity, current.owner, current.generation, current.expires_at)
+            with self.assertRaises(StateError):
+                _transition_task(repository, identity, expected_state="queued", next_state="planning", evidence_fingerprint="e" * 64, lease=wrong_repository_lease)
+
+    def test_every_durable_state_mutation_requires_the_exact_current_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            identity = self.task_identity()
+            snapshot = self.source_snapshot()
+            with self.assertRaises(StateError):
+                _admit_task(repository, identity, (snapshot,))
+            lease = _lease(repository, identity)
+            _admit_task(repository, identity, (snapshot,), lease=lease)
+            mutations = (
+                lambda candidate: _admit_task(
+                    repository,
+                    self.identity_for("second-admission"),
+                    (SourceSnapshot("local-fixture-second-admission", "ythdelmar68/roundwright", "b" * 64),),
+                    lease=candidate,
+                ),
+                lambda candidate: _record_artifact(repository, identity, artifact_kind="plan", artifact_fingerprint="1" * 64, lease=candidate),
+                lambda candidate: _set_blocker(repository, identity, blocker_class="evidence-incomplete", evidence_fingerprint="2" * 64, lease=candidate),
+                lambda candidate: _set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint="3" * 64, lease=candidate),
+            )
+            wrong_owner = type(lease)(lease.repository_id, lease.state_identity, "other-owner", lease.generation, lease.expires_at)
+            stale = type(lease)(lease.repository_id, lease.state_identity, lease.owner, lease.generation, 0)
+            wrong_repository = type(lease)("other/repository", lease.state_identity, lease.owner, lease.generation, lease.expires_at)
+            for mutation in mutations:
+                for candidate in (None, wrong_owner, stale, wrong_repository):
+                    with self.subTest(mutation=mutation, lease=candidate), self.assertRaises(StateError):
+                        mutation(candidate)
+            for mutation in mutations:
+                mutation(lease)
 
     def test_blocked_recovery_and_committed_projection_references_are_consistent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -575,3 +798,81 @@ class StateTests(unittest.TestCase):
             admit_task(repository, identity, (self.source_snapshot(),))
             with self.assertRaises(StateError):
                 admit_task(repository, identity, (self.source_snapshot(),))
+
+    def test_active_tasks_cannot_reuse_a_branch_or_normalized_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            first = self.task_identity()
+            admit_task(repository, first, (self.source_snapshot(),))
+            same_branch = TaskIdentity("task-other-branch", "source-other-branch", first.repository_id, first.branch, "C:/other/worktree", first.base_sha)
+            same_worktree = TaskIdentity("task-other-worktree", "source-other-worktree", first.repository_id, "codex/other", first.worktree, first.base_sha)
+            dot_alias = TaskIdentity("task-dot-alias", "source-dot-alias", first.repository_id, "codex/dot", "C:/private/./worktree", first.base_sha)
+            separator_alias = TaskIdentity("task-separator-alias", "source-separator-alias", first.repository_id, "codex/separator", "C:\\private\\worktree", first.base_sha)
+            case_alias = TaskIdentity("task-case-alias", "source-case-alias", first.repository_id, "codex/case", "C:/PRIVATE/worktree", first.base_sha)
+            with self.assertRaises(StateError):
+                admit_task(repository, same_branch, (SourceSnapshot(same_branch.source_id, first.repository_id, "b" * 64),))
+            with self.assertRaises(StateError):
+                admit_task(repository, same_worktree, (SourceSnapshot(same_worktree.source_id, first.repository_id, "c" * 64),))
+            for identity, digest in ((dot_alias, "d" * 64), (separator_alias, "e" * 64), (case_alias, "f" * 64)):
+                with self.subTest(identity=identity.task_id), self.assertRaises(StateError):
+                    admit_task(repository, identity, (SourceSnapshot(identity.source_id, first.repository_id, digest),))
+            relative = TaskIdentity("task-relative", "source-relative", first.repository_id, "codex/relative", "private/worktree", first.base_sha)
+            with self.assertRaises(StateError):
+                admit_task(repository, relative, (SourceSnapshot(relative.source_id, first.repository_id, "1" * 64),))
+            posix = TaskIdentity(
+                "task-posix",
+                "source-posix",
+                first.repository_id,
+                "codex/posix",
+                "/private/worktree",
+                first.base_sha,
+            )
+            admit_task(repository, posix, (SourceSnapshot(posix.source_id, first.repository_id, "2" * 64),))
+            posix_dot_alias = TaskIdentity(
+                "task-posix-dot",
+                "source-posix-dot",
+                first.repository_id,
+                "codex/posix-dot",
+                "/private/./worktree",
+                first.base_sha,
+            )
+            posix_separator_alias = TaskIdentity(
+                "task-posix-separator",
+                "source-posix-separator",
+                first.repository_id,
+                "codex/posix-separator",
+                "/private//worktree",
+                first.base_sha,
+            )
+            for identity, digest in ((posix_dot_alias, "3" * 64), (posix_separator_alias, "4" * 64)):
+                with self.subTest(identity=identity.task_id), self.assertRaises(StateError):
+                    admit_task(repository, identity, (SourceSnapshot(identity.source_id, first.repository_id, digest),))
+            posix_case_variant = TaskIdentity(
+                "task-posix-case",
+                "source-posix-case",
+                first.repository_id,
+                "codex/posix-case",
+                "/PRIVATE/worktree",
+                first.base_sha,
+            )
+            admit_task(repository, posix_case_variant, (SourceSnapshot(posix_case_variant.source_id, first.repository_id, "5" * 64),))
+            unc = TaskIdentity(
+                "task-unc",
+                "source-unc",
+                first.repository_id,
+                "codex/unc",
+                "\\\\SERVER\\Share\\Task",
+                first.base_sha,
+            )
+            admit_task(repository, unc, (SourceSnapshot(unc.source_id, first.repository_id, "6" * 64),))
+            unc_alias = TaskIdentity(
+                "task-unc-alias",
+                "source-unc-alias",
+                first.repository_id,
+                "codex/unc-alias",
+                "//server/share/task",
+                first.base_sha,
+            )
+            with self.assertRaises(StateError):
+                admit_task(repository, unc_alias, (SourceSnapshot(unc_alias.source_id, first.repository_id, "7" * 64),))

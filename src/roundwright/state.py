@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import ntpath
 import os
+import posixpath
 import stat
 import sqlite3
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -61,6 +64,62 @@ MIGRATIONS = (
             ("blockers", "CREATE TABLE blockers (task_id TEXT NOT NULL REFERENCES tasks(task_id), blocker_class TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT, PRIMARY KEY(task_id, blocker_class))"),
             ("next_actions", "CREATE TABLE next_actions (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), action_kind TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, resolution_fingerprint TEXT)"),
         ),
+    ),
+    Migration(
+        3,
+        (
+            "CREATE TABLE transition_leases (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), repository_id TEXT NOT NULL, state_identity TEXT NOT NULL, owner TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0), expires_at INTEGER NOT NULL CHECK(expires_at >= 0))",
+            "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL)",
+            "CREATE TABLE candidate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, evidence_fingerprint))",
+        ),
+        (
+            ("transition_leases", "CREATE TABLE transition_leases (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), repository_id TEXT NOT NULL, state_identity TEXT NOT NULL, owner TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation > 0), expires_at INTEGER NOT NULL CHECK(expires_at >= 0))"),
+            ("candidate_seals", "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL)"),
+            ("candidate_evidence", "CREATE TABLE candidate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, evidence_fingerprint))"),
+        ),
+    ),
+    Migration(
+        4,
+        (
+            "CREATE TABLE transition_lease_generations (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), generation INTEGER NOT NULL CHECK(generation > 0))",
+            "ALTER TABLE candidate_seals ADD COLUMN state_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("transition_lease_generations", "CREATE TABLE transition_lease_generations (lease_scope TEXT PRIMARY KEY CHECK(lease_scope = 'repository-state'), generation INTEGER NOT NULL CHECK(generation > 0))"),
+            ("candidate_seals", "CREATE TABLE candidate_seals (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, state_identity TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
+    Migration(
+        5,
+        (
+            "ALTER TABLE tasks ADD COLUMN worktree_key TEXT NOT NULL DEFAULT ''",
+            "CREATE TABLE task_worktree_ownership (worktree_key TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))",
+        ),
+        (
+            ("tasks", "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_snapshots(source_id), repository_id TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL, base_sha TEXT NOT NULL, state TEXT NOT NULL, blocked_from_state TEXT, worktree_key TEXT NOT NULL DEFAULT '', CHECK(state IN ('queued', 'planning', 'plan-review', 'implementing', 'diff-review', 'ready-for-owner', 'blocked')), CHECK((state = 'blocked' AND blocked_from_state IS NOT NULL) OR (state != 'blocked' AND blocked_from_state IS NULL)))"),
+            ("task_worktree_ownership", "CREATE TABLE task_worktree_ownership (worktree_key TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))"),
+        ),
+    ),
+    Migration(
+        6,
+        (
+            "CREATE TABLE task_branch_ownership (branch TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))",
+        ),
+        (
+            ("task_branch_ownership", "CREATE TABLE task_branch_ownership (branch TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id))"),
+        ),
+    ),
+    Migration(
+        7,
+        (
+            "INSERT INTO transition_lease_generations(lease_scope, generation) "
+            "SELECT 'repository-state', CASE "
+            "WHEN COALESCE((SELECT MAX(generation) FROM transition_leases WHERE lease_scope = 'repository-state'), 0) >= 2 "
+            "THEN (SELECT MAX(generation) + 1 FROM transition_leases WHERE lease_scope = 'repository-state') "
+            "ELSE 2 END "
+            "ON CONFLICT(lease_scope) DO UPDATE SET generation = MAX(transition_lease_generations.generation, excluded.generation)",
+        ),
+        (),
     ),
 )
 
@@ -201,6 +260,8 @@ def admit_task(
     repository: RepositoryIdentity,
     identity: TaskIdentity,
     snapshots: tuple[SourceSnapshot, ...],
+    *,
+    lease: object | None = None,
 ) -> TaskProjection:
     """Durably admit exactly one immutable local source into the runnable pool."""
 
@@ -211,7 +272,7 @@ def admit_task(
     _validate_source_snapshot(snapshot)
     if snapshot.source_id != identity.source_id or snapshot.repository_id != identity.repository_id:
         raise StateError("task identity does not match its source snapshot")
-    return _mutate_task(repository, identity, snapshot)
+    return _mutate_task(repository, identity, snapshot, lease)
 
 
 def transition_task(
@@ -221,6 +282,7 @@ def transition_task(
     expected_state: str,
     next_state: str,
     evidence_fingerprint: str,
+    lease: object | None = None,
 ) -> TaskProjection:
     """Advance one task through the explicit Phase 2 state sequence atomically."""
 
@@ -231,6 +293,7 @@ def transition_task(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity, expected_state)
         blocked_from = connection.execute(
             "SELECT blocked_from_state FROM tasks WHERE task_id = ?", (identity.task_id,)
@@ -279,7 +342,12 @@ def transition_task(
 
 
 def record_artifact(
-    repository: RepositoryIdentity, identity: TaskIdentity, *, artifact_kind: str, artifact_fingerprint: str
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    *,
+    artifact_kind: str,
+    artifact_fingerprint: str,
+    lease: object | None = None,
 ) -> TaskProjection:
     """Persist an opaque artifact reference without making it the source of truth."""
 
@@ -289,6 +357,7 @@ def record_artifact(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity)
         connection.execute(
             "INSERT OR IGNORE INTO artifact_references(task_id, artifact_kind, artifact_fingerprint) VALUES (?, ?, ?)",
@@ -304,7 +373,12 @@ def record_artifact(
 
 
 def set_blocker(
-    repository: RepositoryIdentity, identity: TaskIdentity, *, blocker_class: str, evidence_fingerprint: str
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    *,
+    blocker_class: str,
+    evidence_fingerprint: str,
+    lease: object | None = None,
 ) -> TaskProjection:
     """Store a bounded blocker classification while retaining raw evidence outside owner views."""
 
@@ -314,6 +388,7 @@ def set_blocker(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity)
         connection.execute(
             "INSERT INTO blockers(task_id, blocker_class, evidence_fingerprint, resolution_fingerprint) VALUES (?, ?, ?, NULL) "
@@ -330,7 +405,12 @@ def set_blocker(
 
 
 def set_next_action(
-    repository: RepositoryIdentity, identity: TaskIdentity, *, action_kind: str, evidence_fingerprint: str
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    *,
+    action_kind: str,
+    evidence_fingerprint: str,
+    lease: object | None = None,
 ) -> TaskProjection:
     """Persist the one bounded next action associated with committed task state."""
 
@@ -340,6 +420,7 @@ def set_next_action(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity)
         connection.execute(
             "INSERT INTO next_actions(task_id, action_kind, evidence_fingerprint, resolution_fingerprint) VALUES (?, ?, ?, NULL) "
@@ -401,10 +482,13 @@ def task_projection(repository: RepositoryIdentity, identity: TaskIdentity) -> T
     )
 
 
-def _mutate_task(repository: RepositoryIdentity, identity: TaskIdentity, snapshot: SourceSnapshot) -> TaskProjection:
+def _mutate_task(
+    repository: RepositoryIdentity, identity: TaskIdentity, snapshot: SourceSnapshot, lease: object | None
+) -> TaskProjection:
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
         existing_source = connection.execute(
             "SELECT repository_id, source_digest FROM source_snapshots WHERE source_id = ?", (snapshot.source_id,)
         ).fetchone()
@@ -415,14 +499,39 @@ def _mutate_task(repository: RepositoryIdentity, identity: TaskIdentity, snapsho
             )
         elif existing_source != (snapshot.repository_id, snapshot.source_digest):
             raise StateError("source snapshot identity does not match replayed input")
+        worktree_key = _canonical_worktree_key(identity.worktree)
         existing_task = connection.execute(
             "SELECT source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?", (identity.task_id,)
         ).fetchone()
         expected = (identity.source_id, identity.repository_id, identity.branch, identity.worktree, identity.base_sha)
+        branch_owner = connection.execute(
+            "SELECT task_id FROM task_branch_ownership WHERE branch = ?", (identity.branch,)
+        ).fetchone()
+        collision = connection.execute(
+            "SELECT task_id FROM tasks WHERE branch = ? AND task_id != ?",
+            (identity.branch, identity.task_id),
+        ).fetchone()
+        owner = connection.execute(
+            "SELECT task_id FROM task_worktree_ownership WHERE worktree_key = ?", (worktree_key,)
+        ).fetchone()
+        if (
+            collision is not None
+            or (branch_owner is not None and branch_owner[0] != identity.task_id)
+            or (owner is not None and owner[0] != identity.task_id)
+        ):
+            raise StateError("an active task already owns the branch or worktree")
         if existing_task is None:
             connection.execute(
-                "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
-                (identity.task_id, *expected),
+                "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state, worktree_key) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (identity.task_id, *expected, worktree_key),
+            )
+            connection.execute(
+                "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?)",
+                (worktree_key, identity.task_id),
+            )
+            connection.execute(
+                "INSERT INTO task_branch_ownership(branch, task_id) VALUES (?, ?)",
+                (identity.branch, identity.task_id),
             )
         elif existing_task != expected:
             raise StateError("task identity does not match replayed input")
@@ -455,15 +564,45 @@ def _require_matching_task(
     connection: sqlite3.Connection, identity: TaskIdentity, expected_state: str | None = None
 ) -> tuple[str]:
     row = connection.execute(
-        "SELECT state, source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?",
+        "SELECT state, source_id, repository_id, branch, worktree, base_sha, worktree_key FROM tasks WHERE task_id = ?",
         (identity.task_id,),
     ).fetchone()
     expected = (identity.source_id, identity.repository_id, identity.branch, identity.worktree, identity.base_sha)
-    if row is None or tuple(row[1:]) != expected:
+    if row is None or tuple(row[1:6]) != expected:
         raise StateError("task identity does not match committed state")
+    if row[6] != _canonical_worktree_key(identity.worktree):
+        raise StateError("task worktree ownership is not current")
+    branch_owner = connection.execute(
+        "SELECT task_id FROM task_branch_ownership WHERE branch = ?", (identity.branch,)
+    ).fetchone()
+    worktree_owner = connection.execute(
+        "SELECT task_id FROM task_worktree_ownership WHERE worktree_key = ?", (row[6],)
+    ).fetchone()
+    if branch_owner != (identity.task_id,) or worktree_owner != (identity.task_id,):
+        raise StateError("task ownership is not current")
     if expected_state is not None and row[0] != expected_state:
         raise StateError("task state does not match the requested transition")
     return (row[0],)
+
+
+def _require_current_transition_lease(connection: sqlite3.Connection, lease: object | None, repository_id: str) -> None:
+    """Require the exact unexpired lease row for every state transition."""
+
+    required = ("repository_id", "state_identity", "owner", "generation", "expires_at")
+    if lease is None or any(not hasattr(lease, attribute) for attribute in required):
+        raise StateError("a current transition lease is required")
+    row = connection.execute(
+        "SELECT repository_id, state_identity, owner, generation, expires_at FROM transition_leases WHERE lease_scope = 'repository-state'"
+    ).fetchone()
+    if row is None or tuple(getattr(lease, attribute) for attribute in required) != tuple(row):
+        raise StateError("transition lease ownership has drifted")
+    if getattr(lease, "repository_id") != repository_id:
+        raise StateError("transition lease does not match the task repository")
+    state = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
+    if state is None or state[0] != getattr(lease, "state_identity"):
+        raise StateError("transition lease state identity has drifted")
+    if not isinstance(getattr(lease, "expires_at"), int) or getattr(lease, "expires_at") <= int(time.time()):
+        raise StateError("transition lease is stale and requires owner recovery")
 
 
 def _validate_source_snapshot(snapshot: SourceSnapshot) -> None:
@@ -479,6 +618,7 @@ def _validate_task_identity(identity: TaskIdentity) -> None:
     _require_token(identity.repository_id, "repository identity")
     _require_token(identity.branch, "task branch")
     _require_worktree(identity.worktree)
+    _canonical_worktree_key(identity.worktree)
     if len(identity.base_sha) != 40 or any(character not in "0123456789abcdef" for character in identity.base_sha):
         raise StateError("base commit is not a full lowercase SHA")
 
@@ -491,6 +631,24 @@ def _require_token(value: str, name: str) -> None:
 def _require_worktree(value: str) -> None:
     if not isinstance(value, str) or not value or any(unicodedata.category(character) == "Cc" for character in value):
         raise StateError("task worktree is invalid")
+
+
+def _canonical_worktree_key(value: str) -> str:
+    """Return one platform-aware, absolute ownership key without exposing it."""
+
+    _require_worktree(value)
+    if (
+        len(value) >= 3
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in ("/", "\\")
+    ):
+        return ntpath.normcase(ntpath.normpath(value)).replace("\\", "/")
+    if value.startswith(("\\\\", "//")):
+        return ntpath.normcase(ntpath.normpath(value)).replace("\\", "/")
+    if value.startswith("/"):
+        return posixpath.normpath(value)
+    raise StateError("task worktree must be an absolute path")
 
 
 def _require_fingerprint(value: str) -> None:
@@ -543,6 +701,8 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
             )
+        _backfill_task_ownership(connection)
+        _validate_task_ownership(connection)
         _ensure_state_identity(connection, allow_create=allow_new_identity and not exists)
         _validate_schema(connection, ordered)
         connection.commit()
@@ -563,7 +723,84 @@ def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migr
     if len(applied) != len(ordered):
         raise StateError("database schema is not fully migrated")
     _validate_schema(connection, ordered)
+    _validate_task_ownership(connection)
     return ordered[-1].version if ordered else 0, _read_state_identity(connection)
+
+
+def _backfill_task_ownership(connection: sqlite3.Connection) -> None:
+    """Establish all durable task ownership invariants during migration."""
+
+    has_worktree_ownership = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_worktree_ownership'"
+    ).fetchone()
+    has_branch_ownership = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_branch_ownership'"
+    ).fetchone()
+    if not has_worktree_ownership and not has_branch_ownership:
+        return
+    for task_id, branch, worktree in connection.execute("SELECT task_id, branch, worktree FROM tasks ORDER BY task_id"):
+        if has_branch_ownership:
+            branch_owner = connection.execute(
+                "SELECT task_id FROM task_branch_ownership WHERE branch = ?", (branch,)
+            ).fetchone()
+            if branch_owner is not None and branch_owner[0] != task_id:
+                raise StateError("active task branch ownership is ambiguous")
+            connection.execute(
+                "INSERT INTO task_branch_ownership(branch, task_id) VALUES (?, ?) "
+                "ON CONFLICT(branch) DO UPDATE SET task_id = excluded.task_id",
+                (branch, task_id),
+            )
+        if not has_worktree_ownership:
+            continue
+        key = _canonical_worktree_key(worktree)
+        existing = connection.execute(
+            "SELECT task_id FROM task_worktree_ownership WHERE worktree_key = ?", (key,)
+        ).fetchone()
+        if existing is not None and existing[0] != task_id:
+            raise StateError("active task worktree ownership is ambiguous")
+        connection.execute("UPDATE tasks SET worktree_key = ? WHERE task_id = ?", (key, task_id))
+        reservation = connection.execute(
+            "SELECT worktree_key FROM task_worktree_ownership WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if reservation is None:
+            connection.execute(
+                "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?)",
+                (key, task_id),
+            )
+        elif reservation[0] != key:
+            connection.execute(
+                "UPDATE task_worktree_ownership SET worktree_key = ? WHERE task_id = ?", (key, task_id)
+            )
+
+
+def _validate_task_ownership(connection: sqlite3.Connection) -> None:
+    """Fail closed if a fully migrated ledger no longer has one owner per task."""
+
+    tables = {
+        row[0]
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "tasks" not in tables:
+        return
+    for table in ("task_branch_ownership", "task_worktree_ownership"):
+        if table not in tables:
+            return
+    tasks = tuple(connection.execute("SELECT task_id, branch, worktree, worktree_key FROM tasks ORDER BY task_id"))
+    if connection.execute("SELECT COUNT(*) FROM task_branch_ownership").fetchone()[0] != len(tasks):
+        raise StateError("task branch ownership is incomplete")
+    if connection.execute("SELECT COUNT(*) FROM task_worktree_ownership").fetchone()[0] != len(tasks):
+        raise StateError("task worktree ownership is incomplete")
+    for task_id, branch, worktree, worktree_key in tasks:
+        if worktree_key != _canonical_worktree_key(worktree):
+            raise StateError("task worktree ownership is invalid")
+        if connection.execute(
+            "SELECT task_id FROM task_branch_ownership WHERE branch = ?", (branch,)
+        ).fetchone() != (task_id,):
+            raise StateError("task branch ownership is invalid")
+        if connection.execute(
+            "SELECT task_id FROM task_worktree_ownership WHERE worktree_key = ?", (worktree_key,)
+        ).fetchone() != (task_id,):
+            raise StateError("task worktree ownership is invalid")
 
 
 def _validate_definitions(migrations: Iterable[Migration]) -> tuple[Migration, ...]:

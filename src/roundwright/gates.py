@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 
 from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence
@@ -94,7 +96,6 @@ class TrustedGatePolicyEvidence:
 
     snapshot: TrustedPolicySnapshot
     receipt: ActivationReceipt
-    task_fingerprint: str
     standing_authority: StandingAuthority
     evaluated_at: datetime
     receipt_status: ReceiptStatus
@@ -199,7 +200,7 @@ def record_gate_evidence(
 
     _validate_context(context)
     _validate_evidence(evidence)
-    policy_activated_at = _current_trusted_policy_activation(context, policy_evidence)
+    policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         raise GateError("gate context does not match current trusted policy evidence")
     if (
@@ -332,7 +333,7 @@ def evaluate_gates(
 ) -> GateDecision:
     """Load SQLite-backed evidence then apply the pure centralized decision API."""
 
-    policy_activated_at = _current_trusted_policy_activation(context, policy_evidence)
+    policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "current trusted policy evidence is unavailable"),))
     decision = _read_persisted_decision(repository, binding, seal, lease=lease)
@@ -355,7 +356,7 @@ def transition_ready_for_owner(
 ):
     """Permit only an aggregate PASS to perform the final lifecycle transition."""
 
-    policy_activated_at = _current_trusted_policy_activation(context, policy_evidence)
+    policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         raise GateError("gate context does not match current trusted policy evidence")
     candidate_evidence(repository, binding, seal, lease=lease)
@@ -481,22 +482,46 @@ def _validate_context(context: GateContext) -> None:
         raise GateError("gate context is invalid")
 
 
-def _current_trusted_policy_activation(context: GateContext, evidence: object) -> str | None:
+def task_identity_fingerprint(identity: object) -> str:
+    """Return the opaque activation-receipt binding for one durable task."""
+
+    from .state import TaskIdentity
+
+    if type(identity) is not TaskIdentity or any(type(value) is not str for value in identity.__dict__.values()):
+        raise GateError("task identity is invalid")
+    return hashlib.sha256("\x00".join(identity.__dict__.values()).encode("utf-8")).hexdigest()
+
+
+def _current_trusted_policy_activation(
+    repository: RepositoryIdentity,
+    binding: WorktreeBinding,
+    context: GateContext,
+    evidence: object,
+) -> str | None:
     """Require the policy module to independently validate this exact binding."""
 
     if type(evidence) is not TrustedGatePolicyEvidence:
         return None
     try:
+        identity = _task_identity(repository, context.task_id)
+        if (
+            identity.task_id != binding.task_id
+            or identity.repository_id != binding.repository_id
+            or identity.branch != binding.branch
+            or Path(identity.worktree) != binding.worktree
+            or identity.base_sha != binding.base_sha
+        ):
+            return None
         decision = evaluate_policy(
             evidence.snapshot,
             evidence.receipt,
-            task_fingerprint=evidence.task_fingerprint,
+            task_fingerprint=task_identity_fingerprint(identity),
             candidate_sha=context.candidate_sha,
             standing_authority=evidence.standing_authority,
             now=evidence.evaluated_at,
             receipt_status=evidence.receipt_status,
         )
-    except (AttributeError, TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError, StateError):
         return None
     if not (
         decision.authorized

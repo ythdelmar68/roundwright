@@ -29,6 +29,7 @@ from roundwright.gates import (
     render_gate_decision,
     read_gate_evidence,
     record_gate_evidence,
+    task_identity_fingerprint,
     transition_ready_for_owner,
 )
 from roundwright.configuration import RepositoryIdentity
@@ -201,6 +202,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         self,
         context: GateContext,
         *,
+        task_fingerprint: str | None = None,
         activated_at: datetime | None = None,
         status: ReceiptStatus = ReceiptStatus.FRESH,
     ) -> TrustedGatePolicyEvidence:
@@ -214,7 +216,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             snapshot.source.revision_fingerprint,
             snapshot.policy_digest,
             1,
-            "e" * 64,
+            self.expected_task_fingerprint(context) if task_fingerprint is None else task_fingerprint,
             context.candidate_sha,
             activated_at,
             now + timedelta(minutes=1),
@@ -222,10 +224,14 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         return TrustedGatePolicyEvidence(
             snapshot,
             receipt,
-            "e" * 64,
             StandingAuthority(frozenset(PolicyAction)),
             now,
             status,
+        )
+
+    def expected_task_fingerprint(self, context: GateContext) -> str:
+        return task_identity_fingerprint(
+            TaskIdentity(context.task_id, "source-21", "ythdelmar68/roundwright", "codex/issue-21", "C:/private/issue-21", "a" * 40)
         )
 
     def repository(self, root: Path) -> RepositoryIdentity:
@@ -499,6 +505,84 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute("SELECT receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, seal.candidate_sha)).fetchone(),
                     (fresh_context.receipt_fingerprint,),
+                )
+            finally:
+                connection.close()
+
+    def test_foreign_task_receipt_with_the_same_candidate_cannot_complete_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            foreign = TaskIdentity(
+                "issue-22",
+                "source-22",
+                identity.repository_id,
+                "codex/issue-22",
+                "C:/private/issue-22",
+                identity.base_sha,
+            )
+            admit_task(
+                repository,
+                foreign,
+                (SourceSnapshot(foreign.source_id, foreign.repository_id, "2" * 64),),
+                lease=lease,
+            )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                    (foreign.task_id, foreign.base_sha, seal.candidate_sha, lease.state_identity),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            foreign_policy = self.policy_evidence(
+                context,
+                task_fingerprint=task_identity_fingerprint(foreign),
+            )
+            foreign_evidence = GateEvidence(
+                identity.task_id,
+                seal.candidate_sha,
+                GateKey.BUILD,
+                EvidenceOutcome.PASS,
+                "validator",
+                99,
+                "f" * 64,
+            )
+            with mock.patch("roundwright.gates.bind_candidate_evidence"):
+                with self.assertRaises(GateError):
+                    record_gate_evidence(
+                        repository,
+                        binding,
+                        seal,
+                        context,
+                        foreign_evidence,
+                        policy_evidence=foreign_policy,
+                        lease=lease,
+                    )
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(
+                    evaluate_gates(repository, binding, seal, context, policy_evidence=foreign_policy, lease=lease).outcome,
+                    GateOutcome.BLOCKED,
+                )
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(
+                        repository,
+                        binding,
+                        seal,
+                        context,
+                        evidence_fingerprint="7" * 64,
+                        policy_evidence=foreign_policy,
+                        lease=lease,
+                    )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    ("diff-review",),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (foreign.task_id,)).fetchone(),
+                    (seal.candidate_sha,),
                 )
             finally:
                 connection.close()

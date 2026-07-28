@@ -139,6 +139,18 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE gate_contexts (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)))"),
         ),
     ),
+    Migration(
+        10,
+        (
+            "ALTER TABLE gate_contexts ADD COLUMN policy_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN receipt_fingerprint TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_evidence ADD COLUMN follow_ups TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE gate_contexts (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL DEFAULT '', receipt_fingerprint TEXT NOT NULL DEFAULT '')"),
+            ("gate_evidence", "CREATE TABLE gate_evidence (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, gate_key TEXT NOT NULL, outcome TEXT NOT NULL, evaluator_id TEXT NOT NULL, evaluated_at INTEGER NOT NULL CHECK(evaluated_at > 0), evidence_fingerprint TEXT NOT NULL, changed_boundary TEXT, reason TEXT, follow_ups TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(task_id, candidate_sha, gate_key, evaluator_id, evidence_fingerprint))"),
+        ),
+    ),
 )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -81,6 +82,17 @@ class GateContext:
     candidate_sha: str
     source_count: int
     isolated_local_task: bool
+    policy_digest: str
+    receipt_fingerprint: str
+
+
+@dataclass(frozen=True)
+class FollowUp:
+    """One evaluator follow-up and its explicit resolution binding."""
+
+    identifier: str
+    resolved: bool
+    resolution_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +106,7 @@ class GateEvidence:
     evidence_fingerprint: str
     changed_boundary: str | None = None
     reason: str | None = None
+    follow_ups: object = ()
 
 
 @dataclass(frozen=True)
@@ -112,12 +125,18 @@ class GateDecision:
 def decide_gates(context: GateContext, evidence: tuple[GateEvidence, ...]) -> GateDecision:
     """Purely aggregate structured gate evidence into one fail-closed decision."""
 
-    if not _is_well_formed_context(context):
+    if type(context) is not GateContext or not _is_well_formed_context(context):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "invalid gate context"),))
+    if type(evidence) is not tuple:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("evidence", GateOutcome.BLOCKED, "invalid evidence container"),))
     registry = {requirement.key.value: requirement for requirement in GATE_REGISTRY}
     grouped: dict[str, list[GateEvidence]] = {key: [] for key in registry}
     unsupported = False
+    malformed = False
     for item in evidence:
+        if type(item) is not GateEvidence or not isinstance(item.gate_key, (GateKey, str)):
+            malformed = True
+            continue
         key = _value(item.gate_key)
         if key not in registry:
             unsupported = True
@@ -133,6 +152,8 @@ def decide_gates(context: GateContext, evidence: tuple[GateEvidence, ...]) -> Ga
         results.append(_decide_requirement(context, requirement, entries))
     if unsupported:
         results.append(GateResult("unsupported", GateOutcome.BLOCKED, "unsupported gate evidence"))
+    if malformed:
+        results.append(GateResult("malformed", GateOutcome.BLOCKED, "invalid structured evidence"))
 
     outcome = GateOutcome.PASS
     if any(result.outcome is GateOutcome.BLOCKED for result in results):
@@ -189,21 +210,22 @@ def record_gate_evidence(
         if context.source_count != source_count:
             raise GateError("gate context source count does not match committed task state")
         persisted_context = connection.execute(
-            "SELECT source_count, isolated_local_task FROM gate_contexts WHERE task_id = ?", (binding.task_id,)
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ?", (binding.task_id,)
         ).fetchone()
-        context_values = (context.source_count, int(context.isolated_local_task))
+        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint)
         if persisted_context is None:
             connection.execute(
-                "INSERT INTO gate_contexts(task_id, source_count, isolated_local_task) VALUES (?, ?, ?)",
+                "INSERT INTO gate_contexts(task_id, source_count, isolated_local_task, policy_digest, receipt_fingerprint) VALUES (?, ?, ?, ?, ?)",
                 (binding.task_id, *context_values),
             )
         elif persisted_context != context_values:
             raise GateError("gate context conflicts with committed task state")
         existing = connection.execute(
-            "SELECT outcome, evaluated_at, changed_boundary, reason FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? AND gate_key = ? AND evaluator_id = ? AND evidence_fingerprint = ?",
+            "SELECT outcome, evaluated_at, changed_boundary, reason, follow_ups FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? AND gate_key = ? AND evaluator_id = ? AND evidence_fingerprint = ?",
             (evidence.task_id, evidence.candidate_sha, _value(evidence.gate_key), evidence.evaluator_id, evidence.evidence_fingerprint),
         ).fetchone()
-        expected = (_value(evidence.outcome), evidence.evaluated_at, evidence.changed_boundary, evidence.reason)
+        follow_ups = _encode_follow_ups(evidence.follow_ups)
+        expected = (_value(evidence.outcome), evidence.evaluated_at, evidence.changed_boundary, evidence.reason, follow_ups)
         conflict = existing is not None and existing != expected
         if conflict:
             connection.execute(
@@ -212,7 +234,7 @@ def record_gate_evidence(
             )
         elif existing is None:
             connection.execute(
-                "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason, follow_ups) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     evidence.task_id,
                     evidence.candidate_sha,
@@ -223,6 +245,7 @@ def record_gate_evidence(
                     evidence.evidence_fingerprint,
                     evidence.changed_boundary,
                     evidence.reason,
+                    follow_ups,
                 ),
             )
         connection.commit()
@@ -248,13 +271,13 @@ def read_gate_evidence(
     connection = _open_writable_connection(repository)
     try:
         rows = connection.execute(
-            "SELECT task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? ORDER BY gate_key, evaluator_id, evidence_fingerprint",
+            "SELECT task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason, follow_ups FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? ORDER BY gate_key, evaluator_id, evidence_fingerprint",
             (binding.task_id, seal.candidate_sha),
         ).fetchall()
     finally:
         connection.close()
     return tuple(
-        GateEvidence(*row)
+        GateEvidence(*row[:9], _decode_follow_ups(row[9]))
         for row in rows
         if isinstance(row[6], str) and row[6] in valid_fingerprints
     )
@@ -264,14 +287,14 @@ def evaluate_gates(
     repository: RepositoryIdentity,
     binding: WorktreeBinding,
     seal: CandidateSeal,
-    context: GateContext | None = None,
+    context: GateContext,
     *,
     lease: TransitionLease | None = None,
 ) -> GateDecision:
     """Load SQLite-backed evidence then apply the pure centralized decision API."""
 
     decision = _read_persisted_decision(repository, binding, seal, lease=lease)
-    if context is not None and context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
+    if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate identity mismatch"),))
     return decision
 
@@ -280,7 +303,7 @@ def transition_ready_for_owner(
     repository: RepositoryIdentity,
     binding: WorktreeBinding,
     seal: CandidateSeal,
-    context: GateContext | None = None,
+    context: GateContext,
     *,
     evidence_fingerprint: str,
     lease: TransitionLease | None = None,
@@ -288,7 +311,7 @@ def transition_ready_for_owner(
     """Permit only an aggregate PASS to perform the final lifecycle transition."""
 
     candidate_evidence(repository, binding, seal, lease=lease)
-    if context is not None and context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
+    if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         raise GateError("gate context does not match committed task state")
     return _transition_ready_for_owner(
         repository,
@@ -339,19 +362,19 @@ def _decision_from_connection(connection, identity) -> GateDecision:
     if context is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "gate context is unavailable"),))
     rows = connection.execute(
-        "SELECT gates.task_id, gates.candidate_sha, gates.gate_key, gates.outcome, gates.evaluator_id, gates.evaluated_at, gates.evidence_fingerprint, gates.changed_boundary, gates.reason FROM gate_evidence AS gates JOIN candidate_evidence AS candidate ON candidate.task_id = gates.task_id AND candidate.candidate_sha = gates.candidate_sha AND candidate.evidence_fingerprint = gates.evidence_fingerprint WHERE gates.task_id = ? AND gates.candidate_sha = ? ORDER BY gates.gate_key, gates.evaluator_id, gates.evidence_fingerprint",
+        "SELECT gates.task_id, gates.candidate_sha, gates.gate_key, gates.outcome, gates.evaluator_id, gates.evaluated_at, gates.evidence_fingerprint, gates.changed_boundary, gates.reason, gates.follow_ups FROM gate_evidence AS gates JOIN candidate_evidence AS candidate ON candidate.task_id = gates.task_id AND candidate.candidate_sha = gates.candidate_sha AND candidate.evidence_fingerprint = gates.evidence_fingerprint WHERE gates.task_id = ? AND gates.candidate_sha = ? ORDER BY gates.gate_key, gates.evaluator_id, gates.evidence_fingerprint",
         (identity.task_id, seal[1]),
     ).fetchall()
-    return decide_gates(context, tuple(GateEvidence(*row) for row in rows))
+    return decide_gates(context, tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows))
 
 
 def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:
     row = connection.execute(
-        "SELECT source_count, isolated_local_task FROM gate_contexts WHERE task_id = ?", (task_id,)
+        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ?", (task_id,)
     ).fetchone()
-    if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1):
+    if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1) or not _is_fingerprint(row[2]) or not _is_fingerprint(row[3]):
         return None
-    return GateContext(task_id, candidate_sha, row[0], bool(row[1]))
+    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3])
 
 
 def _decide_requirement(context: GateContext, requirement: GateRequirement, entries: list[GateEvidence]) -> GateResult:
@@ -365,6 +388,8 @@ def _decide_requirement(context: GateContext, requirement: GateRequirement, entr
         return GateResult(key, GateOutcome.BLOCKED, "conflicting evidence")
     outcome = next(iter(outcomes))
     if outcome == EvidenceOutcome.PASS.value:
+        if any(not follow_up.resolved for entry in entries for follow_up in entry.follow_ups):
+            return GateResult(key, GateOutcome.BLOCKED, "unresolved follow-up remains")
         return GateResult(key, GateOutcome.PASS, "accepted")
     if outcome == EvidenceOutcome.NOT_APPLICABLE.value:
         if not requirement.permits_phase_two_local_na:
@@ -402,6 +427,8 @@ def _is_well_formed_context(context: GateContext) -> bool:
         and type(context.source_count) is int
         and context.source_count > 0
         and type(context.isolated_local_task) is bool
+        and _is_fingerprint(context.policy_digest)
+        and _is_fingerprint(context.receipt_fingerprint)
     )
 
 
@@ -411,6 +438,8 @@ def _is_well_formed(evidence: GateEvidence) -> bool:
         and bool(_TOKEN.fullmatch(evidence.task_id))
         and isinstance(evidence.candidate_sha, str)
         and bool(_COMMIT.fullmatch(evidence.candidate_sha))
+        and isinstance(evidence.gate_key, (GateKey, str))
+        and isinstance(evidence.outcome, (EvidenceOutcome, str))
         and _value(evidence.outcome) in {entry.value for entry in EvidenceOutcome}
         and isinstance(evidence.evaluator_id, str)
         and bool(_TOKEN.fullmatch(evidence.evaluator_id))
@@ -420,11 +449,62 @@ def _is_well_formed(evidence: GateEvidence) -> bool:
         and bool(_FINGERPRINT.fullmatch(evidence.evidence_fingerprint))
         and (evidence.changed_boundary is None or isinstance(evidence.changed_boundary, str))
         and (evidence.reason is None or isinstance(evidence.reason, str))
+        and _follow_ups_are_valid(evidence.follow_ups)
     )
 
 
 def _justified_na(evidence: GateEvidence) -> bool:
     return all(isinstance(value, str) and bool(value.strip()) for value in (evidence.changed_boundary, evidence.reason))
+
+
+def _is_fingerprint(value: object) -> bool:
+    return isinstance(value, str) and bool(_FINGERPRINT.fullmatch(value))
+
+
+def _follow_ups_are_valid(value: object) -> bool:
+    if type(value) is not tuple:
+        return False
+    identifiers: set[str] = set()
+    for follow_up in value:
+        if type(follow_up) is not FollowUp or not isinstance(follow_up.identifier, str) or not _TOKEN.fullmatch(follow_up.identifier) or type(follow_up.resolved) is not bool:
+            return False
+        if follow_up.identifier in identifiers:
+            return False
+        identifiers.add(follow_up.identifier)
+        if follow_up.resolved != _is_fingerprint(follow_up.resolution_fingerprint):
+            return False
+    return True
+
+
+def _encode_follow_ups(value: object) -> str:
+    if not _follow_ups_are_valid(value):
+        raise GateError("gate follow-ups are invalid")
+    return json.dumps(
+        [
+            {"identifier": follow_up.identifier, "resolved": follow_up.resolved, "resolution_fingerprint": follow_up.resolution_fingerprint}
+            for follow_up in value
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _decode_follow_ups(value: object) -> object:
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if type(decoded) is not list:
+        return None
+    follow_ups: list[FollowUp] = []
+    for item in decoded:
+        if type(item) is not dict or set(item) != {"identifier", "resolved", "resolution_fingerprint"}:
+            return None
+        follow_ups.append(FollowUp(item["identifier"], item["resolved"], item["resolution_fingerprint"]))
+    value = tuple(follow_ups)
+    return value if _follow_ups_are_valid(value) else None
 
 
 def _task_identity(repository: RepositoryIdentity, task_id: str):

@@ -14,10 +14,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.gates import (
     EvidenceOutcome,
+    FollowUp,
     GATE_REGISTRY,
     GateContext,
     GateDecision,
     GateEvidence,
+    GateError,
     GateKey,
     GateOutcome,
     decide_gates,
@@ -35,9 +37,11 @@ from roundwright.state import SourceSnapshot, StateError, TaskIdentity, admit_ta
 class GateDecisionTests(unittest.TestCase):
     task_id = "issue-21"
     candidate = "a" * 40
+    policy_digest = "c" * 64
+    receipt_fingerprint = "d" * 64
 
     def context(self, *, sources: int = 1, isolated: bool = True) -> GateContext:
-        return GateContext(self.task_id, self.candidate, sources, isolated)
+        return GateContext(self.task_id, self.candidate, sources, isolated, self.policy_digest, self.receipt_fingerprint)
 
     def evidence(
         self,
@@ -48,6 +52,7 @@ class GateDecisionTests(unittest.TestCase):
         candidate: str | None = None,
         boundary: str | None = None,
         reason: str | None = None,
+        follow_ups: object = (),
     ) -> GateEvidence:
         return GateEvidence(
             self.task_id,
@@ -59,6 +64,7 @@ class GateDecisionTests(unittest.TestCase):
             fingerprint,
             boundary,
             reason,
+            follow_ups,
         )
 
     def accepted_evidence(self) -> tuple[GateEvidence, ...]:
@@ -129,7 +135,7 @@ class GateDecisionTests(unittest.TestCase):
         self.assertEqual(decide_gates(self.context(), tuple(conflict)).outcome, GateOutcome.BLOCKED)
 
     def test_candidate_movement_requires_fresh_evidence(self) -> None:
-        moved = GateContext(self.task_id, "b" * 40, 1, True)
+        moved = GateContext(self.task_id, "b" * 40, 1, True, self.policy_digest, self.receipt_fingerprint)
         self.assertEqual(decide_gates(moved, self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
         self.assertEqual(decide_gates(moved, ()).outcome, GateOutcome.PENDING)
 
@@ -157,7 +163,15 @@ class GateDecisionTests(unittest.TestCase):
             accepted[-1].reason,
         )
         self.assertEqual(decide_gates(self.context(), tuple(accepted)).outcome, GateOutcome.BLOCKED)
-        self.assertEqual(decide_gates(GateContext(self.task_id, self.candidate, True, "yes"), self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
+        self.assertEqual(decide_gates(GateContext(self.task_id, self.candidate, True, "yes", self.policy_digest, self.receipt_fingerprint), self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
+
+    def test_unresolved_follow_ups_and_malformed_shapes_fail_closed(self) -> None:
+        evidence = [item for item in self.accepted_evidence() if item.gate_key != GateKey.SUPERVISOR_DIFF_REVIEW]
+        evidence.append(self.evidence(GateKey.SUPERVISOR_DIFF_REVIEW, follow_ups=(FollowUp("follow-up-1", False),)))
+        self.assertEqual(decide_gates(self.context(), tuple(evidence)).outcome, GateOutcome.BLOCKED)
+        malformed = GateEvidence(self.task_id, self.candidate, [], EvidenceOutcome.PASS, "validator", 1, "1" * 64)
+        self.assertEqual(decide_gates(self.context(), (malformed,)).outcome, GateOutcome.BLOCKED)
+        self.assertEqual(decide_gates(self.context(), list(self.accepted_evidence())).outcome, GateOutcome.BLOCKED)
 
 
 class SQLiteGateEvidenceTests(unittest.TestCase):
@@ -180,7 +194,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
-        context = GateContext(identity.task_id, seal.candidate_sha, 1, True)
+        context = GateContext(identity.task_id, seal.candidate_sha, 1, True, "c" * 64, "d" * 64)
         evidence = []
         for number, requirement in enumerate(GATE_REGISTRY, 1):
             outcome = EvidenceOutcome.NOT_APPLICABLE if requirement.permits_phase_two_local_na else EvidenceOutcome.PASS
@@ -216,7 +230,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            context = GateContext(identity.task_id, seal.candidate_sha, 1, True)
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, "c" * 64, "d" * 64)
             evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             with mock.patch("roundwright.gates.bind_candidate_evidence") as bind:
                 record_gate_evidence(repository, binding, seal, context, evidence, lease=lease)
@@ -242,7 +256,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            context = GateContext(identity.task_id, seal.candidate_sha, 1, True)
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, "c" * 64, "d" * 64)
             passed = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             findings = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.FINDINGS, "validator", 1, "2" * 64)
             with mock.patch("roundwright.gates.bind_candidate_evidence"):
@@ -280,6 +294,28 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                     transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
                 with self.assertRaises(StateError):
                     transition_task(repository, identity, expected_state="diff-review", next_state="ready-for-owner", evidence_fingerprint="8" * 64, lease=lease)
+
+    def test_persisted_follow_up_and_policy_movement_block_without_candidate_movement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "UPDATE gate_evidence SET follow_ups = ? WHERE task_id = ? AND gate_key = ?",
+                    ('[{"identifier":"follow-up-1","resolution_fingerprint":null,"resolved":false}]', identity.task_id, GateKey.SUPERVISOR_DIFF_REVIEW.value),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, lease=lease).outcome, GateOutcome.BLOCKED)
+            moved_policy = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, "e" * 64, context.receipt_fingerprint)
+            moved_receipt = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, context.policy_digest, "f" * 64)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, moved_policy, lease=lease).outcome, GateOutcome.BLOCKED)
+                self.assertEqual(evaluate_gates(repository, binding, seal, moved_receipt, lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, moved_policy, evidence_fingerprint="7" * 64, lease=lease)
 
 
 if __name__ == "__main__":

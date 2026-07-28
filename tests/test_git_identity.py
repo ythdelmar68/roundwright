@@ -198,6 +198,15 @@ class GitIdentityTests(unittest.TestCase):
             binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
             seal = seal_candidate(repository, binding, lease=lease)
             bind_candidate_evidence(repository, binding, seal, evidence_fingerprint="b" * 64, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason, follow_ups) VALUES (?, ?, 'build', 'PASS', 'validator', 1, ?, NULL, NULL, '[]')",
+                    (identity.task_id, seal.candidate_sha, "b" * 64),
+                )
+                connection.commit()
+            finally:
+                connection.close()
             self.assertEqual(candidate_evidence(repository, binding, seal, lease=lease), ("b" * 64,))
             self.assertEqual(seal_candidate(repository, binding, lease=lease), seal)
             self.assertEqual(candidate_evidence(repository, binding, seal, lease=lease), ("b" * 64,))
@@ -209,8 +218,30 @@ class GitIdentityTests(unittest.TestCase):
             moved = seal_candidate(repository, binding, lease=lease)
             self.assertNotEqual(moved.candidate_sha, seal.candidate_sha)
             self.assertEqual(candidate_evidence(repository, binding, moved, lease=lease), ())
-            with self.assertRaises(GitIdentityError):
-                candidate_evidence(repository, binding, seal, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM gate_evidence WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
+            finally:
+                connection.close()
+            bind_candidate_evidence(repository, binding, moved, evidence_fingerprint="c" * 64, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "INSERT INTO gate_evidence(task_id, candidate_sha, gate_key, outcome, evaluator_id, evaluated_at, evidence_fingerprint, changed_boundary, reason, follow_ups) VALUES (?, ?, 'build', 'PASS', 'validator', 1, ?, NULL, NULL, '[]')",
+                    (identity.task_id, moved.candidate_sha, "c" * 64),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            self.run_git(binding.worktree, "reset", "--hard", base)
+            restored = seal_candidate(repository, binding, lease=lease)
+            self.assertEqual(restored.candidate_sha, seal.candidate_sha)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM gate_evidence WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
+            finally:
+                connection.close()
+            self.assertEqual(candidate_evidence(repository, binding, restored, lease=lease), ())
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute("UPDATE state_metadata SET value = ? WHERE key = 'state_id'", ("87654321-4321-8765-4321-876543218765",))

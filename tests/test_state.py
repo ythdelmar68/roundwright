@@ -476,6 +476,51 @@ class StateTests(unittest.TestCase):
                 initialize(repository)
             self.assertEqual(before, path.read_bytes())
 
+    def test_version_five_forward_unc_ownership_rekeys_during_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, MIGRATIONS[:5])
+                connection.execute(
+                    "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                    ("legacy-unc-source", "ythdelmar68/roundwright", "a" * 64),
+                )
+                connection.execute(
+                    "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state, worktree_key) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+                    (
+                        "legacy-unc-task",
+                        "legacy-unc-source",
+                        "ythdelmar68/roundwright",
+                        "codex/legacy-unc",
+                        "//SERVER/Share/Task",
+                        "b" * 40,
+                        "//SERVER/Share/Task",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?)",
+                    ("//SERVER/Share/Task", "legacy-unc-task"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT worktree_key FROM tasks WHERE task_id = ?", ("legacy-unc-task",)).fetchone(),
+                    ("//server/share/task",),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT worktree_key, task_id FROM task_worktree_ownership").fetchone(),
+                    ("//server/share/task", "legacy-unc-task"),
+                )
+            finally:
+                connection.close()
+
     def test_task_projection_rejects_checksum_drift_and_incompatible_schema(self) -> None:
         for mutation in ("checksum", "schema"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:

@@ -747,11 +747,18 @@ def _backfill_task_ownership(connection: sqlite3.Connection) -> None:
         if existing is not None and existing[0] != task_id:
             raise StateError("active task worktree ownership is ambiguous")
         connection.execute("UPDATE tasks SET worktree_key = ? WHERE task_id = ?", (key, task_id))
-        connection.execute(
-            "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?) "
-            "ON CONFLICT(worktree_key) DO UPDATE SET task_id = excluded.task_id",
-            (key, task_id),
-        )
+        reservation = connection.execute(
+            "SELECT worktree_key FROM task_worktree_ownership WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if reservation is None:
+            connection.execute(
+                "INSERT INTO task_worktree_ownership(worktree_key, task_id) VALUES (?, ?)",
+                (key, task_id),
+            )
+        elif reservation[0] != key:
+            connection.execute(
+                "UPDATE task_worktree_ownership SET worktree_key = ? WHERE task_id = ?", (key, task_id)
+            )
 
 
 def _validate_task_ownership(connection: sqlite3.Connection) -> None:

@@ -21,13 +21,15 @@ from roundwright.gates import (
     GateKey,
     GateOutcome,
     decide_gates,
+    evaluate_gates,
     render_gate_decision,
     read_gate_evidence,
     record_gate_evidence,
+    transition_ready_for_owner,
 )
 from roundwright.configuration import RepositoryIdentity
-from roundwright.git_identity import CandidateSeal, WorktreeBinding, acquire_transition_lease
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease
+from roundwright.state import SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, transition_task
 
 
 class GateDecisionTests(unittest.TestCase):
@@ -164,6 +166,38 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         object.__setattr__(repository, "root", root.resolve())
         return repository
 
+    def complete_persisted_pass(self, root: Path):
+        repository = self.repository(root)
+        initialize(repository)
+        identity = TaskIdentity("issue-21", "source-21", "ythdelmar68/roundwright", "codex/issue-21", "C:/private/issue-21", "a" * 40)
+        lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="gate-tests", ttl_seconds=60)
+        admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "1" * 64),), lease=lease)
+        binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, Path(identity.worktree), identity.base_sha, lease.state_identity)
+        seal = CandidateSeal(identity.task_id, identity.base_sha, "b" * 40, lease.state_identity)
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)", (seal.task_id, seal.base_sha, seal.candidate_sha, seal.state_identity))
+            connection.commit()
+        finally:
+            connection.close()
+        context = GateContext(identity.task_id, seal.candidate_sha, 1, True)
+        evidence = []
+        for number, requirement in enumerate(GATE_REGISTRY, 1):
+            outcome = EvidenceOutcome.NOT_APPLICABLE if requirement.permits_phase_two_local_na else EvidenceOutcome.PASS
+            evidence.append(GateEvidence(identity.task_id, seal.candidate_sha, requirement.key, outcome, "validator", number, f"{number:064x}", "isolated local boundary" if outcome is EvidenceOutcome.NOT_APPLICABLE else None, "no external adapter in Phase 2" if outcome is EvidenceOutcome.NOT_APPLICABLE else None))
+        with mock.patch("roundwright.gates.bind_candidate_evidence"):
+            for item in evidence:
+                record_gate_evidence(repository, binding, seal, context, item, lease=lease)
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.executemany("INSERT INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)", [(identity.task_id, seal.candidate_sha, item.evidence_fingerprint) for item in evidence])
+            connection.commit()
+        finally:
+            connection.close()
+        for before, after, fingerprint in (("queued", "planning", "3"), ("planning", "plan-review", "4"), ("plan-review", "implementing", "5"), ("implementing", "diff-review", "6")):
+            transition_task(repository, identity, expected_state=before, next_state=after, evidence_fingerprint=fingerprint * 64, lease=lease)
+        return repository, identity, binding, seal, context, lease, tuple(item.evidence_fingerprint for item in evidence)
+
     def test_sqlite_evidence_is_candidate_bound_and_uses_the_current_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
@@ -220,12 +254,32 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT outcome FROM gate_evidence").fetchone(), ("CONFLICT",))
             finally:
                 connection.close()
-            from roundwright.state import StateError, transition_task
-
             for before, after, fingerprint in (("queued", "planning", "3"), ("planning", "plan-review", "4"), ("plan-review", "implementing", "5"), ("implementing", "diff-review", "6")):
                 transition_task(repository, identity, expected_state=before, next_state=after, evidence_fingerprint=fingerprint * 64, lease=lease)
             with self.assertRaises(StateError):
                 transition_task(repository, identity, expected_state="diff-review", next_state="ready-for-owner", evidence_fingerprint="7" * 64, lease=lease)
+
+    def test_persisted_all_gates_pass_decodes_context_and_allows_final_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, lease=lease).outcome, GateOutcome.PASS)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone(), ("ready-for-owner",))
+            finally:
+                connection.close()
+
+    def test_live_head_and_dirty_drift_block_the_only_final_transition_path(self) -> None:
+        for message in ("candidate head moved and candidate sealing is required", "candidate worktree is dirty"):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                repository, identity, binding, seal, context, lease, _ = self.complete_persisted_pass(Path(temporary))
+                with self.assertRaisesRegex(GitIdentityError, message), mock.patch("roundwright.gates.candidate_evidence", side_effect=GitIdentityError(message)):
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, lease=lease)
+                with self.assertRaises(StateError):
+                    transition_task(repository, identity, expected_state="diff-review", next_state="ready-for-owner", evidence_fingerprint="8" * 64, lease=lease)
 
 
 if __name__ == "__main__":

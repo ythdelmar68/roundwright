@@ -302,18 +302,70 @@ def transition_task(
     evidence_fingerprint: str,
     lease: object | None = None,
 ) -> TaskProjection:
-    """Advance one task through the explicit Phase 2 state sequence atomically."""
+    """Advance a non-final task transition through the explicit Phase 2 state sequence."""
 
     _validate_task_identity(identity)
     _require_state(expected_state)
     _require_state(next_state)
     _require_fingerprint(evidence_fingerprint)
+    if expected_state == "diff-review" and next_state == "ready-for-owner":
+        raise StateError("ready-for-owner requires the candidate-bound final transition")
+    return _commit_transition(repository, identity, expected_state, next_state, evidence_fingerprint, lease=lease)
+
+
+def _transition_ready_for_owner(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    binding: object,
+    seal: object,
+    *,
+    evidence_fingerprint: str,
+    lease: object | None = None,
+) -> TaskProjection:
+    """Perform the sole final transition after live candidate validation under the lease."""
+
+    from .git_identity import CandidateSeal, WorktreeBinding, candidate_evidence
+
+    _validate_task_identity(identity)
+    _require_fingerprint(evidence_fingerprint)
+    if not isinstance(binding, WorktreeBinding) or not isinstance(seal, CandidateSeal):
+        raise StateError("ready-for-owner requires an exact live candidate binding")
+    if binding.task_id != identity.task_id or binding.repository_id != identity.repository_id:
+        raise StateError("ready-for-owner candidate binding does not match the task")
+    if seal.task_id != identity.task_id or seal.base_sha != identity.base_sha:
+        raise StateError("ready-for-owner candidate seal does not match the task")
+    candidate_evidence(repository, binding, seal, lease=lease)
+    return _commit_transition(
+        repository,
+        identity,
+        "diff-review",
+        "ready-for-owner",
+        evidence_fingerprint,
+        lease=lease,
+        candidate_validated=True,
+    )
+
+
+def _commit_transition(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    expected_state: str,
+    next_state: str,
+    evidence_fingerprint: str,
+    *,
+    lease: object | None,
+    candidate_validated: bool = False,
+) -> TaskProjection:
+    """Commit an already-authorized state transition in one SQLite transaction."""
+
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity, expected_state)
         if expected_state == "diff-review" and next_state == "ready-for-owner":
+            if not candidate_validated:
+                raise StateError("ready-for-owner requires live candidate validation")
             from .gates import GateOutcome, _decision_from_connection
 
             if _decision_from_connection(connection, identity).outcome is not GateOutcome.PASS:

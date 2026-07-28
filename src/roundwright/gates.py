@@ -8,7 +8,7 @@ from enum import StrEnum
 
 from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence
-from .state import StateError, _open_writable_connection, _require_current_transition_lease, transition_task
+from .state import StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner
 
 
 class GateError(StateError):
@@ -290,11 +290,11 @@ def transition_ready_for_owner(
     candidate_evidence(repository, binding, seal, lease=lease)
     if context is not None and context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         raise GateError("gate context does not match committed task state")
-    return transition_task(
+    return _transition_ready_for_owner(
         repository,
         _task_identity(repository, binding.task_id),
-        expected_state="diff-review",
-        next_state="ready-for-owner",
+        binding,
+        seal,
         evidence_fingerprint=evidence_fingerprint,
         lease=lease,
     )
@@ -349,9 +349,9 @@ def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateCont
     row = connection.execute(
         "SELECT source_count, isolated_local_task FROM gate_contexts WHERE task_id = ?", (task_id,)
     ).fetchone()
-    if row is None:
+    if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1):
         return None
-    return GateContext(task_id, candidate_sha, row[0], row[1])
+    return GateContext(task_id, candidate_sha, row[0], bool(row[1]))
 
 
 def _decide_requirement(context: GateContext, requirement: GateRequirement, entries: list[GateEvidence]) -> GateResult:

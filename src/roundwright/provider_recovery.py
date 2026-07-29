@@ -284,6 +284,7 @@ def record_session_identity(
             raise ProviderRecoveryError("session identity cannot be recorded for this attempt")
         if row.session_identity is not None and row.session_identity != session_identity:
             raise ProviderRecoveryError("session identity replay conflicts with committed state")
+        _require_session_reuse_allowed(connection, row, session_identity)
         if row.session_identity is None:
             connection.execute("UPDATE provider_attempts SET session_identity = ? WHERE attempt_id = ?", (session_identity, attempt_id))
         checkpoint = connection.execute(
@@ -704,6 +705,19 @@ def _require_session_checkpoint(
     ).fetchone()
     if row != (task_id, session_identity, _context_fingerprint(context)):
         raise ProviderRecoveryError("session checkpoint is unavailable or has drifted")
+
+
+def _require_session_reuse_allowed(connection, row: ProviderAttempt, session_identity: str) -> None:
+    """Permit cross-attempt session reuse only for persistent Worker sessions."""
+
+    existing_roles = connection.execute(
+        "SELECT provider_role FROM provider_attempts WHERE task_id = ? AND session_identity = ? AND attempt_id != ?",
+        (row.task_id, session_identity, row.attempt_id),
+    ).fetchall()
+    if existing_roles and (
+        row.role is not ProviderRole.WORKER or any(role[0] != ProviderRole.WORKER.value for role in existing_roles)
+    ):
+        raise ProviderRecoveryError("session identity cannot be reused across provider attempts")
 
 
 def _validate_context(identity: TaskIdentity, context: RecoveryContext) -> None:

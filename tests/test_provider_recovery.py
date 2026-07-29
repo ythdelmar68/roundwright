@@ -332,6 +332,13 @@ class ProviderRecoveryTests(unittest.TestCase):
                 record_completed_output(repository, identity, self.context(identity), attempt_id="session-only-supervisor", output_pointer="delayed-output", completion_evidence_fingerprint="e" * 64, lease=lease)
             with self.assertRaises(ProviderRecoveryError):
                 accept_supervisor_review(repository, identity, self.context(identity), attempt_id="session-only-supervisor", accepted_review_identity="delayed-review", lease=lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="fresh-supervisor")
+            with self.assertRaises(ProviderRecoveryError):
+                record_session_identity(repository, identity, self.context(identity), attempt_id="fresh-supervisor", session_identity="review-thread", lease=lease)
+            self.assertEqual(
+                record_session_identity(repository, identity, self.context(identity), attempt_id="fresh-supervisor", session_identity="fresh-review-thread", lease=lease).session_identity,
+                "fresh-review-thread",
+            )
 
     def test_multiple_attempts_can_continue_one_persistent_worker_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

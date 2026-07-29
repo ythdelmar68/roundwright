@@ -198,6 +198,15 @@ MIGRATIONS = (
             ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        15,
+        (
+            "CREATE TABLE provider_session_checkpoints (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), session_identity TEXT NOT NULL, identity_fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at > 0), UNIQUE(task_id, session_identity))",
+        ),
+        (
+            ("provider_session_checkpoints", "CREATE TABLE provider_session_checkpoints (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), session_identity TEXT NOT NULL, identity_fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at > 0), UNIQUE(task_id, session_identity))"),
+        ),
+    ),
 )
 
 

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ from roundwright.provider_recovery import (
     record_completed_output,
     record_external_turn,
     record_invalid_output,
+    record_session_identity,
     recover_attempt,
 )
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
@@ -93,6 +95,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-one")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="worker-one", session_identity="thread-one", lease=lease)
             record_external_turn(
                 repository, identity, self.context(identity), attempt_id="worker-one", session_identity="thread-one",
                 external_turn_identity="turn-one", lease=lease,
@@ -130,6 +133,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-output")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="worker-output", session_identity="thread-output", lease=lease)
             record_external_turn(repository, identity, self.context(identity), attempt_id="worker-output", session_identity="thread-output", external_turn_identity="turn-output", lease=lease)
             record_completed_output(
                 repository, identity, self.context(identity), attempt_id="worker-output", output_pointer="private-output-pointer",
@@ -154,6 +158,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.admit(repository, supervisor, lease)
             for identity, role, attempt in ((worker, ProviderRole.WORKER, "worker-stale"), (supervisor, ProviderRole.SUPERVISOR, "supervisor-stale")):
                 self.prepare(repository, identity, lease, role=role, attempt=attempt)
+                record_session_identity(repository, identity, self.context(identity), attempt_id=attempt, session_identity=f"session-{attempt}", lease=lease)
                 record_external_turn(repository, identity, self.context(identity), attempt_id=attempt, session_identity=f"session-{attempt}", external_turn_identity=f"turn-{attempt}", lease=lease)
 
             expired = int(time.time()) + 11
@@ -174,6 +179,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="review-one")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="review-one", session_identity="review-session", lease=lease)
             record_external_turn(repository, identity, self.context(identity), attempt_id="review-one", session_identity="review-session", external_turn_identity="review-turn", lease=lease)
             record_completed_output(repository, identity, self.context(identity), attempt_id="review-one", output_pointer="review-output", completion_evidence_fingerprint="e" * 64, lease=lease)
             accepted = accept_supervisor_review(repository, identity, self.context(identity), attempt_id="review-one", accepted_review_identity="accepted-cycle-one", lease=lease)
@@ -190,6 +196,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-invalid")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="worker-invalid", session_identity="invalid-session", lease=lease)
             record_external_turn(repository, identity, self.context(identity), attempt_id="worker-invalid", session_identity="invalid-session", external_turn_identity="invalid-turn", lease=lease)
             record_invalid_output(
                 repository, identity, self.context(identity), attempt_id="worker-invalid", output_pointer="invalid-output",
@@ -201,6 +208,69 @@ class ProviderRecoveryTests(unittest.TestCase):
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_invalid_outputs").fetchone(), (1,))
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_recovery_events").fetchone(), (1,))
+            finally:
+                connection.close()
+
+    def test_persisted_session_checkpoint_resumes_the_same_thread_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-session")
+            recorded = record_session_identity(
+                repository, identity, self.context(identity), attempt_id="worker-session", session_identity="thread-session", lease=lease,
+            )
+            replayed = record_session_identity(
+                repository, identity, self.context(identity), attempt_id="worker-session", session_identity="thread-session", lease=lease,
+            )
+            self.assertEqual(recorded, replayed)
+            self.assertEqual(read_attempt(repository, identity, "worker-session").session_identity, "thread-session")
+            recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="worker-session", max_attempts=1, lease=lease)
+            self.assertEqual(recovery.next_action, RecoveryAction.RESUME_SAME_SESSION)
+            self.assertEqual(recovery.session_identity, "thread-session")
+            with self.assertRaises(ProviderRecoveryError):
+                record_session_identity(repository, identity, self.context(identity), attempt_id="worker-session", session_identity="different-thread", lease=lease)
+            record_external_turn(
+                repository, identity, self.context(identity), attempt_id="worker-session", session_identity="thread-session",
+                external_turn_identity="turn-after-resume", lease=lease,
+            )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_session_checkpoints").fetchone(), (1,))
+            finally:
+                connection.close()
+
+    def test_identity_drift_returns_an_owner_safe_block_without_mutating_the_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            context = self.context(identity, candidate="a" * 40)
+            prepare_attempt(
+                repository, identity, context, attempt_id="candidate-drift", role=ProviderRole.WORKER,
+                process_lease_id="lease-candidate-drift", process_lease_expires_at=int(time.time()) + 10,
+                input_fingerprint="a" * 64, lease=lease,
+            )
+            changed = hashlib.sha256(b"identity-drift").hexdigest()
+            for field in (
+                "repository_fingerprint", "worktree_fingerprint", "branch_fingerprint", "base_fingerprint",
+                "candidate_fingerprint", "policy_fingerprint", "deployment_fingerprint",
+            ):
+                with self.subTest(field=field):
+                    recovery = recover_attempt(
+                        repository, identity, replace(context, **{field: changed}), attempt_id="candidate-drift", max_attempts=1, lease=lease,
+                    )
+                    self.assertEqual(recovery.next_action, RecoveryAction.BLOCKED_IDENTITY_DRIFT)
+                    self.assertEqual(recovery.blocker, "identity-drift")
+            self.assertEqual(read_attempt(repository, identity, "candidate-drift").state, AttemptState.PREPARED)
+            self.assertNotIn(identity.worktree, repr(recovery))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_recovery_events").fetchone(), (0,))
             finally:
                 connection.close()
 

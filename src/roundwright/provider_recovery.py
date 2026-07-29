@@ -211,7 +211,7 @@ def record_external_turn(
     lease: TransitionLease | None = None,
     now: int | None = None,
 ) -> ProviderAttempt:
-    """Record the provider-issued identities immediately after dispatch."""
+    """Record an external turn only after its session checkpoint is durable."""
 
     _validate_task(identity)
     _validate_context(identity, context)
@@ -226,19 +226,75 @@ def record_external_turn(
         _require_persisted_context(connection, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
         if row.state is AttemptState.DISPATCHED and (row.session_identity, row.external_turn_identity) == (session_identity, external_turn_identity):
+            _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context)
             connection.commit()
             return row
-        if row.state is not AttemptState.PREPARED:
+        if row.state is not AttemptState.PREPARED or row.session_identity != session_identity:
             raise ProviderRecoveryError("external turn identity cannot be replayed for this attempt")
+        _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context)
         connection.execute(
-            "UPDATE provider_attempts SET session_identity = ?, external_turn_identity = ?, state = ? WHERE attempt_id = ?",
-            (session_identity, external_turn_identity, AttemptState.DISPATCHED.value, attempt_id),
+            "UPDATE provider_attempts SET external_turn_identity = ?, state = ? WHERE attempt_id = ?",
+            (external_turn_identity, AttemptState.DISPATCHED.value, attempt_id),
         )
         _checkpoint(connection, identity.task_id, row.role, "after-dispatch", attempt_id, context, _clock(now))
         connection.commit()
     except sqlite3.IntegrityError as error:
         connection.rollback()
         raise ProviderRecoveryError("external turn identity conflicts with committed state") from error
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return read_attempt(repository, identity, attempt_id)
+
+
+def record_session_identity(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    session_identity: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Checkpoint a provider thread/session before creating an external turn."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    _require_token(session_identity, "session identity")
+    observed = _clock(now)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        if row.state is not AttemptState.PREPARED:
+            raise ProviderRecoveryError("session identity cannot be recorded for this attempt")
+        if row.session_identity is not None and row.session_identity != session_identity:
+            raise ProviderRecoveryError("session identity replay conflicts with committed state")
+        if row.session_identity is None:
+            connection.execute("UPDATE provider_attempts SET session_identity = ? WHERE attempt_id = ?", (session_identity, attempt_id))
+        checkpoint = connection.execute(
+            "SELECT task_id, session_identity, identity_fingerprint FROM provider_session_checkpoints WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        expected = (identity.task_id, session_identity, _context_fingerprint(context))
+        if checkpoint is None:
+            connection.execute(
+                "INSERT INTO provider_session_checkpoints(attempt_id, task_id, session_identity, identity_fingerprint, created_at) VALUES (?, ?, ?, ?, ?)",
+                (attempt_id, *expected, observed),
+            )
+        elif checkpoint != expected:
+            raise ProviderRecoveryError("session checkpoint replay conflicts with committed state")
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise ProviderRecoveryError("session identity conflicts with committed state") from error
     except Exception:
         connection.rollback()
         raise
@@ -407,7 +463,6 @@ def recover_attempt(
     """
 
     _validate_task(identity)
-    _validate_context(identity, context)
     _require_token(attempt_id, "attempt identity")
     if not isinstance(max_attempts, int) or max_attempts < 1:
         raise ProviderRecoveryError("attempt limit is invalid")
@@ -419,8 +474,17 @@ def recover_attempt(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
-        _require_persisted_context(connection, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        if not _context_matches(connection, identity, context):
+            connection.rollback()
+            return _projection(row, RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift")
+        _validate_context(identity, context)
+        if row.state is AttemptState.PREPARED and row.session_identity is not None:
+            try:
+                _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context)
+            except ProviderRecoveryError:
+                connection.rollback()
+                return _projection(row, RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "session-checkpoint-unavailable")
         action, blocker, next_state = _recovery_outcome(
             connection,
             row,
@@ -469,6 +533,13 @@ def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_e
     if row.state is AttemptState.INVALIDATED:
         return RecoveryAction.FRESH_SUPERVISOR_SESSION, "supervisor-session-invalidated", None
     if row.state is AttemptState.PREPARED:
+        if row.session_identity is not None:
+            if row.process_lease_expires_at <= observed:
+                if row.role is ProviderRole.WORKER:
+                    return RecoveryAction.BLOCKED_STALE_WORKER, "stale-worker-process-lease", AttemptState.BLOCKED
+                if row.role is ProviderRole.SUPERVISOR:
+                    return RecoveryAction.FRESH_SUPERVISOR_SESSION, "stale-supervisor-process-lease", AttemptState.INVALIDATED
+            return RecoveryAction.RESUME_SAME_SESSION, None, None
         count = connection.execute(
             "SELECT COUNT(*) FROM provider_attempts WHERE task_id = ? AND provider_role = ?",
             (row.task_id, row.role.value),
@@ -541,8 +612,40 @@ def _persist_context(connection, context: RecoveryContext) -> None:
         raise ProviderRecoveryError("recovery identity context has drifted")
 
 
+def _context_matches(connection, identity: TaskIdentity, context: object) -> bool:
+    """Compare all resume identities without exposing their raw values."""
+
+    if not isinstance(context, RecoveryContext) or context.task_id != identity.task_id:
+        return False
+    existing = connection.execute(
+        "SELECT repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_recovery_contexts WHERE task_id = ?",
+        (identity.task_id,),
+    ).fetchone()
+    expected = (
+        context.repository_fingerprint,
+        context.worktree_fingerprint,
+        context.branch_fingerprint,
+        context.base_fingerprint,
+        context.candidate_fingerprint,
+        context.policy_fingerprint,
+        context.deployment_fingerprint,
+    )
+    return existing == expected
+
+
 def _require_persisted_context(connection, context: RecoveryContext) -> None:
     _persist_context(connection, context)
+
+
+def _require_session_checkpoint(
+    connection, task_id: str, attempt_id: str, session_identity: str, context: RecoveryContext
+) -> None:
+    row = connection.execute(
+        "SELECT task_id, session_identity, identity_fingerprint FROM provider_session_checkpoints WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if row != (task_id, session_identity, _context_fingerprint(context)):
+        raise ProviderRecoveryError("session checkpoint is unavailable or has drifted")
 
 
 def _validate_context(identity: TaskIdentity, context: RecoveryContext) -> None:

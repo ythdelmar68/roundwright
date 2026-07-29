@@ -291,21 +291,30 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(recover_attempt(repository, identity, first, attempt_id="supervisor-first", max_attempts=3, lease=lease).next_action, RecoveryAction.RETRY)
             self.assertEqual(recover_attempt(repository, identity, second, attempt_id="supervisor-second", max_attempts=3, lease=lease).next_action, RecoveryAction.RETRY)
 
-    def test_late_verified_completion_can_resume_an_earlier_ambiguous_output(self) -> None:
+    def test_late_verified_completion_restores_a_reviewable_ambiguous_supervisor_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
             initialize(repository)
             lease = self.lease(repository)
             identity = self.identity()
             self.admit(repository, identity, lease)
-            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="late-completion")
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="late-completion")
             record_session_identity(repository, identity, self.context(identity), attempt_id="late-completion", session_identity="late-thread", lease=lease)
             record_external_turn(repository, identity, self.context(identity), attempt_id="late-completion", session_identity="late-thread", external_turn_identity="late-turn", lease=lease)
             record_completed_output(repository, identity, self.context(identity), attempt_id="late-completion", output_pointer="late-output", completion_evidence_fingerprint="e" * 64, lease=lease)
             self.assertEqual(recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", max_attempts=1, lease=lease).next_action, RecoveryAction.BLOCKED_AMBIGUOUS_TURN)
+            conflicting = recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="f" * 64, max_attempts=1, lease=lease)
+            self.assertEqual((conflicting.next_action, conflicting.blocker), (RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "completion-evidence-unverified"))
+            verified = recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="e" * 64, max_attempts=1, lease=lease)
+            self.assertEqual(verified.next_action, RecoveryAction.CONSUME_VERIFIED_OUTPUT)
+            self.assertEqual(read_attempt(repository, identity, "late-completion").state, AttemptState.COMPLETED)
             self.assertEqual(recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="e" * 64, max_attempts=1, lease=lease).next_action, RecoveryAction.CONSUME_VERIFIED_OUTPUT)
+            self.assertEqual(
+                accept_supervisor_review(repository, identity, self.context(identity), attempt_id="late-completion", accepted_review_identity="late-accepted", lease=lease).state,
+                AttemptState.ACCEPTED,
+            )
 
-    def test_stale_session_only_supervisor_requires_a_fresh_attempt_without_schema_failure(self) -> None:
+    def test_stale_session_only_supervisor_invalidates_a_delayed_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
             initialize(repository)
@@ -316,7 +325,13 @@ class ProviderRecoveryTests(unittest.TestCase):
             record_session_identity(repository, identity, self.context(identity), attempt_id="session-only-supervisor", session_identity="review-thread", lease=lease)
             recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="session-only-supervisor", max_attempts=2, lease=lease, now=int(time.time()) + 11)
             self.assertEqual(recovery.next_action, RecoveryAction.FRESH_SUPERVISOR_SESSION)
-            self.assertEqual(read_attempt(repository, identity, "session-only-supervisor").state, AttemptState.PREPARED)
+            self.assertEqual(read_attempt(repository, identity, "session-only-supervisor").state, AttemptState.INVALIDATED)
+            with self.assertRaises(ProviderRecoveryError):
+                record_external_turn(repository, identity, self.context(identity), attempt_id="session-only-supervisor", session_identity="review-thread", external_turn_identity="delayed-turn", lease=lease)
+            with self.assertRaises(ProviderRecoveryError):
+                record_completed_output(repository, identity, self.context(identity), attempt_id="session-only-supervisor", output_pointer="delayed-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+            with self.assertRaises(ProviderRecoveryError):
+                accept_supervisor_review(repository, identity, self.context(identity), attempt_id="session-only-supervisor", accepted_review_identity="delayed-review", lease=lease)
 
     def test_multiple_attempts_can_continue_one_persistent_worker_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

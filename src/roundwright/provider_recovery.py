@@ -545,7 +545,9 @@ def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_e
         return RecoveryAction.ACCEPTED_REVIEW, None, None
     if row.state in {AttemptState.COMPLETED, AttemptState.AMBIGUOUS} and row.completion_evidence_fingerprint is not None:
         if verified_completion_evidence == row.completion_evidence_fingerprint:
-            return RecoveryAction.CONSUME_VERIFIED_OUTPUT, None, None
+            return RecoveryAction.CONSUME_VERIFIED_OUTPUT, None, (
+                AttemptState.COMPLETED if row.state is AttemptState.AMBIGUOUS else None
+            )
         return RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "completion-evidence-unverified", (
             AttemptState.AMBIGUOUS if row.state is AttemptState.COMPLETED else None
         )
@@ -564,7 +566,7 @@ def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_e
                 if row.role is ProviderRole.WORKER:
                     return RecoveryAction.BLOCKED_STALE_WORKER, "stale-worker-process-lease", AttemptState.BLOCKED
                 if row.role is ProviderRole.SUPERVISOR:
-                    return RecoveryAction.FRESH_SUPERVISOR_SESSION, "stale-supervisor-process-lease", None
+                    return RecoveryAction.FRESH_SUPERVISOR_SESSION, "stale-supervisor-process-lease", AttemptState.INVALIDATED
             return RecoveryAction.RESUME_SAME_SESSION, None, None
         count = connection.execute(
             "SELECT COUNT(*) FROM provider_attempts WHERE task_id = ? AND provider_role = ?",

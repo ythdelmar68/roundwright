@@ -207,6 +207,28 @@ MIGRATIONS = (
             ("provider_session_checkpoints", "CREATE TABLE provider_session_checkpoints (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), session_identity TEXT NOT NULL, identity_fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at > 0), UNIQUE(task_id, session_identity))"),
         ),
     ),
+    Migration(
+        16,
+        (
+            "CREATE TABLE provider_attempt_contexts (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL)",
+            "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint) SELECT attempts.attempt_id, attempts.task_id, contexts.repository_fingerprint, contexts.worktree_fingerprint, contexts.branch_fingerprint, contexts.base_fingerprint, contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.deployment_fingerprint FROM provider_attempts AS attempts JOIN provider_recovery_contexts AS contexts ON contexts.task_id = attempts.task_id",
+            "ALTER TABLE provider_session_checkpoints RENAME TO provider_session_checkpoints_v1",
+            "CREATE TABLE provider_session_checkpoints (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), session_identity TEXT NOT NULL, identity_fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at > 0))",
+            "INSERT INTO provider_session_checkpoints(attempt_id, task_id, session_identity, identity_fingerprint, created_at) SELECT attempt_id, task_id, session_identity, identity_fingerprint, created_at FROM provider_session_checkpoints_v1",
+            "DROP TABLE provider_session_checkpoints_v1",
+            "CREATE TABLE provider_recovery_outcomes (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), recovery_action TEXT NOT NULL, blocker TEXT, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0))",
+            "ALTER TABLE provider_invalid_outputs RENAME TO provider_invalid_outputs_v1",
+            "CREATE TABLE provider_invalid_outputs (invalid_output_id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), output_fingerprint TEXT NOT NULL, reason_fingerprint TEXT NOT NULL, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(attempt_id, output_fingerprint, reason_fingerprint))",
+            "INSERT INTO provider_invalid_outputs(invalid_output_id, task_id, attempt_id, output_fingerprint, reason_fingerprint, recorded_at) SELECT invalid_output_id, task_id, attempt_id, output_fingerprint, reason_fingerprint, recorded_at FROM provider_invalid_outputs_v1",
+            "DROP TABLE provider_invalid_outputs_v1",
+        ),
+        (
+            ("provider_attempt_contexts", "CREATE TABLE provider_attempt_contexts (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL)"),
+            ("provider_session_checkpoints", "CREATE TABLE provider_session_checkpoints (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), session_identity TEXT NOT NULL, identity_fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at > 0))"),
+            ("provider_recovery_outcomes", "CREATE TABLE provider_recovery_outcomes (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), recovery_action TEXT NOT NULL, blocker TEXT, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0))"),
+            ("provider_invalid_outputs", "CREATE TABLE provider_invalid_outputs (invalid_output_id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), output_fingerprint TEXT NOT NULL, reason_fingerprint TEXT NOT NULL, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(attempt_id, output_fingerprint, reason_fingerprint))"),
+        ),
+    ),
 )
 
 

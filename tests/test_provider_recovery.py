@@ -1,0 +1,378 @@
+"""Hermetic recovery coverage for provider-neutral Phase 2 turns."""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import sys
+import tempfile
+import time
+import unittest
+from dataclasses import replace
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from roundwright.configuration import RepositoryIdentity
+from roundwright.git_identity import acquire_transition_lease
+from roundwright.provider_recovery import (
+    AttemptState,
+    ProviderRecoveryError,
+    ProviderRole,
+    RecoveryAction,
+    RecoveryContext,
+    accept_supervisor_review,
+    prepare_attempt,
+    read_attempt,
+    record_completed_output,
+    record_external_turn,
+    record_invalid_output,
+    record_session_identity,
+    recover_attempt,
+)
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+
+
+class ProviderRecoveryTests(unittest.TestCase):
+    def repository(self, root: Path) -> RepositoryIdentity:
+        identity = object.__new__(RepositoryIdentity)
+        object.__setattr__(identity, "root", root.resolve())
+        return identity
+
+    def identity(self, suffix: str = "one") -> TaskIdentity:
+        return TaskIdentity(
+            task_id=f"task-22-{suffix}",
+            source_id=f"fixture-{suffix}",
+            repository_id="ythdelmar68/roundwright",
+            branch=f"codex/issue-22-{suffix}",
+            worktree=f"C:/private/worktree-{suffix}",
+            base_sha="b" * 40,
+        )
+
+    def context(self, identity: TaskIdentity, *, candidate: str | None = None) -> RecoveryContext:
+        return RecoveryContext.for_task(
+            identity,
+            candidate_sha=candidate,
+            policy_fingerprint="c" * 64,
+            deployment_fingerprint="d" * 64,
+        )
+
+    def admit(self, repository: RepositoryIdentity, identity: TaskIdentity, lease: object) -> None:
+        admit_task(
+            repository,
+            identity,
+            (SourceSnapshot(identity.source_id, identity.repository_id, hashlib.sha256(identity.source_id.encode()).hexdigest()),),
+            lease=lease,
+        )
+
+    def lease(self, repository: RepositoryIdentity):
+        return acquire_transition_lease(
+            repository,
+            repository_id="ythdelmar68/roundwright",
+            owner="recovery-tests",
+            ttl_seconds=1000,
+        )
+
+    def prepare(self, repository: RepositoryIdentity, identity: TaskIdentity, lease: object, *, role: ProviderRole, attempt: str):
+        return prepare_attempt(
+            repository,
+            identity,
+            self.context(identity),
+            attempt_id=attempt,
+            role=role,
+            process_lease_id=f"lease-{attempt}",
+            process_lease_expires_at=int(time.time()) + 10,
+            input_fingerprint="a" * 64,
+            lease=lease,
+        )
+
+    def test_external_turn_without_verified_completion_blocks_without_duplicate_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-one")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="worker-one", session_identity="thread-one", lease=lease)
+            record_external_turn(
+                repository, identity, self.context(identity), attempt_id="worker-one", session_identity="thread-one",
+                external_turn_identity="turn-one", lease=lease,
+            )
+
+            recovery = recover_attempt(
+                repository, identity, self.context(identity), attempt_id="worker-one", max_attempts=2, lease=lease,
+            )
+
+            self.assertEqual(recovery.next_action, RecoveryAction.BLOCKED_AMBIGUOUS_TURN)
+            self.assertEqual(recovery.external_turn_identity, "turn-one")
+            self.assertEqual(read_attempt(repository, identity, "worker-one").state, AttemptState.AMBIGUOUS)
+
+    def test_no_external_turn_has_a_bounded_retry_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.PLANNING, attempt="plan-one")
+            retry = recover_attempt(repository, identity, self.context(identity), attempt_id="plan-one", max_attempts=2, lease=lease)
+            self.assertEqual(retry.next_action, RecoveryAction.RETRY)
+
+            self.prepare(repository, identity, lease, role=ProviderRole.PLANNING, attempt="plan-two")
+            exhausted = recover_attempt(repository, identity, self.context(identity), attempt_id="plan-two", max_attempts=2, lease=lease)
+            self.assertEqual(exhausted.next_action, RecoveryAction.BLOCKED_RETRY_LIMIT)
+            self.assertEqual(read_attempt(repository, identity, "plan-two").state, AttemptState.BLOCKED)
+
+    def test_verified_completed_output_is_consumed_idempotently_and_is_owner_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-output")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="worker-output", session_identity="thread-output", lease=lease)
+            record_external_turn(repository, identity, self.context(identity), attempt_id="worker-output", session_identity="thread-output", external_turn_identity="turn-output", lease=lease)
+            record_completed_output(
+                repository, identity, self.context(identity), attempt_id="worker-output", output_pointer="private-output-pointer",
+                completion_evidence_fingerprint="e" * 64, lease=lease,
+            )
+            recovery = recover_attempt(
+                repository, identity, self.context(identity), attempt_id="worker-output", verified_completion_evidence="e" * 64,
+                max_attempts=1, lease=lease,
+            )
+            self.assertEqual(recovery.next_action, RecoveryAction.CONSUME_VERIFIED_OUTPUT)
+            self.assertTrue(recovery.output_available)
+            self.assertNotIn("private-output-pointer", repr(recovery))
+
+    def test_stale_worker_blocks_only_that_task_while_stale_supervisor_requires_a_fresh_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            worker = self.identity("worker")
+            supervisor = self.identity("supervisor")
+            self.admit(repository, worker, lease)
+            self.admit(repository, supervisor, lease)
+            for identity, role, attempt in ((worker, ProviderRole.WORKER, "worker-stale"), (supervisor, ProviderRole.SUPERVISOR, "supervisor-stale")):
+                self.prepare(repository, identity, lease, role=role, attempt=attempt)
+                record_session_identity(repository, identity, self.context(identity), attempt_id=attempt, session_identity=f"session-{attempt}", lease=lease)
+                record_external_turn(repository, identity, self.context(identity), attempt_id=attempt, session_identity=f"session-{attempt}", external_turn_identity=f"turn-{attempt}", lease=lease)
+
+            expired = int(time.time()) + 11
+            worker_recovery = recover_attempt(repository, worker, self.context(worker), attempt_id="worker-stale", max_attempts=2, lease=lease, now=expired)
+            supervisor_recovery = recover_attempt(repository, supervisor, self.context(supervisor), attempt_id="supervisor-stale", max_attempts=2, lease=lease, now=expired)
+            self.assertEqual(worker_recovery.next_action, RecoveryAction.BLOCKED_STALE_WORKER)
+            self.assertEqual(supervisor_recovery.next_action, RecoveryAction.FRESH_SUPERVISOR_SESSION)
+            self.assertEqual(read_attempt(repository, worker, "worker-stale").state, AttemptState.BLOCKED)
+            self.assertEqual(read_attempt(repository, supervisor, "supervisor-stale").state, AttemptState.INVALIDATED)
+            with self.assertRaises(ProviderRecoveryError):
+                accept_supervisor_review(repository, supervisor, self.context(supervisor), attempt_id="supervisor-stale", accepted_review_identity="partial-pass", lease=lease)
+
+    def test_accepted_review_identity_is_separate_from_completion_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="review-one")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="review-one", session_identity="review-session", lease=lease)
+            record_external_turn(repository, identity, self.context(identity), attempt_id="review-one", session_identity="review-session", external_turn_identity="review-turn", lease=lease)
+            record_completed_output(repository, identity, self.context(identity), attempt_id="review-one", output_pointer="review-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+            accepted = accept_supervisor_review(repository, identity, self.context(identity), attempt_id="review-one", accepted_review_identity="accepted-cycle-one", lease=lease)
+            self.assertEqual(accepted.state, AttemptState.ACCEPTED)
+            self.assertEqual(accepted.accepted_review_identity, "accepted-cycle-one")
+            recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="review-one", max_attempts=1, lease=lease)
+            self.assertEqual(recovery.next_action, RecoveryAction.ACCEPTED_REVIEW)
+
+    def test_invalid_outputs_and_recovery_attempts_are_counted_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-invalid")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="worker-invalid", session_identity="invalid-session", lease=lease)
+            record_external_turn(repository, identity, self.context(identity), attempt_id="worker-invalid", session_identity="invalid-session", external_turn_identity="invalid-turn", lease=lease)
+            record_invalid_output(
+                repository, identity, self.context(identity), attempt_id="worker-invalid", output_pointer="invalid-output",
+                output_fingerprint="e" * 64, reason_fingerprint="f" * 64, lease=lease,
+            )
+            recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="worker-invalid", max_attempts=1, lease=lease)
+            self.assertEqual(recovery.next_action, RecoveryAction.BLOCKED_AMBIGUOUS_TURN)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_invalid_outputs").fetchone(), (1,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_recovery_events").fetchone(), (1,))
+            finally:
+                connection.close()
+
+    def test_persisted_session_checkpoint_resumes_the_same_thread_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="worker-session")
+            recorded = record_session_identity(
+                repository, identity, self.context(identity), attempt_id="worker-session", session_identity="thread-session", lease=lease,
+            )
+            replayed = record_session_identity(
+                repository, identity, self.context(identity), attempt_id="worker-session", session_identity="thread-session", lease=lease,
+            )
+            self.assertEqual(recorded, replayed)
+            self.assertEqual(read_attempt(repository, identity, "worker-session").session_identity, "thread-session")
+            recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="worker-session", max_attempts=1, lease=lease)
+            self.assertEqual(recovery.next_action, RecoveryAction.RESUME_SAME_SESSION)
+            self.assertEqual(recovery.session_identity, "thread-session")
+            with self.assertRaises(ProviderRecoveryError):
+                record_session_identity(repository, identity, self.context(identity), attempt_id="worker-session", session_identity="different-thread", lease=lease)
+            record_external_turn(
+                repository, identity, self.context(identity), attempt_id="worker-session", session_identity="thread-session",
+                external_turn_identity="turn-after-resume", lease=lease,
+            )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_session_checkpoints").fetchone(), (1,))
+            finally:
+                connection.close()
+
+    def test_identity_drift_returns_an_owner_safe_block_without_mutating_the_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            context = self.context(identity, candidate="a" * 40)
+            prepare_attempt(
+                repository, identity, context, attempt_id="candidate-drift", role=ProviderRole.WORKER,
+                process_lease_id="lease-candidate-drift", process_lease_expires_at=int(time.time()) + 10,
+                input_fingerprint="a" * 64, lease=lease,
+            )
+            changed = hashlib.sha256(b"identity-drift").hexdigest()
+            for field in (
+                "repository_fingerprint", "worktree_fingerprint", "branch_fingerprint", "base_fingerprint",
+                "candidate_fingerprint", "policy_fingerprint", "deployment_fingerprint",
+            ):
+                with self.subTest(field=field):
+                    recovery = recover_attempt(
+                        repository, identity, replace(context, **{field: changed}), attempt_id="candidate-drift", max_attempts=1, lease=lease,
+                    )
+                    self.assertEqual(recovery.next_action, RecoveryAction.BLOCKED_IDENTITY_DRIFT)
+                    self.assertEqual(recovery.blocker, "identity-drift")
+            self.assertEqual(read_attempt(repository, identity, "candidate-drift").state, AttemptState.PREPARED)
+            self.assertNotIn(identity.worktree, repr(recovery))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_recovery_events").fetchone(), (0,))
+            finally:
+                connection.close()
+
+    def test_context_is_bound_to_each_attempt_after_candidate_and_policy_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            first = self.context(identity, candidate="a" * 40)
+            prepare_attempt(repository, identity, first, attempt_id="supervisor-first", role=ProviderRole.SUPERVISOR, process_lease_id="lease-supervisor-first", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            second = replace(
+                self.context(identity, candidate="b" * 40), policy_fingerprint="e" * 64, deployment_fingerprint="f" * 64,
+            )
+            fresh = prepare_attempt(repository, identity, second, attempt_id="supervisor-second", role=ProviderRole.SUPERVISOR, process_lease_id="lease-supervisor-second", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="b" * 64, lease=lease)
+            self.assertEqual(fresh.attempt_number, 2)
+            self.assertEqual(recover_attempt(repository, identity, first, attempt_id="supervisor-first", max_attempts=3, lease=lease).next_action, RecoveryAction.RETRY)
+            self.assertEqual(recover_attempt(repository, identity, second, attempt_id="supervisor-second", max_attempts=3, lease=lease).next_action, RecoveryAction.RETRY)
+
+    def test_late_verified_completion_restores_a_reviewable_ambiguous_supervisor_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="late-completion")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="late-completion", session_identity="late-thread", lease=lease)
+            record_external_turn(repository, identity, self.context(identity), attempt_id="late-completion", session_identity="late-thread", external_turn_identity="late-turn", lease=lease)
+            record_completed_output(repository, identity, self.context(identity), attempt_id="late-completion", output_pointer="late-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+            self.assertEqual(recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", max_attempts=1, lease=lease).next_action, RecoveryAction.BLOCKED_AMBIGUOUS_TURN)
+            conflicting = recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="f" * 64, max_attempts=1, lease=lease)
+            self.assertEqual((conflicting.next_action, conflicting.blocker), (RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "completion-evidence-unverified"))
+            verified = recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="e" * 64, max_attempts=1, lease=lease)
+            self.assertEqual(verified.next_action, RecoveryAction.CONSUME_VERIFIED_OUTPUT)
+            self.assertEqual(read_attempt(repository, identity, "late-completion").state, AttemptState.COMPLETED)
+            self.assertEqual(recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="e" * 64, max_attempts=1, lease=lease).next_action, RecoveryAction.CONSUME_VERIFIED_OUTPUT)
+            self.assertEqual(
+                accept_supervisor_review(repository, identity, self.context(identity), attempt_id="late-completion", accepted_review_identity="late-accepted", lease=lease).state,
+                AttemptState.ACCEPTED,
+            )
+
+    def test_stale_session_only_supervisor_invalidates_a_delayed_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="session-only-supervisor")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="session-only-supervisor", session_identity="review-thread", lease=lease)
+            recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="session-only-supervisor", max_attempts=2, lease=lease, now=int(time.time()) + 11)
+            self.assertEqual(recovery.next_action, RecoveryAction.FRESH_SUPERVISOR_SESSION)
+            self.assertEqual(read_attempt(repository, identity, "session-only-supervisor").state, AttemptState.INVALIDATED)
+            with self.assertRaises(ProviderRecoveryError):
+                record_external_turn(repository, identity, self.context(identity), attempt_id="session-only-supervisor", session_identity="review-thread", external_turn_identity="delayed-turn", lease=lease)
+            with self.assertRaises(ProviderRecoveryError):
+                record_completed_output(repository, identity, self.context(identity), attempt_id="session-only-supervisor", output_pointer="delayed-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+            with self.assertRaises(ProviderRecoveryError):
+                accept_supervisor_review(repository, identity, self.context(identity), attempt_id="session-only-supervisor", accepted_review_identity="delayed-review", lease=lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="fresh-supervisor")
+            with self.assertRaises(ProviderRecoveryError):
+                record_session_identity(repository, identity, self.context(identity), attempt_id="fresh-supervisor", session_identity="review-thread", lease=lease)
+            self.assertEqual(
+                record_session_identity(repository, identity, self.context(identity), attempt_id="fresh-supervisor", session_identity="fresh-review-thread", lease=lease).session_identity,
+                "fresh-review-thread",
+            )
+
+    def test_multiple_attempts_can_continue_one_persistent_worker_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            for attempt, turn in (("persistent-one", "persistent-turn-one"), ("persistent-two", "persistent-turn-two")):
+                self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt=attempt)
+                record_session_identity(repository, identity, self.context(identity), attempt_id=attempt, session_identity="persistent-thread", lease=lease)
+                record_external_turn(repository, identity, self.context(identity), attempt_id=attempt, session_identity="persistent-thread", external_turn_identity=turn, lease=lease)
+            self.assertEqual(read_attempt(repository, identity, "persistent-two").attempt_number, 2)
+
+    def test_terminal_block_and_invalid_output_replays_keep_their_original_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            self.prepare(repository, identity, lease, role=ProviderRole.PLANNING, attempt="retry-block")
+            first = recover_attempt(repository, identity, self.context(identity), attempt_id="retry-block", max_attempts=1, lease=lease)
+            replay = recover_attempt(repository, identity, self.context(identity), attempt_id="retry-block", max_attempts=1, lease=lease)
+            self.assertEqual((replay.next_action, replay.blocker), (first.next_action, first.blocker))
+
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="invalid-replay")
+            record_session_identity(repository, identity, self.context(identity), attempt_id="invalid-replay", session_identity="invalid-replay-thread", lease=lease)
+            record_external_turn(repository, identity, self.context(identity), attempt_id="invalid-replay", session_identity="invalid-replay-thread", external_turn_identity="invalid-replay-turn", lease=lease)
+            first_invalid = record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="f" * 64, lease=lease)
+            self.assertEqual(record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="f" * 64, lease=lease), first_invalid)
+            with self.assertRaises(ProviderRecoveryError):
+                record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="a" * 64, lease=lease)
+
+
+if __name__ == "__main__":
+    unittest.main()

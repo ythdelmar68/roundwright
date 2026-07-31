@@ -323,7 +323,21 @@ def dispatch_plan(
                     source_digest, kind, external_turn_identity, process_lease_id,
                     process_lease_expires_at, context_digest,
                 )
-            if provider is not None and tuple(provider[:-1]) != expected_provider:
+            expected_prepared = (
+                ProviderRole.PLANNING.value,
+                process_lease_id,
+                process_lease_expires_at,
+                normalized.digest,
+            )
+            prepared_checkpoint = (
+                provider is not None
+                and (provider[0], provider[1], provider[2], provider[5]) == expected_prepared
+                and provider[3] in (None, worker_thread_identity)
+                and provider[4] is None
+                and provider[6] == AttemptState.PREPARED.value
+                and persisted_context == expected_context
+            )
+            if not prepared_checkpoint and provider is not None:
                 raise WorkerPlanningError("persisted provider dispatch does not match the requested identity")
         connection.commit()
     except Exception:

@@ -174,6 +174,23 @@ class WorkerPlanningTests(unittest.TestCase):
                     process_lease_expires_at=now + 60, lease=lease, now=now,
                 )
 
+    def test_dispatch_resumes_a_bound_session_checkpoint_before_external_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            original = worker_planning.record_session_identity
+
+            def crash_after_session(*args, **kwargs):
+                original(*args, **kwargs)
+                raise RuntimeError("simulated post-session crash")
+
+            with mock.patch.object(worker_planning, "record_session_identity", side_effect=crash_after_session):
+                with self.assertRaisesRegex(RuntimeError, "post-session crash"):
+                    self.dispatch(repository, identity, lease, context, now)
+            replayed = self.dispatch(repository, identity, lease, context, now)
+            self.assertEqual(replayed.external_turn_identity, "turn-provider-one")
+            with self.assertRaisesRegex(WorkerPlanningError, "committed state"):
+                self.dispatch(repository, identity, lease, context, now, thread="different-worker-thread")
+
     def test_completed_output_binding_recovers_only_the_same_plan_after_artifact_crash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))

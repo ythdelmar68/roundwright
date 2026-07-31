@@ -180,7 +180,7 @@ def prepare_attempt(
                 or row.process_lease_id != process_lease_id
                 or row.process_lease_expires_at != process_lease_expires_at
                 or row.input_fingerprint != input_fingerprint
-                or row.state is not AttemptState.PREPARED
+                or row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}
             ):
                 raise ProviderRecoveryError("provider attempt replay conflicts with committed state")
             connection.commit()
@@ -319,16 +319,19 @@ def record_completed_output(
     attempt_id: str,
     output_pointer: str,
     completion_evidence_fingerprint: str,
+    output_fingerprint: str = "",
     lease: TransitionLease | None = None,
     now: int | None = None,
 ) -> ProviderAttempt:
-    """Persist an opaque completed-output pointer and independent evidence."""
+    """Persist a completed-output pointer, evidence, and immutable output binding."""
 
     _validate_task(identity)
     _validate_context(identity, context)
     _require_token(attempt_id, "attempt identity")
     _require_token(output_pointer, "output pointer")
     _require_fingerprint(completion_evidence_fingerprint, "completion evidence fingerprint")
+    if output_fingerprint:
+        _require_fingerprint(output_fingerprint, "output fingerprint")
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -337,14 +340,32 @@ def record_completed_output(
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
         expected = (output_pointer, completion_evidence_fingerprint)
+        binding = connection.execute(
+            "SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
         if row.state is AttemptState.COMPLETED:
             if (row.output_pointer, row.completion_evidence_fingerprint) != expected:
                 raise ProviderRecoveryError("completed output replay conflicts with committed state")
+            if binding is None:
+                connection.execute(
+                    "INSERT INTO provider_completion_outputs(attempt_id, output_fingerprint) VALUES (?, ?)",
+                    (attempt_id, output_fingerprint),
+                )
+            elif binding[0] != output_fingerprint:
+                raise ProviderRecoveryError("completed output replay conflicts with committed content")
         elif row.state is AttemptState.DISPATCHED:
+            if binding is not None and binding[0] != output_fingerprint:
+                raise ProviderRecoveryError("completed output conflicts with committed content")
             connection.execute(
                 "UPDATE provider_attempts SET output_pointer = ?, completion_evidence_fingerprint = ?, state = ? WHERE attempt_id = ?",
                 (*expected, AttemptState.COMPLETED.value, attempt_id),
             )
+            if binding is None:
+                connection.execute(
+                    "INSERT INTO provider_completion_outputs(attempt_id, output_fingerprint) VALUES (?, ?)",
+                    (attempt_id, output_fingerprint),
+                )
         else:
             raise ProviderRecoveryError("completed output requires a dispatched provider turn")
         connection.commit()
@@ -708,14 +729,15 @@ def _require_session_checkpoint(
 
 
 def _require_session_reuse_allowed(connection, row: ProviderAttempt, session_identity: str) -> None:
-    """Permit cross-attempt session reuse only for persistent Worker sessions."""
+    """Permit cross-attempt reuse only for persistent Worker planning/execution sessions."""
 
     existing_roles = connection.execute(
         "SELECT provider_role FROM provider_attempts WHERE task_id = ? AND session_identity = ? AND attempt_id != ?",
         (row.task_id, session_identity, row.attempt_id),
     ).fetchall()
+    reusable_roles = {ProviderRole.PLANNING.value, ProviderRole.WORKER.value}
     if existing_roles and (
-        row.role is not ProviderRole.WORKER or any(role[0] != ProviderRole.WORKER.value for role in existing_roles)
+        row.role.value not in reusable_roles or any(role[0] not in reusable_roles for role in existing_roles)
     ):
         raise ProviderRecoveryError("session identity cannot be reused across provider attempts")
 

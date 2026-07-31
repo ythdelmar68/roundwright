@@ -281,9 +281,12 @@ def record_plan_review(
             dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, dispatch.plan_digest,
         ):
             raise PlanReviewError("review output identity does not match the durable dispatch")
-    except PlanReviewError as error:
+        canonical_details = () if normalized.verdict is PlanReviewVerdict.PASS else _canonical_routed_details(normalized)
+    except (PlanReviewError, WorkerPlanningError) as error:
         _record_invalid(repository, identity, context, dispatch, output, str(error), lease, now)
-        raise
+        if isinstance(error, PlanReviewError):
+            raise
+        raise PlanReviewError("review findings routing data is invalid") from error
     record_completed_output(
         repository, identity, context, attempt_id=dispatch.provider_attempt_id,
         output_pointer=f"plan-review:{review_attempt_id}", completion_evidence_fingerprint=completion_evidence_fingerprint,
@@ -293,7 +296,7 @@ def record_plan_review(
     if normalized.verdict is PlanReviewVerdict.FINDINGS:
         finding_ids = route_plan_findings(
             repository, identity, plan_attempt_id=dispatch.plan_attempt_id,
-            findings=_canonical_routed_details(normalized), lease=lease, now=now,
+            findings=canonical_details, lease=lease, now=now,
         )
         _persist_route(repository, identity, dispatch, finding_ids, lease)
     else:
@@ -468,18 +471,21 @@ def _recover_routed_findings(repository, identity, dispatch, artifact, task_stat
         residual_risks = tuple(json.loads(artifact[4]))
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise PlanReviewError("persisted findings artifact is malformed") from error
-    output = PlanReviewOutput(
-        dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity,
-        dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, dispatch.plan_digest,
-        PlanReviewVerdict.FINDINGS, findings, missing_tests, ambiguous_criteria, residual_risks,
-    ).normalized()
+    try:
+        output = PlanReviewOutput(
+            dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity,
+            dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, dispatch.plan_digest,
+            PlanReviewVerdict.FINDINGS, findings, missing_tests, ambiguous_criteria, residual_risks,
+        ).normalized()
+        canonical_details = _canonical_routed_details(output)
+    except (PlanReviewError, WorkerPlanningError) as error:
+        raise PlanReviewError("persisted findings routing data is invalid") from error
     if output.digest != artifact[5]:
         raise PlanReviewError("persisted findings artifact has drifted")
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity)
         _require_completed_review_provider(connection, identity, dispatch, artifact[5])
-        canonical_details = _canonical_routed_details(output)
         expected_ids = _finding_ids(identity, dispatch.plan_attempt_id, canonical_details)
         route = connection.execute("SELECT task_id, plan_attempt_id, worker_thread_identity, finding_ids_json FROM plan_review_routes WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()
         thread = connection.execute("SELECT worker_thread_identity FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?", (dispatch.plan_attempt_id, identity.task_id)).fetchone()
@@ -590,10 +596,15 @@ def _read_dispatch_connection(connection, identity, review_attempt_id):
 
 
 def _routed_details(output: PlanReviewOutput) -> tuple[str, ...]:
-    return tuple(
-        [*(f"finding:{item}" for item in output.findings), *(f"missing-test:{item}" for item in output.missing_tests),
-         *(f"ambiguous-criterion:{item}" for item in output.ambiguous_criteria), *(f"residual-risk:{item}" for item in output.residual_risks)]
-    )
+    tagged: list[str] = []
+    for prefix, details, name in (
+        ("finding", output.findings, "findings"),
+        ("missing-test", output.missing_tests, "missing tests"),
+        ("ambiguous-criterion", output.ambiguous_criteria, "ambiguous criteria"),
+        ("residual-risk", output.residual_risks, "residual risks"),
+    ):
+        tagged.extend(f"{prefix}:{detail}" for detail in _canonical_plan_findings(details, name, allow_empty=True))
+    return tuple(tagged)
 
 
 def _canonical_routed_details(output: PlanReviewOutput) -> tuple[str, ...]:

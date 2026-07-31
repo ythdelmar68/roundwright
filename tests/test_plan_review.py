@@ -146,6 +146,7 @@ class PlanReviewTests(unittest.TestCase):
             recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
             self.assertEqual(recovered.verdict, PlanReviewVerdict.FINDINGS)
             self.assertEqual(task_projection(repository, identity).state, "planning")
+            self.assertEqual(recovered.routed_finding_ids, plan_review._finding_ids(identity, "plan-one", ("finding:Alpha", "finding:Zulu Item")))
 
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
@@ -156,7 +157,22 @@ class PlanReviewTests(unittest.TestCase):
                     record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
             recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
             self.assertEqual(recovered.verdict, PlanReviewVerdict.FINDINGS)
-            self.assertTrue(recovered.routed_finding_ids)
+            self.assertEqual(recovered.routed_finding_ids, plan_review._finding_ids(identity, "plan-one", ("finding:Alpha", "finding:Zulu Item")))
+
+    def test_oversized_tagged_finding_is_rejected_before_completion_or_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("x" * 2000,))
+            with self.assertRaisesRegex(PlanReviewError, "routing data is invalid"):
+                record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.AMBIGUOUS)
+            connection = _open_writable_connection(repository)
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM plan_review_artifacts WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT state FROM plan_review_attempts WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()[0], PlanReviewState.INVALIDATED.value)
+            finally:
+                connection.close()
 
     def test_findings_recovery_requires_the_exact_completed_output_binding(self):
         for binding in (None, "0" * 64):

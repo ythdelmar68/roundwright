@@ -292,7 +292,7 @@ def record_plan_review(
     if normalized.verdict is PlanReviewVerdict.FINDINGS:
         finding_ids = route_plan_findings(
             repository, identity, plan_attempt_id=dispatch.plan_attempt_id,
-            findings=_routed_details(normalized), lease=lease, now=now,
+            findings=_canonical_routed_details(normalized), lease=lease, now=now,
         )
         _persist_route(repository, identity, dispatch, finding_ids, lease)
     else:
@@ -477,8 +477,9 @@ def _recover_routed_findings(repository, identity, dispatch, artifact, task_stat
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity)
-        _require_completed_review_provider(connection, identity, dispatch)
-        expected_ids = _finding_ids(identity, dispatch.plan_attempt_id, _routed_details(output))
+        _require_completed_review_provider(connection, identity, dispatch, artifact[5])
+        canonical_details = _canonical_routed_details(output)
+        expected_ids = _finding_ids(identity, dispatch.plan_attempt_id, canonical_details)
         route = connection.execute("SELECT task_id, plan_attempt_id, worker_thread_identity, finding_ids_json FROM plan_review_routes WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()
         thread = connection.execute("SELECT worker_thread_identity FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?", (dispatch.plan_attempt_id, identity.task_id)).fetchone()
         if thread is None:
@@ -499,13 +500,13 @@ def _recover_routed_findings(repository, identity, dispatch, artifact, task_stat
     finally:
         connection.close()
     if task_state == "plan-review":
-        finding_ids = route_plan_findings(repository, identity, plan_attempt_id=dispatch.plan_attempt_id, findings=_routed_details(output), lease=lease, now=now)
+        finding_ids = route_plan_findings(repository, identity, plan_attempt_id=dispatch.plan_attempt_id, findings=canonical_details, lease=lease, now=now)
         _persist_route(repository, identity, dispatch, finding_ids, lease)
     elif route is None:
         _persist_route(repository, identity, dispatch, expected_ids, lease)
 
 
-def _require_completed_review_provider(connection, identity, dispatch) -> None:
+def _require_completed_review_provider(connection, identity, dispatch, artifact_digest) -> None:
     row = connection.execute(
         "SELECT provider_role, state, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
         (dispatch.provider_attempt_id, identity.task_id),
@@ -516,6 +517,9 @@ def _require_completed_review_provider(connection, identity, dispatch) -> None:
     )
     if row is None or tuple(row[:6]) != expected or row[6] is None:
         raise PlanReviewError("findings provider output binding is incomplete")
+    binding = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()
+    if binding != (artifact_digest,):
+        raise PlanReviewError("findings provider output binding has drifted")
 
 
 def _require_exact_provider_context(connection, identity, provider_attempt_id, context) -> None:
@@ -589,6 +593,12 @@ def _routed_details(output: PlanReviewOutput) -> tuple[str, ...]:
         [*(f"finding:{item}" for item in output.findings), *(f"missing-test:{item}" for item in output.missing_tests),
          *(f"ambiguous-criterion:{item}" for item in output.ambiguous_criteria), *(f"residual-risk:{item}" for item in output.residual_risks)]
     )
+
+
+def _canonical_routed_details(output: PlanReviewOutput) -> tuple[str, ...]:
+    """Match Worker planning's immutable sorted, deduplicated findings contract."""
+
+    return tuple(sorted(set(_routed_details(output))))
 
 
 def _items(value: Iterable[str], name: str) -> tuple[str, ...]:

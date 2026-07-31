@@ -139,7 +139,7 @@ class PlanReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
             dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
-            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Clarify scope",))
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Zulu", "Alpha", "Zulu"))
             with mock.patch.object(plan_review, "route_plan_findings", side_effect=RuntimeError("crash before transition")):
                 with self.assertRaisesRegex(RuntimeError, "crash before transition"):
                     record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
@@ -150,13 +150,35 @@ class PlanReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
             dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
-            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Clarify scope",))
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Zulu", "Alpha", "Zulu"))
             with mock.patch.object(plan_review, "_persist_route", side_effect=RuntimeError("crash after transition")):
                 with self.assertRaisesRegex(RuntimeError, "crash after transition"):
                     record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
             recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
             self.assertEqual(recovered.verdict, PlanReviewVerdict.FINDINGS)
             self.assertTrue(recovered.routed_finding_ids)
+
+    def test_findings_recovery_requires_the_exact_completed_output_binding(self):
+        for binding in (None, "0" * 64):
+            with self.subTest(binding=binding), tempfile.TemporaryDirectory() as temporary:
+                repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+                dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+                output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Zulu", "Alpha"))
+                with mock.patch.object(plan_review, "route_plan_findings", side_effect=RuntimeError("crash before transition")):
+                    with self.assertRaisesRegex(RuntimeError, "crash before transition"):
+                        record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+                connection = _open_writable_connection(repository)
+                try:
+                    if binding is None:
+                        connection.execute("DELETE FROM provider_completion_outputs WHERE attempt_id = ?", (dispatch.provider_attempt_id,))
+                    else:
+                        connection.execute("UPDATE provider_completion_outputs SET output_fingerprint = ? WHERE attempt_id = ?", (binding, dispatch.provider_attempt_id))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(PlanReviewError, "output binding"):
+                    recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+                self.assertEqual(task_projection(repository, identity).state, "plan-review")
 
     def test_restart_invalidates_an_unaccepted_partial_pass_before_fresh_review(self):
         with tempfile.TemporaryDirectory() as temporary:

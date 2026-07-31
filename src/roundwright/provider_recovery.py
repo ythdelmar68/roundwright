@@ -708,14 +708,15 @@ def _require_session_checkpoint(
 
 
 def _require_session_reuse_allowed(connection, row: ProviderAttempt, session_identity: str) -> None:
-    """Permit cross-attempt session reuse only for persistent Worker sessions."""
+    """Permit cross-attempt reuse only for persistent Worker planning/execution sessions."""
 
     existing_roles = connection.execute(
         "SELECT provider_role FROM provider_attempts WHERE task_id = ? AND session_identity = ? AND attempt_id != ?",
         (row.task_id, session_identity, row.attempt_id),
     ).fetchall()
+    reusable_roles = {ProviderRole.PLANNING.value, ProviderRole.WORKER.value}
     if existing_roles and (
-        row.role is not ProviderRole.WORKER or any(role[0] != ProviderRole.WORKER.value for role in existing_roles)
+        row.role.value not in reusable_roles or any(role[0] not in reusable_roles for role in existing_roles)
     ):
         raise ProviderRecoveryError("session identity cannot be reused across provider attempts")
 

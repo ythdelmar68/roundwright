@@ -1,0 +1,119 @@
+"""Hermetic coverage for the bounded Phase 2 Worker planning path."""
+
+from __future__ import annotations
+
+import time
+import tempfile
+import unittest
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from roundwright.configuration import RepositoryIdentity
+from roundwright.git_identity import acquire_transition_lease
+from roundwright.provider_recovery import RecoveryContext
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
+from roundwright.worker_planning import (
+    PlanReviewReceipt,
+    PlanningInput,
+    WorkerPlan,
+    WorkerPlanningError,
+    accept_plan_review_and_begin_implementation,
+    begin_planning,
+    dispatch_plan,
+    read_plan,
+    record_plan,
+    route_plan_findings,
+    submit_plan_for_review,
+)
+
+
+class WorkerPlanningTests(unittest.TestCase):
+    def repository(self, root: Path) -> RepositoryIdentity:
+        identity = object.__new__(RepositoryIdentity)
+        object.__setattr__(identity, "root", root.resolve())
+        return identity
+
+    def identity(self) -> TaskIdentity:
+        return TaskIdentity("task-23", "source-23", "ythdelmar68/roundwright", "codex/issue-23", "C:/private/issue-23", "a" * 40)
+
+    def input(self) -> PlanningInput:
+        return PlanningInput("Worker planning", ("No SDK",), ("Persist plan",), ("src/roundwright/worker_planning.py",), ("Run hermetic tests",), ("Schema drift",), ("Retry same thread",))
+
+    def plan(self, *, blockers: tuple[str, ...] = ()) -> WorkerPlan:
+        return WorkerPlan("Worker planning", ("No SDK",), ("src/roundwright/worker_planning.py",), ("Persist plan",), ("Run hermetic tests",), ("Schema drift",), ("Retry same thread",), blockers)
+
+    def setup_task(self, root: Path):
+        repository = self.repository(root)
+        initialize(repository)
+        identity = self.identity()
+        now = int(time.time())
+        lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="planning-tests", ttl_seconds=120)
+        admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "b" * 64),), lease=lease)
+        begin_planning(repository, identity, evidence_fingerprint="c" * 64, lease=lease)
+        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64)
+        return repository, identity, lease, context, now
+
+    def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None):
+        return dispatch_plan(
+            repository, identity, context, self.input(), plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
+            worker_thread_identity=thread, external_turn_identity=f"turn-{provider_attempt}", process_lease_id=f"lease-{provider_attempt}",
+            process_lease_expires_at=now + 60, parent_plan_attempt_id=parent, lease=lease, now=now,
+        )
+
+    def test_plan_is_bound_to_source_input_attempt_and_persistent_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            dispatched = self.dispatch(repository, identity, lease, context, now)
+            persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            self.assertEqual((dispatched.input_digest, persisted.input_digest), (self.input().digest, self.input().digest))
+            self.assertEqual(persisted.source_digest, "b" * 64)
+            self.assertEqual(persisted.worker_thread_identity, "worker-thread-23")
+            self.assertFalse(persisted.has_true_blockers)
+            self.assertEqual(read_plan(repository, identity, "plan-one"), persisted)
+
+    def test_pid_and_pending_values_are_not_worker_thread_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            for thread in ("2345", "pid-2345", "pending", "pending-thread"):
+                with self.subTest(thread=thread), self.assertRaises(WorkerPlanningError):
+                    self.dispatch(repository, identity, lease, context, now, plan_attempt=f"plan-{thread}", provider_attempt=f"provider-{thread}", thread=thread)
+
+    def test_findings_revision_keeps_the_same_worker_thread_and_each_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            findings = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
+            self.assertEqual(len(findings), 1)
+            revision = self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one")
+            self.assertEqual(revision.worker_thread_identity, "worker-thread-23")
+            with self.assertRaises(WorkerPlanningError):
+                self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-three", provider_attempt="provider-three", thread="different-thread", parent="plan-one")
+
+    def test_owner_blocker_never_becomes_a_reviewable_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            with self.assertRaisesRegex(WorkerPlanningError, "owner input"):
+                record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(blockers=("owner-security-decision",)), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            with self.assertRaises(WorkerPlanningError):
+                submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
+
+    def test_only_an_accepted_pass_derives_done_criteria_and_enters_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
+            with self.assertRaises(WorkerPlanningError):
+                accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, False), evidence_fingerprint="2" * 64, lease=lease)
+            completion = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, True), evidence_fingerprint="3" * 64, lease=lease)
+            self.assertEqual(completion.criteria, ("acceptance:Persist plan", "test:Run hermetic tests"))
+            self.assertEqual(task_projection(repository, identity).state, "implementing")
+
+
+if __name__ == "__main__":
+    unittest.main()

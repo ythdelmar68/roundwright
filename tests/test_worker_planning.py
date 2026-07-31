@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.configuration import RepositoryIdentity
 import roundwright.worker_planning as worker_planning
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.provider_recovery import RecoveryContext
+from roundwright.provider_recovery import RecoveryContext, record_completed_output
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt,
@@ -166,11 +166,36 @@ class WorkerPlanningTests(unittest.TestCase):
                     self.dispatch(repository, identity, lease, context, now)
             replayed = self.dispatch(repository, identity, lease, context, now)
             self.assertEqual(replayed.provider_attempt_id, "provider-one")
+            self.assertEqual(self.dispatch(repository, identity, lease, context, now), replayed)
             with self.assertRaises(WorkerPlanningError):
                 dispatch_plan(
                     repository, identity, context, self.input(), plan_attempt_id="plan-one", provider_attempt_id="provider-one",
                     worker_thread_identity="worker-thread-23", external_turn_identity="turn-two", process_lease_id="lease-provider-one",
                     process_lease_expires_at=now + 60, lease=lease, now=now,
+                )
+
+    def test_completed_output_binding_recovers_only_the_same_plan_after_artifact_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            output = self.output()
+            # This is the durable state left by a crash after provider completion
+            # commits and before the artifact transaction begins.
+            record_completed_output(
+                repository, identity, context, attempt_id="provider-one", output_pointer="plan:plan-one",
+                completion_evidence_fingerprint="f" * 64, output_fingerprint=output.plan.digest,
+                lease=lease, now=now,
+            )
+            recovered = record_plan(
+                repository, identity, context, plan_attempt_id="plan-one", output=output,
+                completion_evidence_fingerprint="f" * 64, lease=lease, now=now,
+            )
+            self.assertEqual(recovered.content_digest, output.plan.digest)
+            with self.assertRaisesRegex(WorkerPlanningError, "committed content"):
+                record_plan(
+                    repository, identity, context, plan_attempt_id="plan-one",
+                    output=self.output(plan=self.plan(blockers=("owner-different-decision",))),
+                    completion_evidence_fingerprint="f" * 64, lease=lease, now=now,
                 )
 
     def test_findings_routing_is_atomic_and_replayable(self) -> None:

@@ -21,6 +21,7 @@ from .git_identity import TransitionLease, _require_current_lease
 from .provider_recovery import (
     AttemptState,
     ProviderAttempt,
+    ProviderRecoveryError,
     ProviderRole,
     RecoveryContext,
     prepare_attempt,
@@ -284,6 +285,46 @@ def dispatch_plan(
         if existing is not None:
             if tuple(existing) != expected:
                 raise WorkerPlanningError("plan dispatch replay conflicts with committed state")
+            provider = connection.execute(
+                "SELECT provider_role, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, state FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+                (provider_attempt_id, identity.task_id),
+            ).fetchone()
+            persisted_context = connection.execute(
+                "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+                (provider_attempt_id,),
+            ).fetchone()
+            expected_provider = (
+                ProviderRole.PLANNING.value,
+                process_lease_id,
+                process_lease_expires_at,
+                worker_thread_identity,
+                external_turn_identity,
+                normalized.digest,
+            )
+            expected_context = (
+                identity.task_id,
+                context.repository_fingerprint,
+                context.worktree_fingerprint,
+                context.branch_fingerprint,
+                context.base_fingerprint,
+                context.candidate_fingerprint,
+                context.policy_fingerprint,
+                context.deployment_fingerprint,
+            )
+            if (
+                provider is not None
+                and tuple(provider[:-1]) == expected_provider
+                and provider[-1] in (AttemptState.DISPATCHED.value, AttemptState.COMPLETED.value)
+                and persisted_context == expected_context
+            ):
+                connection.commit()
+                return PlanningDispatch(
+                    plan_attempt_id, provider_attempt_id, worker_thread_identity, normalized.digest,
+                    source_digest, kind, external_turn_identity, process_lease_id,
+                    process_lease_expires_at, context_digest,
+                )
+            if provider is not None and tuple(provider[:-1]) != expected_provider:
+                raise WorkerPlanningError("persisted provider dispatch does not match the requested identity")
         connection.commit()
     except Exception:
         connection.rollback()
@@ -304,33 +345,6 @@ def dispatch_plan(
         now=now,
     )
     _require_planning_attempt(provider)
-    if provider.state is AttemptState.DISPATCHED:
-        if (provider.session_identity, provider.external_turn_identity) != (
-            worker_thread_identity,
-            external_turn_identity,
-        ):
-            raise WorkerPlanningError("dispatched provider turn does not match the requested Worker thread")
-    else:
-        record_session_identity(
-            repository,
-            identity,
-            context,
-            attempt_id=provider_attempt_id,
-            session_identity=worker_thread_identity,
-            lease=lease,
-            now=now,
-        )
-        record_external_turn(
-            repository,
-            identity,
-            context,
-            attempt_id=provider_attempt_id,
-            session_identity=worker_thread_identity,
-            external_turn_identity=external_turn_identity,
-            lease=lease,
-            now=now,
-        )
-
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -339,8 +353,8 @@ def dispatch_plan(
         source_digest = _source_digest(connection, identity)
         if kind is PlanAttemptKind.INITIAL:
             previous = connection.execute(
-                "SELECT 1 FROM worker_plan_attempts WHERE task_id = ? AND attempt_kind = 'initial'",
-                (identity.task_id,),
+                "SELECT 1 FROM worker_plan_attempts WHERE task_id = ? AND attempt_kind = 'initial' AND plan_attempt_id != ?",
+                (identity.task_id, plan_attempt_id),
             ).fetchone()
             if previous is not None:
                 raise WorkerPlanningError("an initial plan attempt is already recorded")
@@ -399,6 +413,32 @@ def dispatch_plan(
         raise
     finally:
         connection.close()
+    if provider.state is AttemptState.DISPATCHED:
+        if (provider.session_identity, provider.external_turn_identity) != (
+            worker_thread_identity,
+            external_turn_identity,
+        ):
+            raise WorkerPlanningError("dispatched provider turn does not match the requested Worker thread")
+    else:
+        record_session_identity(
+            repository,
+            identity,
+            context,
+            attempt_id=provider_attempt_id,
+            session_identity=worker_thread_identity,
+            lease=lease,
+            now=now,
+        )
+        record_external_turn(
+            repository,
+            identity,
+            context,
+            attempt_id=provider_attempt_id,
+            session_identity=worker_thread_identity,
+            external_turn_identity=external_turn_identity,
+            lease=lease,
+            now=now,
+        )
     return PlanningDispatch(
         plan_attempt_id,
         provider_attempt_id,
@@ -446,19 +486,40 @@ def record_plan(
         dispatch.source_digest,
     ):
         raise WorkerPlanningError("Worker output identity does not match the durable dispatch")
-    completed = record_completed_output(
-        repository,
-        identity,
-        context,
-        attempt_id=dispatch.provider_attempt_id,
-        output_pointer=f"plan:{plan_attempt_id}",
-        completion_evidence_fingerprint=completion_evidence_fingerprint,
-        lease=lease,
-        now=now,
-    )
+    normalized = normalized_output.plan
+    # A durable artifact or owner-blocked output owns this attempt.  Check it
+    # before touching the provider completion record so conflicting replays
+    # cannot change any already-committed planning state.
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity, "planning")
+        attempt = _plan_attempt(connection, identity, plan_attempt_id)
+        if attempt["state"] == PlanAttemptState.OWNER_BLOCKED.value and attempt["owner_blocker_digest"] != normalized.digest:
+            raise WorkerPlanningError("owner-blocked plan replay conflicts with committed output")
+        artifact = connection.execute(
+            "SELECT content_digest FROM worker_plan_artifacts WHERE plan_attempt_id = ? AND task_id = ?",
+            (plan_attempt_id, identity.task_id),
+        ).fetchone()
+        if artifact is not None and artifact[0] != normalized.digest:
+            raise WorkerPlanningError("plan artifact replay conflicts with committed content")
+    finally:
+        connection.close()
+    try:
+        completed = record_completed_output(
+            repository,
+            identity,
+            context,
+            attempt_id=dispatch.provider_attempt_id,
+            output_pointer=f"plan:{plan_attempt_id}",
+            completion_evidence_fingerprint=completion_evidence_fingerprint,
+            output_fingerprint=normalized.digest,
+            lease=lease,
+            now=now,
+        )
+    except ProviderRecoveryError as error:
+        raise WorkerPlanningError(str(error)) from error
     if completed.state is not AttemptState.COMPLETED:
         raise WorkerPlanningError("Worker plan provider turn is not completed")
-    normalized = normalized_output.plan
     observed = _clock(now)
     connection = _open_writable_connection(repository)
     try:
@@ -803,6 +864,16 @@ def _require_completed_dispatch(connection, identity: TaskIdentity, plan_attempt
     )
     if provider != expected:
         raise WorkerPlanningError("plan artifact is not bound to an exact completed provider turn")
+    artifact = connection.execute(
+        "SELECT content_digest FROM worker_plan_artifacts WHERE plan_attempt_id = ? AND task_id = ?",
+        (plan_attempt_id, identity.task_id),
+    ).fetchone()
+    completion = connection.execute(
+        "SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?",
+        (attempt["provider_attempt_id"],),
+    ).fetchone()
+    if artifact is None or completion != artifact:
+        raise WorkerPlanningError("plan artifact content is not bound to the completed provider output")
 
 
 def _context_digest(context: RecoveryContext) -> str:

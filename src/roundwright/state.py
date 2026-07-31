@@ -317,6 +317,15 @@ MIGRATIONS = (
             ("worker_plan_attempts", "CREATE TABLE worker_plan_attempts (plan_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, source_digest TEXT NOT NULL, input_digest TEXT NOT NULL, task_summary TEXT NOT NULL, parent_plan_attempt_id TEXT REFERENCES worker_plan_attempts(plan_attempt_id), attempt_kind TEXT NOT NULL CHECK(attempt_kind IN ('initial', 'revision')), state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'owner-blocked')), created_at INTEGER NOT NULL CHECK(created_at > 0), revision_findings_digest TEXT NOT NULL DEFAULT '', process_lease_id TEXT NOT NULL DEFAULT '', process_lease_expires_at INTEGER NOT NULL DEFAULT 0, external_turn_identity TEXT NOT NULL DEFAULT '', context_digest TEXT NOT NULL DEFAULT '', owner_blocker_digest TEXT NOT NULL DEFAULT '')"),
         ),
     ),
+    Migration(
+        21,
+        (
+            "CREATE TABLE provider_completion_outputs (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), output_fingerprint TEXT NOT NULL)",
+        ),
+        (
+            ("provider_completion_outputs", "CREATE TABLE provider_completion_outputs (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), output_fingerprint TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 

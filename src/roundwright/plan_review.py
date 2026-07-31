@@ -21,7 +21,6 @@ from .provider_recovery import (
     AttemptState,
     ProviderRole,
     RecoveryContext,
-    accept_supervisor_review,
     invalidate_supervisor_attempt,
     prepare_attempt,
     read_attempt,
@@ -210,24 +209,35 @@ def dispatch_plan_review(
     )
     if provider.role is not ProviderRole.SUPERVISOR:
         raise PlanReviewError("review provider attempt has the wrong role")
-    record_session_identity(repository, identity, context, attempt_id=provider_attempt_id,
-                            session_identity=supervisor_session_identity, lease=lease, now=now)
-    record_external_turn(repository, identity, context, attempt_id=provider_attempt_id,
-                         session_identity=supervisor_session_identity, external_turn_identity=external_turn_identity,
-                         lease=lease, now=now)
+    if provider.state is AttemptState.PREPARED:
+        record_session_identity(repository, identity, context, attempt_id=provider_attempt_id,
+                                session_identity=supervisor_session_identity, lease=lease, now=now)
+        record_external_turn(repository, identity, context, attempt_id=provider_attempt_id,
+                             session_identity=supervisor_session_identity, external_turn_identity=external_turn_identity,
+                             lease=lease, now=now)
+    elif provider.state is AttemptState.DISPATCHED:
+        if (provider.session_identity, provider.external_turn_identity) != (supervisor_session_identity, external_turn_identity):
+            raise PlanReviewError("review provider turn conflicts with the requested dispatch")
+    else:
+        raise PlanReviewError("review provider attempt cannot finish a missing dispatch")
+    _persist_dispatch(repository, identity, expected, lease, observed)
+    return expected
+
+
+def _persist_dispatch(repository, identity, expected, lease, observed) -> None:
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity, "plan-review")
-        current = _read_dispatch_connection(connection, identity, review_attempt_id)
+        current = _read_dispatch_connection(connection, identity, expected.review_attempt_id)
         if current is None:
             connection.execute(
                 "INSERT INTO plan_review_attempts(review_attempt_id, task_id, plan_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, source_digest, plan_digest, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    review_attempt_id, identity.task_id, plan_attempt_id, provider_attempt_id,
-                    supervisor_session_identity, external_turn_identity, source_digest, plan_digest,
-                    input_digest, PlanReviewState.DISPATCHED.value, observed,
+                    expected.review_attempt_id, identity.task_id, expected.plan_attempt_id, expected.provider_attempt_id,
+                    expected.supervisor_session_identity, expected.external_turn_identity, expected.source_digest,
+                    expected.plan_digest, expected.input_digest, PlanReviewState.DISPATCHED.value, observed,
                 ),
             )
         elif current != expected:
@@ -238,7 +248,6 @@ def dispatch_plan_review(
         raise
     finally:
         connection.close()
-    return expected
 
 
 def record_plan_review(
@@ -287,11 +296,7 @@ def record_plan_review(
         )
         _persist_route(repository, identity, dispatch, finding_ids, lease)
     else:
-        accept_supervisor_review(
-            repository, identity, context, attempt_id=dispatch.provider_attempt_id,
-            accepted_review_identity=review_attempt_id, lease=lease, now=now,
-        )
-        _persist_accepted_pass(repository, identity, dispatch, lease)
+        _accept_pass_atomically(repository, identity, dispatch, lease, now)
     return read_plan_review(repository, identity, review_attempt_id)
 
 
@@ -310,7 +315,9 @@ def recover_plan_review(
     if dispatch is None:
         raise PlanReviewError("review dispatch is unavailable")
     attempt = read_attempt(repository, identity, dispatch.provider_attempt_id)
-    if attempt.state is not AttemptState.ACCEPTED:
+    if attempt.state is AttemptState.ACCEPTED:
+        _accept_pass_atomically(repository, identity, dispatch, lease, now)
+    else:
         invalidate_supervisor_attempt(repository, identity, context, attempt_id=attempt.attempt_id, lease=lease, now=now)
         connection = _open_writable_connection(repository)
         try:
@@ -396,16 +403,33 @@ def _persist_route(repository, identity, dispatch, finding_ids, lease) -> None:
         connection.close()
 
 
-def _persist_accepted_pass(repository, identity, dispatch, lease) -> None:
+def _accept_pass_atomically(repository, identity, dispatch, lease, now) -> None:
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, identity.repository_id, None)
+        _require_current_lease(connection, lease, identity.repository_id, _clock(now))
         _require_matching_task(connection, identity, "plan-review")
         submitted = connection.execute("SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?", (identity.task_id,)).fetchone()
         expected = (dispatch.plan_attempt_id, dispatch.review_attempt_id, dispatch.plan_digest)
         if submitted != (dispatch.plan_attempt_id, dispatch.plan_digest):
             raise PlanReviewError("accepted PASS no longer matches the submitted plan")
+        artifact = connection.execute("SELECT verdict FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?", (dispatch.review_attempt_id, identity.task_id)).fetchone()
+        if artifact != (PlanReviewVerdict.PASS.value,):
+            raise PlanReviewError("only a recorded PASS can be accepted")
+        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
+        if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[3] is None:
+            raise PlanReviewError("accepted PASS provider attempt is incomplete")
+        if provider[1] == AttemptState.COMPLETED.value:
+            connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?", (dispatch.review_attempt_id, AttemptState.ACCEPTED.value, dispatch.provider_attempt_id))
+            provider = (provider[0], AttemptState.ACCEPTED.value, dispatch.review_attempt_id, provider[3])
+        if provider[1] != AttemptState.ACCEPTED.value or provider[2] != dispatch.review_attempt_id:
+            raise PlanReviewError("accepted PASS provider attempt conflicts with committed state")
+        provider_review = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (dispatch.review_attempt_id,)).fetchone()
+        expected_provider_review = (identity.task_id, dispatch.provider_attempt_id, provider[3])
+        if provider_review is None:
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)", (dispatch.review_attempt_id, *expected_provider_review))
+        elif provider_review != expected_provider_review:
+            raise PlanReviewError("accepted provider review conflicts with committed state")
         existing = connection.execute("SELECT plan_attempt_id, review_identity, review_digest FROM accepted_plan_reviews WHERE task_id = ?", (identity.task_id,)).fetchone()
         if existing is None:
             connection.execute("INSERT INTO accepted_plan_reviews(task_id, plan_attempt_id, review_identity, review_digest) VALUES (?, ?, ?, ?)", (identity.task_id, *expected))

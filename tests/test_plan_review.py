@@ -1,3 +1,5 @@
+import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -22,7 +24,7 @@ from roundwright.plan_review import (
     recover_plan_review,
 )
 from roundwright.provider_recovery import AttemptState, RecoveryContext, read_attempt
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
+from roundwright.state import SourceSnapshot, TaskIdentity, _open_writable_connection, admit_task, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt,
     PlanningInput,
@@ -97,13 +99,54 @@ class PlanReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
             dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
-            with mock.patch.object(plan_review, "accept_supervisor_review"):
+            with mock.patch.object(plan_review, "_accept_pass_atomically"):
+                record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            connection = _open_writable_connection(repository)
+            try:
+                evidence = connection.execute("SELECT completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()[0]
+                connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = 'accepted' WHERE attempt_id = ?", (dispatch.review_attempt_id, dispatch.provider_attempt_id))
+                connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)", (dispatch.review_attempt_id, identity.task_id, dispatch.provider_attempt_id, evidence))
+                connection.commit()
+            finally:
+                connection.close()
+            recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+            self.assertEqual(recovered.state, PlanReviewState.RECORDED)
+            self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.ACCEPTED)
+            completion = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, True), evidence_fingerprint="3" * 64, lease=lease)
+            self.assertEqual(completion.plan_attempt_id, "plan-one")
+
+    def test_dispatch_replay_finishes_after_the_provider_turn_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            with mock.patch.object(plan_review, "_persist_dispatch", side_effect=RuntimeError("crash after turn")):
+                with self.assertRaisesRegex(RuntimeError, "crash after turn"):
+                    self.dispatch(repository, identity, lease, context, now, persisted)
+            replay = self.dispatch(repository, identity, lease, context, now, persisted)
+            attempt = read_attempt(repository, identity, replay.provider_attempt_id)
+            self.assertEqual(attempt.state, AttemptState.DISPATCHED)
+            self.assertEqual((attempt.session_identity, attempt.external_turn_identity), (replay.supervisor_session_identity, replay.external_turn_identity))
+
+    def test_restart_invalidates_an_unaccepted_partial_pass_before_fresh_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            with mock.patch.object(plan_review, "_accept_pass_atomically"):
                 record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
             recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
             self.assertEqual(recovered.state, PlanReviewState.INVALIDATED)
             self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.INVALIDATED)
             next_dispatch = self.dispatch(repository, identity, lease, context, now, persisted, review="review-two", provider="supervisor-two", session="supervisor-session-two")
             self.assertNotEqual(next_dispatch.supervisor_session_identity, dispatch.supervisor_session_identity)
+
+    def test_review_path_uses_no_process_or_credential_access_and_cannot_implement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            with mock.patch.dict(os.environ, {"SUPERVISOR_TEST_CREDENTIAL": "secret"}, clear=True), \
+                 mock.patch("os.getenv", side_effect=AssertionError("credential access")), \
+                 mock.patch.object(subprocess, "run", side_effect=AssertionError("process access")):
+                dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+                record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            self.assertEqual(task_projection(repository, identity).state, "plan-review")
 
 
 if __name__ == "__main__":

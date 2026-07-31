@@ -56,9 +56,9 @@ class WorkerPlanningTests(unittest.TestCase):
         context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64)
         return repository, identity, lease, context, now
 
-    def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None):
+    def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None, planning_input: PlanningInput | None = None):
         return dispatch_plan(
-            repository, identity, context, self.input(), plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
+            repository, identity, context, self.input() if planning_input is None else planning_input, plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
             worker_thread_identity=thread, external_turn_identity=f"turn-{provider_attempt}", process_lease_id=f"lease-{provider_attempt}",
             process_lease_expires_at=now + 60, parent_plan_attempt_id=parent, lease=lease, now=now,
         )
@@ -86,12 +86,29 @@ class WorkerPlanningTests(unittest.TestCase):
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
             record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             findings = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
             self.assertEqual(len(findings), 1)
             revision = self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one")
             self.assertEqual(revision.worker_thread_identity, "worker-thread-23")
             with self.assertRaises(WorkerPlanningError):
                 self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-three", provider_attempt="provider-three", thread="different-thread", parent="plan-one")
+
+    def test_revisions_reject_scope_drift_and_repeated_findings_are_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
+            first = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
+            unrelated = PlanningInput("Unrelated scope", (), ("Other criterion",), (), ("Other test",), (), ())
+            with self.assertRaisesRegex(WorkerPlanningError, "immutable task scope"):
+                self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one", planning_input=unrelated)
+            self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one")
+            record_plan(repository, identity, context, plan_attempt_id="plan-two", plan=self.plan(), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-two", evidence_fingerprint="3" * 64, lease=lease)
+            second = route_plan_findings(repository, identity, plan_attempt_id="plan-two", findings=("Clarify tests",), lease=lease, now=now)
+            self.assertNotEqual(first, second)
 
     def test_owner_blocker_never_becomes_a_reviewable_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -113,6 +130,21 @@ class WorkerPlanningTests(unittest.TestCase):
             completion = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, True), evidence_fingerprint="3" * 64, lease=lease)
             self.assertEqual(completion.criteria, ("acceptance:Persist plan", "test:Run hermetic tests"))
             self.assertEqual(task_projection(repository, identity).state, "implementing")
+
+    def test_accepted_pass_cannot_target_an_older_submitted_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            first = record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
+            route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
+            self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one")
+            second = record_plan(repository, identity, context, plan_attempt_id="plan-two", plan=self.plan(), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-two", evidence_fingerprint="3" * 64, lease=lease)
+            with self.assertRaisesRegex(WorkerPlanningError, "submitted review target"):
+                accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", first.content_digest, True), evidence_fingerprint="4" * 64, lease=lease)
+            accepted = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-two", receipt=PlanReviewReceipt("review-two", second.content_digest, True), evidence_fingerprint="5" * 64, lease=lease)
+            self.assertEqual(accepted.plan_attempt_id, "plan-two")
 
 
 if __name__ == "__main__":

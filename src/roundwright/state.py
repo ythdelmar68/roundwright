@@ -293,6 +293,17 @@ MIGRATIONS = (
             ("deterministic_done_criteria", "CREATE TABLE deterministic_done_criteria (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL UNIQUE REFERENCES worker_plan_attempts(plan_attempt_id), criteria_json TEXT NOT NULL, criteria_digest TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        19,
+        (
+            "ALTER TABLE worker_plan_attempts ADD COLUMN revision_findings_digest TEXT NOT NULL DEFAULT ''",
+            "CREATE TABLE submitted_plan_reviews (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL UNIQUE REFERENCES worker_plan_attempts(plan_attempt_id), plan_digest TEXT NOT NULL)",
+        ),
+        (
+            ("worker_plan_attempts", "CREATE TABLE worker_plan_attempts (plan_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, source_digest TEXT NOT NULL, input_digest TEXT NOT NULL, task_summary TEXT NOT NULL, parent_plan_attempt_id TEXT REFERENCES worker_plan_attempts(plan_attempt_id), attempt_kind TEXT NOT NULL CHECK(attempt_kind IN ('initial', 'revision')), state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'owner-blocked')), created_at INTEGER NOT NULL CHECK(created_at > 0), revision_findings_digest TEXT NOT NULL DEFAULT '')"),
+            ("submitted_plan_reviews", "CREATE TABLE submitted_plan_reviews (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL UNIQUE REFERENCES worker_plan_attempts(plan_attempt_id), plan_digest TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 
@@ -302,7 +313,7 @@ LIFECYCLE_STATES = frozenset(
 _ALLOWED_TRANSITIONS = {
     "queued": frozenset({"planning", "blocked"}),
     "planning": frozenset({"plan-review", "blocked"}),
-    "plan-review": frozenset({"implementing", "blocked"}),
+    "plan-review": frozenset({"planning", "implementing", "blocked"}),
     "implementing": frozenset({"diff-review", "blocked"}),
     "diff-review": frozenset({"ready-for-owner", "blocked"}),
     "ready-for-owner": frozenset(),

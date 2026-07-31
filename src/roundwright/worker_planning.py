@@ -220,10 +220,13 @@ def dispatch_plan(
             ).fetchone()
             if previous is not None:
                 raise WorkerPlanningError("an initial plan attempt is already recorded")
+            revision_findings_digest = ""
         else:
-            _require_parent_attempt(connection, identity, parent_plan_attempt_id, worker_thread_identity)
+            revision_findings_digest = _revision_scope(
+                connection, identity, parent_plan_attempt_id, worker_thread_identity, normalized
+            )
         existing = connection.execute(
-            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind "
+            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, revision_findings_digest "
             "FROM worker_plan_attempts WHERE plan_attempt_id = ?",
             (plan_attempt_id,),
         ).fetchone()
@@ -235,6 +238,7 @@ def dispatch_plan(
             normalized.task_summary,
             parent_plan_attempt_id,
             kind.value,
+            revision_findings_digest,
         )
         if existing is not None:
             if tuple(existing) != expected:
@@ -294,10 +298,13 @@ def dispatch_plan(
             ).fetchone()
             if previous is not None:
                 raise WorkerPlanningError("an initial plan attempt is already recorded")
+            revision_findings_digest = ""
         else:
-            _require_parent_attempt(connection, identity, parent_plan_attempt_id, worker_thread_identity)
+            revision_findings_digest = _revision_scope(
+                connection, identity, parent_plan_attempt_id, worker_thread_identity, normalized
+            )
         existing = connection.execute(
-            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind "
+            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, revision_findings_digest "
             "FROM worker_plan_attempts WHERE plan_attempt_id = ?",
             (plan_attempt_id,),
         ).fetchone()
@@ -309,17 +316,25 @@ def dispatch_plan(
             normalized.task_summary,
             parent_plan_attempt_id,
             kind.value,
+            revision_findings_digest,
         )
         if existing is None:
             connection.execute(
-                "INSERT INTO worker_plan_attempts(plan_attempt_id, task_id, provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, state, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO worker_plan_attempts(plan_attempt_id, task_id, provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, state, created_at, revision_findings_digest) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan_attempt_id,
                     identity.task_id,
-                    *expected,
+                    provider_attempt_id,
+                    worker_thread_identity,
+                    source_digest,
+                    normalized.digest,
+                    normalized.task_summary,
+                    parent_plan_attempt_id,
+                    kind.value,
                     PlanAttemptState.DISPATCHED.value,
                     observed,
+                    revision_findings_digest,
                 ),
             )
         elif tuple(existing) != expected:
@@ -422,7 +437,7 @@ def route_plan_findings(
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> tuple[str, ...]:
-    """Retain bounded review findings without treating them as an accepted review."""
+    """Return an exact rejected review target to planning for a same-thread revision."""
 
     _require_token(plan_attempt_id, "plan attempt identity")
     normalized = _items(tuple(findings), "plan findings")
@@ -431,12 +446,22 @@ def route_plan_findings(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
-        _require_matching_task(connection, identity)
+        _require_matching_task(connection, identity, "plan-review")
         _plan_attempt(connection, identity, plan_attempt_id, required_state=PlanAttemptState.RECORDED)
+        target = connection.execute(
+            "SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?",
+            (identity.task_id,),
+        ).fetchone()
+        artifact = connection.execute(
+            "SELECT content_digest FROM worker_plan_artifacts WHERE plan_attempt_id = ? AND task_id = ?",
+            (plan_attempt_id, identity.task_id),
+        ).fetchone()
+        if target != (plan_attempt_id, artifact[0] if artifact is not None else None):
+            raise WorkerPlanningError("plan findings do not match the submitted review target")
         identifiers: list[str] = []
         for finding in normalized:
             digest = _digest({"finding": finding})
-            finding_id = f"finding-{digest[:24]}"
+            finding_id = f"finding-{_digest({'task': identity.task_id, 'plan': plan_attempt_id, 'finding': digest})[:24]}"
             existing = connection.execute(
                 "SELECT task_id, plan_attempt_id, finding_digest FROM worker_plan_findings WHERE finding_id = ?",
                 (finding_id,),
@@ -450,13 +475,39 @@ def route_plan_findings(
             elif existing != expected:
                 raise WorkerPlanningError("plan finding identity conflicts with committed state")
             identifiers.append(finding_id)
+        findings_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "findings": tuple(identifiers)})
+        connection.execute("DELETE FROM submitted_plan_reviews WHERE task_id = ?", (identity.task_id,))
         connection.commit()
-        return tuple(identifiers)
     except Exception:
         connection.rollback()
         raise
     finally:
         connection.close()
+    transition_task(
+        repository,
+        identity,
+        expected_state="plan-review",
+        next_state="blocked",
+        evidence_fingerprint=_digest({"event": "plan-review-findings", "target": plan_attempt_id, "findings": findings_digest}),
+        lease=lease,
+    )
+    transition_task(
+        repository,
+        identity,
+        expected_state="blocked",
+        next_state="plan-review",
+        evidence_fingerprint=_digest({"event": "plan-revision-admitted", "target": plan_attempt_id, "findings": findings_digest}),
+        lease=lease,
+    )
+    transition_task(
+        repository,
+        identity,
+        expected_state="plan-review",
+        next_state="planning",
+        evidence_fingerprint=_digest({"event": "plan-revision-open", "target": plan_attempt_id, "findings": findings_digest}),
+        lease=lease,
+    )
+    return tuple(identifiers)
 
 
 def submit_plan_for_review(
@@ -472,6 +523,29 @@ def submit_plan_for_review(
     plan = _persisted_plan(repository, identity, plan_attempt_id)
     if plan.state is not PlanAttemptState.RECORDED or plan.has_true_blockers:
         raise WorkerPlanningError("only a complete unblocked plan can be submitted for review")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, None)
+        _require_matching_task(connection, identity, "planning")
+        existing = connection.execute(
+            "SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?",
+            (identity.task_id,),
+        ).fetchone()
+        expected = (plan_attempt_id, plan.content_digest)
+        if existing is None:
+            connection.execute(
+                "INSERT INTO submitted_plan_reviews(task_id, plan_attempt_id, plan_digest) VALUES (?, ?, ?)",
+                (identity.task_id, *expected),
+            )
+        elif existing != expected:
+            raise WorkerPlanningError("a different plan is already submitted for review")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
     transition_task(
         repository,
         identity,
@@ -506,6 +580,12 @@ def accept_plan_review_and_begin_implementation(
         _require_current_lease(connection, lease, identity.repository_id, None)
         _require_matching_task(connection, identity, "plan-review")
         _plan_attempt(connection, identity, plan_attempt_id, required_state=PlanAttemptState.RECORDED)
+        submitted = connection.execute(
+            "SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?",
+            (identity.task_id,),
+        ).fetchone()
+        if submitted != (plan_attempt_id, receipt.plan_digest):
+            raise WorkerPlanningError("accepted plan review does not match the submitted review target")
         artifact = connection.execute(
             "SELECT content_json, content_digest FROM worker_plan_artifacts WHERE plan_attempt_id = ? AND task_id = ?",
             (plan_attempt_id, identity.task_id),
@@ -601,12 +681,12 @@ def _read_dispatch(repository: RepositoryIdentity, identity: TaskIdentity, plan_
 
 def _plan_attempt(connection, identity: TaskIdentity, plan_attempt_id: str, *, required_state: PlanAttemptState | None = None) -> dict[str, str]:
     row = connection.execute(
-        "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, parent_plan_attempt_id, attempt_kind, state FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?",
+        "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, parent_plan_attempt_id, attempt_kind, state, revision_findings_digest FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?",
         (plan_attempt_id, identity.task_id),
     ).fetchone()
     if row is None:
         raise WorkerPlanningError("plan attempt does not match the task")
-    result = dict(zip(("provider_attempt_id", "worker_thread_identity", "source_digest", "input_digest", "parent_plan_attempt_id", "attempt_kind", "state"), row, strict=True))
+    result = dict(zip(("provider_attempt_id", "worker_thread_identity", "source_digest", "input_digest", "parent_plan_attempt_id", "attempt_kind", "state", "revision_findings_digest"), row, strict=True))
     if required_state is not None and result["state"] != required_state.value:
         raise WorkerPlanningError("plan attempt is not in the required state")
     return result
@@ -616,6 +696,31 @@ def _require_parent_attempt(connection, identity: TaskIdentity, parent: str, wor
     row = _plan_attempt(connection, identity, parent, required_state=PlanAttemptState.RECORDED)
     if row["worker_thread_identity"] != worker_thread_identity:
         raise WorkerPlanningError("plan revision must use the original Worker thread")
+
+
+def _revision_scope(
+    connection,
+    identity: TaskIdentity,
+    parent: str,
+    worker_thread_identity: str,
+    planning_input: PlanningInput,
+) -> str:
+    """Require a recorded review delta and the original immutable task input."""
+
+    _require_parent_attempt(connection, identity, parent, worker_thread_identity)
+    initial = connection.execute(
+        "SELECT input_digest, task_summary FROM worker_plan_attempts WHERE task_id = ? AND attempt_kind = 'initial'",
+        (identity.task_id,),
+    ).fetchone()
+    if initial is None or initial != (planning_input.digest, planning_input.task_summary):
+        raise WorkerPlanningError("plan revision changes immutable task scope")
+    findings = connection.execute(
+        "SELECT finding_id, finding_digest FROM worker_plan_findings WHERE task_id = ? AND plan_attempt_id = ? ORDER BY finding_id",
+        (identity.task_id, parent),
+    ).fetchall()
+    if not findings:
+        raise WorkerPlanningError("plan revision requires routed review findings")
+    return _digest({"task": identity.task_id, "parent": parent, "findings": tuple(findings)})
 
 
 def _source_digest(connection, identity: TaskIdentity) -> str:

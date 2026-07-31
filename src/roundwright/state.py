@@ -358,6 +358,15 @@ MIGRATIONS = (
             ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        24,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN verification_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 

@@ -15,6 +15,7 @@ import re
 import time
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Iterable
 
 from .configuration import RepositoryIdentity
@@ -93,6 +94,7 @@ class DiffReviewDispatch:
     message_identity: str
     base_sha: str
     candidate_sha: str
+    verification_digest: str
     input_digest: str
 
 
@@ -152,6 +154,7 @@ class PersistedDiffReview:
     message_identity: str
     base_sha: str
     candidate_sha: str
+    verification_digest: str
     verdict: DiffReviewVerdict
     accepted: bool
     routed_finding_ids: tuple[str, ...]
@@ -249,9 +252,11 @@ def record_implementation_candidate(
     dispatch = _read_implementation_dispatch(repository, identity, implementation_attempt_id)
     if dispatch is None:
         raise CandidateReviewError("implementation dispatch is unavailable")
+    _require_candidate_binding(identity, binding, None)
     seal = seal_candidate(repository, binding, lease=lease)
-    if seal.task_id != identity.task_id or seal.base_sha != identity.base_sha:
-        raise CandidateReviewError("sealed candidate does not match the task base")
+    _require_candidate_binding(identity, binding, seal)
+    if seal.candidate_sha == identity.base_sha:
+        raise CandidateReviewError("implementation candidate requires a new local commit")
     candidate_evidence(repository, binding, seal, lease=lease)
     output_digest = _digest({"implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha})
     record_completed_output(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
@@ -296,6 +301,7 @@ def record_candidate_verification(
     """Persist a structured test/build result only for the currently clean candidate."""
 
     value = verification.normalized()
+    _require_candidate_binding(identity, binding, seal)
     candidate_evidence(repository, binding, seal, lease=lease)
     _require_current_candidate(repository, identity, seal)
     connection = _open_writable_connection(repository)
@@ -348,13 +354,14 @@ def dispatch_diff_review(
         (process_lease_id, "process lease identity"),
     ):
         _token(value, name)
+    _require_candidate_binding(identity, binding, seal)
     candidate_evidence(repository, binding, seal, lease=lease)
     _require_current_candidate(repository, identity, seal, implementation_attempt_id)
-    _require_verification_coverage(repository, identity, seal.candidate_sha)
+    verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
     if _session_is_plan_review(repository, identity, supervisor_session_identity):
         raise CandidateReviewError("diff review must use a session distinct from plan review")
-    input_digest = _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha, "message": message_identity})
-    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, input_digest)
+    input_digest = _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha, "message": message_identity, "verifications": verification_digest})
+    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, verification_digest, input_digest)
     existing = _read_diff_dispatch(repository, identity, diff_review_attempt_id)
     if existing is not None:
         if existing != expected:
@@ -376,11 +383,11 @@ def dispatch_diff_review(
         current = _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
         if current is None:
             connection.execute(
-                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)",
+                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?)",
                 (
                     diff_review_attempt_id, identity.task_id, implementation_attempt_id,
                     provider_attempt_id, supervisor_session_identity, external_turn_identity,
-                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now),
+                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest,
                 ),
             )
         elif current != expected:
@@ -418,8 +425,11 @@ def record_diff_review(
     normalized = output.normalized()
     if tuple(normalized.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")) != tuple(dispatch.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")):
         raise CandidateReviewError("diff review output identity does not match the durable dispatch")
+    _require_candidate_binding(identity, binding, seal)
     candidate_evidence(repository, binding, seal, lease=lease)
     _require_current_candidate(repository, identity, seal, dispatch.implementation_attempt_id)
+    if _verification_snapshot(repository, identity, seal.candidate_sha) != dispatch.verification_digest:
+        raise CandidateReviewError("diff review verification evidence has changed")
     record_completed_output(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
                             output_pointer=f"diff-review:{diff_review_attempt_id}", completion_evidence_fingerprint=completion_evidence_fingerprint,
                             output_fingerprint=normalized.digest, lease=lease, now=now)
@@ -466,10 +476,10 @@ def read_diff_review(repository: RepositoryIdentity, identity: TaskIdentity, dif
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity)
-        row = connection.execute("SELECT attempts.implementation_attempt_id, attempts.supervisor_session_identity, attempts.message_identity, attempts.base_sha, attempts.candidate_sha, attempts.state, artifacts.verdict, routes.finding_ids_json FROM diff_review_attempts AS attempts LEFT JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = attempts.diff_review_attempt_id LEFT JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
-        if row is None or row[6] is None:
+        row = connection.execute("SELECT attempts.implementation_attempt_id, attempts.supervisor_session_identity, attempts.message_identity, attempts.base_sha, attempts.candidate_sha, attempts.verification_digest, attempts.state, artifacts.verdict, routes.finding_ids_json FROM diff_review_attempts AS attempts LEFT JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = attempts.diff_review_attempt_id LEFT JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+        if row is None or row[7] is None:
             raise CandidateReviewError("diff review result is unavailable")
-        return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], DiffReviewVerdict(row[6]), row[5] == "accepted", tuple(json.loads(row[7] or "[]")))
+        return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5], DiffReviewVerdict(row[7]), row[6] == "accepted", tuple(json.loads(row[8] or "[]")))
     finally:
         connection.close()
 
@@ -510,7 +520,7 @@ def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
 
 
 def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id):
-    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
     return None if row is None else DiffReviewDispatch(diff_review_attempt_id, *row)
 
 
@@ -526,15 +536,38 @@ def _require_current_candidate(repository, identity, seal, implementation_attemp
         connection.close()
 
 
-def _require_verification_coverage(repository, identity, candidate_sha):
+def _verification_snapshot(repository, identity, candidate_sha):
     connection = _open_writable_connection(repository)
     try:
-        rows = connection.execute("SELECT verification_kind FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, candidate_sha)).fetchall()
+        rows = tuple(connection.execute("SELECT verification_id, verification_kind, outcome, evidence_fingerprint, justification FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? ORDER BY verification_id", (identity.task_id, candidate_sha)))
     finally:
         connection.close()
-    kinds = {row[0] for row in rows}
+    kinds = {row[1] for row in rows}
     if kinds != {VerificationKind.TEST.value, VerificationKind.BUILD.value}:
         raise CandidateReviewError("candidate requires targeted test and build verification")
+    return _digest({"task": identity.task_id, "candidate": candidate_sha, "verifications": rows})
+
+
+def _require_candidate_binding(identity, binding, seal):
+    """Reject aliases before any Git, provider, or durable candidate operation."""
+
+    if not isinstance(binding, WorktreeBinding):
+        raise CandidateReviewError("candidate worktree binding is invalid")
+    if (
+        binding.task_id != identity.task_id
+        or binding.repository_id != identity.repository_id
+        or binding.branch != identity.branch
+        or binding.base_sha != identity.base_sha
+        or binding.worktree.resolve(strict=False) != Path(identity.worktree).resolve(strict=False)
+    ):
+        raise CandidateReviewError("candidate worktree binding does not match the task")
+    if seal is not None and (
+        not isinstance(seal, CandidateSeal)
+        or seal.task_id != identity.task_id
+        or seal.base_sha != identity.base_sha
+        or seal.state_identity != binding.state_identity
+    ):
+        raise CandidateReviewError("candidate seal does not match the task binding")
 
 
 def _session_is_plan_review(repository, identity, session):

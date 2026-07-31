@@ -110,7 +110,8 @@ class CandidateReviewTests(unittest.TestCase):
             self.assertEqual((result.base_sha, result.candidate_sha), (seal.base_sha, seal.candidate_sha))
             self.assertEqual(task_projection(repository, identity).state, "diff-review")
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("post-pass-test", VerificationKind.TEST, VerificationOutcome.PASS, "9" * 64), lease=lease)
-            self.assertFalse(read_diff_review(repository, identity, dispatch.diff_review_attempt_id).accepted)
+            self.assertFalse(read_diff_review(repository, identity, dispatch.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
+            self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.INVALIDATED)
 
     def test_findings_route_to_the_same_worker_and_require_a_new_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -130,6 +131,8 @@ class CandidateReviewTests(unittest.TestCase):
             self.assertEqual(task_projection(repository, identity).state, "implementing")
             with self.assertRaisesRegex(CandidateReviewError, "accepted Worker thread"):
                 begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="wrong-worker", external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            repair = begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=dispatch.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=result.routed_finding_ids, external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            self.assertNotEqual(repair.input_digest, dispatch.input_digest)
 
     def test_base_head_cannot_authorize_a_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:

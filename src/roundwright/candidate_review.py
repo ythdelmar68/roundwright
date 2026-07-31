@@ -170,6 +170,9 @@ def begin_implementation(
     provider_attempt_id: str,
     plan_attempt_id: str,
     worker_thread_identity: str,
+    repair_diff_review_id: str | None = None,
+    repair_candidate_sha: str | None = None,
+    routed_finding_ids: tuple[str, ...] = (),
     external_turn_identity: str,
     process_lease_id: str,
     process_lease_expires_at: int,
@@ -185,7 +188,10 @@ def begin_implementation(
     ):
         _token(value, name)
     accepted = _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity)
-    input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity})
+    repair_parent = _repair_parent(
+        repository, identity, repair_diff_review_id, repair_candidate_sha, routed_finding_ids, worker_thread_identity,
+    )
+    input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity, "repair": repair_parent})
     expected = ImplementationDispatch(implementation_attempt_id, provider_attempt_id, plan_attempt_id, accepted, worker_thread_identity, external_turn_identity, input_digest)
     existing = _read_implementation_dispatch(repository, identity, implementation_attempt_id)
     if existing is not None:
@@ -322,6 +328,15 @@ def record_candidate_verification(
         kinds = {row[0] for row in connection.execute("SELECT verification_kind FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, seal.candidate_sha))}
         if kinds == {VerificationKind.TEST.value, VerificationKind.BUILD.value}:
             snapshot = _verification_snapshot_connection(connection, identity, seal.candidate_sha)
+            stale_attempts = tuple(
+                row[0] for row in connection.execute(
+                    "SELECT provider_attempt_id FROM diff_review_attempts WHERE task_id = ? AND candidate_sha = ? AND state = 'accepted' AND verification_digest != ?",
+                    (identity.task_id, seal.candidate_sha, snapshot),
+                )
+            )
+            for attempt_id in stale_attempts:
+                connection.execute("DELETE FROM accepted_provider_reviews WHERE attempt_id = ?", (attempt_id,))
+                connection.execute("UPDATE provider_attempts SET state = 'invalidated', accepted_review_identity = NULL WHERE attempt_id = ? AND state = 'accepted'", (attempt_id,))
             connection.execute(
                 "UPDATE diff_review_attempts SET state = 'recorded', accepted_review_identity = NULL "
                 "WHERE task_id = ? AND candidate_sha = ? AND state = 'accepted' AND verification_digest != ?",
@@ -488,11 +503,26 @@ def record_diff_review(
         transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=normalized.digest, lease=lease)
     else:
         _accept_diff_pass(repository, identity, context, dispatch, lease, now)
-    return read_diff_review(repository, identity, diff_review_attempt_id)
+    return read_diff_review(repository, identity, diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
 
 
-def read_diff_review(repository: RepositoryIdentity, identity: TaskIdentity, diff_review_attempt_id: str) -> PersistedDiffReview:
+def read_diff_review(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    diff_review_attempt_id: str,
+    *,
+    binding: WorktreeBinding | None = None,
+    seal: CandidateSeal | None = None,
+    context: RecoveryContext | None = None,
+    lease: TransitionLease | None = None,
+) -> PersistedDiffReview:
     _token(diff_review_attempt_id, "diff review identity")
+    if binding is None or seal is None or context is None:
+        raise CandidateReviewError("reading diff review acceptance requires live candidate evidence")
+    _require_candidate_binding(identity, binding, seal)
+    candidate_evidence(repository, binding, seal, lease=lease)
+    _require_current_candidate(repository, identity, seal)
+    _require_diff_review_context(identity, context, seal)
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity)
@@ -501,6 +531,7 @@ def read_diff_review(repository: RepositoryIdentity, identity: TaskIdentity, dif
             raise CandidateReviewError("diff review result is unavailable")
         provider = connection.execute("SELECT state, accepted_review_identity, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
         accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
+        _require_exact_provider_context(connection, identity, row[8], context)
     finally:
         connection.close()
     current_snapshot = _verification_snapshot(repository, identity, row[4])
@@ -527,6 +558,33 @@ def _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity
         return row[0]
     finally:
         connection.close()
+
+
+def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, worker_thread_identity):
+    """Bind repair dispatch to the exact prior candidate and routed diff findings."""
+
+    values = (review_id, candidate_sha)
+    if values == (None, None) and not finding_ids:
+        return ""
+    if not isinstance(review_id, str) or not isinstance(candidate_sha, str):
+        raise CandidateReviewError("repair dispatch requires a complete parent identity")
+    _token(review_id, "repair diff review identity")
+    _commit(candidate_sha, "repair candidate")
+    if not isinstance(finding_ids, tuple) or not finding_ids:
+        raise CandidateReviewError("repair dispatch requires routed findings")
+    for finding_id in finding_ids:
+        _token(finding_id, "routed finding identity")
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json FROM diff_review_attempts AS attempts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?",
+            (review_id, identity.task_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None or row[0] != candidate_sha or row[1] != worker_thread_identity or tuple(json.loads(row[2])) != finding_ids:
+        raise CandidateReviewError("repair dispatch does not match routed diff findings")
+    return _digest({"review": review_id, "candidate": candidate_sha, "findings": finding_ids})
 
 
 def _read_implementation_dispatch(repository, identity, implementation_attempt_id):

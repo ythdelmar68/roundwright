@@ -1,0 +1,585 @@
+"""Hermetic implementation, candidate sealing, and immutable diff review.
+
+This Phase 2 boundary receives identities and structured evidence from fake or
+sandboxed adapters.  It never launches a Worker or Supervisor, reads a
+credential, creates a pull request, or makes a network request.  Git identity
+is delegated to :mod:`roundwright.git_identity`, which is the sole authority
+for proving a clean local commit candidate.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Iterable
+
+from .configuration import RepositoryIdentity
+from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
+from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, prepare_attempt, record_completed_output, record_external_turn, record_session_identity
+from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, transition_task
+
+
+class CandidateReviewError(StateError):
+    """Raised when candidate-bound implementation or diff review is unsafe."""
+
+
+class VerificationKind(StrEnum):
+    TEST = "test"
+    BUILD = "build"
+
+
+class VerificationOutcome(StrEnum):
+    PASS = "pass"
+    NOT_APPLICABLE = "not-applicable"
+
+
+class DiffReviewVerdict(StrEnum):
+    PASS = "pass"
+    FINDINGS = "findings"
+
+
+_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class ImplementationDispatch:
+    implementation_attempt_id: str
+    provider_attempt_id: str
+    plan_attempt_id: str
+    accepted_plan_review_identity: str
+    worker_thread_identity: str
+    external_turn_identity: str
+    input_digest: str
+
+
+@dataclass(frozen=True)
+class CandidateVerification:
+    verification_id: str
+    kind: VerificationKind
+    outcome: VerificationOutcome
+    evidence_fingerprint: str
+    justification: str = ""
+
+    def normalized(self) -> "CandidateVerification":
+        _token(self.verification_id, "verification identity")
+        _fingerprint(self.evidence_fingerprint, "verification evidence fingerprint")
+        try:
+            kind = VerificationKind(self.kind)
+            outcome = VerificationOutcome(self.outcome)
+        except (TypeError, ValueError) as error:
+            raise CandidateReviewError("verification kind or outcome is unsupported") from error
+        if not isinstance(self.justification, str):
+            raise CandidateReviewError("verification justification is invalid")
+        justification = " ".join(self.justification.split())
+        if outcome is VerificationOutcome.NOT_APPLICABLE and not justification:
+            raise CandidateReviewError("not-applicable verification requires a justification")
+        if outcome is VerificationOutcome.PASS and justification:
+            raise CandidateReviewError("passing verification must not include a justification")
+        return CandidateVerification(self.verification_id, kind, outcome, self.evidence_fingerprint, justification)
+
+
+@dataclass(frozen=True)
+class DiffReviewDispatch:
+    diff_review_attempt_id: str
+    implementation_attempt_id: str
+    provider_attempt_id: str
+    supervisor_session_identity: str
+    external_turn_identity: str
+    message_identity: str
+    base_sha: str
+    candidate_sha: str
+    input_digest: str
+
+
+@dataclass(frozen=True)
+class DiffReviewOutput:
+    diff_review_attempt_id: str
+    provider_attempt_id: str
+    supervisor_session_identity: str
+    external_turn_identity: str
+    message_identity: str
+    base_sha: str
+    candidate_sha: str
+    verdict: DiffReviewVerdict
+    findings: tuple[str, ...] = ()
+
+    def normalized(self) -> "DiffReviewOutput":
+        for value, name in (
+            (self.diff_review_attempt_id, "diff review identity"),
+            (self.provider_attempt_id, "provider attempt identity"),
+            (self.supervisor_session_identity, "Supervisor session identity"),
+            (self.external_turn_identity, "external turn identity"),
+            (self.message_identity, "review message identity"),
+        ):
+            _token(value, name)
+        _commit(self.base_sha, "reviewed base")
+        _commit(self.candidate_sha, "reviewed candidate")
+        try:
+            verdict = DiffReviewVerdict(self.verdict)
+        except (TypeError, ValueError) as error:
+            raise CandidateReviewError("diff review verdict is unsupported") from error
+        findings = _items(self.findings, "diff review findings", allow_empty=True)
+        if verdict is DiffReviewVerdict.PASS and findings:
+            raise CandidateReviewError("PASS must not include findings")
+        if verdict is DiffReviewVerdict.FINDINGS and not findings:
+            raise CandidateReviewError("FINDINGS requires at least one finding")
+        return DiffReviewOutput(
+            self.diff_review_attempt_id, self.provider_attempt_id, self.supervisor_session_identity,
+            self.external_turn_identity, self.message_identity, self.base_sha, self.candidate_sha, verdict, findings,
+        )
+
+    @property
+    def digest(self) -> str:
+        value = self.normalized()
+        return _digest({
+            "review": value.diff_review_attempt_id, "provider": value.provider_attempt_id,
+            "session": value.supervisor_session_identity, "turn": value.external_turn_identity,
+            "message": value.message_identity, "base": value.base_sha, "candidate": value.candidate_sha,
+            "verdict": value.verdict.value, "findings": value.findings,
+        })
+
+
+@dataclass(frozen=True)
+class PersistedDiffReview:
+    diff_review_attempt_id: str
+    implementation_attempt_id: str
+    supervisor_session_identity: str
+    message_identity: str
+    base_sha: str
+    candidate_sha: str
+    verdict: DiffReviewVerdict
+    accepted: bool
+    routed_finding_ids: tuple[str, ...]
+
+
+def begin_implementation(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    implementation_attempt_id: str,
+    provider_attempt_id: str,
+    plan_attempt_id: str,
+    worker_thread_identity: str,
+    external_turn_identity: str,
+    process_lease_id: str,
+    process_lease_expires_at: int,
+    lease: TransitionLease | None,
+    now: int | None = None,
+) -> ImplementationDispatch:
+    """Resume exactly the Worker accepted by plan review for an implementation turn."""
+
+    for value, name in (
+        (implementation_attempt_id, "implementation attempt identity"), (provider_attempt_id, "provider attempt identity"),
+        (plan_attempt_id, "plan attempt identity"), (worker_thread_identity, "Worker thread identity"),
+        (external_turn_identity, "external turn identity"), (process_lease_id, "process lease identity"),
+    ):
+        _token(value, name)
+    accepted = _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity)
+    input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity})
+    expected = ImplementationDispatch(implementation_attempt_id, provider_attempt_id, plan_attempt_id, accepted, worker_thread_identity, external_turn_identity, input_digest)
+    existing = _read_implementation_dispatch(repository, identity, implementation_attempt_id)
+    if existing is not None:
+        if existing != expected:
+            raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
+        return existing
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity, "implementing")
+    finally:
+        connection.close()
+    provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.WORKER,
+                               process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
+                               input_fingerprint=input_digest, lease=lease, now=now)
+    if provider.role is not ProviderRole.WORKER:
+        raise CandidateReviewError("implementation provider attempt has the wrong role")
+    if provider.state is AttemptState.PREPARED:
+        record_session_identity(repository, identity, context, attempt_id=provider_attempt_id,
+                                session_identity=worker_thread_identity, lease=lease, now=now)
+        record_external_turn(repository, identity, context, attempt_id=provider_attempt_id,
+                             session_identity=worker_thread_identity, external_turn_identity=external_turn_identity,
+                             lease=lease, now=now)
+    elif provider.state is not AttemptState.DISPATCHED or (provider.session_identity, provider.external_turn_identity) != (worker_thread_identity, external_turn_identity):
+        raise CandidateReviewError("implementation provider turn conflicts with the requested dispatch")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, now)
+        _require_matching_task(connection, identity, "implementing")
+        current = _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id)
+        if current is None:
+            connection.execute(
+                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)",
+                (
+                    implementation_attempt_id, identity.task_id, plan_attempt_id, accepted,
+                    provider_attempt_id, worker_thread_identity, external_turn_identity,
+                    input_digest, _clock(now),
+                ),
+            )
+        elif current != expected:
+            raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return expected
+
+
+def record_implementation_candidate(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    binding: WorktreeBinding,
+    *,
+    implementation_attempt_id: str,
+    completion_evidence_fingerprint: str,
+    lease: TransitionLease | None,
+    now: int | None = None,
+) -> CandidateSeal:
+    """Seal a clean local commit, bind it to the exact Worker output, and enter diff review."""
+
+    _fingerprint(completion_evidence_fingerprint, "implementation completion evidence fingerprint")
+    dispatch = _read_implementation_dispatch(repository, identity, implementation_attempt_id)
+    if dispatch is None:
+        raise CandidateReviewError("implementation dispatch is unavailable")
+    seal = seal_candidate(repository, binding, lease=lease)
+    if seal.task_id != identity.task_id or seal.base_sha != identity.base_sha:
+        raise CandidateReviewError("sealed candidate does not match the task base")
+    candidate_evidence(repository, binding, seal, lease=lease)
+    output_digest = _digest({"implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha})
+    record_completed_output(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
+                            output_pointer=f"implementation:{implementation_attempt_id}",
+                            completion_evidence_fingerprint=completion_evidence_fingerprint,
+                            output_fingerprint=output_digest, lease=lease, now=now)
+    bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=completion_evidence_fingerprint, lease=lease)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, now)
+        _require_matching_task(connection, identity, "implementing")
+        existing = connection.execute(
+            "SELECT task_id, base_sha, candidate_sha, completion_evidence_fingerprint, content_digest FROM implementation_candidates WHERE implementation_attempt_id = ?",
+            (implementation_attempt_id,),
+        ).fetchone()
+        expected = (identity.task_id, seal.base_sha, seal.candidate_sha, completion_evidence_fingerprint, output_digest)
+        if existing is None:
+            connection.execute("INSERT INTO implementation_candidates(implementation_attempt_id, task_id, base_sha, candidate_sha, completion_evidence_fingerprint, content_digest) VALUES (?, ?, ?, ?, ?, ?)", (implementation_attempt_id, *expected))
+            connection.execute("UPDATE implementation_attempts SET state = 'recorded' WHERE implementation_attempt_id = ?", (implementation_attempt_id,))
+        elif existing != expected:
+            raise CandidateReviewError("implementation candidate conflicts with committed content")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    transition_task(repository, identity, expected_state="implementing", next_state="diff-review", evidence_fingerprint=output_digest, lease=lease)
+    return seal
+
+
+def record_candidate_verification(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    verification: CandidateVerification,
+    *,
+    lease: TransitionLease | None,
+) -> None:
+    """Persist a structured test/build result only for the currently clean candidate."""
+
+    value = verification.normalized()
+    candidate_evidence(repository, binding, seal, lease=lease)
+    _require_current_candidate(repository, identity, seal)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, None)
+        _require_matching_task(connection, identity, "diff-review")
+        existing = connection.execute(
+            "SELECT verification_kind, outcome, evidence_fingerprint, justification FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? AND verification_id = ?",
+            (identity.task_id, seal.candidate_sha, value.verification_id),
+        ).fetchone()
+        expected = (value.kind.value, value.outcome.value, value.evidence_fingerprint, value.justification)
+        if existing is None:
+            connection.execute("INSERT INTO candidate_verifications(task_id, candidate_sha, verification_id, verification_kind, outcome, evidence_fingerprint, justification) VALUES (?, ?, ?, ?, ?, ?, ?)", (identity.task_id, seal.candidate_sha, value.verification_id, *expected))
+        elif existing != expected:
+            raise CandidateReviewError("candidate verification conflicts with committed evidence")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=value.evidence_fingerprint, lease=lease)
+
+
+def dispatch_diff_review(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    diff_review_attempt_id: str,
+    implementation_attempt_id: str,
+    provider_attempt_id: str,
+    supervisor_session_identity: str,
+    external_turn_identity: str,
+    message_identity: str,
+    process_lease_id: str,
+    process_lease_expires_at: int,
+    lease: TransitionLease | None,
+    now: int | None = None,
+) -> DiffReviewDispatch:
+    """Dispatch one fresh read-only review of exactly ``base...candidate``."""
+
+    for value, name in (
+        (diff_review_attempt_id, "diff review identity"), (implementation_attempt_id, "implementation attempt identity"),
+        (provider_attempt_id, "provider attempt identity"), (supervisor_session_identity, "Supervisor session identity"),
+        (external_turn_identity, "external turn identity"), (message_identity, "review message identity"),
+        (process_lease_id, "process lease identity"),
+    ):
+        _token(value, name)
+    candidate_evidence(repository, binding, seal, lease=lease)
+    _require_current_candidate(repository, identity, seal, implementation_attempt_id)
+    _require_verification_coverage(repository, identity, seal.candidate_sha)
+    if _session_is_plan_review(repository, identity, supervisor_session_identity):
+        raise CandidateReviewError("diff review must use a session distinct from plan review")
+    input_digest = _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha, "message": message_identity})
+    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, input_digest)
+    existing = _read_diff_dispatch(repository, identity, diff_review_attempt_id)
+    if existing is not None:
+        if existing != expected:
+            raise CandidateReviewError("diff review dispatch replay conflicts with committed state")
+        return existing
+    provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.SUPERVISOR,
+                               process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
+                               input_fingerprint=input_digest, lease=lease, now=now)
+    if provider.state is AttemptState.PREPARED:
+        record_session_identity(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, lease=lease, now=now)
+        record_external_turn(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, external_turn_identity=external_turn_identity, lease=lease, now=now)
+    elif provider.state is not AttemptState.DISPATCHED or (provider.session_identity, provider.external_turn_identity) != (supervisor_session_identity, external_turn_identity):
+        raise CandidateReviewError("diff review provider turn conflicts with the requested dispatch")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, now)
+        _require_matching_task(connection, identity, "diff-review")
+        current = _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
+        if current is None:
+            connection.execute(
+                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)",
+                (
+                    diff_review_attempt_id, identity.task_id, implementation_attempt_id,
+                    provider_attempt_id, supervisor_session_identity, external_turn_identity,
+                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now),
+                ),
+            )
+        elif current != expected:
+            raise CandidateReviewError("diff review dispatch replay conflicts with committed state")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return expected
+
+
+def record_diff_review(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    diff_review_attempt_id: str,
+    output: object,
+    completion_evidence_fingerprint: str,
+    lease: TransitionLease | None,
+    now: int | None = None,
+) -> PersistedDiffReview:
+    """Record PASS only for the current candidate, or route FINDINGS to its Worker."""
+
+    _fingerprint(completion_evidence_fingerprint, "diff review completion evidence fingerprint")
+    dispatch = _read_diff_dispatch(repository, identity, diff_review_attempt_id)
+    if dispatch is None:
+        raise CandidateReviewError("diff review dispatch is unavailable")
+    if not isinstance(output, DiffReviewOutput):
+        raise CandidateReviewError("diff review output is malformed")
+    normalized = output.normalized()
+    if tuple(normalized.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")) != tuple(dispatch.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")):
+        raise CandidateReviewError("diff review output identity does not match the durable dispatch")
+    candidate_evidence(repository, binding, seal, lease=lease)
+    _require_current_candidate(repository, identity, seal, dispatch.implementation_attempt_id)
+    record_completed_output(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
+                            output_pointer=f"diff-review:{diff_review_attempt_id}", completion_evidence_fingerprint=completion_evidence_fingerprint,
+                            output_fingerprint=normalized.digest, lease=lease, now=now)
+    findings = normalized.findings
+    finding_ids = tuple(f"diff-finding-{_digest({'task': identity.task_id, 'candidate': seal.candidate_sha, 'finding': finding})[:24]}" for finding in findings)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, now)
+        _require_matching_task(connection, identity, "diff-review")
+        artifact = connection.execute("SELECT verdict, findings_json, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,)).fetchone()
+        expected_artifact = (normalized.verdict.value, json.dumps(findings), normalized.digest)
+        if artifact is None:
+            connection.execute("INSERT INTO diff_review_artifacts(diff_review_attempt_id, task_id, verdict, findings_json, content_digest) VALUES (?, ?, ?, ?, ?)", (diff_review_attempt_id, identity.task_id, *expected_artifact))
+            connection.execute("UPDATE diff_review_attempts SET state = 'recorded' WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,))
+        elif artifact != expected_artifact:
+            raise CandidateReviewError("diff review output conflicts with committed content")
+        if normalized.verdict is DiffReviewVerdict.FINDINGS:
+            thread = connection.execute("SELECT worker_thread_identity FROM implementation_attempts WHERE implementation_attempt_id = ?", (dispatch.implementation_attempt_id,)).fetchone()
+            if thread is None:
+                raise CandidateReviewError("review target Worker thread is unavailable")
+            route = connection.execute("SELECT worker_thread_identity, finding_ids_json FROM diff_review_routes WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,)).fetchone()
+            expected_route = (thread[0], json.dumps(finding_ids))
+            if route is None:
+                connection.execute("INSERT INTO diff_review_routes(diff_review_attempt_id, task_id, worker_thread_identity, finding_ids_json) VALUES (?, ?, ?, ?)", (diff_review_attempt_id, identity.task_id, *expected_route))
+            elif route != expected_route:
+                raise CandidateReviewError("diff review findings route conflicts with committed state")
+        else:
+            connection.execute("UPDATE diff_review_attempts SET state = 'accepted' WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=completion_evidence_fingerprint, lease=lease)
+    if normalized.verdict is DiffReviewVerdict.FINDINGS:
+        transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=normalized.digest, lease=lease)
+    return read_diff_review(repository, identity, diff_review_attempt_id)
+
+
+def read_diff_review(repository: RepositoryIdentity, identity: TaskIdentity, diff_review_attempt_id: str) -> PersistedDiffReview:
+    _token(diff_review_attempt_id, "diff review identity")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        row = connection.execute("SELECT attempts.implementation_attempt_id, attempts.supervisor_session_identity, attempts.message_identity, attempts.base_sha, attempts.candidate_sha, attempts.state, artifacts.verdict, routes.finding_ids_json FROM diff_review_attempts AS attempts LEFT JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = attempts.diff_review_attempt_id LEFT JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+        if row is None or row[6] is None:
+            raise CandidateReviewError("diff review result is unavailable")
+        return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], DiffReviewVerdict(row[6]), row[5] == "accepted", tuple(json.loads(row[7] or "[]")))
+    finally:
+        connection.close()
+
+
+def _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity) -> str:
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        row = connection.execute("SELECT accepted.review_identity, attempts.worker_thread_identity FROM accepted_plan_reviews AS accepted JOIN worker_plan_attempts AS attempts ON attempts.plan_attempt_id = accepted.plan_attempt_id WHERE accepted.task_id = ? AND accepted.plan_attempt_id = ?", (identity.task_id, plan_attempt_id)).fetchone()
+        if row is None or row[1] != worker_thread_identity:
+            raise CandidateReviewError("implementation must resume the accepted Worker thread")
+        return row[0]
+    finally:
+        connection.close()
+
+
+def _read_implementation_dispatch(repository, identity, implementation_attempt_id):
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        return _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id)
+    finally:
+        connection.close()
+
+
+def _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id):
+    row = connection.execute("SELECT provider_attempt_id, plan_attempt_id, accepted_plan_review_identity, worker_thread_identity, external_turn_identity, input_digest FROM implementation_attempts WHERE implementation_attempt_id = ? AND task_id = ?", (implementation_attempt_id, identity.task_id)).fetchone()
+    return None if row is None else ImplementationDispatch(implementation_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5])
+
+
+def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        return _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
+    finally:
+        connection.close()
+
+
+def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id):
+    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+    return None if row is None else DiffReviewDispatch(diff_review_attempt_id, *row)
+
+
+def _require_current_candidate(repository, identity, seal, implementation_attempt_id=None):
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        sql = "SELECT attempts.implementation_attempt_id, candidates.base_sha, candidates.candidate_sha FROM implementation_candidates AS candidates JOIN implementation_attempts AS attempts ON attempts.implementation_attempt_id = candidates.implementation_attempt_id WHERE candidates.task_id = ? AND candidates.candidate_sha = ?"
+        row = connection.execute(sql, (identity.task_id, seal.candidate_sha)).fetchone()
+        if row is None or row[1:] != (seal.base_sha, seal.candidate_sha) or (implementation_attempt_id is not None and row[0] != implementation_attempt_id):
+            raise CandidateReviewError("candidate seal is not the current implementation candidate")
+    finally:
+        connection.close()
+
+
+def _require_verification_coverage(repository, identity, candidate_sha):
+    connection = _open_writable_connection(repository)
+    try:
+        rows = connection.execute("SELECT verification_kind FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, candidate_sha)).fetchall()
+    finally:
+        connection.close()
+    kinds = {row[0] for row in rows}
+    if kinds != {VerificationKind.TEST.value, VerificationKind.BUILD.value}:
+        raise CandidateReviewError("candidate requires targeted test and build verification")
+
+
+def _session_is_plan_review(repository, identity, session):
+    connection = _open_writable_connection(repository)
+    try:
+        return connection.execute("SELECT 1 FROM plan_review_attempts WHERE task_id = ? AND supervisor_session_identity = ?", (identity.task_id, session)).fetchone() is not None
+    finally:
+        connection.close()
+
+
+def _require_lease(connection, lease, identity, now):
+    from .git_identity import _require_current_lease
+    _require_current_lease(connection, lease, identity.repository_id, _clock(now))
+
+
+def _items(value: Iterable[str], name: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)):
+        raise CandidateReviewError(f"{name} must be a sequence")
+    try:
+        values = tuple(" ".join(item.split()) if isinstance(item, str) else item for item in value)
+    except TypeError as error:
+        raise CandidateReviewError(f"{name} must be a sequence") from error
+    if (not allow_empty and not values) or any(not isinstance(item, str) or not item for item in values):
+        raise CandidateReviewError(f"{name} contains an invalid item")
+    return tuple(sorted(set(values)))
+
+
+def _token(value, name):
+    if not isinstance(value, str) or not _TOKEN.fullmatch(value):
+        raise CandidateReviewError(f"{name} is invalid")
+
+
+def _fingerprint(value, name):
+    if not isinstance(value, str) or not _FINGERPRINT.fullmatch(value):
+        raise CandidateReviewError(f"{name} is invalid")
+
+
+def _commit(value, name):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise CandidateReviewError(f"{name} is invalid")
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def _clock(now):
+    return int(time.time()) if now is None else now

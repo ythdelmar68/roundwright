@@ -326,6 +326,19 @@ MIGRATIONS = (
             ("provider_completion_outputs", "CREATE TABLE provider_completion_outputs (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), output_fingerprint TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        22,
+        (
+            "CREATE TABLE plan_review_attempts (review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, source_digest TEXT NOT NULL, plan_digest TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'invalidated')), created_at INTEGER NOT NULL CHECK(created_at > 0))",
+            "CREATE TABLE plan_review_artifacts (review_attempt_id TEXT PRIMARY KEY REFERENCES plan_review_attempts(review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, missing_tests_json TEXT NOT NULL, ambiguous_criteria_json TEXT NOT NULL, residual_risks_json TEXT NOT NULL, content_digest TEXT NOT NULL)",
+            "CREATE TABLE plan_review_routes (review_attempt_id TEXT PRIMARY KEY REFERENCES plan_review_attempts(review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL)",
+        ),
+        (
+            ("plan_review_attempts", "CREATE TABLE plan_review_attempts (review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, source_digest TEXT NOT NULL, plan_digest TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'invalidated')), created_at INTEGER NOT NULL CHECK(created_at > 0))"),
+            ("plan_review_artifacts", "CREATE TABLE plan_review_artifacts (review_attempt_id TEXT PRIMARY KEY REFERENCES plan_review_attempts(review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, missing_tests_json TEXT NOT NULL, ambiguous_criteria_json TEXT NOT NULL, residual_risks_json TEXT NOT NULL, content_digest TEXT NOT NULL)"),
+            ("plan_review_routes", "CREATE TABLE plan_review_routes (review_attempt_id TEXT PRIMARY KEY REFERENCES plan_review_attempts(review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 

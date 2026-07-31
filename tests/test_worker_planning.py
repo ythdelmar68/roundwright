@@ -21,6 +21,7 @@ from roundwright.worker_planning import (
     PlanReviewReceipt,
     PlanningInput,
     WorkerPlan,
+    WorkerPlanOutput,
     WorkerPlanningError,
     accept_plan_review_and_begin_implementation,
     begin_planning,
@@ -47,6 +48,9 @@ class WorkerPlanningTests(unittest.TestCase):
     def plan(self, *, blockers: tuple[str, ...] = ()) -> WorkerPlan:
         return WorkerPlan("Worker planning", ("No SDK",), ("src/roundwright/worker_planning.py",), ("Persist plan",), ("Run hermetic tests",), ("Schema drift",), ("Retry same thread",), blockers)
 
+    def output(self, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", turn: str | None = None, plan: WorkerPlan | None = None) -> WorkerPlanOutput:
+        return WorkerPlanOutput(plan_attempt, provider_attempt, thread, turn or f"turn-{provider_attempt}", self.input().digest, "b" * 64, self.plan() if plan is None else plan)
+
     def setup_task(self, root: Path):
         repository = self.repository(root)
         initialize(repository)
@@ -69,7 +73,7 @@ class WorkerPlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             dispatched = self.dispatch(repository, identity, lease, context, now)
-            persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             self.assertEqual((dispatched.input_digest, persisted.input_digest), (self.input().digest, self.input().digest))
             self.assertEqual(persisted.source_digest, "b" * 64)
             self.assertEqual(persisted.worker_thread_identity, "worker-thread-23")
@@ -87,7 +91,7 @@ class WorkerPlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
-            record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             findings = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
             self.assertEqual(len(findings), 1)
@@ -100,14 +104,14 @@ class WorkerPlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
-            record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             first = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
             unrelated = PlanningInput("Unrelated scope", (), ("Other criterion",), (), ("Other test",), (), ())
             with self.assertRaisesRegex(WorkerPlanningError, "immutable task scope"):
                 self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one", planning_input=unrelated)
             self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one")
-            record_plan(repository, identity, context, plan_attempt_id="plan-two", plan=self.plan(), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-two", output=self.output(plan_attempt="plan-two", provider_attempt="provider-two"), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-two", evidence_fingerprint="3" * 64, lease=lease)
             second = route_plan_findings(repository, identity, plan_attempt_id="plan-two", findings=("Clarify tests",), lease=lease, now=now)
             self.assertNotEqual(first, second)
@@ -117,7 +121,7 @@ class WorkerPlanningTests(unittest.TestCase):
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
             with self.assertRaisesRegex(WorkerPlanningError, "owner input"):
-                record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(blockers=("owner-security-decision",)), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+                record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(plan=self.plan(blockers=("owner-security-decision",))), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             with self.assertRaises(WorkerPlanningError):
                 submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
 
@@ -125,7 +129,7 @@ class WorkerPlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
-            persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             with self.assertRaises(WorkerPlanningError):
                 accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, False), evidence_fingerprint="2" * 64, lease=lease)
@@ -137,11 +141,11 @@ class WorkerPlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
-            first = record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            first = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
             self.dispatch(repository, identity, lease, context, now, plan_attempt="plan-two", provider_attempt="provider-two", parent="plan-one")
-            second = record_plan(repository, identity, context, plan_attempt_id="plan-two", plan=self.plan(), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            second = record_plan(repository, identity, context, plan_attempt_id="plan-two", output=self.output(plan_attempt="plan-two", provider_attempt="provider-two"), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-two", evidence_fingerprint="3" * 64, lease=lease)
             with self.assertRaisesRegex(WorkerPlanningError, "submitted review target"):
                 accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", first.content_digest, True), evidence_fingerprint="4" * 64, lease=lease)
@@ -173,7 +177,7 @@ class WorkerPlanningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now = self.setup_task(Path(temporary))
             self.dispatch(repository, identity, lease, context, now)
-            record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             routed = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
             self.assertEqual(task_projection(repository, identity).state, "planning")
@@ -181,6 +185,41 @@ class WorkerPlanningTests(unittest.TestCase):
                 route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now),
                 routed,
             )
+
+    def test_output_envelope_and_recorded_replays_are_identity_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            with self.assertRaisesRegex(WorkerPlanningError, "output identity"):
+                record_plan(
+                    repository, identity, context, plan_attempt_id="plan-one",
+                    output=self.output(turn="turn-other"), completion_evidence_fingerprint="f" * 64,
+                    lease=lease, now=now,
+                )
+            first = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            replay = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=self.output(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            self.assertEqual(replay, first)
+            with self.assertRaisesRegex(WorkerPlanningError, "conflicts with committed content"):
+                record_plan(
+                    repository, identity, context, plan_attempt_id="plan-one",
+                    output=self.output(plan=self.plan(blockers=("owner-security-decision",))), completion_evidence_fingerprint="f" * 64,
+                    lease=lease, now=now,
+                )
+
+    def test_owner_blocker_replay_does_not_mutate_the_committed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            blocked = self.output(plan=self.plan(blockers=("owner-security-decision",)))
+            for _ in range(2):
+                with self.assertRaisesRegex(WorkerPlanningError, "owner input"):
+                    record_plan(repository, identity, context, plan_attempt_id="plan-one", output=blocked, completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            with self.assertRaisesRegex(WorkerPlanningError, "conflicts with committed output"):
+                record_plan(
+                    repository, identity, context, plan_attempt_id="plan-one",
+                    output=self.output(plan=self.plan(blockers=("owner-different-decision",))), completion_evidence_fingerprint="f" * 64,
+                    lease=lease, now=now,
+                )
 
 
 if __name__ == "__main__":

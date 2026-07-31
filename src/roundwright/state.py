@@ -304,6 +304,19 @@ MIGRATIONS = (
             ("submitted_plan_reviews", "CREATE TABLE submitted_plan_reviews (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL UNIQUE REFERENCES worker_plan_attempts(plan_attempt_id), plan_digest TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        20,
+        (
+            "ALTER TABLE worker_plan_attempts ADD COLUMN process_lease_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE worker_plan_attempts ADD COLUMN process_lease_expires_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE worker_plan_attempts ADD COLUMN external_turn_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE worker_plan_attempts ADD COLUMN context_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE worker_plan_attempts ADD COLUMN owner_blocker_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("worker_plan_attempts", "CREATE TABLE worker_plan_attempts (plan_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, source_digest TEXT NOT NULL, input_digest TEXT NOT NULL, task_summary TEXT NOT NULL, parent_plan_attempt_id TEXT REFERENCES worker_plan_attempts(plan_attempt_id), attempt_kind TEXT NOT NULL CHECK(attempt_kind IN ('initial', 'revision')), state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'owner-blocked')), created_at INTEGER NOT NULL CHECK(created_at > 0), revision_findings_digest TEXT NOT NULL DEFAULT '', process_lease_id TEXT NOT NULL DEFAULT '', process_lease_expires_at INTEGER NOT NULL DEFAULT 0, external_turn_identity TEXT NOT NULL DEFAULT '', context_digest TEXT NOT NULL DEFAULT '', owner_blocker_digest TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 

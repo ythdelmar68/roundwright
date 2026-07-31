@@ -24,6 +24,7 @@ from .provider_recovery import (
     ProviderRole,
     RecoveryContext,
     prepare_attempt,
+    read_attempt,
     record_completed_output,
     record_external_turn,
     record_session_identity,
@@ -111,6 +112,36 @@ class WorkerPlan:
 
 
 @dataclass(frozen=True)
+class WorkerPlanOutput:
+    """Identity-bearing Worker result accepted only for its exact dispatched turn."""
+
+    plan_attempt_id: str
+    provider_attempt_id: str
+    worker_thread_identity: str
+    external_turn_identity: str
+    input_digest: str
+    source_digest: str
+    plan: WorkerPlan
+
+    def normalized(self) -> "WorkerPlanOutput":
+        _require_token(self.plan_attempt_id, "plan attempt identity")
+        _require_token(self.provider_attempt_id, "provider attempt identity")
+        _require_worker_thread(self.worker_thread_identity)
+        _require_token(self.external_turn_identity, "external turn identity")
+        _require_fingerprint(self.input_digest, "plan input digest")
+        _require_fingerprint(self.source_digest, "plan source digest")
+        return WorkerPlanOutput(
+            self.plan_attempt_id,
+            self.provider_attempt_id,
+            self.worker_thread_identity,
+            self.external_turn_identity,
+            self.input_digest,
+            self.source_digest,
+            self.plan.normalized(),
+        )
+
+
+@dataclass(frozen=True)
 class PlanningDispatch:
     """Durable identity emitted before a Worker turn is allowed to return a plan."""
 
@@ -120,6 +151,10 @@ class PlanningDispatch:
     input_digest: str
     source_digest: str
     kind: PlanAttemptKind
+    external_turn_identity: str
+    process_lease_id: str
+    process_lease_expires_at: int
+    context_digest: str
 
 
 @dataclass(frozen=True)
@@ -201,6 +236,7 @@ def dispatch_plan(
     _require_worker_thread(worker_thread_identity)
     _require_token(external_turn_identity, "external turn identity")
     normalized = planning_input.normalized()
+    context_digest = _context_digest(context)
     observed = _clock(now)
     kind = PlanAttemptKind.INITIAL if parent_plan_attempt_id is None else PlanAttemptKind.REVISION
     if parent_plan_attempt_id is not None:
@@ -227,7 +263,7 @@ def dispatch_plan(
                 connection, identity, parent_plan_attempt_id, worker_thread_identity, normalized
             )
         existing = connection.execute(
-            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, revision_findings_digest "
+            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, revision_findings_digest, external_turn_identity, process_lease_id, process_lease_expires_at, context_digest "
             "FROM worker_plan_attempts WHERE plan_attempt_id = ?",
             (plan_attempt_id,),
         ).fetchone()
@@ -240,6 +276,10 @@ def dispatch_plan(
             parent_plan_attempt_id,
             kind.value,
             revision_findings_digest,
+            external_turn_identity,
+            process_lease_id,
+            process_lease_expires_at,
+            context_digest,
         )
         if existing is not None:
             if tuple(existing) != expected:
@@ -310,7 +350,7 @@ def dispatch_plan(
                 connection, identity, parent_plan_attempt_id, worker_thread_identity, normalized
             )
         existing = connection.execute(
-            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, revision_findings_digest "
+            "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, revision_findings_digest, external_turn_identity, process_lease_id, process_lease_expires_at, context_digest "
             "FROM worker_plan_attempts WHERE plan_attempt_id = ?",
             (plan_attempt_id,),
         ).fetchone()
@@ -323,11 +363,15 @@ def dispatch_plan(
             parent_plan_attempt_id,
             kind.value,
             revision_findings_digest,
+            external_turn_identity,
+            process_lease_id,
+            process_lease_expires_at,
+            context_digest,
         )
         if existing is None:
             connection.execute(
-                "INSERT INTO worker_plan_attempts(plan_attempt_id, task_id, provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, state, created_at, revision_findings_digest) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO worker_plan_attempts(plan_attempt_id, task_id, provider_attempt_id, worker_thread_identity, source_digest, input_digest, task_summary, parent_plan_attempt_id, attempt_kind, state, created_at, revision_findings_digest, external_turn_identity, process_lease_id, process_lease_expires_at, context_digest) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan_attempt_id,
                     identity.task_id,
@@ -341,6 +385,10 @@ def dispatch_plan(
                     PlanAttemptState.DISPATCHED.value,
                     observed,
                     revision_findings_digest,
+                    external_turn_identity,
+                    process_lease_id,
+                    process_lease_expires_at,
+                    context_digest,
                 ),
             )
         elif tuple(existing) != expected:
@@ -358,6 +406,10 @@ def dispatch_plan(
         normalized.digest,
         source_digest,
         kind,
+        external_turn_identity,
+        process_lease_id,
+        process_lease_expires_at,
+        context_digest,
     )
 
 
@@ -367,16 +419,46 @@ def record_plan(
     context: RecoveryContext,
     *,
     plan_attempt_id: str,
-    plan: WorkerPlan,
+    output: WorkerPlanOutput,
     completion_evidence_fingerprint: str,
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> PersistedPlan:
-    """Validate and persist one non-empty plan output without granting review PASS."""
+    """Validate one exact completed Worker output before making its plan reviewable."""
 
     _require_token(plan_attempt_id, "plan attempt identity")
     _require_fingerprint(completion_evidence_fingerprint, "completion evidence fingerprint")
-    normalized = plan.normalized()
+    normalized_output = output.normalized()
+    if normalized_output.plan_attempt_id != plan_attempt_id:
+        raise WorkerPlanningError("Worker output plan attempt does not match the requested artifact")
+    dispatch = _read_dispatch(repository, identity, plan_attempt_id)
+    if (
+        normalized_output.provider_attempt_id,
+        normalized_output.worker_thread_identity,
+        normalized_output.external_turn_identity,
+        normalized_output.input_digest,
+        normalized_output.source_digest,
+    ) != (
+        dispatch.provider_attempt_id,
+        dispatch.worker_thread_identity,
+        dispatch.external_turn_identity,
+        dispatch.input_digest,
+        dispatch.source_digest,
+    ):
+        raise WorkerPlanningError("Worker output identity does not match the durable dispatch")
+    completed = record_completed_output(
+        repository,
+        identity,
+        context,
+        attempt_id=dispatch.provider_attempt_id,
+        output_pointer=f"plan:{plan_attempt_id}",
+        completion_evidence_fingerprint=completion_evidence_fingerprint,
+        lease=lease,
+        now=now,
+    )
+    if completed.state is not AttemptState.COMPLETED:
+        raise WorkerPlanningError("Worker plan provider turn is not completed")
+    normalized = normalized_output.plan
     observed = _clock(now)
     connection = _open_writable_connection(repository)
     try:
@@ -384,15 +466,6 @@ def record_plan(
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity, "planning")
         attempt = _plan_attempt(connection, identity, plan_attempt_id)
-        if attempt["state"] == PlanAttemptState.OWNER_BLOCKED.value:
-            raise WorkerPlanningError("owner-blocked plan attempts cannot be completed")
-        if _has_owner_blocker(normalized.true_blockers):
-            connection.execute(
-                "UPDATE worker_plan_attempts SET state = ? WHERE plan_attempt_id = ?",
-                (PlanAttemptState.OWNER_BLOCKED.value, plan_attempt_id),
-            )
-            connection.commit()
-            raise WorkerPlanningError("plan requires owner input")
         if normalized.task_summary != _input_task_summary(connection, plan_attempt_id):
             raise WorkerPlanningError("plan task summary does not match immutable planning input")
         payload = _canonical_json(_plan_payload(normalized))
@@ -403,6 +476,25 @@ def record_plan(
         ).fetchone()
         if existing is not None and existing != (payload, digest):
             raise WorkerPlanningError("plan artifact replay conflicts with committed content")
+        if existing is not None:
+            if attempt["state"] != PlanAttemptState.RECORDED.value:
+                raise WorkerPlanningError("recorded plan artifact has an invalid attempt state")
+            connection.commit()
+            return _persisted_plan(repository, identity, plan_attempt_id)
+        if attempt["state"] == PlanAttemptState.OWNER_BLOCKED.value:
+            if attempt["owner_blocker_digest"] != digest:
+                raise WorkerPlanningError("owner-blocked plan replay conflicts with committed output")
+            connection.commit()
+            raise WorkerPlanningError("plan requires owner input")
+        if attempt["state"] != PlanAttemptState.DISPATCHED.value:
+            raise WorkerPlanningError("plan attempt is not eligible for its first output")
+        if _has_owner_blocker(normalized.true_blockers):
+            connection.execute(
+                "UPDATE worker_plan_attempts SET state = ?, owner_blocker_digest = ? WHERE plan_attempt_id = ?",
+                (PlanAttemptState.OWNER_BLOCKED.value, digest, plan_attempt_id),
+            )
+            connection.commit()
+            raise WorkerPlanningError("plan requires owner input")
         if existing is None:
             connection.execute(
                 "INSERT INTO worker_plan_artifacts(plan_attempt_id, task_id, content_json, content_digest) VALUES (?, ?, ?, ?)",
@@ -418,19 +510,6 @@ def record_plan(
         raise
     finally:
         connection.close()
-
-    # The opaque pointer is deliberately stable and contains no local path or plan body.
-    attempt = _read_dispatch(repository, identity, plan_attempt_id)
-    record_completed_output(
-        repository,
-        identity,
-        context,
-        attempt_id=attempt.provider_attempt_id,
-        output_pointer=f"plan:{plan_attempt_id}",
-        completion_evidence_fingerprint=completion_evidence_fingerprint,
-        lease=lease,
-        now=now,
-    )
     return _persisted_plan(repository, identity, plan_attempt_id)
 
 
@@ -538,6 +617,7 @@ def submit_plan_for_review(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, None)
         _require_matching_task(connection, identity, "planning")
+        _require_completed_dispatch(connection, identity, plan_attempt_id)
         existing = connection.execute(
             "SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?",
             (identity.task_id,),
@@ -590,6 +670,7 @@ def accept_plan_review_and_begin_implementation(
         _require_current_lease(connection, lease, identity.repository_id, None)
         _require_matching_task(connection, identity, "plan-review")
         _plan_attempt(connection, identity, plan_attempt_id, required_state=PlanAttemptState.RECORDED)
+        _require_completed_dispatch(connection, identity, plan_attempt_id)
         submitted = connection.execute(
             "SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?",
             (identity.task_id,),
@@ -679,27 +760,64 @@ def _read_dispatch(repository: RepositoryIdentity, identity: TaskIdentity, plan_
     try:
         _require_matching_task(connection, identity)
         row = connection.execute(
-            "SELECT provider_attempt_id, worker_thread_identity, input_digest, source_digest, attempt_kind FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?",
+            "SELECT provider_attempt_id, worker_thread_identity, input_digest, source_digest, attempt_kind, external_turn_identity, process_lease_id, process_lease_expires_at, context_digest FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?",
             (plan_attempt_id, identity.task_id),
         ).fetchone()
         if row is None:
             raise WorkerPlanningError("plan attempt is unavailable")
-        return PlanningDispatch(plan_attempt_id, row[0], row[1], row[2], row[3], PlanAttemptKind(row[4]))
+        return PlanningDispatch(plan_attempt_id, row[0], row[1], row[2], row[3], PlanAttemptKind(row[4]), row[5], row[6], row[7], row[8])
     finally:
         connection.close()
 
 
 def _plan_attempt(connection, identity: TaskIdentity, plan_attempt_id: str, *, required_state: PlanAttemptState | None = None) -> dict[str, str]:
     row = connection.execute(
-        "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, parent_plan_attempt_id, attempt_kind, state, revision_findings_digest FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?",
+        "SELECT provider_attempt_id, worker_thread_identity, source_digest, input_digest, parent_plan_attempt_id, attempt_kind, state, revision_findings_digest, external_turn_identity, process_lease_id, process_lease_expires_at, context_digest, owner_blocker_digest FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?",
         (plan_attempt_id, identity.task_id),
     ).fetchone()
     if row is None:
         raise WorkerPlanningError("plan attempt does not match the task")
-    result = dict(zip(("provider_attempt_id", "worker_thread_identity", "source_digest", "input_digest", "parent_plan_attempt_id", "attempt_kind", "state", "revision_findings_digest"), row, strict=True))
+    result = dict(zip(("provider_attempt_id", "worker_thread_identity", "source_digest", "input_digest", "parent_plan_attempt_id", "attempt_kind", "state", "revision_findings_digest", "external_turn_identity", "process_lease_id", "process_lease_expires_at", "context_digest", "owner_blocker_digest"), row, strict=True))
     if required_state is not None and result["state"] != required_state.value:
         raise WorkerPlanningError("plan attempt is not in the required state")
     return result
+
+
+def _require_completed_dispatch(connection, identity: TaskIdentity, plan_attempt_id: str) -> None:
+    """Prove that the stored plan can only be reviewed after its exact turn completed."""
+
+    attempt = _plan_attempt(connection, identity, plan_attempt_id)
+    provider = connection.execute(
+        "SELECT provider_role, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, state "
+        "FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+        (attempt["provider_attempt_id"], identity.task_id),
+    ).fetchone()
+    expected = (
+        ProviderRole.PLANNING.value,
+        attempt["process_lease_id"],
+        attempt["process_lease_expires_at"],
+        attempt["worker_thread_identity"],
+        attempt["external_turn_identity"],
+        attempt["input_digest"],
+        AttemptState.COMPLETED.value,
+    )
+    if provider != expected:
+        raise WorkerPlanningError("plan artifact is not bound to an exact completed provider turn")
+
+
+def _context_digest(context: RecoveryContext) -> str:
+    return _digest(
+        {
+            "task": context.task_id,
+            "repository": context.repository_fingerprint,
+            "worktree": context.worktree_fingerprint,
+            "branch": context.branch_fingerprint,
+            "base": context.base_fingerprint,
+            "candidate": context.candidate_fingerprint,
+            "policy": context.policy_fingerprint,
+            "deployment": context.deployment_fingerprint,
+        }
+    )
 
 
 def _require_parent_attempt(connection, identity: TaskIdentity, parent: str, worker_thread_identity: str) -> None:

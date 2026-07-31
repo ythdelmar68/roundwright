@@ -769,13 +769,8 @@ def accept_plan_review_and_begin_implementation(
             (identity.task_id,),
         ).fetchone()
         expected_review = (plan_attempt_id, receipt.review_identity, receipt.plan_digest)
-        if existing_review is None:
-            connection.execute(
-                "INSERT INTO accepted_plan_reviews(task_id, plan_attempt_id, review_identity, review_digest) VALUES (?, ?, ?, ?)",
-                (identity.task_id, *expected_review),
-            )
-        elif existing_review != expected_review:
-            raise WorkerPlanningError("accepted plan review conflicts with committed state")
+        if existing_review != expected_review:
+            raise WorkerPlanningError("accepted plan review has not been recorded for this exact plan")
         existing_criteria = connection.execute(
             "SELECT plan_attempt_id, criteria_json, criteria_digest FROM deterministic_done_criteria WHERE task_id = ?",
             (identity.task_id,),

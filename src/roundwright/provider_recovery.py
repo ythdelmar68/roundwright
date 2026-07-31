@@ -482,6 +482,50 @@ def accept_supervisor_review(
     return read_attempt(repository, identity, attempt_id)
 
 
+def invalidate_supervisor_attempt(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Invalidate an incomplete Supervisor result; recovery must use a fresh session."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    observed = _clock(now)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("only a Supervisor attempt can be invalidated")
+        if row.state is AttemptState.ACCEPTED:
+            connection.commit()
+            return row
+        if row.state is not AttemptState.INVALIDATED:
+            connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.INVALIDATED.value, attempt_id))
+            row = replace(row, state=AttemptState.INVALIDATED)
+        _persist_recovery_outcome(connection, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION, "partial-supervisor-review", observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return row
+
+
 def recover_attempt(
     repository: RepositoryIdentity,
     identity: TaskIdentity,

@@ -17,6 +17,7 @@ import roundwright.worker_planning as worker_planning
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_recovery import RecoveryContext, record_completed_output
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
+from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from roundwright.worker_planning import (
     PlanReviewReceipt,
     PlanningInput,
@@ -67,6 +68,19 @@ class WorkerPlanningTests(unittest.TestCase):
             repository, identity, context, self.input() if planning_input is None else planning_input, plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
             worker_thread_identity=thread, external_turn_identity=f"turn-{provider_attempt}", process_lease_id=f"lease-{provider_attempt}",
             process_lease_expires_at=now + 60, parent_plan_attempt_id=parent, lease=lease, now=now,
+        )
+
+    def accept_review(self, repository, identity, lease, context, now, persisted, *, review_attempt: str = "review-one", provider_attempt: str = "supervisor-one", session: str = "supervisor-session-one"):
+        dispatch_plan_review(
+            repository, identity, context, review_attempt_id=review_attempt, provider_attempt_id=provider_attempt,
+            supervisor_session_identity=session, external_turn_identity=f"turn-{provider_attempt}",
+            plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider_attempt}",
+            process_lease_expires_at=now + 60, lease=lease, now=now,
+        )
+        record_plan_review(
+            repository, identity, context, review_attempt_id=review_attempt,
+            output=PlanReviewOutput(review_attempt, provider_attempt, session, f"turn-{provider_attempt}", persisted.plan_attempt_id, persisted.source_digest, persisted.content_digest, PlanReviewVerdict.PASS, (), (), (), ()),
+            completion_evidence_fingerprint="9" * 64, lease=lease, now=now,
         )
 
     def test_plan_is_bound_to_source_input_attempt_and_persistent_thread(self) -> None:
@@ -133,6 +147,7 @@ class WorkerPlanningTests(unittest.TestCase):
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
             with self.assertRaises(WorkerPlanningError):
                 accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, False), evidence_fingerprint="2" * 64, lease=lease)
+            self.accept_review(repository, identity, lease, context, now, persisted)
             completion = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, True), evidence_fingerprint="3" * 64, lease=lease)
             self.assertEqual(completion.criteria, ("acceptance:Persist plan", "test:Run hermetic tests"))
             self.assertEqual(task_projection(repository, identity).state, "implementing")
@@ -149,6 +164,7 @@ class WorkerPlanningTests(unittest.TestCase):
             submit_plan_for_review(repository, identity, plan_attempt_id="plan-two", evidence_fingerprint="3" * 64, lease=lease)
             with self.assertRaisesRegex(WorkerPlanningError, "submitted review target"):
                 accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", first.content_digest, True), evidence_fingerprint="4" * 64, lease=lease)
+            self.accept_review(repository, identity, lease, context, now, second, review_attempt="review-two", provider_attempt="supervisor-two", session="supervisor-session-two")
             accepted = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-two", receipt=PlanReviewReceipt("review-two", second.content_digest, True), evidence_fingerprint="5" * 64, lease=lease)
             self.assertEqual(accepted.plan_attempt_id, "plan-two")
 

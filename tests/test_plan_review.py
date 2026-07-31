@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 import sys
@@ -109,6 +110,14 @@ class PlanReviewTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
+            for field, value in (
+                ("repository_fingerprint", "0" * 64), ("worktree_fingerprint", "1" * 64),
+                ("branch_fingerprint", "2" * 64), ("base_fingerprint", "3" * 64),
+                ("candidate_fingerprint", "4" * 64), ("policy_fingerprint", "5" * 64),
+                ("deployment_fingerprint", "6" * 64),
+            ):
+                with self.subTest(field=field), self.assertRaisesRegex(PlanReviewError, "context has drifted"):
+                    recover_plan_review(repository, identity, replace(context, **{field: value}), review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
             recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
             self.assertEqual(recovered.state, PlanReviewState.RECORDED)
             self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.ACCEPTED)
@@ -125,6 +134,29 @@ class PlanReviewTests(unittest.TestCase):
             attempt = read_attempt(repository, identity, replay.provider_attempt_id)
             self.assertEqual(attempt.state, AttemptState.DISPATCHED)
             self.assertEqual((attempt.session_identity, attempt.external_turn_identity), (replay.supervisor_session_identity, replay.external_turn_identity))
+
+    def test_findings_recovery_replays_only_missing_routing_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Clarify scope",))
+            with mock.patch.object(plan_review, "route_plan_findings", side_effect=RuntimeError("crash before transition")):
+                with self.assertRaisesRegex(RuntimeError, "crash before transition"):
+                    record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+            self.assertEqual(recovered.verdict, PlanReviewVerdict.FINDINGS)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Clarify scope",))
+            with mock.patch.object(plan_review, "_persist_route", side_effect=RuntimeError("crash after transition")):
+                with self.assertRaisesRegex(RuntimeError, "crash after transition"):
+                    record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            recovered = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+            self.assertEqual(recovered.verdict, PlanReviewVerdict.FINDINGS)
+            self.assertTrue(recovered.routed_finding_ids)
 
     def test_restart_invalidates_an_unaccepted_partial_pass_before_fresh_review(self):
         with tempfile.TemporaryDirectory() as temporary:

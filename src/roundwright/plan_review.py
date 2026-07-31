@@ -296,7 +296,7 @@ def record_plan_review(
         )
         _persist_route(repository, identity, dispatch, finding_ids, lease)
     else:
-        _accept_pass_atomically(repository, identity, dispatch, lease, now)
+        _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
     return read_plan_review(repository, identity, review_attempt_id)
 
 
@@ -314,9 +314,22 @@ def recover_plan_review(
     dispatch = _read_dispatch(repository, identity, review_attempt_id)
     if dispatch is None:
         raise PlanReviewError("review dispatch is unavailable")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
+        artifact = connection.execute(
+            "SELECT verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, content_digest FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?",
+            (review_attempt_id, identity.task_id),
+        ).fetchone()
+        task_state = connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone()
+    finally:
+        connection.close()
     attempt = read_attempt(repository, identity, dispatch.provider_attempt_id)
-    if attempt.state is AttemptState.ACCEPTED:
-        _accept_pass_atomically(repository, identity, dispatch, lease, now)
+    if artifact is not None and artifact[0] == PlanReviewVerdict.FINDINGS.value:
+        _recover_routed_findings(repository, identity, dispatch, artifact, task_state[0] if task_state else None, lease, now)
+    elif attempt.state is AttemptState.ACCEPTED:
+        _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
     else:
         invalidate_supervisor_attempt(repository, identity, context, attempt_id=attempt.attempt_id, lease=lease, now=now)
         connection = _open_writable_connection(repository)
@@ -403,12 +416,13 @@ def _persist_route(repository, identity, dispatch, finding_ids, lease) -> None:
         connection.close()
 
 
-def _accept_pass_atomically(repository, identity, dispatch, lease, now) -> None:
+def _accept_pass_atomically(repository, identity, context, dispatch, lease, now) -> None:
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, _clock(now))
         _require_matching_task(connection, identity, "plan-review")
+        _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
         submitted = connection.execute("SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?", (identity.task_id,)).fetchone()
         expected = (dispatch.plan_attempt_id, dispatch.review_attempt_id, dispatch.plan_digest)
         if submitted != (dispatch.plan_attempt_id, dispatch.plan_digest):
@@ -441,6 +455,97 @@ def _accept_pass_atomically(repository, identity, dispatch, lease, now) -> None:
         raise
     finally:
         connection.close()
+
+
+def _recover_routed_findings(repository, identity, dispatch, artifact, task_state, lease, now) -> None:
+    """Finish or verify a committed FINDINGS cycle without opening another review."""
+
+    try:
+        findings = tuple(json.loads(artifact[1]))
+        missing_tests = tuple(json.loads(artifact[2]))
+        ambiguous_criteria = tuple(json.loads(artifact[3]))
+        residual_risks = tuple(json.loads(artifact[4]))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise PlanReviewError("persisted findings artifact is malformed") from error
+    output = PlanReviewOutput(
+        dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity,
+        dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, dispatch.plan_digest,
+        PlanReviewVerdict.FINDINGS, findings, missing_tests, ambiguous_criteria, residual_risks,
+    ).normalized()
+    if output.digest != artifact[5]:
+        raise PlanReviewError("persisted findings artifact has drifted")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        _require_completed_review_provider(connection, identity, dispatch)
+        expected_ids = _finding_ids(identity, dispatch.plan_attempt_id, _routed_details(output))
+        route = connection.execute("SELECT task_id, plan_attempt_id, worker_thread_identity, finding_ids_json FROM plan_review_routes WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()
+        thread = connection.execute("SELECT worker_thread_identity FROM worker_plan_attempts WHERE plan_attempt_id = ? AND task_id = ?", (dispatch.plan_attempt_id, identity.task_id)).fetchone()
+        if thread is None:
+            raise PlanReviewError("review target Worker thread is unavailable")
+        expected_route = (identity.task_id, dispatch.plan_attempt_id, thread[0], json.dumps(expected_ids))
+        rows = connection.execute("SELECT finding_id FROM worker_plan_findings WHERE task_id = ? AND plan_attempt_id = ? ORDER BY finding_id", (identity.task_id, dispatch.plan_attempt_id)).fetchall()
+        routed = tuple(row[0] for row in rows)
+        if task_state == "planning":
+            if routed != tuple(sorted(expected_ids)):
+                raise PlanReviewError("planning state does not retain the exact routed findings")
+            if route is not None and route != expected_route:
+                raise PlanReviewError("review findings route conflicts with committed state")
+        elif task_state == "plan-review":
+            if route is not None or routed:
+                raise PlanReviewError("findings routing checkpoint conflicts with task state")
+        else:
+            raise PlanReviewError("findings recovery task state is invalid")
+    finally:
+        connection.close()
+    if task_state == "plan-review":
+        finding_ids = route_plan_findings(repository, identity, plan_attempt_id=dispatch.plan_attempt_id, findings=_routed_details(output), lease=lease, now=now)
+        _persist_route(repository, identity, dispatch, finding_ids, lease)
+    elif route is None:
+        _persist_route(repository, identity, dispatch, expected_ids, lease)
+
+
+def _require_completed_review_provider(connection, identity, dispatch) -> None:
+    row = connection.execute(
+        "SELECT provider_role, state, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+        (dispatch.provider_attempt_id, identity.task_id),
+    ).fetchone()
+    expected = (
+        ProviderRole.SUPERVISOR.value, AttemptState.COMPLETED.value, dispatch.supervisor_session_identity,
+        dispatch.external_turn_identity, dispatch.input_digest, f"plan-review:{dispatch.review_attempt_id}",
+    )
+    if row is None or tuple(row[:6]) != expected or row[6] is None:
+        raise PlanReviewError("findings provider output binding is incomplete")
+
+
+def _require_exact_provider_context(connection, identity, provider_attempt_id, context) -> None:
+    if not isinstance(context, RecoveryContext) or context.task_id != identity.task_id:
+        raise PlanReviewError("review recovery context does not match the task")
+    for value, name in (
+        (context.repository_fingerprint, "repository fingerprint"), (context.worktree_fingerprint, "worktree fingerprint"),
+        (context.branch_fingerprint, "branch fingerprint"), (context.base_fingerprint, "base fingerprint"),
+        (context.policy_fingerprint, "policy fingerprint"), (context.deployment_fingerprint, "deployment fingerprint"),
+    ):
+        _require_fingerprint(value, name)
+    if context.candidate_fingerprint is not None:
+        _require_fingerprint(context.candidate_fingerprint, "candidate fingerprint")
+    expected = (
+        identity.task_id, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint,
+        context.base_fingerprint, context.candidate_fingerprint, context.policy_fingerprint, context.deployment_fingerprint,
+    )
+    row = connection.execute(
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+        (provider_attempt_id,),
+    ).fetchone()
+    if row != expected:
+        raise PlanReviewError("review recovery context has drifted")
+
+
+def _finding_ids(identity, plan_attempt_id, findings) -> tuple[str, ...]:
+    return tuple(
+        f"finding-{_digest({'task': identity.task_id, 'plan': plan_attempt_id, 'finding': _digest({'finding': finding})})[:24]}"
+        for finding in findings
+    )
 
 
 def _record_invalid(repository, identity, context, dispatch, output, reason, lease, now) -> None:

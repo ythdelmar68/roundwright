@@ -139,7 +139,7 @@ class PlanReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
             dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
-            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Zulu", "Alpha", "Zulu"))
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("  Zulu   Item  ", "Zulu Item", "  Alpha  "))
             with mock.patch.object(plan_review, "route_plan_findings", side_effect=RuntimeError("crash before transition")):
                 with self.assertRaisesRegex(RuntimeError, "crash before transition"):
                     record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
@@ -150,7 +150,7 @@ class PlanReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
             dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
-            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("Zulu", "Alpha", "Zulu"))
+            output = self.output(dispatch, verdict=PlanReviewVerdict.FINDINGS, findings=("  Zulu   Item  ", "Zulu Item", "  Alpha  "))
             with mock.patch.object(plan_review, "_persist_route", side_effect=RuntimeError("crash after transition")):
                 with self.assertRaisesRegex(RuntimeError, "crash after transition"):
                     record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=output, completion_evidence_fingerprint="2" * 64, lease=lease, now=now)

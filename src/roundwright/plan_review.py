@@ -33,6 +33,7 @@ from .state import StateError, TaskIdentity, _open_writable_connection, _require
 from .worker_planning import (
     PlanAttemptState,
     WorkerPlanningError,
+    _items as _canonical_plan_findings,
     read_plan,
     route_plan_findings,
 )
@@ -596,9 +597,9 @@ def _routed_details(output: PlanReviewOutput) -> tuple[str, ...]:
 
 
 def _canonical_routed_details(output: PlanReviewOutput) -> tuple[str, ...]:
-    """Match Worker planning's immutable sorted, deduplicated findings contract."""
+    """Use Worker planning's complete findings normalization without copying it."""
 
-    return tuple(sorted(set(_routed_details(output))))
+    return _canonical_plan_findings(_routed_details(output), "plan findings")
 
 
 def _items(value: Iterable[str], name: str) -> tuple[str, ...]:

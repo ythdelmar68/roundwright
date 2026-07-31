@@ -19,6 +19,7 @@ from typing import Iterable
 from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
 from .provider_recovery import (
+    AttemptState,
     ProviderAttempt,
     ProviderRole,
     RecoveryContext,
@@ -243,8 +244,6 @@ def dispatch_plan(
         if existing is not None:
             if tuple(existing) != expected:
                 raise WorkerPlanningError("plan dispatch replay conflicts with committed state")
-            connection.commit()
-            return PlanningDispatch(plan_attempt_id, provider_attempt_id, worker_thread_identity, normalized.digest, source_digest, kind)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -265,25 +264,32 @@ def dispatch_plan(
         now=now,
     )
     _require_planning_attempt(provider)
-    record_session_identity(
-        repository,
-        identity,
-        context,
-        attempt_id=provider_attempt_id,
-        session_identity=worker_thread_identity,
-        lease=lease,
-        now=now,
-    )
-    record_external_turn(
-        repository,
-        identity,
-        context,
-        attempt_id=provider_attempt_id,
-        session_identity=worker_thread_identity,
-        external_turn_identity=external_turn_identity,
-        lease=lease,
-        now=now,
-    )
+    if provider.state is AttemptState.DISPATCHED:
+        if (provider.session_identity, provider.external_turn_identity) != (
+            worker_thread_identity,
+            external_turn_identity,
+        ):
+            raise WorkerPlanningError("dispatched provider turn does not match the requested Worker thread")
+    else:
+        record_session_identity(
+            repository,
+            identity,
+            context,
+            attempt_id=provider_attempt_id,
+            session_identity=worker_thread_identity,
+            lease=lease,
+            now=now,
+        )
+        record_external_turn(
+            repository,
+            identity,
+            context,
+            attempt_id=provider_attempt_id,
+            session_identity=worker_thread_identity,
+            external_turn_identity=external_turn_identity,
+            lease=lease,
+            now=now,
+        )
 
     connection = _open_writable_connection(repository)
     try:
@@ -446,7 +452,22 @@ def route_plan_findings(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
-        _require_matching_task(connection, identity, "plan-review")
+        state = _require_matching_task(connection, identity)[0]
+        identifiers, findings_digest = _finding_identifiers(identity, plan_attempt_id, normalized)
+        transition_evidence = _digest(
+            {"event": "plan-revision-open", "target": plan_attempt_id, "findings": findings_digest}
+        )
+        if state == "planning":
+            _require_routed_findings(connection, identity, plan_attempt_id, identifiers)
+            if connection.execute(
+                "SELECT 1 FROM transition_events WHERE task_id = ? AND evidence_fingerprint = ?",
+                (identity.task_id, transition_evidence),
+            ).fetchone() is None:
+                raise WorkerPlanningError("planning state is not a committed findings-routing replay")
+            connection.commit()
+            return identifiers
+        if state != "plan-review":
+            raise WorkerPlanningError("plan findings require the submitted plan-review state")
         _plan_attempt(connection, identity, plan_attempt_id, required_state=PlanAttemptState.RECORDED)
         target = connection.execute(
             "SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?",
@@ -458,10 +479,8 @@ def route_plan_findings(
         ).fetchone()
         if target != (plan_attempt_id, artifact[0] if artifact is not None else None):
             raise WorkerPlanningError("plan findings do not match the submitted review target")
-        identifiers: list[str] = []
-        for finding in normalized:
+        for finding, finding_id in zip(normalized, identifiers, strict=True):
             digest = _digest({"finding": finding})
-            finding_id = f"finding-{_digest({'task': identity.task_id, 'plan': plan_attempt_id, 'finding': digest})[:24]}"
             existing = connection.execute(
                 "SELECT task_id, plan_attempt_id, finding_digest FROM worker_plan_findings WHERE finding_id = ?",
                 (finding_id,),
@@ -474,8 +493,23 @@ def route_plan_findings(
                 )
             elif existing != expected:
                 raise WorkerPlanningError("plan finding identity conflicts with committed state")
-            identifiers.append(finding_id)
-        findings_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "findings": tuple(identifiers)})
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM transition_events WHERE task_id = ?",
+            (identity.task_id,),
+        ).fetchone()[0]
+        if connection.execute(
+            "SELECT 1 FROM transition_events WHERE task_id = ? AND evidence_fingerprint = ?",
+            (identity.task_id, transition_evidence),
+        ).fetchone() is not None:
+            raise WorkerPlanningError("findings-routing evidence has already been committed")
+        connection.execute(
+            "UPDATE tasks SET state = 'planning', blocked_from_state = NULL WHERE task_id = ? AND state = 'plan-review'",
+            (identity.task_id,),
+        )
+        connection.execute(
+            "INSERT INTO transition_events(task_id, sequence, from_state, to_state, evidence_fingerprint) VALUES (?, ?, 'plan-review', 'planning', ?)",
+            (identity.task_id, sequence, transition_evidence),
+        )
         connection.execute("DELETE FROM submitted_plan_reviews WHERE task_id = ?", (identity.task_id,))
         connection.commit()
     except Exception:
@@ -483,31 +517,7 @@ def route_plan_findings(
         raise
     finally:
         connection.close()
-    transition_task(
-        repository,
-        identity,
-        expected_state="plan-review",
-        next_state="blocked",
-        evidence_fingerprint=_digest({"event": "plan-review-findings", "target": plan_attempt_id, "findings": findings_digest}),
-        lease=lease,
-    )
-    transition_task(
-        repository,
-        identity,
-        expected_state="blocked",
-        next_state="plan-review",
-        evidence_fingerprint=_digest({"event": "plan-revision-admitted", "target": plan_attempt_id, "findings": findings_digest}),
-        lease=lease,
-    )
-    transition_task(
-        repository,
-        identity,
-        expected_state="plan-review",
-        next_state="planning",
-        evidence_fingerprint=_digest({"event": "plan-revision-open", "target": plan_attempt_id, "findings": findings_digest}),
-        lease=lease,
-    )
-    return tuple(identifiers)
+    return identifiers
 
 
 def submit_plan_for_review(
@@ -721,6 +731,27 @@ def _revision_scope(
     if not findings:
         raise WorkerPlanningError("plan revision requires routed review findings")
     return _digest({"task": identity.task_id, "parent": parent, "findings": tuple(findings)})
+
+
+def _finding_identifiers(
+    identity: TaskIdentity, plan_attempt_id: str, findings: tuple[str, ...]
+) -> tuple[tuple[str, ...], str]:
+    identifiers = tuple(
+        f"finding-{_digest({'task': identity.task_id, 'plan': plan_attempt_id, 'finding': _digest({'finding': finding})})[:24]}"
+        for finding in findings
+    )
+    return identifiers, _digest({"task": identity.task_id, "plan": plan_attempt_id, "findings": identifiers})
+
+
+def _require_routed_findings(
+    connection, identity: TaskIdentity, plan_attempt_id: str, identifiers: tuple[str, ...]
+) -> None:
+    rows = connection.execute(
+        "SELECT finding_id FROM worker_plan_findings WHERE task_id = ? AND plan_attempt_id = ? ORDER BY finding_id",
+        (identity.task_id, plan_attempt_id),
+    ).fetchall()
+    if tuple(row[0] for row in rows) != tuple(sorted(identifiers)):
+        raise WorkerPlanningError("planning state does not retain the exact routed findings")
 
 
 def _source_digest(connection, identity: TaskIdentity) -> str:

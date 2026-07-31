@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import sys
 
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
+import roundwright.worker_planning as worker_planning
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_recovery import RecoveryContext
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
@@ -145,6 +147,40 @@ class WorkerPlanningTests(unittest.TestCase):
                 accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", first.content_digest, True), evidence_fingerprint="4" * 64, lease=lease)
             accepted = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-two", receipt=PlanReviewReceipt("review-two", second.content_digest, True), evidence_fingerprint="5" * 64, lease=lease)
             self.assertEqual(accepted.plan_attempt_id, "plan-two")
+
+    def test_dispatch_replays_an_exact_turn_after_a_post_dispatch_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            original = worker_planning.record_external_turn
+
+            def crash_after_record(*args, **kwargs):
+                original(*args, **kwargs)
+                raise RuntimeError("simulated post-dispatch crash")
+
+            with mock.patch.object(worker_planning, "record_external_turn", side_effect=crash_after_record):
+                with self.assertRaisesRegex(RuntimeError, "post-dispatch crash"):
+                    self.dispatch(repository, identity, lease, context, now)
+            replayed = self.dispatch(repository, identity, lease, context, now)
+            self.assertEqual(replayed.provider_attempt_id, "provider-one")
+            with self.assertRaises(WorkerPlanningError):
+                dispatch_plan(
+                    repository, identity, context, self.input(), plan_attempt_id="plan-one", provider_attempt_id="provider-one",
+                    worker_thread_identity="worker-thread-23", external_turn_identity="turn-two", process_lease_id="lease-provider-one",
+                    process_lease_expires_at=now + 60, lease=lease, now=now,
+                )
+
+    def test_findings_routing_is_atomic_and_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now = self.setup_task(Path(temporary))
+            self.dispatch(repository, identity, lease, context, now)
+            record_plan(repository, identity, context, plan_attempt_id="plan-one", plan=self.plan(), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
+            submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
+            routed = route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+            self.assertEqual(
+                route_plan_findings(repository, identity, plan_attempt_id="plan-one", findings=("Clarify tests",), lease=lease, now=now),
+                routed,
+            )
 
 
 if __name__ == "__main__":

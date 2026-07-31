@@ -180,7 +180,7 @@ def prepare_attempt(
                 or row.process_lease_id != process_lease_id
                 or row.process_lease_expires_at != process_lease_expires_at
                 or row.input_fingerprint != input_fingerprint
-                or row.state is not AttemptState.PREPARED
+                or row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}
             ):
                 raise ProviderRecoveryError("provider attempt replay conflicts with committed state")
             connection.commit()

@@ -16,12 +16,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.candidate_review import (
     CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict,
     VerificationKind, VerificationOutcome, begin_implementation, dispatch_diff_review,
-    record_candidate_verification, record_diff_review, record_implementation_candidate,
+    read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
 )
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
-from roundwright.provider_recovery import RecoveryContext
+from roundwright.provider_recovery import AttemptState, RecoveryContext, read_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt, PlanningInput, WorkerPlan, WorkerPlanOutput,
@@ -79,39 +79,52 @@ class CandidateReviewTests(unittest.TestCase):
         seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="3" * 64, lease=lease, now=now)
         return dispatch, seal
 
+    def review_context(self, identity, initial_context, seal):
+        return RecoveryContext.for_task(identity, candidate_sha=seal.candidate_sha, policy_fingerprint=initial_context.policy_fingerprint, deployment_fingerprint=initial_context.deployment_fingerprint)
+
     def test_clean_candidate_requires_test_and_build_then_binds_a_fresh_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")
             repository, identity, lease, context, binding, now = values
             _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
             with self.assertRaisesRegex(CandidateReviewError, "test and build"):
-                dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id="diff-25", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor", supervisor_session_identity="diff-session-25", external_turn_identity="diff-turn", message_identity="diff-message", process_lease_id="diff-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+                dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-25", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor", supervisor_session_identity="diff-session-25", external_turn_identity="diff-turn", message_identity="diff-message", process_lease_id="diff-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("targeted-tests", VerificationKind.TEST, VerificationOutcome.PASS, "4" * 64), lease=lease)
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("build", VerificationKind.BUILD, VerificationOutcome.NOT_APPLICABLE, "5" * 64, "no build target"), lease=lease)
+            with self.assertRaisesRegex(CandidateReviewError, "sealed candidate"):
+                dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id="context-drift", implementation_attempt_id="implementation-25", provider_attempt_id="context-supervisor", supervisor_session_identity="context-session", external_turn_identity="context-turn", message_identity="context-message", process_lease_id="context-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             with self.assertRaisesRegex(CandidateReviewError, "distinct from plan review"):
-                dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id="diff-25", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor", supervisor_session_identity="plan-session-25", external_turn_identity="diff-turn", message_identity="diff-message", process_lease_id="diff-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
-            dispatch = dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id="diff-25", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor", supervisor_session_identity="diff-session-25", external_turn_identity="diff-turn", message_identity="diff-message", process_lease_id="diff-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+                dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-25", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor", supervisor_session_identity="plan-session-25", external_turn_identity="diff-turn", message_identity="diff-message", process_lease_id="diff-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-25", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor", supervisor_session_identity="diff-session-25", external_turn_identity="diff-turn", message_identity="diff-message", process_lease_id="diff-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("later-targeted-test", VerificationKind.TEST, VerificationOutcome.PASS, "6" * 64), lease=lease)
             with self.assertRaisesRegex(CandidateReviewError, "verification evidence has changed"):
-                record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-25", "diff-supervisor", "diff-session-25", "diff-turn", "diff-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
-            dispatch = dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
-            result = record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
+                record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-25", "diff-supervisor", "diff-session-25", "diff-turn", "diff-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
+            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
+            result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
             self.assertTrue(result.accepted)
+            self.assertEqual(result.accepted_review_identity, dispatch.diff_review_attempt_id)
+            self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.ACCEPTED)
+            replay = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
+            self.assertEqual(replay.accepted_review_identity, dispatch.diff_review_attempt_id)
             self.assertEqual((result.base_sha, result.candidate_sha), (seal.base_sha, seal.candidate_sha))
             self.assertEqual(task_projection(repository, identity).state, "diff-review")
+            record_candidate_verification(repository, identity, binding, seal, CandidateVerification("post-pass-test", VerificationKind.TEST, VerificationOutcome.PASS, "9" * 64), lease=lease)
+            self.assertFalse(read_diff_review(repository, identity, dispatch.diff_review_attempt_id).accepted)
 
     def test_findings_route_to_the_same_worker_and_require_a_new_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")
             repository, identity, lease, context, binding, now = values
             _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
             for verification in (
                 CandidateVerification("tests", VerificationKind.TEST, VerificationOutcome.PASS, "7" * 64),
                 CandidateVerification("build", VerificationKind.BUILD, VerificationOutcome.PASS, "8" * 64),
             ):
                 record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
-            dispatch = dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id="diff-findings", implementation_attempt_id="implementation-25", provider_attempt_id="findings-supervisor", supervisor_session_identity="findings-session", external_turn_identity="findings-turn", message_identity="findings-message", process_lease_id="findings-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
-            result = record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-findings", "findings-supervisor", "findings-session", "findings-turn", "findings-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("repair boundary",)), completion_evidence_fingerprint="9" * 64, lease=lease, now=now)
+            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-findings", implementation_attempt_id="implementation-25", provider_attempt_id="findings-supervisor", supervisor_session_identity="findings-session", external_turn_identity="findings-turn", message_identity="findings-message", process_lease_id="findings-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-findings", "findings-supervisor", "findings-session", "findings-turn", "findings-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("repair boundary",)), completion_evidence_fingerprint="9" * 64, lease=lease, now=now)
             self.assertFalse(result.accepted)
             self.assertEqual(len(result.routed_finding_ids), 1)
             self.assertEqual(task_projection(repository, identity).state, "implementing")

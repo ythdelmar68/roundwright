@@ -441,7 +441,7 @@ _ALLOWED_TRANSITIONS = {
     "blocked": frozenset({"queued", "planning", "plan-review", "implementing", "diff-review"}),
 }
 BLOCKER_CLASSES = frozenset({"evidence-ambiguous", "evidence-incomplete", "identity-mismatch", "policy-denied"})
-NEXT_ACTION_KINDS = frozenset({"provide-evidence", "reconcile-identity", "resolve-policy", "review-plan"})
+NEXT_ACTION_KINDS = frozenset({"provide-evidence", "reconcile-identity", "resolve-policy", "review-plan", "owner-review"})
 ARTIFACT_KINDS = frozenset({"diff", "plan", "review", "status"})
 
 

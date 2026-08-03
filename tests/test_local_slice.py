@@ -115,6 +115,7 @@ first_pass_commands = len(commands) - before_first
 connection = sqlite3.connect(database_path(repository))
 try:
     leases_after_first = connection.execute("SELECT COUNT(*) FROM transition_leases").fetchone()[0]
+    database_snapshot_before_replay = hashlib.sha256('\\n'.join(connection.iterdump()).encode('utf-8')).hexdigest()
 finally:
     connection.close()
 def writes_denied(*args, **kwargs):
@@ -134,6 +135,11 @@ else:
     changed_source_rejected = False
 changed_source_commands = len(commands) - before_changed_source
 state_module._open_writable_connection = original_writable_connection
+connection = sqlite3.connect(database_path(repository))
+try:
+    database_snapshot_after_replay = hashlib.sha256('\\n'.join(connection.iterdump()).encode('utf-8')).hexdigest()
+finally:
+    connection.close()
 try:
     run_once_local_slice(repository, LocalSliceFixture('failed-task', 'failed-source', 'local/repository', 'codex/failed-slice', root / 'unsafe-worktree', 'failed source\\n'), now=datetime(2030, 1, 1, tzinfo=timezone.utc))
 except Exception:
@@ -167,6 +173,19 @@ expected_status = '\\n'.join((
     f'gates={gate_outcome}', f'plan_session={plan_review[0]}', f'diff_session={diff_review[0]}',
     f'next_action={next_action}', f"blockers={','.join(blockers) if blockers else 'none'}",
 ))
+def normalize_command(command):
+    replacements = {
+        str(root).casefold(): '<root>', str(root.parent / 'worker').casefold(): '<worktree>',
+        first.candidate.base_sha: '<base>',
+        first.candidate.candidate_sha: '<candidate>',
+    }
+    return [replacements.get(value, value) for value in command]
+command_sequences = [
+    [normalize_command(command) for command in commands[before_first:before_replay]],
+    [normalize_command(command) for command in commands[before_replay:before_changed_source]],
+    [normalize_command(command) for command in commands[before_changed_source:before_changed_source + changed_source_commands]],
+]
+command_sequence_digest = hashlib.sha256(json.dumps(command_sequences, separators=(',', ':')).encode('utf-8')).hexdigest()
 print(json.dumps({
     'state': first.task.state,
     'base': first.candidate.base_sha,
@@ -194,6 +213,8 @@ print(json.dumps({
     'command_profile': [first_pass_commands, replay_commands, changed_source_commands],
     'replay_shapes': [list(command[3:]) for command in commands[before_replay:before_changed_source]],
     'status_matches_sqlite': status == expected_status,
+    'database_snapshot_unchanged': database_snapshot_before_replay == database_snapshot_after_replay,
+    'command_sequence_digest': command_sequence_digest,
     'leases': [leases_after_first, leases_after_replay_and_failure],
     'failure_released_lease': failure_released_lease,
 }))
@@ -240,6 +261,8 @@ print(json.dumps({
             self.assertEqual(result["replay_shapes"], [
                 ["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
             ])
+            self.assertTrue(result["database_snapshot_unchanged"])
+            self.assertEqual(result["command_sequence_digest"], "3d58dde86578e55953a049a2f64db6d72fd419c6ab138b118ba49b62964134dd")
             self.assertEqual(result["leases"], [0, 0])
             self.assertTrue(result["failure_released_lease"])
             expected_na = {"dependency-graph", "github-trace", "public-identifier", "live-proof", "external-ci"}

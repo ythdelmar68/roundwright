@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -228,7 +229,7 @@ def begin_implementation(
         external_turn_identity, input_digest, repair_parent.diff_review_attempt_id,
         repair_parent.candidate_sha, repair_parent.finding_ids,
     )
-    claimed = _claim_repair_parent(repository, identity, repair_parent, worker_thread_identity, implementation_attempt_id, provider_attempt_id, external_turn_identity, lease, now)
+    claim_token = _claim_repair_parent(repository, identity, repair_parent, worker_thread_identity, implementation_attempt_id, provider_attempt_id, external_turn_identity, lease, now)
     try:
         provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.WORKER,
                                    process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
@@ -259,7 +260,7 @@ def begin_implementation(
                         repair_parent.candidate_sha, json.dumps(repair_parent.finding_ids),
                     ),
                 )
-                _consume_repair_parent(connection, identity, repair_parent, worker_thread_identity, implementation_attempt_id, provider_attempt_id, external_turn_identity)
+                _consume_repair_parent(connection, identity, repair_parent, worker_thread_identity, implementation_attempt_id, provider_attempt_id, external_turn_identity, claim_token)
             elif current != expected:
                 raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
             connection.commit()
@@ -269,8 +270,8 @@ def begin_implementation(
         finally:
             connection.close()
     except Exception:
-        if claimed:
-            _release_repair_claim(repository, identity, repair_parent, implementation_attempt_id, provider_attempt_id, external_turn_identity, lease, now)
+        if claim_token is not None:
+            _release_repair_claim(repository, identity, repair_parent, claim_token, lease, now)
         raise
     return expected
 
@@ -750,11 +751,11 @@ def _current_repair_route(repository, identity):
         connection.close()
 
 
-def _consume_repair_parent(connection, identity, parent, worker_thread_identity, implementation_attempt_id, provider_attempt_id, external_turn_identity):
+def _consume_repair_parent(connection, identity, parent, worker_thread_identity, implementation_attempt_id, provider_attempt_id, external_turn_identity, claim_token):
     """Consume only the still-current route in the same transaction as dispatch."""
 
     row = connection.execute(
-        "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.claimed_by_implementation_attempt_id, routes.claimed_provider_attempt_id, routes.claimed_external_turn_identity FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
+        "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.claimed_by_implementation_attempt_id, routes.claimed_provider_attempt_id, routes.claimed_external_turn_identity, routes.claim_owner_token FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
         (identity.task_id,),
     ).fetchone()
     current = None if row is None else (row[0], row[1], row[2], tuple(json.loads(row[3])))
@@ -763,11 +764,11 @@ def _consume_repair_parent(connection, identity, parent, worker_thread_identity,
         if current is not None:
             raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
         return
-    if current != expected or row[4:] != (implementation_attempt_id, provider_attempt_id, external_turn_identity):
+    if current != expected or row[4:] != (implementation_attempt_id, provider_attempt_id, external_turn_identity, claim_token):
         raise CandidateReviewError("repair dispatch does not own the latest outstanding diff findings")
     updated = connection.execute(
-        "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = ?, claimed_by_implementation_attempt_id = NULL, claimed_provider_attempt_id = NULL, claimed_external_turn_identity = NULL WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claimed_by_implementation_attempt_id = ? AND claimed_provider_attempt_id = ? AND claimed_external_turn_identity = ?",
-        (implementation_attempt_id, parent.diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, external_turn_identity),
+        "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = ?, claimed_by_implementation_attempt_id = NULL, claimed_provider_attempt_id = NULL, claimed_external_turn_identity = NULL, claim_owner_token = NULL WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claimed_by_implementation_attempt_id = ? AND claimed_provider_attempt_id = ? AND claimed_external_turn_identity = ? AND claim_owner_token = ?",
+        (implementation_attempt_id, parent.diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, external_turn_identity, claim_token),
     ).rowcount
     if updated != 1:
         raise CandidateReviewError("repair findings route was already consumed")
@@ -782,7 +783,7 @@ def _claim_repair_parent(repository, identity, parent, worker_thread_identity, i
         _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "implementing")
         row = connection.execute(
-            "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.claimed_by_implementation_attempt_id, routes.claimed_provider_attempt_id, routes.claimed_external_turn_identity FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
+            "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.claimed_by_implementation_attempt_id, routes.claimed_provider_attempt_id, routes.claimed_external_turn_identity, routes.claim_owner_token FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
             (identity.task_id,),
         ).fetchone()
         current = None if row is None else (row[0], row[1], row[2], tuple(json.loads(row[3])))
@@ -791,17 +792,18 @@ def _claim_repair_parent(repository, identity, parent, worker_thread_identity, i
             if current is not None:
                 raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
             connection.commit()
-            return False
-        if current != expected or row[4:] not in ((None, None, None), (implementation_attempt_id, provider_attempt_id, external_turn_identity)):
+            return None
+        if current != expected or row[4:] != (None, None, None, None):
             raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
+        claim_token = uuid.uuid4().hex
         updated = connection.execute(
-            "UPDATE diff_review_routes SET claimed_by_implementation_attempt_id = ?, claimed_provider_attempt_id = ?, claimed_external_turn_identity = ? WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL AND ((claimed_by_implementation_attempt_id IS NULL AND claimed_provider_attempt_id IS NULL AND claimed_external_turn_identity IS NULL) OR (claimed_by_implementation_attempt_id = ? AND claimed_provider_attempt_id = ? AND claimed_external_turn_identity = ?))",
-            (implementation_attempt_id, provider_attempt_id, external_turn_identity, parent.diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, external_turn_identity),
+            "UPDATE diff_review_routes SET claimed_by_implementation_attempt_id = ?, claimed_provider_attempt_id = ?, claimed_external_turn_identity = ?, claim_owner_token = ? WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claimed_by_implementation_attempt_id IS NULL AND claimed_provider_attempt_id IS NULL AND claimed_external_turn_identity IS NULL AND claim_owner_token IS NULL",
+            (implementation_attempt_id, provider_attempt_id, external_turn_identity, claim_token, parent.diff_review_attempt_id),
         ).rowcount
         if updated != 1:
             raise CandidateReviewError("repair findings route is already claimed")
         connection.commit()
-        return True
+        return claim_token
     except Exception:
         connection.rollback()
         raise
@@ -809,7 +811,7 @@ def _claim_repair_parent(repository, identity, parent, worker_thread_identity, i
         connection.close()
 
 
-def _release_repair_claim(repository, identity, parent, implementation_attempt_id, provider_attempt_id, external_turn_identity, lease, now):
+def _release_repair_claim(repository, identity, parent, claim_token, lease, now):
     """Release a reservation when setup fails before its dispatch can commit."""
 
     connection = _open_writable_connection(repository)
@@ -817,8 +819,8 @@ def _release_repair_claim(repository, identity, parent, implementation_attempt_i
         connection.execute("BEGIN IMMEDIATE")
         _require_lease(connection, lease, identity, now)
         connection.execute(
-            "UPDATE diff_review_routes SET claimed_by_implementation_attempt_id = NULL, claimed_provider_attempt_id = NULL, claimed_external_turn_identity = NULL WHERE diff_review_attempt_id = ? AND task_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claimed_by_implementation_attempt_id = ? AND claimed_provider_attempt_id = ? AND claimed_external_turn_identity = ?",
-            (parent.diff_review_attempt_id, identity.task_id, implementation_attempt_id, provider_attempt_id, external_turn_identity),
+            "UPDATE diff_review_routes SET claimed_by_implementation_attempt_id = NULL, claimed_provider_attempt_id = NULL, claimed_external_turn_identity = NULL, claim_owner_token = NULL WHERE diff_review_attempt_id = ? AND task_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claim_owner_token = ?",
+            (parent.diff_review_attempt_id, identity.task_id, claim_token),
         )
         connection.commit()
     except Exception:

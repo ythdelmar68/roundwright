@@ -277,6 +277,50 @@ class CandidateReviewTests(unittest.TestCase):
             with self.assertRaises(ProviderRecoveryError):
                 read_attempt(repository, identity, f"alias-worker-{failures[0][0]}")
 
+    def test_concurrent_provider_replay_alias_cannot_release_the_claimant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("lease-tests", VerificationKind.TEST, VerificationOutcome.PASS, "8" * 64),
+                CandidateVerification("lease-build", VerificationKind.BUILD, VerificationOutcome.PASS, "9" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            review = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-lease", implementation_attempt_id="implementation-25", provider_attempt_id="lease-supervisor", supervisor_session_identity="lease-session", external_turn_identity="lease-review-turn", message_identity="lease-message", process_lease_id="lease-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            findings = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=DiffReviewOutput("diff-lease", "lease-supervisor", "lease-session", "lease-review-turn", "lease-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("lease repair",)), completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
+            alternate_context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint=context.deployment_fingerprint)
+            barrier = threading.Barrier(2)
+            original_claim = candidate_review._claim_repair_parent
+
+            def synchronized_claim(*arguments):
+                barrier.wait(timeout=10)
+                return original_claim(*arguments)
+
+            def dispatch(index):
+                try:
+                    replay_context = context if index == 1 else alternate_context
+                    return index, begin_implementation(repository, identity, replay_context, implementation_attempt_id="repair-lease-alias", provider_attempt_id="lease-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=review.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=findings.routed_finding_ids, external_turn_identity="lease-turn", process_lease_id=f"lease-worker-{index}", process_lease_expires_at=now + 60, lease=lease, now=now)
+                except Exception as error:
+                    return index, error
+
+            with patch.object(candidate_review, "_claim_repair_parent", side_effect=synchronized_claim):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    outcomes = list(pool.map(dispatch, (1, 2)))
+            winners = [(index, value) for index, value in outcomes if isinstance(value, ImplementationDispatch)]
+            failures = [(index, value) for index, value in outcomes if isinstance(value, Exception)]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0][1], CandidateReviewError)
+            self.assertEqual(read_attempt(repository, identity, "lease-worker").state, AttemptState.DISPATCHED)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM implementation_attempts WHERE implementation_attempt_id = 'repair-lease-alias'").fetchone(), (1,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id = ? AND provider_role = 'worker'", (identity.task_id,)).fetchone(), (2,))
+            finally:
+                connection.close()
+
     def test_dirty_or_moved_candidate_stales_both_accepted_review_layers(self):
         for mutation in ("dirty", "moved"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:

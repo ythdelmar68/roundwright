@@ -7,19 +7,23 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.candidate_review import (
-    CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict,
+    CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
     VerificationKind, VerificationOutcome, begin_implementation, dispatch_diff_review,
     read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
     recover_diff_review,
 )
+import roundwright.candidate_review as candidate_review
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
@@ -196,6 +200,44 @@ class CandidateReviewTests(unittest.TestCase):
             accepted = record_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id=final_review.diff_review_attempt_id, output=DiffReviewOutput("diff-final", "final-supervisor", "final-session", "final-review-turn", "final-message", final_seal.base_sha, final_seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="1" * 64, lease=lease, now=now)
             self.assertTrue(accepted.accepted)
             self.assertNotEqual(fresh.supervisor_session_identity, dispatch.supervisor_session_identity)
+
+    def test_concurrent_repair_dispatch_claims_only_one_provider_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("race-tests", VerificationKind.TEST, VerificationOutcome.PASS, "2" * 64),
+                CandidateVerification("race-build", VerificationKind.BUILD, VerificationOutcome.PASS, "3" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            review = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-race", implementation_attempt_id="implementation-25", provider_attempt_id="race-supervisor", supervisor_session_identity="race-session", external_turn_identity="race-review-turn", message_identity="race-message", process_lease_id="race-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            findings = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=DiffReviewOutput("diff-race", "race-supervisor", "race-session", "race-review-turn", "race-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("race repair",)), completion_evidence_fingerprint="4" * 64, lease=lease, now=now)
+            barrier = threading.Barrier(2)
+            original_claim = candidate_review._claim_repair_parent
+
+            def synchronized_claim(*arguments):
+                barrier.wait(timeout=10)
+                return original_claim(*arguments)
+
+            def dispatch(index):
+                try:
+                    return index, begin_implementation(repository, identity, context, implementation_attempt_id=f"repair-race-{index}", provider_attempt_id=f"race-worker-{index}", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=review.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=findings.routed_finding_ids, external_turn_identity=f"race-turn-{index}", process_lease_id=f"race-lease-{index}", process_lease_expires_at=now + 60, lease=lease, now=now)
+                except Exception as error:
+                    return index, error
+
+            with patch.object(candidate_review, "_claim_repair_parent", side_effect=synchronized_claim):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    outcomes = list(pool.map(dispatch, (1, 2)))
+            winners = [(index, value) for index, value in outcomes if isinstance(value, ImplementationDispatch)]
+            failures = [(index, value) for index, value in outcomes if isinstance(value, Exception)]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0][1], CandidateReviewError)
+            self.assertEqual(read_attempt(repository, identity, winners[0][1].provider_attempt_id).state, AttemptState.DISPATCHED)
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, f"race-worker-{failures[0][0]}")
 
     def test_dirty_or_moved_candidate_stales_both_accepted_review_layers(self):
         for mutation in ("dirty", "moved"):

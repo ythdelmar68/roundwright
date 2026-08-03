@@ -228,49 +228,50 @@ def begin_implementation(
         external_turn_identity, input_digest, repair_parent.diff_review_attempt_id,
         repair_parent.candidate_sha, repair_parent.finding_ids,
     )
-    connection = _open_writable_connection(repository)
+    claimed = _claim_repair_parent(repository, identity, repair_parent, worker_thread_identity, implementation_attempt_id, lease, now)
     try:
-        _require_matching_task(connection, identity, "implementing")
-    finally:
-        connection.close()
-    provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.WORKER,
-                               process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
-                               input_fingerprint=input_digest, lease=lease, now=now)
-    if provider.role is not ProviderRole.WORKER:
-        raise CandidateReviewError("implementation provider attempt has the wrong role")
-    if provider.state is AttemptState.PREPARED:
-        record_session_identity(repository, identity, context, attempt_id=provider_attempt_id,
-                                session_identity=worker_thread_identity, lease=lease, now=now)
-        record_external_turn(repository, identity, context, attempt_id=provider_attempt_id,
-                             session_identity=worker_thread_identity, external_turn_identity=external_turn_identity,
-                             lease=lease, now=now)
-    elif provider.state is not AttemptState.DISPATCHED or (provider.session_identity, provider.external_turn_identity) != (worker_thread_identity, external_turn_identity):
-        raise CandidateReviewError("implementation provider turn conflicts with the requested dispatch")
-    connection = _open_writable_connection(repository)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        _require_lease(connection, lease, identity, now)
-        _require_matching_task(connection, identity, "implementing")
-        current = _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id)
-        if current is None:
-            connection.execute(
-                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at, repair_diff_review_id, repair_candidate_sha, routed_finding_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?)",
-                (
-                    implementation_attempt_id, identity.task_id, plan_attempt_id, accepted,
-                    provider_attempt_id, worker_thread_identity, external_turn_identity,
-                    input_digest, _clock(now), repair_parent.diff_review_attempt_id,
-                    repair_parent.candidate_sha, json.dumps(repair_parent.finding_ids),
-                ),
-            )
-            _consume_repair_parent(connection, identity, repair_parent, worker_thread_identity, implementation_attempt_id)
-        elif current != expected:
-            raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
-        connection.commit()
+        provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.WORKER,
+                                   process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
+                                   input_fingerprint=input_digest, lease=lease, now=now)
+        if provider.role is not ProviderRole.WORKER:
+            raise CandidateReviewError("implementation provider attempt has the wrong role")
+        if provider.state is AttemptState.PREPARED:
+            record_session_identity(repository, identity, context, attempt_id=provider_attempt_id,
+                                    session_identity=worker_thread_identity, lease=lease, now=now)
+            record_external_turn(repository, identity, context, attempt_id=provider_attempt_id,
+                                 session_identity=worker_thread_identity, external_turn_identity=external_turn_identity,
+                                 lease=lease, now=now)
+        elif provider.state is not AttemptState.DISPATCHED or (provider.session_identity, provider.external_turn_identity) != (worker_thread_identity, external_turn_identity):
+            raise CandidateReviewError("implementation provider turn conflicts with the requested dispatch")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _require_lease(connection, lease, identity, now)
+            _require_matching_task(connection, identity, "implementing")
+            current = _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id)
+            if current is None:
+                connection.execute(
+                    "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at, repair_diff_review_id, repair_candidate_sha, routed_finding_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?)",
+                    (
+                        implementation_attempt_id, identity.task_id, plan_attempt_id, accepted,
+                        provider_attempt_id, worker_thread_identity, external_turn_identity,
+                        input_digest, _clock(now), repair_parent.diff_review_attempt_id,
+                        repair_parent.candidate_sha, json.dumps(repair_parent.finding_ids),
+                    ),
+                )
+                _consume_repair_parent(connection, identity, repair_parent, worker_thread_identity, implementation_attempt_id)
+            elif current != expected:
+                raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
     except Exception:
-        connection.rollback()
+        if claimed:
+            _release_repair_claim(repository, identity, repair_parent, implementation_attempt_id, lease, now)
         raise
-    finally:
-        connection.close()
     return expected
 
 
@@ -753,7 +754,7 @@ def _consume_repair_parent(connection, identity, parent, worker_thread_identity,
     """Consume only the still-current route in the same transaction as dispatch."""
 
     row = connection.execute(
-        "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
+        "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.claimed_by_implementation_attempt_id FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
         (identity.task_id,),
     ).fetchone()
     current = None if row is None else (row[0], row[1], row[2], tuple(json.loads(row[3])))
@@ -762,14 +763,69 @@ def _consume_repair_parent(connection, identity, parent, worker_thread_identity,
         if current is not None:
             raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
         return
-    if current != expected:
-        raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
+    if current != expected or row[4] != implementation_attempt_id:
+        raise CandidateReviewError("repair dispatch does not own the latest outstanding diff findings")
     updated = connection.execute(
-        "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = ? WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL",
-        (implementation_attempt_id, parent.diff_review_attempt_id),
+        "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = ?, claimed_by_implementation_attempt_id = NULL WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claimed_by_implementation_attempt_id = ?",
+        (implementation_attempt_id, parent.diff_review_attempt_id, implementation_attempt_id),
     ).rowcount
     if updated != 1:
         raise CandidateReviewError("repair findings route was already consumed")
+
+
+def _claim_repair_parent(repository, identity, parent, worker_thread_identity, implementation_attempt_id, lease, now):
+    """Reserve a new repair's current route before any provider turn is persisted."""
+
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, now)
+        _require_matching_task(connection, identity, "implementing")
+        row = connection.execute(
+            "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.claimed_by_implementation_attempt_id FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
+            (identity.task_id,),
+        ).fetchone()
+        current = None if row is None else (row[0], row[1], row[2], tuple(json.loads(row[3])))
+        expected = (parent.diff_review_attempt_id, parent.candidate_sha, worker_thread_identity, parent.finding_ids)
+        if parent.diff_review_attempt_id is None:
+            if current is not None:
+                raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
+            connection.commit()
+            return False
+        if current != expected or row[4] not in (None, implementation_attempt_id):
+            raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
+        updated = connection.execute(
+            "UPDATE diff_review_routes SET claimed_by_implementation_attempt_id = ? WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL AND (claimed_by_implementation_attempt_id IS NULL OR claimed_by_implementation_attempt_id = ?)",
+            (implementation_attempt_id, parent.diff_review_attempt_id, implementation_attempt_id),
+        ).rowcount
+        if updated != 1:
+            raise CandidateReviewError("repair findings route is already claimed")
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _release_repair_claim(repository, identity, parent, implementation_attempt_id, lease, now):
+    """Release a reservation when setup fails before its dispatch can commit."""
+
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, now)
+        connection.execute(
+            "UPDATE diff_review_routes SET claimed_by_implementation_attempt_id = NULL WHERE diff_review_attempt_id = ? AND task_id = ? AND consumed_by_implementation_attempt_id IS NULL AND claimed_by_implementation_attempt_id = ?",
+            (parent.diff_review_attempt_id, identity.task_id, implementation_attempt_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _require_replayed_repair_parent(repository, identity, parent, worker_thread_identity, implementation_attempt_id):

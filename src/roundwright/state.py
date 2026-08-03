@@ -397,6 +397,15 @@ MIGRATIONS = (
             ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id))"),
         ),
     ),
+    Migration(
+        28,
+        (
+            "ALTER TABLE diff_review_routes ADD COLUMN claimed_by_implementation_attempt_id TEXT",
+        ),
+        (
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id), claimed_by_implementation_attempt_id TEXT)"),
+        ),
+    ),
 )
 
 

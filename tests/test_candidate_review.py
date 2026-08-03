@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -17,12 +18,13 @@ from roundwright.candidate_review import (
     CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict,
     VerificationKind, VerificationOutcome, begin_implementation, dispatch_diff_review,
     read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
+    recover_diff_review,
 )
 from roundwright.configuration import RepositoryIdentity
-from roundwright.git_identity import CandidateSeal, WorktreeBinding, acquire_transition_lease, provision_worktree
+from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
-from roundwright.provider_recovery import AttemptState, RecoveryContext, read_attempt
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
+from roundwright.provider_recovery import AttemptState, RecoveryAction, RecoveryContext, read_attempt, recover_attempt
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt, PlanningInput, WorkerPlan, WorkerPlanOutput,
     accept_plan_review_and_begin_implementation, begin_planning, dispatch_plan,
@@ -82,6 +84,20 @@ class CandidateReviewTests(unittest.TestCase):
     def review_context(self, identity, initial_context, seal):
         return RecoveryContext.for_task(identity, candidate_sha=seal.candidate_sha, policy_fingerprint=initial_context.policy_fingerprint, deployment_fingerprint=initial_context.deployment_fingerprint)
 
+    def accepted_diff_review(self, values, *, review_id="diff-accepted", provider_id="accepted-supervisor"):
+        repository, identity, lease, context, binding, now = values
+        dispatch, seal = self.implement(values)
+        review_context = self.review_context(identity, context, seal)
+        for verification in (
+            CandidateVerification(f"{review_id}-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64),
+            CandidateVerification(f"{review_id}-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64),
+        ):
+            record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+        review = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review_id, implementation_attempt_id=dispatch.implementation_attempt_id, provider_attempt_id=provider_id, supervisor_session_identity=f"{review_id}-session", external_turn_identity=f"{review_id}-turn", message_identity=f"{review_id}-message", process_lease_id=f"{review_id}-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+        result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=DiffReviewOutput(review_id, provider_id, f"{review_id}-session", f"{review_id}-turn", f"{review_id}-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+        self.assertTrue(result.accepted)
+        return seal, review_context, review
+
     def test_clean_candidate_requires_test_and_build_then_binds_a_fresh_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")
@@ -105,6 +121,10 @@ class CandidateReviewTests(unittest.TestCase):
             self.assertTrue(result.accepted)
             self.assertEqual(result.accepted_review_identity, dispatch.diff_review_attempt_id)
             self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.ACCEPTED)
+            self.assertEqual(
+                recover_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, max_attempts=1, lease=lease).next_action,
+                RecoveryAction.ACCEPTED_REVIEW,
+            )
             replay = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
             self.assertEqual(replay.accepted_review_identity, dispatch.diff_review_attempt_id)
             self.assertEqual((result.base_sha, result.candidate_sha), (seal.base_sha, seal.candidate_sha))
@@ -131,8 +151,83 @@ class CandidateReviewTests(unittest.TestCase):
             self.assertEqual(task_projection(repository, identity).state, "implementing")
             with self.assertRaisesRegex(CandidateReviewError, "accepted Worker thread"):
                 begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="wrong-worker", external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            with self.assertRaisesRegex(CandidateReviewError, "routed diff-review parent"):
+                begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             repair = begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=dispatch.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=result.routed_finding_ids, external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             self.assertNotEqual(repair.input_digest, dispatch.input_digest)
+            self.assertEqual(repair.repair_diff_review_id, dispatch.diff_review_attempt_id)
+            self.assertEqual(repair.repair_candidate_sha, seal.candidate_sha)
+            self.assertEqual(repair.routed_finding_ids, result.routed_finding_ids)
+            (Path(identity.worktree) / "candidate.txt").write_text("repaired candidate\n", encoding="utf-8")
+            self.git(Path(identity.worktree), "add", "candidate.txt")
+            self.git(Path(identity.worktree), "commit", "-m", "fix(candidate): repair routed finding")
+            repaired_seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=repair.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
+            self.assertNotEqual(repaired_seal.candidate_sha, seal.candidate_sha)
+            repaired_context = self.review_context(identity, context, repaired_seal)
+            for verification in (
+                CandidateVerification("repair-tests", VerificationKind.TEST, VerificationOutcome.PASS, "b" * 64),
+                CandidateVerification("repair-build", VerificationKind.BUILD, VerificationOutcome.PASS, "c" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, repaired_seal, verification, lease=lease)
+            fresh = dispatch_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id="diff-repaired", implementation_attempt_id=repair.implementation_attempt_id, provider_attempt_id="repair-supervisor", supervisor_session_identity="repair-session", external_turn_identity="repair-review-turn", message_identity="repair-message", process_lease_id="repair-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            accepted = record_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id=fresh.diff_review_attempt_id, output=DiffReviewOutput("diff-repaired", "repair-supervisor", "repair-session", "repair-review-turn", "repair-message", repaired_seal.base_sha, repaired_seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="d" * 64, lease=lease, now=now)
+            self.assertTrue(accepted.accepted)
+            self.assertNotEqual(fresh.supervisor_session_identity, dispatch.supervisor_session_identity)
+
+    def test_dirty_or_moved_candidate_stales_both_accepted_review_layers(self):
+        for mutation in ("dirty", "moved"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, context, binding, now = values
+                seal, review_context, review = self.accepted_diff_review(values, review_id=f"diff-{mutation}", provider_id=f"supervisor-{mutation}")
+                candidate = Path(identity.worktree) / "candidate.txt"
+                if mutation == "dirty":
+                    (Path(identity.worktree) / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+                    expected = "dirty"
+                else:
+                    candidate.write_text("moved candidate\n", encoding="utf-8")
+                    self.git(Path(identity.worktree), "add", "candidate.txt")
+                    self.git(Path(identity.worktree), "commit", "-m", "test: move candidate")
+                    expected = "head moved"
+                with self.assertRaisesRegex(GitIdentityError, expected):
+                    read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease)
+                self.assertEqual(read_attempt(repository, identity, review.provider_attempt_id).state, AttemptState.INVALIDATED)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(connection.execute("SELECT state, accepted_review_identity FROM diff_review_attempts WHERE diff_review_attempt_id = ?", (review.diff_review_attempt_id,)).fetchone(), ("recorded", None))
+                    self.assertIsNone(connection.execute("SELECT 1 FROM accepted_provider_reviews WHERE attempt_id = ?", (review.provider_attempt_id,)).fetchone())
+                finally:
+                    connection.close()
+
+    def test_preaccepted_provider_output_must_match_structured_review_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            seal, review_context, review = self.accepted_diff_review(values, review_id="diff-output", provider_id="supervisor-output")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_completion_outputs SET output_fingerprint = ? WHERE attempt_id = ?", ("f" * 64, review.provider_attempt_id))
+                connection.commit()
+            finally:
+                connection.close()
+            recovered = recover_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, max_attempts=1, lease=lease)
+            self.assertEqual(recovered.next_action, RecoveryAction.FRESH_SUPERVISOR_SESSION)
+            self.assertEqual(read_attempt(repository, identity, review.provider_attempt_id).state, AttemptState.INVALIDATED)
+            self.assertFalse(read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
+            self.assertEqual(
+                recover_attempt(repository, identity, review_context, attempt_id=review.provider_attempt_id, max_attempts=1, lease=lease).next_action,
+                RecoveryAction.FRESH_SUPERVISOR_SESSION,
+            )
+
+    def test_generic_recovery_cannot_reuse_an_accepted_diff_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            seal, review_context, review = self.accepted_diff_review(values, review_id="diff-generic", provider_id="supervisor-generic")
+            recovery = recover_attempt(repository, identity, review_context, attempt_id=review.provider_attempt_id, max_attempts=1, lease=lease)
+            self.assertEqual(recovery.next_action, RecoveryAction.FRESH_SUPERVISOR_SESSION)
+            self.assertEqual(read_attempt(repository, identity, review.provider_attempt_id).state, AttemptState.INVALIDATED)
+            self.assertFalse(read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
 
     def test_base_head_cannot_authorize_a_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:

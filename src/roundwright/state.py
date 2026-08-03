@@ -376,6 +376,17 @@ MIGRATIONS = (
             ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT)"),
         ),
     ),
+    Migration(
+        26,
+        (
+            "ALTER TABLE implementation_attempts ADD COLUMN repair_diff_review_id TEXT",
+            "ALTER TABLE implementation_attempts ADD COLUMN repair_candidate_sha TEXT",
+            "ALTER TABLE implementation_attempts ADD COLUMN routed_finding_ids_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            ("implementation_attempts", "CREATE TABLE implementation_attempts (implementation_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), accepted_plan_review_identity TEXT NOT NULL REFERENCES accepted_plan_reviews(review_identity), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded')), created_at INTEGER NOT NULL CHECK(created_at > 0), repair_diff_review_id TEXT, repair_candidate_sha TEXT, routed_finding_ids_json TEXT NOT NULL DEFAULT '[]')"),
+        ),
+    ),
 )
 
 

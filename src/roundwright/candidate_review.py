@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Iterable
 
 from .configuration import RepositoryIdentity
-from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
-from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity
+from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
+from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, transition_task
 
 
@@ -56,6 +56,24 @@ class ImplementationDispatch:
     worker_thread_identity: str
     external_turn_identity: str
     input_digest: str
+    repair_diff_review_id: str | None = None
+    repair_candidate_sha: str | None = None
+    routed_finding_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RepairParent:
+    """Durable lineage from a routed finding to its repair attempt."""
+
+    diff_review_attempt_id: str | None
+    candidate_sha: str | None
+    finding_ids: tuple[str, ...]
+
+    @property
+    def digest(self) -> str:
+        if self.diff_review_attempt_id is None:
+            return ""
+        return _digest({"review": self.diff_review_attempt_id, "candidate": self.candidate_sha, "findings": self.finding_ids})
 
 
 @dataclass(frozen=True)
@@ -188,11 +206,17 @@ def begin_implementation(
     ):
         _token(value, name)
     accepted = _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity)
+    if _has_routed_diff_findings(repository, identity) and repair_diff_review_id is None:
+        raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
     repair_parent = _repair_parent(
         repository, identity, repair_diff_review_id, repair_candidate_sha, routed_finding_ids, worker_thread_identity,
     )
-    input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity, "repair": repair_parent})
-    expected = ImplementationDispatch(implementation_attempt_id, provider_attempt_id, plan_attempt_id, accepted, worker_thread_identity, external_turn_identity, input_digest)
+    input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity, "repair": repair_parent.digest})
+    expected = ImplementationDispatch(
+        implementation_attempt_id, provider_attempt_id, plan_attempt_id, accepted, worker_thread_identity,
+        external_turn_identity, input_digest, repair_parent.diff_review_attempt_id,
+        repair_parent.candidate_sha, repair_parent.finding_ids,
+    )
     existing = _read_implementation_dispatch(repository, identity, implementation_attempt_id)
     if existing is not None:
         if existing != expected:
@@ -224,11 +248,12 @@ def begin_implementation(
         current = _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id)
         if current is None:
             connection.execute(
-                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)",
+                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at, repair_diff_review_id, repair_candidate_sha, routed_finding_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?)",
                 (
                     implementation_attempt_id, identity.task_id, plan_attempt_id, accepted,
                     provider_attempt_id, worker_thread_identity, external_turn_identity,
-                    input_digest, _clock(now),
+                    input_digest, _clock(now), repair_parent.diff_review_attempt_id,
+                    repair_parent.candidate_sha, json.dumps(repair_parent.finding_ids),
                 ),
             )
         elif current != expected:
@@ -450,10 +475,7 @@ def record_diff_review(
     normalized = output.normalized()
     if tuple(normalized.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")) != tuple(dispatch.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")):
         raise CandidateReviewError("diff review output identity does not match the durable dispatch")
-    _require_candidate_binding(identity, binding, seal)
-    candidate_evidence(repository, binding, seal, lease=lease)
-    _require_current_candidate(repository, identity, seal, dispatch.implementation_attempt_id)
-    _require_diff_review_context(identity, context, seal)
+    _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
     if _verification_snapshot(repository, identity, seal.candidate_sha) != dispatch.verification_digest:
         raise CandidateReviewError("diff review verification evidence has changed")
     provider = read_attempt(repository, identity, dispatch.provider_attempt_id)
@@ -462,7 +484,9 @@ def record_diff_review(
             provider.accepted_review_identity != dispatch.diff_review_attempt_id
             or provider.output_pointer != f"diff-review:{diff_review_attempt_id}"
             or provider.completion_evidence_fingerprint != completion_evidence_fingerprint
+            or _provider_output_fingerprint(repository, identity, dispatch.provider_attempt_id) != normalized.digest
         ):
+            _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
             raise CandidateReviewError("accepted diff review replay conflicts with provider evidence")
     else:
         record_completed_output(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
@@ -502,6 +526,7 @@ def record_diff_review(
     if normalized.verdict is DiffReviewVerdict.FINDINGS:
         transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=normalized.digest, lease=lease)
     else:
+        _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
         _accept_diff_pass(repository, identity, context, dispatch, lease, now)
     return read_diff_review(repository, identity, diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
 
@@ -519,17 +544,15 @@ def read_diff_review(
     _token(diff_review_attempt_id, "diff review identity")
     if binding is None or seal is None or context is None:
         raise CandidateReviewError("reading diff review acceptance requires live candidate evidence")
-    _require_candidate_binding(identity, binding, seal)
-    candidate_evidence(repository, binding, seal, lease=lease)
-    _require_current_candidate(repository, identity, seal)
-    _require_diff_review_context(identity, context, seal)
+    _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, None, lease)
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity)
-        row = connection.execute("SELECT attempts.implementation_attempt_id, attempts.supervisor_session_identity, attempts.message_identity, attempts.base_sha, attempts.candidate_sha, attempts.verification_digest, attempts.state, attempts.accepted_review_identity, attempts.provider_attempt_id, artifacts.verdict, routes.finding_ids_json FROM diff_review_attempts AS attempts LEFT JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = attempts.diff_review_attempt_id LEFT JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+        row = connection.execute("SELECT attempts.implementation_attempt_id, attempts.supervisor_session_identity, attempts.message_identity, attempts.base_sha, attempts.candidate_sha, attempts.verification_digest, attempts.state, attempts.accepted_review_identity, attempts.provider_attempt_id, artifacts.verdict, routes.finding_ids_json, artifacts.content_digest FROM diff_review_attempts AS attempts LEFT JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = attempts.diff_review_attempt_id LEFT JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
         if row is None or row[9] is None:
             raise CandidateReviewError("diff review result is unavailable")
-        provider = connection.execute("SELECT state, accepted_review_identity, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
+        provider = connection.execute("SELECT state, accepted_review_identity, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
+        output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (row[8],)).fetchone()
         accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
         _require_exact_provider_context(connection, identity, row[8], context)
     finally:
@@ -541,11 +564,116 @@ def read_diff_review(
         and provider is not None
         and provider[0] == AttemptState.ACCEPTED.value
         and provider[1] == row[7]
-        and provider[2] is not None
-        and accepted_provider == (identity.task_id, row[8], provider[2])
+        and provider[2] == f"diff-review:{diff_review_attempt_id}"
+        and provider[3] is not None
+        and output == (row[11],)
+        and accepted_provider == (identity.task_id, row[8], provider[3])
         and current_snapshot == row[5]
     )
+    if not accepted and row[6] == "accepted":
+        _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
     return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5], row[7] if accepted else None, DiffReviewVerdict(row[9]), accepted, tuple(json.loads(row[10] or "[]")))
+
+
+def recover_diff_review(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    diff_review_attempt_id: str,
+    verified_completion_evidence: str | None = None,
+    max_attempts: int,
+    lease: TransitionLease | None,
+    now: int | None = None,
+) -> RecoveryProjection:
+    """Recover a diff review only after revalidating its live candidate binding."""
+
+    _token(diff_review_attempt_id, "diff review identity")
+    dispatch = _read_diff_dispatch(repository, identity, diff_review_attempt_id)
+    if dispatch is None:
+        raise CandidateReviewError("diff review dispatch is unavailable")
+    _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT state FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?",
+            (diff_review_attempt_id, identity.task_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row == ("accepted",):
+        accepted = read_diff_review(repository, identity, diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
+        if not accepted.accepted:
+            return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
+                                   verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
+                                   lease=lease, now=now)
+        return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
+                               verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
+                               lease=lease, now=now, _allow_accepted_diff_review=True)
+    return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
+                           verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
+                           lease=lease, now=now)
+
+
+def _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, implementation_attempt_id, lease):
+    """Revalidate the candidate before any acceptance read, replay, or recovery."""
+
+    try:
+        _require_candidate_binding(identity, binding, seal)
+        candidate_evidence(repository, binding, seal, lease=lease)
+        _require_current_candidate(repository, identity, seal, implementation_attempt_id)
+        _require_diff_review_context(identity, context, seal)
+        connection = _open_writable_connection(repository)
+        try:
+            row = connection.execute(
+                "SELECT provider_attempt_id FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?",
+                (diff_review_attempt_id, identity.task_id),
+            ).fetchone()
+            if row is not None:
+                _require_exact_provider_context(connection, identity, row[0], context)
+        finally:
+            connection.close()
+    except (CandidateReviewError, GitIdentityError):
+        _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
+        raise
+
+
+def _provider_output_fingerprint(repository, identity, attempt_id):
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (attempt_id,)).fetchone()
+        return None if row is None else row[0]
+    finally:
+        connection.close()
+
+
+def _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease):
+    """Atomically stale the diff-review and provider acceptance layers together."""
+
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_lease(connection, lease, identity, None)
+        row = connection.execute(
+            "SELECT provider_attempt_id FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?",
+            (diff_review_attempt_id, identity.task_id),
+        ).fetchone()
+        if row is not None:
+            _stale_diff_review_acceptance_connection(connection, identity, diff_review_attempt_id, row[0])
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _stale_diff_review_acceptance_connection(connection, identity, diff_review_attempt_id, provider_attempt_id):
+    connection.execute("DELETE FROM accepted_provider_reviews WHERE attempt_id = ?", (provider_attempt_id,))
+    connection.execute("UPDATE provider_attempts SET state = 'invalidated', accepted_review_identity = NULL WHERE attempt_id = ? AND state = 'accepted'", (provider_attempt_id,))
+    connection.execute("UPDATE diff_review_attempts SET state = 'recorded', accepted_review_identity = NULL WHERE diff_review_attempt_id = ? AND task_id = ? AND state = 'accepted'", (diff_review_attempt_id, identity.task_id))
 
 
 def _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity) -> str:
@@ -565,7 +693,7 @@ def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, 
 
     values = (review_id, candidate_sha)
     if values == (None, None) and not finding_ids:
-        return ""
+        return RepairParent(None, None, ())
     if not isinstance(review_id, str) or not isinstance(candidate_sha, str):
         raise CandidateReviewError("repair dispatch requires a complete parent identity")
     _token(review_id, "repair diff review identity")
@@ -584,7 +712,15 @@ def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, 
         connection.close()
     if row is None or row[0] != candidate_sha or row[1] != worker_thread_identity or tuple(json.loads(row[2])) != finding_ids:
         raise CandidateReviewError("repair dispatch does not match routed diff findings")
-    return _digest({"review": review_id, "candidate": candidate_sha, "findings": finding_ids})
+    return RepairParent(review_id, candidate_sha, finding_ids)
+
+
+def _has_routed_diff_findings(repository, identity):
+    connection = _open_writable_connection(repository)
+    try:
+        return connection.execute("SELECT 1 FROM diff_review_routes WHERE task_id = ?", (identity.task_id,)).fetchone() is not None
+    finally:
+        connection.close()
 
 
 def _read_implementation_dispatch(repository, identity, implementation_attempt_id):
@@ -597,8 +733,8 @@ def _read_implementation_dispatch(repository, identity, implementation_attempt_i
 
 
 def _read_implementation_dispatch_connection(connection, identity, implementation_attempt_id):
-    row = connection.execute("SELECT provider_attempt_id, plan_attempt_id, accepted_plan_review_identity, worker_thread_identity, external_turn_identity, input_digest FROM implementation_attempts WHERE implementation_attempt_id = ? AND task_id = ?", (implementation_attempt_id, identity.task_id)).fetchone()
-    return None if row is None else ImplementationDispatch(implementation_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5])
+    row = connection.execute("SELECT provider_attempt_id, plan_attempt_id, accepted_plan_review_identity, worker_thread_identity, external_turn_identity, input_digest, repair_diff_review_id, repair_candidate_sha, routed_finding_ids_json FROM implementation_attempts WHERE implementation_attempt_id = ? AND task_id = ?", (implementation_attempt_id, identity.task_id)).fetchone()
+    return None if row is None else ImplementationDispatch(implementation_attempt_id, *row[:6], row[6], row[7], tuple(json.loads(row[8])))
 
 
 def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
@@ -653,20 +789,25 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
             raise CandidateReviewError("diff review acceptance does not match its dispatch")
         if _verification_snapshot_connection(connection, identity, dispatch.candidate_sha) != dispatch.verification_digest:
             raise CandidateReviewError("diff review verification evidence has changed")
-        artifact = connection.execute("SELECT verdict FROM diff_review_artifacts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
-        if artifact != (DiffReviewVerdict.PASS.value,):
+        artifact = connection.execute("SELECT verdict, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
+        if artifact is None or artifact[0] != DiffReviewVerdict.PASS.value:
             raise CandidateReviewError("only a recorded PASS can be accepted")
-        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
-        if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[3] is None:
+        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
+        output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()
+        if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[4] is None:
             raise CandidateReviewError("accepted PASS provider attempt is incomplete")
+        if provider[3] != f"diff-review:{dispatch.diff_review_attempt_id}" or output != (artifact[1],):
+            _stale_diff_review_acceptance_connection(connection, identity, dispatch.diff_review_attempt_id, dispatch.provider_attempt_id)
+            connection.commit()
+            raise CandidateReviewError("accepted PASS provider output does not match the structured diff review")
         accepted_identity = dispatch.diff_review_attempt_id
         if provider[1] == AttemptState.COMPLETED.value:
             connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?", (accepted_identity, AttemptState.ACCEPTED.value, dispatch.provider_attempt_id))
-            provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3])
+            provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3], provider[4])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != accepted_identity:
             raise CandidateReviewError("accepted PASS provider attempt conflicts with committed state")
         accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
-        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[3])
+        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4])
         if accepted_provider is None:
             connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)", (accepted_identity, *expected_provider))
         elif accepted_provider != expected_provider:

@@ -183,7 +183,7 @@ def _git_confirms_worktree(root: Path) -> bool:
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,
-            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            env=_hermetic_git_environment(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -197,6 +197,11 @@ def _has_repository_selecting_git_environment() -> bool:
         name in os.environ
         for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
     )
+
+
+def _hermetic_git_environment() -> dict[str, str]:
+    allowed = {"PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"}
+    return {key: value for key, value in os.environ.items() if key.upper() in allowed}
 
 
 def _is_reparse_point(path: Path) -> bool:

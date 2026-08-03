@@ -109,6 +109,73 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(recovery.external_turn_identity, "turn-one")
             self.assertEqual(read_attempt(repository, identity, "worker-one").state, AttemptState.AMBIGUOUS)
 
+    def test_restart_blocks_ambiguous_turns_at_every_lifecycle_checkpoint(self) -> None:
+        """No persisted external turn may be replayed without completion evidence."""
+
+        checkpoints = (
+            ("planning", ProviderRole.PLANNING),
+            ("active-worker", ProviderRole.WORKER),
+            ("supervisor-plan-review", ProviderRole.SUPERVISOR),
+            ("implementation", ProviderRole.WORKER),
+            ("supervisor-diff-review", ProviderRole.SUPERVISOR),
+            ("final-aggregation", ProviderRole.AGGREGATION),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+
+            for checkpoint, role in checkpoints:
+                attempt_id = f"checkpoint-{checkpoint}"
+                session_identity = f"session-{checkpoint}"
+                turn_identity = f"turn-{checkpoint}"
+                self.prepare(repository, identity, lease, role=role, attempt=attempt_id)
+                record_session_identity(
+                    repository,
+                    identity,
+                    self.context(identity),
+                    attempt_id=attempt_id,
+                    session_identity=session_identity,
+                    lease=lease,
+                )
+                record_external_turn(
+                    repository,
+                    identity,
+                    self.context(identity),
+                    attempt_id=attempt_id,
+                    session_identity=session_identity,
+                    external_turn_identity=turn_identity,
+                    lease=lease,
+                )
+
+                with self.subTest(checkpoint=checkpoint):
+                    recovery = recover_attempt(
+                        repository,
+                        identity,
+                        self.context(identity),
+                        attempt_id=attempt_id,
+                        max_attempts=3,
+                        lease=lease,
+                    )
+                    self.assertEqual(recovery.next_action, RecoveryAction.BLOCKED_AMBIGUOUS_TURN)
+                    self.assertEqual(recovery.external_turn_identity, turn_identity)
+                    self.assertEqual(read_attempt(repository, identity, attempt_id).state, AttemptState.AMBIGUOUS)
+
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (len(checkpoints),),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_recovery_events WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (len(checkpoints),),
+                )
+            finally:
+                connection.close()
+
     def test_no_external_turn_has_a_bounded_retry_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))

@@ -35,6 +35,12 @@ path-free denial rather than an implementation exception, including malformed
 trusted source, policy-document, and activation-receipt structures. Invalid
 receipt fields are not copied into owner-facing diagnostics.
 
+For the Phase 2 positive proof, `roundwright.local_slice` exposes one explicit
+test-fixture boundary. It joins the existing SQLite, local-Git, Worker, fresh
+Supervisor, candidate, and gate contracts for a single isolated source. It is
+not a command-shell mode and never calls a provider, GitHub, CI, or any other
+networked service.
+
 ## Development check
 
 Use Python 3.12:

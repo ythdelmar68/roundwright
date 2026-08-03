@@ -85,14 +85,20 @@ def no_credential(name, *args, **kwargs):
     return original_getenv(name, *args, **kwargs)
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
+before_first = len(commands)
 first = run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+first_pass_commands = len(commands) - before_first
+before_replay = len(commands)
 second = run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+replay_commands = len(commands) - before_replay
+before_changed_source = len(commands)
 try:
     run_once_local_slice(repository, LocalSliceFixture('local-task', 'local-source', 'local/repository', 'codex/local-slice', root.parent / 'worker', 'changed source\\n'), now=datetime(2030, 1, 1, tzinfo=timezone.utc))
 except Exception:
     changed_source_rejected = True
 else:
     changed_source_rejected = False
+changed_source_commands = len(commands) - before_changed_source
 connection = sqlite3.connect(database_path(repository))
 try:
     transitions = connection.execute('SELECT from_state, to_state FROM transition_events WHERE task_id = ? ORDER BY sequence', ('local-task',)).fetchall()
@@ -104,11 +110,21 @@ try:
     gate_rows = connection.execute('SELECT gate_key, outcome, changed_boundary, reason, follow_ups FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? ORDER BY gate_key', ('local-task', first.candidate.candidate_sha)).fetchall()
     verifications = connection.execute('SELECT verification_kind, outcome FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? ORDER BY verification_kind', ('local-task', first.candidate.candidate_sha)).fetchall()
     source = connection.execute('SELECT source_digest FROM source_snapshots WHERE source_id = ?', ('local-source',)).fetchone()
+    seal = connection.execute('SELECT base_sha, candidate_sha FROM candidate_seals WHERE task_id = ?', ('local-task',)).fetchone()
+    state = connection.execute('SELECT state FROM tasks WHERE task_id = ?', ('local-task',)).fetchone()[0]
+    blockers = [row[0] for row in connection.execute('SELECT blocker_class FROM blockers WHERE task_id = ? AND resolution_fingerprint IS NULL ORDER BY blocker_class', ('local-task',))]
+    next_action = connection.execute('SELECT action_kind FROM next_actions WHERE task_id = ? AND resolution_fingerprint IS NULL', ('local-task',)).fetchone()[0]
 finally:
     connection.close()
 worktree_clean = original_run(['git', '-C', str(root.parent / 'worker'), 'status', '--porcelain=v1', '--untracked-files=all'], check=True, text=True, capture_output=True).stdout == ''
 implementation_commits = original_run(['git', '-C', str(root.parent / 'worker'), 'rev-list', '--count', f'{first.candidate.base_sha}..{first.candidate.candidate_sha}'], check=True, text=True, capture_output=True).stdout.strip()
 status = render_local_slice_status(first)
+gate_outcome = 'PASS' if len(gate_rows) == 13 and all(row[1] in ('PASS', 'NOT_APPLICABLE') for row in gate_rows) else 'BLOCKED'
+expected_status = '\\n'.join((
+    'roundwright local-slice', 'task=local-task', f'state={state}', f'base={seal[0]}', f'candidate={seal[1]}',
+    f'gates={gate_outcome}', f'plan_session={plan_review[0]}', f'diff_session={diff_review[0]}',
+    f'next_action={next_action}', f"blockers={','.join(blockers) if blockers else 'none'}",
+))
 print(json.dumps({
     'state': first.task.state,
     'base': first.candidate.base_sha,
@@ -133,6 +149,8 @@ print(json.dumps({
     'implementation_commits': implementation_commits,
     'status': status,
     'commands': commands,
+    'command_profile': [first_pass_commands, replay_commands, changed_source_commands],
+    'status_matches_sqlite': status == expected_status,
 }))
 """ % (str(installed), str(fixture))
             environment = {"PATH": os.environ["PATH"]}
@@ -168,12 +186,12 @@ print(json.dumps({
             self.assertTrue(result["source_matches"])
             self.assertTrue(result["worktree_clean"])
             self.assertEqual(result["implementation_commits"], "1")
-            self.assertIn(f"state={result['state']}", result["status"])
-            self.assertIn(f"base={result['base']}", result["status"])
-            self.assertIn(f"candidate={result['candidate']}", result["status"])
-            self.assertIn("gates=PASS", result["status"])
+            self.assertTrue(result["status_matches_sqlite"])
             self.assertTrue(result["commands"])
             self.assertTrue(all(command[0] in {"git", "git.exe"} and "push" not in command for command in result["commands"]))
+            self.assertGreater(result["command_profile"][0], 1)
+            self.assertLessEqual(result["command_profile"][0], 300)
+            self.assertEqual(result["command_profile"][1:], [1, 1])
             expected_na = {"dependency-graph", "github-trace", "public-identifier", "live-proof", "external-ci"}
             self.assertEqual({row[0] for row in result["gates"]}, {
                 "plan-review", "candidate-seal", "supervisor-diff-review", "targeted-tests", "full-tests", "build",

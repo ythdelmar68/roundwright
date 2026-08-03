@@ -319,23 +319,37 @@ def _completed_result(repository, identity, fixture):
             "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (identity.task_id,)
         ).fetchone()
         plan = connection.execute(
-            "SELECT reviews.supervisor_session_identity FROM plan_review_attempts AS reviews "
+            "SELECT reviews.supervisor_session_identity, reviews.source_digest, reviews.plan_digest, "
+            "plans.source_digest, plan_artifact.content_digest, submitted.plan_digest, accepted_plan.review_digest "
+            "FROM plan_review_attempts AS reviews "
             "JOIN plan_review_artifacts AS artifacts ON artifacts.review_attempt_id = reviews.review_attempt_id "
+            "JOIN worker_plan_attempts AS plans ON plans.plan_attempt_id = reviews.plan_attempt_id "
+            "JOIN worker_plan_artifacts AS plan_artifact ON plan_artifact.plan_attempt_id = plans.plan_attempt_id "
+            "JOIN submitted_plan_reviews AS submitted ON submitted.task_id = reviews.task_id "
+            "AND submitted.plan_attempt_id = reviews.plan_attempt_id "
+            "JOIN accepted_plan_reviews AS accepted_plan ON accepted_plan.task_id = reviews.task_id "
+            "AND accepted_plan.plan_attempt_id = reviews.plan_attempt_id "
             "JOIN provider_attempts AS attempts ON attempts.attempt_id = reviews.provider_attempt_id "
             "JOIN accepted_provider_reviews AS accepted ON accepted.accepted_review_identity = reviews.review_attempt_id "
             "AND accepted.attempt_id = attempts.attempt_id WHERE reviews.task_id = ? "
             "AND reviews.review_attempt_id = 'local-plan-review' AND reviews.state = 'recorded' "
+            "AND reviews.plan_attempt_id = 'local-plan' "
             "AND artifacts.verdict = 'pass' AND attempts.state = 'accepted' "
             "AND attempts.accepted_review_identity = reviews.review_attempt_id",
             (identity.task_id,),
         ).fetchone()
         diff = connection.execute(
-            "SELECT reviews.supervisor_session_identity FROM diff_review_attempts AS reviews "
+            "SELECT reviews.supervisor_session_identity, reviews.base_sha, reviews.candidate_sha, "
+            "candidates.base_sha, candidates.candidate_sha, implementation.plan_attempt_id, "
+            "implementation.accepted_plan_review_identity FROM diff_review_attempts AS reviews "
             "JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = reviews.diff_review_attempt_id "
+            "JOIN implementation_candidates AS candidates ON candidates.implementation_attempt_id = reviews.implementation_attempt_id "
+            "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = reviews.implementation_attempt_id "
             "JOIN provider_attempts AS attempts ON attempts.attempt_id = reviews.provider_attempt_id "
             "JOIN accepted_provider_reviews AS accepted ON accepted.accepted_review_identity = reviews.diff_review_attempt_id "
             "AND accepted.attempt_id = attempts.attempt_id WHERE reviews.task_id = ? "
             "AND reviews.diff_review_attempt_id = 'local-diff-review' AND reviews.state = 'accepted' "
+            "AND reviews.implementation_attempt_id = 'local-implementation' "
             "AND artifacts.verdict = 'pass' AND attempts.state = 'accepted' "
             "AND attempts.accepted_review_identity = reviews.diff_review_attempt_id",
             (identity.task_id,),
@@ -358,6 +372,11 @@ def _completed_result(repository, identity, fixture):
         raise LocalSliceError("completed local slice does not match its normalized source or candidate seal")
     if plan is None or diff is None or context_row is None:
         raise LocalSliceError("completed local slice is missing accepted review or gate evidence")
+    if (
+        plan[1:] != (expected_source, plan[2], expected_source, plan[2], plan[2], plan[2])
+        or diff[1:] != (row[0], row[1], row[0], row[1], "local-plan", "local-plan-review")
+    ):
+        raise LocalSliceError("completed local slice review evidence does not match its source, plan, or candidate")
     expected_context, _ = _gate_evidence(
         identity, CandidateSeal(identity.task_id, *row), datetime(2030, 1, 1, tzinfo=timezone.utc)
     )

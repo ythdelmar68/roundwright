@@ -387,6 +387,16 @@ MIGRATIONS = (
             ("implementation_attempts", "CREATE TABLE implementation_attempts (implementation_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), accepted_plan_review_identity TEXT NOT NULL REFERENCES accepted_plan_reviews(review_identity), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded')), created_at INTEGER NOT NULL CHECK(created_at > 0), repair_diff_review_id TEXT, repair_candidate_sha TEXT, routed_finding_ids_json TEXT NOT NULL DEFAULT '[]')"),
         ),
     ),
+    Migration(
+        27,
+        (
+            "ALTER TABLE diff_review_routes ADD COLUMN consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id)",
+            "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = (SELECT implementation_attempt_id FROM implementation_attempts WHERE implementation_attempts.task_id = diff_review_routes.task_id AND implementation_attempts.repair_diff_review_id = diff_review_routes.diff_review_attempt_id) WHERE consumed_by_implementation_attempt_id IS NULL AND EXISTS (SELECT 1 FROM implementation_attempts WHERE implementation_attempts.task_id = diff_review_routes.task_id AND implementation_attempts.repair_diff_review_id = diff_review_routes.diff_review_attempt_id)",
+        ),
+        (
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id))"),
+        ),
+    ),
 )
 
 

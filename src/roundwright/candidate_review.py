@@ -206,8 +206,6 @@ def begin_implementation(
     ):
         _token(value, name)
     accepted = _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity)
-    if _has_routed_diff_findings(repository, identity) and repair_diff_review_id is None:
-        raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
     repair_parent = _repair_parent(
         repository, identity, repair_diff_review_id, repair_candidate_sha, routed_finding_ids, worker_thread_identity,
     )
@@ -256,6 +254,7 @@ def begin_implementation(
                     repair_parent.candidate_sha, json.dumps(repair_parent.finding_ids),
                 ),
             )
+            _consume_repair_parent(connection, identity, repair_parent, worker_thread_identity, implementation_attempt_id)
         elif current != expected:
             raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
         connection.commit()
@@ -609,9 +608,18 @@ def recover_diff_review(
             return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
                                    verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
                                    lease=lease, now=now)
+        provider = read_attempt(repository, identity, dispatch.provider_attempt_id)
+        if provider.state is AttemptState.ACCEPTED and provider.accepted_review_identity == diff_review_attempt_id:
+            return RecoveryProjection(
+                provider.attempt_id, provider.role, provider.state, provider.process_lease_id,
+                provider.session_identity, provider.external_turn_identity,
+                provider.output_pointer is not None and provider.completion_evidence_fingerprint is not None,
+                provider.accepted_review_identity, None, RecoveryAction.ACCEPTED_REVIEW,
+            )
+        _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
         return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
                                verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
-                               lease=lease, now=now, _allow_accepted_diff_review=True)
+                               lease=lease, now=now)
     return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
                            verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
                            lease=lease, now=now)
@@ -689,10 +697,13 @@ def _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity
 
 
 def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, worker_thread_identity):
-    """Bind repair dispatch to the exact prior candidate and routed diff findings."""
+    """Bind a repair to the latest outstanding findings route for this task."""
 
     values = (review_id, candidate_sha)
+    current = _current_repair_route(repository, identity)
     if values == (None, None) and not finding_ids:
+        if current is not None:
+            raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
         return RepairParent(None, None, ())
     if not isinstance(review_id, str) or not isinstance(candidate_sha, str):
         raise CandidateReviewError("repair dispatch requires a complete parent identity")
@@ -702,25 +713,46 @@ def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, 
         raise CandidateReviewError("repair dispatch requires routed findings")
     for finding_id in finding_ids:
         _token(finding_id, "routed finding identity")
-    connection = _open_writable_connection(repository)
-    try:
-        row = connection.execute(
-            "SELECT attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json FROM diff_review_attempts AS attempts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?",
-            (review_id, identity.task_id),
-        ).fetchone()
-    finally:
-        connection.close()
-    if row is None or row[0] != candidate_sha or row[1] != worker_thread_identity or tuple(json.loads(row[2])) != finding_ids:
-        raise CandidateReviewError("repair dispatch does not match routed diff findings")
+    if current != (review_id, candidate_sha, worker_thread_identity, finding_ids):
+        raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
     return RepairParent(review_id, candidate_sha, finding_ids)
 
 
-def _has_routed_diff_findings(repository, identity):
+def _current_repair_route(repository, identity):
+    """Return the one newest findings route that has not yet begun a repair."""
+
     connection = _open_writable_connection(repository)
     try:
-        return connection.execute("SELECT 1 FROM diff_review_routes WHERE task_id = ?", (identity.task_id,)).fetchone() is not None
+        row = connection.execute(
+            "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
+            (identity.task_id,),
+        ).fetchone()
+        return None if row is None else (row[0], row[1], row[2], tuple(json.loads(row[3])))
     finally:
         connection.close()
+
+
+def _consume_repair_parent(connection, identity, parent, worker_thread_identity, implementation_attempt_id):
+    """Consume only the still-current route in the same transaction as dispatch."""
+
+    row = connection.execute(
+        "SELECT routes.diff_review_attempt_id, attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.task_id = ? AND routes.consumed_by_implementation_attempt_id IS NULL ORDER BY attempts.created_at DESC, attempts.rowid DESC LIMIT 1",
+        (identity.task_id,),
+    ).fetchone()
+    current = None if row is None else (row[0], row[1], row[2], tuple(json.loads(row[3])))
+    expected = (parent.diff_review_attempt_id, parent.candidate_sha, worker_thread_identity, parent.finding_ids)
+    if parent.diff_review_attempt_id is None:
+        if current is not None:
+            raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
+        return
+    if current != expected:
+        raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
+    updated = connection.execute(
+        "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = ? WHERE diff_review_attempt_id = ? AND consumed_by_implementation_attempt_id IS NULL",
+        (implementation_attempt_id, parent.diff_review_attempt_id),
+    ).rowcount
+    if updated != 1:
+        raise CandidateReviewError("repair findings route was already consumed")
 
 
 def _read_implementation_dispatch(repository, identity, implementation_attempt_id):

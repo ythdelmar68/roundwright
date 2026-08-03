@@ -339,6 +339,92 @@ MIGRATIONS = (
             ("plan_review_routes", "CREATE TABLE plan_review_routes (review_attempt_id TEXT PRIMARY KEY REFERENCES plan_review_attempts(review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        23,
+        (
+            "CREATE TABLE implementation_attempts (implementation_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), accepted_plan_review_identity TEXT NOT NULL REFERENCES accepted_plan_reviews(review_identity), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded')), created_at INTEGER NOT NULL CHECK(created_at > 0))",
+            "CREATE TABLE implementation_candidates (implementation_attempt_id TEXT PRIMARY KEY REFERENCES implementation_attempts(implementation_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, completion_evidence_fingerprint TEXT NOT NULL, content_digest TEXT NOT NULL, UNIQUE(task_id, candidate_sha))",
+            "CREATE TABLE candidate_verifications (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, verification_id TEXT NOT NULL, verification_kind TEXT NOT NULL CHECK(verification_kind IN ('test', 'build')), outcome TEXT NOT NULL CHECK(outcome IN ('pass', 'not-applicable')), evidence_fingerprint TEXT NOT NULL, justification TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, verification_id))",
+            "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0))",
+            "CREATE TABLE diff_review_artifacts (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, content_digest TEXT NOT NULL)",
+            "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL)",
+        ),
+        (
+            ("implementation_attempts", "CREATE TABLE implementation_attempts (implementation_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), accepted_plan_review_identity TEXT NOT NULL REFERENCES accepted_plan_reviews(review_identity), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded')), created_at INTEGER NOT NULL CHECK(created_at > 0))"),
+            ("implementation_candidates", "CREATE TABLE implementation_candidates (implementation_attempt_id TEXT PRIMARY KEY REFERENCES implementation_attempts(implementation_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, completion_evidence_fingerprint TEXT NOT NULL, content_digest TEXT NOT NULL, UNIQUE(task_id, candidate_sha))"),
+            ("candidate_verifications", "CREATE TABLE candidate_verifications (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, verification_id TEXT NOT NULL, verification_kind TEXT NOT NULL CHECK(verification_kind IN ('test', 'build')), outcome TEXT NOT NULL CHECK(outcome IN ('pass', 'not-applicable')), evidence_fingerprint TEXT NOT NULL, justification TEXT NOT NULL, PRIMARY KEY(task_id, candidate_sha, verification_id))"),
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0))"),
+            ("diff_review_artifacts", "CREATE TABLE diff_review_artifacts (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, content_digest TEXT NOT NULL)"),
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL)"),
+        ),
+    ),
+    Migration(
+        24,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN verification_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
+    Migration(
+        25,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN accepted_review_identity TEXT",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT)"),
+        ),
+    ),
+    Migration(
+        26,
+        (
+            "ALTER TABLE implementation_attempts ADD COLUMN repair_diff_review_id TEXT",
+            "ALTER TABLE implementation_attempts ADD COLUMN repair_candidate_sha TEXT",
+            "ALTER TABLE implementation_attempts ADD COLUMN routed_finding_ids_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            ("implementation_attempts", "CREATE TABLE implementation_attempts (implementation_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), plan_attempt_id TEXT NOT NULL REFERENCES worker_plan_attempts(plan_attempt_id), accepted_plan_review_identity TEXT NOT NULL REFERENCES accepted_plan_reviews(review_identity), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), worker_thread_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded')), created_at INTEGER NOT NULL CHECK(created_at > 0), repair_diff_review_id TEXT, repair_candidate_sha TEXT, routed_finding_ids_json TEXT NOT NULL DEFAULT '[]')"),
+        ),
+    ),
+    Migration(
+        27,
+        (
+            "ALTER TABLE diff_review_routes ADD COLUMN consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id)",
+            "UPDATE diff_review_routes SET consumed_by_implementation_attempt_id = (SELECT implementation_attempt_id FROM implementation_attempts WHERE implementation_attempts.task_id = diff_review_routes.task_id AND implementation_attempts.repair_diff_review_id = diff_review_routes.diff_review_attempt_id) WHERE consumed_by_implementation_attempt_id IS NULL AND EXISTS (SELECT 1 FROM implementation_attempts WHERE implementation_attempts.task_id = diff_review_routes.task_id AND implementation_attempts.repair_diff_review_id = diff_review_routes.diff_review_attempt_id)",
+        ),
+        (
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id))"),
+        ),
+    ),
+    Migration(
+        28,
+        (
+            "ALTER TABLE diff_review_routes ADD COLUMN claimed_by_implementation_attempt_id TEXT",
+        ),
+        (
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id), claimed_by_implementation_attempt_id TEXT)"),
+        ),
+    ),
+    Migration(
+        29,
+        (
+            "ALTER TABLE diff_review_routes ADD COLUMN claimed_provider_attempt_id TEXT",
+            "ALTER TABLE diff_review_routes ADD COLUMN claimed_external_turn_identity TEXT",
+        ),
+        (
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id), claimed_by_implementation_attempt_id TEXT, claimed_provider_attempt_id TEXT, claimed_external_turn_identity TEXT)"),
+        ),
+    ),
+    Migration(
+        30,
+        (
+            "ALTER TABLE diff_review_routes ADD COLUMN claim_owner_token TEXT",
+        ),
+        (
+            ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id), claimed_by_implementation_attempt_id TEXT, claimed_provider_attempt_id TEXT, claimed_external_turn_identity TEXT, claim_owner_token TEXT)"),
+        ),
+    ),
 )
 
 
@@ -350,7 +436,7 @@ _ALLOWED_TRANSITIONS = {
     "planning": frozenset({"plan-review", "blocked"}),
     "plan-review": frozenset({"planning", "implementing", "blocked"}),
     "implementing": frozenset({"diff-review", "blocked"}),
-    "diff-review": frozenset({"ready-for-owner", "blocked"}),
+    "diff-review": frozenset({"implementing", "ready-for-owner", "blocked"}),
     "ready-for-owner": frozenset(),
     "blocked": frozenset({"queued", "planning", "plan-review", "implementing", "diff-review"}),
 }

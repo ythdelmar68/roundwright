@@ -575,6 +575,9 @@ def recover_attempt(
             max_attempts=max_attempts,
             observed=observed,
         )
+        if row.state is AttemptState.ACCEPTED and row.output_pointer is not None and row.output_pointer.startswith("diff-review:"):
+            _stale_unvalidated_diff_review(connection, identity, row)
+            row = replace(row, state=AttemptState.INVALIDATED, accepted_review_identity=None)
         if next_state is not None and next_state is not row.state:
             connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (next_state.value, attempt_id))
             row = replace(row, state=next_state)
@@ -608,6 +611,8 @@ def read_attempt(repository: RepositoryIdentity, identity: TaskIdentity, attempt
 
 def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_evidence: str | None, max_attempts: int, observed: int):
     if row.state is AttemptState.ACCEPTED:
+        if row.output_pointer is not None and row.output_pointer.startswith("diff-review:"):
+            return RecoveryAction.FRESH_SUPERVISOR_SESSION, "candidate-review-revalidation-required", AttemptState.INVALIDATED
         return RecoveryAction.ACCEPTED_REVIEW, None, None
     if row.state in {AttemptState.COMPLETED, AttemptState.AMBIGUOUS} and row.completion_evidence_fingerprint is not None:
         if verified_completion_evidence == row.completion_evidence_fingerprint:
@@ -649,6 +654,14 @@ def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_e
         if row.role is ProviderRole.SUPERVISOR:
             return RecoveryAction.FRESH_SUPERVISOR_SESSION, "stale-supervisor-process-lease", AttemptState.INVALIDATED
     return RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "external-turn-ambiguous", AttemptState.AMBIGUOUS
+
+
+def _stale_unvalidated_diff_review(connection, identity: TaskIdentity, row: ProviderAttempt) -> None:
+    """Prevent generic recovery from reviving a candidate-bound review unaudited."""
+
+    connection.execute("DELETE FROM accepted_provider_reviews WHERE attempt_id = ?", (row.attempt_id,))
+    connection.execute("UPDATE provider_attempts SET state = ?, accepted_review_identity = NULL WHERE attempt_id = ? AND state = ?", (AttemptState.INVALIDATED.value, row.attempt_id, AttemptState.ACCEPTED.value))
+    connection.execute("UPDATE diff_review_attempts SET state = 'recorded', accepted_review_identity = NULL WHERE task_id = ? AND provider_attempt_id = ? AND state = 'accepted'", (identity.task_id, row.attempt_id))
 
 
 def _projection(row: ProviderAttempt, action: RecoveryAction, blocker: str | None) -> RecoveryProjection:

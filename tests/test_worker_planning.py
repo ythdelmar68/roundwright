@@ -180,9 +180,44 @@ class WorkerPlanningTests(unittest.TestCase):
             with mock.patch.object(worker_planning, "record_external_turn", side_effect=crash_after_record):
                 with self.assertRaisesRegex(RuntimeError, "post-dispatch crash"):
                     self.dispatch(repository, identity, lease, context, now)
+            self.assertEqual(task_projection(repository, identity).state, "planning")
+            connection = worker_planning._open_writable_connection(repository)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state, external_turn_identity FROM provider_attempts WHERE attempt_id = ?",
+                        ("provider-one",),
+                    ).fetchone(),
+                    ("dispatched", "turn-provider-one"),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state FROM worker_plan_attempts WHERE plan_attempt_id = ?",
+                        ("plan-one",),
+                    ).fetchone(),
+                    ("dispatched",),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM worker_plan_artifacts WHERE plan_attempt_id = ?", ("plan-one",)).fetchone(),
+                    (0,),
+                )
+            finally:
+                connection.close()
             replayed = self.dispatch(repository, identity, lease, context, now)
             self.assertEqual(replayed.provider_attempt_id, "provider-one")
             self.assertEqual(self.dispatch(repository, identity, lease, context, now), replayed)
+            connection = worker_planning._open_writable_connection(repository)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM worker_plan_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
             with self.assertRaises(WorkerPlanningError):
                 dispatch_plan(
                     repository, identity, context, self.input(), plan_attempt_id="plan-one", provider_attempt_id="provider-one",

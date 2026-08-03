@@ -206,9 +206,7 @@ def begin_implementation(
     ):
         _token(value, name)
     accepted = _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity)
-    repair_parent = _repair_parent(
-        repository, identity, repair_diff_review_id, repair_candidate_sha, routed_finding_ids, worker_thread_identity,
-    )
+    repair_parent = _specified_repair_parent(repair_diff_review_id, repair_candidate_sha, routed_finding_ids)
     input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity, "repair": repair_parent.digest})
     expected = ImplementationDispatch(
         implementation_attempt_id, provider_attempt_id, plan_attempt_id, accepted, worker_thread_identity,
@@ -219,7 +217,17 @@ def begin_implementation(
     if existing is not None:
         if existing != expected:
             raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
+        _require_replayed_repair_parent(repository, identity, repair_parent, worker_thread_identity, implementation_attempt_id)
         return existing
+    repair_parent = _repair_parent(
+        repository, identity, repair_diff_review_id, repair_candidate_sha, routed_finding_ids, worker_thread_identity,
+    )
+    input_digest = _digest({"task": identity.task_id, "plan": plan_attempt_id, "review": accepted, "worker": worker_thread_identity, "repair": repair_parent.digest})
+    expected = ImplementationDispatch(
+        implementation_attempt_id, provider_attempt_id, plan_attempt_id, accepted, worker_thread_identity,
+        external_turn_identity, input_digest, repair_parent.diff_review_attempt_id,
+        repair_parent.candidate_sha, repair_parent.finding_ids,
+    )
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity, "implementing")
@@ -699,11 +707,22 @@ def _accepted_plan(repository, identity, plan_attempt_id, worker_thread_identity
 def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, worker_thread_identity):
     """Bind a repair to the latest outstanding findings route for this task."""
 
-    values = (review_id, candidate_sha)
+    parent = _specified_repair_parent(review_id, candidate_sha, finding_ids)
     current = _current_repair_route(repository, identity)
-    if values == (None, None) and not finding_ids:
+    if parent.diff_review_attempt_id is None:
         if current is not None:
             raise CandidateReviewError("repair dispatch requires a routed diff-review parent")
+        return parent
+    if current != (parent.diff_review_attempt_id, parent.candidate_sha, worker_thread_identity, parent.finding_ids):
+        raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
+    return parent
+
+
+def _specified_repair_parent(review_id, candidate_sha, finding_ids):
+    """Normalize a caller's repair-parent tuple without consulting live routes."""
+
+    values = (review_id, candidate_sha)
+    if values == (None, None) and not finding_ids:
         return RepairParent(None, None, ())
     if not isinstance(review_id, str) or not isinstance(candidate_sha, str):
         raise CandidateReviewError("repair dispatch requires a complete parent identity")
@@ -713,8 +732,6 @@ def _repair_parent(repository, identity, review_id, candidate_sha, finding_ids, 
         raise CandidateReviewError("repair dispatch requires routed findings")
     for finding_id in finding_ids:
         _token(finding_id, "routed finding identity")
-    if current != (review_id, candidate_sha, worker_thread_identity, finding_ids):
-        raise CandidateReviewError("repair dispatch does not match the latest outstanding diff findings")
     return RepairParent(review_id, candidate_sha, finding_ids)
 
 
@@ -753,6 +770,24 @@ def _consume_repair_parent(connection, identity, parent, worker_thread_identity,
     ).rowcount
     if updated != 1:
         raise CandidateReviewError("repair findings route was already consumed")
+
+
+def _require_replayed_repair_parent(repository, identity, parent, worker_thread_identity, implementation_attempt_id):
+    """Permit an exact retry only when the same dispatch consumed its parent."""
+
+    if parent.diff_review_attempt_id is None:
+        return
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT attempts.candidate_sha, routes.worker_thread_identity, routes.finding_ids_json, routes.consumed_by_implementation_attempt_id FROM diff_review_routes AS routes JOIN diff_review_attempts AS attempts ON attempts.diff_review_attempt_id = routes.diff_review_attempt_id WHERE routes.diff_review_attempt_id = ? AND routes.task_id = ?",
+            (parent.diff_review_attempt_id, identity.task_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    expected = (parent.candidate_sha, worker_thread_identity, json.dumps(parent.finding_ids), implementation_attempt_id)
+    if row != expected:
+        raise CandidateReviewError("repair dispatch replay does not own its routed diff findings")
 
 
 def _read_implementation_dispatch(repository, identity, implementation_attempt_id):

@@ -23,7 +23,7 @@ from roundwright.candidate_review import (
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
-from roundwright.provider_recovery import AttemptState, RecoveryAction, RecoveryContext, read_attempt, recover_attempt
+from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, read_attempt, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt, PlanningInput, WorkerPlan, WorkerPlanOutput,
@@ -152,8 +152,11 @@ class CandidateReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(CandidateReviewError, "accepted Worker thread"):
                 begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="wrong-worker", external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             with self.assertRaisesRegex(CandidateReviewError, "routed diff-review parent"):
-                begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+                begin_implementation(repository, identity, context, implementation_attempt_id="repair-rejected", provider_attempt_id="rejected-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="rejected-turn", process_lease_id="rejected-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, "rejected-worker")
             repair = begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=dispatch.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=result.routed_finding_ids, external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            self.assertEqual(repair, begin_implementation(repository, identity, context, implementation_attempt_id="repair-25", provider_attempt_id="repair-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=dispatch.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=result.routed_finding_ids, external_turn_identity="repair-turn", process_lease_id="repair-lease", process_lease_expires_at=now + 60, lease=lease, now=now))
             self.assertNotEqual(repair.input_digest, dispatch.input_digest)
             self.assertEqual(repair.repair_diff_review_id, dispatch.diff_review_attempt_id)
             self.assertEqual(repair.repair_candidate_sha, seal.candidate_sha)

@@ -441,6 +441,11 @@ def _clock(now: int | None) -> int:
     return value
 
 
+def _hermetic_git_environment() -> dict[str, str]:
+    allowed = {"PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"}
+    return {key: value for key, value in os.environ.items() if key.upper() in allowed}
+
+
 def _validated_worktree_path(root: Path, worktree: Path) -> Path:
     try:
         normalized = worktree.resolve(strict=False)
@@ -543,7 +548,7 @@ def _git_bytes(worktree: Path, *arguments: str) -> bytes:
 
 
 def _git_result(worktree: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment = _hermetic_git_environment()
     try:
         return subprocess.run(
             ["git", "-C", os.fspath(worktree), *arguments],
@@ -559,7 +564,7 @@ def _git_result(worktree: Path, *arguments: str) -> subprocess.CompletedProcess[
 
 
 def _git_bytes_result(worktree: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment = _hermetic_git_environment()
     try:
         return subprocess.run(
             ["git", "-C", os.fspath(worktree), *arguments],

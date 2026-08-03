@@ -9,6 +9,8 @@ remain fail closed.
 from __future__ import annotations
 
 import hashlib
+import os
+import sqlite3
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -40,11 +42,11 @@ from .gates import (
     task_identity_fingerprint,
     transition_ready_for_owner,
 )
-from .git_identity import CandidateSeal, acquire_transition_lease, provision_worktree, resolve_canonical_base
+from .git_identity import CandidateSeal, provision_worktree, resolve_canonical_base, transition_lease
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_recovery import RecoveryContext
-from .state import SourceSnapshot, StateError, TaskIdentity, TaskProjection, admit_task, initialize, record_artifact, set_next_action, task_projection
+from .state import SourceSnapshot, StateError, TaskIdentity, TaskProjection, admit_task, check_database, database_path, initialize, record_artifact, set_next_action, task_projection
 from .worker_planning import (
     PlanReviewReceipt,
     PlanningInput,
@@ -104,7 +106,6 @@ def run_once_local_slice(
     if not isinstance(fixture.source_contents, str) or not fixture.source_contents:
         raise LocalSliceError("local slice source is invalid")
 
-    initialize(repository)
     base_sha = resolve_canonical_base(repository, "main")
     identity = TaskIdentity(
         fixture.task_id,
@@ -114,23 +115,29 @@ def run_once_local_slice(
         str(fixture.worktree.resolve(strict=False)),
         base_sha,
     )
-    completed = _completed_result(repository, identity, fixture)
-    if completed is not None:
-        return completed
+    database = check_database(repository)
+    if database.state == "healthy":
+        completed = _completed_result(repository, identity, fixture)
+        if completed is not None:
+            return completed
+    elif database.state == "missing":
+        initialize(repository)
+    else:
+        raise LocalSliceError("local slice database is unavailable")
 
     instant = datetime.now(timezone.utc) if now is None else now
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise LocalSliceError("local slice clock must be timezone-aware")
     epoch = int(instant.timestamp())
-    lease = acquire_transition_lease(
-        repository,
-        repository_id=identity.repository_id,
-        owner="local-slice-fixture",
-        ttl_seconds=120,
-        now=epoch,
-    )
     try:
-        return _run_new_slice(repository, identity, fixture, lease, instant, epoch)
+        with transition_lease(
+            repository,
+            repository_id=identity.repository_id,
+            owner="local-slice-fixture",
+            ttl_seconds=120,
+            now=epoch,
+        ) as lease:
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -305,10 +312,8 @@ def _completed_result(repository, identity, fixture):
         return None
     if task.state != "ready-for-owner":
         raise LocalSliceError("local slice has incomplete persisted state")
-    from .state import _open_writable_connection
-
     expected_source = _fingerprint("source", _normalized_source_contents(fixture.source_contents))
-    connection = _open_writable_connection(repository)
+    connection = sqlite3.connect(f"{database_path(repository).resolve().as_uri()}?mode=ro", uri=True)
     try:
         source = connection.execute(
             "SELECT snapshots.source_digest FROM tasks JOIN source_snapshots AS snapshots ON snapshots.source_id = tasks.source_id "
@@ -431,7 +436,13 @@ def _commit_local_implementation(worktree: Path, source_contents: str) -> None:
 
 
 def _git(directory: Path, *arguments: str) -> str:
-    result = subprocess.run(["git", "-C", str(directory), *arguments], check=False, text=True, capture_output=True)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), *arguments], check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, env=_hermetic_git_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LocalSliceError("local Git fixture command failed") from error
     if result.returncode != 0:
         raise LocalSliceError("local Git fixture command failed")
     return result.stdout.strip()
@@ -450,3 +461,10 @@ def _normalized_source_contents(value: str) -> str:
     if not normalized:
         raise LocalSliceError("local slice source is invalid")
     return normalized + "\n"
+
+
+def _hermetic_git_environment() -> dict[str, str]:
+    """Expose only the OS variables needed to invoke the local Git executable."""
+
+    allowed = {"PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"}
+    return {key: value for key, value in os.environ.items() if key.upper() in allowed}

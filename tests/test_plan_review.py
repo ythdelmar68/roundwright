@@ -130,10 +130,38 @@ class PlanReviewTests(unittest.TestCase):
             with mock.patch.object(plan_review, "_persist_dispatch", side_effect=RuntimeError("crash after turn")):
                 with self.assertRaisesRegex(RuntimeError, "crash after turn"):
                     self.dispatch(repository, identity, lease, context, now, persisted)
+            self.assertEqual(task_projection(repository, identity).state, "plan-review")
+            connection = _open_writable_connection(repository)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state, external_turn_identity FROM provider_attempts WHERE attempt_id = ?",
+                        ("supervisor-one",),
+                    ).fetchone(),
+                    ("dispatched", "turn-supervisor-one"),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM plan_review_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (0,),
+                )
+            finally:
+                connection.close()
             replay = self.dispatch(repository, identity, lease, context, now, persisted)
             attempt = read_attempt(repository, identity, replay.provider_attempt_id)
             self.assertEqual(attempt.state, AttemptState.DISPATCHED)
             self.assertEqual((attempt.session_identity, attempt.external_turn_identity), (replay.supervisor_session_identity, replay.external_turn_identity))
+            connection = _open_writable_connection(repository)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (2,),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM plan_review_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
 
     def test_findings_recovery_replays_only_missing_routing_checkpoints(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -102,6 +102,127 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         return seal, review_context, review
 
+    def test_implementation_replays_the_persisted_worker_turn_after_a_crash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, _, now = values
+            original = candidate_review.record_external_turn
+
+            def crash_after_turn(*args, **kwargs):
+                original(*args, **kwargs)
+                raise RuntimeError("crash after implementation turn")
+
+            with patch.object(candidate_review, "record_external_turn", side_effect=crash_after_turn):
+                with self.assertRaisesRegex(RuntimeError, "implementation turn"):
+                    begin_implementation(
+                        repository, identity, context,
+                        implementation_attempt_id="implementation-25", provider_attempt_id="worker-implementation",
+                        plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25",
+                        external_turn_identity="implementation-turn", process_lease_id="implementation-lease",
+                        process_lease_expires_at=now + 60, lease=lease, now=now,
+                    )
+            self.assertEqual(task_projection(repository, identity).state, "implementing")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state, external_turn_identity FROM provider_attempts WHERE attempt_id = ?",
+                        ("worker-implementation",),
+                    ).fetchone(),
+                    ("dispatched", "implementation-turn"),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM implementation_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (0,),
+                )
+            finally:
+                connection.close()
+
+            replay = begin_implementation(
+                repository, identity, context,
+                implementation_attempt_id="implementation-25", provider_attempt_id="worker-implementation",
+                plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25",
+                external_turn_identity="implementation-turn", process_lease_id="implementation-lease",
+                process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            self.assertEqual(replay.external_turn_identity, "implementation-turn")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE attempt_id = ?", ("worker-implementation",)).fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM implementation_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
+
+    def test_diff_review_replays_the_persisted_supervisor_turn_after_a_crash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("restart-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64),
+                CandidateVerification("restart-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            original = candidate_review.record_external_turn
+
+            def crash_after_turn(*args, **kwargs):
+                original(*args, **kwargs)
+                raise RuntimeError("crash after diff-review turn")
+
+            with patch.object(candidate_review, "record_external_turn", side_effect=crash_after_turn):
+                with self.assertRaisesRegex(RuntimeError, "diff-review turn"):
+                    dispatch_diff_review(
+                        repository, identity, review_context, binding, seal,
+                        diff_review_attempt_id="diff-restart", implementation_attempt_id=implementation.implementation_attempt_id,
+                        provider_attempt_id="diff-supervisor", supervisor_session_identity="diff-restart-session",
+                        external_turn_identity="diff-restart-turn", message_identity="diff-restart-message",
+                        process_lease_id="diff-restart-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+                    )
+            self.assertEqual(task_projection(repository, identity).state, "diff-review")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state, external_turn_identity FROM provider_attempts WHERE attempt_id = ?",
+                        ("diff-supervisor",),
+                    ).fetchone(),
+                    ("dispatched", "diff-restart-turn"),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM diff_review_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (0,),
+                )
+            finally:
+                connection.close()
+
+            replay = dispatch_diff_review(
+                repository, identity, review_context, binding, seal,
+                diff_review_attempt_id="diff-restart", implementation_attempt_id=implementation.implementation_attempt_id,
+                provider_attempt_id="diff-supervisor", supervisor_session_identity="diff-restart-session",
+                external_turn_identity="diff-restart-turn", message_identity="diff-restart-message",
+                process_lease_id="diff-restart-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            self.assertEqual(replay.external_turn_identity, "diff-restart-turn")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE attempt_id = ?", ("diff-supervisor",)).fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM diff_review_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
+
     def test_clean_candidate_requires_test_and_build_then_binds_a_fresh_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

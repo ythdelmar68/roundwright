@@ -341,11 +341,38 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             policy_evidence = self.policy_evidence(context)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
                 self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.PASS)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    ("diff-review",),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, seal.candidate_sha)).fetchone(),
+                    (len(GATE_REGISTRY),),
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (0,),
+                )
+            finally:
+                connection.close()
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
                 transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="7" * 64, policy_evidence=policy_evidence, lease=lease)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone(), ("ready-for-owner",))
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,)).fetchone(),
+                    (0,),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT from_state, to_state FROM transition_events WHERE task_id = ? ORDER BY sequence",
+                        (identity.task_id,),
+                    ).fetchall(),
+                    [("queued", "planning"), ("planning", "plan-review"), ("plan-review", "implementing"), ("implementing", "diff-review"), ("diff-review", "ready-for-owner")],
+                )
             finally:
                 connection.close()
 

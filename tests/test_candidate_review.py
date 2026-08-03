@@ -239,6 +239,44 @@ class CandidateReviewTests(unittest.TestCase):
             with self.assertRaises(ProviderRecoveryError):
                 read_attempt(repository, identity, f"race-worker-{failures[0][0]}")
 
+    def test_concurrent_same_implementation_alias_leaves_no_loser_provider_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("alias-tests", VerificationKind.TEST, VerificationOutcome.PASS, "5" * 64),
+                CandidateVerification("alias-build", VerificationKind.BUILD, VerificationOutcome.PASS, "6" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            review = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-alias", implementation_attempt_id="implementation-25", provider_attempt_id="alias-supervisor", supervisor_session_identity="alias-session", external_turn_identity="alias-review-turn", message_identity="alias-message", process_lease_id="alias-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            findings = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=DiffReviewOutput("diff-alias", "alias-supervisor", "alias-session", "alias-review-turn", "alias-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("alias repair",)), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
+            barrier = threading.Barrier(2)
+            original_claim = candidate_review._claim_repair_parent
+
+            def synchronized_claim(*arguments):
+                barrier.wait(timeout=10)
+                return original_claim(*arguments)
+
+            def dispatch(index):
+                try:
+                    return index, begin_implementation(repository, identity, context, implementation_attempt_id="repair-alias", provider_attempt_id=f"alias-worker-{index}", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=review.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=findings.routed_finding_ids, external_turn_identity=f"alias-turn-{index}", process_lease_id=f"alias-lease-{index}", process_lease_expires_at=now + 60, lease=lease, now=now)
+                except Exception as error:
+                    return index, error
+
+            with patch.object(candidate_review, "_claim_repair_parent", side_effect=synchronized_claim):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    outcomes = list(pool.map(dispatch, (1, 2)))
+            winners = [(index, value) for index, value in outcomes if isinstance(value, ImplementationDispatch)]
+            failures = [(index, value) for index, value in outcomes if isinstance(value, Exception)]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0][1], CandidateReviewError)
+            self.assertEqual(read_attempt(repository, identity, winners[0][1].provider_attempt_id).state, AttemptState.DISPATCHED)
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, f"alias-worker-{failures[0][0]}")
+
     def test_dirty_or_moved_candidate_stales_both_accepted_review_layers(self):
         for mutation in ("dirty", "moved"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:

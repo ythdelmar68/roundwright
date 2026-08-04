@@ -26,6 +26,7 @@ from roundwright.deployment import (
     evaluate_deployment_authority,
 )
 from roundwright.deployment import _receipt_binding_fingerprint
+from roundwright.runtime_binding import RuntimeBinding
 
 
 def fingerprint(character: str) -> str:
@@ -72,6 +73,20 @@ class DeploymentAuthorityTests(unittest.TestCase):
         self.assertTrue(decision.authorized)
         self.assertEqual(decision.mode, DeploymentMode.AUTHORITATIVE)
         self.assertEqual(decision.receipt_fingerprint, receipt.receipt_fingerprint)
+
+    def test_runtime_binding_drift_in_external_receipt_fails_closed(self) -> None:
+        identity = self.identity()
+        receipt = self.receipt(identity)
+        verification = replace(
+            self.verification(identity, receipt),
+            runtime_binding=RuntimeBinding(
+                "roundwright-runtime/v1", "sha256:" + "0" * 64,
+                "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+            ),
+        )
+        decision = evaluate_deployment_authority(identity, receipt, verification, now=self.now)
+        self.assertFalse(decision.authorized)
+        self.assertIn("runtime configuration", decision.reason)
 
     def test_missing_expired_and_conflicting_receipts_fail_closed(self) -> None:
         identity = self.identity()

@@ -537,6 +537,7 @@ def _current_trusted_policy_activation(
         decision.authorized
         and decision.policy_digest == context.policy_digest
         and decision.receipt_fingerprint == context.receipt_fingerprint
+        and evidence.receipt.runtime_binding == context.runtime_binding
     ):
         return None
     try:

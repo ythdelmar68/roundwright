@@ -110,7 +110,7 @@ class PlanReviewTests(unittest.TestCase):
             try:
                 evidence = connection.execute("SELECT completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()[0]
                 connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = 'accepted' WHERE attempt_id = ?", (dispatch.review_attempt_id, dispatch.provider_attempt_id))
-                connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)", (dispatch.review_attempt_id, identity.task_id, dispatch.provider_attempt_id, evidence))
+                connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (dispatch.review_attempt_id, identity.task_id, dispatch.provider_attempt_id, evidence, *context.runtime_binding.columns()))
                 connection.commit()
             finally:
                 connection.close()

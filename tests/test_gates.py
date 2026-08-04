@@ -35,6 +35,7 @@ from roundwright.gates import (
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease
 from roundwright.policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
+from roundwright.runtime_binding import RuntimeBinding
 from roundwright.state import SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, transition_task
 
 
@@ -205,6 +206,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         task_fingerprint: str | None = None,
         activated_at: datetime | None = None,
         status: ReceiptStatus = ReceiptStatus.FRESH,
+        runtime_binding: RuntimeBinding | None = None,
     ) -> TrustedGatePolicyEvidence:
         snapshot = self.policy_snapshot()
         activated_at = datetime(2026, 7, 29, tzinfo=timezone.utc) if activated_at is None else activated_at
@@ -220,6 +222,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             context.candidate_sha,
             activated_at,
             now + timedelta(minutes=1),
+            context.runtime_binding if runtime_binding is None else runtime_binding,
         )
         return TrustedGatePolicyEvidence(
             snapshot,
@@ -375,6 +378,20 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 )
             finally:
                 connection.close()
+
+    def test_activation_receipt_runtime_binding_drift_blocks_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, _, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            stale_binding = RuntimeBinding(
+                "roundwright-runtime/v1", "sha256:" + "0" * 64,
+                "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+            )
+            evidence = self.policy_evidence(context, runtime_binding=stale_binding)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(
+                    evaluate_gates(repository, binding, seal, context, policy_evidence=evidence, lease=lease).outcome,
+                    GateOutcome.BLOCKED,
+                )
 
     def test_live_head_and_dirty_drift_block_the_only_final_transition_path(self) -> None:
         for message in ("candidate head moved and candidate sealing is required", "candidate worktree is dirty"):

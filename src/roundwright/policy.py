@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
+from .runtime_binding import RuntimeBinding
+
+_DEFAULT_RUNTIME_BINDING = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, tuple("sha256:" + value * 64 for value in "234"))
 
 
 POLICY_SCHEMA_VERSION = 1
@@ -128,6 +131,7 @@ class ActivationReceipt:
     candidate_sha: str
     activated_at: datetime
     expires_at: datetime
+    runtime_binding: RuntimeBinding = _DEFAULT_RUNTIME_BINDING
 
     def __post_init__(self) -> None:
         for value, description in (
@@ -149,6 +153,8 @@ class ActivationReceipt:
         _require_utc(self.expires_at, "receipt expiry")
         if self.expires_at <= self.activated_at:
             raise PolicyError("the activation receipt has an invalid lifetime")
+        if type(self.runtime_binding) is not RuntimeBinding:
+            raise PolicyError("the activation receipt runtime configuration binding is invalid")
 
 
 @dataclass(frozen=True)

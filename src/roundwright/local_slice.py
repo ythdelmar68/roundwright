@@ -170,7 +170,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch):
     set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint=_fingerprint("next", identity.task_id), lease=lease)
     begin_planning(repository, identity, evidence_fingerprint=_fingerprint("transition", "queued", identity.task_id), lease=lease)
 
-    runtime_binding = load_configuration(cwd=repository.root, environment={}).pin().runtime_binding()
+    runtime_binding = _local_runtime_binding(repository)
     context = RecoveryContext.for_task(
         identity,
         candidate_sha=None,
@@ -386,7 +386,7 @@ def _completed_result(repository, identity, fixture):
         or diff[1:] != (row[0], row[1], row[0], row[1], "local-plan", "local-plan-review")
     ):
         raise LocalSliceError("completed local slice review evidence does not match its source, plan, or candidate")
-    runtime_binding = load_configuration(cwd=repository.root, environment={}).pin().runtime_binding()
+    runtime_binding = _local_runtime_binding(repository)
     expected_context, _ = _gate_evidence(
         identity, CandidateSeal(identity.task_id, *row), datetime(2030, 1, 1, tzinfo=timezone.utc), runtime_binding
     )
@@ -421,6 +421,16 @@ def _completed_result(repository, identity, fixture):
     return LocalSliceResult(task, CandidateSeal(identity.task_id, *row), decision.outcome, plan[0], diff[0])
 
 
+def _local_runtime_binding(repository: RepositoryIdentity):
+    """Resolve the fixture binding without invoking repository discovery commands."""
+
+    return load_configuration(
+        cwd=Path(os.__file__).resolve().parent,
+        environment={},
+        home=repository.root,
+    ).pin().runtime_binding()
+
+
 def _gate_evidence(identity, seal, instant, runtime_binding):
     source = TrustedControlSource(_fingerprint("control-source", identity.task_id), _fingerprint("control-revision", identity.task_id))
     snapshot = TrustedPolicySnapshot(source, PolicyDocument(1, frozenset({PolicyAction.ISSUE_COMMENT})))
@@ -429,6 +439,7 @@ def _gate_evidence(identity, seal, instant, runtime_binding):
         _fingerprint("owner", identity.task_id), context.receipt_fingerprint,
         source.source_fingerprint, source.revision_fingerprint, snapshot.policy_digest, 1,
         task_identity_fingerprint(identity), seal.candidate_sha, instant, instant + timedelta(minutes=1),
+        runtime_binding,
     )
     return context, TrustedGatePolicyEvidence(snapshot, receipt, StandingAuthority(frozenset(PolicyAction)), instant, ReceiptStatus.FRESH)
 

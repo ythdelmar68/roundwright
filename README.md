@@ -41,6 +41,14 @@ Supervisor, candidate, and gate contracts for a single isolated source. It is
 not a command-shell mode and never calls a provider, GitHub, CI, or any other
 networked service.
 
+## Operational documentation
+
+Phase 3's [dogfood promotion roadmap](docs/operations/dogfood-promotion-roadmap.md)
+keeps implementation phase separate from operational maturity. The
+[Shadow validation protocol](docs/architecture/shadow-validation.md) defines
+the permanent read-only comparison layer; neither document grants runtime or
+repository mutation authority.
+
 ## Development check
 
 Use Python 3.12:

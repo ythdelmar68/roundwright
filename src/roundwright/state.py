@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .configuration import RepositoryIdentity
+from .runtime_binding import RuntimeBinding, RuntimeBindingError
 
 
 class StateError(RuntimeError):
@@ -425,6 +426,15 @@ MIGRATIONS = (
             ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id), claimed_by_implementation_attempt_id TEXT, claimed_provider_attempt_id TEXT, claimed_external_turn_identity TEXT, claim_owner_token TEXT)"),
         ),
     ),
+    Migration(
+        31,
+        (
+            "CREATE TABLE runtime_configuration_bindings (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), schema_version TEXT NOT NULL, resolved_digest TEXT NOT NULL, worker_profile_identity TEXT NOT NULL, supervisor_profile_identities TEXT NOT NULL)",
+        ),
+        (
+            ("runtime_configuration_bindings", "CREATE TABLE runtime_configuration_bindings (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), schema_version TEXT NOT NULL, resolved_digest TEXT NOT NULL, worker_profile_identity TEXT NOT NULL, supervisor_profile_identities TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 
@@ -498,6 +508,30 @@ class DatabaseStatus:
     @property
     def healthy(self) -> bool:
         return self.state == "healthy"
+
+
+def record_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding) -> None:
+    """Persist the one immutable binding before a provider turn can be prepared."""
+    import json
+    try:
+        with _open_writable_connection(repository) as connection:
+            row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
+            values = (binding.schema_version, binding.resolved_digest, binding.worker_profile_identity, json.dumps(binding.supervisor_profile_identities, separators=(",", ":")))
+            if row is None:
+                connection.execute("INSERT INTO runtime_configuration_bindings(task_id, schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?)", (identity.task_id, *values))
+            elif tuple(row) != values:
+                raise StateError("resolved configuration binding has drifted")
+    except RuntimeBindingError as error:
+        raise StateError("resolved configuration binding is invalid") from error
+
+
+def require_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding) -> None:
+    import json
+    with _open_writable_connection(repository) as connection:
+        row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
+    expected = (binding.schema_version, binding.resolved_digest, binding.worker_profile_identity, json.dumps(binding.supervisor_profile_identities, separators=(",", ":")))
+    if row is None or tuple(row) != expected:
+        raise StateError("resolved configuration binding is missing or has drifted")
 
 
 def database_path(repository: RepositoryIdentity) -> Path:

@@ -17,6 +17,7 @@ from enum import Enum
 from importlib import resources
 from pathlib import Path
 from typing import Any, Generic, Mapping, TypeVar
+from .runtime_binding import RuntimeBinding
 
 
 class ConfigurationError(ValueError):
@@ -142,6 +143,9 @@ class ResolvedConfigurationBinding:
     def require_matches(self, other: "ResolvedConfigurationBinding") -> None:
         if type(other) is not ResolvedConfigurationBinding or self != other:
             raise ConfigurationError("resolved configuration binding has drifted")
+
+    def runtime_binding(self) -> RuntimeBinding:
+        return RuntimeBinding(self.schema_version, self.digest, self.worker_profile_identity, self.supervisor_profile_identities)
 
 
 @dataclass(frozen=True)

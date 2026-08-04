@@ -12,7 +12,9 @@ from roundwright.configuration import (
     ConfigurationSource,
     FinalFindingsPolicy,
     RepositoryIdentity,
+    ReviewDisposition,
     ReviewMode,
+    ReviewOutcome,
     load_configuration,
     parse_cli_overrides,
 )
@@ -111,6 +113,28 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError) as raised:
             load_configuration(cwd=root, environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "private-token"})
         self.assertNotIn("private-token", str(raised.exception))
+
+    def test_path_layers_are_source_auditable_and_digest_paths_without_disclosing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            configuration = load_configuration(
+                cwd=root, environment={"ROUNDWRIGHT_CACHE_DIRECTORY": str(cache)},
+                cli_values={"cache_directory": root / "cli-cache"},
+            )
+        self.assertEqual(configuration.cache_directory.value, root / "cli-cache")
+        self.assertEqual(configuration.sources["cache_directory"], ConfigurationSource.COMMAND_LINE)
+        self.assertNotIn(str(root), configuration.resolved_digest)
+
+    def test_review_policy_contract_covers_early_pass_final_repair_and_trusted_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = load_configuration(cwd=Path(temporary), environment={}).review_policy
+        self.assertEqual(policy.disposition(1, ReviewOutcome.PASS), ReviewDisposition.EARLY_PASS)
+        self.assertEqual(policy.disposition(9, ReviewOutcome.FINDINGS), ReviewDisposition.NEXT_ROUND)
+        self.assertEqual(policy.disposition(10, ReviewOutcome.FINDINGS), ReviewDisposition.WORKER_FINAL_REPAIR)
+        self.assertEqual(policy.disposition(10, ReviewOutcome.FINDINGS, worker_finalized=True), ReviewDisposition.REVIEW_LIMIT_REACHED_WORKER_FINALIZED)
+        with self.assertRaisesRegex(ConfigurationError, "floor"):
+            policy.__class__(2, 10, 3, policy.on_final_findings).enforce_floor(policy)
 
 
 if __name__ == "__main__":

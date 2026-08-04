@@ -54,15 +54,32 @@ class FinalFindingsPolicy(str, Enum):
     WORKER_FINAL_REPAIR_THEN_MERGE = "worker-final-repair-then-merge"
 
 
+class ReviewOutcome(str, Enum):
+    PASS = "PASS"
+    FINDINGS = "FINDINGS"
+
+
+class ReviewDisposition(str, Enum):
+    EARLY_PASS = "EARLY_PASS"
+    NEXT_ROUND = "NEXT_ROUND"
+    WORKER_FINAL_REPAIR = "WORKER_FINAL_REPAIR"
+    REVIEW_LIMIT_REACHED_WORKER_FINALIZED = "REVIEW_LIMIT_REACHED_WORKER_FINALIZED"
+
+
 T = TypeVar("T")
 _SCHEMA_VERSION = "roundwright-runtime/v1"
 _REPOSITORY_CONFIG = ".roundwright.toml"
+_EXPECTED_REPOSITORY = "ythdelmar68/roundwright"
 _SUPPORTED_MODELS = frozenset({"gpt-5.6-terra", "gpt-5.6-sol"})
 _REVIEW_ENVIRONMENT_KEYS = {
     "complete_rounds": "ROUNDWRIGHT_REVIEW_COMPLETE_ROUNDS",
     "max_rounds": "ROUNDWRIGHT_REVIEW_MAX_ROUNDS",
     "max_supervisor_attempts_per_round": "ROUNDWRIGHT_REVIEW_MAX_SUPERVISOR_ATTEMPTS_PER_ROUND",
     "on_final_findings": "ROUNDWRIGHT_REVIEW_ON_FINAL_FINDINGS",
+}
+_PATH_ENVIRONMENT_KEYS = {
+    "repository_root": "ROUNDWRIGHT_REPOSITORY_ROOT",
+    "cache_directory": "ROUNDWRIGHT_CACHE_DIRECTORY",
 }
 
 
@@ -90,6 +107,26 @@ class ReviewPolicy:
         if type(round_number) is not int or round_number < 1 or round_number > self.max_rounds:
             raise ConfigurationError("review round is outside the configured limit")
         return ReviewMode.COMPLETE if round_number <= self.complete_rounds else ReviewMode.CONVERGING
+
+    def disposition(self, round_number: int, outcome: ReviewOutcome, *, worker_finalized: bool = False) -> ReviewDisposition:
+        self.mode_for_round(round_number)
+        if worker_finalized:
+            if outcome is not ReviewOutcome.FINDINGS or round_number != self.max_rounds:
+                raise ConfigurationError("final worker repair has no valid review predecessor")
+            return ReviewDisposition.REVIEW_LIMIT_REACHED_WORKER_FINALIZED
+        if outcome is ReviewOutcome.PASS:
+            return ReviewDisposition.EARLY_PASS
+        if outcome is not ReviewOutcome.FINDINGS:
+            raise ConfigurationError("review outcome is unsupported")
+        return ReviewDisposition.WORKER_FINAL_REPAIR if round_number == self.max_rounds else ReviewDisposition.NEXT_ROUND
+
+    def enforce_floor(self, floor: "ReviewPolicy") -> "ReviewPolicy":
+        """A trusted policy may only make review stricter, never relax it."""
+        if type(floor) is not ReviewPolicy or self.complete_rounds < floor.complete_rounds or self.max_rounds < floor.max_rounds or self.max_supervisor_attempts_per_round < floor.max_supervisor_attempts_per_round:
+            raise ConfigurationError("review configuration violates the trusted policy floor")
+        if self.on_final_findings is not floor.on_final_findings:
+            raise ConfigurationError("review configuration violates the trusted terminal policy")
+        return self
 
 
 @dataclass(frozen=True)
@@ -173,6 +210,10 @@ class Configuration:
             "schema_version": self.schema_version,
             "worker": _profile_payload(self.worker.value),
             "supervisor_attempt_profiles": [_profile_payload(item) for item in self.supervisor_attempt_profiles.value],
+            "paths": {
+                "repository_root": None if self.repository_root.value is None else _digest({"path": os.fspath(self.repository_root.value)}),
+                "cache_directory": _digest({"path": os.fspath(self.cache_directory.value)}),
+            },
             "review": {
                 name: value.value.value if isinstance(value.value, Enum) else value.value
                 for name, value in sorted(self.review.items())
@@ -235,17 +276,31 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     repository = discover_repository(cwd)
     raw, sources = _default_runtime()[0], {}
     _mark_all(sources, raw, ConfigurationSource.DEFAULT)
+    paths: dict[str, EffectiveValue[Path | None]] = {
+        "repository_root": EffectiveValue(repository.root if repository else None, ConfigurationSource.DEFAULT),
+        "cache_directory": EffectiveValue(user_cache_path(platform=platform, environment=env, home=home), ConfigurationSource.DEFAULT),
+    }
     configured_user = user_config_path(platform=platform, environment=env, home=home) if user_config is None else user_config
-    _merge_runtime(raw, sources, _read_runtime_toml(configured_user, required=user_config is not None), ConfigurationSource.USER)
+    user_values = _read_runtime_toml(configured_user, required=user_config is not None)
+    _apply_paths(paths, user_values.get("paths", {}), ConfigurationSource.USER)
+    _merge_runtime(raw, sources, user_values, ConfigurationSource.USER)
+    if paths["repository_root"].value is not None:
+        repository = RepositoryIdentity.from_root(paths["repository_root"].value)
     repository_config_root: Path | None = None
+    if authoritative_repository_root is None and repository is not None:
+        authoritative_repository_root = discover_authoritative_repository(repository)
     if authoritative_repository_root is not None:
         authoritative_root = _validated_authoritative_repository(authoritative_repository_root)
         repository_values = _read_runtime_toml(authoritative_root / _REPOSITORY_CONFIG, required=False)
+        _apply_paths(paths, repository_values.get("paths", {}), ConfigurationSource.REPOSITORY, required_repository_root=authoritative_root)
         if repository_values:
             repository_config_root = authoritative_root
         _merge_runtime(raw, sources, repository_values, ConfigurationSource.REPOSITORY)
     _merge_runtime(raw, sources, _environment_updates(env), ConfigurationSource.ENVIRONMENT)
-    _merge_runtime(raw, sources, _cli_updates(cli_values or {}), ConfigurationSource.COMMAND_LINE)
+    _apply_paths(paths, _environment_path_updates(env), ConfigurationSource.ENVIRONMENT)
+    cli_updates = _cli_updates(cli_values or {})
+    _apply_paths(paths, cli_updates.get("paths", {}), ConfigurationSource.COMMAND_LINE)
+    _merge_runtime(raw, sources, cli_updates, ConfigurationSource.COMMAND_LINE)
     worker = _parse_profile(raw["roles"]["worker"], name_required=False)
     supervisors = tuple(_parse_profile(value, name_required=True) for value in raw["roles"]["supervisor"]["attempt_profiles"])
     review = _parse_review(raw["review"])
@@ -254,8 +309,8 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     if len({item.name for item in supervisors}) != len(supervisors):
         raise ConfigurationError("supervisor profile names must be unique")
     return Configuration(
-        repository_root=EffectiveValue(repository.root if repository else None, ConfigurationSource.DEFAULT),
-        cache_directory=EffectiveValue(user_cache_path(platform=platform, environment=env, home=home), ConfigurationSource.DEFAULT),
+        repository_root=paths["repository_root"],
+        cache_directory=paths["cache_directory"],  # type: ignore[arg-type]
         worker=EffectiveValue(worker, sources["roles.worker"]),
         supervisor_attempt_profiles=EffectiveValue(supervisors, sources["roles.supervisor.attempt_profiles"]),
         review={name: EffectiveValue(value, sources[f"review.{name}"]) for name, value in review.__dict__.items()},
@@ -308,15 +363,42 @@ def _validated_authoritative_repository(root: Path) -> Path:
         branch = subprocess.run(["git", "-C", os.fspath(repository.root), "symbolic-ref", "--quiet", "--short", "HEAD"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         head = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "HEAD^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         remote = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        origin = subprocess.run(["git", "-C", os.fspath(repository.root), "config", "--get", "remote.origin.url"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        status = subprocess.run(["git", "-C", os.fspath(repository.root), "status", "--porcelain=v1", "--untracked-files=all", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigurationError("authoritative repository identity is unavailable") from error
-    if branch.returncode or head.returncode or remote.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip():
+    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip():
         raise ConfigurationError("repository configuration is not from authoritative main")
     return repository.root
 
 
+def discover_authoritative_repository(repository: RepositoryIdentity) -> Path | None:
+    """Locate the sole clean local worktree checked out at trusted origin/main."""
+    try:
+        listed = subprocess.run(["git", "-C", os.fspath(repository.root), "worktree", "list", "--porcelain"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listed.returncode:
+        return None
+    roots = [Path(line.removeprefix("worktree ")) for line in listed.stdout.splitlines() if line.startswith("worktree ")]
+    candidates: list[Path] = []
+    for root in roots:
+        try:
+            candidates.append(_validated_authoritative_repository(root))
+        except ConfigurationError:
+            continue
+    if len(candidates) > 1:
+        raise ConfigurationError("authoritative repository identity is ambiguous")
+    return candidates[0] if candidates else None
+
+
+def _origin_matches(value: str) -> bool:
+    normalized = value.removesuffix(".git").rstrip("/").casefold()
+    return normalized.endswith(_EXPECTED_REPOSITORY)
+
+
 def _validate_document(document: object, *, complete: bool) -> None:
-    if type(document) is not dict or set(document) - {"runtime", "roles", "review"}:
+    if type(document) is not dict or set(document) - {"runtime", "paths", "roles", "review"}:
         raise ConfigurationError("configuration contains an unknown section")
     if complete and set(document) != {"runtime", "roles", "review"}:
         raise ConfigurationError("packaged runtime defaults are incomplete")
@@ -326,6 +408,10 @@ def _validate_document(document: object, *, complete: bool) -> None:
             raise ConfigurationError("configuration schema version is unsupported")
     elif complete:
         raise ConfigurationError("configuration schema version is missing")
+    paths = document.get("paths")
+    if paths is not None:
+        if type(paths) is not dict or set(paths) - {"repository_root", "cache_directory"} or not all(isinstance(item, (str, Path)) and str(item).strip() for item in paths.values()):
+            raise ConfigurationError("configuration path settings are unsupported")
     roles = document.get("roles")
     if roles is not None:
         if type(roles) is not dict or set(roles) - {"worker", "supervisor"}:
@@ -388,6 +474,10 @@ def _environment_updates(environment: Mapping[str, str]) -> dict[str, Any]:
     return {} if not review else {"review": review}
 
 
+def _environment_path_updates(environment: Mapping[str, str]) -> dict[str, object]:
+    return {name: environment[key] for name, key in _PATH_ENVIRONMENT_KEYS.items() if key in environment}
+
+
 def _cli_updates(values: Mapping[str, object]) -> dict[str, Any]:
     update: dict[str, Any] = {}
     for key, value in values.items():
@@ -400,10 +490,28 @@ def _cli_updates(values: Mapping[str, object]) -> dict[str, Any]:
             update.setdefault("roles", {})["worker"] = value
         elif key == "roles.supervisor.attempt_profiles":
             update.setdefault("roles", {})["supervisor"] = {"attempt_profiles": value}
+        elif key in {"repository_root", "cache_directory"}:
+            update.setdefault("paths", {})[key] = value
         else:
             raise ConfigurationError("CLI override is unsupported")
     _validate_document(update, complete=False)
     return update
+
+
+def _apply_paths(current: dict[str, EffectiveValue[Path | None]], updates: Mapping[str, object], source: ConfigurationSource, *, required_repository_root: Path | None = None) -> None:
+    for name, raw in updates.items():
+        if name not in {"repository_root", "cache_directory"} or not isinstance(raw, (str, Path)) or not str(raw).strip():
+            raise ConfigurationError("configuration path settings are unsupported")
+        value = Path(raw).expanduser()
+        if not value.is_absolute():
+            raise ConfigurationError("configuration paths must be absolute")
+        if name == "repository_root":
+            root = RepositoryIdentity.from_root(value).root
+            if required_repository_root is not None and root != required_repository_root:
+                raise ConfigurationError("repository configuration must not rebind the repository root")
+            current[name] = EffectiveValue(root, source)
+        else:
+            current[name] = EffectiveValue(value, source)
 
 
 def parse_cli_overrides(values: list[str]) -> dict[str, object]:

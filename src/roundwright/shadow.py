@@ -170,6 +170,8 @@ class ShadowIdentity:
     retention_reference: str = ""
     normalization_version: str = ""
     comparator_version: str = ""
+    input_identities: tuple[str, ...] = ()
+    reference_result_digest: str = ""
 
     def digest(self) -> str:
         _validate_identity(self)
@@ -200,9 +202,13 @@ class ShadowObservation:
     accepted_review_identity: str | None = None
     worktree_identity: str | None = None
     worktree_clean: bool = True
+    input_identities: tuple[str, ...] = ()
+    input_digests: tuple[str, ...] = ()
+    reference_result_digest: str | None = None
     evidence_digest: str = field(default="")
 
     def __post_init__(self) -> None:
+        _validate_observation(self, verify_digest=False)
         payload = _observation_payload(self, include_digest=False)
         digest = _digest(payload)
         if self.evidence_digest and self.evidence_digest != digest:
@@ -225,6 +231,7 @@ class ShadowCase:
     case_digest: str = field(default="")
 
     def __post_init__(self) -> None:
+        _validate_case(self, verify_digest=False)
         payload = _case_payload(self, include_digest=False)
         digest = _digest(payload)
         if self.case_digest and self.case_digest != digest:
@@ -329,6 +336,12 @@ class ShadowExecutor:
                     observation.source_id, observation.task_id, observation.base_sha, observation.policy_identity,
                 )):
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "bound identity evidence is missing")
+                if observation.input_identities != case.identity.input_identities or observation.input_digests != case.identity.input_digests:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "immutable replay inputs have drifted")
+                if observation.reference_result_digest is None:
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "reference result content is missing")
+                if observation.reference_result_digest != case.identity.reference_result_digest:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "reference result content has drifted")
                 if observation.worktree_identity is None:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worktree evidence is missing")
                 if not observation.worktree_clean:
@@ -376,7 +389,7 @@ class ShadowExecutor:
         allowed = set(case.expected_nondeterminism)
         if differences and all(item.field in allowed for item in differences):
             return _report(case, ComparisonOutcome.MISMATCH, ReplayClassification.EXPECTED_NONDETERMINISM, replayed_states, comparisons, "declared nondeterministic fields differ")
-        return _report(case, ComparisonOutcome.MISMATCH, ReplayClassification.CONTRACT_MISMATCH, replayed_states, comparisons, "deterministic comparison differs")
+        return _report(case, ComparisonOutcome.MISMATCH, ReplayClassification.CONTRACT_MISMATCH, replayed_states, comparisons, "deterministic comparison differs", MismatchDisposition.SEMANTIC_REGRESSION)
 
 
 def replay_shadow_case(case: ShadowCase) -> ShadowReport:
@@ -389,7 +402,7 @@ def _invalid_report(case: object, classification: ReplayClassification, detail: 
     return ShadowReport("invalid-case", "none", ComparisonOutcome.INVALID, classification, (), (), detail)
 
 
-def _report(case: ShadowCase, outcome: ComparisonOutcome, classification: ReplayClassification, replayed_states: tuple[str, ...], comparisons: tuple[FieldComparison, ...], detail: str) -> ShadowReport:
+def _report(case: ShadowCase, outcome: ComparisonOutcome, classification: ReplayClassification, replayed_states: tuple[str, ...], comparisons: tuple[FieldComparison, ...], detail: str, disposition: MismatchDisposition | None = None) -> ShadowReport:
     identity = case.identity
     pairs = tuple((name, _public_identifier(value)) for name, value in (
         ("source", identity.source_id), ("task", identity.task_id), ("base", identity.base_sha),
@@ -398,14 +411,14 @@ def _report(case: ShadowCase, outcome: ComparisonOutcome, classification: Replay
         ("gate", identity.gate_identity), ("worktree", identity.worktree_identity),
         ("reference_result", identity.reference_result_identity),
     ))
-    return ShadowReport(case.case_id, case.case_digest, outcome, classification, replayed_states, comparisons, detail, public_identities=pairs, retention_reference=_public_identifier(identity.retention_reference))
+    return ShadowReport(case.case_id, case.case_digest, outcome, classification, replayed_states, comparisons, detail, disposition, pairs, _public_identifier(identity.retention_reference))
 
 
 def _comparison(field: ComparisonField, expected: str, actual: str) -> FieldComparison:
     return FieldComparison(field, expected, actual, expected == actual)
 
 
-def _validate_case(case: object) -> None:
+def _validate_case(case: object, *, verify_digest: bool = True) -> None:
     if type(case) is not ShadowCase:
         raise ShadowError("shadow case is invalid")
     _token(case.schema, "shadow case schema")
@@ -419,6 +432,8 @@ def _validate_case(case: object) -> None:
     if any(type(observation) is not ShadowObservation for observation in case.observations):
         raise ShadowError("shadow observation is invalid")
     _validate_identity(case.identity)
+    for observation in case.observations:
+        _validate_observation(observation, verify_digest=verify_digest)
     if type(case.expected_states) is not tuple or any(type(state) is not str for state in case.expected_states) or case.expected_states != _PHASE_TWO_STATES:
         raise ShadowError("expected state trace does not match the Phase 2 contract")
     if not isinstance(case.expected_applicability, Applicability):
@@ -429,7 +444,7 @@ def _validate_case(case: object) -> None:
         raise ShadowError("expected nondeterminism is invalid")
     if any(item is not ComparisonField.NEXT_ACTION for item in case.expected_nondeterminism):
         raise ShadowError("expected nondeterminism includes a semantic field")
-    if type(case.case_digest) is not str or not _SHA256.fullmatch(case.case_digest) or case.case_digest != _digest(_case_payload(case, include_digest=False)):
+    if verify_digest and (type(case.case_digest) is not str or not _SHA256.fullmatch(case.case_digest) or case.case_digest != _digest(_case_payload(case, include_digest=False))):
         raise ShadowError("shadow case digest does not match immutable content")
 
 
@@ -463,9 +478,15 @@ def _validate_identity(identity: object) -> None:
         raise ShadowError("input digests are incomplete")
     if any(type(digest) is not str or not _SHA256.fullmatch(digest) for digest in identity.input_digests):
         raise ShadowError("input digest is invalid")
+    if type(identity.input_identities) is not tuple or len(identity.input_identities) != len(identity.input_digests) or not identity.input_identities:
+        raise ShadowError("input identities are incomplete")
+    if any(type(value) is not str or not _TOKEN.fullmatch(value) for value in identity.input_identities) or len(set(identity.input_identities)) != len(identity.input_identities):
+        raise ShadowError("input identity is invalid")
+    if type(identity.reference_result_digest) is not str or not _SHA256.fullmatch(identity.reference_result_digest):
+        raise ShadowError("reference result digest is invalid")
 
 
-def _validate_observation(observation: object) -> None:
+def _validate_observation(observation: object, *, verify_digest: bool = True) -> None:
     if type(observation) is not ShadowObservation:
         raise ShadowError("shadow observation is invalid")
     _token(observation.event_id, "event identity")
@@ -501,7 +522,13 @@ def _validate_observation(observation: object) -> None:
         raise ShadowError("worktree cleanliness is invalid")
     if observation.requested_mutation is not None and not isinstance(observation.requested_mutation, MutationKind):
         raise ShadowError("requested mutation is invalid")
-    if type(observation.evidence_digest) is not str or not _SHA256.fullmatch(observation.evidence_digest) or observation.evidence_digest != _digest(_observation_payload(observation, include_digest=False)):
+    if type(observation.input_identities) is not tuple or type(observation.input_digests) is not tuple or len(observation.input_identities) != len(observation.input_digests):
+        raise ShadowError("observation inputs are invalid")
+    if any(type(value) is not str or not _TOKEN.fullmatch(value) for value in observation.input_identities) or any(type(value) is not str or not _SHA256.fullmatch(value) for value in observation.input_digests):
+        raise ShadowError("observation input is invalid")
+    if observation.reference_result_digest is not None and (type(observation.reference_result_digest) is not str or not _SHA256.fullmatch(observation.reference_result_digest)):
+        raise ShadowError("observation reference digest is invalid")
+    if verify_digest and (type(observation.evidence_digest) is not str or not _SHA256.fullmatch(observation.evidence_digest) or observation.evidence_digest != _digest(_observation_payload(observation, include_digest=False))):
         raise ShadowError("observation digest does not match immutable content")
 
 
@@ -567,6 +594,8 @@ def _identity_payload(identity: ShadowIdentity) -> dict[str, str]:
         "retention_reference": identity.retention_reference,
         "normalization_version": identity.normalization_version,
         "comparator_version": identity.comparator_version,
+        "input_identities": identity.input_identities,
+        "reference_result_digest": identity.reference_result_digest,
     }
 
 
@@ -592,6 +621,9 @@ def _observation_payload(observation: ShadowObservation, *, include_digest: bool
         "accepted_review_identity": observation.accepted_review_identity,
         "worktree_identity": observation.worktree_identity,
         "worktree_clean": observation.worktree_clean,
+        "input_identities": observation.input_identities,
+        "input_digests": observation.input_digests,
+        "reference_result_digest": observation.reference_result_digest,
     }
     if include_digest:
         payload["evidence_digest"] = observation.evidence_digest
@@ -641,7 +673,4 @@ def _disposition_for(classification: ReplayClassification) -> MismatchDispositio
 
 
 def _public_identifier(value: str) -> str:
-    lowered = value.casefold()
-    if any(part in lowered for part in ("/", "\\", ":", "credential", "secret", "token", "password", "private")):
-        return "sha256:" + _digest({"private": value})
-    return value
+    return "sha256:" + _digest({"opaque": value})

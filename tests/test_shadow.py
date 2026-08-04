@@ -32,7 +32,7 @@ class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",
-            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1",
+            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(),
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -44,6 +44,7 @@ class ShadowTests(unittest.TestCase):
                 state, CANDIDATE, source_id="source-38", task_id="task-38", base_sha=BASE, policy_identity="policy-38",
                 gate_identity="gate-38", applicability=Applicability.APPLICABLE, blocker=None, next_action="owner-review",
                 accepted_review_identity="review-38", worktree_identity="worktree-38",
+                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(),
             ))
         items[-1] = replace(items[-1], **last_changes, evidence_digest="")
         return tuple(items)
@@ -126,10 +127,8 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.EXPECTED_NONDETERMINISM))
 
     def test_identity_nondeterminism_is_rejected_before_it_can_mask_drift(self):
-        report = ShadowExecutor().replay(self.case(
-            self.observations(attempt_id="provider-37"), expected_nondeterminism=(ComparisonField.IDENTITY,),
-        ))
-        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+        with self.assertRaisesRegex(Exception, "expected nondeterminism"):
+            self.case(self.observations(attempt_id="provider-37"), expected_nondeterminism=(ComparisonField.IDENTITY,))
 
     def test_every_mutation_capability_denies_before_its_callback(self):
         adapter = NoMutationCapabilities()
@@ -201,16 +200,15 @@ class ShadowTests(unittest.TestCase):
                 calls.append("compare")
                 return super().__lt__(other)
 
-        event = ShadowExecutor().replay(self.case(self.observations(event_id=HookedString("event-hook"))))
-        count = ShadowExecutor().replay(self.case(self.observations(source_count=HookedInt(1))))
-        self.assertEqual((event.outcome, count.outcome), (ComparisonOutcome.INVALID, ComparisonOutcome.INVALID))
+        with self.assertRaisesRegex(Exception, "event identity"):
+            self.observations(event_id=HookedString("event-hook"))
+        with self.assertRaisesRegex(Exception, "applicability"):
+            self.observations(source_count=HookedInt(1))
         self.assertEqual(calls, [])
 
     def test_protocol_manifest_is_required_immutable_and_curated(self):
-        missing = ShadowExecutor().replay(ShadowCase.build(
-            "case-38", replace(self.identity(), input_digests=()), self.observations(), expected_states=STATES,
-        ))
-        self.assertEqual((missing.outcome, missing.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+        with self.assertRaisesRegex(Exception, "input digests"):
+            ShadowCase.build("case-38", replace(self.identity(), input_digests=()), self.observations(), expected_states=STATES)
         case = self.case()
         object.__setattr__(case.identity, "fixture_environment_identity", "fixture-drift")
         drift = ShadowExecutor().replay(case)
@@ -223,7 +221,17 @@ class ShadowTests(unittest.TestCase):
         self.assertTrue(summary["case_id"].startswith("sha256:"))
         self.assertTrue(summary["identities"]["source"].startswith("sha256:"))
         self.assertTrue(summary["read_only"])
-        self.assertEqual(summary["retention_reference"], "retention-38")
+        self.assertTrue(summary["retention_reference"].startswith("sha256:"))
+
+    def test_replay_inputs_and_opaque_identifiers_fail_closed_or_redact(self):
+        drift = ShadowExecutor().replay(self.case(self.observations(input_digests=("0" * 64,))))
+        self.assertEqual((drift.outcome, drift.classification), (ComparisonOutcome.INVALID, ReplayClassification.STALE_EVIDENCE))
+        observations = tuple(replace(item, source_id="ghp_not-a-public-identity", task_id="person@example.invalid", evidence_digest="") for item in self.observations())
+        case = ShadowCase.build("ghp_case", replace(self.identity(), source_id="ghp_not-a-public-identity", task_id="person@example.invalid"), observations, expected_states=STATES)
+        summary = ShadowExecutor().replay(case).curated_summary()
+        self.assertTrue(summary["case_id"].startswith("sha256:"))
+        self.assertTrue(summary["identities"]["source"].startswith("sha256:"))
+        self.assertTrue(summary["identities"]["task"].startswith("sha256:"))
 
     def test_conflicting_replayed_event_is_a_contract_mismatch(self):
         observations = self.observations()

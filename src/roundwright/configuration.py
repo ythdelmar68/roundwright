@@ -136,6 +136,12 @@ class ResolvedConfigurationBinding:
     schema_version: str
     digest: str
     sources: Mapping[str, ConfigurationSource]
+    worker_profile_identity: str
+    supervisor_profile_identities: tuple[str, ...]
+
+    def require_matches(self, other: "ResolvedConfigurationBinding") -> None:
+        if type(other) is not ResolvedConfigurationBinding or self != other:
+            raise ConfigurationError("resolved configuration binding has drifted")
 
 
 @dataclass(frozen=True)
@@ -222,7 +228,13 @@ class Configuration:
         })
 
     def pin(self) -> ResolvedConfigurationBinding:
-        return ResolvedConfigurationBinding(self.schema_version, self.resolved_digest, dict(self.sources))
+        return ResolvedConfigurationBinding(
+            self.schema_version,
+            self.resolved_digest,
+            dict(self.sources),
+            _digest(_profile_payload(self.worker.value)),
+            tuple(_digest(_profile_payload(profile)) for profile in self.supervisor_attempt_profiles.value),
+        )
 
 
 @dataclass(frozen=True)

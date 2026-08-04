@@ -109,6 +109,8 @@ class ConfigurationTests(unittest.TestCase):
             second = load_configuration(cwd=root, environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "10"})
         self.assertNotEqual(first.pin().digest, second.pin().digest)
         self.assertEqual(first.pin().digest, first.resolved_digest)
+        self.assertTrue(first.pin().worker_profile_identity.startswith("sha256:"))
+        self.assertEqual(len(first.pin().supervisor_profile_identities), 3)
         self.assertNotIn(str(root), str(first.sources))
         with self.assertRaises(ConfigurationError) as raised:
             load_configuration(cwd=root, environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "private-token"})

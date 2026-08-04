@@ -172,6 +172,8 @@ class ShadowIdentity:
     comparator_version: str = ""
     input_identities: tuple[str, ...] = ()
     reference_result_digest: str = ""
+    input_payloads: tuple[bytes, ...] = ()
+    reference_result_payload: bytes = b""
 
     def digest(self) -> str:
         _validate_identity(self)
@@ -205,6 +207,8 @@ class ShadowObservation:
     input_identities: tuple[str, ...] = ()
     input_digests: tuple[str, ...] = ()
     reference_result_digest: str | None = None
+    input_payloads: tuple[bytes, ...] = ()
+    reference_result_payload: bytes | None = None
     evidence_digest: str = field(default="")
 
     def __post_init__(self) -> None:
@@ -243,21 +247,27 @@ class ShadowCase:
         cls,
         case_id: str,
         identity: ShadowIdentity,
-        observations: Iterable[ShadowObservation],
+        observations: tuple[ShadowObservation, ...],
         *,
-        expected_states: Iterable[str],
+        expected_states: tuple[str, ...],
         expected_applicability: Applicability = Applicability.APPLICABLE,
         expected_blocker: str | None = None,
-        expected_nondeterminism: Iterable[ComparisonField] = (),
+        expected_nondeterminism: tuple[ComparisonField, ...] = (),
     ) -> "ShadowCase":
+        if type(observations) is not tuple or any(type(item) is not ShadowObservation for item in observations):
+            raise ShadowError("shadow case observations are invalid")
+        if type(expected_states) is not tuple or any(type(item) is not str for item in expected_states):
+            raise ShadowError("expected state trace is invalid")
+        if type(expected_nondeterminism) is not tuple or any(type(item) is not ComparisonField for item in expected_nondeterminism):
+            raise ShadowError("expected nondeterminism is invalid")
         return cls(
             case_id,
             identity,
-            tuple(observations),
-            tuple(expected_states),
+            observations,
+            expected_states,
             expected_applicability,
             expected_blocker,
-            tuple(expected_nondeterminism),
+            expected_nondeterminism,
         )
 
 
@@ -338,10 +348,14 @@ class ShadowExecutor:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "bound identity evidence is missing")
                 if observation.input_identities != case.identity.input_identities or observation.input_digests != case.identity.input_digests:
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "immutable replay inputs have drifted")
+                if observation.input_payloads != case.identity.input_payloads:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "immutable replay input content has drifted")
                 if observation.reference_result_digest is None:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "reference result content is missing")
                 if observation.reference_result_digest != case.identity.reference_result_digest:
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "reference result content has drifted")
+                if observation.reference_result_payload != case.identity.reference_result_payload:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "reference result payload has drifted")
                 if observation.worktree_identity is None:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worktree evidence is missing")
                 if not observation.worktree_clean:
@@ -399,6 +413,12 @@ def replay_shadow_case(case: ShadowCase) -> ShadowReport:
 
 
 def _invalid_report(case: object, classification: ReplayClassification, detail: str) -> ShadowReport:
+    try:
+        _validate_case(case)
+    except ShadowError:
+        pass
+    else:
+        return _report(case, ComparisonOutcome.INVALID, classification, (), (), detail)
     return ShadowReport("invalid-case", "none", ComparisonOutcome.INVALID, classification, (), (), detail)
 
 
@@ -484,6 +504,12 @@ def _validate_identity(identity: object) -> None:
         raise ShadowError("input identity is invalid")
     if type(identity.reference_result_digest) is not str or not _SHA256.fullmatch(identity.reference_result_digest):
         raise ShadowError("reference result digest is invalid")
+    if type(identity.input_payloads) is not tuple or len(identity.input_payloads) != len(identity.input_digests) or any(type(value) is not bytes for value in identity.input_payloads):
+        raise ShadowError("input payload is invalid")
+    if any(hashlib.sha256(payload).hexdigest() != digest for payload, digest in zip(identity.input_payloads, identity.input_digests, strict=True)):
+        raise ShadowError("input digest does not match immutable content")
+    if type(identity.reference_result_payload) is not bytes or hashlib.sha256(identity.reference_result_payload).hexdigest() != identity.reference_result_digest:
+        raise ShadowError("reference result digest does not match immutable content")
 
 
 def _validate_observation(observation: object, *, verify_digest: bool = True) -> None:
@@ -528,6 +554,12 @@ def _validate_observation(observation: object, *, verify_digest: bool = True) ->
         raise ShadowError("observation input is invalid")
     if observation.reference_result_digest is not None and (type(observation.reference_result_digest) is not str or not _SHA256.fullmatch(observation.reference_result_digest)):
         raise ShadowError("observation reference digest is invalid")
+    if type(observation.input_payloads) is not tuple or len(observation.input_payloads) != len(observation.input_digests) or any(type(value) is not bytes for value in observation.input_payloads):
+        raise ShadowError("observation input payload is invalid")
+    if any(hashlib.sha256(payload).hexdigest() != digest for payload, digest in zip(observation.input_payloads, observation.input_digests, strict=True)):
+        raise ShadowError("observation input digest does not match content")
+    if observation.reference_result_payload is not None and (type(observation.reference_result_payload) is not bytes or observation.reference_result_digest is None or hashlib.sha256(observation.reference_result_payload).hexdigest() != observation.reference_result_digest):
+        raise ShadowError("observation reference content is invalid")
     if verify_digest and (type(observation.evidence_digest) is not str or not _SHA256.fullmatch(observation.evidence_digest) or observation.evidence_digest != _digest(_observation_payload(observation, include_digest=False))):
         raise ShadowError("observation digest does not match immutable content")
 
@@ -596,6 +628,8 @@ def _identity_payload(identity: ShadowIdentity) -> dict[str, str]:
         "comparator_version": identity.comparator_version,
         "input_identities": identity.input_identities,
         "reference_result_digest": identity.reference_result_digest,
+        "input_payloads": tuple(value.hex() for value in identity.input_payloads),
+        "reference_result_payload": identity.reference_result_payload.hex(),
     }
 
 
@@ -624,6 +658,8 @@ def _observation_payload(observation: ShadowObservation, *, include_digest: bool
         "input_identities": observation.input_identities,
         "input_digests": observation.input_digests,
         "reference_result_digest": observation.reference_result_digest,
+        "input_payloads": tuple(value.hex() for value in observation.input_payloads),
+        "reference_result_payload": None if observation.reference_result_payload is None else observation.reference_result_payload.hex(),
     }
     if include_digest:
         payload["evidence_digest"] = observation.evidence_digest

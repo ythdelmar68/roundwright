@@ -32,7 +32,7 @@ class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",
-            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(),
+            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(), (b"input-38",), b"reference-38",
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -44,7 +44,7 @@ class ShadowTests(unittest.TestCase):
                 state, CANDIDATE, source_id="source-38", task_id="task-38", base_sha=BASE, policy_identity="policy-38",
                 gate_identity="gate-38", applicability=Applicability.APPLICABLE, blocker=None, next_action="owner-review",
                 accepted_review_identity="review-38", worktree_identity="worktree-38",
-                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(),
+                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(), input_payloads=(b"input-38",), reference_result_payload=b"reference-38",
             ))
         items[-1] = replace(items[-1], **last_changes, evidence_digest="")
         return tuple(items)
@@ -206,6 +206,18 @@ class ShadowTests(unittest.TestCase):
             self.observations(source_count=HookedInt(1))
         self.assertEqual(calls, [])
 
+    def test_builder_rejects_iterables_before_traversal(self):
+        calls = []
+
+        class HookedIterable:
+            def __iter__(self):
+                calls.append("iter")
+                return iter(())
+
+        with self.assertRaisesRegex(Exception, "observations"):
+            ShadowCase.build("case-38", self.identity(), HookedIterable(), expected_states=STATES)
+        self.assertEqual(calls, [])
+
     def test_protocol_manifest_is_required_immutable_and_curated(self):
         with self.assertRaisesRegex(Exception, "input digests"):
             ShadowCase.build("case-38", replace(self.identity(), input_digests=()), self.observations(), expected_states=STATES)
@@ -224,8 +236,8 @@ class ShadowTests(unittest.TestCase):
         self.assertTrue(summary["retention_reference"].startswith("sha256:"))
 
     def test_replay_inputs_and_opaque_identifiers_fail_closed_or_redact(self):
-        drift = ShadowExecutor().replay(self.case(self.observations(input_digests=("0" * 64,))))
-        self.assertEqual((drift.outcome, drift.classification), (ComparisonOutcome.INVALID, ReplayClassification.STALE_EVIDENCE))
+        with self.assertRaisesRegex(Exception, "input digest"):
+            self.observations(input_digests=("0" * 64,))
         observations = tuple(replace(item, source_id="ghp_not-a-public-identity", task_id="person@example.invalid", evidence_digest="") for item in self.observations())
         case = ShadowCase.build("ghp_case", replace(self.identity(), source_id="ghp_not-a-public-identity", task_id="person@example.invalid"), observations, expected_states=STATES)
         summary = ShadowExecutor().replay(case).curated_summary()

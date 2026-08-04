@@ -218,6 +218,12 @@ class ShadowTests(unittest.TestCase):
             ShadowCase.build("case-38", self.identity(), HookedIterable(), expected_states=STATES)
         self.assertEqual(calls, [])
 
+    def test_uninitialized_exact_evidence_returns_generic_invalid_report(self):
+        case = object.__new__(ShadowCase)
+        report = ShadowExecutor().replay(case)
+        self.assertEqual((report.case_id, report.case_digest), ("invalid-case", "none"))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+
     def test_protocol_manifest_is_required_immutable_and_curated(self):
         with self.assertRaisesRegex(Exception, "input digests"):
             ShadowCase.build("case-38", replace(self.identity(), input_digests=()), self.observations(), expected_states=STATES)

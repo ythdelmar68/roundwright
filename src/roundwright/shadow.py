@@ -324,7 +324,7 @@ class ShadowExecutor:
 
         try:
             _validate_case(case)
-        except ShadowError as error:
+        except (ShadowError, AttributeError) as error:
             return _invalid_report(case, ReplayClassification.CONTRACT_MISMATCH, str(error))
 
         observations: list[ShadowObservation] = []
@@ -415,7 +415,7 @@ def replay_shadow_case(case: ShadowCase) -> ShadowReport:
 def _invalid_report(case: object, classification: ReplayClassification, detail: str) -> ShadowReport:
     try:
         _validate_case(case)
-    except ShadowError:
+    except (ShadowError, AttributeError):
         pass
     else:
         return _report(case, ComparisonOutcome.INVALID, classification, (), (), detail)

@@ -383,9 +383,13 @@ def _validated_authoritative_repository(root: Path) -> Path:
         remote = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         origin = subprocess.run(["git", "-C", os.fspath(repository.root), "config", "--get", "remote.origin.url"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         status = subprocess.run(["git", "-C", os.fspath(repository.root), "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        index = subprocess.run(["git", "-C", os.fspath(repository.root), "ls-files", "--stage", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        flags = subprocess.run(["git", "-C", os.fspath(repository.root), "ls-files", "-v", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigurationError("authoritative repository identity is unavailable") from error
-    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip():
+    ordinary_index = not index.stdout.strip() or index.stdout.split()[0] == "100644"
+    visible_flags = not flags.stdout.strip() or flags.stdout.startswith("H ")
+    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or index.returncode or flags.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip() or not ordinary_index or not visible_flags:
         raise ConfigurationError("repository configuration is not from authoritative main")
     return repository.root
 

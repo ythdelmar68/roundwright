@@ -156,6 +156,7 @@ def prepare_attempt(
     process_lease_id: str,
     process_lease_expires_at: int,
     input_fingerprint: str,
+    selected_profile_identity: str | None = None,
     lease: TransitionLease | None = None,
     now: int | None = None,
 ) -> ProviderAttempt:
@@ -203,7 +204,7 @@ def prepare_attempt(
         ).fetchone()[0]
         connection.execute(
             "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?)",
-            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, _selected_profile_identity(context, role)),
+            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, _selected_profile_identity(context, role, selected_profile_identity)),
         )
         _persist_context(connection, attempt_id, context)
         _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, observed)
@@ -475,7 +476,7 @@ def accept_supervisor_review(
         if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.COMPLETED:
             raise ProviderRecoveryError("only a completed supervisor attempt can be accepted")
         selected = connection.execute("SELECT selected_profile_identity FROM provider_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
-        if selected != (_selected_profile_identity(context, ProviderRole.SUPERVISOR),):
+        if selected is None or selected[0] not in context.runtime_binding.supervisor_profile_identities:
             raise ProviderRecoveryError("accepted supervisor profile binding has drifted")
         connection.execute(
             "UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?",
@@ -786,11 +787,14 @@ def _context_values(context: RecoveryContext) -> tuple[str | None, ...]:
     )
 
 
-def _selected_profile_identity(context: RecoveryContext, role: ProviderRole) -> str:
+def _selected_profile_identity(context: RecoveryContext, role: ProviderRole, requested: str | None = None) -> str:
     """Persist the one exact configured profile selected for this role's turn."""
 
     selected = context.runtime_binding.worker_profile_identity if role is not ProviderRole.SUPERVISOR else context.runtime_binding.supervisor_profile_identities[0]
-    if type(selected) is not str or not selected.startswith("sha256:"):
+    if requested is not None:
+        selected = requested
+    allowed = (context.runtime_binding.worker_profile_identity,) if role is not ProviderRole.SUPERVISOR else context.runtime_binding.supervisor_profile_identities
+    if type(selected) is not str or selected not in allowed:
         raise ProviderRecoveryError("selected provider profile identity is invalid")
     return selected
 

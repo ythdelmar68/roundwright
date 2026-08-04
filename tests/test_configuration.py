@@ -7,6 +7,7 @@ import unittest
 import io
 import os
 import subprocess
+import contextlib
 from pathlib import Path
 from unittest import mock
 
@@ -106,10 +107,13 @@ class ConfigurationTests(unittest.TestCase):
             without_overrides = load_configuration(cwd=candidate, environment={})
             self.assertEqual(without_overrides.review_policy.max_rounds, 6)
             output = io.StringIO()
-            with mock.patch("roundwright.cli.Path.cwd", return_value=candidate):
+            with contextlib.redirect_stdout(output), mock.patch("roundwright.cli.Path.cwd", return_value=candidate):
+                self.assertEqual(cli.main(["config", "validate"]), 0)
                 self.assertEqual(cli.main(["config", "show", "--sources"]), 0)
+                with mock.patch("roundwright.cli.require_safe_entrypoint_identity"):
+                    self.assertEqual(cli.main(["init"]), 0)
             self.assertTrue((main / ".roundwright.toml").is_file())
-            self.assertIn("review.max_rounds", output.getvalue() if output.getvalue() else "review.max_rounds")
+            self.assertIn("review.max_rounds: repository configuration", output.getvalue())
 
     def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:
         profiles = [

@@ -83,7 +83,8 @@ class ShadowTests(unittest.TestCase):
         recorded = self.observations(attempt_disposition=AttemptDisposition.RECORDED)
         stale = self.observations(accepted_review_identity="review-37")
         self.assertEqual(ShadowExecutor().replay(self.case(recorded)).classification, ReplayClassification.INCOMPLETE_EVIDENCE)
-        self.assertEqual(ShadowExecutor().replay(self.case(stale)).classification, ReplayClassification.CONTRACT_MISMATCH)
+        stale_report = ShadowExecutor().replay(self.case(stale))
+        self.assertEqual((stale_report.outcome, stale_report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
 
     def test_missing_gate_evidence_is_incomplete_not_a_comparison_mismatch(self):
         observations = self.observations(gate_identity=None)
@@ -95,7 +96,7 @@ class ShadowTests(unittest.TestCase):
         observations[0] = replace(observations[0], gate_identity="gate-wrong", evidence_digest="")
         report = ShadowExecutor().replay(self.case(tuple(observations)))
         identity = next(item for item in report.comparisons if item.field is ComparisonField.IDENTITY)
-        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.CONTRACT_MISMATCH))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
         self.assertFalse(identity.matches)
 
     def test_missing_or_mismatched_bound_identity_fails_closed(self):
@@ -103,7 +104,7 @@ class ShadowTests(unittest.TestCase):
         mismatched = ShadowExecutor().replay(self.case(self.observations(attempt_id="provider-37")))
         self.assertEqual((missing.outcome, missing.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
         identity = next(item for item in mismatched.comparisons if item.field is ComparisonField.IDENTITY)
-        self.assertEqual((mismatched.outcome, mismatched.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.CONTRACT_MISMATCH))
+        self.assertEqual((mismatched.outcome, mismatched.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
         self.assertFalse(identity.matches)
 
     def test_skipped_phase_two_states_are_incomplete_evidence(self):
@@ -121,6 +122,12 @@ class ShadowTests(unittest.TestCase):
         observations = self.observations(next_action="wait-for-owner")
         report = ShadowExecutor().replay(self.case(observations, expected_nondeterminism=(ComparisonField.NEXT_ACTION,)))
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.EXPECTED_NONDETERMINISM))
+
+    def test_identity_nondeterminism_is_rejected_before_it_can_mask_drift(self):
+        report = ShadowExecutor().replay(self.case(
+            self.observations(attempt_id="provider-37"), expected_nondeterminism=(ComparisonField.IDENTITY,),
+        ))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
 
     def test_every_mutation_capability_denies_before_its_callback(self):
         adapter = NoMutationCapabilities()
@@ -162,6 +169,22 @@ class ShadowTests(unittest.TestCase):
         report = ShadowExecutor().replay(self.case(observations))
         self.assertEqual(report.classification, ReplayClassification.FORBIDDEN_MUTATION)
         self.assertEqual(calls, [])
+
+    def test_subclass_evidence_hooks_are_rejected_without_attribute_access(self):
+        accesses = []
+
+        class AdversarialCase(ShadowCase):
+            def __getattribute__(self, name):
+                accesses.append(name)
+                return super().__getattribute__(name)
+
+        safe_case = self.case()
+        adversarial = object.__new__(AdversarialCase)
+        for field in safe_case.__dataclass_fields__:
+            object.__setattr__(adversarial, field, object.__getattribute__(safe_case, field))
+        report = ShadowExecutor().replay(adversarial)
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+        self.assertEqual(accesses, [])
 
     def test_conflicting_replayed_event_is_a_contract_mismatch(self):
         observations = self.observations()

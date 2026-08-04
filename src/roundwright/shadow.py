@@ -343,6 +343,10 @@ class ShadowExecutor:
             return ShadowReport(
                 case.case_id, case.case_digest, ComparisonOutcome.MATCH, ReplayClassification.EXACT_MATCH, replayed_states, comparisons, "exact deterministic match"
             )
+        if any(item.field in (ComparisonField.IDENTITY, ComparisonField.GATE) for item in differences):
+            return ShadowReport(
+                case.case_id, case.case_digest, ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH, replayed_states, comparisons, "bound identity evidence differs"
+            )
         allowed = set(case.expected_nondeterminism)
         if differences and all(item.field in allowed for item in differences):
             return ShadowReport(
@@ -360,8 +364,8 @@ def replay_shadow_case(case: ShadowCase) -> ShadowReport:
 
 
 def _invalid_report(case: object, classification: ReplayClassification, detail: str) -> ShadowReport:
-    case_id = case.case_id if isinstance(case, ShadowCase) else "invalid-case"
-    digest = case.case_digest if isinstance(case, ShadowCase) else "none"
+    case_id = case.case_id if type(case) is ShadowCase else "invalid-case"
+    digest = case.case_digest if type(case) is ShadowCase else "none"
     return ShadowReport(case_id, digest, ComparisonOutcome.INVALID, classification, (), (), detail)
 
 
@@ -370,28 +374,34 @@ def _comparison(field: ComparisonField, expected: str, actual: str) -> FieldComp
 
 
 def _validate_case(case: object) -> None:
-    if not isinstance(case, ShadowCase):
+    if type(case) is not ShadowCase:
         raise ShadowError("shadow case is invalid")
     if case.schema != SHADOW_CASE_SCHEMA:
         raise ShadowError("shadow case schema is unsupported")
     _token(case.case_id, "case identity")
-    _validate_identity(case.identity)
-    if not isinstance(case.observations, tuple) or not case.observations:
+    if type(case.identity) is not ShadowIdentity:
+        raise ShadowError("shadow identity is invalid")
+    if type(case.observations) is not tuple or not case.observations:
         raise ShadowError("shadow case observations are incomplete")
+    if any(type(observation) is not ShadowObservation for observation in case.observations):
+        raise ShadowError("shadow observation is invalid")
+    _validate_identity(case.identity)
     if case.expected_states != _PHASE_TWO_STATES:
         raise ShadowError("expected state trace does not match the Phase 2 contract")
     if not isinstance(case.expected_applicability, Applicability):
         raise ShadowError("expected applicability is invalid")
     if case.expected_blocker is not None:
         _token(case.expected_blocker, "expected blocker")
-    if any(not isinstance(item, ComparisonField) for item in case.expected_nondeterminism):
+    if any(type(item) is not ComparisonField for item in case.expected_nondeterminism):
         raise ShadowError("expected nondeterminism is invalid")
+    if any(item is not ComparisonField.NEXT_ACTION for item in case.expected_nondeterminism):
+        raise ShadowError("expected nondeterminism includes a semantic field")
     if case.case_digest != _digest(_case_payload(case, include_digest=False)):
         raise ShadowError("shadow case digest does not match immutable content")
 
 
 def _validate_identity(identity: object) -> None:
-    if not isinstance(identity, ShadowIdentity):
+    if type(identity) is not ShadowIdentity:
         raise ShadowError("shadow identity is invalid")
     _token(identity.source_id, "source identity")
     _token(identity.task_id, "task identity")
@@ -411,7 +421,7 @@ def _validate_identity(identity: object) -> None:
 
 
 def _validate_observation(observation: object) -> None:
-    if not isinstance(observation, ShadowObservation):
+    if type(observation) is not ShadowObservation:
         raise ShadowError("shadow observation is invalid")
     _token(observation.event_id, "event identity")
     _token(observation.attempt_id, "attempt identity")

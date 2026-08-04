@@ -30,7 +30,7 @@ STATES = ("queued", "planning", "plan-review", "implementing", "diff-review", "r
 class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
-            "source-38", "task-38", BASE, CANDIDATE, "policy-38", "worker-attempt", "review-38", "gate-38", "owner-review", "worktree-38"
+            "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38"
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -38,8 +38,9 @@ class ShadowTests(unittest.TestCase):
         items = []
         for index, (state, role) in enumerate(zip(STATES, roles, strict=True), start=1):
             items.append(ShadowObservation(
-                f"event-{index}", role, f"attempt-{index}", AttemptDisposition.ACCEPTED,
-                state, CANDIDATE, "gate-38", Applicability.APPLICABLE, None, "owner-review",
+                f"event-{index}", role, "provider-38", AttemptDisposition.ACCEPTED,
+                state, CANDIDATE, source_id="source-38", task_id="task-38", base_sha=BASE, policy_identity="policy-38",
+                gate_identity="gate-38", applicability=Applicability.APPLICABLE, blocker=None, next_action="owner-review",
                 accepted_review_identity="review-38", worktree_identity="worktree-38",
             ))
         items[-1] = replace(items[-1], **last_changes, evidence_digest="")
@@ -78,15 +79,36 @@ class ShadowTests(unittest.TestCase):
         report = ShadowExecutor().replay(self.case(observations))
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
 
-    def test_unaccepted_or_stale_review_evidence_fails_closed(self):
+    def test_unaccepted_or_mismatched_review_evidence_fails_closed(self):
         recorded = self.observations(attempt_disposition=AttemptDisposition.RECORDED)
         stale = self.observations(accepted_review_identity="review-37")
         self.assertEqual(ShadowExecutor().replay(self.case(recorded)).classification, ReplayClassification.INCOMPLETE_EVIDENCE)
-        self.assertEqual(ShadowExecutor().replay(self.case(stale)).classification, ReplayClassification.STALE_EVIDENCE)
+        self.assertEqual(ShadowExecutor().replay(self.case(stale)).classification, ReplayClassification.CONTRACT_MISMATCH)
 
     def test_missing_gate_evidence_is_incomplete_not_a_comparison_mismatch(self):
         observations = self.observations(gate_identity=None)
         report = ShadowExecutor().replay(self.case(observations))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
+
+    def test_observed_identity_is_derived_from_every_persisted_observation(self):
+        observations = list(self.observations())
+        observations[0] = replace(observations[0], gate_identity="gate-wrong", evidence_digest="")
+        report = ShadowExecutor().replay(self.case(tuple(observations)))
+        identity = next(item for item in report.comparisons if item.field is ComparisonField.IDENTITY)
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.CONTRACT_MISMATCH))
+        self.assertFalse(identity.matches)
+
+    def test_missing_or_mismatched_bound_identity_fails_closed(self):
+        missing = ShadowExecutor().replay(self.case(self.observations(source_id=None)))
+        mismatched = ShadowExecutor().replay(self.case(self.observations(attempt_id="provider-37")))
+        self.assertEqual((missing.outcome, missing.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
+        identity = next(item for item in mismatched.comparisons if item.field is ComparisonField.IDENTITY)
+        self.assertEqual((mismatched.outcome, mismatched.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.CONTRACT_MISMATCH))
+        self.assertFalse(identity.matches)
+
+    def test_skipped_phase_two_states_are_incomplete_evidence(self):
+        observations = self.observations()
+        report = ShadowExecutor().replay(self.case((observations[0], observations[-1])))
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
 
     def test_multi_source_not_applicable_evidence_fails_closed(self):
@@ -126,6 +148,20 @@ class ShadowTests(unittest.TestCase):
         observations = (*observations[:-1], replace(observations[-1], requested_mutation=MutationKind.GITHUB, evidence_digest=""))
         report = ShadowExecutor().replay(self.case(observations))
         self.assertEqual(report.classification, ReplayClassification.FORBIDDEN_MUTATION)
+
+    def test_executor_rejects_capability_injection(self):
+        calls = []
+
+        class Bypass(NoMutationCapabilities):
+            def execute(self, kind, action=None):
+                calls.append(kind)
+
+        with self.assertRaises(TypeError):
+            ShadowExecutor(Bypass())
+        observations = self.observations(requested_mutation=MutationKind.GITHUB)
+        report = ShadowExecutor().replay(self.case(observations))
+        self.assertEqual(report.classification, ReplayClassification.FORBIDDEN_MUTATION)
+        self.assertEqual(calls, [])
 
     def test_conflicting_replayed_event_is_a_contract_mismatch(self):
         observations = self.observations()

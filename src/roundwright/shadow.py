@@ -99,45 +99,43 @@ class NoMutationCapabilities:
     """
 
     def execute(self, kind: MutationKind, action: Callable[[], object] | None = None) -> Never:
-        if not isinstance(kind, MutationKind):
-            raise ShadowError("mutation kind is invalid")
-        raise ForbiddenMutationError(kind)
+        return _forbid_mutation(kind)
 
     def git(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.GIT, action)
+        return _forbid_mutation(MutationKind.GIT)
 
     def github(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.GITHUB, action)
+        return _forbid_mutation(MutationKind.GITHUB)
 
     def repository(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.REPOSITORY, action)
+        return _forbid_mutation(MutationKind.REPOSITORY)
 
     def queue(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.QUEUE, action)
+        return _forbid_mutation(MutationKind.QUEUE)
 
     def branch(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.BRANCH, action)
+        return _forbid_mutation(MutationKind.BRANCH)
 
     def worktree(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.WORKTREE, action)
+        return _forbid_mutation(MutationKind.WORKTREE)
 
     def pull_request(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.PULL_REQUEST, action)
+        return _forbid_mutation(MutationKind.PULL_REQUEST)
 
     def issue(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.ISSUE, action)
+        return _forbid_mutation(MutationKind.ISSUE)
 
     def merge(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.MERGE, action)
+        return _forbid_mutation(MutationKind.MERGE)
 
     def close(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.CLOSE, action)
+        return _forbid_mutation(MutationKind.CLOSE)
 
     def cleanup(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.CLEANUP, action)
+        return _forbid_mutation(MutationKind.CLEANUP)
 
     def lifecycle(self, action: Callable[[], object] | None = None) -> Never:
-        return self.execute(MutationKind.LIFECYCLE, action)
+        return _forbid_mutation(MutationKind.LIFECYCLE)
 
 
 @dataclass(frozen=True)
@@ -174,6 +172,10 @@ class ShadowObservation:
     applicability: Applicability
     blocker: str | None
     next_action: str
+    source_id: str | None = None
+    task_id: str | None = None
+    base_sha: str | None = None
+    policy_identity: str | None = None
     source_count: int = 1
     not_applicable_reason: str | None = None
     requested_mutation: MutationKind | None = None
@@ -270,9 +272,6 @@ class ShadowReport:
 class ShadowExecutor:
     """Replay persisted evidence through the fixed lifecycle state machine."""
 
-    def __init__(self, capabilities: NoMutationCapabilities | None = None):
-        self._capabilities = capabilities if capabilities is not None else NoMutationCapabilities()
-
     def replay(self, case: ShadowCase) -> ShadowReport:
         """Compare exactly one case without launching a Worker or changing state."""
 
@@ -293,13 +292,15 @@ class ShadowExecutor:
                     continue
                 seen[observation.event_id] = observation.evidence_digest
                 if observation.requested_mutation is not None:
-                    self._capabilities.execute(observation.requested_mutation)
+                    _forbid_mutation(observation.requested_mutation)
                 if observation.candidate_sha != case.identity.candidate_sha:
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "candidate-bound evidence is stale")
+                if any(value is None for value in (
+                    observation.source_id, observation.task_id, observation.base_sha, observation.policy_identity,
+                )):
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "bound identity evidence is missing")
                 if observation.worktree_identity is None:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worktree evidence is missing")
-                if observation.worktree_identity != case.identity.worktree_identity:
-                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "worktree-bound evidence is stale")
                 if not observation.worktree_clean:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worktree evidence is dirty")
                 if observation.attempt_disposition is AttemptDisposition.AMBIGUOUS:
@@ -308,8 +309,6 @@ class ShadowExecutor:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "review evidence is not accepted")
                 if observation.accepted_review_identity is None:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "accepted review evidence is missing")
-                if observation.accepted_review_identity != case.identity.accepted_review_identity:
-                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "accepted review evidence is stale")
                 if observation.gate_identity is None:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "gate evidence is missing")
                 if observation.applicability is Applicability.NOT_APPLICABLE and (
@@ -326,14 +325,15 @@ class ShadowExecutor:
             return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worker and supervisor observations are both required")
 
         replayed_states = tuple(item.state for item in observations)
-        if not _is_valid_trace(replayed_states):
-            return _invalid_report(case, ReplayClassification.CONTRACT_MISMATCH, "persisted states do not form a deterministic lifecycle trace")
+        trace_error = _trace_error(replayed_states)
+        if trace_error is not None:
+            return _invalid_report(case, trace_error[0], trace_error[1])
 
         final = observations[-1]
         comparisons = (
             _comparison(ComparisonField.STATE, ",".join(case.expected_states), ",".join(replayed_states)),
             _comparison(ComparisonField.GATE, case.identity.gate_identity, final.gate_identity),
-            _comparison(ComparisonField.IDENTITY, case.identity.digest(), _observed_identity_digest(case, observations)),
+            _comparison(ComparisonField.IDENTITY, _expected_identity_digest(case.identity, len(observations)), _observed_identity_digest(observations)),
             _comparison(ComparisonField.APPLICABILITY, case.expected_applicability.value, final.applicability.value),
             _comparison(ComparisonField.BLOCKER, case.expected_blocker or "none", final.blocker or "none"),
             _comparison(ComparisonField.NEXT_ACTION, case.identity.expected_next_action, final.next_action),
@@ -378,8 +378,8 @@ def _validate_case(case: object) -> None:
     _validate_identity(case.identity)
     if not isinstance(case.observations, tuple) or not case.observations:
         raise ShadowError("shadow case observations are incomplete")
-    if not isinstance(case.expected_states, tuple) or not case.expected_states:
-        raise ShadowError("expected state trace is incomplete")
+    if case.expected_states != _PHASE_TWO_STATES:
+        raise ShadowError("expected state trace does not match the Phase 2 contract")
     if not isinstance(case.expected_applicability, Applicability):
         raise ShadowError("expected applicability is invalid")
     if case.expected_blocker is not None:
@@ -423,6 +423,15 @@ def _validate_observation(observation: object) -> None:
         raise ShadowError("observation applicability is invalid")
     if not isinstance(observation.candidate_sha, str) or not _SHA1.fullmatch(observation.candidate_sha):
         raise ShadowError("observation candidate is invalid")
+    for value, name in (
+        (observation.source_id, "observation source identity"),
+        (observation.task_id, "observation task identity"),
+        (observation.policy_identity, "observation policy identity"),
+    ):
+        if value is not None:
+            _token(value, name)
+    if observation.base_sha is not None and (not isinstance(observation.base_sha, str) or not _SHA1.fullmatch(observation.base_sha)):
+        raise ShadowError("observation base identity is invalid")
     if observation.blocker is not None:
         _token(observation.blocker, "blocker")
     if observation.not_applicable_reason is not None:
@@ -441,20 +450,45 @@ def _validate_observation(observation: object) -> None:
         raise ShadowError("observation digest does not match immutable content")
 
 
-def _is_valid_trace(states: tuple[str, ...]) -> bool:
-    canonical = ("queued", "planning", "plan-review", "implementing", "diff-review", "ready-for-owner")
-    positions = {state: index for index, state in enumerate(canonical)}
-    if any(state not in positions for state in states):
-        return False
-    return tuple(sorted((positions[state] for state in states))) == tuple(positions[state] for state in states) and len(set(states)) == len(states)
+_PHASE_TWO_STATES = ("queued", "planning", "plan-review", "implementing", "diff-review", "ready-for-owner")
 
 
-def _observed_identity_digest(case: ShadowCase, observations: list[ShadowObservation]) -> str:
-    # The case is the one immutable carrier for source/task/policy/review
-    # identities; observations prove that its candidate was actually used.
-    # Candidate drift is rejected before this comparison is reached.
-    del observations
-    return case.identity.digest()
+def _trace_error(states: tuple[str, ...]) -> tuple[ReplayClassification, str] | None:
+    if any(state not in _PHASE_TWO_STATES for state in states) or len(set(states)) != len(states):
+        return ReplayClassification.CONTRACT_MISMATCH, "persisted states do not form a deterministic lifecycle trace"
+    if len(states) != len(_PHASE_TWO_STATES) or set(states) != set(_PHASE_TWO_STATES):
+        return ReplayClassification.INCOMPLETE_EVIDENCE, "persisted lifecycle evidence omits a Phase 2 state"
+    if states != _PHASE_TWO_STATES:
+        return ReplayClassification.CONTRACT_MISMATCH, "persisted states are not in Phase 2 lifecycle order"
+    return None
+
+
+def _expected_identity_digest(identity: ShadowIdentity, observation_count: int) -> str:
+    return _digest({
+        "source_id": (identity.source_id,) * observation_count,
+        "task_id": (identity.task_id,) * observation_count,
+        "base_sha": (identity.base_sha,) * observation_count,
+        "candidate_sha": (identity.candidate_sha,) * observation_count,
+        "policy_identity": (identity.policy_identity,) * observation_count,
+        "provider_attempt_identity": (identity.provider_attempt_identity,) * observation_count,
+        "accepted_review_identity": (identity.accepted_review_identity,) * observation_count,
+        "gate_identity": (identity.gate_identity,) * observation_count,
+        "worktree_identity": (identity.worktree_identity,) * observation_count,
+    })
+
+
+def _observed_identity_digest(observations: list[ShadowObservation]) -> str:
+    return _digest({
+        "source_id": tuple(item.source_id for item in observations),
+        "task_id": tuple(item.task_id for item in observations),
+        "base_sha": tuple(item.base_sha for item in observations),
+        "candidate_sha": tuple(item.candidate_sha for item in observations),
+        "policy_identity": tuple(item.policy_identity for item in observations),
+        "provider_attempt_identity": tuple(item.attempt_id for item in observations),
+        "accepted_review_identity": tuple(item.accepted_review_identity for item in observations),
+        "gate_identity": tuple(item.gate_identity for item in observations),
+        "worktree_identity": tuple(item.worktree_identity for item in observations),
+    })
 
 
 def _identity_payload(identity: ShadowIdentity) -> dict[str, str]:
@@ -480,6 +514,10 @@ def _observation_payload(observation: ShadowObservation, *, include_digest: bool
         "attempt_disposition": observation.attempt_disposition.value if isinstance(observation.attempt_disposition, AttemptDisposition) else observation.attempt_disposition,
         "state": observation.state,
         "candidate_sha": observation.candidate_sha,
+        "source_id": observation.source_id,
+        "task_id": observation.task_id,
+        "base_sha": observation.base_sha,
+        "policy_identity": observation.policy_identity,
         "gate_identity": observation.gate_identity,
         "applicability": observation.applicability.value if isinstance(observation.applicability, Applicability) else observation.applicability,
         "blocker": observation.blocker,
@@ -515,6 +553,12 @@ def _case_payload(case: ShadowCase, *, include_digest: bool) -> dict[str, object
 def _token(value: object, name: str) -> None:
     if not isinstance(value, str) or not _TOKEN.fullmatch(value):
         raise ShadowError(f"{name} is invalid")
+
+
+def _forbid_mutation(kind: MutationKind) -> Never:
+    if not isinstance(kind, MutationKind):
+        raise ShadowError("mutation kind is invalid")
+    raise ForbiddenMutationError(kind)
 
 
 def _digest(value: object) -> str:

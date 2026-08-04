@@ -224,6 +224,34 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual((report.case_id, report.case_digest), ("invalid-case", "none"))
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
 
+    def test_partial_exact_nested_evidence_returns_generic_invalid_report(self):
+        safe = self.case()
+        partial_identity = object.__new__(ShadowIdentity)
+        partial_observation = object.__new__(ShadowObservation)
+        identity_case = object.__new__(ShadowCase)
+        observation_case = object.__new__(ShadowCase)
+        for field in safe.__dataclass_fields__:
+            object.__setattr__(identity_case, field, object.__getattribute__(safe, field))
+            object.__setattr__(observation_case, field, object.__getattribute__(safe, field))
+        object.__setattr__(identity_case, "identity", partial_identity)
+        object.__setattr__(observation_case, "observations", (partial_observation,))
+        for case in (identity_case, observation_case):
+            report = ShadowExecutor().replay(case)
+            self.assertEqual((report.case_id, report.case_digest), ("invalid-case", "none"))
+            self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+
+    def test_safe_invalid_reports_retain_curated_evidence(self):
+        stale = ShadowExecutor().replay(self.case(self.observations(candidate_sha="c" * 40)))
+        incomplete = ShadowExecutor().replay(self.case(self.observations(gate_identity=None)))
+        forbidden = ShadowExecutor().replay(self.case(self.observations(requested_mutation=MutationKind.GITHUB)))
+        for report in (stale, incomplete, forbidden):
+            summary = report.curated_summary()
+            self.assertNotEqual(summary["case_digest"], "none")
+            self.assertTrue(summary["case_id"].startswith("sha256:"))
+            self.assertTrue(summary["identities"])
+            self.assertTrue(summary["retention_reference"].startswith("sha256:"))
+            self.assertTrue(summary["read_only"])
+
     def test_protocol_manifest_is_required_immutable_and_curated(self):
         with self.assertRaisesRegex(Exception, "input digests"):
             ShadowCase.build("case-38", replace(self.identity(), input_digests=()), self.observations(), expected_states=STATES)

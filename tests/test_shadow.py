@@ -20,6 +20,7 @@ from roundwright.shadow import (
     ShadowIdentity,
     ShadowObservation,
 )
+import hashlib
 
 
 BASE = "a" * 40
@@ -30,7 +31,8 @@ STATES = ("queued", "planning", "plan-review", "implementing", "diff-review", "r
 class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
-            "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38"
+            "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",
+            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1",
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -185,6 +187,43 @@ class ShadowTests(unittest.TestCase):
         report = ShadowExecutor().replay(adversarial)
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
         self.assertEqual(accesses, [])
+
+    def test_scalar_subclasses_are_rejected_before_hash_or_comparison(self):
+        calls = []
+
+        class HookedString(str):
+            def __hash__(self):
+                calls.append("hash")
+                return super().__hash__()
+
+        class HookedInt(int):
+            def __lt__(self, other):
+                calls.append("compare")
+                return super().__lt__(other)
+
+        event = ShadowExecutor().replay(self.case(self.observations(event_id=HookedString("event-hook"))))
+        count = ShadowExecutor().replay(self.case(self.observations(source_count=HookedInt(1))))
+        self.assertEqual((event.outcome, count.outcome), (ComparisonOutcome.INVALID, ComparisonOutcome.INVALID))
+        self.assertEqual(calls, [])
+
+    def test_protocol_manifest_is_required_immutable_and_curated(self):
+        missing = ShadowExecutor().replay(ShadowCase.build(
+            "case-38", replace(self.identity(), input_digests=()), self.observations(), expected_states=STATES,
+        ))
+        self.assertEqual((missing.outcome, missing.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+        case = self.case()
+        object.__setattr__(case.identity, "fixture_environment_identity", "fixture-drift")
+        drift = ShadowExecutor().replay(case)
+        self.assertEqual((drift.outcome, drift.classification), (ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH))
+        private_observations = tuple(replace(item, source_id="C:/private/token", evidence_digest="") for item in self.observations())
+        private = ShadowCase.build(
+            "C:/private/token", replace(self.identity(), source_id="C:/private/token"), private_observations, expected_states=STATES,
+        )
+        summary = ShadowExecutor().replay(private).curated_summary()
+        self.assertTrue(summary["case_id"].startswith("sha256:"))
+        self.assertTrue(summary["identities"]["source"].startswith("sha256:"))
+        self.assertTrue(summary["read_only"])
+        self.assertEqual(summary["retention_reference"], "retention-38")
 
     def test_conflicting_replayed_event_is_a_contract_mismatch(self):
         observations = self.observations()

@@ -43,6 +43,14 @@ capability adapter rejects every Git, GitHub, repository,
 queue, branch, worktree, pull-request, issue, merge, close, cleanup, and
 lifecycle mutation before a requested callback can run.
 
+The immutable case schema also records input-content digests, a reference
+result identity, declared comparison rules, fixture-environment identity,
+capture time, retention class/reference, and normalization/comparator
+versions. These bindings are part of the case digest. Curated reports export
+only safe identities, a retention reference, explicit read-only proof, and a
+protocol mismatch disposition; private/path-shaped identifiers are replaced by
+one-way public-safe digests.
+
 ## Deterministic comparison
 
 Comparison normalizes only protocol-declared, non-semantic variation before

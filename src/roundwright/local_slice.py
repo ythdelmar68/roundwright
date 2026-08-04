@@ -43,6 +43,7 @@ from .gates import (
     transition_ready_for_owner,
 )
 from .git_identity import CandidateSeal, provision_worktree, resolve_canonical_base, transition_lease
+from .configuration import load_configuration
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_recovery import RecoveryContext
@@ -169,11 +170,13 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch):
     set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint=_fingerprint("next", identity.task_id), lease=lease)
     begin_planning(repository, identity, evidence_fingerprint=_fingerprint("transition", "queued", identity.task_id), lease=lease)
 
+    runtime_binding = load_configuration(cwd=repository.root, environment={}).pin().runtime_binding()
     context = RecoveryContext.for_task(
         identity,
         candidate_sha=None,
         policy_fingerprint=_fingerprint("policy", identity.task_id),
         deployment_fingerprint=_fingerprint("deployment", identity.task_id),
+        runtime_binding=runtime_binding,
     )
     planning_input = PlanningInput(
         "Implement one isolated local task",
@@ -260,6 +263,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch):
     candidate_context = RecoveryContext.for_task(
         identity, candidate_sha=seal.candidate_sha,
         policy_fingerprint=context.policy_fingerprint, deployment_fingerprint=context.deployment_fingerprint,
+        runtime_binding=runtime_binding,
     )
     diff_review = dispatch_diff_review(
         repository, identity, candidate_context, binding, seal,
@@ -279,7 +283,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch):
     )
     record_artifact(repository, identity, artifact_kind="diff", artifact_fingerprint=_fingerprint("diff-artifact", seal.candidate_sha), lease=lease)
 
-    gate_context, policy_evidence = _gate_evidence(identity, seal, instant)
+    gate_context, policy_evidence = _gate_evidence(identity, seal, instant, runtime_binding)
     for index, requirement in enumerate(GATE_REGISTRY, 1):
         not_applicable = requirement.permits_phase_two_local_na
         record_gate_evidence(
@@ -382,8 +386,9 @@ def _completed_result(repository, identity, fixture):
         or diff[1:] != (row[0], row[1], row[0], row[1], "local-plan", "local-plan-review")
     ):
         raise LocalSliceError("completed local slice review evidence does not match its source, plan, or candidate")
+    runtime_binding = load_configuration(cwd=repository.root, environment={}).pin().runtime_binding()
     expected_context, _ = _gate_evidence(
-        identity, CandidateSeal(identity.task_id, *row), datetime(2030, 1, 1, tzinfo=timezone.utc)
+        identity, CandidateSeal(identity.task_id, *row), datetime(2030, 1, 1, tzinfo=timezone.utc), runtime_binding
     )
     if context_row != (
         expected_context.source_count,
@@ -394,7 +399,7 @@ def _completed_result(repository, identity, fixture):
         raise LocalSliceError("completed local slice gate context does not match the fixture contract")
     if any(record[9] != "[]" for record in gate_rows):
         raise LocalSliceError("completed local slice has malformed gate follow-up evidence")
-    context = GateContext(identity.task_id, row[1], context_row[0], bool(context_row[1]), context_row[2], context_row[3])
+    context = GateContext(identity.task_id, row[1], context_row[0], bool(context_row[1]), context_row[2], context_row[3], runtime_binding)
     evidence = tuple(GateEvidence(*record[:9], ()) for record in gate_rows)
     decision = decide_gates(context, evidence)
     if decision.outcome is not GateOutcome.PASS or len(evidence) != len(GATE_REGISTRY):
@@ -416,10 +421,10 @@ def _completed_result(repository, identity, fixture):
     return LocalSliceResult(task, CandidateSeal(identity.task_id, *row), decision.outcome, plan[0], diff[0])
 
 
-def _gate_evidence(identity, seal, instant):
+def _gate_evidence(identity, seal, instant, runtime_binding):
     source = TrustedControlSource(_fingerprint("control-source", identity.task_id), _fingerprint("control-revision", identity.task_id))
     snapshot = TrustedPolicySnapshot(source, PolicyDocument(1, frozenset({PolicyAction.ISSUE_COMMENT})))
-    context = GateContext(identity.task_id, seal.candidate_sha, 1, True, snapshot.policy_digest, _fingerprint("receipt", seal.candidate_sha))
+    context = GateContext(identity.task_id, seal.candidate_sha, 1, True, snapshot.policy_digest, _fingerprint("receipt", seal.candidate_sha), runtime_binding)
     receipt = ActivationReceipt(
         _fingerprint("owner", identity.task_id), context.receipt_fingerprint,
         source.source_fingerprint, source.revision_fingerprint, snapshot.policy_digest, 1,

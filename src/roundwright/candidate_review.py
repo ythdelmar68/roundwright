@@ -562,7 +562,7 @@ def read_diff_review(
             raise CandidateReviewError("diff review result is unavailable")
         provider = connection.execute("SELECT state, accepted_review_identity, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (row[8],)).fetchone()
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
         _require_exact_provider_context(connection, identity, row[8], context)
     finally:
         connection.close()
@@ -576,7 +576,7 @@ def read_diff_review(
         and provider[2] == f"diff-review:{diff_review_attempt_id}"
         and provider[3] is not None
         and output == (row[11],)
-        and accepted_provider == (identity.task_id, row[8], provider[3])
+        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns())
         and current_snapshot == row[5]
     )
     if not accepted and row[6] == "accepted":
@@ -931,10 +931,10 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
             provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3], provider[4])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != accepted_identity:
             raise CandidateReviewError("accepted PASS provider attempt conflicts with committed state")
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
-        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4])
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
+        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns())
         if accepted_provider is None:
-            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)", (accepted_identity, *expected_provider))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
         elif accepted_provider != expected_provider:
             raise CandidateReviewError("accepted provider review conflicts with committed state")
         if row[0] in ("recorded", "accepted") and row[1] in (None, accepted_identity):
@@ -959,6 +959,7 @@ def _require_diff_review_context(identity, context, seal):
         candidate_sha=seal.candidate_sha,
         policy_fingerprint=context.policy_fingerprint,
         deployment_fingerprint=context.deployment_fingerprint,
+        runtime_binding=context.runtime_binding,
     )
     if context != expected:
         raise CandidateReviewError("diff review recovery context does not match the sealed candidate")
@@ -969,8 +970,9 @@ def _require_exact_provider_context(connection, identity, attempt_id, context):
         identity.task_id, context.repository_fingerprint, context.worktree_fingerprint,
         context.branch_fingerprint, context.base_fingerprint, context.candidate_fingerprint,
         context.policy_fingerprint, context.deployment_fingerprint,
+        *context.runtime_binding.columns(),
     )
-    row = connection.execute("SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+    row = connection.execute("SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?", (attempt_id,)).fetchone()
     if row != expected:
         raise CandidateReviewError("diff review recovery context has drifted")
 

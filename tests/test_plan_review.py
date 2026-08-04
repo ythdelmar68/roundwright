@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import roundwright.plan_review as plan_review
 from roundwright.configuration import RepositoryIdentity
+from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.plan_review import (
     PlanReviewError,
@@ -40,6 +41,9 @@ from roundwright.worker_planning import (
 
 
 class PlanReviewTests(unittest.TestCase):
+    def runtime_binding(self) -> RuntimeBinding:
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+
     def repository(self, root):
         identity = object.__new__(RepositoryIdentity)
         object.__setattr__(identity, "root", root.resolve())
@@ -52,7 +56,7 @@ class PlanReviewTests(unittest.TestCase):
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="review-tests", ttl_seconds=120)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "b" * 64),), lease=lease)
         begin_planning(repository, identity, evidence_fingerprint="c" * 64, lease=lease)
-        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64)
+        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64, runtime_binding=self.runtime_binding())
         now = int(time.time())
         input_value = PlanningInput("Review plan", (), ("Persist review",), (), ("Run tests",), (), ())
         plan = WorkerPlan("Review plan", (), (), ("Persist review",), ("Run tests",), (), (), ())

@@ -435,6 +435,33 @@ MIGRATIONS = (
             ("runtime_configuration_bindings", "CREATE TABLE runtime_configuration_bindings (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), schema_version TEXT NOT NULL, resolved_digest TEXT NOT NULL, worker_profile_identity TEXT NOT NULL, supervisor_profile_identities TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        32,
+        (
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("provider_recovery_contexts", "CREATE TABLE provider_recovery_contexts (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '')"),
+            ("provider_attempt_contexts", "CREATE TABLE provider_attempt_contexts (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '')"),
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '')"),
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
 )
 
 
@@ -512,24 +539,31 @@ class DatabaseStatus:
 
 def record_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding) -> None:
     """Persist the one immutable binding before a provider turn can be prepared."""
-    import json
     try:
-        with _open_writable_connection(repository) as connection:
+        connection = _open_writable_connection(repository)
+        try:
             row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
-            values = (binding.schema_version, binding.resolved_digest, binding.worker_profile_identity, json.dumps(binding.supervisor_profile_identities, separators=(",", ":")))
+            values = binding.columns()
             if row is None:
                 connection.execute("INSERT INTO runtime_configuration_bindings(task_id, schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?)", (identity.task_id, *values))
             elif tuple(row) != values:
                 raise StateError("resolved configuration binding has drifted")
+            connection.commit()
+        finally:
+            connection.close()
     except RuntimeBindingError as error:
         raise StateError("resolved configuration binding is invalid") from error
 
 
 def require_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding) -> None:
-    import json
-    with _open_writable_connection(repository) as connection:
+    if type(binding) is not RuntimeBinding:
+        raise StateError("resolved configuration binding is invalid")
+    connection = _open_writable_connection(repository)
+    try:
         row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
-    expected = (binding.schema_version, binding.resolved_digest, binding.worker_profile_identity, json.dumps(binding.supervisor_profile_identities, separators=(",", ":")))
+    finally:
+        connection.close()
+    expected = binding.columns()
     if row is None or tuple(row) != expected:
         raise StateError("resolved configuration binding is missing or has drifted")
 

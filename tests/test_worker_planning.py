@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
+from roundwright.runtime_binding import RuntimeBinding
 import roundwright.worker_planning as worker_planning
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_recovery import RecoveryContext, record_completed_output
@@ -35,6 +36,9 @@ from roundwright.worker_planning import (
 
 
 class WorkerPlanningTests(unittest.TestCase):
+    def runtime_binding(self) -> RuntimeBinding:
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+
     def repository(self, root: Path) -> RepositoryIdentity:
         identity = object.__new__(RepositoryIdentity)
         object.__setattr__(identity, "root", root.resolve())
@@ -60,7 +64,7 @@ class WorkerPlanningTests(unittest.TestCase):
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="planning-tests", ttl_seconds=120)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "b" * 64),), lease=lease)
         begin_planning(repository, identity, evidence_fingerprint="c" * 64, lease=lease)
-        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64)
+        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64, runtime_binding=self.runtime_binding())
         return repository, identity, lease, context, now
 
     def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None, planning_input: PlanningInput | None = None):

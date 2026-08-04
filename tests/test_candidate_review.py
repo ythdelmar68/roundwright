@@ -25,6 +25,7 @@ from roundwright.candidate_review import (
 )
 import roundwright.candidate_review as candidate_review
 from roundwright.configuration import RepositoryIdentity
+from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, read_attempt, recover_attempt
@@ -37,6 +38,9 @@ from roundwright.worker_planning import (
 
 
 class CandidateReviewTests(unittest.TestCase):
+    def runtime_binding(self) -> RuntimeBinding:
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+
     def git(self, directory: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True).stdout.strip()
 
@@ -62,7 +66,7 @@ class CandidateReviewTests(unittest.TestCase):
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="test-owner", ttl_seconds=120)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, hashlib.sha256(b"source-25").hexdigest()),), lease=lease)
         begin_planning(repository, identity, evidence_fingerprint="a" * 64, lease=lease)
-        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint="c" * 64)
+        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint="c" * 64, runtime_binding=self.runtime_binding())
         now = int(time.time())
         input_value = PlanningInput("Implement candidate", (), ("Commit locally",), (), ("Unit tests",), (), ())
         plan = WorkerPlan("Implement candidate", (), (), ("Commit locally",), ("Unit tests",), (), (), ())
@@ -86,7 +90,7 @@ class CandidateReviewTests(unittest.TestCase):
         return dispatch, seal
 
     def review_context(self, identity, initial_context, seal):
-        return RecoveryContext.for_task(identity, candidate_sha=seal.candidate_sha, policy_fingerprint=initial_context.policy_fingerprint, deployment_fingerprint=initial_context.deployment_fingerprint)
+        return RecoveryContext.for_task(identity, candidate_sha=seal.candidate_sha, policy_fingerprint=initial_context.policy_fingerprint, deployment_fingerprint=initial_context.deployment_fingerprint, runtime_binding=initial_context.runtime_binding)
 
     def accepted_diff_review(self, values, *, review_id="diff-accepted", provider_id="accepted-supervisor"):
         repository, identity, lease, context, binding, now = values
@@ -411,7 +415,7 @@ class CandidateReviewTests(unittest.TestCase):
                 record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
             review = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-lease", implementation_attempt_id="implementation-25", provider_attempt_id="lease-supervisor", supervisor_session_identity="lease-session", external_turn_identity="lease-review-turn", message_identity="lease-message", process_lease_id="lease-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             findings = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=DiffReviewOutput("diff-lease", "lease-supervisor", "lease-session", "lease-review-turn", "lease-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("lease repair",)), completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
-            alternate_context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint=context.deployment_fingerprint)
+            alternate_context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint=context.deployment_fingerprint, runtime_binding=context.runtime_binding)
             barrier = threading.Barrier(2)
             original_claim = candidate_review._claim_repair_parent
 

@@ -13,7 +13,8 @@ from pathlib import Path
 from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence
 from .policy import ActivationReceipt, ReceiptStatus, StandingAuthority, TrustedPolicySnapshot, evaluate_policy
-from .state import StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner
+from .runtime_binding import RuntimeBinding, RuntimeBindingError
+from .state import StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner, require_runtime_binding
 
 
 class GateError(StateError):
@@ -78,6 +79,10 @@ GATE_REGISTRY = (
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}")
+_LOCAL_RUNTIME_BINDING = RuntimeBinding(
+    "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64,
+    tuple("sha256:" + value * 64 for value in "234"),
+)
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,7 @@ class GateContext:
     isolated_local_task: bool
     policy_digest: str
     receipt_fingerprint: str
+    runtime_binding: RuntimeBinding = _LOCAL_RUNTIME_BINDING
 
 
 @dataclass(frozen=True)
@@ -229,17 +235,17 @@ def record_gate_evidence(
         if context.source_count != source_count:
             raise GateError("gate context source count does not match committed task state")
         persisted_context = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
             (binding.task_id, seal.candidate_sha),
         ).fetchone()
-        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint)
+        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint, *context.runtime_binding.columns())
         if persisted_context is None:
             connection.execute(
-                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, policy_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, policy_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at),
             )
-        elif persisted_context[:4] != context_values:
-            if type(persisted_context[4]) is not str or policy_activated_at <= persisted_context[4]:
+        elif persisted_context[:8] != context_values:
+            if type(persisted_context[8]) is not str or policy_activated_at <= persisted_context[8]:
                 raise GateError("gate context conflicts with committed task state")
             connection.execute(
                 "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",
@@ -250,10 +256,10 @@ def record_gate_evidence(
                 (binding.task_id, seal.candidate_sha),
             )
             connection.execute(
-                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, policy_activated_at = ? WHERE task_id = ? AND candidate_sha = ?",
+                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, configuration_schema_version = ?, configuration_digest = ?, worker_profile_identity = ?, supervisor_profile_identities = ?, policy_activated_at = ? WHERE task_id = ? AND candidate_sha = ?",
                 (*context_values, policy_activated_at, binding.task_id, seal.candidate_sha),
             )
-        elif persisted_context[4] != policy_activated_at:
+        elif persisted_context[8] != policy_activated_at:
             raise GateError("gate context conflicts with committed task state")
         connection.execute(
             "INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)",
@@ -433,12 +439,16 @@ def _decision_from_connection(connection, identity) -> GateDecision:
 
 def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:
     row = connection.execute(
-        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
         (task_id, candidate_sha),
     ).fetchone()
     if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1) or not _is_fingerprint(row[2]) or not _is_fingerprint(row[3]):
         return None
-    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3])
+    try:
+        runtime_binding = RuntimeBinding(row[4], row[5], row[6], tuple(json.loads(row[7])))
+    except (RuntimeBindingError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3], runtime_binding)
 
 
 def _decide_requirement(context: GateContext, requirement: GateRequirement, entries: list[GateEvidence]) -> GateResult:
@@ -547,6 +557,7 @@ def _is_well_formed_context(context: GateContext) -> bool:
         and type(context.isolated_local_task) is bool
         and _is_fingerprint(context.policy_digest)
         and _is_fingerprint(context.receipt_fingerprint)
+        and type(context.runtime_binding) is RuntimeBinding
     )
 
 

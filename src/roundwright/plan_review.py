@@ -442,10 +442,10 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
             provider = (provider[0], AttemptState.ACCEPTED.value, dispatch.review_attempt_id, provider[3])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != dispatch.review_attempt_id:
             raise PlanReviewError("accepted PASS provider attempt conflicts with committed state")
-        provider_review = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (dispatch.review_attempt_id,)).fetchone()
-        expected_provider_review = (identity.task_id, dispatch.provider_attempt_id, provider[3])
+        provider_review = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (dispatch.review_attempt_id,)).fetchone()
+        expected_provider_review = (identity.task_id, dispatch.provider_attempt_id, provider[3], *context.runtime_binding.columns())
         if provider_review is None:
-            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)", (dispatch.review_attempt_id, *expected_provider_review))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (dispatch.review_attempt_id, *expected_provider_review))
         elif provider_review != expected_provider_review:
             raise PlanReviewError("accepted provider review conflicts with committed state")
         existing = connection.execute("SELECT plan_attempt_id, review_identity, review_digest FROM accepted_plan_reviews WHERE task_id = ?", (identity.task_id,)).fetchone()
@@ -543,9 +543,10 @@ def _require_exact_provider_context(connection, identity, provider_attempt_id, c
     expected = (
         identity.task_id, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint,
         context.base_fingerprint, context.candidate_fingerprint, context.policy_fingerprint, context.deployment_fingerprint,
+        *context.runtime_binding.columns(),
     )
     row = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
         (provider_attempt_id,),
     ).fetchone()
     if row != expected:

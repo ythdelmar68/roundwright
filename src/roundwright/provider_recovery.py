@@ -17,7 +17,8 @@ from enum import StrEnum
 
 from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
-from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task
+from .runtime_binding import RuntimeBinding
+from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, record_runtime_binding, require_runtime_binding
 
 
 class ProviderRecoveryError(StateError):
@@ -70,6 +71,7 @@ class RecoveryContext:
     candidate_fingerprint: str | None
     policy_fingerprint: str
     deployment_fingerprint: str
+    runtime_binding: RuntimeBinding
 
     @classmethod
     def for_task(
@@ -79,6 +81,7 @@ class RecoveryContext:
         candidate_sha: str | None,
         policy_fingerprint: str,
         deployment_fingerprint: str,
+        runtime_binding: RuntimeBinding,
     ) -> "RecoveryContext":
         """Build context without retaining a worktree path in owner projections."""
 
@@ -87,6 +90,8 @@ class RecoveryContext:
             raise ProviderRecoveryError("candidate identity is invalid")
         _require_fingerprint(policy_fingerprint, "policy fingerprint")
         _require_fingerprint(deployment_fingerprint, "deployment fingerprint")
+        if type(runtime_binding) is not RuntimeBinding:
+            raise ProviderRecoveryError("resolved configuration binding is invalid")
         return cls(
             identity.task_id,
             _fingerprint(identity.repository_id),
@@ -96,6 +101,7 @@ class RecoveryContext:
             None if candidate_sha is None else _fingerprint(candidate_sha),
             policy_fingerprint,
             deployment_fingerprint,
+            runtime_binding,
         )
 
 
@@ -157,6 +163,8 @@ def prepare_attempt(
 
     _validate_task(identity)
     _validate_context(identity, context)
+    # Pinning is intentionally the first durable operation in the dispatch path.
+    record_runtime_binding(repository, identity, context.runtime_binding)
     _require_token(attempt_id, "attempt identity")
     _require_role(role)
     _require_token(process_lease_id, "process lease identity")
@@ -168,6 +176,7 @@ def prepare_attempt(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
+        require_runtime_binding(repository, identity, context.runtime_binding)
         existing = connection.execute(
             "SELECT attempt_id FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
             (identity.task_id, attempt_id),
@@ -467,8 +476,8 @@ def accept_supervisor_review(
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
         )
         connection.execute(
-            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)",
-            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint),
+            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint, *context.runtime_binding.columns()),
         )
         connection.commit()
     except sqlite3.IntegrityError as error:
@@ -732,13 +741,13 @@ def _checkpoint(connection, task_id: str, role: ProviderRole, phase: str, attemp
 
 def _persist_context(connection, attempt_id: str, context: RecoveryContext) -> None:
     existing = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     expected = (context.task_id, *_context_values(context))
     if existing is None:
         connection.execute(
-            "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (attempt_id, *expected),
         )
     elif existing != expected:
@@ -751,7 +760,7 @@ def _context_matches(connection, identity: TaskIdentity, attempt_id: str, contex
     if not isinstance(context, RecoveryContext) or context.task_id != identity.task_id:
         return False
     existing = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     expected = (identity.task_id, *_context_values(context))
@@ -767,6 +776,7 @@ def _context_values(context: RecoveryContext) -> tuple[str | None, ...]:
         context.candidate_fingerprint,
         context.policy_fingerprint,
         context.deployment_fingerprint,
+        *context.runtime_binding.columns(),
     )
 
 
@@ -813,6 +823,8 @@ def _validate_context(identity: TaskIdentity, context: RecoveryContext) -> None:
         _require_fingerprint(value, name)
     if context.candidate_fingerprint is not None:
         _require_fingerprint(context.candidate_fingerprint, "candidate fingerprint")
+    if type(context.runtime_binding) is not RuntimeBinding:
+        raise ProviderRecoveryError("resolved configuration binding is invalid")
 
 
 def _validate_task(identity: object) -> None:
@@ -845,7 +857,7 @@ def _fingerprint(value: str) -> str:
 
 
 def _context_fingerprint(context: RecoveryContext) -> str:
-    return _fingerprint("\x00".join("" if value is None else value for value in context.__dict__.values()))
+    return _fingerprint("\x00".join("" if value is None else value for value in _context_values(context)))
 
 
 def _clock(now: int | None) -> int:

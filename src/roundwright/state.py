@@ -462,6 +462,24 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
         ),
     ),
+    Migration(
+        33,
+        (
+            "ALTER TABLE provider_attempts ADD COLUMN selected_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("provider_attempts", "CREATE TABLE \"provider_attempts\" (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), attempt_number INTEGER NOT NULL CHECK(attempt_number > 0), process_lease_id TEXT NOT NULL, process_lease_expires_at INTEGER NOT NULL CHECK(process_lease_expires_at > 0), session_identity TEXT, external_turn_identity TEXT, input_fingerprint TEXT NOT NULL, output_pointer TEXT, completion_evidence_fingerprint TEXT, accepted_review_identity TEXT, state TEXT NOT NULL CHECK(state IN ('prepared', 'dispatched', 'completed', 'accepted', 'ambiguous', 'blocked', 'invalidated')), selected_profile_identity TEXT NOT NULL DEFAULT '', UNIQUE(task_id, provider_role, attempt_number), UNIQUE(task_id, provider_role, external_turn_identity), UNIQUE(task_id, accepted_review_identity), CHECK((external_turn_identity IS NULL AND state IN ('prepared', 'blocked', 'invalidated')) OR (external_turn_identity IS NOT NULL AND state != 'prepared')), CHECK((state IN ('completed', 'accepted') AND output_pointer IS NOT NULL AND completion_evidence_fingerprint IS NOT NULL) OR state NOT IN ('completed', 'accepted')), CHECK((accepted_review_identity IS NOT NULL AND provider_role = 'supervisor' AND state = 'accepted') OR accepted_review_identity IS NULL))"),
+        ),
+    ),
+    Migration(
+        34,
+        (
+            "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'))",
+        ),
+        (
+            ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'))"),
+        ),
+    ),
 )
 
 
@@ -537,10 +555,11 @@ class DatabaseStatus:
         return self.state == "healthy"
 
 
-def record_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding) -> None:
+def record_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding, *, connection: sqlite3.Connection | None = None) -> None:
     """Persist the one immutable binding before a provider turn can be prepared."""
     try:
-        connection = _open_writable_connection(repository)
+        owned_connection = connection is None
+        connection = _open_writable_connection(repository) if connection is None else connection
         try:
             row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
             values = binding.columns()
@@ -548,21 +567,25 @@ def record_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentit
                 connection.execute("INSERT INTO runtime_configuration_bindings(task_id, schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?)", (identity.task_id, *values))
             elif tuple(row) != values:
                 raise StateError("resolved configuration binding has drifted")
-            connection.commit()
+            if owned_connection:
+                connection.commit()
         finally:
-            connection.close()
+            if owned_connection:
+                connection.close()
     except RuntimeBindingError as error:
         raise StateError("resolved configuration binding is invalid") from error
 
 
-def require_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding) -> None:
+def require_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding, *, connection: sqlite3.Connection | None = None) -> None:
     if type(binding) is not RuntimeBinding:
         raise StateError("resolved configuration binding is invalid")
-    connection = _open_writable_connection(repository)
+    owned_connection = connection is None
+    connection = _open_writable_connection(repository) if connection is None else connection
     try:
         row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
     finally:
-        connection.close()
+        if owned_connection:
+            connection.close()
     expected = binding.columns()
     if row is None or tuple(row) != expected:
         raise StateError("resolved configuration binding is missing or has drifted")
@@ -665,6 +688,33 @@ def transition_task(
     if expected_state == "diff-review" and next_state == "ready-for-owner":
         raise StateError("ready-for-owner requires the candidate-bound final transition")
     return _commit_transition(repository, identity, expected_state, next_state, evidence_fingerprint, lease=lease)
+
+
+def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, review_round: int, max_rounds: int, findings_fingerprint: str, worker_repair_fingerprint: str, lease: object | None = None) -> None:
+    """Durably consume the one terminal Worker repair; later Supervisor turns fail closed."""
+
+    _validate_task_identity(identity)
+    if type(review_round) is not int or type(max_rounds) is not int or review_round != max_rounds or review_round < 1:
+        raise StateError("review-limit finalization is invalid")
+    _require_fingerprint(findings_fingerprint)
+    _require_fingerprint(worker_repair_fingerprint)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
+        _require_matching_task(connection, identity)
+        row = connection.execute("SELECT review_round, findings_fingerprint, worker_repair_fingerprint, disposition FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone()
+        expected = (review_round, findings_fingerprint, worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")
+        if row is None:
+            connection.execute("INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition) VALUES (?, ?, ?, ?, ?)", (identity.task_id, *expected))
+        elif tuple(row) != expected:
+            raise StateError("review-limit finalization has already been consumed")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _transition_ready_for_owner(

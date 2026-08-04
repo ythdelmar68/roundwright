@@ -282,7 +282,7 @@ def discover_repository(start: Path | None = None) -> RepositoryIdentity | None:
     return None
 
 
-def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, platform: str | None = None, home: Path | None = None) -> Configuration:
+def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, trusted_review_floor: ReviewPolicy | None = None, platform: str | None = None, home: Path | None = None) -> Configuration:
     """Resolve defaults < user < authoritative repository < env < CLI.
 
     Repository configuration is read only from the discovered/validated root;
@@ -307,7 +307,7 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
         authoritative_repository_root = discover_authoritative_repository(repository)
     if authoritative_repository_root is not None:
         authoritative_root = _validated_authoritative_repository(authoritative_repository_root)
-        repository_values = _read_runtime_toml(authoritative_root / _REPOSITORY_CONFIG, required=False)
+        repository_values = _read_authoritative_runtime_toml(authoritative_root)
         _apply_paths(paths, repository_values.get("paths", {}), ConfigurationSource.REPOSITORY, required_repository_root=authoritative_root)
         if repository_values:
             repository_config_root = authoritative_root
@@ -320,6 +320,8 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     worker = _parse_profile(raw["roles"]["worker"], name_required=False)
     supervisors = tuple(_parse_profile(value, name_required=True) for value in raw["roles"]["supervisor"]["attempt_profiles"])
     review = _parse_review(raw["review"])
+    if trusted_review_floor is not None:
+        review.enforce_floor(trusted_review_floor)
     if len(supervisors) != review.max_supervisor_attempts_per_round:
         raise ConfigurationError("supervisor profile count must equal the configured attempt budget")
     if len({item.name for item in supervisors}) != len(supervisors):
@@ -380,12 +382,35 @@ def _validated_authoritative_repository(root: Path) -> Path:
         head = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "HEAD^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         remote = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         origin = subprocess.run(["git", "-C", os.fspath(repository.root), "config", "--get", "remote.origin.url"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
-        status = subprocess.run(["git", "-C", os.fspath(repository.root), "status", "--porcelain=v1", "--untracked-files=all", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        status = subprocess.run(["git", "-C", os.fspath(repository.root), "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigurationError("authoritative repository identity is unavailable") from error
     if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip():
         raise ConfigurationError("repository configuration is not from authoritative main")
     return repository.root
+
+
+def _read_authoritative_runtime_toml(root: Path) -> dict[str, Any]:
+    """Read configuration only from the exact origin/main Git blob, never checkout bytes."""
+
+    repository = RepositoryIdentity.from_root(root)
+    try:
+        remote = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        blob = subprocess.run(["git", "-C", os.fspath(repository.root), "show", f"{remote.stdout.strip()}:{_REPOSITORY_CONFIG}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, env=_hermetic_git_environment())
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ConfigurationError("authoritative repository configuration is unavailable") from error
+    if remote.returncode:
+        raise ConfigurationError("authoritative repository configuration is unavailable")
+    if blob.returncode == 128:
+        return {}
+    if blob.returncode:
+        raise ConfigurationError("authoritative repository configuration is unavailable")
+    try:
+        document = tomllib.loads(blob.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ConfigurationError("authoritative repository configuration is malformed") from error
+    _validate_document(document, complete=False)
+    return document
 
 
 def discover_authoritative_repository(repository: RepositoryIdentity) -> Path | None:
@@ -409,8 +434,14 @@ def discover_authoritative_repository(repository: RepositoryIdentity) -> Path | 
 
 
 def _origin_matches(value: str) -> bool:
-    normalized = value.removesuffix(".git").rstrip("/").casefold()
-    return normalized.endswith(_EXPECTED_REPOSITORY)
+    normalized = value.strip().removesuffix(".git").rstrip("/")
+    accepted = {
+        f"https://github.com/{_EXPECTED_REPOSITORY}",
+        f"http://github.com/{_EXPECTED_REPOSITORY}",
+        f"ssh://git@github.com/{_EXPECTED_REPOSITORY}",
+        f"git@github.com:{_EXPECTED_REPOSITORY}",
+    }
+    return normalized.casefold() in {item.casefold() for item in accepted}
 
 
 def _validate_document(document: object, *, complete: bool) -> None:

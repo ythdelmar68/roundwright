@@ -36,10 +36,13 @@ def fingerprint(character: str) -> str:
 class DeploymentAuthorityTests(unittest.TestCase):
     now = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
+    def runtime_binding(self) -> RuntimeBinding:
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,))
+
     def identity(self, deployment: str = "e") -> DeploymentIdentity:
         return DeploymentIdentity(
             fingerprint("a"), fingerprint("b"), fingerprint("c"),
-            UUID("12345678-1234-5678-1234-567812345678"), fingerprint(deployment),
+            UUID("12345678-1234-5678-1234-567812345678"), fingerprint(deployment), self.runtime_binding(),
         )
 
     def receipt(self, identity: DeploymentIdentity) -> DeploymentAuthorityReceipt:
@@ -55,7 +58,7 @@ class DeploymentAuthorityTests(unittest.TestCase):
         return AuthorityReceiptVerification(
             receipt.receipt_fingerprint, _receipt_binding_fingerprint(receipt),
             identity.repository_fingerprint, identity.state_id,
-            identity.deployment_fingerprint if deployment is None else fingerprint(deployment), status,
+            identity.deployment_fingerprint if deployment is None else fingerprint(deployment), status, identity.runtime_binding,
         )
 
     def test_read_only_and_test_only_need_no_dispatch_receipt(self) -> None:
@@ -80,8 +83,8 @@ class DeploymentAuthorityTests(unittest.TestCase):
         verification = replace(
             self.verification(identity, receipt),
             runtime_binding=RuntimeBinding(
-                "roundwright-runtime/v1", "sha256:" + "0" * 64,
-                "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+                "roundwright-runtime/v1", "sha256:" + "3" * 64,
+                "sha256:" + "4" * 64, ("sha256:" + "5" * 64,),
             ),
         )
         decision = evaluate_deployment_authority(identity, receipt, verification, now=self.now)
@@ -107,11 +110,11 @@ class DeploymentAuthorityTests(unittest.TestCase):
         identity = self.identity()
         receipt = self.receipt(identity)
         for changed in (
-            DeploymentIdentity(fingerprint("0"), fingerprint("b"), fingerprint("c"), identity.state_id, fingerprint("e")),
-            DeploymentIdentity(fingerprint("a"), fingerprint("0"), fingerprint("c"), identity.state_id, fingerprint("e")),
-            DeploymentIdentity(fingerprint("a"), fingerprint("b"), fingerprint("0"), identity.state_id, fingerprint("e")),
-            DeploymentIdentity(fingerprint("a"), fingerprint("b"), fingerprint("c"), UUID("87654321-4321-8765-4321-876543218765"), fingerprint("e")),
-            DeploymentIdentity(fingerprint("a"), fingerprint("b"), fingerprint("c"), identity.state_id, fingerprint("0")),
+            DeploymentIdentity(fingerprint("0"), fingerprint("b"), fingerprint("c"), identity.state_id, fingerprint("e"), identity.runtime_binding),
+            DeploymentIdentity(fingerprint("a"), fingerprint("0"), fingerprint("c"), identity.state_id, fingerprint("e"), identity.runtime_binding),
+            DeploymentIdentity(fingerprint("a"), fingerprint("b"), fingerprint("0"), identity.state_id, fingerprint("e"), identity.runtime_binding),
+            DeploymentIdentity(fingerprint("a"), fingerprint("b"), fingerprint("c"), UUID("87654321-4321-8765-4321-876543218765"), fingerprint("e"), identity.runtime_binding),
+            DeploymentIdentity(fingerprint("a"), fingerprint("b"), fingerprint("c"), identity.state_id, fingerprint("0"), identity.runtime_binding),
         ):
             with self.subTest(changed=changed):
                 decision = evaluate_deployment_authority(changed, receipt, self.verification(identity, receipt), now=self.now)
@@ -144,14 +147,14 @@ class DeploymentAuthorityTests(unittest.TestCase):
                 receipt,
                 identity=DeploymentIdentity(
                     identity.repository_fingerprint, fingerprint("0"), identity.state_fingerprint,
-                    identity.state_id, identity.deployment_fingerprint,
+                    identity.state_id, identity.deployment_fingerprint, identity.runtime_binding,
                 ),
             ),
             replace(
                 receipt,
                 identity=DeploymentIdentity(
                     identity.repository_fingerprint, identity.canonical_checkout_fingerprint, fingerprint("0"),
-                    identity.state_id, identity.deployment_fingerprint,
+                    identity.state_id, identity.deployment_fingerprint, identity.runtime_binding,
                 ),
             ),
             replace(
@@ -159,7 +162,7 @@ class DeploymentAuthorityTests(unittest.TestCase):
                 identity=DeploymentIdentity(
                     identity.repository_fingerprint, identity.canonical_checkout_fingerprint,
                     identity.state_fingerprint, UUID("87654321-4321-8765-4321-876543218765"),
-                    identity.deployment_fingerprint,
+                    identity.deployment_fingerprint, identity.runtime_binding,
                 ),
             ),
             replace(receipt, issued_at=receipt.issued_at - timedelta(seconds=1)),

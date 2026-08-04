@@ -79,12 +79,6 @@ GATE_REGISTRY = (
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}")
-_LOCAL_RUNTIME_BINDING = RuntimeBinding(
-    "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64,
-    tuple("sha256:" + value * 64 for value in "234"),
-)
-
-
 @dataclass(frozen=True)
 class GateContext:
     task_id: str
@@ -93,7 +87,7 @@ class GateContext:
     isolated_local_task: bool
     policy_digest: str
     receipt_fingerprint: str
-    runtime_binding: RuntimeBinding = _LOCAL_RUNTIME_BINDING
+    runtime_binding: RuntimeBinding
 
 
 @dataclass(frozen=True)

@@ -23,6 +23,7 @@ from roundwright.policy import (
     evaluate_policy,
     parse_policy_document,
 )
+from roundwright.runtime_binding import RuntimeBinding
 
 
 def fingerprint(character: str) -> str:
@@ -53,6 +54,7 @@ class TrustedPolicyTests(unittest.TestCase):
             "candidate_sha": CURRENT_CANDIDATE_SHA,
             "activated_at": self.now - timedelta(minutes=1),
             "expires_at": self.now + timedelta(minutes=1),
+            "runtime_binding": RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,)),
         }
         values.update(changes)
         return ActivationReceipt(**values)  # type: ignore[arg-type]
@@ -259,7 +261,7 @@ class TrustedPolicyTests(unittest.TestCase):
         forged_document = ForgedDocument(1, [PolicyAction.ISSUE_COMMENT])  # type: ignore[arg-type]
         forged_receipt = ForgedReceipt(
             "invalid", "invalid", "invalid", "invalid", "invalid", 1,
-            "invalid", "invalid", self.now, self.now,
+            "invalid", "invalid", self.now, self.now, self.receipt(snapshot).runtime_binding,
         )
         cases = (
             (

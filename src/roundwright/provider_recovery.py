@@ -163,8 +163,6 @@ def prepare_attempt(
 
     _validate_task(identity)
     _validate_context(identity, context)
-    # Pinning is intentionally the first durable operation in the dispatch path.
-    record_runtime_binding(repository, identity, context.runtime_binding)
     _require_token(attempt_id, "attempt identity")
     _require_role(role)
     _require_token(process_lease_id, "process lease identity")
@@ -176,7 +174,12 @@ def prepare_attempt(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
-        require_runtime_binding(repository, identity, context.runtime_binding)
+        if role is ProviderRole.SUPERVISOR and connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone() is not None:
+            raise ProviderRecoveryError("review limit has consumed the final Worker repair")
+        # The binding is first persisted only after lease and task validation,
+        # inside the same transaction that creates the dispatch checkpoint.
+        record_runtime_binding(repository, identity, context.runtime_binding, connection=connection)
+        require_runtime_binding(repository, identity, context.runtime_binding, connection=connection)
         existing = connection.execute(
             "SELECT attempt_id FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
             (identity.task_id, attempt_id),
@@ -199,8 +202,8 @@ def prepare_attempt(
             (identity.task_id, role.value),
         ).fetchone()[0]
         connection.execute(
-            "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?)",
-            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value),
+            "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?)",
+            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, _selected_profile_identity(context, role)),
         )
         _persist_context(connection, attempt_id, context)
         _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, observed)
@@ -471,6 +474,9 @@ def accept_supervisor_review(
             return row
         if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.COMPLETED:
             raise ProviderRecoveryError("only a completed supervisor attempt can be accepted")
+        selected = connection.execute("SELECT selected_profile_identity FROM provider_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+        if selected != (_selected_profile_identity(context, ProviderRole.SUPERVISOR),):
+            raise ProviderRecoveryError("accepted supervisor profile binding has drifted")
         connection.execute(
             "UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?",
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
@@ -778,6 +784,15 @@ def _context_values(context: RecoveryContext) -> tuple[str | None, ...]:
         context.deployment_fingerprint,
         *context.runtime_binding.columns(),
     )
+
+
+def _selected_profile_identity(context: RecoveryContext, role: ProviderRole) -> str:
+    """Persist the one exact configured profile selected for this role's turn."""
+
+    selected = context.runtime_binding.worker_profile_identity if role is not ProviderRole.SUPERVISOR else context.runtime_binding.supervisor_profile_identities[0]
+    if type(selected) is not str or not selected.startswith("sha256:"):
+        raise ProviderRecoveryError("selected provider profile identity is invalid")
+    return selected
 
 
 def _require_persisted_context(connection, attempt_id: str, context: RecoveryContext) -> None:

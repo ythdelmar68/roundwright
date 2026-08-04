@@ -32,7 +32,7 @@ class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",
-            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(), (b"input-38",), b"reference-38", "sha256:" + "c" * 64, "sha256:" + "d" * 64, ("sha256:" + "e" * 64, "sha256:" + "f" * 64, "sha256:" + "0" * 64),
+            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(), (b"input-38",), b"reference-38", "sha256:" + "c" * 64, "roundwright-runtime/v1", "sha256:" + "d" * 64, ("sha256:" + "e" * 64, "sha256:" + "f" * 64, "sha256:" + "0" * 64),
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -44,7 +44,7 @@ class ShadowTests(unittest.TestCase):
                 state, CANDIDATE, source_id="source-38", task_id="task-38", base_sha=BASE, policy_identity="policy-38",
                 gate_identity="gate-38", applicability=Applicability.APPLICABLE, blocker=None, next_action="owner-review",
                 accepted_review_identity="review-38", worktree_identity="worktree-38",
-                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(), input_payloads=(b"input-38",), reference_result_payload=b"reference-38", configuration_digest="sha256:" + "c" * 64, worker_profile_identity="sha256:" + "d" * 64, supervisor_profile_identities=("sha256:" + "e" * 64, "sha256:" + "f" * 64, "sha256:" + "0" * 64),
+                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(), input_payloads=(b"input-38",), reference_result_payload=b"reference-38", configuration_digest="sha256:" + "c" * 64, configuration_schema_version="roundwright-runtime/v1", worker_profile_identity="sha256:" + "d" * 64, supervisor_profile_identities=("sha256:" + "e" * 64, "sha256:" + "f" * 64, "sha256:" + "0" * 64),
             ))
         items[-1] = replace(items[-1], **last_changes, evidence_digest="")
         return tuple(items)

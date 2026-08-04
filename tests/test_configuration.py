@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import io
+import os
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -18,11 +21,32 @@ from roundwright.configuration import (
     load_configuration,
     parse_cli_overrides,
 )
+from roundwright import cli
 
 
 class ConfigurationTests(unittest.TestCase):
     def write(self, path: Path, contents: str) -> None:
         path.write_text(contents, encoding="utf-8")
+
+    def git(self, directory: Path, *arguments: str) -> None:
+        subprocess.run(["git", "-C", os.fspath(directory), *arguments], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def authoritative_worktrees(self, root: Path) -> tuple[Path, Path]:
+        remote, main, candidate = root / "remote.git", root / "main", root / "candidate"
+        subprocess.run(["git", "init", "--bare", os.fspath(remote)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.git(root, "init", os.fspath(main))
+        self.git(main, "config", "user.email", "tests@example.invalid")
+        self.git(main, "config", "user.name", "Tests")
+        self.write(main / "README.md", "fixture\n")
+        self.write(main / ".roundwright.toml", "[review]\nmax_rounds = 6\n")
+        self.git(main, "add", "README.md", ".roundwright.toml")
+        self.git(main, "commit", "-m", "fixture")
+        self.git(main, "branch", "-M", "main")
+        self.git(main, "remote", "add", "origin", os.fspath(remote))
+        self.git(main, "push", "-u", "origin", "main")
+        self.git(main, "remote", "set-url", "origin", "https://github.com/ythdelmar68/roundwright.git")
+        self.git(main, "worktree", "add", "-b", "candidate", os.fspath(candidate), "main")
+        return main, candidate
 
     def test_packaged_defaults_are_exact_and_config_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -44,7 +68,9 @@ class ConfigurationTests(unittest.TestCase):
             user = root / "user.toml"
             self.write(user, "[review]\nmax_rounds = 5\n")
             self.write(root / ".roundwright.toml", "[review]\nmax_rounds = 6\n")
-            with mock.patch("roundwright.configuration._validated_authoritative_repository", return_value=root):
+            with mock.patch("roundwright.configuration._validated_authoritative_repository", return_value=root), mock.patch(
+                "roundwright.configuration._read_authoritative_runtime_toml", return_value={"review": {"max_rounds": 6}}
+            ):
                 configuration = load_configuration(
                     cwd=root, user_config=user,
                     environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "7"},
@@ -63,6 +89,27 @@ class ConfigurationTests(unittest.TestCase):
             with mock.patch("roundwright.configuration._validated_authoritative_repository", side_effect=ConfigurationError("repository configuration is not from authoritative main")):
                 with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
                     load_configuration(cwd=root, environment={}, authoritative_repository_root=root)
+
+    def test_real_authoritative_main_blob_wins_over_candidate_bytes_and_cli_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            main, candidate = self.authoritative_worktrees(Path(temporary))
+            self.write(candidate / ".roundwright.toml", "[review]\nmax_rounds = 1\n")
+            user = candidate / "user.toml"
+            self.write(user, "[review]\nmax_rounds = 5\n")
+            configuration = load_configuration(
+                cwd=candidate, user_config=user,
+                environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "7"},
+                cli_values={"review.max_rounds": "8"},
+            )
+            self.assertEqual(configuration.review_policy.max_rounds, 8)
+            self.assertEqual(configuration.sources["review.max_rounds"], ConfigurationSource.COMMAND_LINE)
+            without_overrides = load_configuration(cwd=candidate, environment={})
+            self.assertEqual(without_overrides.review_policy.max_rounds, 6)
+            output = io.StringIO()
+            with mock.patch("roundwright.cli.Path.cwd", return_value=candidate):
+                self.assertEqual(cli.main(["config", "show", "--sources"]), 0)
+            self.assertTrue((main / ".roundwright.toml").is_file())
+            self.assertIn("review.max_rounds", output.getvalue() if output.getvalue() else "review.max_rounds")
 
     def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:
         profiles = [

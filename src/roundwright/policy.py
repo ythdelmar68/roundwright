@@ -16,8 +16,6 @@ from enum import Enum
 from typing import Any, Mapping
 from .runtime_binding import RuntimeBinding
 
-_DEFAULT_RUNTIME_BINDING = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, tuple("sha256:" + value * 64 for value in "234"))
-
 
 POLICY_SCHEMA_VERSION = 1
 _FINGERPRINT_LENGTH = 64
@@ -131,7 +129,7 @@ class ActivationReceipt:
     candidate_sha: str
     activated_at: datetime
     expires_at: datetime
-    runtime_binding: RuntimeBinding = _DEFAULT_RUNTIME_BINDING
+    runtime_binding: RuntimeBinding
 
     def __post_init__(self) -> None:
         for value, description in (

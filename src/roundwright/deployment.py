@@ -17,8 +17,6 @@ from typing import Mapping
 from uuid import UUID
 from .runtime_binding import RuntimeBinding
 
-_DEFAULT_RUNTIME_BINDING = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, tuple("sha256:" + value * 64 for value in "234"))
-
 
 class DeploymentMode(str, Enum):
     """Public deployment modes, including explicit non-authoritative modes."""
@@ -57,7 +55,7 @@ class DeploymentIdentity:
     state_fingerprint: str
     state_id: UUID
     deployment_fingerprint: str
-    runtime_binding: RuntimeBinding = _DEFAULT_RUNTIME_BINDING
+    runtime_binding: RuntimeBinding
 
     def __post_init__(self) -> None:
         _validate_identity(self)
@@ -92,7 +90,7 @@ class AuthorityReceiptVerification:
     state_id: UUID
     authoritative_deployment_fingerprint: str
     status: AuthorityReceiptStatus
-    runtime_binding: RuntimeBinding = _DEFAULT_RUNTIME_BINDING
+    runtime_binding: RuntimeBinding
 
     def __post_init__(self) -> None:
         _validate_verification(self)

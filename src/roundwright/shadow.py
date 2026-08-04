@@ -176,6 +176,7 @@ class ShadowIdentity:
     input_payloads: tuple[bytes, ...] = ()
     reference_result_payload: bytes = b""
     configuration_digest: str = ""
+    configuration_schema_version: str = ""
     worker_profile_identity: str = ""
     supervisor_profile_identities: tuple[str, ...] = ()
 
@@ -215,6 +216,7 @@ class ShadowObservation:
     reference_result_payload: bytes | None = None
     evidence_digest: str = field(default="")
     configuration_digest: str = ""
+    configuration_schema_version: str = ""
     worker_profile_identity: str = ""
     supervisor_profile_identities: tuple[str, ...] = ()
 
@@ -349,7 +351,7 @@ class ShadowExecutor:
                     _forbid_mutation(observation.requested_mutation)
                 if observation.candidate_sha != case.identity.candidate_sha:
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "candidate-bound evidence is stale")
-                if observation.configuration_digest != case.identity.configuration_digest:
+                if (observation.configuration_schema_version, observation.configuration_digest) != (case.identity.configuration_schema_version, case.identity.configuration_digest):
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "resolved configuration evidence has drifted")
                 if (observation.worker_profile_identity, observation.supervisor_profile_identities) != (case.identity.worker_profile_identity, case.identity.supervisor_profile_identities):
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "resolved configuration profile evidence has drifted")
@@ -523,6 +525,8 @@ def _validate_identity(identity: object) -> None:
         raise ShadowError("reference result digest does not match immutable content")
     if type(identity.configuration_digest) is not str or not _CONFIG_DIGEST.fullmatch(identity.configuration_digest):
         raise ShadowError("resolved configuration digest is invalid")
+    if identity.configuration_schema_version != "roundwright-runtime/v1":
+        raise ShadowError("resolved configuration schema version is invalid")
     if type(identity.worker_profile_identity) is not str or not _CONFIG_DIGEST.fullmatch(identity.worker_profile_identity) or type(identity.supervisor_profile_identities) is not tuple or not identity.supervisor_profile_identities or any(type(value) is not str or not _CONFIG_DIGEST.fullmatch(value) for value in identity.supervisor_profile_identities):
         raise ShadowError("resolved configuration profile identity is invalid")
 
@@ -535,6 +539,8 @@ def _validate_observation(observation: object, *, verify_digest: bool = True) ->
     _token(observation.state, "state")
     if type(observation.configuration_digest) is not str or not _CONFIG_DIGEST.fullmatch(observation.configuration_digest):
         raise ShadowError("resolved configuration digest is invalid")
+    if observation.configuration_schema_version != "roundwright-runtime/v1":
+        raise ShadowError("resolved configuration schema version is invalid")
     if type(observation.worker_profile_identity) is not str or not _CONFIG_DIGEST.fullmatch(observation.worker_profile_identity) or type(observation.supervisor_profile_identities) is not tuple or not observation.supervisor_profile_identities or any(type(value) is not str or not _CONFIG_DIGEST.fullmatch(value) for value in observation.supervisor_profile_identities):
         raise ShadowError("resolved configuration profile identity is invalid")
     _token(observation.next_action, "next action")
@@ -650,6 +656,7 @@ def _identity_payload(identity: ShadowIdentity) -> dict[str, str]:
         "input_payloads": tuple(value.hex() for value in identity.input_payloads),
         "reference_result_payload": identity.reference_result_payload.hex(),
         "configuration_digest": identity.configuration_digest,
+        "configuration_schema_version": identity.configuration_schema_version,
         "worker_profile_identity": identity.worker_profile_identity,
         "supervisor_profile_identities": identity.supervisor_profile_identities,
     }
@@ -683,6 +690,7 @@ def _observation_payload(observation: ShadowObservation, *, include_digest: bool
         "input_payloads": tuple(value.hex() for value in observation.input_payloads),
         "reference_result_payload": None if observation.reference_result_payload is None else observation.reference_result_payload.hex(),
         "configuration_digest": observation.configuration_digest,
+        "configuration_schema_version": observation.configuration_schema_version,
         "worker_profile_identity": observation.worker_profile_identity,
         "supervisor_profile_identities": observation.supervisor_profile_identities,
     }

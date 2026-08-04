@@ -13,6 +13,7 @@ from roundwright.shadow import (
     EvidenceRole,
     MutationKind,
     NoMutationCapabilities,
+    ForbiddenMutationError,
     ReplayClassification,
     ShadowCase,
     ShadowExecutor,
@@ -29,7 +30,7 @@ STATES = ("queued", "planning", "plan-review", "implementing", "diff-review", "r
 class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
-            "source-38", "task-38", BASE, CANDIDATE, "policy-38", "worker-attempt", "review-38", "gate-38", "owner-review"
+            "source-38", "task-38", BASE, CANDIDATE, "policy-38", "worker-attempt", "review-38", "gate-38", "owner-review", "worktree-38"
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -39,6 +40,7 @@ class ShadowTests(unittest.TestCase):
             items.append(ShadowObservation(
                 f"event-{index}", role, f"attempt-{index}", AttemptDisposition.ACCEPTED,
                 state, CANDIDATE, "gate-38", Applicability.APPLICABLE, None, "owner-review",
+                accepted_review_identity="review-38", worktree_identity="worktree-38",
             ))
         items[-1] = replace(items[-1], **last_changes, evidence_digest="")
         return tuple(items)
@@ -71,6 +73,22 @@ class ShadowTests(unittest.TestCase):
         report = ShadowExecutor().replay(self.case(observations))
         self.assertEqual(report.classification, ReplayClassification.STALE_EVIDENCE)
 
+    def test_dirty_worktree_evidence_fails_closed(self):
+        observations = self.observations(worktree_clean=False)
+        report = ShadowExecutor().replay(self.case(observations))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
+
+    def test_unaccepted_or_stale_review_evidence_fails_closed(self):
+        recorded = self.observations(attempt_disposition=AttemptDisposition.RECORDED)
+        stale = self.observations(accepted_review_identity="review-37")
+        self.assertEqual(ShadowExecutor().replay(self.case(recorded)).classification, ReplayClassification.INCOMPLETE_EVIDENCE)
+        self.assertEqual(ShadowExecutor().replay(self.case(stale)).classification, ReplayClassification.STALE_EVIDENCE)
+
+    def test_missing_gate_evidence_is_incomplete_not_a_comparison_mismatch(self):
+        observations = self.observations(gate_identity=None)
+        report = ShadowExecutor().replay(self.case(observations))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.INCOMPLETE_EVIDENCE))
+
     def test_multi_source_not_applicable_evidence_fails_closed(self):
         observations = self.observations()
         observations = (*observations[:-1], replace(observations[-1], applicability=Applicability.NOT_APPLICABLE, source_count=2, evidence_digest=""))
@@ -82,16 +100,27 @@ class ShadowTests(unittest.TestCase):
         report = ShadowExecutor().replay(self.case(observations, expected_nondeterminism=(ComparisonField.NEXT_ACTION,)))
         self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.MISMATCH, ReplayClassification.EXPECTED_NONDETERMINISM))
 
-    def test_forced_capability_denial_happens_before_callback(self):
-        called = False
+    def test_every_mutation_capability_denies_before_its_callback(self):
+        adapter = NoMutationCapabilities()
+        capability_names = {
+            MutationKind.GIT: "git", MutationKind.GITHUB: "github", MutationKind.REPOSITORY: "repository",
+            MutationKind.QUEUE: "queue", MutationKind.BRANCH: "branch", MutationKind.WORKTREE: "worktree",
+            MutationKind.PULL_REQUEST: "pull_request", MutationKind.ISSUE: "issue", MutationKind.MERGE: "merge",
+            MutationKind.CLOSE: "close", MutationKind.CLEANUP: "cleanup", MutationKind.LIFECYCLE: "lifecycle",
+        }
+        self.assertEqual(set(capability_names), set(MutationKind))
+        for kind, name in capability_names.items():
+            with self.subTest(kind=kind):
+                called = False
 
-        def side_effect() -> None:
-            nonlocal called
-            called = True
+                def side_effect() -> None:
+                    nonlocal called
+                    called = True
 
-        with self.assertRaisesRegex(Exception, "forbids git mutation"):
-            NoMutationCapabilities().git(side_effect)
-        self.assertFalse(called)
+                with self.assertRaises(ForbiddenMutationError) as raised:
+                    getattr(adapter, name)(side_effect)
+                self.assertEqual(raised.exception.kind, kind)
+                self.assertFalse(called)
 
         observations = self.observations()
         observations = (*observations[:-1], replace(observations[-1], requested_mutation=MutationKind.GITHUB, evidence_digest=""))

@@ -153,6 +153,7 @@ class ShadowIdentity:
     accepted_review_identity: str
     gate_identity: str
     expected_next_action: str
+    worktree_identity: str
 
     def digest(self) -> str:
         _validate_identity(self)
@@ -176,6 +177,9 @@ class ShadowObservation:
     source_count: int = 1
     not_applicable_reason: str | None = None
     requested_mutation: MutationKind | None = None
+    accepted_review_identity: str | None = None
+    worktree_identity: str | None = None
+    worktree_clean: bool = True
     evidence_digest: str = field(default="")
 
     def __post_init__(self) -> None:
@@ -292,8 +296,22 @@ class ShadowExecutor:
                     self._capabilities.execute(observation.requested_mutation)
                 if observation.candidate_sha != case.identity.candidate_sha:
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "candidate-bound evidence is stale")
+                if observation.worktree_identity is None:
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worktree evidence is missing")
+                if observation.worktree_identity != case.identity.worktree_identity:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "worktree-bound evidence is stale")
+                if not observation.worktree_clean:
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "worktree evidence is dirty")
                 if observation.attempt_disposition is AttemptDisposition.AMBIGUOUS:
                     return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "ambiguous attempt is not replayable")
+                if observation.attempt_disposition is not AttemptDisposition.ACCEPTED:
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "review evidence is not accepted")
+                if observation.accepted_review_identity is None:
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "accepted review evidence is missing")
+                if observation.accepted_review_identity != case.identity.accepted_review_identity:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "accepted review evidence is stale")
+                if observation.gate_identity is None:
+                    return _invalid_report(case, ReplayClassification.INCOMPLETE_EVIDENCE, "gate evidence is missing")
                 if observation.applicability is Applicability.NOT_APPLICABLE and (
                     observation.source_count != 1 or observation.not_applicable_reason != "isolated-single-source"
                 ):
@@ -387,6 +405,7 @@ def _validate_identity(identity: object) -> None:
         (identity.accepted_review_identity, "accepted review identity"),
         (identity.gate_identity, "gate identity"),
         (identity.expected_next_action, "expected next action"),
+        (identity.worktree_identity, "worktree identity"),
     ):
         _token(value, name)
 
@@ -397,7 +416,6 @@ def _validate_observation(observation: object) -> None:
     _token(observation.event_id, "event identity")
     _token(observation.attempt_id, "attempt identity")
     _token(observation.state, "state")
-    _token(observation.gate_identity, "gate identity")
     _token(observation.next_action, "next action")
     if not isinstance(observation.role, EvidenceRole) or not isinstance(observation.attempt_disposition, AttemptDisposition):
         raise ShadowError("observation role or disposition is invalid")
@@ -409,6 +427,14 @@ def _validate_observation(observation: object) -> None:
         _token(observation.blocker, "blocker")
     if observation.not_applicable_reason is not None:
         _token(observation.not_applicable_reason, "not-applicable reason")
+    if observation.gate_identity is not None:
+        _token(observation.gate_identity, "gate identity")
+    if observation.accepted_review_identity is not None:
+        _token(observation.accepted_review_identity, "accepted review identity")
+    if observation.worktree_identity is not None:
+        _token(observation.worktree_identity, "worktree identity")
+    if not isinstance(observation.worktree_clean, bool):
+        raise ShadowError("worktree cleanliness is invalid")
     if observation.requested_mutation is not None and not isinstance(observation.requested_mutation, MutationKind):
         raise ShadowError("requested mutation is invalid")
     if not _SHA256.fullmatch(observation.evidence_digest) or observation.evidence_digest != _digest(_observation_payload(observation, include_digest=False)):
@@ -442,6 +468,7 @@ def _identity_payload(identity: ShadowIdentity) -> dict[str, str]:
         "accepted_review_identity": identity.accepted_review_identity,
         "gate_identity": identity.gate_identity,
         "expected_next_action": identity.expected_next_action,
+        "worktree_identity": identity.worktree_identity,
     }
 
 
@@ -460,6 +487,9 @@ def _observation_payload(observation: ShadowObservation, *, include_digest: bool
         "source_count": observation.source_count,
         "not_applicable_reason": observation.not_applicable_reason,
         "requested_mutation": observation.requested_mutation.value if isinstance(observation.requested_mutation, MutationKind) else observation.requested_mutation,
+        "accepted_review_identity": observation.accepted_review_identity,
+        "worktree_identity": observation.worktree_identity,
+        "worktree_clean": observation.worktree_clean,
     }
     if include_digest:
         payload["evidence_digest"] = observation.evidence_digest

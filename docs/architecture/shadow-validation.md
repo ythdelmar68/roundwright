@@ -37,8 +37,9 @@ next-action identities; each observation and case has a deterministic digest.
 It replays persisted Worker and Supervisor observations through the fixed
 Phase 2 state sequence, without launching another Worker. Exact duplicate
 events are idempotent; conflicting duplicate IDs, ambiguous attempts, stale
-candidate evidence, and unjustified multi-source `NOT_APPLICABLE` evidence are
-invalid. Its forced capability adapter rejects every Git, GitHub, repository,
+candidate/worktree/review evidence, dirty worktrees, missing gates, and
+unjustified multi-source `NOT_APPLICABLE` evidence are invalid. Its forced
+capability adapter rejects every Git, GitHub, repository,
 queue, branch, worktree, pull-request, issue, merge, close, cleanup, and
 lifecycle mutation before a requested callback can run.
 

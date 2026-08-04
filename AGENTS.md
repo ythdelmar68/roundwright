@@ -35,3 +35,32 @@ roundlet:
   allow_remove_worktree: true
 # roundlet:end-repository-authority
 <!-- roundlet-bootstrap-policy:end -->
+
+<!-- roundwright-proposed-authority:start -->
+## Disabled Roundwright Authority Surface
+
+This is a machine-readable, disabled-by-default proposal for a later,
+owner-reviewed transition. It grants no current authority. The active Roundlet
+bootstrap policy above remains the only effective repository mutation policy.
+
+Unknown, missing, malformed, stale, conflicting, or candidate-authored values
+fail closed. A candidate cannot make this block effective or use it to widen
+standing authority. An effective policy may only narrow reviewed standing
+authority. Activation requires an allowlisted owner's separate, external,
+candidate-bound decision after the Phase gate; this block is not that decision.
+
+# roundwright:repository-authority
+roundwright:
+  enabled: false
+  runtime_enabled: false
+  allow_issue_comment: false
+  allow_remote_branch_creation_push: false
+  allow_draft_pull_request_creation: false
+  allow_mark_pr_ready: false
+  allow_merge_pr: false
+  allow_close_leaf_issue: false
+  allow_delete_local_branch: false
+  allow_delete_remote_branch: false
+  allow_remove_worktree: false
+# roundwright:end-repository-authority
+<!-- roundwright-proposed-authority:end -->

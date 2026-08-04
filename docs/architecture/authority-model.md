@@ -21,6 +21,20 @@
 
 Any missing, stale, conflicting, privacy-sensitive, or unverifiable input stops the transition. Recovery resumes from private machine state; it never rewrites frozen source history.
 
+## Phase 3 operational boundary
+
+The [dogfood promotion roadmap](../operations/dogfood-promotion-roadmap.md)
+defines the operational-maturity modes, phase gates, repository authority,
+required evidence, rollback, and owner-only promotion decisions. The
+[Shadow validation protocol](shadow-validation.md) defines the permanent
+read-only regression layer. They do not activate Roundwright or weaken the
+active Roundlet bootstrap policy in the root [`AGENTS.md`](../../AGENTS.md).
+
+Exactly one repository-scoped dispatcher may be authoritative for Roundwright
+at a time. A controlled forward-test repository may have only separately
+approved, bounded authority over its own actions; it never becomes a second
+Roundwright dispatcher.
+
 ## Phase 0 non-goals
 
 - An MCP-first runtime

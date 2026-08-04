@@ -19,3 +19,6 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["roundwright*"]
+
+[tool.setuptools.package-data]
+roundwright = ["runtime-defaults.toml"]

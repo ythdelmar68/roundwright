@@ -77,6 +77,15 @@ class ShadowTests(unittest.TestCase):
         report = ShadowExecutor().replay(self.case(observations))
         self.assertEqual(report.classification, ReplayClassification.STALE_EVIDENCE)
 
+    def test_resolved_configuration_digest_is_pinned_to_shadow_evidence(self):
+        digest = "sha256:" + "c" * 64
+        identity = replace(self.identity(), configuration_digest=digest)
+        observations = tuple(replace(item, configuration_digest=digest, evidence_digest="") for item in self.observations())
+        case = ShadowCase.build("case-config", identity, observations, expected_states=STATES)
+        self.assertEqual(ShadowExecutor().replay(case).classification, ReplayClassification.EXACT_MATCH)
+        stale = tuple(replace(item, configuration_digest="sha256:" + "d" * 64, evidence_digest="") for item in observations)
+        self.assertEqual(ShadowExecutor().replay(ShadowCase.build("case-config", identity, stale, expected_states=STATES)).classification, ReplayClassification.STALE_EVIDENCE)
+
     def test_dirty_worktree_evidence_fails_closed(self):
         observations = self.observations(worktree_clean=False)
         report = ShadowExecutor().replay(self.case(observations))

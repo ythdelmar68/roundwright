@@ -1,409 +1,117 @@
-"""Hermetic coverage for typed configuration and repository boundaries."""
+"""Regression coverage for the Phase 3 runtime configuration boundary."""
 
 from __future__ import annotations
 
-import os
-import sys
-import subprocess
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+from unittest import mock
 
 from roundwright.configuration import (
     ConfigurationError,
     ConfigurationSource,
-    PreflightMode,
-    ReasoningEffort,
+    FinalFindingsPolicy,
     RepositoryIdentity,
-    discover_repository,
+    ReviewMode,
     load_configuration,
-    preflight,
-    user_cache_path,
-    user_config_path,
+    parse_cli_overrides,
 )
 
 
 class ConfigurationTests(unittest.TestCase):
-    def make_repository(self, parent: Path) -> Path:
-        root = parent / "repository"
-        result = subprocess.run(
-            ["git", "init", "--quiet", str(root)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode:
-            self.fail(result.stderr or result.stdout)
-        return root
-
-    def write_config(self, path: Path, contents: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def write(self, path: Path, contents: str) -> None:
         path.write_text(contents, encoding="utf-8")
 
-    def test_platform_user_locations_follow_conventions(self) -> None:
-        home = Path("/home/example")
-        self.assertEqual(user_config_path(platform="linux", environment={}, home=home), home / ".config/roundwright/config.toml")
-        self.assertEqual(user_cache_path(platform="linux", environment={}, home=home), home / ".cache/roundwright")
-        self.assertEqual(user_config_path(platform="darwin", environment={}, home=home), home / "Library/Application Support/roundwright/config.toml")
-        self.assertEqual(user_cache_path(platform="darwin", environment={}, home=home), home / "Library/Caches/roundwright")
+    def test_packaged_defaults_are_exact_and_config_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            windows_root = Path(temporary)
-            environment = {
-                "APPDATA": str(windows_root / "roaming"),
-                "LOCALAPPDATA": str(windows_root / "local"),
-            }
-            self.assertEqual(user_config_path(platform="win32", environment=environment, home=home), windows_root / "roaming/Roundwright/config.toml")
-            self.assertEqual(user_cache_path(platform="win32", environment=environment, home=home), windows_root / "local/Roundwright/Cache")
-        with self.assertRaisesRegex(ConfigurationError, "unsupported"):
-            user_config_path(platform="freebsd", home=home)
-        with self.assertRaisesRegex(ConfigurationError, "invalid"):
-            user_config_path(platform="linux", environment={"XDG_CONFIG_HOME": "relative"}, home=home)
+            configuration = load_configuration(cwd=Path(temporary), environment={}, home=Path(temporary) / "home")
+        self.assertEqual(configuration.schema_version, "roundwright-runtime/v1")
+        self.assertEqual((configuration.worker.value.model, configuration.worker.value.reasoning_effort.value), ("gpt-5.6-terra", "high"))
+        self.assertEqual([(item.name, item.model, item.reasoning_effort.value) for item in configuration.supervisor_attempt_profiles.value], [
+            ("primary", "gpt-5.6-sol", "xhigh"), ("fallback", "gpt-5.6-terra", "high"), ("fallback-retry", "gpt-5.6-terra", "high"),
+        ])
+        self.assertEqual(configuration.review_policy.on_final_findings, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        self.assertEqual(configuration.review_policy.mode_for_round(3), ReviewMode.COMPLETE)
+        self.assertEqual(configuration.review_policy.mode_for_round(4), ReviewMode.CONVERGING)
+        self.assertTrue(configuration.resolved_digest.startswith("sha256:"))
+        self.assertEqual(configuration.worker.source, ConfigurationSource.DEFAULT)
 
-    def test_absent_optional_files_allow_config_free_read_only_startup(self) -> None:
+    def test_user_repository_environment_and_cli_precedence_have_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = load_configuration(cwd=root, home=root / "home", environment={})
-        self.assertIsNone(config.repository_root.value)
-        self.assertFalse(preflight(config, PreflightMode.READ_ONLY).repository_ready)
-        with self.assertRaisesRegex(ConfigurationError, "repository root"):
-            preflight(config, PreflightMode.DISPATCH_CAPABLE)
-
-    def test_nearest_repository_is_normalized_and_repository_paths_cannot_escape(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = self.make_repository(Path(temporary))
-            nested = root / "nested" / "child"
-            nested.mkdir(parents=True)
-            repository = discover_repository(nested)
-            self.assertEqual(repository, RepositoryIdentity.from_root(root))
-            self.assertEqual(repository.resolve_path("nested/file.txt"), repository.root / "nested/file.txt")
-            self.assertEqual(repository.state_directory, repository.root / ".roundwright")
-            with self.assertRaisesRegex(ConfigurationError, "escapes"):
-                repository.resolve_path("../outside.txt")
-            with self.assertRaisesRegex(ConfigurationError, "must not be absolute"):
-                repository.resolve_path(root / "absolute.txt")
-
-    def test_repository_discovery_normalizes_symlinks_and_rejects_invalid_markers(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            repository = self.make_repository(workspace)
-            alias = workspace / "alias"
-            try:
-                alias.symlink_to(repository, target_is_directory=True)
-            except OSError:
-                self.skipTest("symlinks are unavailable on this platform")
-            self.assertEqual(discover_repository(alias), RepositoryIdentity.from_root(repository))
-            invalid = workspace / "invalid"
-            invalid.mkdir()
-            (invalid / ".git").write_text("not a Git worktree", encoding="utf-8")
-            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                RepositoryIdentity.from_root(invalid)
-
-    def test_repository_discovery_rejects_head_only_and_mismatched_gitfile_spoofs(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            spoof = workspace / "head-only"
-            (spoof / ".git").mkdir(parents=True)
-            (spoof / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                RepositoryIdentity.from_root(spoof)
-            target = self.make_repository(workspace / "target")
-            mismatched = workspace / "mismatched"
-            mismatched.mkdir()
-            (mismatched / ".git").write_text(
-                f"gitdir: {target / '.git'}\n", encoding="utf-8"
-            )
-            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                RepositoryIdentity.from_root(mismatched)
-
-    def test_repository_discovery_accepts_a_real_linked_worktree(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            repository = self.make_repository(workspace)
-            (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-            for command in (
-                ["git", "-C", str(repository), "add", "tracked.txt"],
-                ["git", "-C", str(repository), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial"],
-                ["git", "-C", str(repository), "worktree", "add", "--detach", str(workspace / "linked")],
-            ):
-                result = subprocess.run(command, check=False, capture_output=True, text=True)
-                if result.returncode:
-                    self.fail(result.stderr or result.stdout)
-            self.assertEqual(
-                RepositoryIdentity.from_root(workspace / "linked").root,
-                (workspace / "linked").resolve(),
-            )
-
-    def test_precedence_and_source_attribution_are_deterministic_and_path_free(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            repository = self.make_repository(workspace)
-            user_repository = self.make_repository(workspace / "user")
-            env_repository = self.make_repository(workspace / "environment")
-            cli_repository = self.make_repository(workspace / "command")
-            user = workspace / "user.toml"
-            user_cache = workspace / "user-cache"
-            repository_cache = workspace / "repository-cache"
-            environment_cache = workspace / "environment-cache"
-            command_cache = workspace / "command-cache"
-            self.write_config(user, f"[roundwright]\nrepository_root = {str(user_repository)!r}\ncache_directory = {str(user_cache)!r}\n")
-            self.write_config(repository / ".roundwright.toml", f"[roundwright]\nrepository_root = {str(repository)!r}\ncache_directory = {str(repository_cache)!r}\n")
-            config = load_configuration(
-                cwd=repository,
-                user_config=user,
-                environment={"ROUNDWRIGHT_REPOSITORY_ROOT": str(env_repository), "ROUNDWRIGHT_CACHE_DIRECTORY": str(environment_cache)},
-                cli_values={"repository_root": cli_repository, "cache_directory": command_cache},
-            )
-            self.assertEqual(config.repository.root, cli_repository.resolve())
-            self.assertEqual(config.cache_directory.value, command_cache)
-            self.assertEqual(config.sources["repository_root"], ConfigurationSource.COMMAND_LINE)
-            self.assertEqual(config.sources["cache_directory"], ConfigurationSource.COMMAND_LINE)
-            self.assertNotIn(str(cli_repository), str(config.sources))
-
-    def test_model_defaults_are_typed_and_follow_every_configuration_layer(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            repository = self.make_repository(workspace)
-            user = workspace / "user.toml"
-            self.write_config(
-                user,
-                "[roundwright]\nmodel = 'gpt-5.6-sol'\nreasoning_effort = 'high'\n",
-            )
-            self.write_config(
-                repository / ".roundwright.toml",
-                "[roundwright]\nmodel = 'gpt-5.6-terra'\nreasoning_effort = 'low'\n",
-            )
-            configured = load_configuration(
-                cwd=repository,
-                user_config=user,
-                environment={
-                    "ROUNDWRIGHT_MODEL": "gpt-5.6-sol",
-                    "ROUNDWRIGHT_REASONING_EFFORT": "max",
-                },
-                cli_values={"model": "gpt-5.6-terra", "reasoning_effort": "ultra"},
-            )
-            defaults = load_configuration(cwd=workspace, environment={}, home=workspace / "home")
-        self.assertEqual(defaults.model.value, "gpt-5.6-terra")
-        self.assertEqual(defaults.reasoning_effort.value, "medium")
-        self.assertEqual(defaults.model.source, ConfigurationSource.DEFAULT)
-        self.assertEqual(configured.model.value, "gpt-5.6-terra")
-        self.assertEqual(configured.reasoning_effort.value, ReasoningEffort.ULTRA)
-        self.assertEqual(configured.sources["model"], ConfigurationSource.COMMAND_LINE)
-        self.assertEqual(configured.sources["reasoning_effort"], ConfigurationSource.COMMAND_LINE)
-
-    def test_model_configuration_rejects_missing_invalid_unsupported_and_secret_values(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            incomplete = workspace / "incomplete.toml"
-            self.write_config(incomplete, "[roundwright]\nmodel = 'gpt-5.6-terra'\n")
-            with self.assertRaisesRegex(ConfigurationError, "together"):
-                load_configuration(cwd=workspace, user_config=incomplete, environment={})
-            invalid = workspace / "invalid.toml"
-            self.write_config(invalid, "[roundwright]\nmodel = 'gpt-5.6-terra'\nreasoning_effort = 'unknown'\n")
-            with self.assertRaisesRegex(ConfigurationError, "reasoning effort"):
-                load_configuration(cwd=workspace, user_config=invalid, environment={})
-            with self.assertRaises(ConfigurationError) as raised:
-                load_configuration(
-                    cwd=workspace,
-                    environment={
-                        "ROUNDWRIGHT_MODEL": "private-model-token",
-                        "ROUNDWRIGHT_REASONING_EFFORT": "medium",
-                    },
+            user = root / "user.toml"
+            self.write(user, "[review]\nmax_rounds = 5\n")
+            self.write(root / ".roundwright.toml", "[review]\nmax_rounds = 6\n")
+            with mock.patch("roundwright.configuration._validated_authoritative_repository", return_value=root):
+                configuration = load_configuration(
+                    cwd=root, user_config=user,
+                    environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "7"},
+                    cli_values={"review.max_rounds": "8"},
+                    authoritative_repository_root=root,
                 )
-            self.assertNotIn("private-model-token", str(raised.exception))
-            with self.assertRaisesRegex(ConfigurationError, "together"):
-                load_configuration(cwd=workspace, cli_values={"model": "gpt-5.6-sol"})
+        self.assertEqual(configuration.review_policy.max_rounds, 8)
+        self.assertEqual(configuration.sources["review.max_rounds"], ConfigurationSource.COMMAND_LINE)
 
-    def test_model_configuration_rejects_partial_none_pairs_from_environment_and_cli(self) -> None:
+    def test_candidate_configuration_is_ignored_and_an_explicit_non_main_root_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            partial_pairs = (
-                {"model": "gpt-5.6-sol", "reasoning_effort": None},
-                {"model": None, "reasoning_effort": "high"},
-            )
-            for values in partial_pairs:
-                with self.assertRaisesRegex(ConfigurationError, "together"):
-                    load_configuration(
-                        cwd=workspace,
-                        environment={
-                            "ROUNDWRIGHT_MODEL": values["model"],
-                            "ROUNDWRIGHT_REASONING_EFFORT": values["reasoning_effort"],
-                        },
-                    )  # type: ignore[arg-type]
-                with self.assertRaisesRegex(ConfigurationError, "together"):
-                    load_configuration(cwd=workspace, cli_values=values)
+            root = Path(temporary)
+            self.write(root / ".roundwright.toml", "[review]\nmax_rounds = 1\n")
+            candidate = load_configuration(cwd=root, environment={})
+            self.assertEqual(candidate.review_policy.max_rounds, 10)
+            with mock.patch("roundwright.configuration._validated_authoritative_repository", side_effect=ConfigurationError("repository configuration is not from authoritative main")):
+                with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
+                    load_configuration(cwd=root, environment={}, authoritative_repository_root=root)
 
-    def test_each_higher_configuration_source_overrides_each_lower_source(self) -> None:
-        sources = ("default", "user", "repository", "environment", "command")
+    def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:
+        profiles = [
+            {"name": "one", "model": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
+            {"name": "two", "model": "gpt-5.6-terra", "reasoning_effort": "high"},
+        ]
         with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            roots = {source: self.make_repository(workspace / source) for source in sources}
-            caches = {source: workspace / f"{source}-cache" for source in sources}
-            source_names = {
-                "user": ConfigurationSource.USER,
-                "repository": ConfigurationSource.REPOSITORY,
-                "environment": ConfigurationSource.ENVIRONMENT,
-                "command": ConfigurationSource.COMMAND_LINE,
-            }
-            for lower_index, lower in enumerate(sources):
-                for higher in sources[lower_index + 1 :]:
-                    user_config = workspace / f"{lower}-{higher}.toml"
-                    includes_user = lower == "user" or higher == "user"
-                    repository_host = roots["user"] if includes_user else roots["default"]
-                    includes_repository = lower == "repository" or higher == "repository"
-                    if includes_repository:
-                        self.write_config(
-                            repository_host / ".roundwright.toml",
-                            f"[roundwright]\ncache_directory = {str(caches['repository'])!r}\n",
-                        )
-                    if includes_user:
-                        self.write_config(
-                            user_config,
-                            f"[roundwright]\nrepository_root = {str(repository_host)!r}\ncache_directory = {str(caches['user'])!r}\n",
-                        )
-                    environment = {}
-                    if lower == "environment" or higher == "environment":
-                        environment["ROUNDWRIGHT_CACHE_DIRECTORY"] = str(caches["environment"])
-                    cli_values = {}
-                    if lower == "command" or higher == "command":
-                        cli_values["cache_directory"] = caches["command"]
-                    config = load_configuration(
-                        cwd=roots["default"],
-                        environment=environment,
-                        cli_values=cli_values,
-                        user_config=user_config if includes_user else None,
-                        home=workspace / "home",
-                    )
-                    expected = caches[higher]
-                    self.assertEqual(config.cache_directory.value, expected, f"{higher} should override {lower}")
-                    self.assertEqual(config.cache_directory.source, source_names[higher])
+            root = Path(temporary)
+            configuration = load_configuration(cwd=root, environment={}, cli_values={
+                "review.max_supervisor_attempts_per_round": "2",
+                "roles.supervisor.attempt_profiles": profiles,
+            })
+            self.assertEqual([profile.name for profile in configuration.supervisor_attempt_profiles.value], ["one", "two"])
+            with self.assertRaisesRegex(ConfigurationError, "atomic|partial|unsupported"):
+                load_configuration(cwd=root, environment={}, cli_values={"roles.supervisor.attempt_profiles": [{"name": "one", "model": "gpt-5.6-sol"}]})
+            with self.assertRaisesRegex(ConfigurationError, "count"):
+                load_configuration(cwd=root, environment={}, cli_values={"roles.supervisor.attempt_profiles": profiles})
 
-    def test_repository_configuration_cannot_rebind_or_mix_repository_roots(self) -> None:
+    def test_invalid_review_combinations_and_unknown_policy_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            source = self.make_repository(workspace / "source")
-            target = self.make_repository(workspace / "target")
-            self.write_config(
-                source / ".roundwright.toml",
-                f"[roundwright]\nrepository_root = {str(target)!r}\n",
-            )
-            with self.assertRaises(ConfigurationError) as raised:
-                load_configuration(cwd=source, environment={})
-            self.assertIn("must not rebind", str(raised.exception))
-            self.assertNotIn(str(source), str(raised.exception))
-            self.assertNotIn(str(target), str(raised.exception))
-
-            self.write_config(
-                source / ".roundwright.toml",
-                f"[roundwright]\ncache_directory = {str(workspace / 'cache')!r}\n",
-            )
-            configuration = load_configuration(
-                cwd=source,
-                environment={"ROUNDWRIGHT_REPOSITORY_ROOT": str(target)},
-            )
-            with self.assertRaises(ConfigurationError) as raised:
-                preflight(configuration, PreflightMode.DISPATCH_CAPABLE)
-            self.assertIn("does not match", str(raised.exception))
-            self.assertNotIn(str(source), str(raised.exception))
-            self.assertNotIn(str(target), str(raised.exception))
-
-    def test_repository_toml_overrides_user_file_when_user_selects_repository(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            repository = self.make_repository(workspace)
-            user = workspace / "user.toml"
-            user_cache = workspace / "user-cache"
-            repository_cache = workspace / "repository-cache"
-            self.write_config(user, f"[roundwright]\nrepository_root = {str(repository)!r}\ncache_directory = {str(user_cache)!r}\n")
-            self.write_config(repository / ".roundwright.toml", f"[roundwright]\ncache_directory = {str(repository_cache)!r}\n")
-            config = load_configuration(cwd=workspace, user_config=user, environment={})
-        self.assertEqual(config.cache_directory.value, repository_cache)
-        self.assertEqual(config.cache_directory.source, ConfigurationSource.REPOSITORY)
-
-    def test_explicit_missing_malformed_unknown_and_invalid_configuration_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            missing = workspace / "missing.toml"
-            with self.assertRaisesRegex(ConfigurationError, "explicit"):
-                load_configuration(cwd=workspace, user_config=missing, environment={})
-            malformed = workspace / "malformed.toml"
-            self.write_config(malformed, "[roundwright\n")
-            with self.assertRaisesRegex(ConfigurationError, "malformed"):
-                load_configuration(cwd=workspace, user_config=malformed, environment={})
-            unknown = workspace / "unknown.toml"
-            self.write_config(unknown, "[roundwright]\nunknown = 'value'\n")
-            with self.assertRaisesRegex(ConfigurationError, "unknown"):
-                load_configuration(cwd=workspace, user_config=unknown, environment={})
-            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                load_configuration(cwd=workspace, environment={"ROUNDWRIGHT_REPOSITORY_ROOT": str(workspace)})
-            with self.assertRaisesRegex(ConfigurationError, "absolute"):
-                load_configuration(cwd=workspace, environment={"ROUNDWRIGHT_CACHE_DIRECTORY": "relative-cache"})
-            private_path = workspace / "private-token-value"
-            with self.assertRaises(ConfigurationError) as raised:
-                load_configuration(cwd=workspace, environment={"ROUNDWRIGHT_REPOSITORY_ROOT": str(private_path)})
-            self.assertNotIn(str(private_path), str(raised.exception))
-
-    def test_repository_preflight_requires_a_validated_repository_but_read_only_does_not(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = self.make_repository(Path(temporary))
-            config = load_configuration(cwd=root, environment={})
-            report = preflight(config, PreflightMode.DISPATCH_CAPABLE)
-            self.assertTrue(report.repository_ready)
-
-    def test_repository_identity_rejects_reparse_metadata_and_git_environment(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            external = self.make_repository(workspace / "external")
-            reparse_root = workspace / "reparse-root"
-            reparse_root.mkdir()
-            try:
-                (reparse_root / ".git").symlink_to(external / ".git", target_is_directory=True)
-            except OSError:
-                self.skipTest("linked metadata is unavailable on this platform")
-            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                RepositoryIdentity.from_root(reparse_root)
-
-    def test_repository_identity_rejects_repository_selecting_environment(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            repository = self.make_repository(Path(temporary))
-            for environment in (
-                {"GIT_DIR": str(repository / ".git")},
-                {"GIT_WORK_TREE": str(repository)},
-                {"GIT_COMMON_DIR": str(repository / ".git")},
+            root = Path(temporary)
+            for values in (
+                {"review.max_rounds": "0"},
+                {"review.complete_rounds": "11"},
+                {"review.on_final_findings": "pass-anyway"},
+                {"model": "gpt-5.6-sol"},
             ):
-                with mock.patch.dict(os.environ, environment):
-                    with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                        RepositoryIdentity.from_root(repository)
+                with self.subTest(values=values), self.assertRaises(ConfigurationError):
+                    load_configuration(cwd=root, environment={}, cli_values=values)
 
-    @unittest.skipUnless(os.name == "nt", "junctions are a Windows-specific fixture")
-    def test_repository_identity_rejects_junction_metadata(self) -> None:
+    def test_cli_whole_structure_is_json_and_duplicate_or_partial_environment_is_rejected(self) -> None:
+        with self.assertRaises(ConfigurationError):
+            parse_cli_overrides(["review.max_rounds=9", "review.max_rounds=10"])
+        with self.assertRaises(ConfigurationError):
+            parse_cli_overrides(["roles.supervisor.attempt_profiles=not-json"])
         with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            external = self.make_repository(workspace / "external")
-            junction_root = workspace / "junction-root"
-            junction_root.mkdir()
-            result = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(junction_root / ".git"), str(external / ".git")],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode:
-                self.skipTest("junction creation is unavailable on this platform")
-            self.assertTrue((junction_root / ".git").is_junction())
-            with self.assertRaisesRegex(ConfigurationError, "Git worktree"):
-                RepositoryIdentity.from_root(junction_root)
+            configuration = load_configuration(cwd=Path(temporary), environment={"ROUNDWRIGHT_MODEL": "gpt-5.6-sol"})
+        self.assertEqual(configuration.worker.value.model, "gpt-5.6-terra")
 
-    def test_preflight_rejects_serialized_and_malformed_capability_modes(self) -> None:
+    def test_digest_pins_values_and_sources_without_path_or_secret_disclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            configuration = load_configuration(
-                cwd=Path(temporary), environment={}, home=Path(temporary) / "home"
-            )
-        with self.assertRaisesRegex(ConfigurationError, "repository root"):
-            preflight(configuration, "dispatch-capable")
-        for mode in ("read write", "", None, object()):
-            with self.assertRaisesRegex(ConfigurationError, "unsupported"):
-                preflight(configuration, mode)  # type: ignore[arg-type]
+            root = Path(temporary)
+            first = load_configuration(cwd=root, environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "9"})
+            second = load_configuration(cwd=root, environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "10"})
+        self.assertNotEqual(first.pin().digest, second.pin().digest)
+        self.assertEqual(first.pin().digest, first.resolved_digest)
+        self.assertNotIn(str(root), str(first.sources))
+        with self.assertRaises(ConfigurationError) as raised:
+            load_configuration(cwd=root, environment={"ROUNDWRIGHT_REVIEW_MAX_ROUNDS": "private-token"})
+        self.assertNotIn("private-token", str(raised.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

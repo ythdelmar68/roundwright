@@ -18,6 +18,7 @@ from typing import Callable, Iterable, Never
 
 SHADOW_CASE_SCHEMA = "roundwright-shadow-case/v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_CONFIG_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _TOKEN = re.compile(r"[^\s\x00-\x1f]+\Z")
 
@@ -174,6 +175,7 @@ class ShadowIdentity:
     reference_result_digest: str = ""
     input_payloads: tuple[bytes, ...] = ()
     reference_result_payload: bytes = b""
+    configuration_digest: str | None = None
 
     def digest(self) -> str:
         _validate_identity(self)
@@ -210,6 +212,7 @@ class ShadowObservation:
     input_payloads: tuple[bytes, ...] = ()
     reference_result_payload: bytes | None = None
     evidence_digest: str = field(default="")
+    configuration_digest: str | None = None
 
     def __post_init__(self) -> None:
         _validate_observation(self, verify_digest=False)
@@ -342,6 +345,8 @@ class ShadowExecutor:
                     _forbid_mutation(observation.requested_mutation)
                 if observation.candidate_sha != case.identity.candidate_sha:
                     return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "candidate-bound evidence is stale")
+                if case.identity.configuration_digest is not None and observation.configuration_digest != case.identity.configuration_digest:
+                    return _invalid_report(case, ReplayClassification.STALE_EVIDENCE, "resolved configuration evidence has drifted")
                 if any(value is None for value in (
                     observation.source_id, observation.task_id, observation.base_sha, observation.policy_identity,
                 )):
@@ -510,6 +515,8 @@ def _validate_identity(identity: object) -> None:
         raise ShadowError("input digest does not match immutable content")
     if type(identity.reference_result_payload) is not bytes or hashlib.sha256(identity.reference_result_payload).hexdigest() != identity.reference_result_digest:
         raise ShadowError("reference result digest does not match immutable content")
+    if identity.configuration_digest is not None and (type(identity.configuration_digest) is not str or not _CONFIG_DIGEST.fullmatch(identity.configuration_digest)):
+        raise ShadowError("resolved configuration digest is invalid")
 
 
 def _validate_observation(observation: object, *, verify_digest: bool = True) -> None:
@@ -518,6 +525,8 @@ def _validate_observation(observation: object, *, verify_digest: bool = True) ->
     _token(observation.event_id, "event identity")
     _token(observation.attempt_id, "attempt identity")
     _token(observation.state, "state")
+    if observation.configuration_digest is not None and (type(observation.configuration_digest) is not str or not _CONFIG_DIGEST.fullmatch(observation.configuration_digest)):
+        raise ShadowError("resolved configuration digest is invalid")
     _token(observation.next_action, "next action")
     if not isinstance(observation.role, EvidenceRole) or not isinstance(observation.attempt_disposition, AttemptDisposition):
         raise ShadowError("observation role or disposition is invalid")
@@ -630,6 +639,7 @@ def _identity_payload(identity: ShadowIdentity) -> dict[str, str]:
         "reference_result_digest": identity.reference_result_digest,
         "input_payloads": tuple(value.hex() for value in identity.input_payloads),
         "reference_result_payload": identity.reference_result_payload.hex(),
+        "configuration_digest": identity.configuration_digest,
     }
 
 
@@ -660,6 +670,7 @@ def _observation_payload(observation: ShadowObservation, *, include_digest: bool
         "reference_result_digest": observation.reference_result_digest,
         "input_payloads": tuple(value.hex() for value in observation.input_payloads),
         "reference_result_payload": None if observation.reference_result_payload is None else observation.reference_result_payload.hex(),
+        "configuration_digest": observation.configuration_digest,
     }
     if include_digest:
         payload["evidence_digest"] = observation.evidence_digest

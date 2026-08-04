@@ -41,6 +41,15 @@ Supervisor, candidate, and gate contracts for a single isolated source. It is
 not a command-shell mode and never calls a provider, GitHub, CI, or any other
 networked service.
 
+For Phase 3, `roundwright.shadow` is the reusable pure replay boundary. It
+accepts only versioned, content-addressed case bundles bound to source, task,
+base/candidate, policy, provider attempt, accepted review, gate, and next
+action identities. The executor replays persisted Worker/Supervisor evidence
+through the fixed lifecycle state machine and returns a typed comparison report.
+Its capability adapter rejects Git, GitHub, repository, queue, branch,
+worktree, pull-request, issue, merge, close, cleanup, and lifecycle mutations
+before any callback can run.
+
 ## Operational documentation
 
 Phase 3's [dogfood promotion roadmap](docs/operations/dogfood-promotion-roadmap.md)

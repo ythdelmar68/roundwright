@@ -69,8 +69,6 @@ def finalize_review_limit_repair(
     binding: WorktreeBinding,
     seal: CandidateSeal,
     *,
-    review_round: int,
-    max_rounds: int,
     findings_fingerprint: str,
     worker_repair_fingerprint: str,
     worker_thread_identity: str,
@@ -82,8 +80,6 @@ def finalize_review_limit_repair(
     return record_review_limit_finalization(
         repository,
         identity,
-        review_round=review_round,
-        max_rounds=max_rounds,
         findings_fingerprint=findings_fingerprint,
         worker_repair_fingerprint=worker_repair_fingerprint,
         candidate_sha=seal.candidate_sha,

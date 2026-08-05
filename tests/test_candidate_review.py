@@ -223,6 +223,21 @@ class CandidateReviewTests(unittest.TestCase):
                     input_fingerprint="e" * 64, lease=lease, now=now,
                 )
 
+    def test_accepted_diff_review_persists_a_profile_bound_output_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, _, _, _, _ = values
+            seal, _, review = self.accepted_diff_review(values, review_id="bound-review", provider_id="bound-provider")
+            raw_digest = DiffReviewOutput("bound-review", "bound-provider", "bound-review-session", "bound-review-turn", "bound-review-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS).normalized().digest
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                provider_digest = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (review.provider_attempt_id,)).fetchone()[0]
+                artifact_digest = connection.execute("SELECT content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ?", (review.diff_review_attempt_id,)).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(provider_digest, artifact_digest)
+            self.assertNotEqual(provider_digest, raw_digest)
+
     def test_final_review_limit_repair_rejects_wrong_round_or_bound_identity(self):
         cases = (
             ("wrong round", {"review_round": 9, "max_rounds": 10}),

@@ -282,6 +282,21 @@ class CandidateReviewTests(unittest.TestCase):
                     worker_thread_identity="worker-thread-25", lease=lease,
                 )
 
+    def test_final_review_limit_repair_rejects_obsolete_caller_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+            with self.assertRaises(TypeError):
+                finalize_review_limit_repair(
+                    repository, identity, binding, repair_seal, findings_fingerprint=findings,
+                    worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25",
+                    review_round=1, max_rounds=1, lease=lease,
+                )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
+            finally:
+                connection.close()
+
     def test_implementation_replays_the_persisted_worker_turn_after_a_crash(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

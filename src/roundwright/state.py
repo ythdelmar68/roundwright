@@ -755,20 +755,16 @@ def transition_task(
     return _commit_transition(repository, identity, expected_state, next_state, evidence_fingerprint, lease=lease)
 
 
-def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, review_round: int, max_rounds: int, findings_fingerprint: str, worker_repair_fingerprint: str, candidate_sha: str, worker_thread_identity: str, lease: object | None = None) -> ReviewLimitFinalizationReceipt:
+def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, findings_fingerprint: str, worker_repair_fingerprint: str, candidate_sha: str, worker_thread_identity: str, lease: object | None = None) -> ReviewLimitFinalizationReceipt:
     """Durably consume the one terminal Worker repair; later Supervisor turns fail closed."""
 
     _validate_task_identity(identity)
-    if type(review_round) is not int or type(max_rounds) is not int or review_round != max_rounds or review_round < 1:
-        raise StateError("review-limit finalization is invalid")
     _require_fingerprint(findings_fingerprint)
     _require_fingerprint(worker_repair_fingerprint)
     if not isinstance(candidate_sha, str) or len(candidate_sha) != 40 or any(character not in "0123456789abcdef" for character in candidate_sha):
         raise StateError("review-limit candidate identity is invalid")
     if not isinstance(worker_thread_identity, str) or not worker_thread_identity:
         raise StateError("review-limit Worker identity is invalid")
-    receipt_fingerprint = hashlib.sha256("\x00".join((identity.task_id, str(review_round), findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")).encode("utf-8")).hexdigest()
-    receipt = ReviewLimitFinalizationReceipt(review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, receipt_fingerprint)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -776,7 +772,7 @@ def record_review_limit_finalization(repository: RepositoryIdentity, identity: T
         _require_matching_task(connection, identity)
         seal = connection.execute("SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()
         repair = connection.execute(
-            "SELECT implementation.worker_thread_identity FROM implementation_candidates AS candidates "
+            "SELECT implementation.worker_thread_identity, reviews.review_round, reviews.review_mode, reviews.review_max_rounds, reviews.review_on_final_findings, reviews.review_policy_digest FROM implementation_candidates AS candidates "
             "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id "
             "JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = implementation.repair_diff_review_id "
             "AND routes.consumed_by_implementation_attempt_id = implementation.implementation_attempt_id "
@@ -788,8 +784,14 @@ def record_review_limit_finalization(repository: RepositoryIdentity, identity: T
             (identity.task_id, candidate_sha, worker_repair_fingerprint, identity.task_id, findings_fingerprint),
         ).fetchone()
         findings = connection.execute("SELECT routes.worker_thread_identity FROM diff_review_artifacts AS artifacts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = artifacts.diff_review_attempt_id WHERE routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?", (identity.task_id, findings_fingerprint)).fetchone()
-        if seal != (candidate_sha,) or repair != (worker_thread_identity,) or findings != (worker_thread_identity,):
+        if seal != (candidate_sha,) or repair is None or repair[0] != worker_thread_identity or findings != (worker_thread_identity,):
             raise StateError("review-limit finalization does not match the final Worker repair")
+        review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest = repair[1:]
+        if type(review_round) is not int or type(review_max_rounds) is not int or review_round < 1 or review_round != review_max_rounds or review_mode != "CONVERGING" or review_on_final_findings != "worker-final-repair-then-merge":
+            raise StateError("review-limit finalization is not a terminal persisted review")
+        _require_fingerprint(review_policy_digest)
+        receipt_fingerprint = hashlib.sha256("\x00".join((identity.task_id, str(review_round), findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")).encode("utf-8")).hexdigest()
+        receipt = ReviewLimitFinalizationReceipt(review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, receipt_fingerprint)
         row = connection.execute("SELECT review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone()
         expected = (review_round, findings_fingerprint, worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", candidate_sha, worker_thread_identity, receipt_fingerprint)
         if row is None:

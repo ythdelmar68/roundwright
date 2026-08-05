@@ -62,7 +62,8 @@ class ProviderRecoveryTests(unittest.TestCase):
         profile = profile_fingerprint(selected)
         audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(selected.model, selected.reasoning_effort.value),))
         observation = ProviderHealthObservation(role, profile, CodexHealthContract(audit.sdk_version, audit.runtime_version, identity.base_sha).fingerprint, audit.fingerprint, HealthState.READY, None, 0, 2_000_000_000, 1)
-        receipt = ProviderHealthReceipt(identity.base_sha, candidate, "case-22", 0, binding, role, profile, observation, ProviderHealthAuditIdentity(audit, selected))
+        ordinal = 0 if role is ProviderRole.PLANNING else 1 if role is ProviderRole.WORKER else 2
+        receipt = ProviderHealthReceipt(identity.base_sha, candidate, "case-22", ordinal, binding, role, profile, observation, ProviderHealthAuditIdentity(audit, selected))
         return RecoveryContext.for_task(
             identity,
             candidate_sha=candidate,
@@ -124,6 +125,25 @@ class ProviderRecoveryTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts").fetchone(), (0,))
             finally:
                 connection.close()
+
+    def test_prepared_attempt_persists_and_rechecks_the_exact_fresh_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity(); self.admit(repository, identity, lease)
+            context = self.context(identity)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="bound-health")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                row = connection.execute("SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("bound-health",)).fetchone()
+            finally:
+                connection.close()
+            receipt = context.health_receipt
+            self.assertEqual(row, (receipt.contract_commit, receipt.candidate_sha, receipt.case_id, receipt.receipt_digest, receipt.selection_ordinal, receipt.observation.fresh_until, receipt.observation.health_contract_identity))
+            expired = replace(receipt.observation, fresh_until=int(time.time()))
+            blocked = replace(context, health_receipt=replace(receipt, observation=expired, receipt_digest=""))
+            with self.assertRaises(ProviderRecoveryError):
+                record_session_identity(repository, identity, blocked, attempt_id="bound-health", session_identity="blocked-session", lease=lease)
+            self.assertIsNone(read_attempt(repository, identity, "bound-health").session_identity)
 
     def test_external_turn_without_verified_completion_blocks_without_duplicate_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -196,8 +216,8 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.admit(repository, supervisor, lease)
             for identity, role, attempt in ((worker, ProviderRole.WORKER, "worker-stale"), (supervisor, ProviderRole.SUPERVISOR, "supervisor-stale")):
                 self.prepare(repository, identity, lease, role=role, attempt=attempt)
-                record_session_identity(repository, identity, self.context(identity), attempt_id=attempt, session_identity=f"session-{attempt}", lease=lease)
-                record_external_turn(repository, identity, self.context(identity), attempt_id=attempt, session_identity=f"session-{attempt}", external_turn_identity=f"turn-{attempt}", lease=lease)
+                record_session_identity(repository, identity, self.context(identity, role=role), attempt_id=attempt, session_identity=f"session-{attempt}", lease=lease)
+                record_external_turn(repository, identity, self.context(identity, role=role), attempt_id=attempt, session_identity=f"session-{attempt}", external_turn_identity=f"turn-{attempt}", lease=lease)
 
             expired = int(time.time()) + 11
             worker_recovery = recover_attempt(repository, worker, self.context(worker), attempt_id="worker-stale", max_attempts=2, lease=lease, now=expired)
@@ -217,8 +237,8 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="review-one")
-            record_session_identity(repository, identity, self.context(identity), attempt_id="review-one", session_identity="review-session", lease=lease)
-            record_external_turn(repository, identity, self.context(identity), attempt_id="review-one", session_identity="review-session", external_turn_identity="review-turn", lease=lease)
+            record_session_identity(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="review-one", session_identity="review-session", lease=lease)
+            record_external_turn(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="review-one", session_identity="review-session", external_turn_identity="review-turn", lease=lease)
             record_completed_output(repository, identity, self.context(identity), attempt_id="review-one", output_pointer="review-output", completion_evidence_fingerprint="e" * 64, lease=lease)
             accepted = accept_supervisor_review(repository, identity, self.context(identity), attempt_id="review-one", accepted_review_identity="accepted-cycle-one", lease=lease)
             self.assertEqual(accepted.state, AttemptState.ACCEPTED)
@@ -337,8 +357,8 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="late-completion")
-            record_session_identity(repository, identity, self.context(identity), attempt_id="late-completion", session_identity="late-thread", lease=lease)
-            record_external_turn(repository, identity, self.context(identity), attempt_id="late-completion", session_identity="late-thread", external_turn_identity="late-turn", lease=lease)
+            record_session_identity(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="late-completion", session_identity="late-thread", lease=lease)
+            record_external_turn(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="late-completion", session_identity="late-thread", external_turn_identity="late-turn", lease=lease)
             record_completed_output(repository, identity, self.context(identity), attempt_id="late-completion", output_pointer="late-output", completion_evidence_fingerprint="e" * 64, lease=lease)
             self.assertEqual(recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", max_attempts=1, lease=lease).next_action, RecoveryAction.BLOCKED_AMBIGUOUS_TURN)
             conflicting = recover_attempt(repository, identity, self.context(identity), attempt_id="late-completion", verified_completion_evidence="f" * 64, max_attempts=1, lease=lease)
@@ -360,7 +380,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             identity = self.identity()
             self.admit(repository, identity, lease)
             self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="session-only-supervisor")
-            record_session_identity(repository, identity, self.context(identity), attempt_id="session-only-supervisor", session_identity="review-thread", lease=lease)
+            record_session_identity(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="session-only-supervisor", session_identity="review-thread", lease=lease)
             recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="session-only-supervisor", max_attempts=2, lease=lease, now=int(time.time()) + 11)
             self.assertEqual(recovery.next_action, RecoveryAction.FRESH_SUPERVISOR_SESSION)
             self.assertEqual(read_attempt(repository, identity, "session-only-supervisor").state, AttemptState.INVALIDATED)
@@ -372,9 +392,9 @@ class ProviderRecoveryTests(unittest.TestCase):
                 accept_supervisor_review(repository, identity, self.context(identity), attempt_id="session-only-supervisor", accepted_review_identity="delayed-review", lease=lease)
             self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="fresh-supervisor")
             with self.assertRaises(ProviderRecoveryError):
-                record_session_identity(repository, identity, self.context(identity), attempt_id="fresh-supervisor", session_identity="review-thread", lease=lease)
+                record_session_identity(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="fresh-supervisor", session_identity="review-thread", lease=lease)
             self.assertEqual(
-                record_session_identity(repository, identity, self.context(identity), attempt_id="fresh-supervisor", session_identity="fresh-review-thread", lease=lease).session_identity,
+                record_session_identity(repository, identity, self.context(identity, role=ProviderRole.SUPERVISOR), attempt_id="fresh-supervisor", session_identity="fresh-review-thread", lease=lease).session_identity,
                 "fresh-review-thread",
             )
 

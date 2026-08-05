@@ -183,7 +183,7 @@ def prepare_attempt(
     _require_fingerprint(input_fingerprint, "input fingerprint")
     observed = _clock(now)
     selected_profile = _selected_profile_identity(context, role, selected_profile_identity)
-    _require_health_authorization(context, role, selected_profile, observed)
+    receipt = _require_health_authorization(context, role, selected_profile, observed)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -202,6 +202,7 @@ def prepare_attempt(
         if existing is not None:
             row = _attempt_row(connection, identity.task_id, attempt_id)
             _require_persisted_context(connection, attempt_id, context)
+            _persist_health_authorization(connection, attempt_id, receipt)
             if (
                 row.role is not role
                 or row.process_lease_id != process_lease_id
@@ -222,6 +223,7 @@ def prepare_attempt(
             (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, selected_profile),
         )
         _persist_context(connection, attempt_id, context)
+        _persist_health_authorization(connection, attempt_id, receipt)
         _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, observed)
         connection.commit()
     except sqlite3.IntegrityError as error:
@@ -253,13 +255,15 @@ def record_external_turn(
     _require_token(attempt_id, "attempt identity")
     _require_token(session_identity, "session identity")
     _require_token(external_turn_identity, "external turn identity")
+    observed = _clock(now)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, identity.repository_id, _clock(now))
+        _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.state is AttemptState.DISPATCHED and (row.session_identity, row.external_turn_identity) == (session_identity, external_turn_identity):
             _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context)
             connection.commit()
@@ -271,7 +275,7 @@ def record_external_turn(
             "UPDATE provider_attempts SET external_turn_identity = ?, state = ? WHERE attempt_id = ?",
             (external_turn_identity, AttemptState.DISPATCHED.value, attempt_id),
         )
-        _checkpoint(connection, identity.task_id, row.role, "after-dispatch", attempt_id, context, _clock(now))
+        _checkpoint(connection, identity.task_id, row.role, "after-dispatch", attempt_id, context, observed)
         connection.commit()
     except sqlite3.IntegrityError as error:
         connection.rollback()
@@ -308,6 +312,7 @@ def record_session_identity(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.state is not AttemptState.PREPARED:
             raise ProviderRecoveryError("session identity cannot be recorded for this attempt")
         if row.session_identity is not None and row.session_identity != session_identity:
@@ -814,14 +819,14 @@ def _selected_profile_identity(context: RecoveryContext, role: ProviderRole, req
     return selected
 
 
-def _require_health_authorization(context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> None:
+def _require_health_authorization(context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int):
     """Fail before SQLite is opened whenever dispatch is health-bound."""
 
     values = (context.health_contract_commit, context.shadow_case_id, context.health_receipt)
     if context.health_contract_commit is None or context.shadow_case_id is None or context.health_receipt is None:
         raise ProviderRecoveryError("provider health authorization is incomplete")
     try:
-        from .provider_health import ProviderHealthReceipt
+        from .provider_health import ProviderHealthReceipt, required_provider_selections
         receipt = context.health_receipt
         if type(receipt) is not ProviderHealthReceipt:
             raise ProviderRecoveryError("provider health authorization is invalid")
@@ -830,6 +835,9 @@ def _require_health_authorization(context: RecoveryContext, role: ProviderRole, 
             contract_commit=context.health_contract_commit,
             candidate_sha=context.candidate_sha, case_id=context.shadow_case_id, now=observed,
         )
+        if receipt.selection_ordinal >= len(required_provider_selections(context.runtime_binding)) or required_provider_selections(context.runtime_binding)[receipt.selection_ordinal] != (receipt.selection_ordinal, role, profile_identity):
+            raise ProviderRecoveryError("provider health authorization is invalid")
+        return receipt
     except ProviderRecoveryError:
         raise
     except Exception as error:
@@ -838,6 +846,34 @@ def _require_health_authorization(context: RecoveryContext, role: ProviderRole, 
 
 def _require_persisted_context(connection, attempt_id: str, context: RecoveryContext) -> None:
     _persist_context(connection, attempt_id, context)
+
+
+def _health_authorization_values(receipt) -> tuple[object, ...]:
+    return (
+        receipt.contract_commit, receipt.candidate_sha, receipt.case_id,
+        receipt.receipt_digest, receipt.selection_ordinal,
+        receipt.observation.fresh_until, receipt.observation.health_contract_identity,
+    )
+
+
+def _persist_health_authorization(connection, attempt_id: str, receipt) -> None:
+    expected = _health_authorization_values(receipt)
+    existing = connection.execute(
+        "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if existing is None:
+        connection.execute(
+            "INSERT INTO provider_attempt_health_authorizations(attempt_id, contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (attempt_id, *expected),
+        )
+    elif existing != expected:
+        raise ProviderRecoveryError("provider health authorization has drifted")
+
+
+def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> None:
+    receipt = _require_health_authorization(context, role, profile_identity, observed)
+    _persist_health_authorization(connection, attempt_id, receipt)
 
 
 def _require_session_checkpoint(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from dataclasses import replace
 
 from roundwright.shadow import (
@@ -20,6 +21,7 @@ from roundwright.shadow import (
     ShadowIdentity,
     ShadowObservation,
     compare_provider_health_receipt,
+    rehydrate_live_provider_health_evidence,
 )
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.runtime_binding import RuntimeBinding
@@ -54,6 +56,34 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(compare_provider_health_receipt(receipt.evidence(), self.receipt(fresh_until=101).evidence(), now=101).differing_fields, ("invalid-evidence",))
         tampered = receipt.evidence(); tampered.pop("case_id")
         self.assertEqual(compare_provider_health_receipt(receipt.evidence(), tampered, now=101).outcome, ComparisonOutcome.INVALID)
+
+    def test_live_json_receipt_evidence_rehydrates_before_typed_shadow_comparison(self):
+        worker = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        supervisor = ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH)
+        worker_id, supervisor_id = profile_fingerprint(worker), profile_fingerprint(supervisor)
+        binding = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, worker_id, (supervisor_id,))
+        audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(worker.model, "high"), CodexCapability(supervisor.model, "xhigh")))
+        receipts = []
+        for ordinal, (role, profile, profile_id) in enumerate(((ProviderRole.PLANNING, worker, worker_id), (ProviderRole.WORKER, worker, worker_id), (ProviderRole.SUPERVISOR, supervisor, supervisor_id))):
+            observation = ProviderHealthObservation(role, profile_id, CodexHealthContract(audit.sdk_version, audit.runtime_version, "a" * 40).fingerprint, audit.fingerprint, HealthState.READY, None, 100, 200, 1)
+            receipts.append(ProviderHealthReceipt("a" * 40, "b" * 40, "case-42", ordinal, binding, role, profile_id, observation, ProviderHealthAuditIdentity(audit, profile)))
+        receipt = receipts[0]
+        emitted = {
+            "schema": "roundwright-live-provider-health/v1", "ready_at": 101, "ready": True,
+            "contract_commit": receipt.contract_commit, "candidate_sha": receipt.candidate_sha, "case_id": receipt.case_id,
+            "report": {"health_contract_identity": receipt.observation.health_contract_identity,
+                       "configuration": receipt.configuration.complete_columns(),
+                       "selections": tuple((item.selection_ordinal, item.role.value, item.profile_identity) for item in receipts),
+                       "observations": tuple(item.observation.evidence() for item in receipts)},
+            "receipts": tuple(item.evidence() for item in receipts), "receipt_digests": tuple(item.receipt_digest for item in receipts),
+        }
+        replayed = rehydrate_live_provider_health_evidence(json.loads(json.dumps(emitted)))
+        self.assertEqual(len(replayed), 3)
+        self.assertEqual(compare_provider_health_receipt(receipt.evidence(), replayed[0].evidence(), now=101).outcome, ComparisonOutcome.MATCH)
+        for mutate in (lambda value: value["receipts"][0].__setitem__("receipt_digest", "sha256:" + "0" * 64), lambda value: value.__setitem__("extra", True)):
+            tampered = json.loads(json.dumps(emitted)); mutate(tampered)
+            with self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(tampered)
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",

@@ -326,25 +326,30 @@ class RoleBoundCodexChannel:
         self._identity, self._backend = identity, backend
     def credential_identity(self) -> RoleBoundCredentialIdentity: return self._identity
     def audit_runtime(self) -> CodexRuntimeAudit: return self._backend.audit_runtime()
-    def qualify_read_only(self, request: ReadOnlyQualification) -> ProbeOutcome: return self._backend.qualify_read_only(request)
+    def qualify_read_only(self, request: ReadOnlyQualification) -> ProbeOutcome:
+        if type(request) is not ReadOnlyQualification or request.role is not self._identity.role:
+            raise ProviderHealthError("native credential role is invalid")
+        return self._backend.qualify_read_only(request)
 
 
 class RoleBoundCodexCredentialStore:
     """Injected native-channel registry; it never discovers or exposes secrets."""
     __slots__ = ("_store_identity", "_channels")
-    def __init__(self, store_identity: str, channels: dict[ProviderRole, tuple[str, object]]) -> None:
+    def __init__(self, store_identity: str, channels: dict[ProviderRole, tuple[str, NativeCodexChannelBackend]]) -> None:
         if type(store_identity) is not str or not _DIGEST.fullmatch(store_identity) or type(channels) is not dict or set(channels) != set(ProviderRole):
             raise ProviderHealthError("native credential store is invalid")
         built = {}
-        used = set()
+        used_channel_identities = set()
+        used_backends = set()
         for role in ProviderRole:
             entry = channels[role]
             if type(entry) is not tuple or len(entry) != 2:
                 raise ProviderHealthError("native credential channel is invalid")
             channel_identity, backend = entry
-            if type(channel_identity) is not str or not _DIGEST.fullmatch(channel_identity) or channel_identity in used:
+            if type(channel_identity) is not str or not _DIGEST.fullmatch(channel_identity) or channel_identity in used_channel_identities or id(backend) in used_backends:
                 raise ProviderHealthError("native credential channel is invalid")
-            used.add(channel_identity)
+            used_channel_identities.add(channel_identity)
+            used_backends.add(id(backend))
             built[role] = RoleBoundCodexChannel(RoleBoundCredentialIdentity(store_identity, role, channel_identity, tuple(item for item in ProviderRole if item is not role)), backend)
         self._store_identity, self._channels = store_identity, built
     def store_identity(self) -> str: return self._store_identity
@@ -464,16 +469,19 @@ class ProviderQualificationReport:
     observations: tuple[ProviderHealthObservation, ...]
 
     def __post_init__(self) -> None:
+        if type(self.selections) is not tuple or any(type(item) is not tuple or len(item) != 3 for item in self.selections):
+            raise ProviderHealthError("provider qualification report is invalid")
+        expected = required_provider_selections(self.configuration)
         keys = [(item.role, item.profile_identity) for item in self.observations]
-        expected = [(role, profile) for _, role, profile in self.selections]
+        selected = [(role, profile) for _, role, profile in self.selections]
         if (
             not _DIGEST.fullmatch(self.health_contract_identity)
             or type(self.configuration) is not RuntimeBinding
             or not self.observations
-            or type(self.selections) is not tuple
             or any(type(ordinal) is not int or ordinal != index or type(role) is not ProviderRole or not _DIGEST.fullmatch(profile) for index, (ordinal, role, profile) in enumerate(self.selections))
-            or len(expected) != len(self.observations)
-            or keys != expected
+            or self.selections != expected
+            or len(selected) != len(self.observations)
+            or keys != selected
             or any(item.health_contract_identity != self.health_contract_identity for item in self.observations)
         ):
             raise ProviderHealthError("provider qualification report is invalid")
@@ -491,16 +499,34 @@ class ProviderQualificationReport:
             raise ProviderHealthError("provider health clock is invalid")
         return all(item.state is HealthState.READY and item.is_fresh_at(now) for item in self.observations)
 
-    def blocker_for(self, role: ProviderRole, profile: ProviderProfile, *, now: int, ordinal: int = 0) -> CodexFailure | None:
+    def blocker_for(self, role: ProviderRole, profile: ProviderProfile, *, now: int, ordinal: int | None = None) -> CodexFailure | None:
         """Return a matching blocker, treating stale evidence as an exact-stage block."""
 
         if type(now) is not int:
             raise ProviderHealthError("provider health clock is invalid")
+        if type(role) is not ProviderRole or type(profile) is not ProviderProfile or (ordinal is not None and type(ordinal) is not int):
+            raise ProviderHealthError("configured profile was not qualified")
         profile_identity = profile_fingerprint(profile)
-        for index, observation in enumerate(self.observations):
-            if (index, observation.role, observation.profile_identity) == (ordinal, role, profile_identity):
-                return CodexFailure.UNKNOWN if not observation.is_fresh_at(now) else observation.failure
+        matches = [(index, observation) for index, observation in enumerate(self.observations) if (observation.role, observation.profile_identity) == (role, profile_identity)]
+        if ordinal is not None:
+            matches = [(index, observation) for index, observation in matches if index == ordinal]
+        if len(matches) == 1:
+            observation = matches[0][1]
+            return CodexFailure.UNKNOWN if not observation.is_fresh_at(now) else observation.failure
         raise ProviderHealthError("configured profile was not qualified")
+
+
+def required_provider_selections(binding: RuntimeBinding) -> tuple[tuple[int, ProviderRole, str], ...]:
+    """Return every dispatchable role/profile in deterministic dispatch order."""
+
+    if type(binding) is not RuntimeBinding:
+        raise ProviderHealthError("provider configuration is invalid")
+    values = (
+        (ProviderRole.PLANNING, binding.worker_profile_identity),
+        (ProviderRole.WORKER, binding.worker_profile_identity),
+        *((ProviderRole.SUPERVISOR, profile) for profile in binding.supervisor_profile_identities),
+    )
+    return tuple((ordinal, role, profile_identity) for ordinal, (role, profile_identity) in enumerate(values))
 
 
 class ProviderHealthCache:
@@ -552,8 +578,10 @@ class CodexProviderHealth:
         contract_identity = self._contract.fingerprint
         try:
             isolation = self.credential_isolation(role)
+        except CodexAdapterError as error:
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), error.failure, observed_at, freshness_seconds, 1)
         except ProviderHealthError:
-            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.UNKNOWN, observed_at, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.MALFORMED_RESPONSE, observed_at, freshness_seconds, 1)
         if not force_refresh:
             cached = self._cache.get(role, profile_identity, contract_identity, now=observed_at)
             if cached is not None:
@@ -566,6 +594,8 @@ class CodexProviderHealth:
         try:
             store_identity = self._credentials.store_identity()
             evidence = self._credentials.credential_isolation(role)
+        except CodexAdapterError:
+            raise
         except Exception as error:
             raise ProviderHealthError("provider credential isolation is not proven") from error
         if type(store_identity) is not str or not _DIGEST.fullmatch(store_identity) or type(evidence) is not CredentialIsolationEvidence or evidence.role is not role:
@@ -594,10 +624,9 @@ class CodexProviderHealth:
 
         if type(configuration) is not Configuration:
             raise ProviderHealthError("provider configuration is invalid")
-        selected = ((ProviderRole.WORKER, configuration.worker.value),) + tuple(
-            (ProviderRole.SUPERVISOR, profile) for profile in configuration.supervisor_attempt_profiles.value
-        )
         pin = configuration.pin().runtime_binding()
+        profiles = (configuration.worker.value, configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
+        selected = tuple((role, profile) for (_, role, _), profile in zip(required_provider_selections(pin), profiles, strict=True))
         return ProviderQualificationReport(self._contract.fingerprint, pin, tuple(
             (ordinal, role, profile_fingerprint(profile)) for ordinal, (role, profile) in enumerate(selected)
         ), tuple(
@@ -617,6 +646,11 @@ class CodexProviderHealth:
             channel_identity.authorize_channel(role, isolation.credential_identity.store_identity, channel_identity.channel_identity)
             if channel_identity != isolation.credential_identity:
                 raise ProviderHealthError("provider credential channel is invalid")
+        except CodexAdapterError as error:
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), error.failure, now, freshness_seconds, 1)
+        except Exception:
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.MALFORMED_RESPONSE, now, freshness_seconds, 1)
+        try:
             audit = channel.audit_runtime()
         except CodexAdapterError as error:
             return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), error.failure, now, freshness_seconds, 1)

@@ -19,6 +19,7 @@ from roundwright.provider_health import (
     profile_fingerprint, render_health_diagnostic,
 )
 from roundwright.provider_recovery import ProviderRole
+from roundwright.runtime_binding import RuntimeBinding
 
 
 class FakeChannel:
@@ -172,28 +173,44 @@ class ProviderHealthTests(unittest.TestCase):
         self.assertFalse(report.ready)
         self.assertFalse(report.ready_at(100))
         worker = configuration.worker.value
-        failing = configuration.supervisor_attempt_profiles.value[1]
         self.assertIsNone(report.blocker_for(ProviderRole.WORKER, worker, now=100))
-        self.assertEqual(report.blocker_for(ProviderRole.SUPERVISOR, failing, now=100, ordinal=2), CodexFailure.AUTH_MISSING)
+        profiles = (configuration.worker.value, configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
+        blocked_index = next(index for index, observation in enumerate(report.observations) if observation.failure is not None)
+        blocked = report.observations[blocked_index]
+        self.assertEqual(report.blocker_for(blocked.role, profiles[blocked_index], now=100, ordinal=blocked_index), blocked.failure)
         replayed = type(report.observations[0]).from_evidence(report.observations[0].evidence())
         self.assertEqual(replayed, report.observations[0])
-        recovered = service.qualify(ProviderRole.SUPERVISOR, failing, freshness_seconds=30, force_refresh=True, now=101)
-        self.assertEqual(recovered.state, HealthState.READY)
         self.assertIsNone(service.qualify(ProviderRole.WORKER, worker, freshness_seconds=30, now=101).failure)
+
+    def test_configuration_report_requires_complete_ordered_dispatch_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            configuration = load_configuration(cwd=Path(temporary), environment={})
+        profiles = (configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
+        audit = CodexRuntimeAudit("1.2.3", "4.5.6", tuple(CodexCapability(model, effort) for model, effort in dict.fromkeys((profile.model, profile.reasoning_effort.value) for profile in profiles)))
+        report = self.service(audit=audit).qualify_configuration(configuration, freshness_seconds=30, now=100)
+        self.assertEqual([role for _, role, _ in report.selections[:2]], [ProviderRole.PLANNING, ProviderRole.WORKER])
+        self.assertTrue(report.ready_at(100))
+        for selections, observations in (
+            (report.selections[:-1], report.observations[:-1]),
+            (report.selections + (report.selections[0],), report.observations + (report.observations[0],)),
+            (tuple(reversed(report.selections)), tuple(reversed(report.observations))),
+        ):
+            with self.assertRaises(ProviderHealthError):
+                ProviderQualificationReport(report.health_contract_identity, report.configuration, selections, observations)
 
     def test_stale_report_is_not_ready_and_blocks_only_the_stale_profile(self):
         service = self.service()
+        planning = service.qualify(ProviderRole.PLANNING, self.profile, freshness_seconds=30, now=100)
         worker = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         supervisor = service.qualify(ProviderRole.SUPERVISOR, self.profile, freshness_seconds=30, now=110)
-        report = ProviderQualificationReport(self.contract.fingerprint, self.binding(), (
-            (0, worker.role, worker.profile_identity), (1, supervisor.role, supervisor.profile_identity),
-        ), (
-            worker, supervisor,
-        ))
+        binding = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, worker.profile_identity, (worker.profile_identity,))
+        report = ProviderQualificationReport(self.contract.fingerprint, binding, (
+            (0, planning.role, planning.profile_identity), (1, worker.role, worker.profile_identity), (2, supervisor.role, supervisor.profile_identity),
+        ), (planning, worker, supervisor))
         self.assertTrue(report.ready_at(129))
         self.assertFalse(report.ready_at(130))
         self.assertEqual(report.blocker_for(ProviderRole.WORKER, self.profile, now=130), CodexFailure.UNKNOWN)
-        self.assertIsNone(report.blocker_for(ProviderRole.SUPERVISOR, self.profile, now=130, ordinal=1))
+        self.assertIsNone(report.blocker_for(ProviderRole.SUPERVISOR, self.profile, now=130, ordinal=2))
 
     def test_canonical_receipt_rejects_digest_and_dispatch_identity_substitution(self):
         binding = load_configuration(cwd=Path(tempfile.gettempdir()), environment={}).pin().runtime_binding()
@@ -229,7 +246,7 @@ class ProviderHealthTests(unittest.TestCase):
 
     def test_missing_or_wrong_role_credential_evidence_blocks_before_the_adapter_is_opened(self):
         blocked = self.service(isolation=RuntimeError("secret path unavailable")).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
-        self.assertEqual(blocked.failure, CodexFailure.UNKNOWN)
+        self.assertEqual(blocked.failure, CodexFailure.MALFORMED_RESPONSE)
         self.assertEqual(self.store.roles, [])
         with self.assertRaises(ProviderHealthError):
             self.service(isolation=CredentialIsolationEvidence(ProviderRole.SUPERVISOR, RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.SUPERVISOR, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.SUPERVISOR)))).credential_isolation(ProviderRole.WORKER)
@@ -243,6 +260,8 @@ class ProviderHealthTests(unittest.TestCase):
             self.service().qualify(ProviderRole.WORKER, self.profile, freshness_seconds=0, now=100)
         result = self.service((CodexAdapterError(CodexFailure.AUTH_MISSING),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         self.assertEqual(result.failure, CodexFailure.AUTH_MISSING)
+        service = self.service(); self.store.store_response = CodexAdapterError(CodexFailure.AUTH_EXPIRED)
+        self.assertEqual(service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100).failure, CodexFailure.AUTH_EXPIRED)
 
     def test_malformed_adapter_values_are_classified_without_reading_their_properties(self):
         class Trap:
@@ -289,7 +308,7 @@ class ProviderHealthTests(unittest.TestCase):
                 service = self.service()
                 self.store.channel_identity = replacement
                 result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
-                self.assertEqual(result.failure, CodexFailure.UNKNOWN)
+                self.assertEqual(result.failure, CodexFailure.MALFORMED_RESPONSE)
                 self.assertEqual((self.channel.audit_calls, self.channel.requests), (0, []))
 
     def test_malformed_and_throwing_identity_boundaries_are_redacted_and_single_read(self):
@@ -297,7 +316,7 @@ class ProviderHealthTests(unittest.TestCase):
             with self.subTest(boundary=boundary, kind=type(value).__name__):
                 service = self.service(); setattr(self.store if boundary != "identity_response" else self.channel, boundary, value)
                 result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, force_refresh=True, now=100)
-                self.assertEqual(result.failure, CodexFailure.UNKNOWN)
+                self.assertEqual(result.failure, CodexFailure.MALFORMED_RESPONSE)
                 self.assertEqual((self.channel.audit_calls, self.channel.requests), (0, []))
                 self.assertNotIn("private-token", render_health_diagnostic(result))
         service = self.service(); result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, force_refresh=True, now=100)
@@ -316,6 +335,19 @@ class ProviderHealthTests(unittest.TestCase):
         self.assertEqual(result.state, HealthState.READY)
         self.assertEqual((native[ProviderRole.WORKER][1].audit_calls, len(native[ProviderRole.WORKER][1].requests)), (1, 1))
         self.assertEqual({name for name in dir(store.open_role_channel(ProviderRole.WORKER)) if not name.startswith("_")}, {"audit_runtime", "credential_identity", "qualify_read_only"})
+
+    def test_role_bound_channel_rejects_cross_role_requests_and_reused_backend(self):
+        native = {role: ("sha256:" + f"{index:x}" * 64, FakeNativeChannel(self.audit)) for index, role in enumerate(ProviderRole)}
+        store = RoleBoundCodexCredentialStore("sha256:" + "a" * 64, native)
+        channel = store.open_role_channel(ProviderRole.WORKER)
+        with self.assertRaises(ProviderHealthError):
+            channel.qualify_read_only(ReadOnlyQualification(ProviderRole.SUPERVISOR, self.profile.model, self.profile.reasoning_effort.value))
+        self.assertEqual(native[ProviderRole.WORKER][1].requests, [])
+        shared = FakeNativeChannel(self.audit)
+        reused = {role: ("sha256:" + f"{index:x}" * 64, shared) for index, role in enumerate(ProviderRole)}
+        with self.assertRaises(ProviderHealthError):
+            RoleBoundCodexCredentialStore("sha256:" + "a" * 64, reused)
+        self.assertEqual((shared.audit_calls, shared.requests), (0, []))
 
     def test_role_bound_native_store_constructor_rejects_invalid_registry(self):
         native = {role: ("sha256:" + f"{index:x}" * 64, FakeNativeChannel(self.audit)) for index, role in enumerate(ProviderRole)}

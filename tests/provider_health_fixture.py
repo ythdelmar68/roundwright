@@ -79,8 +79,9 @@ def provider_context(
         role, profile_identity, contract.fingerprint, audit.fingerprint,
         HealthState.READY, None, 0, 2_000_000_000, 1,
     )
+    ordinal = 0 if role is ProviderRole.PLANNING else 1 if role is ProviderRole.WORKER else 2 + context.runtime_binding.supervisor_profile_identities.index(profile_identity)
     receipt = ProviderHealthReceipt(
-        identity.base_sha, context.candidate_sha, "test-provider-health", 0,
+        identity.base_sha, context.candidate_sha, "test-provider-health", ordinal,
         context.runtime_binding, role, profile_identity, observation,
         ProviderHealthAuditIdentity(audit, profile),
     )

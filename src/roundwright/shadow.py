@@ -85,6 +85,57 @@ def compare_provider_health_receipt(expected: object, observed: object, *, now: 
         return ProviderHealthReceiptComparison("invalid", ComparisonOutcome.INVALID, "", None, "", "", differing_fields=("invalid-evidence",))
 
 
+def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["ProviderHealthReceipt", ...]:
+    """Safely consume the exact JSON shape emitted by the opt-in fixture.
+
+    JSON changes tuples to lists, so this boundary normalizes only built-in
+    JSON containers before handing each immutable receipt to its canonical
+    verifier.  It never invokes an adapter, hook, or provider.
+    """
+
+    def normalize(value: object) -> object:
+        if type(value) is list:
+            return tuple(normalize(item) for item in value)
+        if type(value) is dict:
+            if any(type(key) is not str for key in value):
+                raise ValueError
+            return {key: normalize(item) for key, item in value.items()}
+        if type(value) in {str, int, bool, type(None)}:
+            return value
+        raise ValueError
+
+    try:
+        from .provider_health import ProviderHealthReceipt, ProviderHealthObservation, required_provider_selections
+        from .runtime_binding import RuntimeBinding
+        required = {"schema", "ready_at", "ready", "contract_commit", "candidate_sha", "case_id", "report", "receipts", "receipt_digests"}
+        if type(evidence) is not dict or set(evidence) != required or evidence["schema"] != "roundwright-live-provider-health/v1" or type(evidence["ready_at"]) is not int or evidence["ready"] is not True:
+            raise ValueError
+        value = normalize(evidence)
+        if type(value) is not dict or type(value["report"]) is not dict or set(value["report"]) != {"health_contract_identity", "configuration", "selections", "observations"} or type(value["receipts"]) is not tuple or type(value["receipt_digests"]) is not tuple:
+            raise ValueError
+        receipts = tuple(ProviderHealthReceipt.from_evidence(item) for item in value["receipts"])
+        report = value["report"]
+        selections, observations = report["selections"], report["observations"]
+        columns = report["configuration"]
+        if type(columns) is not tuple or len(columns) != 9 or type(columns[3]) is not str:
+            raise ValueError
+        binding = RuntimeBinding(columns[0], columns[1], columns[2], tuple(json.loads(columns[3])), *columns[4:])
+        if report["health_contract_identity"] != receipts[0].observation.health_contract_identity or tuple((item[0], item[1], item[2]) for item in selections) != tuple((ordinal, role.value, profile) for ordinal, role, profile in required_provider_selections(binding)):
+            raise ValueError
+        if not receipts or len(receipts) != len(selections) or len(receipts) != len(observations) or len(receipts) != len(value["receipt_digests"]):
+            raise ValueError
+        for ordinal, (selection, raw_observation, receipt, digest) in enumerate(zip(selections, observations, receipts, value["receipt_digests"], strict=True)):
+            if type(selection) is not tuple or len(selection) != 3 or selection[0] != ordinal or type(digest) is not str or receipt.receipt_digest != digest:
+                raise ValueError
+            observation = ProviderHealthObservation.from_evidence(raw_observation)
+            if (receipt.contract_commit, receipt.candidate_sha, receipt.case_id, receipt.selection_ordinal, receipt.configuration, receipt.role.value, receipt.profile_identity, receipt.observation) != (value["contract_commit"], value["candidate_sha"], value["case_id"], ordinal, binding, selection[1], selection[2], observation) or observation.health_contract_identity != report["health_contract_identity"]:
+                raise ValueError
+            receipt.authorize(receipt.configuration, receipt.role, receipt.profile_identity, contract_commit=value["contract_commit"], candidate_sha=value["candidate_sha"], case_id=value["case_id"], now=value["ready_at"])
+        return receipts
+    except Exception as error:
+        raise ShadowError("live provider health evidence is invalid") from error
+
+
 class MismatchDisposition(StrEnum):
     INPUT_DRIFT = "INPUT_DRIFT"
     NORMALIZATION_DEFECT = "NORMALIZATION_DEFECT"

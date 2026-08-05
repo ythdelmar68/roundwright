@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from .configuration import Configuration
 import re
-from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationReport, RoleBoundCodexCredentialStore
+from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationReport, RoleBoundCodexCredentialStore, required_provider_selections
 from .provider_recovery import ProviderRole
 
 
@@ -53,7 +53,8 @@ def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStor
     try:
         report = CodexProviderHealth(store, contract).qualify_configuration(configuration, freshness_seconds=freshness_seconds, max_attempts=1, force_refresh=True, now=now)
         if not report.ready_at(now): raise ValueError
-        profiles = (configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
+        profiles = (configuration.worker.value, configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
+        if tuple(selection for selection in report.selections) != required_provider_selections(report.configuration): raise ValueError
         receipts = []
         for ordinal, ((_, role, profile_identity), observation, profile) in enumerate(zip(report.selections, report.observations, profiles, strict=True)):
             audit = store.open_role_channel(role).audit_runtime()

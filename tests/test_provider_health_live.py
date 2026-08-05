@@ -10,6 +10,7 @@ from roundwright.provider_health import CodexCapability, CodexHealthContract, Co
 from roundwright.provider_health_live import run_bounded_live_provider_health_fixture
 from roundwright.provider_recovery import ProviderRole
 from tests import live_provider_health as live_harness
+from roundwright.shadow import compare_provider_health_receipt, ComparisonOutcome, rehydrate_live_provider_health_evidence
 
 def live_provider_factory():
     test = LiveFixtureTests(); store, configuration, _ = test.fixture()
@@ -47,7 +48,7 @@ class LiveFixtureTests(unittest.TestCase):
                 store, config, channels = self.fixture_at(workspace)
         contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
         result = run_bounded_live_provider_health_fixture(store, contract, config, enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
-        self.assertEqual(len(result.receipts), 1 + len(config.supervisor_attempt_profiles.value))
+        self.assertEqual(len(result.receipts), 2 + len(config.supervisor_attempt_profiles.value))
         self.assertTrue(all(ProviderHealthReceipt.from_evidence(item.evidence()) == item for item in result.receipts))
         self.assertEqual(sum(len(channel.requests) for _, channel in channels.values()), len(result.receipts))
     def test_blocked_or_malformed_live_profile_returns_only_generic_error(self):
@@ -71,11 +72,13 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertTrue(output.getvalue().endswith("\n"))
         lines = output.getvalue().splitlines(); self.assertEqual(len(lines), 1)
         value = json.loads(lines[0]); self.assertEqual((value["schema"], value["ready"], value["ready_at"], value["contract_commit"], value["candidate_sha"], value["case_id"]), ("roundwright-live-provider-health/v1", True, 100, "b" * 40, "c" * 40, "case-42-live"))
-        expected_selections = 1 + len(live_provider_factory()[2].supervisor_attempt_profiles.value)
+        expected_selections = 2 + len(live_provider_factory()[2].supervisor_attempt_profiles.value)
         self.assertEqual(len(value["report"]["selections"]), expected_selections)
         self.assertEqual(len(value["report"]["observations"]), expected_selections)
         self.assertEqual(len(value["receipts"]), expected_selections)
         self.assertEqual(len(value["receipt_digests"]), expected_selections)
         self.assertEqual(value["receipt_digests"], [item["receipt_digest"] for item in value["receipts"]])
         self.assertEqual(len(set(value["receipt_digests"])), len(value["receipt_digests"]))
+        replayed = rehydrate_live_provider_health_evidence(value)
+        self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=100).outcome, ComparisonOutcome.MATCH)
         self.assertFalse(any(marker in lines[0].lower() for marker in ("secret-token", "c:/private", "payload", "_backend", "0x")))

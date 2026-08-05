@@ -579,6 +579,15 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
         ),
     ),
+    Migration(
+        45,
+        (
+            "CREATE TABLE provider_attempt_health_authorizations (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), contract_commit TEXT NOT NULL, candidate_sha TEXT, case_id TEXT NOT NULL, receipt_digest TEXT NOT NULL, selection_ordinal INTEGER NOT NULL, fresh_until INTEGER NOT NULL, health_contract_identity TEXT NOT NULL)",
+        ),
+        (
+            ("provider_attempt_health_authorizations", "CREATE TABLE provider_attempt_health_authorizations (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), contract_commit TEXT NOT NULL, candidate_sha TEXT, case_id TEXT NOT NULL, receipt_digest TEXT NOT NULL, selection_ordinal INTEGER NOT NULL, fresh_until INTEGER NOT NULL, health_contract_identity TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 

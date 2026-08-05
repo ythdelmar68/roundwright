@@ -6,7 +6,10 @@ live adapter is `gh`; an MCP adapter is optional and is never a runtime
 requirement.
 
 Core logic sends immutable `GitHubReadRequest` values and receives immutable,
-public-safe snapshots. The supported reads cover repository identity, issues
+public-safe snapshots. Every response must supply—and match—the requested
+repository plus its operation-specific issue, pull-request, branch, or ref
+identity. Each operation admits one exact response shape, including nested
+records; unknown, missing, and inapplicable fields fail closed. The supported reads cover repository identity, issues
 and parent/sub-issue relationships, comments, branches, pull requests,
 reviews, checks, workflow runs, mergeability, closing references, and exact
 remote heads. Snapshots retain exact identifiers and commit identities, while
@@ -14,7 +17,9 @@ comment bodies are reduced to stable digests. Unknown, missing, mismatched, or
 incomplete response fields are classified as `malformed-response`, not guessed.
 
 Mutation is deliberately described as `GitHubMutationIntent`; it is not
-executed by this Phase 3 core boundary. Outcomes distinguish unavailable
+executed by this Phase 3 core boundary. Its canonical, operation-specific
+payload carries public references and content digests only, and is bound into
+the intent and receipt identity. Outcomes distinguish unavailable
 capability, permission denial, authentication failure, transport failure,
 malformed response, stale response, and policy denial. A later `gh` adapter
 must bind its semantic read-back receipt to the full intent identity.

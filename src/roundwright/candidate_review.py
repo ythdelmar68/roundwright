@@ -530,6 +530,9 @@ def record_diff_review(
     if not isinstance(output, DiffReviewOutput):
         raise CandidateReviewError("diff review output is malformed")
     normalized = output.normalized()
+    bound_output_digest = _bound_diff_review_output_digest(
+        normalized.digest, dispatch.within_round_attempt, dispatch.selected_profile_identity,
+    )
     if tuple(normalized.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")) != tuple(dispatch.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")):
         raise CandidateReviewError("diff review output identity does not match the durable dispatch")
     _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
@@ -541,14 +544,14 @@ def record_diff_review(
             provider.accepted_review_identity != dispatch.diff_review_attempt_id
             or provider.output_pointer != f"diff-review:{diff_review_attempt_id}"
             or provider.completion_evidence_fingerprint != completion_evidence_fingerprint
-            or _provider_output_fingerprint(repository, identity, dispatch.provider_attempt_id) != normalized.digest
+            or _provider_output_fingerprint(repository, identity, dispatch.provider_attempt_id) != bound_output_digest
         ):
             _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
             raise CandidateReviewError("accepted diff review replay conflicts with provider evidence")
     else:
         record_completed_output(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
                                 output_pointer=f"diff-review:{diff_review_attempt_id}", completion_evidence_fingerprint=completion_evidence_fingerprint,
-                                output_fingerprint=normalized.digest, lease=lease, now=now)
+                                output_fingerprint=bound_output_digest, lease=lease, now=now)
     findings = normalized.findings
     finding_ids = tuple(f"diff-finding-{_digest({'task': identity.task_id, 'candidate': seal.candidate_sha, 'finding': finding})[:24]}" for finding in findings)
     connection = _open_writable_connection(repository)
@@ -557,7 +560,7 @@ def record_diff_review(
         _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "diff-review")
         artifact = connection.execute("SELECT verdict, findings_json, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,)).fetchone()
-        expected_artifact = (normalized.verdict.value, json.dumps(findings), normalized.digest)
+        expected_artifact = (normalized.verdict.value, json.dumps(findings), bound_output_digest)
         if artifact is None:
             connection.execute("INSERT INTO diff_review_artifacts(diff_review_attempt_id, task_id, verdict, findings_json, content_digest) VALUES (?, ?, ?, ?, ?)", (diff_review_attempt_id, identity.task_id, *expected_artifact))
             connection.execute("UPDATE diff_review_attempts SET state = 'recorded' WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,))
@@ -581,7 +584,7 @@ def record_diff_review(
         connection.close()
     bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=completion_evidence_fingerprint, lease=lease)
     if normalized.verdict is DiffReviewVerdict.FINDINGS:
-        transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=normalized.digest, lease=lease)
+        transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=bound_output_digest, lease=lease)
     else:
         _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
         _accept_diff_pass(repository, identity, context, dispatch, lease, now)

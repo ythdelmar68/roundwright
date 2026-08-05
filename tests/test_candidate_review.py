@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -19,7 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.candidate_review import (
     CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
-    VerificationKind, VerificationOutcome, begin_implementation, dispatch_diff_review as _dispatch_diff_review,
+    VerificationKind, VerificationOutcome, begin_implementation as _begin_implementation, dispatch_diff_review as _native_dispatch_diff_review,
     finalize_review_limit_repair, read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
     recover_diff_review,
 )
@@ -28,14 +29,36 @@ from roundwright.configuration import RepositoryIdentity
 from roundwright.gates import _valid_review_limit_finalization
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
-from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
+from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review as _native_dispatch_plan_review, record_plan_review
 from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, prepare_attempt, read_attempt, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt, PlanningInput, WorkerPlan, WorkerPlanOutput,
-    accept_plan_review_and_begin_implementation, begin_planning, dispatch_plan,
+    accept_plan_review_and_begin_implementation, begin_planning, dispatch_plan as _native_dispatch_plan,
     record_plan, submit_plan_for_review,
 )
+from tests.provider_health_fixture import provider_context, runtime_binding as health_runtime_binding
+
+
+def dispatch_plan(repository, identity, context, *args, **kwargs):
+    return _native_dispatch_plan(repository, identity, provider_context(context, identity, ProviderRole.PLANNING), *args, **kwargs)
+
+
+def dispatch_plan_review(repository, identity, context, *args, **kwargs):
+    return _native_dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), *args, **kwargs)
+
+
+def begin_implementation(repository, identity, context, *args, **kwargs):
+    return _begin_implementation(repository, identity, provider_context(context, identity, ProviderRole.WORKER), *args, **kwargs)
+
+
+def _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs):
+    selected = kwargs.get("selected_profile_identity")
+    if selected not in context.runtime_binding.supervisor_profile_identities:
+        selected = None
+    return _native_dispatch_diff_review(
+        repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR, selected_profile_identity=selected), binding, seal, **kwargs
+    )
 
 
 def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs):
@@ -51,8 +74,32 @@ class CandidateReviewTests(unittest.TestCase):
     def runtime_binding(self, supervisor_count: int = 3, *, include_policy: bool = True) -> RuntimeBinding:
         values = "cdefgh"
         policy_digest = candidate_review._digest({"complete_rounds": 3, "max_rounds": 10, "max_supervisor_attempts_per_round": supervisor_count, "on_final_findings": "worker-final-repair-then-merge"})
-        values = (3, 10, supervisor_count, "worker-final-repair-then-merge", policy_digest) if include_policy else ()
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cdefgh"[:supervisor_count]), *values)
+        return health_runtime_binding(
+            supervisor_count,
+            complete_rounds=3 if include_policy else None,
+            max_rounds=10 if include_policy else None,
+            final_policy="worker-final-repair-then-merge" if include_policy else None,
+            policy_digest=policy_digest if include_policy else None,
+        )
+
+    def test_sealed_context_projection_excludes_only_per_attempt_health_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, _, context, _, _ = values
+            dispatch, seal = self.implement(values)
+            authorized = provider_context(self.review_context(identity, context, seal), identity, ProviderRole.SUPERVISOR)
+            candidate_review._require_diff_review_context(repository, identity, authorized, seal, dispatch.implementation_attempt_id)
+            replacement = "f" * 64
+            for field, value in (
+                ("task_id", "other-task"), ("repository_fingerprint", replacement),
+                ("worktree_fingerprint", replacement), ("branch_fingerprint", replacement),
+                ("base_fingerprint", replacement), ("candidate_fingerprint", replacement),
+                ("candidate_sha", "c" * 40), ("policy_fingerprint", replacement),
+                ("deployment_fingerprint", replacement), ("runtime_binding", self.runtime_binding(2)),
+            ):
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(CandidateReviewError, "recovery context"):
+                        candidate_review._require_diff_review_context(repository, identity, replace(authorized, **{field: value}), seal, dispatch.implementation_attempt_id)
 
     def git(self, directory: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True).stdout.strip()
@@ -227,7 +274,7 @@ class CandidateReviewTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ProviderRecoveryError, "review limit"):
                 prepare_attempt(
-                    repository, identity, context, attempt_id="later-supervisor", role=ProviderRole.SUPERVISOR,
+                    repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), attempt_id="later-supervisor", role=ProviderRole.SUPERVISOR,
                     process_lease_id="later-supervisor-lease", process_lease_expires_at=now + 60,
                     input_fingerprint="e" * 64, lease=lease, now=now,
                 )

@@ -35,6 +35,37 @@ deadline.  Retry is limited to three qualification attempts and never enters a
 Supervisor review lifecycle.  No Copilot SDK, runtime, or authentication path
 is present.
 
+### Opt-in live provider-health fixture
+
+Hermetic coverage remains in `tests/test_provider_health.py` and
+`tests/test_provider_health_live.py`. The separately invoked live harness is
+`tests/live_provider_health.py`; its name deliberately excludes it from
+`test*.py` discovery. It cannot run unless
+`ROUNDWRIGHT_RUN_LIVE_PROVIDER_HEALTH` is exactly `1`.
+
+It requires `ROUNDWRIGHT_LIVE_PROVIDER_FACTORY=dotted.module:callable`,
+`ROUNDWRIGHT_CONTRACT_COMMIT=<40-lowercase-hex>`, and
+`ROUNDWRIGHT_SHADOW_CASE_ID=<safe-id>`. It optionally accepts
+`ROUNDWRIGHT_CANDIDATE_SHA=<40-lowercase-hex>`. The zero-argument factory must
+return exactly `(RoleBoundCodexCredentialStore, CodexHealthContract,
+Configuration)` using already-resolved native channels. Platform credential
+discovery, token loading, login, provider substitution, and task dispatch are
+excluded.
+
+```text
+python tests/live_provider_health.py
+```
+
+Exit `0` emits one canonical owner-safe JSON receipt bundle; exit `1` emits
+fixed blocked JSON; exit `2` emits fixed disabled JSON. No exception or
+provider prose, credential path, token, raw payload, or private path is
+emitted. Each configured role/profile receives at most one content-free,
+read-only qualification; receipt construction may repeat only the typed
+runtime audit and never probes or dispatches tasks. The resulting receipt
+evidence is intended for the existing typed Shadow comparator and must be
+externally captured and cited before issue closure. This documentation does
+not claim that a live run occurred.
+
 The policy boundary is also pure and typed. A later Orchestrator must supply an
 externally verified immutable control-source snapshot plus an owner activation
 receipt bound to the exact task candidate. Policy evaluation returns only a

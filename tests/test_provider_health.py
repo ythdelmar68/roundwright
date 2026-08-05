@@ -12,6 +12,10 @@ from roundwright.provider_health import (
     CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract,
     CodexProviderHealth, CodexRuntimeAudit, CredentialIsolationEvidence, HealthState, ProbeOutcome,
     ProviderHealthCache, ProviderHealthError, ProviderQualificationReport, ReadOnlyQualification,
+    ProviderHealthReceipt,
+    ProviderHealthAuditIdentity,
+    RoleBoundCredentialIdentity,
+    RoleBoundCodexCredentialStore, RoleBoundCodexChannel,
     profile_fingerprint, render_health_diagnostic,
 )
 from roundwright.provider_recovery import ProviderRole
@@ -22,8 +26,19 @@ class FakeChannel:
         self.audit = audit
         self.outcomes = list(outcomes)
         self.requests = []
+        self.audit_calls = 0
+        self.identity = None
+        self.identity_response = None
+        self.identity_reads = 0
+
+    def credential_identity(self):
+        self.identity_reads += 1
+        value = self.identity if self.identity_response is None else self.identity_response
+        if isinstance(value, Exception): raise value
+        return value
 
     def audit_runtime(self):
+        self.audit_calls += 1
         if isinstance(self.audit, Exception):
             raise self.audit
         return self.audit
@@ -40,23 +55,47 @@ class FakeStore:
     def __init__(self, channel, isolation=None):
         self.channel = channel
         self.isolation = isolation
+        self.channel_identity = None
         self.roles = []
+        self.store_response = None
+        self.isolation_response = None
+        self.store_reads = self.isolation_reads = 0
 
     def open_role_channel(self, role):
         self.roles.append(role)
         return self.channel
 
     def credential_isolation(self, role):
+        self.isolation_reads += 1
+        if isinstance(self.isolation_response, Exception): raise self.isolation_response
         if isinstance(self.isolation, Exception):
             raise self.isolation
-        return CredentialIsolationEvidence(role) if self.isolation is None else self.isolation
+        identity = RoleBoundCredentialIdentity("sha256:" + "a" * 64, role, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not role))
+        self.channel.identity = identity if self.channel_identity is None else self.channel_identity
+        return self.isolation_response if self.isolation_response is not None else (CredentialIsolationEvidence(role, identity) if self.isolation is None else self.isolation)
+
+    def store_identity(self):
+        self.store_reads += 1
+        if isinstance(self.store_response, Exception): raise self.store_response
+        return "sha256:" + "a" * 64 if self.store_response is None else self.store_response
+
+
+class FakeNativeChannel:
+    def __init__(self, audit): self.audit, self.audit_calls, self.requests = audit, 0, []
+    def __repr__(self): return "token C:/private/path raw-payload"
+    def audit_runtime(self): self.audit_calls += 1; return self.audit
+    def qualify_read_only(self, request): self.requests.append(request); return ProbeOutcome(True)
 
 
 class ProviderHealthTests(unittest.TestCase):
     def setUp(self):
         self.profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         self.audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability("gpt-5.6-terra", "high"),))
-        self.contract = CodexHealthContract("1.2.3", "4.5.6")
+        self.contract = CodexHealthContract("1.2.3", "4.5.6", "a" * 40)
+
+    def binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            return load_configuration(cwd=Path(temporary), environment={}).pin().runtime_binding()
 
     def service(self, outcomes=(), audit=None, cache=None, isolation=None):
         self.channel = FakeChannel(self.audit if audit is None else audit, outcomes)
@@ -103,7 +142,7 @@ class ProviderHealthTests(unittest.TestCase):
         cache = ProviderHealthCache()
         first_service = self.service(cache=cache)
         first = first_service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
-        changed_contract = CodexHealthContract("9.9.9", "9.9.9")
+        changed_contract = CodexHealthContract("9.9.9", "9.9.9", "b" * 40)
         changed_channel = FakeChannel(self.audit, (ProbeOutcome(True),))
         changed_service = CodexProviderHealth(FakeStore(changed_channel), changed_contract, cache=cache)
         changed = changed_service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=101)
@@ -114,7 +153,7 @@ class ProviderHealthTests(unittest.TestCase):
         replayed["health_contract_identity"] = changed.health_contract_identity
         self.assertNotEqual(type(first).from_evidence(replayed).health_contract_identity, first.health_contract_identity)
         with self.assertRaises(ProviderHealthError):
-            ProviderQualificationReport(changed.health_contract_identity, (first,))
+            ProviderQualificationReport(changed.health_contract_identity, self.binding(), ((0, first.role, first.profile_identity),), (first,))
 
     def test_configuration_preflight_and_replay_keep_profile_blockers_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -135,7 +174,7 @@ class ProviderHealthTests(unittest.TestCase):
         worker = configuration.worker.value
         failing = configuration.supervisor_attempt_profiles.value[1]
         self.assertIsNone(report.blocker_for(ProviderRole.WORKER, worker, now=100))
-        self.assertEqual(report.blocker_for(ProviderRole.SUPERVISOR, failing, now=100), CodexFailure.AUTH_MISSING)
+        self.assertEqual(report.blocker_for(ProviderRole.SUPERVISOR, failing, now=100, ordinal=2), CodexFailure.AUTH_MISSING)
         replayed = type(report.observations[0]).from_evidence(report.observations[0].evidence())
         self.assertEqual(replayed, report.observations[0])
         recovered = service.qualify(ProviderRole.SUPERVISOR, failing, freshness_seconds=30, force_refresh=True, now=101)
@@ -144,14 +183,32 @@ class ProviderHealthTests(unittest.TestCase):
 
     def test_stale_report_is_not_ready_and_blocks_only_the_stale_profile(self):
         service = self.service()
-        report = ProviderQualificationReport(self.contract.fingerprint, (
-            service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100),
-            service.qualify(ProviderRole.SUPERVISOR, self.profile, freshness_seconds=30, now=110),
+        worker = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        supervisor = service.qualify(ProviderRole.SUPERVISOR, self.profile, freshness_seconds=30, now=110)
+        report = ProviderQualificationReport(self.contract.fingerprint, self.binding(), (
+            (0, worker.role, worker.profile_identity), (1, supervisor.role, supervisor.profile_identity),
+        ), (
+            worker, supervisor,
         ))
         self.assertTrue(report.ready_at(129))
         self.assertFalse(report.ready_at(130))
         self.assertEqual(report.blocker_for(ProviderRole.WORKER, self.profile, now=130), CodexFailure.UNKNOWN)
-        self.assertIsNone(report.blocker_for(ProviderRole.SUPERVISOR, self.profile, now=130))
+        self.assertIsNone(report.blocker_for(ProviderRole.SUPERVISOR, self.profile, now=130, ordinal=1))
+
+    def test_canonical_receipt_rejects_digest_and_dispatch_identity_substitution(self):
+        binding = load_configuration(cwd=Path(tempfile.gettempdir()), environment={}).pin().runtime_binding()
+        observation = self.service().qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        receipt = ProviderHealthReceipt("a" * 40, None, "case-42", 0, binding, ProviderRole.WORKER, observation.profile_identity, observation, ProviderHealthAuditIdentity(self.audit, self.profile))
+        receipt.authorize(binding, ProviderRole.WORKER, observation.profile_identity, contract_commit="a" * 40, candidate_sha=None, case_id="case-42", now=101)
+        self.assertEqual(ProviderHealthReceipt.from_evidence(receipt.evidence()), receipt)
+        tampered = receipt.evidence()
+        tampered["case_id"] = "case-43"
+        with self.assertRaises(ProviderHealthError):
+            ProviderHealthReceipt.from_evidence(tampered)
+        with self.assertRaises(ProviderHealthError):
+            receipt.authorize(binding, ProviderRole.WORKER, observation.profile_identity, contract_commit="b" * 40, candidate_sha=None, case_id="case-42", now=101)
+        with self.assertRaises(ProviderHealthError):
+            ProviderHealthReceipt("a" * 40, None, "case-42", 0, binding, ProviderRole.WORKER, observation.profile_identity, observation, ProviderHealthAuditIdentity(self.audit, self.profile), receipt_digest="sha256:" + "0" * 64)
 
     def test_untyped_exception_and_malformed_response_never_use_message_text_for_classification(self):
         unknown = self.service((RuntimeError("token at C:/private/path is denied"),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
@@ -163,7 +220,7 @@ class ProviderHealthTests(unittest.TestCase):
     def test_role_credential_projection_has_no_secret_access_and_diagnostics_are_redacted(self):
         service = self.service((ProbeOutcome(False, CodexFailure.AUTH_EXPIRED),))
         isolation = service.credential_isolation(ProviderRole.WORKER)
-        self.assertTrue(all(value is False for name, value in vars(isolation).items() if name != "role"))
+        self.assertTrue(all(value is False for name, value in vars(isolation).items() if name not in {"role", "credential_identity"}))
         result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         diagnostic = render_health_diagnostic(result)
         self.assertIn("authentication renewal required", diagnostic)
@@ -175,7 +232,7 @@ class ProviderHealthTests(unittest.TestCase):
         self.assertEqual(blocked.failure, CodexFailure.UNKNOWN)
         self.assertEqual(self.store.roles, [])
         with self.assertRaises(ProviderHealthError):
-            self.service(isolation=CredentialIsolationEvidence(ProviderRole.SUPERVISOR)).credential_isolation(ProviderRole.WORKER)
+            self.service(isolation=CredentialIsolationEvidence(ProviderRole.SUPERVISOR, RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.SUPERVISOR, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.SUPERVISOR)))).credential_isolation(ProviderRole.WORKER)
 
     def test_rejects_invalid_inputs_and_typed_adapter_failures_stay_classified(self):
         with self.assertRaises(ProviderHealthError):
@@ -186,6 +243,92 @@ class ProviderHealthTests(unittest.TestCase):
             self.service().qualify(ProviderRole.WORKER, self.profile, freshness_seconds=0, now=100)
         result = self.service((CodexAdapterError(CodexFailure.AUTH_MISSING),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         self.assertEqual(result.failure, CodexFailure.AUTH_MISSING)
+
+    def test_malformed_adapter_values_are_classified_without_reading_their_properties(self):
+        class Trap:
+            @property
+            def value(self):
+                raise AssertionError("private-token")
+        malformed_audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability("gpt-5.6-terra", "high"),))
+        service = self.service((Trap(),), audit=malformed_audit)
+        result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(result.failure, CodexFailure.MALFORMED_RESPONSE)
+        self.assertNotIn("private-token", render_health_diagnostic(result))
+        with self.assertRaises(ProviderHealthError):
+            CodexRuntimeAudit("1.2.3", "4.5.6", [CodexCapability("gpt-5.6-terra", "high")])
+        with self.assertRaises(ProviderHealthError):
+            ProbeOutcome(False, "auth-missing")
+
+    def test_audit_identity_round_trip_and_fingerprint_substitution_fail_closed(self):
+        identity = ProviderHealthAuditIdentity(self.audit, self.profile)
+        self.assertEqual(ProviderHealthAuditIdentity.from_evidence(identity.evidence()), identity)
+        tampered = identity.evidence()
+        tampered["runtime_fingerprint"] = "sha256:" + "0" * 64
+        with self.assertRaises(ProviderHealthError):
+            ProviderHealthAuditIdentity.from_evidence(tampered)
+
+    def test_role_bound_credential_identity_denies_every_other_role(self):
+        identity = RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.WORKER, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.WORKER))
+        self.assertEqual(RoleBoundCredentialIdentity.from_evidence(identity.evidence()), identity)
+        identity.authorize_channel(ProviderRole.WORKER, identity.store_identity, identity.channel_identity)
+        with self.assertRaises(ProviderHealthError):
+            identity.authorize_channel(ProviderRole.SUPERVISOR, identity.store_identity, identity.channel_identity)
+        malformed = identity.evidence(); malformed["denied_roles"] = tuple(reversed(malformed["denied_roles"]))
+        with self.assertRaises(ProviderHealthError):
+            RoleBoundCredentialIdentity.from_evidence(malformed)
+
+    def test_channel_identity_failures_block_before_audit_or_probe(self):
+        service = self.service()
+        result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual((result.state, self.channel.audit_calls, len(self.channel.requests)), (HealthState.READY, 1, 1))
+        for replacement in (
+            RoleBoundCredentialIdentity("sha256:" + "c" * 64, ProviderRole.WORKER, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.WORKER)),
+            RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.SUPERVISOR, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.SUPERVISOR)),
+        ):
+            with self.subTest(identity=replacement.role):
+                service = self.service()
+                self.store.channel_identity = replacement
+                result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+                self.assertEqual(result.failure, CodexFailure.UNKNOWN)
+                self.assertEqual((self.channel.audit_calls, self.channel.requests), (0, []))
+
+    def test_malformed_and_throwing_identity_boundaries_are_redacted_and_single_read(self):
+        for boundary, value in (("store_response", object()), ("store_response", RuntimeError("private-token")), ("isolation_response", object()), ("isolation_response", RuntimeError("private-token")), ("identity_response", object()), ("identity_response", RuntimeError("private-token"))):
+            with self.subTest(boundary=boundary, kind=type(value).__name__):
+                service = self.service(); setattr(self.store if boundary != "identity_response" else self.channel, boundary, value)
+                result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, force_refresh=True, now=100)
+                self.assertEqual(result.failure, CodexFailure.UNKNOWN)
+                self.assertEqual((self.channel.audit_calls, self.channel.requests), (0, []))
+                self.assertNotIn("private-token", render_health_diagnostic(result))
+        service = self.service(); result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, force_refresh=True, now=100)
+        self.assertEqual(result.state, HealthState.READY)
+        self.assertEqual((self.store.store_reads, self.store.isolation_reads, self.channel.identity_reads), (1, 1, 1))
+
+    def test_role_bound_native_store_surface_and_qualification(self):
+        native = {role: ("sha256:" + f"{index:x}" * 64, FakeNativeChannel(self.audit)) for index, role in enumerate(ProviderRole)}
+        store = RoleBoundCodexCredentialStore("sha256:" + "a" * 64, native)
+        for role in ProviderRole:
+            channel, evidence = store.open_role_channel(role), store.credential_isolation(role)
+            self.assertIs(type(channel), RoleBoundCodexChannel)
+            self.assertEqual(evidence.credential_identity.denied_roles, tuple(item for item in ProviderRole if item is not role))
+            self.assertTrue(all(value is False for name, value in vars(evidence).items() if name not in {"role", "credential_identity"}))
+        result = CodexProviderHealth(store, self.contract).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(result.state, HealthState.READY)
+        self.assertEqual((native[ProviderRole.WORKER][1].audit_calls, len(native[ProviderRole.WORKER][1].requests)), (1, 1))
+        self.assertEqual({name for name in dir(store.open_role_channel(ProviderRole.WORKER)) if not name.startswith("_")}, {"audit_runtime", "credential_identity", "qualify_read_only"})
+
+    def test_role_bound_native_store_constructor_rejects_invalid_registry(self):
+        native = {role: ("sha256:" + f"{index:x}" * 64, FakeNativeChannel(self.audit)) for index, role in enumerate(ProviderRole)}
+        cases = [
+            ({},), ({**native, "wrong": native[ProviderRole.WORKER]},),
+            ({role: ("sha256:" + "a" * 64, value[1]) for role, value in native.items()},),
+            ({**native, ProviderRole.WORKER: "bad"},), ({**native, ProviderRole.WORKER: ("bad", native[ProviderRole.WORKER][1])},),
+        ]
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ProviderHealthError): RoleBoundCodexCredentialStore("sha256:" + "a" * 64, *arguments)
+        store = RoleBoundCodexCredentialStore("sha256:" + "a" * 64, native)
+        with self.assertRaises(ProviderHealthError): store.open_role_channel("worker")
 
 
 if __name__ == "__main__":

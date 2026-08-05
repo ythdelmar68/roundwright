@@ -19,7 +19,12 @@ from roundwright.shadow import (
     ShadowExecutor,
     ShadowIdentity,
     ShadowObservation,
+    compare_provider_health_receipt,
 )
+from roundwright.configuration import ProviderProfile, ReasoningEffort
+from roundwright.runtime_binding import RuntimeBinding
+from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
+from roundwright.provider_recovery import ProviderRole
 import hashlib
 
 
@@ -29,6 +34,26 @@ STATES = ("queued", "planning", "plan-review", "implementing", "diff-review", "r
 
 
 class ShadowTests(unittest.TestCase):
+    def receipt(self, *, commit="a" * 40, candidate=None, case="case-42", ordinal=0, state=HealthState.READY, fresh_until=200):
+        profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        profile_id = profile_fingerprint(profile)
+        binding = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, profile_id, (profile_id,))
+        audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),))
+        observation = ProviderHealthObservation(ProviderRole.WORKER, profile_id, CodexHealthContract(audit.sdk_version, audit.runtime_version, commit).fingerprint, audit.fingerprint, state, None if state is HealthState.READY else __import__("roundwright.provider_health", fromlist=["CodexFailure"]).CodexFailure.UNKNOWN, 100, fresh_until, 1)
+        return ProviderHealthReceipt(commit, candidate, case, ordinal, binding, ProviderRole.WORKER, profile_id, observation, ProviderHealthAuditIdentity(audit, profile))
+
+    def test_provider_health_receipt_comparator_is_safe_and_deterministic(self):
+        receipt = self.receipt(candidate="b" * 40)
+        matched = compare_provider_health_receipt(receipt.evidence(), receipt.evidence(), now=101)
+        self.assertEqual((matched.outcome, matched.differing_fields), (ComparisonOutcome.MATCH, ()))
+        self.assertEqual(matched.curated_summary()["contract_commit"], "a" * 40)
+        changed = self.receipt(commit="c" * 40)
+        mismatch = compare_provider_health_receipt(receipt.evidence(), changed.evidence(), now=101)
+        self.assertEqual(mismatch.outcome, ComparisonOutcome.MISMATCH)
+        self.assertIn("contract_commit", mismatch.differing_fields)
+        self.assertEqual(compare_provider_health_receipt(receipt.evidence(), self.receipt(fresh_until=101).evidence(), now=101).differing_fields, ("invalid-evidence",))
+        tampered = receipt.evidence(); tampered.pop("case_id")
+        self.assertEqual(compare_provider_health_receipt(receipt.evidence(), tampered, now=101).outcome, ComparisonOutcome.INVALID)
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",

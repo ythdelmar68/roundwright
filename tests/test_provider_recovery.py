@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.configuration import RepositoryIdentity
+from roundwright.configuration import RepositoryIdentity, ProviderProfile, ReasoningEffort
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_recovery import (
@@ -32,12 +32,14 @@ from roundwright.provider_recovery import (
     record_session_identity,
     recover_attempt,
 )
+from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 
 
 class ProviderRecoveryTests(unittest.TestCase):
     def runtime_binding(self) -> RuntimeBinding:
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+        profile = profile_fingerprint(ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH))
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, profile, (profile, profile, profile))
 
     def repository(self, root: Path) -> RepositoryIdentity:
         identity = object.__new__(RepositoryIdentity)
@@ -54,13 +56,19 @@ class ProviderRecoveryTests(unittest.TestCase):
             base_sha="b" * 40,
         )
 
-    def context(self, identity: TaskIdentity, *, candidate: str | None = None) -> RecoveryContext:
+    def context(self, identity: TaskIdentity, *, candidate: str | None = None, role: ProviderRole = ProviderRole.WORKER) -> RecoveryContext:
+        binding = self.runtime_binding()
+        selected = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        profile = profile_fingerprint(selected)
+        audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(selected.model, selected.reasoning_effort.value),))
+        observation = ProviderHealthObservation(role, profile, CodexHealthContract(audit.sdk_version, audit.runtime_version, identity.base_sha).fingerprint, audit.fingerprint, HealthState.READY, None, 0, 2_000_000_000, 1)
+        receipt = ProviderHealthReceipt(identity.base_sha, candidate, "case-22", 0, binding, role, profile, observation, ProviderHealthAuditIdentity(audit, selected))
         return RecoveryContext.for_task(
             identity,
             candidate_sha=candidate,
             policy_fingerprint="c" * 64,
             deployment_fingerprint="d" * 64,
-            runtime_binding=self.runtime_binding(),
+            runtime_binding=binding, health_contract_commit=identity.base_sha, shadow_case_id="case-22", health_receipt=receipt,
         )
 
     def admit(self, repository: RepositoryIdentity, identity: TaskIdentity, lease: object) -> None:
@@ -83,7 +91,7 @@ class ProviderRecoveryTests(unittest.TestCase):
         return prepare_attempt(
             repository,
             identity,
-            self.context(identity),
+            self.context(identity, role=role),
             attempt_id=attempt,
             role=role,
             process_lease_id=f"lease-{attempt}",
@@ -91,6 +99,31 @@ class ProviderRecoveryTests(unittest.TestCase):
             input_fingerprint="a" * 64,
             lease=lease,
         )
+
+    def test_missing_or_role_mismatched_health_blocks_before_attempt_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            valid = self.context(identity, role=ProviderRole.WORKER)
+            for name, context in (
+                ("missing", replace(valid, health_receipt=None)),
+                ("mismatched", self.context(identity, role=ProviderRole.SUPERVISOR)),
+            ):
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ProviderRecoveryError, "health authorization"):
+                        prepare_attempt(
+                            repository, identity, context, attempt_id=f"health-{name}", role=ProviderRole.WORKER,
+                            process_lease_id=f"lease-health-{name}", process_lease_expires_at=int(time.time()) + 10,
+                            input_fingerprint="a" * 64, lease=lease,
+                        )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts").fetchone(), (0,))
+            finally:
+                connection.close()
 
     def test_external_turn_without_verified_completion_blocks_without_duplicate_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -286,10 +319,10 @@ class ProviderRecoveryTests(unittest.TestCase):
             lease = self.lease(repository)
             identity = self.identity()
             self.admit(repository, identity, lease)
-            first = self.context(identity, candidate="a" * 40)
+            first = self.context(identity, candidate="a" * 40, role=ProviderRole.SUPERVISOR)
             prepare_attempt(repository, identity, first, attempt_id="supervisor-first", role=ProviderRole.SUPERVISOR, process_lease_id="lease-supervisor-first", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
             second = replace(
-                self.context(identity, candidate="b" * 40), policy_fingerprint="e" * 64, deployment_fingerprint="f" * 64,
+                self.context(identity, candidate="b" * 40, role=ProviderRole.SUPERVISOR), policy_fingerprint="e" * 64, deployment_fingerprint="f" * 64,
             )
             fresh = prepare_attempt(repository, identity, second, attempt_id="supervisor-second", role=ProviderRole.SUPERVISOR, process_lease_id="lease-supervisor-second", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="b" * 64, lease=lease)
             self.assertEqual(fresh.attempt_number, 2)

@@ -25,7 +25,7 @@ from roundwright.plan_review import (
     record_plan_review,
     recover_plan_review,
 )
-from roundwright.provider_recovery import AttemptState, RecoveryContext, read_attempt
+from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, read_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, _open_writable_connection, admit_task, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt,
@@ -38,11 +38,12 @@ from roundwright.worker_planning import (
     record_plan,
     submit_plan_for_review,
 )
+from tests.provider_health_fixture import provider_context, runtime_binding
 
 
 class PlanReviewTests(unittest.TestCase):
     def runtime_binding(self) -> RuntimeBinding:
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+        return runtime_binding()
 
     def repository(self, root):
         identity = object.__new__(RepositoryIdentity)
@@ -60,13 +61,13 @@ class PlanReviewTests(unittest.TestCase):
         now = int(time.time())
         input_value = PlanningInput("Review plan", (), ("Persist review",), (), ("Run tests",), (), ())
         plan = WorkerPlan("Review plan", (), (), ("Persist review",), ("Run tests",), (), (), ())
-        dispatch_plan(repository, identity, context, input_value, plan_attempt_id="plan-one", provider_attempt_id="worker-one", worker_thread_identity="worker-thread-24", external_turn_identity="worker-turn-one", process_lease_id="worker-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+        dispatch_plan(repository, identity, provider_context(context, identity, ProviderRole.PLANNING), input_value, plan_attempt_id="plan-one", provider_attempt_id="worker-one", worker_thread_identity="worker-thread-24", external_turn_identity="worker-turn-one", process_lease_id="worker-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
         persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=WorkerPlanOutput("plan-one", "worker-one", "worker-thread-24", "worker-turn-one", input_value.digest, "b" * 64, plan), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
         submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
         return repository, identity, lease, context, now, persisted
 
     def dispatch(self, repository, identity, lease, context, now, persisted, *, review="review-one", provider="supervisor-one", session="supervisor-session-one"):
-        return dispatch_plan_review(repository, identity, context, review_attempt_id=review, provider_attempt_id=provider, supervisor_session_identity=session, external_turn_identity=f"turn-{provider}", plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider}", process_lease_expires_at=now + 60, lease=lease, now=now)
+        return dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), review_attempt_id=review, provider_attempt_id=provider, supervisor_session_identity=session, external_turn_identity=f"turn-{provider}", plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider}", process_lease_expires_at=now + 60, lease=lease, now=now)
 
     def output(self, dispatch, *, verdict=PlanReviewVerdict.PASS, plan_digest=None, findings=(), missing=(), ambiguous=(), risks=()):
         return PlanReviewOutput(dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity, dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, plan_digest or dispatch.plan_digest, verdict, findings, missing, ambiguous, risks)

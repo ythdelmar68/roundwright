@@ -44,6 +44,47 @@ class ComparisonOutcome(StrEnum):
     INVALID = "INVALID"
 
 
+@dataclass(frozen=True)
+class ProviderHealthReceiptComparison:
+    case_id: str
+    outcome: ComparisonOutcome
+    contract_commit: str
+    candidate_sha: str | None
+    profile_identity: str
+    receipt_digest: str
+    sdk_version: str = ""
+    runtime_version: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
+    differing_fields: tuple[str, ...] = ()
+
+    def curated_summary(self) -> dict[str, object]:
+        return {"case_id": self.case_id, "outcome": self.outcome.value, "contract_commit": self.contract_commit,
+                "candidate_sha": self.candidate_sha, "profile_identity": self.profile_identity, "receipt_digest": self.receipt_digest,
+                "sdk_version": self.sdk_version, "runtime_version": self.runtime_version, "model": self.model,
+                "reasoning_effort": self.reasoning_effort, "differing_fields": self.differing_fields}
+
+
+def compare_provider_health_receipt(expected: object, observed: object, *, now: int) -> ProviderHealthReceiptComparison:
+    """Rehydrate and compare redacted receipt evidence without any adapter hook."""
+    try:
+        from .provider_health import HealthState, ProviderHealthReceipt
+        if type(expected) is not dict or type(observed) is not dict or type(now) is not int:
+            raise ValueError
+        left, right = ProviderHealthReceipt.from_evidence(expected), ProviderHealthReceipt.from_evidence(observed)
+        identity = left.audit_identity
+        result = ProviderHealthReceiptComparison(left.case_id, ComparisonOutcome.MATCH, left.contract_commit, left.candidate_sha, left.profile_identity, left.receipt_digest, identity.audit.sdk_version, identity.audit.runtime_version, identity.profile.model, identity.profile.reasoning_effort.value)
+        if left.observation.state is not HealthState.READY or not left.observation.is_fresh_at(now) or right.observation.state is not HealthState.READY or not right.observation.is_fresh_at(now):
+            return ProviderHealthReceiptComparison("invalid", ComparisonOutcome.INVALID, "", None, "", "", differing_fields=("invalid-evidence",))
+        if left == right:
+            return result
+        fields = ("contract_commit", "candidate_sha", "case_id", "selection_ordinal", "configuration", "role", "profile_identity", "observation", "audit_identity", "receipt_digest")
+        differing = tuple(name for name in fields if getattr(left, name) != getattr(right, name))
+        return ProviderHealthReceiptComparison(left.case_id, ComparisonOutcome.MISMATCH, left.contract_commit, left.candidate_sha, left.profile_identity, left.receipt_digest, identity.audit.sdk_version, identity.audit.runtime_version, identity.profile.model, identity.profile.reasoning_effort.value, differing)
+    except Exception:
+        return ProviderHealthReceiptComparison("invalid", ComparisonOutcome.INVALID, "", None, "", "", differing_fields=("invalid-evidence",))
+
+
 class MismatchDisposition(StrEnum):
     INPUT_DRIFT = "INPUT_DRIFT"
     NORMALIZATION_DEFECT = "NORMALIZATION_DEFECT"

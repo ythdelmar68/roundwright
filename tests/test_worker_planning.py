@@ -16,7 +16,7 @@ from roundwright.configuration import RepositoryIdentity
 from roundwright.runtime_binding import RuntimeBinding
 import roundwright.worker_planning as worker_planning
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.provider_recovery import RecoveryContext, record_completed_output
+from roundwright.provider_recovery import ProviderRole, RecoveryContext, record_completed_output
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize, task_projection
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from roundwright.worker_planning import (
@@ -33,11 +33,12 @@ from roundwright.worker_planning import (
     route_plan_findings,
     submit_plan_for_review,
 )
+from tests.provider_health_fixture import provider_context, runtime_binding
 
 
 class WorkerPlanningTests(unittest.TestCase):
     def runtime_binding(self) -> RuntimeBinding:
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+        return runtime_binding()
 
     def repository(self, root: Path) -> RepositoryIdentity:
         identity = object.__new__(RepositoryIdentity)
@@ -69,14 +70,14 @@ class WorkerPlanningTests(unittest.TestCase):
 
     def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None, planning_input: PlanningInput | None = None):
         return dispatch_plan(
-            repository, identity, context, self.input() if planning_input is None else planning_input, plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
+            repository, identity, provider_context(context, identity, ProviderRole.PLANNING), self.input() if planning_input is None else planning_input, plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
             worker_thread_identity=thread, external_turn_identity=f"turn-{provider_attempt}", process_lease_id=f"lease-{provider_attempt}",
             process_lease_expires_at=now + 60, parent_plan_attempt_id=parent, lease=lease, now=now,
         )
 
     def accept_review(self, repository, identity, lease, context, now, persisted, *, review_attempt: str = "review-one", provider_attempt: str = "supervisor-one", session: str = "supervisor-session-one"):
         dispatch_plan_review(
-            repository, identity, context, review_attempt_id=review_attempt, provider_attempt_id=provider_attempt,
+            repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), review_attempt_id=review_attempt, provider_attempt_id=provider_attempt,
             supervisor_session_identity=session, external_turn_identity=f"turn-{provider_attempt}",
             plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider_attempt}",
             process_lease_expires_at=now + 60, lease=lease, now=now,

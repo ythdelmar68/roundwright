@@ -69,9 +69,13 @@ class RecoveryContext:
     branch_fingerprint: str
     base_fingerprint: str
     candidate_fingerprint: str | None
+    candidate_sha: str | None
     policy_fingerprint: str
     deployment_fingerprint: str
     runtime_binding: RuntimeBinding
+    health_contract_commit: str | None = None
+    shadow_case_id: str | None = None
+    health_receipt: object | None = None
 
     @classmethod
     def for_task(
@@ -82,6 +86,9 @@ class RecoveryContext:
         policy_fingerprint: str,
         deployment_fingerprint: str,
         runtime_binding: RuntimeBinding,
+        health_contract_commit: str | None = None,
+        shadow_case_id: str | None = None,
+        health_receipt: object | None = None,
     ) -> "RecoveryContext":
         """Build context without retaining a worktree path in owner projections."""
 
@@ -99,9 +106,13 @@ class RecoveryContext:
             _fingerprint(identity.branch),
             _fingerprint(identity.base_sha),
             None if candidate_sha is None else _fingerprint(candidate_sha),
+            candidate_sha,
             policy_fingerprint,
             deployment_fingerprint,
             runtime_binding,
+            health_contract_commit,
+            shadow_case_id,
+            health_receipt,
         )
 
 
@@ -171,6 +182,8 @@ def prepare_attempt(
     _require_future_time(process_lease_expires_at, now)
     _require_fingerprint(input_fingerprint, "input fingerprint")
     observed = _clock(now)
+    selected_profile = _selected_profile_identity(context, role, selected_profile_identity)
+    _require_health_authorization(context, role, selected_profile, observed)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -194,7 +207,7 @@ def prepare_attempt(
                 or row.process_lease_id != process_lease_id
                 or row.process_lease_expires_at != process_lease_expires_at
                 or row.input_fingerprint != input_fingerprint
-                or row.selected_profile_identity != _selected_profile_identity(context, role, selected_profile_identity)
+                or row.selected_profile_identity != selected_profile
                 or row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}
             ):
                 raise ProviderRecoveryError("provider attempt replay conflicts with committed state")
@@ -206,7 +219,7 @@ def prepare_attempt(
         ).fetchone()[0]
         connection.execute(
             "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?)",
-            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, _selected_profile_identity(context, role, selected_profile_identity)),
+            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, selected_profile),
         )
         _persist_context(connection, attempt_id, context)
         _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, observed)
@@ -799,6 +812,28 @@ def _selected_profile_identity(context: RecoveryContext, role: ProviderRole, req
     if type(selected) is not str or selected not in allowed:
         raise ProviderRecoveryError("selected provider profile identity is invalid")
     return selected
+
+
+def _require_health_authorization(context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> None:
+    """Fail before SQLite is opened whenever dispatch is health-bound."""
+
+    values = (context.health_contract_commit, context.shadow_case_id, context.health_receipt)
+    if context.health_contract_commit is None or context.shadow_case_id is None or context.health_receipt is None:
+        raise ProviderRecoveryError("provider health authorization is incomplete")
+    try:
+        from .provider_health import ProviderHealthReceipt
+        receipt = context.health_receipt
+        if type(receipt) is not ProviderHealthReceipt:
+            raise ProviderRecoveryError("provider health authorization is invalid")
+        receipt.authorize(
+            context.runtime_binding, role, profile_identity,
+            contract_commit=context.health_contract_commit,
+            candidate_sha=context.candidate_sha, case_id=context.shadow_case_id, now=observed,
+        )
+    except ProviderRecoveryError:
+        raise
+    except Exception as error:
+        raise ProviderRecoveryError("provider health authorization is invalid") from error
 
 
 def _require_persisted_context(connection, attempt_id: str, context: RecoveryContext) -> None:

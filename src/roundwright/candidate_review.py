@@ -83,6 +83,7 @@ def finalize_review_limit_repair(
     findings_fingerprint: str,
     worker_repair_fingerprint: str,
     worker_thread_identity: str,
+    runtime_binding: RuntimeBinding,
     lease: TransitionLease | None,
 ) -> ReviewLimitFinalizationReceipt:
     """Consume the one same-Worker final repair under the active transition lease."""
@@ -95,6 +96,7 @@ def finalize_review_limit_repair(
         worker_repair_fingerprint=worker_repair_fingerprint,
         candidate_sha=seal.candidate_sha,
         worker_thread_identity=worker_thread_identity,
+        runtime_binding=runtime_binding,
         lease=lease,
     )
 

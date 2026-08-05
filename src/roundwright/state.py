@@ -800,7 +800,7 @@ def transition_task(
     return _commit_transition(repository, identity, expected_state, next_state, evidence_fingerprint, lease=lease)
 
 
-def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, findings_fingerprint: str, worker_repair_fingerprint: str, candidate_sha: str, worker_thread_identity: str, lease: object | None = None) -> ReviewLimitFinalizationReceipt:
+def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, findings_fingerprint: str, worker_repair_fingerprint: str, candidate_sha: str, worker_thread_identity: str, runtime_binding: RuntimeBinding, lease: object | None = None) -> ReviewLimitFinalizationReceipt:
     """Durably consume the one terminal Worker repair; later Supervisor turns fail closed."""
 
     _validate_task_identity(identity)
@@ -810,22 +810,23 @@ def record_review_limit_finalization(repository: RepositoryIdentity, identity: T
         raise StateError("review-limit candidate identity is invalid")
     if not isinstance(worker_thread_identity, str) or not worker_thread_identity:
         raise StateError("review-limit Worker identity is invalid")
+    if type(runtime_binding) is not RuntimeBinding or not runtime_binding.has_review_policy:
+        raise StateError("review-limit finalization requires a pinned review policy binding")
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity)
+        require_runtime_binding(repository, identity, runtime_binding, connection=connection)
         seal = connection.execute("SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()
         repair = connection.execute(
-            "SELECT reviews.diff_review_attempt_id, implementation.worker_thread_identity, reviews.review_round, reviews.review_mode, reviews.review_complete_rounds, reviews.review_max_rounds, reviews.review_max_supervisor_attempts_per_round, reviews.review_on_final_findings, reviews.review_policy_digest, runtime.schema_version, runtime.resolved_digest, runtime.worker_profile_identity, runtime.supervisor_profile_identities, policy.configuration_digest, policy.complete_rounds, policy.max_rounds, policy.max_supervisor_attempts_per_round, policy.on_final_findings, policy.policy_digest FROM implementation_candidates AS candidates "
+            "SELECT reviews.diff_review_attempt_id, implementation.worker_thread_identity, reviews.review_round, reviews.review_mode, reviews.review_complete_rounds, reviews.review_max_rounds, reviews.review_max_supervisor_attempts_per_round, reviews.review_on_final_findings, reviews.review_policy_digest FROM implementation_candidates AS candidates "
             "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id "
             "JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = implementation.repair_diff_review_id "
             "AND routes.consumed_by_implementation_attempt_id = implementation.implementation_attempt_id "
             "JOIN diff_review_attempts AS reviews ON reviews.diff_review_attempt_id = routes.diff_review_attempt_id "
             "AND implementation.repair_candidate_sha = reviews.candidate_sha "
             "JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = routes.diff_review_attempt_id "
-            "JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = candidates.task_id "
-            "JOIN runtime_review_policies AS policy ON policy.task_id = candidates.task_id AND policy.configuration_digest = runtime.resolved_digest "
             "WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND candidates.completion_evidence_fingerprint = ? "
             "AND routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?",
             (identity.task_id, candidate_sha, worker_repair_fingerprint, identity.task_id, findings_fingerprint),
@@ -833,20 +834,18 @@ def record_review_limit_finalization(repository: RepositoryIdentity, identity: T
         findings = connection.execute("SELECT routes.worker_thread_identity FROM diff_review_artifacts AS artifacts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = artifacts.diff_review_attempt_id WHERE routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?", (identity.task_id, findings_fingerprint)).fetchone()
         if seal != (candidate_sha,) or repair is None or repair[1] != worker_thread_identity or findings != (worker_thread_identity,):
             raise StateError("review-limit finalization does not match the final Worker repair")
-        diff_review_attempt_id, _, review_round, review_mode, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, policy_configuration_digest, policy_complete_rounds, policy_max_rounds, policy_max_supervisor_attempts_per_round, policy_on_final_findings, policy_digest = repair
-        try:
-            RuntimeBinding(schema_version, configuration_digest, worker_profile_identity, tuple(json.loads(supervisor_profile_identities)))
-        except (RuntimeBindingError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise StateError("review-limit finalization configuration binding is invalid") from error
-        expected_policy_digest = hashlib.sha256(json.dumps({"complete_rounds": policy_complete_rounds, "max_rounds": policy_max_rounds, "max_supervisor_attempts_per_round": policy_max_supervisor_attempts_per_round, "on_final_findings": policy_on_final_findings}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        diff_review_attempt_id, _, review_round, review_mode, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest = repair
         if (
             type(review_round) is not int or type(review_complete_rounds) is not int or type(review_max_rounds) is not int or type(review_max_supervisor_attempts_per_round) is not int
-            or review_round < 1 or review_round != review_max_rounds or review_mode != "CONVERGING" or review_on_final_findings != "worker-final-repair-then-merge"
-            or (configuration_digest, policy_complete_rounds, policy_max_rounds, policy_max_supervisor_attempts_per_round, policy_on_final_findings, policy_digest) != (policy_configuration_digest, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest)
-            or review_policy_digest != expected_policy_digest
+            or review_round != runtime_binding.review_max_rounds or review_mode != "CONVERGING"
+            or (review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) != (
+                runtime_binding.review_complete_rounds, runtime_binding.review_max_rounds,
+                runtime_binding.review_max_supervisor_attempts_per_round, runtime_binding.review_on_final_findings,
+                runtime_binding.review_policy_digest,
+            )
         ):
             raise StateError("review-limit finalization is not a terminal persisted review")
-        _require_fingerprint(review_policy_digest)
+        configuration_digest = runtime_binding.resolved_digest
         receipt_fingerprint = hashlib.sha256("\x00".join((identity.task_id, diff_review_attempt_id, str(review_round), findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, configuration_digest, review_policy_digest, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")).encode("utf-8")).hexdigest()
         receipt = ReviewLimitFinalizationReceipt(review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint)
         row = connection.execute("SELECT review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone()

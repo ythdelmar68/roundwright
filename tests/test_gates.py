@@ -411,8 +411,12 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
 
     def test_review_limit_finalization_receipt_is_required_only_for_finalized_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
-            receipt = ReviewLimitFinalizationReceipt(10, "a" * 64, "b" * 64, seal.candidate_sha, "worker-thread-21", "final-review-21", "sha256:" + "d" * 64, "e" * 64, "c" * 64)
+            runtime_binding = RuntimeBinding(
+                "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+                3, 10, 1, "worker-final-repair-then-merge", "e" * 64,
+            )
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary), runtime_binding=runtime_binding)
+            receipt = ReviewLimitFinalizationReceipt(10, "a" * 64, "b" * 64, seal.candidate_sha, "worker-thread-21", "final-review-21", runtime_binding.resolved_digest, runtime_binding.review_policy_digest, "c" * 64)
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute(
@@ -443,6 +447,17 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             )
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
                 self.assertEqual(evaluate_gates(repository, binding, seal, stale, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+            substituted_binding = RuntimeBinding(
+                "roundwright-runtime/v1", "sha256:" + "f" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+                3, 4, 1, "worker-final-repair-then-merge", "f" * 64,
+            )
+            substituted = GateContext(
+                context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task,
+                context.policy_digest, context.receipt_fingerprint, substituted_binding,
+                context.selected_supervisor_profile_identity, receipt,
+            )
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, substituted, policy_evidence=self.policy_evidence(substituted), lease=lease).outcome, GateOutcome.BLOCKED)
 
     def test_activation_receipt_runtime_binding_drift_blocks_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

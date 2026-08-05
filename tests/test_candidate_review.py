@@ -25,6 +25,7 @@ from roundwright.candidate_review import (
 )
 import roundwright.candidate_review as candidate_review
 from roundwright.configuration import RepositoryIdentity
+from roundwright.gates import _valid_review_limit_finalization
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
@@ -202,7 +203,7 @@ class CandidateReviewTests(unittest.TestCase):
             receipt = finalize_review_limit_repair(
                 repository, identity, binding, repair_seal,
                 findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
-                worker_thread_identity="worker-thread-25", lease=lease,
+                worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease,
             )
             self.assertEqual(receipt.candidate_sha, repair_seal.candidate_sha)
             connection = sqlite3.connect(database_path(repository))
@@ -220,7 +221,7 @@ class CandidateReviewTests(unittest.TestCase):
                 finalize_review_limit_repair(
                     repository, identity, binding, repair_seal,
                     findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
-                    worker_thread_identity="worker-thread-25", lease=lease,
+                    worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease,
                 ),
                 receipt,
             )
@@ -300,13 +301,13 @@ class CandidateReviewTests(unittest.TestCase):
         )
         for label, replacement in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
-                repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+                repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
                 seal = repair_seal if "seal_candidate" not in replacement else CandidateSeal(
                     repair_seal.task_id, repair_seal.base_sha, replacement["seal_candidate"], repair_seal.state_identity,
                 )
                 arguments = {
                     "findings_fingerprint": findings,
-                    "worker_repair_fingerprint": "d" * 64, "worker_thread_identity": "worker-thread-25",
+                    "worker_repair_fingerprint": "d" * 64, "worker_thread_identity": "worker-thread-25", "runtime_binding": context.runtime_binding,
                 }
                 arguments.update({key: value for key, value in replacement.items() if key != "seal_candidate"})
                 with self.assertRaises(Exception):
@@ -314,11 +315,11 @@ class CandidateReviewTests(unittest.TestCase):
 
     def test_final_review_limit_repair_rejects_a_conflicting_second_finalization(self):
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
             finalize_review_limit_repair(
                 repository, identity, binding, repair_seal,
                 findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
-                worker_thread_identity="worker-thread-25", lease=lease,
+                worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease,
             )
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -330,17 +331,17 @@ class CandidateReviewTests(unittest.TestCase):
                 finalize_review_limit_repair(
                     repository, identity, binding, repair_seal,
                     findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
-                    worker_thread_identity="worker-thread-25", lease=lease,
+                    worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease,
                 )
 
     def test_final_review_limit_repair_rejects_obsolete_caller_limits(self):
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
             with self.assertRaises(TypeError):
                 finalize_review_limit_repair(
                     repository, identity, binding, repair_seal, findings_fingerprint=findings,
                     worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25",
-                    review_round=1, max_rounds=1, lease=lease,
+                    runtime_binding=context.runtime_binding, review_round=1, max_rounds=1, lease=lease,
                 )
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -350,7 +351,7 @@ class CandidateReviewTests(unittest.TestCase):
 
     def test_final_review_limit_repair_rejects_tampered_persisted_round(self):
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute("UPDATE diff_review_attempts SET review_round = ? WHERE task_id = ?", (9, identity.task_id))
@@ -358,7 +359,7 @@ class CandidateReviewTests(unittest.TestCase):
             finally:
                 connection.close()
             with self.assertRaises(Exception):
-                finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", lease=lease)
+                finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
@@ -389,7 +390,7 @@ class CandidateReviewTests(unittest.TestCase):
         cases = ("detached", "coherent")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
-                repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+                repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
                 connection = sqlite3.connect(database_path(repository))
                 try:
                     if case == "detached":
@@ -401,12 +402,34 @@ class CandidateReviewTests(unittest.TestCase):
                 finally:
                     connection.close()
                 with self.assertRaises(Exception):
-                    finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", lease=lease)
+                    finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease)
                 connection = sqlite3.connect(database_path(repository))
                 try:
                     self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
                 finally:
                     connection.close()
+
+    def test_final_review_limit_repair_rejects_a_coherent_persisted_policy_substitution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+            substituted_digest = candidate_review._digest({"complete_rounds": 3, "max_rounds": 4, "max_supervisor_attempts_per_round": 3, "on_final_findings": "worker-final-repair-then-merge"})
+            substituted_configuration = "sha256:" + "f" * 64
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE runtime_configuration_bindings SET resolved_digest = ? WHERE task_id = ?", (substituted_configuration, identity.task_id))
+                connection.execute("UPDATE runtime_review_policies SET configuration_digest = ?, complete_rounds = ?, max_rounds = ?, max_supervisor_attempts_per_round = ?, on_final_findings = ?, policy_digest = ? WHERE task_id = ?", (substituted_configuration, 3, 4, 3, "worker-final-repair-then-merge", substituted_digest, identity.task_id))
+                connection.execute("UPDATE diff_review_attempts SET review_round = ?, review_complete_rounds = ?, review_max_rounds = ?, review_max_supervisor_attempts_per_round = ?, review_on_final_findings = ?, review_policy_digest = ? WHERE task_id = ?", (4, 3, 4, 3, "worker-final-repair-then-merge", substituted_digest, identity.task_id))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(Exception):
+                finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", runtime_binding=context.runtime_binding, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
+            finally:
+                connection.close()
+            self.assertFalse(_valid_review_limit_finalization(repository, binding, repair_seal, context.runtime_binding, None))
 
     def test_implementation_replays_the_persisted_worker_turn_after_a_crash(self):
         with tempfile.TemporaryDirectory() as temporary:

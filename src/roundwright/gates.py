@@ -201,7 +201,7 @@ def record_gate_evidence(
     """Persist one exact-candidate gate record and bind its fingerprint to that candidate."""
 
     _validate_context(context)
-    if not _valid_review_limit_finalization(repository, binding, seal, context.review_limit_finalization):
+    if not _valid_review_limit_finalization(repository, binding, seal, context.runtime_binding, context.review_limit_finalization):
         raise GateError("review-limit finalization receipt is unavailable or stale")
     _validate_evidence(evidence)
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
@@ -340,7 +340,7 @@ def evaluate_gates(
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "current trusted policy evidence is unavailable"),))
-    if not _valid_review_limit_finalization(repository, binding, seal, context.review_limit_finalization):
+    if not _valid_review_limit_finalization(repository, binding, seal, context.runtime_binding, context.review_limit_finalization):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("review-limit", GateOutcome.BLOCKED, "review-limit finalization receipt is unavailable or stale"),))
     decision = _read_persisted_decision(repository, binding, seal, lease=lease)
     if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
@@ -365,7 +365,7 @@ def transition_ready_for_owner(
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         raise GateError("gate context does not match current trusted policy evidence")
-    if not _valid_review_limit_finalization(repository, binding, seal, context.review_limit_finalization):
+    if not _valid_review_limit_finalization(repository, binding, seal, context.runtime_binding, context.review_limit_finalization):
         raise GateError("review-limit finalization receipt is unavailable or stale")
     candidate_evidence(repository, binding, seal, lease=lease)
     if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
@@ -422,6 +422,7 @@ def _valid_review_limit_finalization(
     repository: RepositoryIdentity,
     binding: WorktreeBinding,
     seal: CandidateSeal,
+    runtime_binding: RuntimeBinding,
     receipt: ReviewLimitFinalizationReceipt | None,
 ) -> bool:
     """Require a receipt exactly when durable state consumed a final Worker repair."""
@@ -432,11 +433,36 @@ def _valid_review_limit_finalization(
             "SELECT review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?",
             (binding.task_id,),
         ).fetchone()
+        routed_review = connection.execute(
+            "SELECT reviews.review_round, reviews.review_mode, reviews.review_complete_rounds, reviews.review_max_rounds, reviews.review_max_supervisor_attempts_per_round, reviews.review_on_final_findings, reviews.review_policy_digest "
+            "FROM implementation_candidates AS candidates "
+            "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id "
+            "JOIN diff_review_attempts AS reviews ON reviews.diff_review_attempt_id = implementation.repair_diff_review_id "
+            "JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = reviews.diff_review_attempt_id "
+            "WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND artifacts.verdict = 'findings'",
+            (binding.task_id, seal.candidate_sha),
+        ).fetchone()
     finally:
         connection.close()
     if row is None:
-        return receipt is None
-    if type(receipt) is not ReviewLimitFinalizationReceipt:
+        if routed_review is None:
+            return receipt is None
+        if type(runtime_binding) is not RuntimeBinding or not runtime_binding.has_review_policy:
+            return False
+        expected = (
+            runtime_binding.review_complete_rounds,
+            runtime_binding.review_max_rounds,
+            runtime_binding.review_max_supervisor_attempts_per_round,
+            runtime_binding.review_on_final_findings,
+            runtime_binding.review_policy_digest,
+        )
+        if tuple(routed_review[2:]) != expected:
+            return False
+        return not (
+            routed_review[0] == runtime_binding.review_max_rounds
+            and routed_review[1] == "CONVERGING"
+        ) and receipt is None
+    if type(receipt) is not ReviewLimitFinalizationReceipt or type(runtime_binding) is not RuntimeBinding or not runtime_binding.has_review_policy:
         return False
     return (
         receipt.review_round,
@@ -448,7 +474,15 @@ def _valid_review_limit_finalization(
         receipt.configuration_digest,
         receipt.review_policy_digest,
         receipt.receipt_fingerprint,
-    ) == tuple(row) and receipt.candidate_sha == seal.candidate_sha
+    ) == tuple(row) and receipt.candidate_sha == seal.candidate_sha and (
+        receipt.review_round,
+        receipt.configuration_digest,
+        receipt.review_policy_digest,
+    ) == (
+        runtime_binding.review_max_rounds,
+        runtime_binding.resolved_digest,
+        runtime_binding.review_policy_digest,
+    )
 
 
 def _decision_from_connection(connection, identity) -> GateDecision:

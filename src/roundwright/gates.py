@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import json
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -14,7 +14,7 @@ from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence
 from .policy import ActivationReceipt, ReceiptStatus, StandingAuthority, TrustedPolicySnapshot, evaluate_policy
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
-from .state import StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner, require_runtime_binding
+from .state import ReviewLimitFinalizationReceipt, StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner, require_runtime_binding
 
 
 class GateError(StateError):
@@ -89,6 +89,7 @@ class GateContext:
     receipt_fingerprint: str
     runtime_binding: RuntimeBinding
     selected_supervisor_profile_identity: str
+    review_limit_finalization: ReviewLimitFinalizationReceipt | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,8 @@ def record_gate_evidence(
     """Persist one exact-candidate gate record and bind its fingerprint to that candidate."""
 
     _validate_context(context)
+    if not _valid_review_limit_finalization(repository, binding, seal, context.review_limit_finalization):
+        raise GateError("review-limit finalization receipt is unavailable or stale")
     _validate_evidence(evidence)
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
@@ -337,6 +340,8 @@ def evaluate_gates(
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "current trusted policy evidence is unavailable"),))
+    if not _valid_review_limit_finalization(repository, binding, seal, context.review_limit_finalization):
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("review-limit", GateOutcome.BLOCKED, "review-limit finalization receipt is unavailable or stale"),))
     decision = _read_persisted_decision(repository, binding, seal, lease=lease)
     if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate identity mismatch"),))
@@ -360,6 +365,8 @@ def transition_ready_for_owner(
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         raise GateError("gate context does not match current trusted policy evidence")
+    if not _valid_review_limit_finalization(repository, binding, seal, context.review_limit_finalization):
+        raise GateError("review-limit finalization receipt is unavailable or stale")
     candidate_evidence(repository, binding, seal, lease=lease)
     if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
         raise GateError("gate context does not match committed task state")
@@ -409,6 +416,36 @@ def _persisted_policy_activation(repository: RepositoryIdentity, task_id: str, c
     finally:
         connection.close()
     return row[0] if row is not None and isinstance(row[0], str) and row[0] else None
+
+
+def _valid_review_limit_finalization(
+    repository: RepositoryIdentity,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    receipt: ReviewLimitFinalizationReceipt | None,
+) -> bool:
+    """Require a receipt exactly when durable state consumed a final Worker repair."""
+
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?",
+            (binding.task_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return receipt is None
+    if type(receipt) is not ReviewLimitFinalizationReceipt:
+        return False
+    return (
+        receipt.review_round,
+        receipt.findings_fingerprint,
+        receipt.worker_repair_fingerprint,
+        receipt.candidate_sha,
+        receipt.worker_thread_identity,
+        receipt.receipt_fingerprint,
+    ) == tuple(row) and receipt.candidate_sha == seal.candidate_sha
 
 
 def _decision_from_connection(connection, identity) -> GateDecision:

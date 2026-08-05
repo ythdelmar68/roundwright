@@ -22,7 +22,7 @@ from typing import Iterable
 from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
-from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, transition_task
+from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, record_review_limit_finalization, transition_task
 
 
 class CandidateReviewError(StateError):
@@ -42,6 +42,35 @@ class VerificationOutcome(StrEnum):
 class DiffReviewVerdict(StrEnum):
     PASS = "pass"
     FINDINGS = "findings"
+
+
+def finalize_review_limit_repair(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    review_round: int,
+    max_rounds: int,
+    findings_fingerprint: str,
+    worker_repair_fingerprint: str,
+    worker_thread_identity: str,
+    lease: TransitionLease | None,
+) -> ReviewLimitFinalizationReceipt:
+    """Consume the one same-Worker final repair under the active transition lease."""
+
+    _require_candidate_binding(identity, binding, seal)
+    return record_review_limit_finalization(
+        repository,
+        identity,
+        review_round=review_round,
+        max_rounds=max_rounds,
+        findings_fingerprint=findings_fingerprint,
+        worker_repair_fingerprint=worker_repair_fingerprint,
+        candidate_sha=seal.candidate_sha,
+        worker_thread_identity=worker_thread_identity,
+        lease=lease,
+    )
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")

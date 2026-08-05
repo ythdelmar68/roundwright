@@ -498,6 +498,17 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
         ),
     ),
+    Migration(
+        37,
+        (
+            "ALTER TABLE review_limit_finalizations ADD COLUMN candidate_sha TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_limit_finalizations ADD COLUMN worker_thread_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_limit_finalizations ADD COLUMN receipt_fingerprint TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'), candidate_sha TEXT NOT NULL DEFAULT '', worker_thread_identity TEXT NOT NULL DEFAULT '', receipt_fingerprint TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 
@@ -537,6 +548,16 @@ class TaskIdentity:
     branch: str
     worktree: str
     base_sha: str
+
+
+@dataclass(frozen=True)
+class ReviewLimitFinalizationReceipt:
+    review_round: int
+    findings_fingerprint: str
+    worker_repair_fingerprint: str
+    candidate_sha: str
+    worker_thread_identity: str
+    receipt_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -708,7 +729,7 @@ def transition_task(
     return _commit_transition(repository, identity, expected_state, next_state, evidence_fingerprint, lease=lease)
 
 
-def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, review_round: int, max_rounds: int, findings_fingerprint: str, worker_repair_fingerprint: str, lease: object | None = None) -> None:
+def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, review_round: int, max_rounds: int, findings_fingerprint: str, worker_repair_fingerprint: str, candidate_sha: str, worker_thread_identity: str, lease: object | None = None) -> ReviewLimitFinalizationReceipt:
     """Durably consume the one terminal Worker repair; later Supervisor turns fail closed."""
 
     _validate_task_identity(identity)
@@ -716,18 +737,30 @@ def record_review_limit_finalization(repository: RepositoryIdentity, identity: T
         raise StateError("review-limit finalization is invalid")
     _require_fingerprint(findings_fingerprint)
     _require_fingerprint(worker_repair_fingerprint)
+    if not isinstance(candidate_sha, str) or len(candidate_sha) != 40 or any(character not in "0123456789abcdef" for character in candidate_sha):
+        raise StateError("review-limit candidate identity is invalid")
+    if not isinstance(worker_thread_identity, str) or not worker_thread_identity:
+        raise StateError("review-limit Worker identity is invalid")
+    receipt_fingerprint = hashlib.sha256("\x00".join((identity.task_id, str(review_round), findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")).encode("utf-8")).hexdigest()
+    receipt = ReviewLimitFinalizationReceipt(review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, receipt_fingerprint)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity)
-        row = connection.execute("SELECT review_round, findings_fingerprint, worker_repair_fingerprint, disposition FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone()
-        expected = (review_round, findings_fingerprint, worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")
+        seal = connection.execute("SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()
+        repair = connection.execute("SELECT implementation.worker_thread_identity FROM implementation_candidates AS candidates JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND candidates.completion_evidence_fingerprint = ?", (identity.task_id, candidate_sha, worker_repair_fingerprint)).fetchone()
+        findings = connection.execute("SELECT routes.worker_thread_identity FROM diff_review_artifacts AS artifacts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = artifacts.diff_review_attempt_id WHERE routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?", (identity.task_id, findings_fingerprint)).fetchone()
+        if seal != (candidate_sha,) or repair != (worker_thread_identity,) or findings != (worker_thread_identity,):
+            raise StateError("review-limit finalization does not match the final Worker repair")
+        row = connection.execute("SELECT review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone()
+        expected = (review_round, findings_fingerprint, worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", candidate_sha, worker_thread_identity, receipt_fingerprint)
         if row is None:
-            connection.execute("INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition) VALUES (?, ?, ?, ?, ?)", (identity.task_id, *expected))
+            connection.execute("INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (identity.task_id, *expected))
         elif tuple(row) != expected:
             raise StateError("review-limit finalization has already been consumed")
         connection.commit()
+        return receipt
     except Exception:
         connection.rollback()
         raise

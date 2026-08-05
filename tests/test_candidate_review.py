@@ -24,7 +24,7 @@ from roundwright.candidate_review import (
     recover_diff_review,
 )
 import roundwright.candidate_review as candidate_review
-from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
+from roundwright.configuration import RepositoryIdentity
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
@@ -43,14 +43,15 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
     kwargs.setdefault("selected_profile_identity", context.runtime_binding.supervisor_profile_identities[0])
     kwargs.setdefault("within_round_attempt", 1)
     kwargs.setdefault("review_round", 4)
-    kwargs.setdefault("review_policy", ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE))
     return _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
-    def runtime_binding(self, supervisor_count: int = 3) -> RuntimeBinding:
+    def runtime_binding(self, supervisor_count: int = 3, *, include_policy: bool = True) -> RuntimeBinding:
         values = "cdefgh"
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in values[:supervisor_count]))
+        policy_digest = candidate_review._digest({"complete_rounds": 3, "max_rounds": 10, "max_supervisor_attempts_per_round": supervisor_count, "on_final_findings": "worker-final-repair-then-merge"})
+        values = (3, 10, supervisor_count, "worker-final-repair-then-merge", policy_digest) if include_policy else ()
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cdefgh"[:supervisor_count]), *values)
 
     def git(self, directory: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True).stdout.strip()
@@ -68,7 +69,7 @@ class CandidateReviewTests(unittest.TestCase):
         self.git(root, "push", "-u", "origin", "main")
         return RepositoryIdentity.from_root(root)
 
-    def ready_task(self, root: Path, *, commit: bool = True, supervisor_count: int = 3):
+    def ready_task(self, root: Path, *, commit: bool = True, supervisor_count: int = 3, include_policy: bool = True):
         repository = self.repository(root)
         initialize(repository)
         base = self.git(root, "rev-parse", "HEAD")
@@ -77,7 +78,7 @@ class CandidateReviewTests(unittest.TestCase):
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="test-owner", ttl_seconds=120)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, hashlib.sha256(b"source-25").hexdigest()),), lease=lease)
         begin_planning(repository, identity, evidence_fingerprint="a" * 64, lease=lease)
-        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint="c" * 64, runtime_binding=self.runtime_binding(supervisor_count))
+        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint="c" * 64, runtime_binding=self.runtime_binding(supervisor_count, include_policy=include_policy))
         now = int(time.time())
         input_value = PlanningInput("Implement candidate", (), ("Commit locally",), (), ("Unit tests",), (), ())
         plan = WorkerPlan("Implement candidate", (), (), ("Commit locally",), ("Unit tests",), (), (), ())
@@ -176,7 +177,7 @@ class CandidateReviewTests(unittest.TestCase):
                 review_context = self.review_context(identity, context, seal)
                 for verification in (CandidateVerification("map-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64), CandidateVerification("map-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64)):
                     record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
-                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, review_round=4, review_policy=ReviewPolicy(3, 10, profile_count, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE), lease=lease, now=now)
+                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, review_round=4, lease=lease, now=now)
                 if not accepted:
                     with self.assertRaises(CandidateReviewError):
                         _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
@@ -363,6 +364,49 @@ class CandidateReviewTests(unittest.TestCase):
                 self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
             finally:
                 connection.close()
+
+    def test_diff_review_requires_the_pinned_runtime_policy_projection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository", include_policy=False)
+            repository, identity, lease, context, binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("policy-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64),
+                CandidateVerification("policy-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            with self.assertRaisesRegex(CandidateReviewError, "review policy projection"):
+                dispatch_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id="unbound-policy", implementation_attempt_id=implementation.implementation_attempt_id,
+                    provider_attempt_id="unbound-policy-supervisor", supervisor_session_identity="unbound-policy-session",
+                    external_turn_identity="unbound-policy-turn", message_identity="unbound-policy-message",
+                    process_lease_id="unbound-policy-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+                )
+
+    def test_final_review_limit_repair_rejects_detached_or_coherently_tampered_policy(self):
+        cases = ("detached", "coherent")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    if case == "detached":
+                        connection.execute("UPDATE runtime_review_policies SET configuration_digest = ? WHERE task_id = ?", ("sha256:" + "f" * 64, identity.task_id))
+                    else:
+                        digest = candidate_review._digest({"complete_rounds": 2, "max_rounds": 10, "max_supervisor_attempts_per_round": 3, "on_final_findings": "worker-final-repair-then-merge"})
+                        connection.execute("UPDATE diff_review_attempts SET review_complete_rounds = ?, review_max_rounds = ?, review_max_supervisor_attempts_per_round = ?, review_on_final_findings = ?, review_policy_digest = ? WHERE task_id = ?", (2, 10, 3, "worker-final-repair-then-merge", digest, identity.task_id))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(Exception):
+                    finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", lease=lease)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
+                finally:
+                    connection.close()
 
     def test_implementation_replays_the_persisted_worker_turn_after_a_crash(self):
         with tempfile.TemporaryDirectory() as temporary:

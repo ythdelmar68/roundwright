@@ -412,12 +412,12 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
     def test_review_limit_finalization_receipt_is_required_only_for_finalized_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
-            receipt = ReviewLimitFinalizationReceipt(10, "a" * 64, "b" * 64, seal.candidate_sha, "worker-thread-21", "c" * 64)
+            receipt = ReviewLimitFinalizationReceipt(10, "a" * 64, "b" * 64, seal.candidate_sha, "worker-thread-21", "final-review-21", "sha256:" + "d" * 64, "e" * 64, "c" * 64)
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute(
-                    "INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (identity.task_id, receipt.review_round, receipt.findings_fingerprint, receipt.worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", receipt.candidate_sha, receipt.worker_thread_identity, receipt.receipt_fingerprint),
+                    "INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (identity.task_id, receipt.review_round, receipt.findings_fingerprint, receipt.worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", receipt.candidate_sha, receipt.worker_thread_identity, receipt.diff_review_attempt_id, receipt.configuration_digest, receipt.review_policy_digest, receipt.receipt_fingerprint),
                 )
                 connection.commit()
             finally:
@@ -434,7 +434,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 self.assertEqual(evaluate_gates(repository, binding, seal, finalized, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.PASS)
             drifted = ReviewLimitFinalizationReceipt(
                 receipt.review_round, receipt.findings_fingerprint, receipt.worker_repair_fingerprint,
-                receipt.candidate_sha, receipt.worker_thread_identity, "d" * 64,
+                receipt.candidate_sha, receipt.worker_thread_identity, receipt.diff_review_attempt_id, receipt.configuration_digest, receipt.review_policy_digest, "d" * 64,
             )
             stale = GateContext(
                 context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task,

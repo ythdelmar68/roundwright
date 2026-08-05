@@ -429,7 +429,7 @@ def _valid_review_limit_finalization(
     connection = _open_writable_connection(repository)
     try:
         row = connection.execute(
-            "SELECT review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?",
+            "SELECT review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?",
             (binding.task_id,),
         ).fetchone()
     finally:
@@ -444,6 +444,9 @@ def _valid_review_limit_finalization(
         receipt.worker_repair_fingerprint,
         receipt.candidate_sha,
         receipt.worker_thread_identity,
+        receipt.diff_review_attempt_id,
+        receipt.configuration_digest,
+        receipt.review_policy_digest,
         receipt.receipt_fingerprint,
     ) == tuple(row) and receipt.candidate_sha == seal.candidate_sha
 

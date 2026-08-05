@@ -140,13 +140,25 @@ class ResolvedConfigurationBinding:
     sources: Mapping[str, ConfigurationSource]
     worker_profile_identity: str
     supervisor_profile_identities: tuple[str, ...]
+    review_policy: ReviewPolicy
 
     def require_matches(self, other: "ResolvedConfigurationBinding") -> None:
         if type(other) is not ResolvedConfigurationBinding or self != other:
             raise ConfigurationError("resolved configuration binding has drifted")
 
     def runtime_binding(self) -> RuntimeBinding:
-        return RuntimeBinding(self.schema_version, self.digest, self.worker_profile_identity, self.supervisor_profile_identities)
+        policy = self.review_policy
+        policy_digest = _digest({
+            "complete_rounds": policy.complete_rounds,
+            "max_rounds": policy.max_rounds,
+            "max_supervisor_attempts_per_round": policy.max_supervisor_attempts_per_round,
+            "on_final_findings": policy.on_final_findings.value,
+        }).removeprefix("sha256:")
+        return RuntimeBinding(
+            self.schema_version, self.digest, self.worker_profile_identity, self.supervisor_profile_identities,
+            policy.complete_rounds, policy.max_rounds, policy.max_supervisor_attempts_per_round,
+            policy.on_final_findings.value, policy_digest,
+        )
 
 
 @dataclass(frozen=True)
@@ -241,6 +253,7 @@ class Configuration:
             dict(self.sources),
             _digest(_profile_payload(self.worker.value)),
             tuple(_digest(_profile_payload(profile)) for profile in self.supervisor_attempt_profiles.value),
+            self.review_policy,
         )
 
 

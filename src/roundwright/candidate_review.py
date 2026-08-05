@@ -19,7 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Iterable
 
-from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode, ReviewPolicy
+from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
@@ -34,19 +34,29 @@ class CandidateReviewError(StateError):
 class _ReviewPolicyProjection:
     review_round: int
     review_mode: ReviewMode
+    complete_rounds: int
     max_rounds: int
+    max_supervisor_attempts_per_round: int
     on_final_findings: FinalFindingsPolicy
     policy_digest: str
 
 
-def _project_review_policy(review_round: int, policy: ReviewPolicy) -> _ReviewPolicyProjection:
+def _project_review_policy(review_round: int, binding: RuntimeBinding) -> _ReviewPolicyProjection:
     """Derive one typed immutable review policy projection."""
 
-    if type(review_round) is not int or type(policy) is not ReviewPolicy:
+    if type(review_round) is not int or type(binding) is not RuntimeBinding or not binding.has_review_policy:
         raise CandidateReviewError("review policy projection is invalid")
-    mode = policy.mode_for_round(review_round)
-    digest = _digest({"complete_rounds": policy.complete_rounds, "max_rounds": policy.max_rounds, "max_supervisor_attempts_per_round": policy.max_supervisor_attempts_per_round, "on_final_findings": policy.on_final_findings.value})
-    return _ReviewPolicyProjection(review_round, mode, policy.max_rounds, policy.on_final_findings, digest)
+    if not 1 <= review_round <= binding.review_max_rounds:
+        raise CandidateReviewError("review policy projection is invalid")
+    try:
+        final_policy = FinalFindingsPolicy(binding.review_on_final_findings)
+    except ValueError as error:
+        raise CandidateReviewError("review policy projection is invalid") from error
+    mode = ReviewMode.COMPLETE if review_round <= binding.review_complete_rounds else ReviewMode.CONVERGING
+    digest = _digest({"complete_rounds": binding.review_complete_rounds, "max_rounds": binding.review_max_rounds, "max_supervisor_attempts_per_round": binding.review_max_supervisor_attempts_per_round, "on_final_findings": final_policy.value})
+    if digest != binding.review_policy_digest:
+        raise CandidateReviewError("resolved review policy binding has drifted")
+    return _ReviewPolicyProjection(review_round, mode, binding.review_complete_rounds, binding.review_max_rounds, binding.review_max_supervisor_attempts_per_round, final_policy, digest)
 
 
 class VerificationKind(StrEnum):
@@ -126,7 +136,7 @@ def _diff_review_input_digest(
     selected_profile_identity: str,
     policy_projection: _ReviewPolicyProjection,
 ) -> str:
-    return _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": base_sha, "candidate": candidate_sha, "message": message_identity, "verifications": verification_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity, "review_round": policy_projection.review_round, "review_mode": policy_projection.review_mode.value, "review_max_rounds": policy_projection.max_rounds, "review_on_final_findings": policy_projection.on_final_findings.value, "review_policy_digest": policy_projection.policy_digest})
+    return _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": base_sha, "candidate": candidate_sha, "message": message_identity, "verifications": verification_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity, "review_round": policy_projection.review_round, "review_mode": policy_projection.review_mode.value, "review_complete_rounds": policy_projection.complete_rounds, "review_max_rounds": policy_projection.max_rounds, "review_max_supervisor_attempts_per_round": policy_projection.max_supervisor_attempts_per_round, "review_on_final_findings": policy_projection.on_final_findings.value, "review_policy_digest": policy_projection.policy_digest})
 
 
 @dataclass(frozen=True)
@@ -488,7 +498,6 @@ def dispatch_diff_review(
     selected_profile_identity: str,
     within_round_attempt: int,
     review_round: int,
-    review_policy: ReviewPolicy,
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> DiffReviewDispatch:
@@ -506,7 +515,7 @@ def dispatch_diff_review(
     _require_current_candidate(repository, identity, seal, implementation_attempt_id)
     _require_diff_review_context(identity, context, seal)
     verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
-    policy_projection = _project_review_policy(review_round, review_policy)
+    policy_projection = _project_review_policy(review_round, context.runtime_binding)
     _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity)
     if _session_is_plan_review(repository, identity, supervisor_session_identity):
         raise CandidateReviewError("diff review must use a session distinct from plan review")
@@ -533,11 +542,11 @@ def dispatch_diff_review(
         current = _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
         if current is None:
             connection.execute(
-                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     diff_review_attempt_id, identity.task_id, implementation_attempt_id,
                     provider_attempt_id, supervisor_session_identity, external_turn_identity,
-                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest, within_round_attempt, selected_profile_identity, policy_projection.review_round, policy_projection.review_mode.value, policy_projection.max_rounds, policy_projection.on_final_findings.value, policy_projection.policy_digest,
+                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest, within_round_attempt, selected_profile_identity, policy_projection.review_round, policy_projection.review_mode.value, policy_projection.max_rounds, policy_projection.on_final_findings.value, policy_projection.policy_digest, policy_projection.complete_rounds, policy_projection.max_supervisor_attempts_per_round,
                 ),
             )
         elif current != expected:
@@ -977,13 +986,13 @@ def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
 
 
 def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id):
-    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
     if row is None:
         return None
-    if type(row[11]) is not int or row[11] < 1 or type(row[13]) is not int or row[11] > row[13] or type(row[15]) is not str or not _FINGERPRINT.fullmatch(row[15]):
+    if type(row[11]) is not int or row[11] < 1 or type(row[13]) is not int or type(row[16]) is not int or type(row[17]) is not int or row[11] > row[13] or type(row[15]) is not str or not _FINGERPRINT.fullmatch(row[15]):
         raise CandidateReviewError("persisted diff review profile mapping is invalid")
     try:
-        projection = _ReviewPolicyProjection(row[11], ReviewMode(row[12]), row[13], FinalFindingsPolicy(row[14]), row[15])
+        projection = _ReviewPolicyProjection(row[11], ReviewMode(row[12]), row[16], row[13], row[17], FinalFindingsPolicy(row[14]), row[15])
     except (TypeError, ValueError) as error:
         raise CandidateReviewError("persisted review policy projection is invalid") from error
     binding_row = connection.execute(
@@ -995,6 +1004,10 @@ def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
     except (TypeError, ValueError, json.JSONDecodeError, RuntimeBindingError) as error:
         raise CandidateReviewError("persisted resolved configuration binding is invalid") from error
     _validate_diff_review_profile_mapping(runtime_binding, row[9], row[10])
+    policy_row = connection.execute("SELECT configuration_digest, complete_rounds, max_rounds, max_supervisor_attempts_per_round, on_final_findings, policy_digest FROM runtime_review_policies WHERE task_id = ?", (identity.task_id,)).fetchone()
+    expected_policy = (runtime_binding.resolved_digest, projection.complete_rounds, projection.max_rounds, projection.max_supervisor_attempts_per_round, projection.on_final_findings.value, projection.policy_digest)
+    if policy_row != expected_policy or projection.max_supervisor_attempts_per_round != len(runtime_binding.supervisor_profile_identities):
+        raise CandidateReviewError("persisted review policy binding has drifted")
     if type(row[7]) is not str or not _FINGERPRINT.fullmatch(row[7]):
         raise CandidateReviewError("persisted diff review verification digest is invalid")
     expected_input_digest = _diff_review_input_digest(identity, row[0], row[5], row[6], row[4], row[7], row[9], row[10], projection)

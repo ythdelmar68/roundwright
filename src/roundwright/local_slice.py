@@ -119,7 +119,6 @@ def run_once_local_slice(
     )
     configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
     runtime_binding = configuration.pin().runtime_binding()
-    review_policy = configuration.review_policy
     database = check_database(repository)
     if database.state == "healthy":
         completed = _completed_result(repository, identity, fixture, runtime_binding)
@@ -142,7 +141,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding, review_policy)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -167,7 +166,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding, review_policy):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -274,7 +273,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
         provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
         external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
         process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1,
-        review_round=1, review_policy=review_policy, lease=lease, now=epoch,
+        review_round=1, lease=lease, now=epoch,
     )
     record_diff_review(
         repository, identity, candidate_context, binding, seal, diff_review_attempt_id=diff_review.diff_review_attempt_id,

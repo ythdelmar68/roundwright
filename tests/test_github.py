@@ -194,6 +194,9 @@ class GitHubAdapterTests(unittest.TestCase):
         mixed = self.payload(request.operation)
         mixed["references"][0]["pull_request_number"] = 99  # type: ignore[index]
         self.assertFalse(FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=mixed)}).read(request).ok)
+        stale = self.payload(request.operation)
+        stale["references"][0]["head_sha"] = "b" * 40  # type: ignore[index]
+        self.assertFalse(FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=stale)}).read(request).ok)
 
     def test_ref_sensitive_mutations_bind_exact_commits_and_stale_heads(self) -> None:
         create_pr = self.intent(GitHubMutationOperation.CREATE_PULL_REQUEST)

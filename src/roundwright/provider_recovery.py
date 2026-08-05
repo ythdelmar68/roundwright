@@ -122,6 +122,7 @@ class ProviderAttempt:
     completion_evidence_fingerprint: str | None
     accepted_review_identity: str | None
     state: AttemptState
+    selected_profile_identity: str
 
 
 @dataclass(frozen=True)
@@ -193,6 +194,7 @@ def prepare_attempt(
                 or row.process_lease_id != process_lease_id
                 or row.process_lease_expires_at != process_lease_expires_at
                 or row.input_fingerprint != input_fingerprint
+                or row.selected_profile_identity != _selected_profile_identity(context, role, selected_profile_identity)
                 or row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}
             ):
                 raise ProviderRecoveryError("provider attempt replay conflicts with committed state")
@@ -727,13 +729,13 @@ def _persist_recovery_outcome(
 
 def _attempt_row(connection, task_id: str, attempt_id: str) -> ProviderAttempt:
     row = connection.execute(
-        "SELECT attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
+        "SELECT attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
         (task_id, attempt_id),
     ).fetchone()
     if row is None:
         raise ProviderRecoveryError("provider attempt is unavailable")
     try:
-        return ProviderAttempt(row[0], row[1], ProviderRole(row[2]), *row[3:12], AttemptState(row[12]))
+        return ProviderAttempt(row[0], row[1], ProviderRole(row[2]), *row[3:12], AttemptState(row[12]), row[13])
     except (TypeError, ValueError) as error:
         raise ProviderRecoveryError("provider attempt is malformed") from error
 

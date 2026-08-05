@@ -221,6 +221,7 @@ def record_gate_evidence(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_transition_lease(connection, lease, binding.repository_id)
+        require_runtime_binding(repository, _task_identity(repository, binding.task_id), context.runtime_binding, connection=connection)
         row = connection.execute(
             "SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (binding.task_id,)
         ).fetchone()
@@ -593,6 +594,7 @@ def _current_trusted_policy_activation(
             or identity.base_sha != binding.base_sha
         ):
             return None
+        require_runtime_binding(repository, identity, context.runtime_binding)
         decision = evaluate_policy(
             evidence.snapshot,
             evidence.receipt,

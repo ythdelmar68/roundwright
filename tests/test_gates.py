@@ -36,7 +36,7 @@ from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease
 from roundwright.policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.state import ReviewLimitFinalizationReceipt, SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, transition_task
+from roundwright.state import ReviewLimitFinalizationReceipt, SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding, transition_task
 
 
 class GateDecisionTests(unittest.TestCase):
@@ -283,6 +283,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         finally:
             connection.close()
         binding_value = self.runtime_binding() if runtime_binding is None else runtime_binding
+        record_runtime_binding(repository, identity, binding_value)
         selected_profile_identity = binding_value.supervisor_profile_identities[0] if selected_profile_identity is None else selected_profile_identity
         context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, receipt_fingerprint, binding_value, selected_profile_identity)
         policy_evidence = self.policy_evidence(context)
@@ -322,6 +323,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             finally:
                 connection.close()
             binding_value = self.runtime_binding()
+            record_runtime_binding(repository, identity, binding_value)
             context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64, binding_value, binding_value.supervisor_profile_identities[0])
             policy_evidence = self.policy_evidence(context)
             evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
@@ -350,6 +352,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             finally:
                 connection.close()
             binding_value = self.runtime_binding()
+            record_runtime_binding(repository, identity, binding_value)
             context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64, binding_value, binding_value.supervisor_profile_identities[0])
             policy_evidence = self.policy_evidence(context)
             passed = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
@@ -503,6 +506,38 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.close()
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
                 self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=self.policy_evidence(context), lease=lease).outcome, GateOutcome.BLOCKED)
+
+    def test_task_pinned_runtime_binding_is_required_by_every_gate_authority_path(self) -> None:
+        for case in ("missing", "policy-only", "full"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                runtime_binding = RuntimeBinding(
+                    "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+                    3, 10, 1, "worker-final-repair-then-merge", "a" * 64,
+                )
+                repository, identity, binding, seal, context, lease, _ = self.complete_persisted_pass(Path(temporary), runtime_binding=runtime_binding)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    if case == "missing":
+                        connection.execute("DELETE FROM runtime_review_policies WHERE task_id = ?", (identity.task_id,))
+                        connection.execute("DELETE FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,))
+                    else:
+                        replacement = RuntimeBinding(
+                            "roundwright-runtime/v1", "sha256:" + "f" * 64 if case == "full" else runtime_binding.resolved_digest,
+                            "sha256:" + "e" * 64 if case == "full" else runtime_binding.worker_profile_identity,
+                            ("sha256:" + "d" * 64,) if case == "full" else runtime_binding.supervisor_profile_identities,
+                            3, 4 if case == "policy-only" else 10, 1, "worker-final-repair-then-merge", "b" * 64,
+                        )
+                        connection.execute("UPDATE runtime_configuration_bindings SET schema_version = ?, resolved_digest = ?, worker_profile_identity = ?, supervisor_profile_identities = ? WHERE task_id = ?", (*replacement.columns(), identity.task_id))
+                        connection.execute("UPDATE runtime_review_policies SET configuration_digest = ?, complete_rounds = ?, max_rounds = ?, max_supervisor_attempts_per_round = ?, on_final_findings = ?, policy_digest = ? WHERE task_id = ?", (*replacement.review_policy_columns(), identity.task_id))
+                    connection.commit()
+                finally:
+                    connection.close()
+                evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "pinned-binding", 99, "f" * 64)
+                with self.assertRaises(GateError):
+                    record_gate_evidence(repository, binding, seal, context, evidence, policy_evidence=self.policy_evidence(context), lease=lease)
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=self.policy_evidence(context), lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="e" * 64, policy_evidence=self.policy_evidence(context), lease=lease)
 
     def test_selected_supervisor_profile_is_persisted_and_must_match_the_activation_receipt(self) -> None:
         profile_binding = RuntimeBinding(

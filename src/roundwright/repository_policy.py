@@ -231,6 +231,7 @@ class RepositoryMutationBinding:
             and self.task_fingerprint == context.task_fingerprint
             and self.candidate_sha == context.candidate_sha
             and self.receipt_verification_fingerprint == verification.verification_fingerprint
+            and self.receipt_fingerprint == verification.receipt_fingerprint
             and self.receipt_binding_digest == verification.receipt_binding_digest
             and self.receipt_status is verification.status
         )

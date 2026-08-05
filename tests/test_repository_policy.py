@@ -192,6 +192,8 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         self.assertTrue(binding.matches_context(context, verification))
         other = self.context(repository_fingerprint=fingerprint("1"))
         self.assertFalse(binding.matches_context(other, verification))
+        cross_receipt = self.verification(receipt, receipt_fingerprint=fingerprint("2"))
+        self.assertFalse(binding.matches_context(context, cross_receipt))
         reused = self.evaluate(snapshot, receipt, other, RepositoryMutationOperation.ISSUE_COMMENT)
         self.assertFalse(reused.authorized)
         self.assertNotEqual(binding.digest, reused.binding.digest)

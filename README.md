@@ -24,6 +24,17 @@ cannot rebind repository identity or make a different repository dispatch-ready.
 Model and reasoning-effort defaults are typed configuration values with the
 same precedence; configured values must be supplied as a validated pair.
 
+The Codex provider-health boundary is similarly typed and deliberately narrow.
+An external native credential store may supply an opaque, role-specific channel
+for an exact SDK/runtime audit and one content-free read-only qualification
+probe.  It cannot carry a task, prompt, tool request, or provider response.
+Only adapter-supplied typed failure categories are persisted or rendered;
+provider prose, raw payloads, credential locations, and secrets are rejected.
+Observations are process-local and usable only through their explicit freshness
+deadline.  Retry is limited to three qualification attempts and never enters a
+Supervisor review lifecycle.  No Copilot SDK, runtime, or authentication path
+is present.
+
 The policy boundary is also pure and typed. A later Orchestrator must supply an
 externally verified immutable control-source snapshot plus an owner activation
 receipt bound to the exact task candidate. Policy evaluation returns only a

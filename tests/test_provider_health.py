@@ -1,0 +1,163 @@
+"""Hermetic coverage for the Codex-only provider qualification boundary."""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+
+from pathlib import Path
+
+from roundwright.configuration import ProviderProfile, ReasoningEffort, load_configuration
+from roundwright.provider_health import (
+    CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract,
+    CodexProviderHealth, CodexRuntimeAudit, CredentialIsolationEvidence, HealthState, ProbeOutcome,
+    ProviderHealthCache, ProviderHealthError, ReadOnlyQualification,
+    profile_fingerprint, render_health_diagnostic,
+)
+from roundwright.provider_recovery import ProviderRole
+
+
+class FakeChannel:
+    def __init__(self, audit, outcomes=()):
+        self.audit = audit
+        self.outcomes = list(outcomes)
+        self.requests = []
+
+    def audit_runtime(self):
+        if isinstance(self.audit, Exception):
+            raise self.audit
+        return self.audit
+
+    def qualify_read_only(self, request):
+        self.requests.append(request)
+        result = self.outcomes.pop(0) if self.outcomes else ProbeOutcome(True)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class FakeStore:
+    def __init__(self, channel, isolation=None):
+        self.channel = channel
+        self.isolation = isolation
+        self.roles = []
+
+    def open_role_channel(self, role):
+        self.roles.append(role)
+        return self.channel
+
+    def credential_isolation(self, role):
+        if isinstance(self.isolation, Exception):
+            raise self.isolation
+        return CredentialIsolationEvidence(role) if self.isolation is None else self.isolation
+
+
+class ProviderHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        self.audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability("gpt-5.6-terra", "high"),))
+        self.contract = CodexHealthContract("1.2.3", "4.5.6")
+
+    def service(self, outcomes=(), audit=None, cache=None, isolation=None):
+        self.channel = FakeChannel(self.audit if audit is None else audit, outcomes)
+        self.store = FakeStore(self.channel, isolation)
+        return CodexProviderHealth(self.store, self.contract, cache=cache)
+
+    def test_qualifies_exact_audited_profile_with_a_single_content_free_probe(self):
+        result = self.service().qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual((result.state, result.failure, result.attempts), (HealthState.READY, None, 1))
+        self.assertEqual(self.store.roles, [ProviderRole.WORKER])
+        self.assertEqual(self.channel.requests, [ReadOnlyQualification(ProviderRole.WORKER, "gpt-5.6-terra", "high")])
+        self.assertEqual(set(result.evidence()), {"role", "profile_identity", "runtime_fingerprint", "state", "failure", "observed_at", "fresh_until", "attempts"})
+
+    def test_version_and_model_mismatch_block_only_the_qualified_profile(self):
+        incompatible = self.service(audit=CodexRuntimeAudit("1.2.4", "4.5.6", self.audit.capabilities)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(incompatible.failure, CodexFailure.SDK_INCOMPATIBLE)
+        other = ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH)
+        unavailable = self.service().qualify(ProviderRole.SUPERVISOR, other, freshness_seconds=30, now=100)
+        self.assertEqual(unavailable.failure, CodexFailure.MODEL_UNAVAILABLE)
+        self.assertEqual(self.channel.requests, [])
+
+    def test_only_typed_retryable_failures_retry_and_never_exceed_the_bound(self):
+        service = self.service((
+            ProbeOutcome(False, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE),
+            ProbeOutcome(False, CodexFailure.QUOTA_OR_RATE_LIMIT),
+            ProbeOutcome(True),
+        ))
+        result = service.qualify(ProviderRole.SUPERVISOR, self.profile, freshness_seconds=30, max_attempts=3, now=100)
+        self.assertEqual((result.state, result.attempts), (HealthState.READY, 3))
+        denied = self.service((ProbeOutcome(False, CodexFailure.SANDBOX_OR_APPROVAL_DENIED),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, max_attempts=3, now=100)
+        self.assertEqual((denied.failure, denied.attempts), (CodexFailure.SANDBOX_OR_APPROVAL_DENIED, 1))
+
+    def test_cache_has_an_explicit_boundary_and_force_refresh_is_bounded(self):
+        cache = ProviderHealthCache()
+        service = self.service(cache=cache)
+        first = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=10, now=100)
+        self.channel.outcomes = [ProbeOutcome(False, CodexFailure.AUTH_MISSING)]
+        self.assertEqual(service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=10, now=109), first)
+        refreshed = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=10, force_refresh=True, now=109)
+        self.assertEqual(refreshed.failure, CodexFailure.AUTH_MISSING)
+        self.assertEqual(len(self.channel.requests), 2)
+
+    def test_configuration_preflight_and_replay_keep_profile_blockers_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            configuration = load_configuration(cwd=Path(temporary), environment={})
+        capability_audit = CodexRuntimeAudit(
+            "1.2.3", "4.5.6", (
+                CodexCapability("gpt-5.6-terra", "high"),
+                CodexCapability("gpt-5.6-sol", "xhigh"),
+            ),
+        )
+        service = self.service((
+            ProbeOutcome(True), ProbeOutcome(True),
+            ProbeOutcome(False, CodexFailure.AUTH_MISSING), ProbeOutcome(True),
+        ), audit=capability_audit)
+        report = service.qualify_configuration(configuration, freshness_seconds=30, now=100)
+        self.assertFalse(report.ready)
+        worker = configuration.worker.value
+        failing = configuration.supervisor_attempt_profiles.value[1]
+        self.assertIsNone(report.blocker_for(ProviderRole.WORKER, worker))
+        self.assertEqual(report.blocker_for(ProviderRole.SUPERVISOR, failing), CodexFailure.AUTH_MISSING)
+        replayed = type(report.observations[0]).from_evidence(report.observations[0].evidence())
+        self.assertEqual(replayed, report.observations[0])
+        recovered = service.qualify(ProviderRole.SUPERVISOR, failing, freshness_seconds=30, force_refresh=True, now=101)
+        self.assertEqual(recovered.state, HealthState.READY)
+        self.assertIsNone(service.qualify(ProviderRole.WORKER, worker, freshness_seconds=30, now=101).failure)
+
+    def test_untyped_exception_and_malformed_response_never_use_message_text_for_classification(self):
+        unknown = self.service((RuntimeError("token at C:/private/path is denied"),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(unknown.failure, CodexFailure.UNKNOWN)
+        malformed = self.service((object(),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(malformed.failure, CodexFailure.MALFORMED_RESPONSE)
+        self.assertNotIn("private", render_health_diagnostic(unknown))
+
+    def test_role_credential_projection_has_no_secret_access_and_diagnostics_are_redacted(self):
+        service = self.service((ProbeOutcome(False, CodexFailure.AUTH_EXPIRED),))
+        isolation = service.credential_isolation(ProviderRole.WORKER)
+        self.assertTrue(all(value is False for name, value in vars(isolation).items() if name != "role"))
+        result = service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        diagnostic = render_health_diagnostic(result)
+        self.assertIn("authentication renewal required", diagnostic)
+        for forbidden in ("token", "path", "payload", "gpt-5.6-terra", profile_fingerprint(self.profile)):
+            self.assertNotIn(forbidden, diagnostic)
+
+    def test_missing_or_wrong_role_credential_evidence_blocks_before_the_adapter_is_opened(self):
+        blocked = self.service(isolation=RuntimeError("secret path unavailable")).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(blocked.failure, CodexFailure.UNKNOWN)
+        self.assertEqual(self.store.roles, [])
+        with self.assertRaises(ProviderHealthError):
+            self.service(isolation=CredentialIsolationEvidence(ProviderRole.SUPERVISOR)).credential_isolation(ProviderRole.WORKER)
+
+    def test_rejects_invalid_inputs_and_typed_adapter_failures_stay_classified(self):
+        with self.assertRaises(ProviderHealthError):
+            CodexRuntimeAudit("bad", "4.5.6", self.audit.capabilities)
+        with self.assertRaises(ProviderHealthError):
+            ProbeOutcome(True, CodexFailure.UNKNOWN)
+        with self.assertRaises(ProviderHealthError):
+            self.service().qualify(ProviderRole.WORKER, self.profile, freshness_seconds=0, now=100)
+        result = self.service((CodexAdapterError(CodexFailure.AUTH_MISSING),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        self.assertEqual(result.failure, CodexFailure.AUTH_MISSING)
+
+
+if __name__ == "__main__":
+    unittest.main()

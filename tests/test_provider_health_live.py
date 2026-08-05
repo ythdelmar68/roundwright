@@ -2,6 +2,7 @@
 from __future__ import annotations
 import unittest
 import io, json, contextlib
+import tempfile
 from unittest import mock
 from pathlib import Path
 from roundwright.configuration import load_configuration
@@ -22,7 +23,11 @@ class Channel:
 
 class LiveFixtureTests(unittest.TestCase):
     def fixture(self, outcome=ProbeOutcome(True), malformed=False):
-        configuration = load_configuration(cwd=Path("C:/tmp"), environment={}, home=Path("C:/tmp"))
+        with tempfile.TemporaryDirectory(prefix="roundwright live ") as temporary:
+            return self.fixture_at(Path(temporary), outcome=outcome, malformed=malformed)
+
+    def fixture_at(self, workspace, outcome=ProbeOutcome(True), malformed=False):
+        configuration = load_configuration(cwd=workspace, environment={}, home=workspace)
         capabilities = tuple({(p.model, p.reasoning_effort.value) for p in (configuration.worker.value, *configuration.supervisor_attempt_profiles.value)})
         audit = object() if malformed else CodexRuntimeAudit("1.2.3", "4.5.6", tuple(CodexCapability(*item) for item in capabilities))
         channels = {role: ("sha256:" + f"{index:x}" * 64, Channel(audit, outcome)) for index, role in enumerate(ProviderRole)}
@@ -34,7 +39,13 @@ class LiveFixtureTests(unittest.TestCase):
             with self.assertRaises(ProviderHealthError): run_bounded_live_provider_health_fixture(store, contract, config, **args)
         self.assertTrue(all(not channel.audits and not channel.requests for _, channel in channels.values()))
     def test_enabled_fixture_returns_ordered_canonical_redacted_receipts(self):
-        store, config, channels = self.fixture(); contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
+        with tempfile.TemporaryDirectory(prefix="roundwright live ") as temporary:
+            workspace = Path(temporary)
+            self.assertTrue(workspace.is_dir())
+            self.assertIn(" ", workspace.name)
+            with mock.patch.dict("os.environ", {"HOME": "ignored"}, clear=True), mock.patch("os.getcwd", return_value="ignored"):
+                store, config, channels = self.fixture_at(workspace)
+        contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
         result = run_bounded_live_provider_health_fixture(store, contract, config, enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
         self.assertEqual(len(result.receipts), 1 + len(config.supervisor_attempt_profiles.value))
         self.assertTrue(all(ProviderHealthReceipt.from_evidence(item.evidence()) == item for item in result.receipts))

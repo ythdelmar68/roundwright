@@ -176,6 +176,17 @@ class CandidateReviewTests(unittest.TestCase):
                     continue
                 dispatch = _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                 self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).selected_profile_identity, arguments["selected_profile_identity"])
+                self.assertEqual((dispatch.within_round_attempt, dispatch.selected_profile_identity), (ordinal, arguments["selected_profile_identity"]))
+                self.assertEqual(candidate_review._read_diff_dispatch(repository, identity, dispatch.diff_review_attempt_id), dispatch)
+                for column, replacement in (("within_round_attempt", 0), ("selected_profile_identity", "")):
+                    connection = sqlite3.connect(database_path(repository))
+                    try:
+                        connection.execute(f"UPDATE diff_review_attempts SET {column} = ? WHERE diff_review_attempt_id = ?", (replacement, dispatch.diff_review_attempt_id))
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaises(CandidateReviewError):
+                        candidate_review._read_diff_dispatch(repository, identity, dispatch.diff_review_attempt_id)
 
     def test_final_review_limit_repair_is_candidate_bound_idempotent_and_blocks_later_supervisor(self):
         with tempfile.TemporaryDirectory() as temporary:

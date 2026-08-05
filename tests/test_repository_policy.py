@@ -162,6 +162,27 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
                     decision = self.evaluate(snapshot, self.receipt(snapshot, context, **change), context, RepositoryMutationOperation.ISSUE_COMMENT)
                     self.assertFalse(decision.authorized)
 
+    def test_authorized_decision_retains_complete_binding_and_cannot_be_reused(self) -> None:
+        snapshot, context = self.snapshot(allow_issue_comment=True), self.context()
+        receipt = self.receipt(snapshot, context)
+        decision = self.evaluate(snapshot, receipt, context, RepositoryMutationOperation.ISSUE_COMMENT)
+        self.assertTrue(decision.authorized)
+        binding = decision.binding
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(binding.source_fingerprint, snapshot.source.source_fingerprint)
+        self.assertEqual(binding.revision_fingerprint, snapshot.source.revision_fingerprint)
+        self.assertEqual(binding.policy_digest, snapshot.policy_digest)
+        self.assertEqual(binding.schema_version, snapshot.document.schema_version)
+        self.assertEqual(binding.owner_fingerprint, receipt.owner_fingerprint)
+        self.assertEqual(binding.receipt_fingerprint, receipt.receipt_fingerprint)
+        self.assertTrue(binding.matches_context(context, RepositoryReceiptStatus.FRESH))
+        other = self.context(repository_fingerprint=fingerprint("1"))
+        self.assertFalse(binding.matches_context(other, RepositoryReceiptStatus.FRESH))
+        reused = self.evaluate(snapshot, receipt, other, RepositoryMutationOperation.ISSUE_COMMENT)
+        self.assertFalse(reused.authorized)
+        self.assertNotEqual(binding.digest, reused.binding.digest)
+
     def test_candidate_policy_edits_lifecycle_and_clock_drift_fail_closed(self) -> None:
         snapshot, context = self.snapshot(allow_issue_comment=True), self.context()
         receipt = self.receipt(snapshot, context)

@@ -240,9 +240,8 @@ class CandidateReviewTests(unittest.TestCase):
             self.assertEqual(provider_digest, artifact_digest)
             self.assertNotEqual(provider_digest, raw_digest)
 
-    def test_final_review_limit_repair_rejects_wrong_round_or_bound_identity(self):
+    def test_final_review_limit_repair_rejects_wrong_bound_identity(self):
         cases = (
-            ("wrong round", {"review_round": 9, "max_rounds": 10}),
             ("wrong Worker", {"worker_thread_identity": "other-worker"}),
             ("wrong candidate", {"seal_candidate": "f" * 40}),
             ("wrong findings", {"findings_fingerprint": "e" * 64}),
@@ -255,7 +254,7 @@ class CandidateReviewTests(unittest.TestCase):
                     repair_seal.task_id, repair_seal.base_sha, replacement["seal_candidate"], repair_seal.state_identity,
                 )
                 arguments = {
-                    "review_round": 10, "max_rounds": 10, "findings_fingerprint": findings,
+                    "findings_fingerprint": findings,
                     "worker_repair_fingerprint": "d" * 64, "worker_thread_identity": "worker-thread-25",
                 }
                 arguments.update({key: value for key, value in replacement.items() if key != "seal_candidate"})

@@ -117,7 +117,9 @@ def run_once_local_slice(
         str(fixture.worktree.resolve(strict=False)),
         base_sha,
     )
-    runtime_binding = _local_runtime_binding(repository, trusted_policy_snapshot, trusted_review_floor)
+    configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
+    runtime_binding = configuration.pin().runtime_binding()
+    review_policy = configuration.review_policy
     database = check_database(repository)
     if database.state == "healthy":
         completed = _completed_result(repository, identity, fixture, runtime_binding)
@@ -140,7 +142,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding, review_policy)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -165,7 +167,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding, review_policy):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -271,7 +273,8 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
         diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
         provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
         external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
-        process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1, lease=lease, now=epoch,
+        process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1,
+        review_round=1, review_policy=review_policy, lease=lease, now=epoch,
     )
     record_diff_review(
         repository, identity, candidate_context, binding, seal, diff_review_attempt_id=diff_review.diff_review_attempt_id,
@@ -423,8 +426,8 @@ def _completed_result(repository, identity, fixture, runtime_binding):
     return LocalSliceResult(task, CandidateSeal(identity.task_id, *row), decision.outcome, plan[0], diff[0])
 
 
-def _local_runtime_binding(repository: RepositoryIdentity, trusted_policy_snapshot: object, trusted_review_floor: object):
-    """Resolve the fixture binding without invoking repository discovery commands."""
+def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot: object, trusted_review_floor: object):
+    """Resolve the fixture configuration without invoking repository discovery commands."""
 
     return resolve_dispatch_configuration(
         cwd=Path(os.__file__).resolve().parent,
@@ -432,7 +435,7 @@ def _local_runtime_binding(repository: RepositoryIdentity, trusted_policy_snapsh
         home=repository.root,
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=trusted_review_floor,
-    ).pin().runtime_binding()
+    )
 
 
 def _gate_evidence(identity, seal, instant, runtime_binding):

@@ -290,7 +290,7 @@ def dispatch_plan(
                 (provider_attempt_id, identity.task_id),
             ).fetchone()
             persisted_context = connection.execute(
-                "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+                "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
                 (provider_attempt_id,),
             ).fetchone()
             expected_provider = (
@@ -310,6 +310,7 @@ def dispatch_plan(
                 context.candidate_fingerprint,
                 context.policy_fingerprint,
                 context.deployment_fingerprint,
+                *context.runtime_binding.columns(),
             )
             if (
                 provider is not None

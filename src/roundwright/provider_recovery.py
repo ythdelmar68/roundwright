@@ -17,7 +17,8 @@ from enum import StrEnum
 
 from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
-from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task
+from .runtime_binding import RuntimeBinding
+from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, record_runtime_binding, require_runtime_binding
 
 
 class ProviderRecoveryError(StateError):
@@ -70,6 +71,7 @@ class RecoveryContext:
     candidate_fingerprint: str | None
     policy_fingerprint: str
     deployment_fingerprint: str
+    runtime_binding: RuntimeBinding
 
     @classmethod
     def for_task(
@@ -79,6 +81,7 @@ class RecoveryContext:
         candidate_sha: str | None,
         policy_fingerprint: str,
         deployment_fingerprint: str,
+        runtime_binding: RuntimeBinding,
     ) -> "RecoveryContext":
         """Build context without retaining a worktree path in owner projections."""
 
@@ -87,6 +90,8 @@ class RecoveryContext:
             raise ProviderRecoveryError("candidate identity is invalid")
         _require_fingerprint(policy_fingerprint, "policy fingerprint")
         _require_fingerprint(deployment_fingerprint, "deployment fingerprint")
+        if type(runtime_binding) is not RuntimeBinding:
+            raise ProviderRecoveryError("resolved configuration binding is invalid")
         return cls(
             identity.task_id,
             _fingerprint(identity.repository_id),
@@ -96,6 +101,7 @@ class RecoveryContext:
             None if candidate_sha is None else _fingerprint(candidate_sha),
             policy_fingerprint,
             deployment_fingerprint,
+            runtime_binding,
         )
 
 
@@ -116,6 +122,7 @@ class ProviderAttempt:
     completion_evidence_fingerprint: str | None
     accepted_review_identity: str | None
     state: AttemptState
+    selected_profile_identity: str
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,7 @@ def prepare_attempt(
     process_lease_id: str,
     process_lease_expires_at: int,
     input_fingerprint: str,
+    selected_profile_identity: str | None = None,
     lease: TransitionLease | None = None,
     now: int | None = None,
 ) -> ProviderAttempt:
@@ -168,6 +176,12 @@ def prepare_attempt(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
+        if role is ProviderRole.SUPERVISOR and connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone() is not None:
+            raise ProviderRecoveryError("review limit has consumed the final Worker repair")
+        # The binding is first persisted only after lease and task validation,
+        # inside the same transaction that creates the dispatch checkpoint.
+        record_runtime_binding(repository, identity, context.runtime_binding, connection=connection)
+        require_runtime_binding(repository, identity, context.runtime_binding, connection=connection)
         existing = connection.execute(
             "SELECT attempt_id FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
             (identity.task_id, attempt_id),
@@ -180,6 +194,7 @@ def prepare_attempt(
                 or row.process_lease_id != process_lease_id
                 or row.process_lease_expires_at != process_lease_expires_at
                 or row.input_fingerprint != input_fingerprint
+                or row.selected_profile_identity != _selected_profile_identity(context, role, selected_profile_identity)
                 or row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}
             ):
                 raise ProviderRecoveryError("provider attempt replay conflicts with committed state")
@@ -190,8 +205,8 @@ def prepare_attempt(
             (identity.task_id, role.value),
         ).fetchone()[0]
         connection.execute(
-            "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?)",
-            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value),
+            "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?)",
+            (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, _selected_profile_identity(context, role, selected_profile_identity)),
         )
         _persist_context(connection, attempt_id, context)
         _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, observed)
@@ -462,13 +477,16 @@ def accept_supervisor_review(
             return row
         if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.COMPLETED:
             raise ProviderRecoveryError("only a completed supervisor attempt can be accepted")
+        selected = connection.execute("SELECT selected_profile_identity FROM provider_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+        if selected is None or selected[0] not in context.runtime_binding.supervisor_profile_identities:
+            raise ProviderRecoveryError("accepted supervisor profile binding has drifted")
         connection.execute(
             "UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?",
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
         )
         connection.execute(
-            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint) VALUES (?, ?, ?, ?)",
-            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint),
+            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint, *context.runtime_binding.columns(), row.selected_profile_identity),
         )
         connection.commit()
     except sqlite3.IntegrityError as error:
@@ -711,13 +729,13 @@ def _persist_recovery_outcome(
 
 def _attempt_row(connection, task_id: str, attempt_id: str) -> ProviderAttempt:
     row = connection.execute(
-        "SELECT attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
+        "SELECT attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
         (task_id, attempt_id),
     ).fetchone()
     if row is None:
         raise ProviderRecoveryError("provider attempt is unavailable")
     try:
-        return ProviderAttempt(row[0], row[1], ProviderRole(row[2]), *row[3:12], AttemptState(row[12]))
+        return ProviderAttempt(row[0], row[1], ProviderRole(row[2]), *row[3:12], AttemptState(row[12]), row[13])
     except (TypeError, ValueError) as error:
         raise ProviderRecoveryError("provider attempt is malformed") from error
 
@@ -732,13 +750,13 @@ def _checkpoint(connection, task_id: str, role: ProviderRole, phase: str, attemp
 
 def _persist_context(connection, attempt_id: str, context: RecoveryContext) -> None:
     existing = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     expected = (context.task_id, *_context_values(context))
     if existing is None:
         connection.execute(
-            "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (attempt_id, *expected),
         )
     elif existing != expected:
@@ -751,7 +769,7 @@ def _context_matches(connection, identity: TaskIdentity, attempt_id: str, contex
     if not isinstance(context, RecoveryContext) or context.task_id != identity.task_id:
         return False
     existing = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     expected = (identity.task_id, *_context_values(context))
@@ -767,7 +785,20 @@ def _context_values(context: RecoveryContext) -> tuple[str | None, ...]:
         context.candidate_fingerprint,
         context.policy_fingerprint,
         context.deployment_fingerprint,
+        *context.runtime_binding.columns(),
     )
+
+
+def _selected_profile_identity(context: RecoveryContext, role: ProviderRole, requested: str | None = None) -> str:
+    """Persist the one exact configured profile selected for this role's turn."""
+
+    selected = context.runtime_binding.worker_profile_identity if role is not ProviderRole.SUPERVISOR else context.runtime_binding.supervisor_profile_identities[0]
+    if requested is not None:
+        selected = requested
+    allowed = (context.runtime_binding.worker_profile_identity,) if role is not ProviderRole.SUPERVISOR else context.runtime_binding.supervisor_profile_identities
+    if type(selected) is not str or selected not in allowed:
+        raise ProviderRecoveryError("selected provider profile identity is invalid")
+    return selected
 
 
 def _require_persisted_context(connection, attempt_id: str, context: RecoveryContext) -> None:
@@ -813,6 +844,8 @@ def _validate_context(identity: TaskIdentity, context: RecoveryContext) -> None:
         _require_fingerprint(value, name)
     if context.candidate_fingerprint is not None:
         _require_fingerprint(context.candidate_fingerprint, "candidate fingerprint")
+    if type(context.runtime_binding) is not RuntimeBinding:
+        raise ProviderRecoveryError("resolved configuration binding is invalid")
 
 
 def _validate_task(identity: object) -> None:
@@ -845,7 +878,7 @@ def _fingerprint(value: str) -> str:
 
 
 def _context_fingerprint(context: RecoveryContext) -> str:
-    return _fingerprint("\x00".join("" if value is None else value for value in context.__dict__.values()))
+    return _fingerprint("\x00".join("" if value is None else value for value in _context_values(context)))
 
 
 def _clock(now: int | None) -> int:

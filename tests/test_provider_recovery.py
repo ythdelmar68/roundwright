@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
+from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_recovery import (
     AttemptState,
@@ -35,6 +36,9 @@ from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database
 
 
 class ProviderRecoveryTests(unittest.TestCase):
+    def runtime_binding(self) -> RuntimeBinding:
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+
     def repository(self, root: Path) -> RepositoryIdentity:
         identity = object.__new__(RepositoryIdentity)
         object.__setattr__(identity, "root", root.resolve())
@@ -56,6 +60,7 @@ class ProviderRecoveryTests(unittest.TestCase):
             candidate_sha=candidate,
             policy_fingerprint="c" * 64,
             deployment_fingerprint="d" * 64,
+            runtime_binding=self.runtime_binding(),
         )
 
     def admit(self, repository: RepositoryIdentity, identity: TaskIdentity, lease: object) -> None:

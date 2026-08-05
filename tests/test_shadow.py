@@ -32,7 +32,7 @@ class ShadowTests(unittest.TestCase):
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",
-            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(), (b"input-38",), b"reference-38",
+            "reference-38", (hashlib.sha256(b"input-38").hexdigest(),), "rules-38", "fixture-38", "2030-01-01T00:00:00Z", "phase-3", "retention-38", "normalizer-v1", "comparator-v1", ("input-38",), hashlib.sha256(b"reference-38").hexdigest(), (b"input-38",), b"reference-38", "sha256:" + "c" * 64, "roundwright-runtime/v1", "sha256:" + "d" * 64, ("sha256:" + "e" * 64, "sha256:" + "f" * 64, "sha256:" + "0" * 64), "sha256:" + "e" * 64,
         )
 
     def observations(self, **last_changes: object) -> tuple[ShadowObservation, ...]:
@@ -44,7 +44,7 @@ class ShadowTests(unittest.TestCase):
                 state, CANDIDATE, source_id="source-38", task_id="task-38", base_sha=BASE, policy_identity="policy-38",
                 gate_identity="gate-38", applicability=Applicability.APPLICABLE, blocker=None, next_action="owner-review",
                 accepted_review_identity="review-38", worktree_identity="worktree-38",
-                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(), input_payloads=(b"input-38",), reference_result_payload=b"reference-38",
+                input_identities=("input-38",), input_digests=(hashlib.sha256(b"input-38").hexdigest(),), reference_result_digest=hashlib.sha256(b"reference-38").hexdigest(), input_payloads=(b"input-38",), reference_result_payload=b"reference-38", configuration_digest="sha256:" + "c" * 64, configuration_schema_version="roundwright-runtime/v1", worker_profile_identity="sha256:" + "d" * 64, supervisor_profile_identities=("sha256:" + "e" * 64, "sha256:" + "f" * 64, "sha256:" + "0" * 64), selected_supervisor_profile_identity="sha256:" + "e" * 64,
             ))
         items[-1] = replace(items[-1], **last_changes, evidence_digest="")
         return tuple(items)
@@ -76,6 +76,28 @@ class ShadowTests(unittest.TestCase):
         observations = (*observations[:-1], replace(observations[-1], candidate_sha="c" * 40, evidence_digest=""))
         report = ShadowExecutor().replay(self.case(observations))
         self.assertEqual(report.classification, ReplayClassification.STALE_EVIDENCE)
+
+    def test_resolved_configuration_digest_is_pinned_to_shadow_evidence(self):
+        digest = "sha256:" + "c" * 64
+        identity = replace(self.identity(), configuration_digest=digest)
+        observations = tuple(replace(item, configuration_digest=digest, evidence_digest="") for item in self.observations())
+        case = ShadowCase.build("case-config", identity, observations, expected_states=STATES)
+        self.assertEqual(ShadowExecutor().replay(case).classification, ReplayClassification.EXACT_MATCH)
+        stale = tuple(replace(item, configuration_digest="sha256:" + "d" * 64, evidence_digest="") for item in observations)
+        self.assertEqual(ShadowExecutor().replay(ShadowCase.build("case-config", identity, stale, expected_states=STATES)).classification, ReplayClassification.STALE_EVIDENCE)
+        with self.assertRaisesRegex(Exception, "configuration digest"):
+            ShadowCase.build("case-missing-config", replace(self.identity(), configuration_digest=""), self.observations(), expected_states=STATES)
+
+    def test_resolved_configuration_profile_identity_drift_is_stale_evidence(self):
+        observations = self.observations(
+            worker_profile_identity="sha256:" + "0" * 64,
+        )
+        report = ShadowExecutor().replay(self.case(observations))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.STALE_EVIDENCE))
+
+    def test_selected_supervisor_profile_drift_is_stale_evidence(self):
+        report = ShadowExecutor().replay(self.case(self.observations(selected_supervisor_profile_identity="sha256:" + "f" * 64)))
+        self.assertEqual((report.outcome, report.classification), (ComparisonOutcome.INVALID, ReplayClassification.STALE_EVIDENCE))
 
     def test_dirty_worktree_evidence_fails_closed(self):
         observations = self.observations(worktree_clean=False)

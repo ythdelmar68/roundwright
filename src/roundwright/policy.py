@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
+from .runtime_binding import RuntimeBinding
 
 
 POLICY_SCHEMA_VERSION = 1
@@ -128,6 +129,8 @@ class ActivationReceipt:
     candidate_sha: str
     activated_at: datetime
     expires_at: datetime
+    runtime_binding: RuntimeBinding
+    selected_supervisor_profile_identity: str
 
     def __post_init__(self) -> None:
         for value, description in (
@@ -149,6 +152,10 @@ class ActivationReceipt:
         _require_utc(self.expires_at, "receipt expiry")
         if self.expires_at <= self.activated_at:
             raise PolicyError("the activation receipt has an invalid lifetime")
+        if type(self.runtime_binding) is not RuntimeBinding:
+            raise PolicyError("the activation receipt runtime configuration binding is invalid")
+        if self.selected_supervisor_profile_identity not in self.runtime_binding.supervisor_profile_identities:
+            raise PolicyError("the activation receipt selected supervisor profile is invalid")
 
 
 @dataclass(frozen=True)

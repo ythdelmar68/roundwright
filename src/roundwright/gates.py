@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import json
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -13,7 +13,8 @@ from pathlib import Path
 from .configuration import RepositoryIdentity
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence
 from .policy import ActivationReceipt, ReceiptStatus, StandingAuthority, TrustedPolicySnapshot, evaluate_policy
-from .state import StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner
+from .runtime_binding import RuntimeBinding, RuntimeBindingError
+from .state import ReviewLimitFinalizationReceipt, StateError, _open_writable_connection, _require_current_transition_lease, _transition_ready_for_owner, require_runtime_binding
 
 
 class GateError(StateError):
@@ -78,8 +79,6 @@ GATE_REGISTRY = (
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}")
-
-
 @dataclass(frozen=True)
 class GateContext:
     task_id: str
@@ -88,6 +87,9 @@ class GateContext:
     isolated_local_task: bool
     policy_digest: str
     receipt_fingerprint: str
+    runtime_binding: RuntimeBinding
+    selected_supervisor_profile_identity: str
+    review_limit_finalization: ReviewLimitFinalizationReceipt | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,8 @@ def record_gate_evidence(
     """Persist one exact-candidate gate record and bind its fingerprint to that candidate."""
 
     _validate_context(context)
+    if not _valid_review_limit_finalization(repository, binding, seal, context.runtime_binding, context.review_limit_finalization):
+        raise GateError("review-limit finalization receipt is unavailable or stale")
     _validate_evidence(evidence)
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
@@ -217,6 +221,7 @@ def record_gate_evidence(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_current_transition_lease(connection, lease, binding.repository_id)
+        require_runtime_binding(repository, _task_identity(repository, binding.task_id), context.runtime_binding, connection=connection)
         row = connection.execute(
             "SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (binding.task_id,)
         ).fetchone()
@@ -229,17 +234,17 @@ def record_gate_evidence(
         if context.source_count != source_count:
             raise GateError("gate context source count does not match committed task state")
         persisted_context = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
             (binding.task_id, seal.candidate_sha),
         ).fetchone()
-        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint)
+        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint, *context.runtime_binding.complete_columns(), context.selected_supervisor_profile_identity)
         if persisted_context is None:
             connection.execute(
-                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, policy_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, policy_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at),
             )
-        elif persisted_context[:4] != context_values:
-            if type(persisted_context[4]) is not str or policy_activated_at <= persisted_context[4]:
+        elif persisted_context[:14] != context_values:
+            if type(persisted_context[14]) is not str or policy_activated_at <= persisted_context[14]:
                 raise GateError("gate context conflicts with committed task state")
             connection.execute(
                 "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",
@@ -250,10 +255,10 @@ def record_gate_evidence(
                 (binding.task_id, seal.candidate_sha),
             )
             connection.execute(
-                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, policy_activated_at = ? WHERE task_id = ? AND candidate_sha = ?",
+                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, configuration_schema_version = ?, configuration_digest = ?, worker_profile_identity = ?, supervisor_profile_identities = ?, review_complete_rounds = ?, review_max_rounds = ?, review_max_supervisor_attempts_per_round = ?, review_on_final_findings = ?, review_policy_digest = ?, selected_supervisor_profile_identity = ?, policy_activated_at = ? WHERE task_id = ? AND candidate_sha = ?",
                 (*context_values, policy_activated_at, binding.task_id, seal.candidate_sha),
             )
-        elif persisted_context[4] != policy_activated_at:
+        elif persisted_context[14] != policy_activated_at:
             raise GateError("gate context conflicts with committed task state")
         connection.execute(
             "INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)",
@@ -336,8 +341,10 @@ def evaluate_gates(
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "current trusted policy evidence is unavailable"),))
+    if not _valid_review_limit_finalization(repository, binding, seal, context.runtime_binding, context.review_limit_finalization):
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("review-limit", GateOutcome.BLOCKED, "review-limit finalization receipt is unavailable or stale"),))
     decision = _read_persisted_decision(repository, binding, seal, lease=lease)
-    if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
+    if not _contexts_match(context, _persisted_gate_context(repository, binding.task_id, seal.candidate_sha)):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate identity mismatch"),))
     if policy_activated_at != _persisted_policy_activation(repository, binding.task_id, seal.candidate_sha):
         return GateDecision(GateOutcome.BLOCKED, (GateResult("policy", GateOutcome.BLOCKED, "trusted policy receipt is stale"),))
@@ -359,8 +366,10 @@ def transition_ready_for_owner(
     policy_activated_at = _current_trusted_policy_activation(repository, binding, context, policy_evidence)
     if policy_activated_at is None:
         raise GateError("gate context does not match current trusted policy evidence")
+    if not _valid_review_limit_finalization(repository, binding, seal, context.runtime_binding, context.review_limit_finalization):
+        raise GateError("review-limit finalization receipt is unavailable or stale")
     candidate_evidence(repository, binding, seal, lease=lease)
-    if context != _persisted_gate_context(repository, binding.task_id, seal.candidate_sha):
+    if not _contexts_match(context, _persisted_gate_context(repository, binding.task_id, seal.candidate_sha)):
         raise GateError("gate context does not match committed task state")
     if policy_activated_at != _persisted_policy_activation(repository, binding.task_id, seal.candidate_sha):
         raise GateError("trusted policy receipt is stale")
@@ -410,6 +419,73 @@ def _persisted_policy_activation(repository: RepositoryIdentity, task_id: str, c
     return row[0] if row is not None and isinstance(row[0], str) and row[0] else None
 
 
+def _valid_review_limit_finalization(
+    repository: RepositoryIdentity,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    runtime_binding: RuntimeBinding,
+    receipt: ReviewLimitFinalizationReceipt | None,
+) -> bool:
+    """Require a receipt exactly when durable state consumed a final Worker repair."""
+
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?",
+            (binding.task_id,),
+        ).fetchone()
+        routed_review = connection.execute(
+            "SELECT reviews.review_round, reviews.review_mode, reviews.review_complete_rounds, reviews.review_max_rounds, reviews.review_max_supervisor_attempts_per_round, reviews.review_on_final_findings, reviews.review_policy_digest "
+            "FROM implementation_candidates AS candidates "
+            "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id "
+            "JOIN diff_review_attempts AS reviews ON reviews.diff_review_attempt_id = implementation.repair_diff_review_id "
+            "JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = reviews.diff_review_attempt_id "
+            "WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND artifacts.verdict = 'findings'",
+            (binding.task_id, seal.candidate_sha),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        if routed_review is None:
+            return receipt is None
+        if type(runtime_binding) is not RuntimeBinding or not runtime_binding.has_review_policy:
+            return False
+        expected = (
+            runtime_binding.review_complete_rounds,
+            runtime_binding.review_max_rounds,
+            runtime_binding.review_max_supervisor_attempts_per_round,
+            runtime_binding.review_on_final_findings,
+            runtime_binding.review_policy_digest,
+        )
+        if tuple(routed_review[2:]) != expected:
+            return False
+        return not (
+            routed_review[0] == runtime_binding.review_max_rounds
+            and routed_review[1] == "CONVERGING"
+        ) and receipt is None
+    if type(receipt) is not ReviewLimitFinalizationReceipt or type(runtime_binding) is not RuntimeBinding or not runtime_binding.has_review_policy:
+        return False
+    return (
+        receipt.review_round,
+        receipt.findings_fingerprint,
+        receipt.worker_repair_fingerprint,
+        receipt.candidate_sha,
+        receipt.worker_thread_identity,
+        receipt.diff_review_attempt_id,
+        receipt.configuration_digest,
+        receipt.review_policy_digest,
+        receipt.receipt_fingerprint,
+    ) == tuple(row) and receipt.candidate_sha == seal.candidate_sha and (
+        receipt.review_round,
+        receipt.configuration_digest,
+        receipt.review_policy_digest,
+    ) == (
+        runtime_binding.review_max_rounds,
+        runtime_binding.resolved_digest,
+        runtime_binding.review_policy_digest,
+    )
+
+
 def _decision_from_connection(connection, identity) -> GateDecision:
     """Derive readiness from the exact persisted task, seal, context, and evidence rows."""
 
@@ -433,12 +509,18 @@ def _decision_from_connection(connection, identity) -> GateDecision:
 
 def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:
     row = connection.execute(
-        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
         (task_id, candidate_sha),
     ).fetchone()
-    if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1) or not _is_fingerprint(row[2]) or not _is_fingerprint(row[3]):
+    if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1) or not _is_fingerprint(row[2]) or not _is_fingerprint(row[3]) or type(row[13]) is not str:
         return None
-    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3])
+    try:
+        runtime_binding = RuntimeBinding(row[4], row[5], row[6], tuple(json.loads(row[7])), row[8], row[9], row[10], row[11], row[12])
+    except (RuntimeBindingError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if row[13] not in runtime_binding.supervisor_profile_identities:
+        return None
+    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3], runtime_binding, row[13])
 
 
 def _decide_requirement(context: GateContext, requirement: GateRequirement, entries: list[GateEvidence]) -> GateResult:
@@ -512,6 +594,7 @@ def _current_trusted_policy_activation(
             or identity.base_sha != binding.base_sha
         ):
             return None
+        require_runtime_binding(repository, identity, context.runtime_binding)
         decision = evaluate_policy(
             evidence.snapshot,
             evidence.receipt,
@@ -527,6 +610,8 @@ def _current_trusted_policy_activation(
         decision.authorized
         and decision.policy_digest == context.policy_digest
         and decision.receipt_fingerprint == context.receipt_fingerprint
+        and _runtime_bindings_match(context.runtime_binding, evidence.receipt.runtime_binding)
+        and evidence.receipt.selected_supervisor_profile_identity == context.selected_supervisor_profile_identity
     ):
         return None
     try:
@@ -534,6 +619,30 @@ def _current_trusted_policy_activation(
         return activated_at.isoformat() if type(activated_at) is datetime else None
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _runtime_bindings_match(expected: RuntimeBinding, actual: object) -> bool:
+    try:
+        expected.require_matches(actual)
+    except (AttributeError, RuntimeBindingError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _contexts_match(expected: GateContext, actual: object) -> bool:
+    if type(expected) is not GateContext or type(actual) is not GateContext:
+        return False
+    if (
+        expected.task_id, expected.candidate_sha, expected.source_count,
+        expected.isolated_local_task, expected.policy_digest, expected.receipt_fingerprint,
+        expected.selected_supervisor_profile_identity,
+    ) != (
+        actual.task_id, actual.candidate_sha, actual.source_count,
+        actual.isolated_local_task, actual.policy_digest, actual.receipt_fingerprint,
+        actual.selected_supervisor_profile_identity,
+    ):
+        return False
+    return _runtime_bindings_match(expected.runtime_binding, actual.runtime_binding)
 
 
 def _is_well_formed_context(context: GateContext) -> bool:
@@ -547,6 +656,8 @@ def _is_well_formed_context(context: GateContext) -> bool:
         and type(context.isolated_local_task) is bool
         and _is_fingerprint(context.policy_digest)
         and _is_fingerprint(context.receipt_fingerprint)
+        and type(context.runtime_binding) is RuntimeBinding
+        and context.selected_supervisor_profile_identity in context.runtime_binding.supervisor_profile_identities
     )
 
 

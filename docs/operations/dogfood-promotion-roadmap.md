@@ -49,6 +49,25 @@ The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
 then #40, #41, #42, #46, and #47. The Phase 3 qualification result may produce
 `PROMOTION_READY` only; it cannot start a canary.
 
+## Deferred Phase 5 dependency-review lifecycle
+
+Phase 3 records, but does not implement or activate, dependency review. Its
+default future profile is Codex `gpt-5.6-terra` with `high` reasoning effort.
+There is no Phase 3 activation key, runnable job, provider adapter, or created
+dependency-review leaf. A Phase 5 planning issue may be opened only after the
+Phase 4 closing qualification gate is closed and an allowlisted owner
+explicitly requests that planning step.
+
+When it is separately implemented and authorized, each dependency-review job
+will start a fresh, read-only attempt over one immutable affected-subset
+snapshot. It retains durable proposals, validation outcomes, and graph state;
+it never treats a previous model conversation as durable state. The
+deterministic Orchestrator may auto-activate only mechanically verifiable,
+explicit or policy-derived edges. A semantic inferred hard edge is routed to
+an owner for a decision. Any accepted affected-subset change requires a fresh
+subset review. This is a lifecycle record, not a present capability or grant
+of authority.
+
 ## Repository authority matrix
 
 | Stage | Roundwright repository | Controlled forward-test repository | Shadow | Decision record |

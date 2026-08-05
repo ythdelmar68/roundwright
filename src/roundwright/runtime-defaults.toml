@@ -1,0 +1,19 @@
+[runtime]
+schema_version = "roundwright-runtime/v1"
+
+[roles.worker]
+model = "gpt-5.6-terra"
+reasoning_effort = "high"
+
+[roles.supervisor]
+attempt_profiles = [
+  { name = "primary", model = "gpt-5.6-sol", reasoning_effort = "xhigh" },
+  { name = "fallback", model = "gpt-5.6-terra", reasoning_effort = "high" },
+  { name = "fallback-retry", model = "gpt-5.6-terra", reasoning_effort = "high" },
+]
+
+[review]
+complete_rounds = 3
+max_rounds = 10
+max_supervisor_attempts_per_round = 3
+on_final_findings = "worker-final-repair-then-merge"

@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from .deployment import blocked_command_shell_preflight
 from .doctor import collect_diagnostics, render_diagnostics
 from .identity import UnsafeEntrypointIdentityError, require_safe_entrypoint_identity
-from .configuration import ConfigurationError, RepositoryIdentity, discover_repository, load_configuration, preflight, PreflightMode
+from .configuration import ConfigurationError, RepositoryIdentity, discover_repository, load_configuration, parse_cli_overrides, preflight, PreflightMode
 from .state import StateError, check_database, initialize
 
 
@@ -22,6 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
     subcommands.add_parser("doctor", help="report read-only package diagnostics")
     subcommands.add_parser("status", help="report deployment modes without dispatching")
+    configuration = subcommands.add_parser("config", help="validate or inspect resolved runtime configuration")
+    config_commands = configuration.add_subparsers(dest="config_command")
+    for name, help_text in (("validate", "validate runtime configuration without writing"), ("show", "show public-safe configuration sources")):
+        command = config_commands.add_parser(name, help=help_text)
+        command.add_argument("--set", dest="configuration_overrides", action="append", default=[], metavar="KEY=VALUE")
+    config_commands.choices["show"].add_argument("--sources", action="store_true", help="show source labels only")
     subcommands.add_parser("init", help="create or verify repository-local state")
     database = subcommands.add_parser("db", help="inspect repository-local database state")
     database.add_subparsers(dest="database_command").add_parser("check", help="read-only database migration check")
@@ -41,6 +47,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return report.exit_code
     if arguments.command == "status":
         return _render_status(sys.stdout)
+    if arguments.command == "config" and arguments.config_command in {"validate", "show"}:
+        return _configuration_command(arguments, sys.stdout)
     if arguments.command == "init":
         return _initialize(sys.stdout)
     if arguments.command == "db" and arguments.database_command == "check":
@@ -52,6 +60,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         parser.print_help()
         return 0
+
+
+def _configuration_command(arguments: argparse.Namespace, output: object) -> int:
+    try:
+        configuration = load_configuration(cwd=Path.cwd(), cli_values=parse_cli_overrides(arguments.configuration_overrides))
+    except ConfigurationError as error:
+        output.write(f"roundwright config {arguments.config_command}\nresult: blocked\ndetail: {error}\n")  # type: ignore[attr-defined]
+        return 2
+    output.write(f"roundwright config {arguments.config_command}\nschema: {configuration.schema_version}\ndigest: {configuration.resolved_digest}\n")  # type: ignore[attr-defined]
+    if arguments.config_command == "show":
+        for name, source in sorted(configuration.sources.items()):
+            output.write(f"{name}: {source.value}\n")  # type: ignore[attr-defined]
+    output.write("result: valid\n")  # type: ignore[attr-defined]
+    return 0
 
 
 def _repository() -> RepositoryIdentity:
@@ -66,7 +88,11 @@ def _initialize(output: object) -> int:
         require_safe_entrypoint_identity(sys.argv[0])
         configuration = load_configuration(cwd=Path.cwd())
         preflight(configuration, PreflightMode.READ_ONLY)
-        repository = configuration.repository
+        repository = (
+            RepositoryIdentity.from_root(configuration.repository_configuration_root)
+            if configuration.repository_configuration_root is not None
+            else configuration.repository
+        )
         if repository is None:
             raise ConfigurationError("repository-local state requires a repository root")
         status = initialize(repository)

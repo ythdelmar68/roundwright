@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import ntpath
 import os
 import posixpath
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .configuration import RepositoryIdentity
+from .runtime_binding import RuntimeBinding, RuntimeBindingError
 
 
 class StateError(RuntimeError):
@@ -425,6 +427,158 @@ MIGRATIONS = (
             ("diff_review_routes", "CREATE TABLE diff_review_routes (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), worker_thread_identity TEXT NOT NULL, finding_ids_json TEXT NOT NULL, consumed_by_implementation_attempt_id TEXT REFERENCES implementation_attempts(implementation_attempt_id), claimed_by_implementation_attempt_id TEXT, claimed_provider_attempt_id TEXT, claimed_external_turn_identity TEXT, claim_owner_token TEXT)"),
         ),
     ),
+    Migration(
+        31,
+        (
+            "CREATE TABLE runtime_configuration_bindings (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), schema_version TEXT NOT NULL, resolved_digest TEXT NOT NULL, worker_profile_identity TEXT NOT NULL, supervisor_profile_identities TEXT NOT NULL)",
+        ),
+        (
+            ("runtime_configuration_bindings", "CREATE TABLE runtime_configuration_bindings (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), schema_version TEXT NOT NULL, resolved_digest TEXT NOT NULL, worker_profile_identity TEXT NOT NULL, supervisor_profile_identities TEXT NOT NULL)"),
+        ),
+    ),
+    Migration(
+        32,
+        (
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_recovery_contexts ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN configuration_schema_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN worker_profile_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN supervisor_profile_identities TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("provider_recovery_contexts", "CREATE TABLE provider_recovery_contexts (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '')"),
+            ("provider_attempt_contexts", "CREATE TABLE provider_attempt_contexts (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '')"),
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '')"),
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
+    Migration(
+        33,
+        (
+            "ALTER TABLE provider_attempts ADD COLUMN selected_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("provider_attempts", "CREATE TABLE \"provider_attempts\" (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), attempt_number INTEGER NOT NULL CHECK(attempt_number > 0), process_lease_id TEXT NOT NULL, process_lease_expires_at INTEGER NOT NULL CHECK(process_lease_expires_at > 0), session_identity TEXT, external_turn_identity TEXT, input_fingerprint TEXT NOT NULL, output_pointer TEXT, completion_evidence_fingerprint TEXT, accepted_review_identity TEXT, state TEXT NOT NULL CHECK(state IN ('prepared', 'dispatched', 'completed', 'accepted', 'ambiguous', 'blocked', 'invalidated')), selected_profile_identity TEXT NOT NULL DEFAULT '', UNIQUE(task_id, provider_role, attempt_number), UNIQUE(task_id, provider_role, external_turn_identity), UNIQUE(task_id, accepted_review_identity), CHECK((external_turn_identity IS NULL AND state IN ('prepared', 'blocked', 'invalidated')) OR (external_turn_identity IS NOT NULL AND state != 'prepared')), CHECK((state IN ('completed', 'accepted') AND output_pointer IS NOT NULL AND completion_evidence_fingerprint IS NOT NULL) OR state NOT IN ('completed', 'accepted')), CHECK((accepted_review_identity IS NOT NULL AND provider_role = 'supervisor' AND state = 'accepted') OR accepted_review_identity IS NULL))"),
+        ),
+    ),
+    Migration(
+        34,
+        (
+            "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'))",
+        ),
+        (
+            ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'))"),
+        ),
+    ),
+    Migration(
+        35,
+        (
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN selected_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
+    Migration(
+        36,
+        (
+            "ALTER TABLE gate_contexts ADD COLUMN selected_supervisor_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
+    Migration(
+        37,
+        (
+            "ALTER TABLE review_limit_finalizations ADD COLUMN candidate_sha TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_limit_finalizations ADD COLUMN worker_thread_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_limit_finalizations ADD COLUMN receipt_fingerprint TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'), candidate_sha TEXT NOT NULL DEFAULT '', worker_thread_identity TEXT NOT NULL DEFAULT '', receipt_fingerprint TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
+    Migration(
+        38,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN within_round_attempt INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN selected_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
+    Migration(
+        39,
+        ("ALTER TABLE accepted_provider_reviews ADD COLUMN within_round_attempt INTEGER NOT NULL DEFAULT 0",),
+        (("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0)"),),
+    ),
+    Migration(
+        40,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_round INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_mode TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_max_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_on_final_findings TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '', review_round INTEGER NOT NULL DEFAULT 0, review_mode TEXT NOT NULL DEFAULT '', review_max_rounds INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),),
+    ),
+    Migration(
+        41,
+        (
+            "CREATE TABLE runtime_review_policies (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), configuration_digest TEXT NOT NULL, complete_rounds INTEGER NOT NULL, max_rounds INTEGER NOT NULL, max_supervisor_attempts_per_round INTEGER NOT NULL, on_final_findings TEXT NOT NULL, policy_digest TEXT NOT NULL)",
+        ),
+        (
+            ("runtime_review_policies", "CREATE TABLE runtime_review_policies (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), configuration_digest TEXT NOT NULL, complete_rounds INTEGER NOT NULL, max_rounds INTEGER NOT NULL, max_supervisor_attempts_per_round INTEGER NOT NULL, on_final_findings TEXT NOT NULL, policy_digest TEXT NOT NULL)"),
+        ),
+    ),
+    Migration(
+        42,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_complete_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '', review_round INTEGER NOT NULL DEFAULT 0, review_mode TEXT NOT NULL DEFAULT '', review_max_rounds INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0)"),
+        ),
+    ),
+    Migration(
+        43,
+        (
+            "ALTER TABLE review_limit_finalizations ADD COLUMN diff_review_attempt_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_limit_finalizations ADD COLUMN configuration_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE review_limit_finalizations ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'), candidate_sha TEXT NOT NULL DEFAULT '', worker_thread_identity TEXT NOT NULL DEFAULT '', receipt_fingerprint TEXT NOT NULL DEFAULT '', diff_review_attempt_id TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
+    Migration(
+        44,
+        (
+            "ALTER TABLE gate_contexts ADD COLUMN review_complete_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gate_contexts ADD COLUMN review_max_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gate_contexts ADD COLUMN review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gate_contexts ADD COLUMN review_on_final_findings TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
 )
 
 
@@ -467,6 +621,19 @@ class TaskIdentity:
 
 
 @dataclass(frozen=True)
+class ReviewLimitFinalizationReceipt:
+    review_round: int
+    findings_fingerprint: str
+    worker_repair_fingerprint: str
+    candidate_sha: str
+    worker_thread_identity: str
+    diff_review_attempt_id: str
+    configuration_digest: str
+    review_policy_digest: str
+    receipt_fingerprint: str
+
+
+@dataclass(frozen=True)
 class ArtifactReference:
     """Path-free artifact projection bound to a committed opaque fingerprint."""
 
@@ -498,6 +665,53 @@ class DatabaseStatus:
     @property
     def healthy(self) -> bool:
         return self.state == "healthy"
+
+
+def record_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding, *, connection: sqlite3.Connection | None = None) -> None:
+    """Persist the one immutable binding before a provider turn can be prepared."""
+    try:
+        owned_connection = connection is None
+        connection = _open_writable_connection(repository) if connection is None else connection
+        try:
+            row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
+            values = binding.columns()
+            if row is None:
+                connection.execute("INSERT INTO runtime_configuration_bindings(task_id, schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?)", (identity.task_id, *values))
+            elif tuple(row) != values:
+                raise StateError("resolved configuration binding has drifted")
+            if binding.has_review_policy:
+                policy_values = binding.review_policy_columns()
+                policy_row = connection.execute("SELECT configuration_digest, complete_rounds, max_rounds, max_supervisor_attempts_per_round, on_final_findings, policy_digest FROM runtime_review_policies WHERE task_id = ?", (identity.task_id,)).fetchone()
+                if policy_row is None:
+                    connection.execute("INSERT INTO runtime_review_policies(task_id, configuration_digest, complete_rounds, max_rounds, max_supervisor_attempts_per_round, on_final_findings, policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?)", (identity.task_id, *policy_values))
+                elif tuple(policy_row) != policy_values:
+                    raise StateError("resolved review policy binding has drifted")
+            if owned_connection:
+                connection.commit()
+        finally:
+            if owned_connection:
+                connection.close()
+    except RuntimeBindingError as error:
+        raise StateError("resolved configuration binding is invalid") from error
+
+
+def require_runtime_binding(repository: RepositoryIdentity, identity: TaskIdentity, binding: RuntimeBinding, *, connection: sqlite3.Connection | None = None) -> None:
+    if type(binding) is not RuntimeBinding:
+        raise StateError("resolved configuration binding is invalid")
+    owned_connection = connection is None
+    connection = _open_writable_connection(repository) if connection is None else connection
+    try:
+        row = connection.execute("SELECT schema_version, resolved_digest, worker_profile_identity, supervisor_profile_identities FROM runtime_configuration_bindings WHERE task_id = ?", (identity.task_id,)).fetchone()
+        policy_row = connection.execute("SELECT configuration_digest, complete_rounds, max_rounds, max_supervisor_attempts_per_round, on_final_findings, policy_digest FROM runtime_review_policies WHERE task_id = ?", (identity.task_id,)).fetchone() if binding.has_review_policy else None
+    finally:
+        if owned_connection:
+            connection.close()
+    expected = binding.columns()
+    if row is None or tuple(row) != expected:
+        raise StateError("resolved configuration binding is missing or has drifted")
+    if binding.has_review_policy:
+        if policy_row is None or tuple(policy_row) != binding.review_policy_columns():
+            raise StateError("resolved review policy binding is missing or has drifted")
 
 
 def database_path(repository: RepositoryIdentity) -> Path:
@@ -597,6 +811,69 @@ def transition_task(
     if expected_state == "diff-review" and next_state == "ready-for-owner":
         raise StateError("ready-for-owner requires the candidate-bound final transition")
     return _commit_transition(repository, identity, expected_state, next_state, evidence_fingerprint, lease=lease)
+
+
+def record_review_limit_finalization(repository: RepositoryIdentity, identity: TaskIdentity, *, findings_fingerprint: str, worker_repair_fingerprint: str, candidate_sha: str, worker_thread_identity: str, runtime_binding: RuntimeBinding, lease: object | None = None) -> ReviewLimitFinalizationReceipt:
+    """Durably consume the one terminal Worker repair; later Supervisor turns fail closed."""
+
+    _validate_task_identity(identity)
+    _require_fingerprint(findings_fingerprint)
+    _require_fingerprint(worker_repair_fingerprint)
+    if not isinstance(candidate_sha, str) or len(candidate_sha) != 40 or any(character not in "0123456789abcdef" for character in candidate_sha):
+        raise StateError("review-limit candidate identity is invalid")
+    if not isinstance(worker_thread_identity, str) or not worker_thread_identity:
+        raise StateError("review-limit Worker identity is invalid")
+    if type(runtime_binding) is not RuntimeBinding or not runtime_binding.has_review_policy:
+        raise StateError("review-limit finalization requires a pinned review policy binding")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_transition_lease(connection, lease, identity.repository_id)
+        _require_matching_task(connection, identity)
+        require_runtime_binding(repository, identity, runtime_binding, connection=connection)
+        seal = connection.execute("SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()
+        repair = connection.execute(
+            "SELECT reviews.diff_review_attempt_id, implementation.worker_thread_identity, reviews.review_round, reviews.review_mode, reviews.review_complete_rounds, reviews.review_max_rounds, reviews.review_max_supervisor_attempts_per_round, reviews.review_on_final_findings, reviews.review_policy_digest FROM implementation_candidates AS candidates "
+            "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id "
+            "JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = implementation.repair_diff_review_id "
+            "AND routes.consumed_by_implementation_attempt_id = implementation.implementation_attempt_id "
+            "JOIN diff_review_attempts AS reviews ON reviews.diff_review_attempt_id = routes.diff_review_attempt_id "
+            "AND implementation.repair_candidate_sha = reviews.candidate_sha "
+            "JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = routes.diff_review_attempt_id "
+            "WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND candidates.completion_evidence_fingerprint = ? "
+            "AND routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?",
+            (identity.task_id, candidate_sha, worker_repair_fingerprint, identity.task_id, findings_fingerprint),
+        ).fetchone()
+        findings = connection.execute("SELECT routes.worker_thread_identity FROM diff_review_artifacts AS artifacts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = artifacts.diff_review_attempt_id WHERE routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?", (identity.task_id, findings_fingerprint)).fetchone()
+        if seal != (candidate_sha,) or repair is None or repair[1] != worker_thread_identity or findings != (worker_thread_identity,):
+            raise StateError("review-limit finalization does not match the final Worker repair")
+        diff_review_attempt_id, _, review_round, review_mode, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest = repair
+        if (
+            type(review_round) is not int or type(review_complete_rounds) is not int or type(review_max_rounds) is not int or type(review_max_supervisor_attempts_per_round) is not int
+            or review_round != runtime_binding.review_max_rounds or review_mode != "CONVERGING"
+            or (review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) != (
+                runtime_binding.review_complete_rounds, runtime_binding.review_max_rounds,
+                runtime_binding.review_max_supervisor_attempts_per_round, runtime_binding.review_on_final_findings,
+                runtime_binding.review_policy_digest,
+            )
+        ):
+            raise StateError("review-limit finalization is not a terminal persisted review")
+        configuration_digest = runtime_binding.resolved_digest
+        receipt_fingerprint = hashlib.sha256("\x00".join((identity.task_id, diff_review_attempt_id, str(review_round), findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, configuration_digest, review_policy_digest, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED")).encode("utf-8")).hexdigest()
+        receipt = ReviewLimitFinalizationReceipt(review_round, findings_fingerprint, worker_repair_fingerprint, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint)
+        row = connection.execute("SELECT review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone()
+        expected = (review_round, findings_fingerprint, worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint)
+        if row is None:
+            connection.execute("INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, diff_review_attempt_id, configuration_digest, review_policy_digest, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identity.task_id, *expected))
+        elif tuple(row) != expected:
+            raise StateError("review-limit finalization has already been consumed")
+        connection.commit()
+        return receipt
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _transition_ready_for_owner(

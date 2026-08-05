@@ -15,6 +15,7 @@ import hashlib
 import json
 from typing import Mapping
 from uuid import UUID
+from .runtime_binding import RuntimeBinding
 
 
 class DeploymentMode(str, Enum):
@@ -54,6 +55,7 @@ class DeploymentIdentity:
     state_fingerprint: str
     state_id: UUID
     deployment_fingerprint: str
+    runtime_binding: RuntimeBinding
 
     def __post_init__(self) -> None:
         _validate_identity(self)
@@ -88,6 +90,7 @@ class AuthorityReceiptVerification:
     state_id: UUID
     authoritative_deployment_fingerprint: str
     status: AuthorityReceiptStatus
+    runtime_binding: RuntimeBinding
 
     def __post_init__(self) -> None:
         _validate_verification(self)
@@ -161,6 +164,8 @@ def evaluate_deployment_authority(
         return _blocked("the repository-external state identity does not match", receipt)
     if verification.authoritative_deployment_fingerprint != identity.deployment_fingerprint:
         return _blocked("a different deployment is authoritative for this repository state", receipt)
+    if not _runtime_bindings_match(identity.runtime_binding, verification.runtime_binding):
+        return _blocked("the repository-external runtime configuration binding does not match", receipt)
     if not receipt.issued_at <= now < receipt.expires_at:
         return _blocked("the deployment authority receipt is expired or not yet active", receipt)
     return DeploymentAuthorityDecision(
@@ -191,6 +196,7 @@ def _identities_match(left: DeploymentIdentity, right: DeploymentIdentity) -> bo
         and left.state_fingerprint == right.state_fingerprint
         and left.state_id == right.state_id
         and left.deployment_fingerprint == right.deployment_fingerprint
+        and _runtime_bindings_match(left.runtime_binding, right.runtime_binding)
     )
 
 
@@ -234,6 +240,8 @@ def _validate_identity(identity: DeploymentIdentity) -> None:
         _require_fingerprint(value, description)
     if type(identity.state_id) is not UUID:
         raise DeploymentAuthorityError("the authoritative state UUID is invalid")
+    if type(identity.runtime_binding) is not RuntimeBinding:
+        raise DeploymentAuthorityError("the runtime configuration binding is invalid")
 
 
 def _validate_receipt(receipt: DeploymentAuthorityReceipt) -> None:
@@ -260,6 +268,8 @@ def _validate_verification(verification: AuthorityReceiptVerification) -> None:
         raise DeploymentAuthorityError("the verified state UUID is invalid")
     if type(verification.status) is not AuthorityReceiptStatus:
         raise DeploymentAuthorityError("the verified authority receipt status is invalid")
+    if type(verification.runtime_binding) is not RuntimeBinding:
+        raise DeploymentAuthorityError("the verified runtime configuration binding is invalid")
 
 
 def _receipt_binding_fingerprint(receipt: DeploymentAuthorityReceipt) -> str:
@@ -273,6 +283,7 @@ def _receipt_binding_fingerprint(receipt: DeploymentAuthorityReceipt) -> str:
             "repository_fingerprint": receipt.identity.repository_fingerprint,
             "state_fingerprint": receipt.identity.state_fingerprint,
             "state_id": str(receipt.identity.state_id),
+            "runtime_binding": receipt.identity.runtime_binding.fingerprint,
         },
         "issued_at": receipt.issued_at.isoformat(),
         "mode": receipt.mode.value,
@@ -280,6 +291,14 @@ def _receipt_binding_fingerprint(receipt: DeploymentAuthorityReceipt) -> str:
     }
     encoded = json.dumps(canonical_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _runtime_bindings_match(expected: RuntimeBinding, actual: object) -> bool:
+    try:
+        expected.require_matches(actual)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _require_fingerprint(value: str, description: str) -> None:

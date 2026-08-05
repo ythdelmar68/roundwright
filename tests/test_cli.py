@@ -28,6 +28,21 @@ def executable_name() -> str:
 
 
 class CliTests(unittest.TestCase):
+    def test_config_validate_and_source_only_show_are_read_only_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before = set(root.iterdir())
+            output = io.StringIO()
+            with mock.patch("roundwright.cli.Path.cwd", return_value=root):
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(main(["config", "validate", "--set", "review.max_rounds=9"]), 0)
+                    self.assertEqual(main(["config", "show", "--sources"]), 0)
+            self.assertEqual(before, set(root.iterdir()))
+        rendered = output.getvalue()
+        self.assertIn("result: valid", rendered)
+        self.assertIn("review.max_rounds: default", rendered)
+        self.assertNotIn(str(root), rendered)
+
     def test_help_is_available_without_configuration(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:

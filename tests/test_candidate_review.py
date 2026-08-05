@@ -24,7 +24,7 @@ from roundwright.candidate_review import (
     recover_diff_review,
 )
 import roundwright.candidate_review as candidate_review
-from roundwright.configuration import RepositoryIdentity
+from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
@@ -42,6 +42,8 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
     kwargs.setdefault("selected_profile_identity", context.runtime_binding.supervisor_profile_identities[0])
     kwargs.setdefault("within_round_attempt", 1)
+    kwargs.setdefault("review_round", 4)
+    kwargs.setdefault("review_policy", ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE))
     return _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
@@ -169,7 +171,7 @@ class CandidateReviewTests(unittest.TestCase):
                 review_context = self.review_context(identity, context, seal)
                 for verification in (CandidateVerification("map-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64), CandidateVerification("map-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64)):
                     record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
-                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, lease=lease, now=now)
+                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, review_round=4, review_policy=ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE), lease=lease, now=now)
                 if not accepted:
                     with self.assertRaises(CandidateReviewError):
                         _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)

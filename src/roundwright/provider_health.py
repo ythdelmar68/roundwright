@@ -101,6 +101,12 @@ class CodexHealthContract:
     def accepts(self, audit: CodexRuntimeAudit) -> bool:
         return (audit.sdk_version, audit.runtime_version) == (self.sdk_version, self.runtime_version)
 
+    @property
+    def fingerprint(self) -> str:
+        """Immutable identity for cache, evidence, and replay binding."""
+
+        return _digest({"sdk_version": self.sdk_version, "runtime_version": self.runtime_version})
+
 
 @dataclass(frozen=True)
 class ReadOnlyQualification:
@@ -188,6 +194,7 @@ class ProviderHealthObservation:
 
     role: ProviderRole
     profile_identity: str
+    health_contract_identity: str
     runtime_fingerprint: str
     state: HealthState
     failure: CodexFailure | None
@@ -196,7 +203,12 @@ class ProviderHealthObservation:
     attempts: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.role, ProviderRole) or not _DIGEST.fullmatch(self.profile_identity) or not _DIGEST.fullmatch(self.runtime_fingerprint):
+        if (
+            not isinstance(self.role, ProviderRole)
+            or not _DIGEST.fullmatch(self.profile_identity)
+            or not _DIGEST.fullmatch(self.health_contract_identity)
+            or not _DIGEST.fullmatch(self.runtime_fingerprint)
+        ):
             raise ProviderHealthError("provider health identity is invalid")
         if (self.state is HealthState.READY) != (self.failure is None):
             raise ProviderHealthError("provider health state is invalid")
@@ -214,6 +226,7 @@ class ProviderHealthObservation:
         return {
             "role": self.role.value,
             "profile_identity": self.profile_identity,
+            "health_contract_identity": self.health_contract_identity,
             "runtime_fingerprint": self.runtime_fingerprint,
             "state": self.state.value,
             "failure": None if self.failure is None else self.failure.value,
@@ -227,7 +240,7 @@ class ProviderHealthObservation:
         """Rehydrate only the complete, redacted record used by Shadow replay."""
 
         if type(evidence) is not dict or set(evidence) != {
-            "role", "profile_identity", "runtime_fingerprint", "state", "failure",
+            "role", "profile_identity", "health_contract_identity", "runtime_fingerprint", "state", "failure",
             "observed_at", "fresh_until", "attempts",
         }:
             raise ProviderHealthError("provider health evidence is invalid")
@@ -236,6 +249,7 @@ class ProviderHealthObservation:
             return cls(
                 ProviderRole(evidence["role"]),  # type: ignore[arg-type]
                 evidence["profile_identity"],  # type: ignore[arg-type]
+                evidence["health_contract_identity"],  # type: ignore[arg-type]
                 evidence["runtime_fingerprint"],  # type: ignore[arg-type]
                 HealthState(evidence["state"]),  # type: ignore[arg-type]
                 None if failure_value is None else CodexFailure(failure_value),  # type: ignore[arg-type]
@@ -251,22 +265,41 @@ class ProviderHealthObservation:
 class ProviderQualificationReport:
     """Independent stage evidence for every configured Codex role/profile."""
 
+    health_contract_identity: str
     observations: tuple[ProviderHealthObservation, ...]
 
     def __post_init__(self) -> None:
         keys = [(item.role, item.profile_identity) for item in self.observations]
-        if not self.observations or len(keys) != len(set(keys)):
+        if (
+            not _DIGEST.fullmatch(self.health_contract_identity)
+            or not self.observations
+            or len(keys) != len(set(keys))
+            or any(item.health_contract_identity != self.health_contract_identity for item in self.observations)
+        ):
             raise ProviderHealthError("provider qualification report is invalid")
 
     @property
     def ready(self) -> bool:
-        return all(item.state is HealthState.READY for item in self.observations)
+        """An unbound freshness check is never dispatch-ready; use ``ready_at``."""
 
-    def blocker_for(self, role: ProviderRole, profile: ProviderProfile) -> CodexFailure | None:
+        return False
+
+    def ready_at(self, now: int) -> bool:
+        """Return ready only when all exact-contract observations remain fresh."""
+
+        if type(now) is not int:
+            raise ProviderHealthError("provider health clock is invalid")
+        return all(item.state is HealthState.READY and item.is_fresh_at(now) for item in self.observations)
+
+    def blocker_for(self, role: ProviderRole, profile: ProviderProfile, *, now: int) -> CodexFailure | None:
+        """Return a matching blocker, treating stale evidence as an exact-stage block."""
+
+        if type(now) is not int:
+            raise ProviderHealthError("provider health clock is invalid")
         profile_identity = profile_fingerprint(profile)
         for observation in self.observations:
             if (observation.role, observation.profile_identity) == (role, profile_identity):
-                return observation.failure
+                return CodexFailure.UNKNOWN if not observation.is_fresh_at(now) else observation.failure
         raise ProviderHealthError("configured profile was not qualified")
 
 
@@ -274,14 +307,14 @@ class ProviderHealthCache:
     """Process-local cache; it never serializes credentials or adapter payloads."""
 
     def __init__(self) -> None:
-        self._observations: dict[tuple[ProviderRole, str], ProviderHealthObservation] = {}
+        self._observations: dict[tuple[ProviderRole, str, str], ProviderHealthObservation] = {}
 
-    def get(self, role: ProviderRole, profile_identity: str, *, now: int) -> ProviderHealthObservation | None:
-        observation = self._observations.get((role, profile_identity))
+    def get(self, role: ProviderRole, profile_identity: str, health_contract_identity: str, *, now: int) -> ProviderHealthObservation | None:
+        observation = self._observations.get((role, profile_identity, health_contract_identity))
         return observation if observation is not None and observation.is_fresh_at(now) else None
 
     def put(self, observation: ProviderHealthObservation) -> None:
-        self._observations[(observation.role, observation.profile_identity)] = observation
+        self._observations[(observation.role, observation.profile_identity, observation.health_contract_identity)] = observation
 
 
 class CodexProviderHealth:
@@ -312,15 +345,16 @@ class CodexProviderHealth:
         if type(observed_at) is not int:
             raise ProviderHealthError("provider health clock is invalid")
         profile_identity = profile_fingerprint(profile)
+        contract_identity = self._contract.fingerprint
         try:
             self.credential_isolation(role)
         except ProviderHealthError:
-            return self._record(role, profile_identity, _unknown_runtime_fingerprint(), CodexFailure.UNKNOWN, observed_at, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.UNKNOWN, observed_at, freshness_seconds, 1)
         if not force_refresh:
-            cached = self._cache.get(role, profile_identity, now=observed_at)
+            cached = self._cache.get(role, profile_identity, contract_identity, now=observed_at)
             if cached is not None:
                 return cached
-        return self._refresh(role, profile, profile_identity, observed_at, freshness_seconds, max_attempts)
+        return self._refresh(role, profile, profile_identity, contract_identity, observed_at, freshness_seconds, max_attempts)
 
     def credential_isolation(self, role: ProviderRole) -> CredentialIsolationEvidence:
         """Require the native store's explicit no-secret projection for this role."""
@@ -354,7 +388,7 @@ class CodexProviderHealth:
         selected = ((ProviderRole.WORKER, configuration.worker.value),) + tuple(
             (ProviderRole.SUPERVISOR, profile) for profile in configuration.supervisor_attempt_profiles.value
         )
-        return ProviderQualificationReport(tuple(
+        return ProviderQualificationReport(self._contract.fingerprint, tuple(
             self.qualify(
                 role, profile, freshness_seconds=freshness_seconds,
                 max_attempts=max_attempts, force_refresh=force_refresh, now=now,
@@ -362,20 +396,20 @@ class CodexProviderHealth:
             for role, profile in selected
         ))
 
-    def _refresh(self, role: ProviderRole, profile: ProviderProfile, profile_identity: str, now: int, freshness_seconds: int, max_attempts: int) -> ProviderHealthObservation:
+    def _refresh(self, role: ProviderRole, profile: ProviderProfile, profile_identity: str, contract_identity: str, now: int, freshness_seconds: int, max_attempts: int) -> ProviderHealthObservation:
         try:
             channel = self._credentials.open_role_channel(role)
             audit = channel.audit_runtime()
         except CodexAdapterError as error:
-            return self._record(role, profile_identity, _unknown_runtime_fingerprint(), error.failure, now, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), error.failure, now, freshness_seconds, 1)
         except Exception:
-            return self._record(role, profile_identity, _unknown_runtime_fingerprint(), CodexFailure.UNKNOWN, now, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.UNKNOWN, now, freshness_seconds, 1)
         if type(audit) is not CodexRuntimeAudit:
-            return self._record(role, profile_identity, _unknown_runtime_fingerprint(), CodexFailure.MALFORMED_RESPONSE, now, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.MALFORMED_RESPONSE, now, freshness_seconds, 1)
         if not self._contract.accepts(audit):
-            return self._record(role, profile_identity, audit.fingerprint, CodexFailure.SDK_INCOMPATIBLE, now, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, audit.fingerprint, CodexFailure.SDK_INCOMPATIBLE, now, freshness_seconds, 1)
         if not audit.supports(profile):
-            return self._record(role, profile_identity, audit.fingerprint, CodexFailure.MODEL_UNAVAILABLE, now, freshness_seconds, 1)
+            return self._record(role, profile_identity, contract_identity, audit.fingerprint, CodexFailure.MODEL_UNAVAILABLE, now, freshness_seconds, 1)
         request = ReadOnlyQualification(role, profile.model, profile.reasoning_effort.value)
         failure: CodexFailure | None = None
         attempts = 0
@@ -385,7 +419,7 @@ class CodexProviderHealth:
                 if type(outcome) is not ProbeOutcome:
                     failure = CodexFailure.MALFORMED_RESPONSE
                 elif outcome.available:
-                    return self._record(role, profile_identity, audit.fingerprint, None, now, freshness_seconds, attempts)
+                    return self._record(role, profile_identity, contract_identity, audit.fingerprint, None, now, freshness_seconds, attempts)
                 else:
                     failure = outcome.failure
             except CodexAdapterError as error:
@@ -394,11 +428,11 @@ class CodexProviderHealth:
                 failure = CodexFailure.UNKNOWN
             if failure not in {CodexFailure.QUOTA_OR_RATE_LIMIT, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE}:
                 break
-        return self._record(role, profile_identity, audit.fingerprint, failure or CodexFailure.UNKNOWN, now, freshness_seconds, attempts)
+        return self._record(role, profile_identity, contract_identity, audit.fingerprint, failure or CodexFailure.UNKNOWN, now, freshness_seconds, attempts)
 
-    def _record(self, role: ProviderRole, profile_identity: str, runtime_fingerprint: str, failure: CodexFailure | None, now: int, freshness_seconds: int, attempts: int) -> ProviderHealthObservation:
+    def _record(self, role: ProviderRole, profile_identity: str, contract_identity: str, runtime_fingerprint: str, failure: CodexFailure | None, now: int, freshness_seconds: int, attempts: int) -> ProviderHealthObservation:
         observation = ProviderHealthObservation(
-            role, profile_identity, runtime_fingerprint,
+            role, profile_identity, contract_identity, runtime_fingerprint,
             HealthState.READY if failure is None else HealthState.BLOCKED,
             failure, now, now + freshness_seconds, attempts,
         )

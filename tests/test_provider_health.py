@@ -11,7 +11,7 @@ from roundwright.configuration import ProviderProfile, ReasoningEffort, load_con
 from roundwright.provider_health import (
     CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract,
     CodexProviderHealth, CodexRuntimeAudit, CredentialIsolationEvidence, HealthState, ProbeOutcome,
-    ProviderHealthCache, ProviderHealthError, ReadOnlyQualification,
+    ProviderHealthCache, ProviderHealthError, ProviderQualificationReport, ReadOnlyQualification,
     profile_fingerprint, render_health_diagnostic,
 )
 from roundwright.provider_recovery import ProviderRole
@@ -68,7 +68,7 @@ class ProviderHealthTests(unittest.TestCase):
         self.assertEqual((result.state, result.failure, result.attempts), (HealthState.READY, None, 1))
         self.assertEqual(self.store.roles, [ProviderRole.WORKER])
         self.assertEqual(self.channel.requests, [ReadOnlyQualification(ProviderRole.WORKER, "gpt-5.6-terra", "high")])
-        self.assertEqual(set(result.evidence()), {"role", "profile_identity", "runtime_fingerprint", "state", "failure", "observed_at", "fresh_until", "attempts"})
+        self.assertEqual(set(result.evidence()), {"role", "profile_identity", "health_contract_identity", "runtime_fingerprint", "state", "failure", "observed_at", "fresh_until", "attempts"})
 
     def test_version_and_model_mismatch_block_only_the_qualified_profile(self):
         incompatible = self.service(audit=CodexRuntimeAudit("1.2.4", "4.5.6", self.audit.capabilities)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
@@ -99,6 +99,23 @@ class ProviderHealthTests(unittest.TestCase):
         self.assertEqual(refreshed.failure, CodexFailure.AUTH_MISSING)
         self.assertEqual(len(self.channel.requests), 2)
 
+    def test_cache_and_evidence_are_bound_to_the_exact_health_contract(self):
+        cache = ProviderHealthCache()
+        first_service = self.service(cache=cache)
+        first = first_service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+        changed_contract = CodexHealthContract("9.9.9", "9.9.9")
+        changed_channel = FakeChannel(self.audit, (ProbeOutcome(True),))
+        changed_service = CodexProviderHealth(FakeStore(changed_channel), changed_contract, cache=cache)
+        changed = changed_service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=101)
+        self.assertIsNot(first, changed)
+        self.assertEqual(changed.failure, CodexFailure.SDK_INCOMPATIBLE)
+        self.assertNotEqual(first.health_contract_identity, changed.health_contract_identity)
+        replayed = first.evidence()
+        replayed["health_contract_identity"] = changed.health_contract_identity
+        self.assertNotEqual(type(first).from_evidence(replayed).health_contract_identity, first.health_contract_identity)
+        with self.assertRaises(ProviderHealthError):
+            ProviderQualificationReport(changed.health_contract_identity, (first,))
+
     def test_configuration_preflight_and_replay_keep_profile_blockers_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
             configuration = load_configuration(cwd=Path(temporary), environment={})
@@ -114,15 +131,27 @@ class ProviderHealthTests(unittest.TestCase):
         ), audit=capability_audit)
         report = service.qualify_configuration(configuration, freshness_seconds=30, now=100)
         self.assertFalse(report.ready)
+        self.assertFalse(report.ready_at(100))
         worker = configuration.worker.value
         failing = configuration.supervisor_attempt_profiles.value[1]
-        self.assertIsNone(report.blocker_for(ProviderRole.WORKER, worker))
-        self.assertEqual(report.blocker_for(ProviderRole.SUPERVISOR, failing), CodexFailure.AUTH_MISSING)
+        self.assertIsNone(report.blocker_for(ProviderRole.WORKER, worker, now=100))
+        self.assertEqual(report.blocker_for(ProviderRole.SUPERVISOR, failing, now=100), CodexFailure.AUTH_MISSING)
         replayed = type(report.observations[0]).from_evidence(report.observations[0].evidence())
         self.assertEqual(replayed, report.observations[0])
         recovered = service.qualify(ProviderRole.SUPERVISOR, failing, freshness_seconds=30, force_refresh=True, now=101)
         self.assertEqual(recovered.state, HealthState.READY)
         self.assertIsNone(service.qualify(ProviderRole.WORKER, worker, freshness_seconds=30, now=101).failure)
+
+    def test_stale_report_is_not_ready_and_blocks_only_the_stale_profile(self):
+        service = self.service()
+        report = ProviderQualificationReport(self.contract.fingerprint, (
+            service.qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100),
+            service.qualify(ProviderRole.SUPERVISOR, self.profile, freshness_seconds=30, now=110),
+        ))
+        self.assertTrue(report.ready_at(129))
+        self.assertFalse(report.ready_at(130))
+        self.assertEqual(report.blocker_for(ProviderRole.WORKER, self.profile, now=130), CodexFailure.UNKNOWN)
+        self.assertIsNone(report.blocker_for(ProviderRole.SUPERVISOR, self.profile, now=130))
 
     def test_untyped_exception_and_malformed_response_never_use_message_text_for_classification(self):
         unknown = self.service((RuntimeError("token at C:/private/path is denied"),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)

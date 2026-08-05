@@ -133,7 +133,7 @@ class CandidateReviewTests(unittest.TestCase):
             diff_review_attempt_id="final-findings", implementation_attempt_id=initial.implementation_attempt_id,
             provider_attempt_id="final-supervisor", supervisor_session_identity="final-supervisor-session",
             external_turn_identity="final-supervisor-turn", message_identity="final-supervisor-message",
-            process_lease_id="final-supervisor-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+            process_lease_id="final-supervisor-lease", process_lease_expires_at=now + 60, review_round=10, lease=lease, now=now,
         )
         findings = DiffReviewOutput(
             review.diff_review_attempt_id, "final-supervisor", "final-supervisor-session",
@@ -194,7 +194,7 @@ class CandidateReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, binding, now, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
             receipt = finalize_review_limit_repair(
-                repository, identity, binding, repair_seal, review_round=10, max_rounds=10,
+                repository, identity, binding, repair_seal,
                 findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
                 worker_thread_identity="worker-thread-25", lease=lease,
             )
@@ -212,7 +212,7 @@ class CandidateReviewTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(
                 finalize_review_limit_repair(
-                    repository, identity, binding, repair_seal, review_round=10, max_rounds=10,
+                    repository, identity, binding, repair_seal,
                     findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
                     worker_thread_identity="worker-thread-25", lease=lease,
                 ),

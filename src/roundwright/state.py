@@ -509,6 +509,16 @@ MIGRATIONS = (
             ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'), candidate_sha TEXT NOT NULL DEFAULT '', worker_thread_identity TEXT NOT NULL DEFAULT '', receipt_fingerprint TEXT NOT NULL DEFAULT '')"),
         ),
     ),
+    Migration(
+        38,
+        (
+            "ALTER TABLE diff_review_attempts ADD COLUMN within_round_attempt INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN selected_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 

@@ -175,6 +175,7 @@ class DiffReviewDispatch:
     input_digest: str
     within_round_attempt: int
     selected_profile_identity: str
+    review_policy: _ReviewPolicyProjection
 
 
 @dataclass(frozen=True)
@@ -463,6 +464,8 @@ def dispatch_diff_review(
     process_lease_expires_at: int,
     selected_profile_identity: str,
     within_round_attempt: int,
+    review_round: int,
+    review_policy: ReviewPolicy,
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> DiffReviewDispatch:
@@ -480,6 +483,7 @@ def dispatch_diff_review(
     _require_current_candidate(repository, identity, seal, implementation_attempt_id)
     _require_diff_review_context(identity, context, seal)
     verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
+    policy_projection = _project_review_policy(review_round, review_policy)
     if type(within_round_attempt) is not int or within_round_attempt not in (1, 2, 3):
         raise CandidateReviewError("within-round Supervisor attempt is invalid")
     profiles = context.runtime_binding.supervisor_profile_identities
@@ -487,8 +491,8 @@ def dispatch_diff_review(
         raise CandidateReviewError("selected Supervisor profile does not match the within-round attempt")
     if _session_is_plan_review(repository, identity, supervisor_session_identity):
         raise CandidateReviewError("diff review must use a session distinct from plan review")
-    input_digest = _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha, "message": message_identity, "verifications": verification_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity})
-    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity)
+    input_digest = _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha, "message": message_identity, "verifications": verification_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity, "review_round": policy_projection.review_round, "review_mode": policy_projection.review_mode.value, "review_max_rounds": policy_projection.max_rounds, "review_on_final_findings": policy_projection.on_final_findings.value, "review_policy_digest": policy_projection.policy_digest})
+    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, policy_projection)
     existing = _read_diff_dispatch(repository, identity, diff_review_attempt_id)
     if existing is not None:
         if existing != expected:
@@ -510,11 +514,11 @@ def dispatch_diff_review(
         current = _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
         if current is None:
             connection.execute(
-                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?)",
+                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     diff_review_attempt_id, identity.task_id, implementation_attempt_id,
                     provider_attempt_id, supervisor_session_identity, external_turn_identity,
-                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest, within_round_attempt, selected_profile_identity,
+                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest, within_round_attempt, selected_profile_identity, policy_projection.review_round, policy_projection.review_mode.value, policy_projection.max_rounds, policy_projection.on_final_findings.value, policy_projection.policy_digest,
                 ),
             )
         elif current != expected:
@@ -947,12 +951,16 @@ def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
 
 
 def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id):
-    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
     if row is None:
         return None
-    if type(row[9]) is not int or row[9] not in (1, 2, 3) or type(row[10]) is not str or not row[10] or len(identity.task_id) == 0:
+    if type(row[9]) is not int or row[9] not in (1, 2, 3) or type(row[10]) is not str or not row[10] or type(row[11]) is not int or row[11] < 1 or type(row[13]) is not int or row[11] > row[13] or type(row[15]) is not str or not _FINGERPRINT.fullmatch(row[15]):
         raise CandidateReviewError("persisted diff review profile mapping is invalid")
-    return DiffReviewDispatch(diff_review_attempt_id, *row)
+    try:
+        projection = _ReviewPolicyProjection(row[11], ReviewMode(row[12]), row[13], FinalFindingsPolicy(row[14]), row[15])
+    except (TypeError, ValueError) as error:
+        raise CandidateReviewError("persisted review policy projection is invalid") from error
+    return DiffReviewDispatch(diff_review_attempt_id, *row[:11], projection)
 
 
 def _require_current_candidate(repository, identity, seal, implementation_attempt_id=None):

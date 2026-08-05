@@ -77,6 +77,16 @@ _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _bound_diff_review_output_digest(raw_digest: str, within_round_attempt: int, selected_profile_identity: str) -> str:
+    """Bind one normalized review output to its exact configured Supervisor attempt."""
+
+    _fingerprint(raw_digest, "normalized diff review output digest")
+    if type(within_round_attempt) is not int or within_round_attempt not in (1, 2, 3):
+        raise CandidateReviewError("within-round Supervisor attempt is invalid")
+    _token(selected_profile_identity, "selected Supervisor profile identity")
+    return _digest({"normalized_output_digest": raw_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity})
+
+
 @dataclass(frozen=True)
 class ImplementationDispatch:
     implementation_attempt_id: str

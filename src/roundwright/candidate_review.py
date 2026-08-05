@@ -19,7 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Iterable
 
-from .configuration import RepositoryIdentity
+from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode, ReviewPolicy
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, record_review_limit_finalization, transition_task
@@ -27,6 +27,25 @@ from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _op
 
 class CandidateReviewError(StateError):
     """Raised when candidate-bound implementation or diff review is unsafe."""
+
+
+@dataclass(frozen=True)
+class _ReviewPolicyProjection:
+    review_round: int
+    review_mode: ReviewMode
+    max_rounds: int
+    on_final_findings: FinalFindingsPolicy
+    policy_digest: str
+
+
+def _project_review_policy(review_round: int, policy: ReviewPolicy) -> _ReviewPolicyProjection:
+    """Derive one typed immutable review policy projection."""
+
+    if type(review_round) is not int or type(policy) is not ReviewPolicy:
+        raise CandidateReviewError("review policy projection is invalid")
+    mode = policy.mode_for_round(review_round)
+    digest = _digest({"complete_rounds": policy.complete_rounds, "max_rounds": policy.max_rounds, "max_supervisor_attempts_per_round": policy.max_supervisor_attempts_per_round, "on_final_findings": policy.on_final_findings.value})
+    return _ReviewPolicyProjection(review_round, mode, policy.max_rounds, policy.on_final_findings, digest)
 
 
 class VerificationKind(StrEnum):

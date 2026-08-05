@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.candidate_review import (
     CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
-    VerificationKind, VerificationOutcome, begin_implementation, dispatch_diff_review,
+    VerificationKind, VerificationOutcome, begin_implementation, dispatch_diff_review as _dispatch_diff_review,
     finalize_review_limit_repair, read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
     recover_diff_review,
 )
@@ -35,6 +35,14 @@ from roundwright.worker_planning import (
     accept_plan_review_and_begin_implementation, begin_planning, dispatch_plan,
     record_plan, submit_plan_for_review,
 )
+
+
+def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs):
+    """Fixture boundary: every existing scenario names the pinned primary attempt."""
+
+    kwargs.setdefault("selected_profile_identity", context.runtime_binding.supervisor_profile_identities[0])
+    kwargs.setdefault("within_round_attempt", 1)
+    return _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):

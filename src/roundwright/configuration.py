@@ -309,8 +309,9 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
         authoritative_root = _validated_authoritative_repository(authoritative_repository_root)
         repository_values = _read_authoritative_runtime_toml(authoritative_root)
         _apply_paths(paths, repository_values.get("paths", {}), ConfigurationSource.REPOSITORY, required_repository_root=authoritative_root)
-        if repository_values:
-            repository_config_root = authoritative_root
+        # The validated authoritative repository remains the mutation target
+        # even when it intentionally has no optional runtime TOML.
+        repository_config_root = authoritative_root
         _merge_runtime(raw, sources, repository_values, ConfigurationSource.REPOSITORY)
     _merge_runtime(raw, sources, _environment_updates(env), ConfigurationSource.ENVIRONMENT)
     _apply_paths(paths, _environment_path_updates(env), ConfigurationSource.ENVIRONMENT)

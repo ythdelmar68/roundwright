@@ -32,15 +32,18 @@ class ConfigurationTests(unittest.TestCase):
     def git(self, directory: Path, *arguments: str) -> None:
         subprocess.run(["git", "-C", os.fspath(directory), *arguments], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def authoritative_worktrees(self, root: Path) -> tuple[Path, Path]:
+    def authoritative_worktrees(self, root: Path, configuration: str | None = "[review]\nmax_rounds = 6\n") -> tuple[Path, Path]:
         remote, main, candidate = root / "remote.git", root / "main", root / "candidate"
         subprocess.run(["git", "init", "--bare", os.fspath(remote)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.git(root, "init", os.fspath(main))
         self.git(main, "config", "user.email", "tests@example.invalid")
         self.git(main, "config", "user.name", "Tests")
         self.write(main / "README.md", "fixture\n")
-        self.write(main / ".roundwright.toml", "[review]\nmax_rounds = 6\n")
-        self.git(main, "add", "README.md", ".roundwright.toml")
+        if configuration is not None:
+            self.write(main / ".roundwright.toml", configuration)
+            self.git(main, "add", "README.md", ".roundwright.toml")
+        else:
+            self.git(main, "add", "README.md")
         self.git(main, "commit", "-m", "fixture")
         self.git(main, "branch", "-M", "main")
         self.git(main, "remote", "add", "origin", os.fspath(remote))
@@ -116,6 +119,15 @@ class ConfigurationTests(unittest.TestCase):
             self.assertTrue((main / ".roundwright" / "state.sqlite3").is_file())
             self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
             self.assertIn("review.max_rounds: repository configuration", output.getvalue())
+
+    def test_config_free_authoritative_main_remains_the_init_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            main, candidate = self.authoritative_worktrees(Path(temporary), configuration=None)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), mock.patch("roundwright.cli.Path.cwd", return_value=candidate), mock.patch("roundwright.cli.require_safe_entrypoint_identity"):
+                self.assertEqual(cli.main(["init"]), 0)
+            self.assertTrue((main / ".roundwright" / "state.sqlite3").is_file())
+            self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
 
     def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:
         profiles = [

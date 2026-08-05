@@ -268,7 +268,7 @@ def evaluate_repository_mutation_policy(
             return _denied(reason, snapshot, receipt, operation)
     if not document.enabled:
         return _denied("repository mutation policy is disabled", snapshot, receipt, operation)
-    if not document.allows(operation):
+    if not _action_switch_is_enabled(document, operation):
         return _denied("repository mutation action is disabled", snapshot, receipt, operation)
     return RepositoryMutationDecision(operation, True, "repository mutation policy is active for this exact operation", snapshot.policy_digest, snapshot.source.source_fingerprint, receipt.receipt_fingerprint, True, True, "mutation-adapter-may-attempt-readback")
 
@@ -293,7 +293,7 @@ def _denied(reason: str, snapshot: object = None, receipt: object = None, operat
         snapshot.source.source_fingerprint if valid_snapshot else None,
         receipt.receipt_fingerprint if valid_receipt else None,
         bool(policy.enabled) if policy is not None else False,
-        bool(policy.allows(operation)) if policy is not None and type(operation) is RepositoryMutationOperation else False,
+        _action_switch_is_enabled(policy, operation) if policy is not None and type(operation) is RepositoryMutationOperation else False,
         "resolve-policy-or-owner-receipt",
     )
 
@@ -313,6 +313,32 @@ def _canonical_policy_bytes(policy: RepositoryMutationPolicy) -> bytes:
 
 def _policy_narrows(policy: RepositoryMutationPolicy, ceiling: RepositoryMutationPolicy) -> bool:
     return all(not getattr(policy, name) or getattr(ceiling, name) for name in _POLICY_KEYS - {"schema_version"})
+
+
+def _action_switch_is_enabled(
+    policy: RepositoryMutationPolicy, operation: RepositoryMutationOperation
+) -> bool:
+    """Read only validated fields; never dispatch through an evidence method."""
+
+    if operation is RepositoryMutationOperation.ISSUE_COMMENT:
+        return policy.allow_issue_comment
+    if operation is RepositoryMutationOperation.PUSH_BRANCH:
+        return policy.allow_push_branch
+    if operation is RepositoryMutationOperation.CREATE_DRAFT_PR:
+        return policy.allow_create_draft_pr
+    if operation is RepositoryMutationOperation.MARK_PR_READY:
+        return policy.allow_mark_pr_ready
+    if operation is RepositoryMutationOperation.MERGE_PR:
+        return policy.allow_merge_pr
+    if operation is RepositoryMutationOperation.CLOSE_LEAF_ISSUE:
+        return policy.allow_close_leaf_issue
+    if operation is RepositoryMutationOperation.DELETE_REMOTE_BRANCH:
+        return policy.allow_delete_remote_branch
+    if operation is RepositoryMutationOperation.DELETE_LOCAL_BRANCH:
+        return policy.allow_delete_local_branch
+    if operation is RepositoryMutationOperation.REMOVE_WORKTREE:
+        return policy.allow_remove_worktree
+    raise RepositoryPolicyError("repository mutation operation is invalid")
 
 
 def _policy_is_valid(policy: object) -> bool:

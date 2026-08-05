@@ -182,6 +182,20 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         self.assertIsNone(decision.operation)
         self.assertNotIn("path", str(decision.diagnostic()).casefold())
 
+    def test_shadowed_policy_method_or_extra_attribute_cannot_authorize_or_raise(self) -> None:
+        snapshot, context = self.snapshot(allow_issue_comment=False), self.context()
+        receipt = self.receipt(snapshot, context)
+        object.__setattr__(snapshot.document, "allows", lambda operation: True)
+        object.__setattr__(snapshot.document, "untrusted_extra", "ignored")
+        decision = self.evaluate(snapshot, receipt, context, RepositoryMutationOperation.ISSUE_COMMENT)
+        self.assertFalse(decision.authorized)
+        self.assertFalse(decision.action_enabled)
+        self.assertIn("action is disabled", decision.reason)
+        stale = self.receipt(snapshot, context, expires_at=self.now - timedelta(seconds=1))
+        denied = self.evaluate(snapshot, stale, context, RepositoryMutationOperation.ISSUE_COMMENT)
+        self.assertFalse(denied.authorized)
+        self.assertFalse(denied.action_enabled)
+
     def test_shadow_counterfactual_disables_every_operation_and_cannot_widen_policy(self) -> None:
         for operation in RepositoryMutationOperation:
             with self.subTest(operation=operation):

@@ -164,7 +164,7 @@ def evaluate_deployment_authority(
         return _blocked("the repository-external state identity does not match", receipt)
     if verification.authoritative_deployment_fingerprint != identity.deployment_fingerprint:
         return _blocked("a different deployment is authoritative for this repository state", receipt)
-    if verification.runtime_binding != identity.runtime_binding:
+    if not _runtime_bindings_match(identity.runtime_binding, verification.runtime_binding):
         return _blocked("the repository-external runtime configuration binding does not match", receipt)
     if not receipt.issued_at <= now < receipt.expires_at:
         return _blocked("the deployment authority receipt is expired or not yet active", receipt)
@@ -196,7 +196,7 @@ def _identities_match(left: DeploymentIdentity, right: DeploymentIdentity) -> bo
         and left.state_fingerprint == right.state_fingerprint
         and left.state_id == right.state_id
         and left.deployment_fingerprint == right.deployment_fingerprint
-        and left.runtime_binding == right.runtime_binding
+        and _runtime_bindings_match(left.runtime_binding, right.runtime_binding)
     )
 
 
@@ -283,7 +283,7 @@ def _receipt_binding_fingerprint(receipt: DeploymentAuthorityReceipt) -> str:
             "repository_fingerprint": receipt.identity.repository_fingerprint,
             "state_fingerprint": receipt.identity.state_fingerprint,
             "state_id": str(receipt.identity.state_id),
-            "runtime_binding": receipt.identity.runtime_binding.columns(),
+            "runtime_binding": receipt.identity.runtime_binding.fingerprint,
         },
         "issued_at": receipt.issued_at.isoformat(),
         "mode": receipt.mode.value,
@@ -291,6 +291,14 @@ def _receipt_binding_fingerprint(receipt: DeploymentAuthorityReceipt) -> str:
     }
     encoded = json.dumps(canonical_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _runtime_bindings_match(expected: RuntimeBinding, actual: object) -> bool:
+    try:
+        expected.require_matches(actual)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _require_fingerprint(value: str, description: str) -> None:

@@ -566,6 +566,19 @@ MIGRATIONS = (
             ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'), candidate_sha TEXT NOT NULL DEFAULT '', worker_thread_identity TEXT NOT NULL DEFAULT '', receipt_fingerprint TEXT NOT NULL DEFAULT '', diff_review_attempt_id TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
         ),
     ),
+    Migration(
+        44,
+        (
+            "ALTER TABLE gate_contexts ADD COLUMN review_complete_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gate_contexts ADD COLUMN review_max_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gate_contexts ADD COLUMN review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE gate_contexts ADD COLUMN review_on_final_findings TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
 )
 
 

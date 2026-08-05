@@ -413,11 +413,9 @@ class CandidateReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
             substituted_digest = candidate_review._digest({"complete_rounds": 3, "max_rounds": 4, "max_supervisor_attempts_per_round": 3, "on_final_findings": "worker-final-repair-then-merge"})
-            substituted_configuration = "sha256:" + "f" * 64
             connection = sqlite3.connect(database_path(repository))
             try:
-                connection.execute("UPDATE runtime_configuration_bindings SET resolved_digest = ? WHERE task_id = ?", (substituted_configuration, identity.task_id))
-                connection.execute("UPDATE runtime_review_policies SET configuration_digest = ?, complete_rounds = ?, max_rounds = ?, max_supervisor_attempts_per_round = ?, on_final_findings = ?, policy_digest = ? WHERE task_id = ?", (substituted_configuration, 3, 4, 3, "worker-final-repair-then-merge", substituted_digest, identity.task_id))
+                connection.execute("UPDATE runtime_review_policies SET complete_rounds = ?, max_rounds = ?, max_supervisor_attempts_per_round = ?, on_final_findings = ?, policy_digest = ? WHERE task_id = ?", (3, 4, 3, "worker-final-repair-then-merge", substituted_digest, identity.task_id))
                 connection.execute("UPDATE diff_review_attempts SET review_round = ?, review_complete_rounds = ?, review_max_rounds = ?, review_max_supervisor_attempts_per_round = ?, review_on_final_findings = ?, review_policy_digest = ? WHERE task_id = ?", (4, 3, 4, 3, "worker-final-repair-then-merge", substituted_digest, identity.task_id))
                 connection.commit()
             finally:

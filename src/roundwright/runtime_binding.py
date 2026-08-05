@@ -94,6 +94,18 @@ class RuntimeBinding:
             json.dumps(self.supervisor_profile_identities, separators=(",", ":")),
         )
 
+    def complete_columns(self) -> tuple[str | int, ...]:
+        """Return the complete durable identity, including review policy evidence."""
+
+        return (
+            *self.columns(),
+            self.review_complete_rounds,
+            self.review_max_rounds,
+            self.review_max_supervisor_attempts_per_round,
+            self.review_on_final_findings,
+            self.review_policy_digest,
+        )
+
     @property
     def has_review_policy(self) -> bool:
         return self.review_complete_rounds != 0

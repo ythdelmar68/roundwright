@@ -473,6 +473,37 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                     GateOutcome.BLOCKED,
                 )
 
+    def test_policy_only_runtime_binding_drift_blocks_persisted_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_binding = RuntimeBinding(
+                "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+                3, 10, 1, "worker-final-repair-then-merge", "a" * 64,
+            )
+            repository, _, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary), runtime_binding=runtime_binding)
+            substituted = RuntimeBinding(
+                runtime_binding.schema_version, runtime_binding.resolved_digest, runtime_binding.worker_profile_identity,
+                runtime_binding.supervisor_profile_identities, 3, 4, 1, "worker-final-repair-then-merge", "b" * 64,
+            )
+            evidence = self.policy_evidence(context, runtime_binding=substituted)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+
+    def test_policy_only_persisted_gate_context_drift_blocks_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_binding = RuntimeBinding(
+                "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+                3, 10, 1, "worker-final-repair-then-merge", "a" * 64,
+            )
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary), runtime_binding=runtime_binding)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE gate_contexts SET review_max_rounds = ?, review_policy_digest = ? WHERE task_id = ? AND candidate_sha = ?", (4, "b" * 64, identity.task_id, seal.candidate_sha))
+                connection.commit()
+            finally:
+                connection.close()
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=self.policy_evidence(context), lease=lease).outcome, GateOutcome.BLOCKED)
+
     def test_selected_supervisor_profile_is_persisted_and_must_match_the_activation_receipt(self) -> None:
         profile_binding = RuntimeBinding(
             "roundwright-runtime/v1",

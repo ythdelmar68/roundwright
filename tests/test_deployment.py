@@ -91,6 +91,27 @@ class DeploymentAuthorityTests(unittest.TestCase):
         self.assertFalse(decision.authorized)
         self.assertIn("runtime configuration", decision.reason)
 
+    def test_policy_only_runtime_binding_drift_in_external_receipt_fails_closed(self) -> None:
+        runtime_binding = RuntimeBinding(
+            "roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,),
+            3, 10, 1, "worker-final-repair-then-merge", "a" * 64,
+        )
+        identity = DeploymentIdentity(
+            fingerprint("a"), fingerprint("b"), fingerprint("c"), UUID("12345678-1234-5678-1234-567812345678"),
+            fingerprint("e"), runtime_binding,
+        )
+        receipt = self.receipt(identity)
+        verification = replace(
+            self.verification(identity, receipt),
+            runtime_binding=RuntimeBinding(
+                runtime_binding.schema_version, runtime_binding.resolved_digest, runtime_binding.worker_profile_identity,
+                runtime_binding.supervisor_profile_identities, 3, 4, 1, "worker-final-repair-then-merge", "b" * 64,
+            ),
+        )
+        decision = evaluate_deployment_authority(identity, receipt, verification, now=self.now)
+        self.assertFalse(decision.authorized)
+        self.assertIn("runtime configuration", decision.reason)
+
     def test_missing_expired_and_conflicting_receipts_fail_closed(self) -> None:
         identity = self.identity()
         receipt = self.receipt(identity)

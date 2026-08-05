@@ -219,6 +219,7 @@ class PersistedDiffReview:
     verdict: DiffReviewVerdict
     accepted: bool
     routed_finding_ids: tuple[str, ...]
+    content_digest: str
 
 
 def begin_implementation(
@@ -636,7 +637,7 @@ def read_diff_review(
     )
     if not accepted and row[6] == "accepted":
         _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
-    return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5], row[7] if accepted else None, DiffReviewVerdict(row[9]), accepted, tuple(json.loads(row[10] or "[]")))
+    return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5], row[7] if accepted else None, DiffReviewVerdict(row[9]), accepted, tuple(json.loads(row[10] or "[]")), row[11])
 
 
 def recover_diff_review(

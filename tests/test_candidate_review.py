@@ -157,7 +157,7 @@ class CandidateReviewTests(unittest.TestCase):
             repository, identity, context, binding, implementation_attempt_id=repair.implementation_attempt_id,
             completion_evidence_fingerprint="d" * 64, lease=lease, now=now,
         )
-        return repository, identity, lease, context, binding, now, findings.digest, repair_seal
+        return repository, identity, lease, context, binding, now, routed.content_digest, repair_seal
 
     def test_diff_dispatch_requires_the_exact_within_round_profile(self):
         cases = ((1, 0, True), (2, 1, True), (3, 2, True), (0, 0, False), (4, 0, False), (1, 1, False), (1, 2, False), (2, 0, False), (2, 2, False), (3, 0, False), (3, 1, False))

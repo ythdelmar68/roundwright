@@ -11,6 +11,8 @@ import contextlib
 from pathlib import Path
 from unittest import mock
 
+import roundwright.configuration as configuration_module
+
 from roundwright.configuration import (
     ConfigurationError,
     ConfigurationSource,
@@ -32,7 +34,14 @@ class ConfigurationTests(unittest.TestCase):
     def git(self, directory: Path, *arguments: str) -> None:
         subprocess.run(["git", "-C", os.fspath(directory), *arguments], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def git_input(self, directory: Path, *arguments: str, input: str) -> None:
+        subprocess.run(
+            ["git", "-C", os.fspath(directory), *arguments], input=input.encode("utf-8"),
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
     def authoritative_worktrees(self, root: Path, configuration: str | None = "[review]\nmax_rounds = 6\n") -> tuple[Path, Path]:
+        root.mkdir(parents=True, exist_ok=True)
         remote, main, candidate = root / "remote.git", root / "main", root / "candidate"
         subprocess.run(["git", "init", "--bare", os.fspath(remote)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.git(root, "init", os.fspath(main))
@@ -128,6 +137,103 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(cli.main(["init"]), 0)
             self.assertTrue((main / ".roundwright" / "state.sqlite3").is_file())
             self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
+
+    def test_authoritative_configuration_accepts_only_absent_or_one_ordinary_stage_zero_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_free_main, _ = self.authoritative_worktrees(Path(temporary) / "config-free", configuration=None)
+            self.assertEqual(configuration_module._validated_authoritative_repository(config_free_main), config_free_main.resolve())
+            self.assertEqual(configuration_module._read_authoritative_runtime_toml(config_free_main), {})
+            main, _ = self.authoritative_worktrees(Path(temporary) / "tracked")
+            self.assertEqual(configuration_module._validated_authoritative_repository(main), main.resolve())
+            self.assertEqual(configuration_module._read_authoritative_runtime_toml(main)["review"]["max_rounds"], 6)
+
+    def test_authoritative_configuration_rejects_hidden_or_nonordinary_index_entries(self) -> None:
+        def assert_rejected(mutate) -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                main, _ = self.authoritative_worktrees(Path(temporary))
+                mutate(main)
+                with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
+                    configuration_module._validated_authoritative_repository(main)
+
+        def assume_unchanged(main: Path) -> None:
+            self.git(main, "update-index", "--assume-unchanged", ".roundwright.toml")
+
+        def skip_worktree(main: Path) -> None:
+            self.git(main, "update-index", "--skip-worktree", ".roundwright.toml")
+
+        def nonordinary_mode(main: Path) -> None:
+            self.git(main, "update-index", "--chmod=+x", ".roundwright.toml")
+
+        def multi_stage(main: Path) -> None:
+            line = subprocess.run(
+                ["git", "-C", os.fspath(main), "ls-files", "--stage", "--", ".roundwright.toml"],
+                check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ).stdout.strip()
+            object_id = line.split()[1]
+            self.git_input(
+                main,
+                "update-index",
+                "--index-info",
+                input=(
+                    f"0 {'0' * len(object_id)} 0\t.roundwright.toml\n"
+                    f"100644 {object_id} 1\t.roundwright.toml\n"
+                    f"100644 {object_id} 2\t.roundwright.toml\n"
+                    f"100644 {object_id} 3\t.roundwright.toml\n"
+                ),
+            )
+            self.assertEqual(
+                len(
+                    subprocess.run(
+                        ["git", "-C", os.fspath(main), "ls-files", "--stage", "--unmerged", "--", ".roundwright.toml"],
+                        check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    ).stdout.splitlines()
+                ),
+                3,
+            )
+
+        for label, mutation in (
+            ("assume-unchanged", assume_unchanged),
+            ("skip-worktree", skip_worktree),
+            ("nonordinary", nonordinary_mode),
+            ("multi-stage", multi_stage),
+        ):
+            with self.subTest(case=label):
+                assert_rejected(mutation)
+
+    def test_authoritative_configuration_rejects_foreign_identity_and_modified_sources(self) -> None:
+        def assert_rejected(mutate) -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                main, _ = self.authoritative_worktrees(Path(temporary))
+                mutate(main)
+                with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
+                    configuration_module._validated_authoritative_repository(main)
+
+        def foreign_origin(main: Path) -> None:
+            self.git(main, "remote", "set-url", "origin", "https://github.com/ythdelmar68/roundwright-alias.git")
+
+        def aliased_origin(main: Path) -> None:
+            self.git(main, "remote", "set-url", "origin", "https://github.com/ythdelmar68/roundwright.git/")
+
+        def modified_source(main: Path) -> None:
+            self.write(main / ".roundwright.toml", "[review]\nmax_rounds = 1\n")
+
+        for label, mutation in (
+            ("foreign-origin", foreign_origin),
+            ("aliased-origin", aliased_origin),
+            ("modified", modified_source),
+        ):
+            with self.subTest(case=label):
+                assert_rejected(mutation)
+
+    def test_authoritative_configuration_rejects_ignored_and_untracked_configurations(self) -> None:
+        for label, ignored in (("ignored", True), ("untracked", False)):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
+                main, _ = self.authoritative_worktrees(Path(temporary), configuration=None)
+                if ignored:
+                    self.write(main / ".gitignore", ".roundwright.toml\n")
+                self.write(main / ".roundwright.toml", "[review]\nmax_rounds = 1\n")
+                with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
+                    configuration_module._validated_authoritative_repository(main)
 
     def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:
         profiles = [

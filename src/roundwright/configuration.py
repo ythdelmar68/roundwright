@@ -385,6 +385,7 @@ def _validated_authoritative_repository(root: Path) -> Path:
         origin = subprocess.run(["git", "-C", os.fspath(repository.root), "config", "--get", "remote.origin.url"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         status = subprocess.run(["git", "-C", os.fspath(repository.root), "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         index = subprocess.run(["git", "-C", os.fspath(repository.root), "ls-files", "--stage", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+        unmerged = subprocess.run(["git", "-C", os.fspath(repository.root), "ls-files", "--stage", "--unmerged", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
         flags = subprocess.run(["git", "-C", os.fspath(repository.root), "ls-files", "-v", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigurationError("authoritative repository identity is unavailable") from error
@@ -395,8 +396,11 @@ def _validated_authoritative_repository(root: Path) -> Path:
         parts = fields.split()
         mode, object_id, stage = parts if separator and len(parts) == 3 else ("", "", "")
         ordinary_index = mode == "100644" and len(object_id) == 40 and stage == "0" and path == _REPOSITORY_CONFIG
-    visible_flags = not flags.stdout.strip() or flags.stdout.startswith("H ")
-    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or index.returncode or flags.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip() or not ordinary_index or not visible_flags:
+    flag_entries = [line for line in flags.stdout.splitlines() if line]
+    visible_flags = not index_entries and not flag_entries
+    if len(index_entries) == 1:
+        visible_flags = flag_entries == [f"H {_REPOSITORY_CONFIG}"]
+    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or index.returncode or unmerged.returncode or flags.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip() or unmerged.stdout.strip() or not ordinary_index or not visible_flags:
         raise ConfigurationError("repository configuration is not from authoritative main")
     return repository.root
 
@@ -445,7 +449,7 @@ def discover_authoritative_repository(repository: RepositoryIdentity) -> Path | 
 
 
 def _origin_matches(value: str) -> bool:
-    normalized = value.strip().removesuffix(".git").rstrip("/")
+    normalized = value.strip().removesuffix(".git")
     accepted = {
         f"https://github.com/{_EXPECTED_REPOSITORY}",
         f"http://github.com/{_EXPECTED_REPOSITORY}",

@@ -480,6 +480,15 @@ MIGRATIONS = (
             ("review_limit_finalizations", "CREATE TABLE review_limit_finalizations (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), review_round INTEGER NOT NULL, findings_fingerprint TEXT NOT NULL, worker_repair_fingerprint TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition = 'REVIEW_LIMIT_REACHED_WORKER_FINALIZED'))"),
         ),
     ),
+    Migration(
+        35,
+        (
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN selected_profile_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 

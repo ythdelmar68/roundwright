@@ -485,8 +485,8 @@ def accept_supervisor_review(
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
         )
         connection.execute(
-            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint, *context.runtime_binding.columns()),
+            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint, *context.runtime_binding.columns(), row.selected_profile_identity),
         )
         connection.commit()
     except sqlite3.IntegrityError as error:

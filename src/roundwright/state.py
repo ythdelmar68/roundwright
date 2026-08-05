@@ -749,7 +749,18 @@ def record_review_limit_finalization(repository: RepositoryIdentity, identity: T
         _require_current_transition_lease(connection, lease, identity.repository_id)
         _require_matching_task(connection, identity)
         seal = connection.execute("SELECT candidate_sha FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()
-        repair = connection.execute("SELECT implementation.worker_thread_identity FROM implementation_candidates AS candidates JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND candidates.completion_evidence_fingerprint = ?", (identity.task_id, candidate_sha, worker_repair_fingerprint)).fetchone()
+        repair = connection.execute(
+            "SELECT implementation.worker_thread_identity FROM implementation_candidates AS candidates "
+            "JOIN implementation_attempts AS implementation ON implementation.implementation_attempt_id = candidates.implementation_attempt_id "
+            "JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = implementation.repair_diff_review_id "
+            "AND routes.consumed_by_implementation_attempt_id = implementation.implementation_attempt_id "
+            "JOIN diff_review_attempts AS reviews ON reviews.diff_review_attempt_id = routes.diff_review_attempt_id "
+            "AND implementation.repair_candidate_sha = reviews.candidate_sha "
+            "JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = routes.diff_review_attempt_id "
+            "WHERE candidates.task_id = ? AND candidates.candidate_sha = ? AND candidates.completion_evidence_fingerprint = ? "
+            "AND routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?",
+            (identity.task_id, candidate_sha, worker_repair_fingerprint, identity.task_id, findings_fingerprint),
+        ).fetchone()
         findings = connection.execute("SELECT routes.worker_thread_identity FROM diff_review_artifacts AS artifacts JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = artifacts.diff_review_attempt_id WHERE routes.task_id = ? AND artifacts.verdict = 'findings' AND artifacts.content_digest = ?", (identity.task_id, findings_fingerprint)).fetchone()
         if seal != (candidate_sha,) or repair != (worker_thread_identity,) or findings != (worker_thread_identity,):
             raise StateError("review-limit finalization does not match the final Worker repair")

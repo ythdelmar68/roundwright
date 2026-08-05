@@ -590,9 +590,9 @@ def read_diff_review(
         row = connection.execute("SELECT attempts.implementation_attempt_id, attempts.supervisor_session_identity, attempts.message_identity, attempts.base_sha, attempts.candidate_sha, attempts.verification_digest, attempts.state, attempts.accepted_review_identity, attempts.provider_attempt_id, artifacts.verdict, routes.finding_ids_json, artifacts.content_digest FROM diff_review_attempts AS attempts LEFT JOIN diff_review_artifacts AS artifacts ON artifacts.diff_review_attempt_id = attempts.diff_review_attempt_id LEFT JOIN diff_review_routes AS routes ON routes.diff_review_attempt_id = attempts.diff_review_attempt_id WHERE attempts.diff_review_attempt_id = ? AND attempts.task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
         if row is None or row[9] is None:
             raise CandidateReviewError("diff review result is unavailable")
-        provider = connection.execute("SELECT state, accepted_review_identity, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
+        provider = connection.execute("SELECT state, accepted_review_identity, output_pointer, completion_evidence_fingerprint, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (row[8],)).fetchone()
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
         _require_exact_provider_context(connection, identity, row[8], context)
     finally:
         connection.close()
@@ -606,7 +606,8 @@ def read_diff_review(
         and provider[2] == f"diff-review:{diff_review_attempt_id}"
         and provider[3] is not None
         and output == (row[11],)
-        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns())
+        and provider[4] in context.runtime_binding.supervisor_profile_identities
+        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns(), provider[4])
         and current_snapshot == row[5]
     )
     if not accepted and row[6] == "accepted":
@@ -947,9 +948,9 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
         artifact = connection.execute("SELECT verdict, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
         if artifact is None or artifact[0] != DiffReviewVerdict.PASS.value:
             raise CandidateReviewError("only a recorded PASS can be accepted")
-        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, output_pointer, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
+        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, output_pointer, completion_evidence_fingerprint, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()
-        if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[4] is None:
+        if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[4] is None or provider[5] not in context.runtime_binding.supervisor_profile_identities:
             raise CandidateReviewError("accepted PASS provider attempt is incomplete")
         if provider[3] != f"diff-review:{dispatch.diff_review_attempt_id}" or output != (artifact[1],):
             _stale_diff_review_acceptance_connection(connection, identity, dispatch.diff_review_attempt_id, dispatch.provider_attempt_id)
@@ -958,13 +959,13 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
         accepted_identity = dispatch.diff_review_attempt_id
         if provider[1] == AttemptState.COMPLETED.value:
             connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?", (accepted_identity, AttemptState.ACCEPTED.value, dispatch.provider_attempt_id))
-            provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3], provider[4])
+            provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3], provider[4], provider[5])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != accepted_identity:
             raise CandidateReviewError("accepted PASS provider attempt conflicts with committed state")
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
-        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns())
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
+        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns(), provider[5])
         if accepted_provider is None:
-            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
         elif accepted_provider != expected_provider:
             raise CandidateReviewError("accepted provider review conflicts with committed state")
         if row[0] in ("recorded", "accepted") and row[1] in (None, accepted_identity):

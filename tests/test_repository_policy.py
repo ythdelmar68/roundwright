@@ -17,6 +17,7 @@ from roundwright.repository_policy import (
     RepositoryMutationOperation,
     RepositoryPolicyError,
     RepositoryPolicySource,
+    RepositoryReceiptVerification,
     RepositoryReceiptStatus,
     StandingRepositoryAuthority,
     TrustedRepositoryPolicySnapshot,
@@ -77,13 +78,24 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         values.update(changes)
         return RepositoryActivationReceipt(**values)  # type: ignore[arg-type]
 
+    def verification(self, receipt: RepositoryActivationReceipt, **changes: object) -> RepositoryReceiptVerification:
+        from roundwright.repository_policy import _receipt_binding_digest
+        values: dict[str, object] = {
+            "verification_fingerprint": fingerprint("9"),
+            "receipt_fingerprint": receipt.receipt_fingerprint,
+            "receipt_binding_digest": _receipt_binding_digest(receipt),
+            "status": RepositoryReceiptStatus.FRESH,
+        }
+        values.update(changes)
+        return RepositoryReceiptVerification(**values)  # type: ignore[arg-type]
+
     def evaluate(self, snapshot: TrustedRepositoryPolicySnapshot, receipt: RepositoryActivationReceipt, context: RepositoryMutationContext, operation: RepositoryMutationOperation, **changes: object):
         values: dict[str, object] = {
             "standing_authority": StandingRepositoryAuthority(self.policy(**{name: True for name in (
                 "allow_issue_comment", "allow_push_branch", "allow_create_draft_pr", "allow_mark_pr_ready", "allow_merge_pr",
                 "allow_close_leaf_issue", "allow_delete_remote_branch", "allow_delete_local_branch", "allow_remove_worktree",
             )})),
-            "receipt_status": RepositoryReceiptStatus.FRESH,
+            "receipt_verification": self.verification(receipt),
             "now": self.now,
         }
         values.update(changes)
@@ -176,9 +188,10 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         self.assertEqual(binding.schema_version, snapshot.document.schema_version)
         self.assertEqual(binding.owner_fingerprint, receipt.owner_fingerprint)
         self.assertEqual(binding.receipt_fingerprint, receipt.receipt_fingerprint)
-        self.assertTrue(binding.matches_context(context, RepositoryReceiptStatus.FRESH))
+        verification = self.verification(receipt)
+        self.assertTrue(binding.matches_context(context, verification))
         other = self.context(repository_fingerprint=fingerprint("1"))
-        self.assertFalse(binding.matches_context(other, RepositoryReceiptStatus.FRESH))
+        self.assertFalse(binding.matches_context(other, verification))
         reused = self.evaluate(snapshot, receipt, other, RepositoryMutationOperation.ISSUE_COMMENT)
         self.assertFalse(reused.authorized)
         self.assertNotEqual(binding.digest, reused.binding.digest)
@@ -190,7 +203,7 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         self.assertFalse(self.evaluate(altered, receipt, context, RepositoryMutationOperation.ISSUE_COMMENT).authorized)
         for status in RepositoryReceiptStatus:
             with self.subTest(status=status):
-                decision = self.evaluate(snapshot, receipt, context, RepositoryMutationOperation.ISSUE_COMMENT, receipt_status=status)
+                decision = self.evaluate(snapshot, receipt, context, RepositoryMutationOperation.ISSUE_COMMENT, receipt_verification=self.verification(receipt, status=status))
                 self.assertEqual(decision.authorized, status is RepositoryReceiptStatus.FRESH)
         stale = self.receipt(snapshot, context, expires_at=self.now - timedelta(seconds=1))
         self.assertFalse(self.evaluate(snapshot, stale, context, RepositoryMutationOperation.ISSUE_COMMENT).authorized)
@@ -198,7 +211,7 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
     def test_unknown_operations_and_forged_values_cannot_create_authority(self) -> None:
         snapshot, context = self.snapshot(), self.context()
         receipt = self.receipt(snapshot, context)
-        decision = evaluate_repository_mutation_policy(snapshot, receipt, context, "release", standing_authority=StandingRepositoryAuthority(self.policy()), receipt_status=RepositoryReceiptStatus.FRESH, now=self.now)  # type: ignore[arg-type]
+        decision = evaluate_repository_mutation_policy(snapshot, receipt, context, "release", standing_authority=StandingRepositoryAuthority(self.policy()), receipt_verification=self.verification(receipt), now=self.now)  # type: ignore[arg-type]
         self.assertFalse(decision.authorized)
         self.assertIsNone(decision.operation)
         self.assertNotIn("path", str(decision.diagnostic()).casefold())
@@ -216,6 +229,21 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         denied = self.evaluate(snapshot, stale, context, RepositoryMutationOperation.ISSUE_COMMENT)
         self.assertFalse(denied.authorized)
         self.assertFalse(denied.action_enabled)
+
+    def test_lifecycle_verification_for_one_receipt_cannot_authorize_another(self) -> None:
+        snapshot, context = self.snapshot(allow_issue_comment=True), self.context()
+        first = self.receipt(snapshot, context)
+        second = self.receipt(snapshot, context, receipt_fingerprint=fingerprint("1"))
+        first_verification = self.verification(first)
+        denied = self.evaluate(snapshot, second, context, RepositoryMutationOperation.ISSUE_COMMENT, receipt_verification=first_verification)
+        self.assertFalse(denied.authorized)
+        self.assertIn("not bound", denied.reason)
+        second_verification = self.verification(second)
+        allowed = self.evaluate(snapshot, second, context, RepositoryMutationOperation.ISSUE_COMMENT, receipt_verification=second_verification)
+        self.assertTrue(allowed.authorized)
+        assert allowed.binding is not None
+        self.assertEqual(allowed.binding.receipt_verification_fingerprint, second_verification.verification_fingerprint)
+        self.assertEqual(allowed.binding.receipt_binding_digest, second_verification.receipt_binding_digest)
 
     def test_shadow_counterfactual_disables_every_operation_and_cannot_widen_policy(self) -> None:
         for operation in RepositoryMutationOperation:

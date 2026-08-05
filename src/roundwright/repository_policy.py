@@ -166,6 +166,19 @@ class RepositoryActivationReceipt:
 
 
 @dataclass(frozen=True)
+class RepositoryReceiptVerification:
+    """External lifecycle evidence bound to one immutable activation receipt."""
+
+    verification_fingerprint: str
+    receipt_fingerprint: str
+    receipt_binding_digest: str
+    status: RepositoryReceiptStatus
+
+    def __post_init__(self) -> None:
+        _validate_receipt_verification(self)
+
+
+@dataclass(frozen=True)
 class RepositoryMutationBinding:
     """Complete immutable evidence identity retained with one decision."""
 
@@ -179,6 +192,8 @@ class RepositoryMutationBinding:
     deployment_fingerprint: str
     task_fingerprint: str
     candidate_sha: str
+    receipt_verification_fingerprint: str
+    receipt_binding_digest: str
     receipt_status: RepositoryReceiptStatus
 
     def __post_init__(self) -> None:
@@ -197,23 +212,27 @@ class RepositoryMutationBinding:
             "deployment_fingerprint": self.deployment_fingerprint,
             "task_fingerprint": self.task_fingerprint,
             "candidate_sha": self.candidate_sha,
+            "receipt_verification_fingerprint": self.receipt_verification_fingerprint,
+            "receipt_binding_digest": self.receipt_binding_digest,
             "receipt_status": self.receipt_status.value,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 
     def matches_context(
-        self, context: RepositoryMutationContext, receipt_status: RepositoryReceiptStatus
+        self, context: RepositoryMutationContext, verification: RepositoryReceiptVerification
     ) -> bool:
         """Reject reuse against a different target or receipt-lifecycle state."""
 
         return (
             type(context) is RepositoryMutationContext
-            and type(receipt_status) is RepositoryReceiptStatus
+            and type(verification) is RepositoryReceiptVerification
             and self.repository_fingerprint == context.repository_fingerprint
             and self.deployment_fingerprint == context.deployment_fingerprint
             and self.task_fingerprint == context.task_fingerprint
             and self.candidate_sha == context.candidate_sha
-            and self.receipt_status is receipt_status
+            and self.receipt_verification_fingerprint == verification.verification_fingerprint
+            and self.receipt_binding_digest == verification.receipt_binding_digest
+            and self.receipt_status is verification.status
         )
 
 
@@ -282,7 +301,7 @@ def evaluate_repository_mutation_policy(
     operation: RepositoryMutationOperation | None,
     *,
     standing_authority: StandingRepositoryAuthority | None,
-    receipt_status: RepositoryReceiptStatus | None,
+    receipt_verification: RepositoryReceiptVerification | None,
     now: datetime | None,
 ) -> RepositoryMutationDecision:
     """Authorize only an exact, fresh, externally activated Boolean switch."""
@@ -290,21 +309,21 @@ def evaluate_repository_mutation_policy(
     if type(operation) is not RepositoryMutationOperation:
         return _denied("repository mutation operation is unavailable", snapshot, receipt)
     if type(snapshot) is not TrustedRepositoryPolicySnapshot or not _snapshot_is_valid(snapshot):
-        return _denied("trusted repository policy evidence is unavailable or invalid", snapshot, receipt, operation, context, receipt_status)
+        return _denied("trusted repository policy evidence is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
     if type(receipt) is not RepositoryActivationReceipt or not _receipt_is_valid(receipt):
-        return _denied("repository policy activation receipt is unavailable or invalid", snapshot, receipt, operation, context, receipt_status)
+        return _denied("repository policy activation receipt is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
     if type(context) is not RepositoryMutationContext or not _context_is_valid(context):
-        return _denied("repository mutation context is unavailable or invalid", snapshot, receipt, operation, context, receipt_status)
+        return _denied("repository mutation context is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
     if type(standing_authority) is not StandingRepositoryAuthority or not _standing_authority_is_valid(standing_authority):
-        return _denied("standing repository authority is unavailable or invalid", snapshot, receipt, operation, context, receipt_status)
-    if type(receipt_status) is not RepositoryReceiptStatus:
-        return _denied("repository policy receipt lifecycle is unavailable", snapshot, receipt, operation, context, receipt_status)
+        return _denied("standing repository authority is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+    if type(receipt_verification) is not RepositoryReceiptVerification or not _receipt_verification_is_valid(receipt_verification):
+        return _denied("repository policy receipt lifecycle verification is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
     if type(now) is not datetime or now.tzinfo is not timezone.utc:
-        return _denied("repository policy evaluation time is unavailable or invalid", snapshot, receipt, operation, context, receipt_status)
+        return _denied("repository policy evaluation time is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
 
     document = snapshot.document
     if not _policy_narrows(document, standing_authority.policy):
-        return _denied("repository policy would widen standing authority", snapshot, receipt, operation, context, receipt_status)
+        return _denied("repository policy would widen standing authority", snapshot, receipt, operation, context, receipt_verification)
     checks = (
         (receipt.source_fingerprint == snapshot.source.source_fingerprint, "repository policy source does not match activation receipt"),
         (receipt.revision_fingerprint == snapshot.source.revision_fingerprint, "repository policy revision does not match activation receipt"),
@@ -315,16 +334,18 @@ def evaluate_repository_mutation_policy(
         (receipt.task_fingerprint == context.task_fingerprint, "activation receipt is not bound to this task"),
         (receipt.candidate_sha == context.candidate_sha, "activation receipt is not bound to this candidate"),
         (receipt.activated_at <= now < receipt.expires_at, "repository policy activation receipt is stale or not yet active"),
-        (receipt_status is RepositoryReceiptStatus.FRESH, "repository policy activation receipt is not fresh"),
+        (receipt_verification.receipt_fingerprint == receipt.receipt_fingerprint, "repository policy lifecycle verification is not bound to this receipt"),
+        (receipt_verification.receipt_binding_digest == _receipt_binding_digest(receipt), "repository policy lifecycle verification does not match this receipt binding"),
+        (receipt_verification.status is RepositoryReceiptStatus.FRESH, "repository policy activation receipt is not fresh"),
     )
     for passed, reason in checks:
         if not passed:
-            return _denied(reason, snapshot, receipt, operation, context, receipt_status)
+            return _denied(reason, snapshot, receipt, operation, context, receipt_verification)
     if not document.enabled:
-        return _denied("repository mutation policy is disabled", snapshot, receipt, operation, context, receipt_status)
+        return _denied("repository mutation policy is disabled", snapshot, receipt, operation, context, receipt_verification)
     if not _action_switch_is_enabled(document, operation):
-        return _denied("repository mutation action is disabled", snapshot, receipt, operation, context, receipt_status)
-    return RepositoryMutationDecision(operation, True, "repository mutation policy is active for this exact operation", snapshot.policy_digest, snapshot.source.source_fingerprint, receipt.receipt_fingerprint, True, True, "mutation-adapter-may-attempt-readback", _binding_from_evidence(snapshot, receipt, context, receipt_status))
+        return _denied("repository mutation action is disabled", snapshot, receipt, operation, context, receipt_verification)
+    return RepositoryMutationDecision(operation, True, "repository mutation policy is active for this exact operation", snapshot.policy_digest, snapshot.source.source_fingerprint, receipt.receipt_fingerprint, True, True, "mutation-adapter-may-attempt-readback", _binding_from_evidence(snapshot, receipt, context, receipt_verification))
 
 
 def evaluate_shadow_mutation_policy(operation: RepositoryMutationOperation | None) -> RepositoryMutationDecision:
@@ -335,7 +356,7 @@ def evaluate_shadow_mutation_policy(operation: RepositoryMutationOperation | Non
     return RepositoryMutationDecision(operation, False, "shadow replay is read-only and all repository mutation switches are disabled", None, None, None, False, False, "retain-zero-mutation-evidence")
 
 
-def _denied(reason: str, snapshot: object = None, receipt: object = None, operation: object = None, context: object = None, receipt_status: object = None) -> RepositoryMutationDecision:
+def _denied(reason: str, snapshot: object = None, receipt: object = None, operation: object = None, context: object = None, receipt_verification: object = None) -> RepositoryMutationDecision:
     valid_snapshot = type(snapshot) is TrustedRepositoryPolicySnapshot and _snapshot_is_valid(snapshot)
     valid_receipt = type(receipt) is RepositoryActivationReceipt and _receipt_is_valid(receipt)
     policy = snapshot.document if valid_snapshot else None
@@ -349,12 +370,12 @@ def _denied(reason: str, snapshot: object = None, receipt: object = None, operat
         bool(policy.enabled) if policy is not None else False,
         _action_switch_is_enabled(policy, operation) if policy is not None and type(operation) is RepositoryMutationOperation else False,
         "resolve-policy-or-owner-receipt",
-        _binding_from_evidence(snapshot, receipt, context, receipt_status),
+        _binding_from_evidence(snapshot, receipt, context, receipt_verification),
     )
 
 
 def _binding_from_evidence(
-    snapshot: object, receipt: object, context: object, receipt_status: object
+    snapshot: object, receipt: object, context: object, receipt_verification: object
 ) -> RepositoryMutationBinding | None:
     if (
         type(snapshot) is not TrustedRepositoryPolicySnapshot
@@ -363,7 +384,8 @@ def _binding_from_evidence(
         or not _receipt_is_valid(receipt)
         or type(context) is not RepositoryMutationContext
         or not _context_is_valid(context)
-        or type(receipt_status) is not RepositoryReceiptStatus
+        or type(receipt_verification) is not RepositoryReceiptVerification
+        or not _receipt_verification_is_valid(receipt_verification)
     ):
         return None
     return RepositoryMutationBinding(
@@ -377,7 +399,9 @@ def _binding_from_evidence(
         context.deployment_fingerprint,
         context.task_fingerprint,
         context.candidate_sha,
-        receipt_status,
+        receipt_verification.verification_fingerprint,
+        receipt_verification.receipt_binding_digest,
+        receipt_verification.status,
     )
 
 
@@ -474,6 +498,16 @@ def _receipt_is_valid(receipt: object) -> bool:
     return True
 
 
+def _receipt_verification_is_valid(verification: object) -> bool:
+    if type(verification) is not RepositoryReceiptVerification:
+        return False
+    try:
+        _validate_receipt_verification(verification)
+    except (AttributeError, TypeError, RepositoryPolicyError):
+        return False
+    return True
+
+
 def _standing_authority_is_valid(authority: object) -> bool:
     return type(authority) is StandingRepositoryAuthority and _policy_is_valid(authority.policy)
 
@@ -495,6 +529,37 @@ def _validate_receipt(receipt: RepositoryActivationReceipt) -> None:
         raise RepositoryPolicyError("repository policy receipt validity window is invalid")
 
 
+def _validate_receipt_verification(verification: RepositoryReceiptVerification) -> None:
+    for value, description in (
+        (verification.verification_fingerprint, "receipt lifecycle verification"),
+        (verification.receipt_fingerprint, "verified receipt"),
+        (verification.receipt_binding_digest, "verified receipt binding"),
+    ):
+        _require_fingerprint(value, description)
+    if type(verification.status) is not RepositoryReceiptStatus:
+        raise RepositoryPolicyError("repository policy receipt lifecycle status is invalid")
+
+
+def _receipt_binding_digest(receipt: RepositoryActivationReceipt) -> str:
+    """Canonical identity that a lifecycle verifier must independently observe."""
+
+    payload = {
+        "owner_fingerprint": receipt.owner_fingerprint,
+        "receipt_fingerprint": receipt.receipt_fingerprint,
+        "source_fingerprint": receipt.source_fingerprint,
+        "revision_fingerprint": receipt.revision_fingerprint,
+        "policy_digest": receipt.policy_digest,
+        "schema_version": receipt.schema_version,
+        "repository_fingerprint": receipt.repository_fingerprint,
+        "deployment_fingerprint": receipt.deployment_fingerprint,
+        "task_fingerprint": receipt.task_fingerprint,
+        "candidate_sha": receipt.candidate_sha,
+        "activated_at": receipt.activated_at.isoformat(),
+        "expires_at": receipt.expires_at.isoformat(),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
 def _validate_binding(binding: RepositoryMutationBinding) -> None:
     for value, description in (
         (binding.source_fingerprint, "binding policy source"),
@@ -505,6 +570,8 @@ def _validate_binding(binding: RepositoryMutationBinding) -> None:
         (binding.repository_fingerprint, "binding repository"),
         (binding.deployment_fingerprint, "binding deployment"),
         (binding.task_fingerprint, "binding task"),
+        (binding.receipt_verification_fingerprint, "binding receipt lifecycle verification"),
+        (binding.receipt_binding_digest, "binding receipt identity"),
     ):
         _require_fingerprint(value, description)
     if type(binding.schema_version) is not int or binding.schema_version != REPOSITORY_POLICY_SCHEMA_VERSION:

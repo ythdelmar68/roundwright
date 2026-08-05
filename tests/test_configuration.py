@@ -23,8 +23,10 @@ from roundwright.configuration import (
     ReviewOutcome,
     load_configuration,
     parse_cli_overrides,
+    resolve_dispatch_configuration,
 )
 from roundwright import cli
+from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -308,6 +310,43 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(policy.disposition(10, ReviewOutcome.FINDINGS, worker_finalized=True), ReviewDisposition.REVIEW_LIMIT_REACHED_WORKER_FINALIZED)
         with self.assertRaisesRegex(ConfigurationError, "floor"):
             policy.__class__(2, 10, 3, policy.on_final_findings).enforce_floor(policy)
+
+    def test_dispatch_configuration_requires_and_pins_typed_trusted_review_floor(self) -> None:
+        snapshot = TrustedPolicySnapshot(
+            TrustedControlSource("a" * 64, "b" * 64),
+            PolicyDocument(1, frozenset({PolicyAction.ISSUE_COMMENT})),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = load_configuration(cwd=root, environment={}).review_policy
+            accepted_floor = baseline.__class__(2, 9, 2, baseline.on_final_findings)
+            resolved = resolve_dispatch_configuration(
+                cwd=root,
+                environment={},
+                trusted_policy_snapshot=snapshot,
+                trusted_review_floor=accepted_floor,
+            )
+            self.assertEqual(resolved.trusted_review_floor, accepted_floor)
+            self.assertNotEqual(resolved.resolved_digest, load_configuration(cwd=root, environment={}).resolved_digest)
+            changed_floor = baseline.__class__(1, 8, 1, baseline.on_final_findings)
+            drifted = resolve_dispatch_configuration(
+                cwd=root,
+                environment={},
+                trusted_policy_snapshot=snapshot,
+                trusted_review_floor=changed_floor,
+            )
+            self.assertNotEqual(resolved.pin().digest, drifted.pin().digest)
+            with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
+                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=None, trusted_review_floor=accepted_floor)
+            with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
+                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=snapshot, trusted_review_floor=None)
+            with self.assertRaisesRegex(ConfigurationError, "trusted policy floor"):
+                resolve_dispatch_configuration(
+                    cwd=root,
+                    environment={},
+                    trusted_policy_snapshot=snapshot,
+                    trusted_review_floor=baseline.__class__(4, 10, 3, baseline.on_final_findings),
+                )
 
 
 if __name__ == "__main__":

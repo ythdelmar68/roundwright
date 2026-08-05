@@ -58,14 +58,28 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')
-from roundwright.configuration import RepositoryIdentity
+from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
 from roundwright.local_slice import LocalSliceFixture, render_local_slice_status, run_once_local_slice
+from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.state import database_path
 import roundwright.local_slice as local_slice
 import roundwright.state as state_module
 
 root = Path(r'''%s''')
 fixture = LocalSliceFixture('local-task', 'local-source', 'local/repository', 'codex/local-slice', root.parent / 'worker', 'implemented locally\\n')
+trusted_policy_snapshot = TrustedPolicySnapshot(
+    TrustedControlSource('a' * 64, 'b' * 64),
+    PolicyDocument(1, frozenset({PolicyAction.ISSUE_COMMENT})),
+)
+trusted_review_floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+drifted_review_floor = ReviewPolicy(2, 9, 2, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+def run_slice(value):
+    return run_once_local_slice(
+        repository, value,
+        trusted_policy_snapshot=trusted_policy_snapshot,
+        trusted_review_floor=trusted_review_floor,
+        now=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
 commands = []
 original_run = subprocess.run
 allowed_environment = {'PATH', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP'}
@@ -109,8 +123,14 @@ def no_credential(name, *args, **kwargs):
     return original_getenv(name, *args, **kwargs)
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
+try:
+    run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+except Exception:
+    missing_trusted_floor_rejected = True
+else:
+    missing_trusted_floor_rejected = False
 before_first = len(commands)
-first = run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+first = run_slice(fixture)
 first_pass_commands = len(commands) - before_first
 connection = sqlite3.connect(database_path(repository))
 try:
@@ -124,24 +144,35 @@ local_slice.initialize = writes_denied
 original_writable_connection = state_module._open_writable_connection
 state_module._open_writable_connection = writes_denied
 before_replay = len(commands)
-second = run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+second = run_slice(fixture)
 replay_commands = len(commands) - before_replay
 before_changed_source = len(commands)
 try:
-    run_once_local_slice(repository, LocalSliceFixture('local-task', 'local-source', 'local/repository', 'codex/local-slice', root.parent / 'worker', 'changed source\\n'), now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+    run_slice(LocalSliceFixture('local-task', 'local-source', 'local/repository', 'codex/local-slice', root.parent / 'worker', 'changed source\\n'))
 except Exception:
     changed_source_rejected = True
 else:
     changed_source_rejected = False
 changed_source_commands = len(commands) - before_changed_source
 state_module._open_writable_connection = original_writable_connection
+try:
+    run_once_local_slice(
+        repository, fixture,
+        trusted_policy_snapshot=trusted_policy_snapshot,
+        trusted_review_floor=drifted_review_floor,
+        now=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
+except Exception:
+    drifted_trusted_floor_rejected = True
+else:
+    drifted_trusted_floor_rejected = False
 connection = sqlite3.connect(database_path(repository))
 try:
     database_snapshot_after_replay = hashlib.sha256('\\n'.join(connection.iterdump()).encode('utf-8')).hexdigest()
 finally:
     connection.close()
 try:
-    run_once_local_slice(repository, LocalSliceFixture('failed-task', 'failed-source', 'local/repository', 'codex/failed-slice', root / 'unsafe-worktree', 'failed source\\n'), now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+    run_slice(LocalSliceFixture('failed-task', 'failed-source', 'local/repository', 'codex/failed-slice', root / 'unsafe-worktree', 'failed source\\n'))
 except Exception:
     failure_released_lease = True
 else:
@@ -209,6 +240,8 @@ print(json.dumps({
     'next_action': first.task.next_action,
     'artifacts': [item.kind for item in first.task.artifacts],
     'blockers': first.task.blockers,
+    'missing_trusted_floor_rejected': missing_trusted_floor_rejected,
+    'drifted_trusted_floor_rejected': drifted_trusted_floor_rejected,
     'changed_source_rejected': changed_source_rejected,
     'transitions': transitions,
     'attempts': attempts,
@@ -247,6 +280,8 @@ print(json.dumps({
             self.assertEqual(result["next_action"], "owner-review")
             self.assertEqual(result["artifacts"], ["diff", "plan", "review", "status"])
             self.assertEqual(result["blockers"], [])
+            self.assertTrue(result["missing_trusted_floor_rejected"])
+            self.assertTrue(result["drifted_trusted_floor_rejected"])
             self.assertTrue(result["changed_source_rejected"])
             self.assertEqual(result["transitions"], [
                 ["queued", "planning"], ["planning", "plan-review"], ["plan-review", "implementing"],

@@ -28,7 +28,7 @@ from .candidate_review import (
     record_diff_review,
     record_implementation_candidate,
 )
-from .configuration import RepositoryIdentity
+from .configuration import RepositoryIdentity, ReviewPolicy, resolve_dispatch_configuration
 from .gates import (
     EvidenceOutcome,
     GATE_REGISTRY,
@@ -43,7 +43,6 @@ from .gates import (
     transition_ready_for_owner,
 )
 from .git_identity import CandidateSeal, provision_worktree, resolve_canonical_base, transition_lease
-from .configuration import load_configuration
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_recovery import RecoveryContext
@@ -92,6 +91,8 @@ def run_once_local_slice(
     repository: RepositoryIdentity,
     fixture: LocalSliceFixture,
     *,
+    trusted_policy_snapshot: TrustedPolicySnapshot | None = None,
+    trusted_review_floor: ReviewPolicy | None = None,
     now: datetime | None = None,
 ) -> LocalSliceResult:
     """Drive one local task to ready-for-owner, or return its exact completed replay.
@@ -116,9 +117,10 @@ def run_once_local_slice(
         str(fixture.worktree.resolve(strict=False)),
         base_sha,
     )
+    runtime_binding = _local_runtime_binding(repository, trusted_policy_snapshot, trusted_review_floor)
     database = check_database(repository)
     if database.state == "healthy":
-        completed = _completed_result(repository, identity, fixture)
+        completed = _completed_result(repository, identity, fixture, runtime_binding)
         if completed is not None:
             return completed
     elif database.state == "missing":
@@ -138,7 +140,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -163,14 +165,13 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
     set_next_action(repository, identity, action_kind="review-plan", evidence_fingerprint=_fingerprint("next", identity.task_id), lease=lease)
     begin_planning(repository, identity, evidence_fingerprint=_fingerprint("transition", "queued", identity.task_id), lease=lease)
 
-    runtime_binding = _local_runtime_binding(repository)
     context = RecoveryContext.for_task(
         identity,
         candidate_sha=None,
@@ -309,7 +310,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch):
     return LocalSliceResult(task_projection(repository, identity), seal, decision.outcome, plan_review.supervisor_session_identity, diff_review.supervisor_session_identity)
 
 
-def _completed_result(repository, identity, fixture):
+def _completed_result(repository, identity, fixture, runtime_binding):
     try:
         task = task_projection(repository, identity)
     except StateError:
@@ -364,7 +365,7 @@ def _completed_result(repository, identity, fixture):
             (identity.task_id,),
         ).fetchone()
         context_row = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, selected_supervisor_profile_identity FROM gate_contexts "
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_supervisor_profile_identity FROM gate_contexts "
             "WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, row[1] if row else None),
         ).fetchone()
         gate_rows = connection.execute(
@@ -386,7 +387,6 @@ def _completed_result(repository, identity, fixture):
         or diff[1:] != (row[0], row[1], row[0], row[1], "local-plan", "local-plan-review")
     ):
         raise LocalSliceError("completed local slice review evidence does not match its source, plan, or candidate")
-    runtime_binding = _local_runtime_binding(repository)
     expected_context, _ = _gate_evidence(
         identity, CandidateSeal(identity.task_id, *row), datetime(2030, 1, 1, tzinfo=timezone.utc), runtime_binding
     )
@@ -395,12 +395,13 @@ def _completed_result(repository, identity, fixture):
         int(expected_context.isolated_local_task),
         expected_context.policy_digest,
         expected_context.receipt_fingerprint,
+        *runtime_binding.columns(),
         expected_context.selected_supervisor_profile_identity,
     ):
         raise LocalSliceError("completed local slice gate context does not match the fixture contract")
     if any(record[9] != "[]" for record in gate_rows):
         raise LocalSliceError("completed local slice has malformed gate follow-up evidence")
-    context = GateContext(identity.task_id, row[1], context_row[0], bool(context_row[1]), context_row[2], context_row[3], runtime_binding, context_row[4])
+    context = GateContext(identity.task_id, row[1], context_row[0], bool(context_row[1]), context_row[2], context_row[3], runtime_binding, context_row[8])
     evidence = tuple(GateEvidence(*record[:9], ()) for record in gate_rows)
     decision = decide_gates(context, evidence)
     if decision.outcome is not GateOutcome.PASS or len(evidence) != len(GATE_REGISTRY):
@@ -422,13 +423,15 @@ def _completed_result(repository, identity, fixture):
     return LocalSliceResult(task, CandidateSeal(identity.task_id, *row), decision.outcome, plan[0], diff[0])
 
 
-def _local_runtime_binding(repository: RepositoryIdentity):
+def _local_runtime_binding(repository: RepositoryIdentity, trusted_policy_snapshot: object, trusted_review_floor: object):
     """Resolve the fixture binding without invoking repository discovery commands."""
 
-    return load_configuration(
+    return resolve_dispatch_configuration(
         cwd=Path(os.__file__).resolve().parent,
         environment={},
         home=repository.root,
+        trusted_policy_snapshot=trusted_policy_snapshot,
+        trusted_review_floor=trusted_review_floor,
     ).pin().runtime_binding()
 
 

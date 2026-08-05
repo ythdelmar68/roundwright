@@ -18,6 +18,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Generic, Mapping, TypeVar
 from .runtime_binding import RuntimeBinding
+from .policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 
 
 class ConfigurationError(ValueError):
@@ -189,6 +190,7 @@ class Configuration:
     review: Mapping[str, EffectiveValue[object]]
     schema_version: str = _SCHEMA_VERSION
     repository_configuration_root: Path | None = None
+    trusted_review_floor: ReviewPolicy | None = None
 
     @property
     def repository(self) -> RepositoryIdentity | None:
@@ -228,6 +230,7 @@ class Configuration:
                 name: value.value.value if isinstance(value.value, Enum) else value.value
                 for name, value in sorted(self.review.items())
             },
+            "trusted_review_floor": _review_policy_payload(self.trusted_review_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         })
 
@@ -334,7 +337,53 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
         supervisor_attempt_profiles=EffectiveValue(supervisors, sources["roles.supervisor.attempt_profiles"]),
         review={name: EffectiveValue(value, sources[f"review.{name}"]) for name, value in review.__dict__.items()},
         repository_configuration_root=repository_config_root,
+        trusted_review_floor=trusted_review_floor,
     )
+
+
+def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_review_floor: object, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, platform: str | None = None, home: Path | None = None) -> Configuration:
+    """Resolve dispatch-capable configuration only under typed trusted control evidence."""
+
+    if not _is_trusted_review_floor_evidence(trusted_policy_snapshot, trusted_review_floor):
+        raise ConfigurationError("trusted review policy evidence is unavailable")
+    try:
+        trusted_policy_snapshot.policy_digest
+    except (AttributeError, TypeError, ValueError):
+        raise ConfigurationError("trusted review policy evidence is unavailable") from None
+    return load_configuration(
+        cwd=cwd,
+        environment=environment,
+        cli_values=cli_values,
+        user_config=user_config,
+        authoritative_repository_root=authoritative_repository_root,
+        trusted_review_floor=trusted_review_floor,
+        platform=platform,
+        home=home,
+    )
+
+
+def _is_trusted_review_floor_evidence(snapshot: object, floor: object) -> bool:
+    try:
+        if (
+            type(snapshot) is not TrustedPolicySnapshot
+            or type(snapshot.source) is not TrustedControlSource
+            or type(snapshot.document) is not PolicyDocument
+            or type(floor) is not ReviewPolicy
+            or type(floor.complete_rounds) is not int
+            or type(floor.max_rounds) is not int
+            or type(floor.max_supervisor_attempts_per_round) is not int
+            or not isinstance(floor.on_final_findings, FinalFindingsPolicy)
+            or floor.complete_rounds <= 0
+            or floor.max_rounds < floor.complete_rounds
+            or floor.max_supervisor_attempts_per_round <= 0
+        ):
+            return False
+        for value in (snapshot.source.source_fingerprint, snapshot.source.revision_fingerprint, snapshot.policy_digest):
+            if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                return False
+        return snapshot.document.schema_version == 1 and type(snapshot.document.allowed_actions) is frozenset
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def preflight(configuration: Configuration, mode: PreflightMode | str) -> PreflightReport:
@@ -645,6 +694,17 @@ def _profile_payload(profile: ProviderProfile) -> dict[str, str]:
     if profile.name is not None:
         result["name"] = profile.name
     return result
+
+
+def _review_policy_payload(policy: ReviewPolicy | None) -> dict[str, object] | None:
+    if policy is None:
+        return None
+    return {
+        "complete_rounds": policy.complete_rounds,
+        "max_rounds": policy.max_rounds,
+        "max_supervisor_attempts_per_round": policy.max_supervisor_attempts_per_round,
+        "on_final_findings": policy.on_final_findings.value,
+    }
 
 
 def _digest(value: object) -> str:

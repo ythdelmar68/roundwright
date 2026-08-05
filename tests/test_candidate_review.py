@@ -297,6 +297,23 @@ class CandidateReviewTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_final_review_limit_repair_rejects_tampered_persisted_round(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE diff_review_attempts SET review_round = ? WHERE task_id = ?", (9, identity.task_id))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(Exception):
+                finalize_review_limit_repair(repository, identity, binding, repair_seal, findings_fingerprint=findings, worker_repair_fingerprint="d" * 64, worker_thread_identity="worker-thread-25", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertIsNone(connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone())
+            finally:
+                connection.close()
+
     def test_implementation_replays_the_persisted_worker_turn_after_a_crash(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

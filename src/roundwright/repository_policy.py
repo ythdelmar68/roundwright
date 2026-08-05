@@ -223,10 +223,17 @@ class RepositoryMutationBinding:
     ) -> bool:
         """Reject reuse against a different target or receipt-lifecycle state."""
 
+        if (
+            type(self) is not RepositoryMutationBinding
+            or not _binding_is_valid(self)
+            or type(context) is not RepositoryMutationContext
+            or not _context_is_valid(context)
+            or type(verification) is not RepositoryReceiptVerification
+            or not _receipt_verification_is_valid(verification)
+        ):
+            return False
         return (
-            type(context) is RepositoryMutationContext
-            and type(verification) is RepositoryReceiptVerification
-            and self.repository_fingerprint == context.repository_fingerprint
+            self.repository_fingerprint == context.repository_fingerprint
             and self.deployment_fingerprint == context.deployment_fingerprint
             and self.task_fingerprint == context.task_fingerprint
             and self.candidate_sha == context.candidate_sha
@@ -504,6 +511,16 @@ def _receipt_verification_is_valid(verification: object) -> bool:
         return False
     try:
         _validate_receipt_verification(verification)
+    except (AttributeError, TypeError, RepositoryPolicyError):
+        return False
+    return True
+
+
+def _binding_is_valid(binding: object) -> bool:
+    if type(binding) is not RepositoryMutationBinding:
+        return False
+    try:
+        _validate_binding(binding)
     except (AttributeError, TypeError, RepositoryPolicyError):
         return False
     return True

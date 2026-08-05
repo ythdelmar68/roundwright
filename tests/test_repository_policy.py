@@ -194,6 +194,16 @@ class RepositoryMutationPolicyTests(unittest.TestCase):
         self.assertFalse(binding.matches_context(other, verification))
         cross_receipt = self.verification(receipt, receipt_fingerprint=fingerprint("2"))
         self.assertFalse(binding.matches_context(context, cross_receipt))
+        class EqualitySpoofingFingerprint(str):
+            invoked = False
+
+            def __eq__(self, other: object) -> bool:
+                type(self).invoked = True
+                return True
+
+        object.__setattr__(cross_receipt, "receipt_fingerprint", EqualitySpoofingFingerprint(fingerprint("3")))
+        self.assertFalse(binding.matches_context(context, cross_receipt))
+        self.assertFalse(EqualitySpoofingFingerprint.invoked)
         reused = self.evaluate(snapshot, receipt, other, RepositoryMutationOperation.ISSUE_COMMENT)
         self.assertFalse(reused.authorized)
         self.assertNotEqual(binding.digest, reused.binding.digest)

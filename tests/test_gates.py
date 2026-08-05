@@ -49,7 +49,8 @@ class GateDecisionTests(unittest.TestCase):
         return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,))
 
     def context(self, *, sources: int = 1, isolated: bool = True) -> GateContext:
-        return GateContext(self.task_id, self.candidate, sources, isolated, self.policy_digest, self.receipt_fingerprint, self.runtime_binding())
+        binding = self.runtime_binding()
+        return GateContext(self.task_id, self.candidate, sources, isolated, self.policy_digest, self.receipt_fingerprint, binding, binding.supervisor_profile_identities[0])
 
     def evidence(
         self,
@@ -143,7 +144,8 @@ class GateDecisionTests(unittest.TestCase):
         self.assertEqual(decide_gates(self.context(), tuple(conflict)).outcome, GateOutcome.BLOCKED)
 
     def test_candidate_movement_requires_fresh_evidence(self) -> None:
-        moved = GateContext(self.task_id, "b" * 40, 1, True, self.policy_digest, self.receipt_fingerprint, self.runtime_binding())
+        binding = self.runtime_binding()
+        moved = GateContext(self.task_id, "b" * 40, 1, True, self.policy_digest, self.receipt_fingerprint, binding, binding.supervisor_profile_identities[0])
         self.assertEqual(decide_gates(moved, self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
         self.assertEqual(decide_gates(moved, ()).outcome, GateOutcome.PENDING)
 
@@ -171,7 +173,8 @@ class GateDecisionTests(unittest.TestCase):
             accepted[-1].reason,
         )
         self.assertEqual(decide_gates(self.context(), tuple(accepted)).outcome, GateOutcome.BLOCKED)
-        self.assertEqual(decide_gates(GateContext(self.task_id, self.candidate, True, "yes", self.policy_digest, self.receipt_fingerprint, self.runtime_binding()), self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
+        binding = self.runtime_binding()
+        self.assertEqual(decide_gates(GateContext(self.task_id, self.candidate, True, "yes", self.policy_digest, self.receipt_fingerprint, binding, binding.supervisor_profile_identities[0]), self.accepted_evidence()).outcome, GateOutcome.BLOCKED)
 
     def test_unresolved_follow_ups_and_malformed_shapes_fail_closed(self) -> None:
         evidence = [item for item in self.accepted_evidence() if item.gate_key != GateKey.SUPERVISOR_DIFF_REVIEW]
@@ -213,10 +216,19 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         activated_at: datetime | None = None,
         status: ReceiptStatus = ReceiptStatus.FRESH,
         runtime_binding: RuntimeBinding | None = None,
+        selected_profile_identity: str | None = None,
     ) -> TrustedGatePolicyEvidence:
         snapshot = self.policy_snapshot()
         activated_at = datetime(2026, 7, 29, tzinfo=timezone.utc) if activated_at is None else activated_at
         now = activated_at + timedelta(minutes=1)
+        receipt_binding = context.runtime_binding if runtime_binding is None else runtime_binding
+        receipt_profile_identity = (
+            context.selected_supervisor_profile_identity
+            if selected_profile_identity is None and runtime_binding is None
+            else receipt_binding.supervisor_profile_identities[0]
+            if selected_profile_identity is None
+            else selected_profile_identity
+        )
         receipt = ActivationReceipt(
             "c" * 64,
             context.receipt_fingerprint,
@@ -228,7 +240,8 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             context.candidate_sha,
             activated_at,
             now + timedelta(minutes=1),
-            context.runtime_binding if runtime_binding is None else runtime_binding,
+            receipt_binding,
+            receipt_profile_identity,
         )
         return TrustedGatePolicyEvidence(
             snapshot,
@@ -248,7 +261,14 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         object.__setattr__(repository, "root", root.resolve())
         return repository
 
-    def complete_persisted_pass(self, root: Path, *, receipt_fingerprint: str = "d" * 64):
+    def complete_persisted_pass(
+        self,
+        root: Path,
+        *,
+        receipt_fingerprint: str = "d" * 64,
+        runtime_binding: RuntimeBinding | None = None,
+        selected_profile_identity: str | None = None,
+    ):
         repository = self.repository(root)
         initialize(repository)
         identity = TaskIdentity("issue-21", "source-21", "ythdelmar68/roundwright", "codex/issue-21", "C:/private/issue-21", "a" * 40)
@@ -262,7 +282,9 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
-        context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, receipt_fingerprint, self.runtime_binding())
+        binding_value = self.runtime_binding() if runtime_binding is None else runtime_binding
+        selected_profile_identity = binding_value.supervisor_profile_identities[0] if selected_profile_identity is None else selected_profile_identity
+        context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, receipt_fingerprint, binding_value, selected_profile_identity)
         policy_evidence = self.policy_evidence(context)
         evidence = []
         for number, requirement in enumerate(GATE_REGISTRY, 1):
@@ -299,7 +321,8 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64, self.runtime_binding())
+            binding_value = self.runtime_binding()
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64, binding_value, binding_value.supervisor_profile_identities[0])
             policy_evidence = self.policy_evidence(context)
             evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             with mock.patch("roundwright.gates.bind_candidate_evidence") as bind:
@@ -326,7 +349,8 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64, self.runtime_binding())
+            binding_value = self.runtime_binding()
+            context = GateContext(identity.task_id, seal.candidate_sha, 1, True, self.policy_snapshot().policy_digest, "d" * 64, binding_value, binding_value.supervisor_profile_identities[0])
             policy_evidence = self.policy_evidence(context)
             passed = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 1, "2" * 64)
             findings = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.FINDINGS, "validator", 1, "2" * 64)
@@ -399,6 +423,94 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                     GateOutcome.BLOCKED,
                 )
 
+    def test_selected_supervisor_profile_is_persisted_and_must_match_the_activation_receipt(self) -> None:
+        profile_binding = RuntimeBinding(
+            "roundwright-runtime/v1",
+            "sha256:" + "3" * 64,
+            "sha256:" + "4" * 64,
+            ("sha256:" + "5" * 64, "sha256:" + "6" * 64, "sha256:" + "7" * 64),
+        )
+        for label, selected_profile_identity in zip(
+            ("primary", "fallback", "fallback-retry"),
+            profile_binding.supervisor_profile_identities,
+            strict=True,
+        ):
+            with self.subTest(attempt=label), tempfile.TemporaryDirectory() as temporary:
+                repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(
+                    Path(temporary),
+                    runtime_binding=profile_binding,
+                    selected_profile_identity=selected_profile_identity,
+                )
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT selected_supervisor_profile_identity FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+                            (identity.task_id, seal.candidate_sha),
+                        ).fetchone(),
+                        (selected_profile_identity,),
+                    )
+                finally:
+                    connection.close()
+                with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                    self.assertEqual(
+                        evaluate_gates(repository, binding, seal, context, policy_evidence=self.policy_evidence(context), lease=lease).outcome,
+                        GateOutcome.PASS,
+                    )
+                    substituted = next(
+                        profile for profile in profile_binding.supervisor_profile_identities if profile != selected_profile_identity
+                    )
+                    self.assertEqual(
+                        evaluate_gates(
+                            repository,
+                            binding,
+                            seal,
+                            context,
+                            policy_evidence=self.policy_evidence(context, selected_profile_identity=substituted),
+                            lease=lease,
+                        ).outcome,
+                        GateOutcome.BLOCKED,
+                    )
+
+    def test_missing_or_foreign_selected_profile_denies_gate_decisions(self) -> None:
+        binding = self.runtime_binding()
+        context = GateContext(
+            "issue-21", "b" * 40, 1, True, self.policy_snapshot().policy_digest, "d" * 64,
+            binding, binding.supervisor_profile_identities[0],
+        )
+        self.assertEqual(
+            decide_gates(
+                GateContext(
+                    context.task_id,
+                    context.candidate_sha,
+                    context.source_count,
+                    context.isolated_local_task,
+                    context.policy_digest,
+                    context.receipt_fingerprint,
+                    context.runtime_binding,
+                    "",
+                ),
+                GateDecisionTests().accepted_evidence(),
+            ).outcome,
+            GateOutcome.BLOCKED,
+        )
+        self.assertEqual(
+            decide_gates(
+                GateContext(
+                    context.task_id,
+                    context.candidate_sha,
+                    context.source_count,
+                    context.isolated_local_task,
+                    context.policy_digest,
+                    context.receipt_fingerprint,
+                    context.runtime_binding,
+                    "sha256:" + "f" * 64,
+                ),
+                GateDecisionTests().accepted_evidence(),
+            ).outcome,
+            GateOutcome.BLOCKED,
+        )
+
     def test_live_head_and_dirty_drift_block_the_only_final_transition_path(self) -> None:
         for message in ("candidate head moved and candidate sealing is required", "candidate worktree is dirty"):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
@@ -423,8 +535,8 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 connection.close()
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
                 self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
-            moved_policy = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, "e" * 64, context.receipt_fingerprint, context.runtime_binding)
-            moved_receipt = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, context.policy_digest, "f" * 64, context.runtime_binding)
+            moved_policy = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, "e" * 64, context.receipt_fingerprint, context.runtime_binding, context.selected_supervisor_profile_identity)
+            moved_receipt = GateContext(context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task, context.policy_digest, "f" * 64, context.runtime_binding, context.selected_supervisor_profile_identity)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
                 self.assertEqual(evaluate_gates(repository, binding, seal, moved_policy, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
                 self.assertEqual(evaluate_gates(repository, binding, seal, moved_receipt, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
@@ -442,6 +554,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 old_context.policy_digest,
                 "f" * 64,
                 old_context.runtime_binding,
+                old_context.selected_supervisor_profile_identity,
             )
             fresh_policy = self.policy_evidence(
                 fresh_context,
@@ -483,6 +596,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 fresh_context.policy_digest,
                 "d" * 64,
                 fresh_context.runtime_binding,
+                fresh_context.selected_supervisor_profile_identity,
             )
             stale_evidence = GateEvidence(
                 identity.task_id,
@@ -701,8 +815,8 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 return tuple(entry.evidence_fingerprint for entry in entries)
 
             seal_b = reseal("e" * 40)
-            context_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, "f" * 64, context_a.runtime_binding)
-            stale_receipt_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, context_a.receipt_fingerprint, context_a.runtime_binding)
+            context_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, "f" * 64, context_a.runtime_binding, context_a.selected_supervisor_profile_identity)
+            stale_receipt_b = GateContext(identity.task_id, seal_b.candidate_sha, 1, True, context_a.policy_digest, context_a.receipt_fingerprint, context_a.runtime_binding, context_a.selected_supervisor_profile_identity)
             with mock.patch("roundwright.gates.candidate_evidence", return_value=()):
                 self.assertEqual(evaluate_gates(repository, binding, seal_b, stale_receipt_b, policy_evidence=self.policy_evidence(stale_receipt_b, status=ReceiptStatus.CONSUMED), lease=lease).outcome, GateOutcome.BLOCKED)
             fingerprints_b = record_complete(seal_b, context_b)

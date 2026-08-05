@@ -364,7 +364,7 @@ def _completed_result(repository, identity, fixture):
             (identity.task_id,),
         ).fetchone()
         context_row = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint FROM gate_contexts "
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, selected_supervisor_profile_identity FROM gate_contexts "
             "WHERE task_id = ? AND candidate_sha = ?", (identity.task_id, row[1] if row else None),
         ).fetchone()
         gate_rows = connection.execute(
@@ -395,11 +395,12 @@ def _completed_result(repository, identity, fixture):
         int(expected_context.isolated_local_task),
         expected_context.policy_digest,
         expected_context.receipt_fingerprint,
+        expected_context.selected_supervisor_profile_identity,
     ):
         raise LocalSliceError("completed local slice gate context does not match the fixture contract")
     if any(record[9] != "[]" for record in gate_rows):
         raise LocalSliceError("completed local slice has malformed gate follow-up evidence")
-    context = GateContext(identity.task_id, row[1], context_row[0], bool(context_row[1]), context_row[2], context_row[3], runtime_binding)
+    context = GateContext(identity.task_id, row[1], context_row[0], bool(context_row[1]), context_row[2], context_row[3], runtime_binding, context_row[4])
     evidence = tuple(GateEvidence(*record[:9], ()) for record in gate_rows)
     decision = decide_gates(context, evidence)
     if decision.outcome is not GateOutcome.PASS or len(evidence) != len(GATE_REGISTRY):
@@ -434,12 +435,13 @@ def _local_runtime_binding(repository: RepositoryIdentity):
 def _gate_evidence(identity, seal, instant, runtime_binding):
     source = TrustedControlSource(_fingerprint("control-source", identity.task_id), _fingerprint("control-revision", identity.task_id))
     snapshot = TrustedPolicySnapshot(source, PolicyDocument(1, frozenset({PolicyAction.ISSUE_COMMENT})))
-    context = GateContext(identity.task_id, seal.candidate_sha, 1, True, snapshot.policy_digest, _fingerprint("receipt", seal.candidate_sha), runtime_binding)
+    selected_profile_identity = runtime_binding.supervisor_profile_identities[0]
+    context = GateContext(identity.task_id, seal.candidate_sha, 1, True, snapshot.policy_digest, _fingerprint("receipt", seal.candidate_sha), runtime_binding, selected_profile_identity)
     receipt = ActivationReceipt(
         _fingerprint("owner", identity.task_id), context.receipt_fingerprint,
         source.source_fingerprint, source.revision_fingerprint, snapshot.policy_digest, 1,
         task_identity_fingerprint(identity), seal.candidate_sha, instant, instant + timedelta(minutes=1),
-        runtime_binding,
+        runtime_binding, selected_profile_identity,
     )
     return context, TrustedGatePolicyEvidence(snapshot, receipt, StandingAuthority(frozenset(PolicyAction)), instant, ReceiptStatus.FRESH)
 

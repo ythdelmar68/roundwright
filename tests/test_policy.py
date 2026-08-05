@@ -55,6 +55,7 @@ class TrustedPolicyTests(unittest.TestCase):
             "activated_at": self.now - timedelta(minutes=1),
             "expires_at": self.now + timedelta(minutes=1),
             "runtime_binding": RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,)),
+            "selected_supervisor_profile_identity": "sha256:" + "2" * 64,
         }
         values.update(changes)
         return ActivationReceipt(**values)  # type: ignore[arg-type]
@@ -262,6 +263,7 @@ class TrustedPolicyTests(unittest.TestCase):
         forged_receipt = ForgedReceipt(
             "invalid", "invalid", "invalid", "invalid", "invalid", 1,
             "invalid", "invalid", self.now, self.now, self.receipt(snapshot).runtime_binding,
+            "invalid",
         )
         cases = (
             (

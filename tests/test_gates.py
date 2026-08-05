@@ -36,7 +36,7 @@ from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease
 from roundwright.policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.state import SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, transition_task
+from roundwright.state import ReviewLimitFinalizationReceipt, SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, transition_task
 
 
 class GateDecisionTests(unittest.TestCase):
@@ -408,6 +408,41 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 )
             finally:
                 connection.close()
+
+    def test_review_limit_finalization_receipt_is_required_only_for_finalized_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            receipt = ReviewLimitFinalizationReceipt(10, "a" * 64, "b" * 64, seal.candidate_sha, "worker-thread-21", "c" * 64)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "INSERT INTO review_limit_finalizations(task_id, review_round, findings_fingerprint, worker_repair_fingerprint, disposition, candidate_sha, worker_thread_identity, receipt_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (identity.task_id, receipt.review_round, receipt.findings_fingerprint, receipt.worker_repair_fingerprint, "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", receipt.candidate_sha, receipt.worker_thread_identity, receipt.receipt_fingerprint),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            policy_evidence = self.policy_evidence(context)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+            finalized = GateContext(
+                context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task,
+                context.policy_digest, context.receipt_fingerprint, context.runtime_binding,
+                context.selected_supervisor_profile_identity, receipt,
+            )
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, finalized, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.PASS)
+            drifted = ReviewLimitFinalizationReceipt(
+                receipt.review_round, receipt.findings_fingerprint, receipt.worker_repair_fingerprint,
+                receipt.candidate_sha, receipt.worker_thread_identity, "d" * 64,
+            )
+            stale = GateContext(
+                context.task_id, context.candidate_sha, context.source_count, context.isolated_local_task,
+                context.policy_digest, context.receipt_fingerprint, context.runtime_binding,
+                context.selected_supervisor_profile_identity, drifted,
+            )
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, stale, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
 
     def test_activation_receipt_runtime_binding_drift_blocks_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

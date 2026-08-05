@@ -271,7 +271,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
         diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
         provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
         external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
-        process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], lease=lease, now=epoch,
+        process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1, lease=lease, now=epoch,
     )
     record_diff_review(
         repository, identity, candidate_context, binding, seal, diff_review_attempt_id=diff_review.diff_review_attempt_id,

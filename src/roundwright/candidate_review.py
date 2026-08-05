@@ -429,7 +429,8 @@ def dispatch_diff_review(
     message_identity: str,
     process_lease_id: str,
     process_lease_expires_at: int,
-    selected_profile_identity: str | None = None,
+    selected_profile_identity: str,
+    within_round_attempt: int,
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> DiffReviewDispatch:
@@ -447,6 +448,11 @@ def dispatch_diff_review(
     _require_current_candidate(repository, identity, seal, implementation_attempt_id)
     _require_diff_review_context(identity, context, seal)
     verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
+    if type(within_round_attempt) is not int or within_round_attempt not in (1, 2, 3):
+        raise CandidateReviewError("within-round Supervisor attempt is invalid")
+    profiles = context.runtime_binding.supervisor_profile_identities
+    if len(profiles) < within_round_attempt or selected_profile_identity != profiles[within_round_attempt - 1]:
+        raise CandidateReviewError("selected Supervisor profile does not match the within-round attempt")
     if _session_is_plan_review(repository, identity, supervisor_session_identity):
         raise CandidateReviewError("diff review must use a session distinct from plan review")
     input_digest = _digest({"task": identity.task_id, "implementation": implementation_attempt_id, "base": seal.base_sha, "candidate": seal.candidate_sha, "message": message_identity, "verifications": verification_digest})

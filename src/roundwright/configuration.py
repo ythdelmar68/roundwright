@@ -387,7 +387,13 @@ def _validated_authoritative_repository(root: Path) -> Path:
         flags = subprocess.run(["git", "-C", os.fspath(repository.root), "ls-files", "-v", "--", _REPOSITORY_CONFIG], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigurationError("authoritative repository identity is unavailable") from error
-    ordinary_index = not index.stdout.strip() or index.stdout.split()[0] == "100644"
+    index_entries = [line for line in index.stdout.splitlines() if line]
+    ordinary_index = not index_entries
+    if len(index_entries) == 1:
+        fields, separator, path = index_entries[0].partition("\t")
+        parts = fields.split()
+        mode, object_id, stage = parts if separator and len(parts) == 3 else ("", "", "")
+        ordinary_index = mode == "100644" and len(object_id) == 40 and stage == "0" and path == _REPOSITORY_CONFIG
     visible_flags = not flags.stdout.strip() or flags.stdout.startswith("H ")
     if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or index.returncode or flags.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip() or not ordinary_index or not visible_flags:
         raise ConfigurationError("repository configuration is not from authoritative main")

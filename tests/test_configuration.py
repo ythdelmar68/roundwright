@@ -113,6 +113,8 @@ class ConfigurationTests(unittest.TestCase):
                 with mock.patch("roundwright.cli.require_safe_entrypoint_identity"):
                     self.assertEqual(cli.main(["init"]), 0)
             self.assertTrue((main / ".roundwright.toml").is_file())
+            self.assertTrue((main / ".roundwright" / "state.sqlite3").is_file())
+            self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
             self.assertIn("review.max_rounds: repository configuration", output.getvalue())
 
     def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:

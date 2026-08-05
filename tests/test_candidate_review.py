@@ -265,13 +265,19 @@ class CandidateReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, _, binding, _, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")
             finalize_review_limit_repair(
-                repository, identity, binding, repair_seal, review_round=10, max_rounds=10,
+                repository, identity, binding, repair_seal,
                 findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
                 worker_thread_identity="worker-thread-25", lease=lease,
             )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE review_limit_finalizations SET receipt_fingerprint = ? WHERE task_id = ?", ("e" * 64, identity.task_id))
+                connection.commit()
+            finally:
+                connection.close()
             with self.assertRaisesRegex(Exception, "already been consumed"):
                 finalize_review_limit_repair(
-                    repository, identity, binding, repair_seal, review_round=11, max_rounds=11,
+                    repository, identity, binding, repair_seal,
                     findings_fingerprint=findings, worker_repair_fingerprint="d" * 64,
                     worker_thread_identity="worker-thread-25", lease=lease,
                 )

@@ -48,8 +48,9 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
-    def runtime_binding(self) -> RuntimeBinding:
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in "cde"))
+    def runtime_binding(self, supervisor_count: int = 3) -> RuntimeBinding:
+        values = "cdefgh"
+        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, "sha256:" + "b" * 64, tuple("sha256:" + value * 64 for value in values[:supervisor_count]))
 
     def git(self, directory: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True).stdout.strip()
@@ -67,7 +68,7 @@ class CandidateReviewTests(unittest.TestCase):
         self.git(root, "push", "-u", "origin", "main")
         return RepositoryIdentity.from_root(root)
 
-    def ready_task(self, root: Path, *, commit: bool = True):
+    def ready_task(self, root: Path, *, commit: bool = True, supervisor_count: int = 3):
         repository = self.repository(root)
         initialize(repository)
         base = self.git(root, "rev-parse", "HEAD")
@@ -76,7 +77,7 @@ class CandidateReviewTests(unittest.TestCase):
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="test-owner", ttl_seconds=120)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, hashlib.sha256(b"source-25").hexdigest()),), lease=lease)
         begin_planning(repository, identity, evidence_fingerprint="a" * 64, lease=lease)
-        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint="c" * 64, runtime_binding=self.runtime_binding())
+        context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="b" * 64, deployment_fingerprint="c" * 64, runtime_binding=self.runtime_binding(supervisor_count))
         now = int(time.time())
         input_value = PlanningInput("Implement candidate", (), ("Commit locally",), (), ("Unit tests",), (), ())
         plan = WorkerPlan("Implement candidate", (), (), ("Commit locally",), ("Unit tests",), (), (), ())
@@ -162,16 +163,20 @@ class CandidateReviewTests(unittest.TestCase):
         return repository, identity, lease, context, binding, now, routed.content_digest, repair_seal
 
     def test_diff_dispatch_requires_the_exact_within_round_profile(self):
-        cases = ((1, 0, True), (2, 1, True), (3, 2, True), (0, 0, False), (4, 0, False), (1, 1, False), (1, 2, False), (2, 0, False), (2, 2, False), (3, 0, False), (3, 1, False))
-        for ordinal, profile_index, accepted in cases:
-            with self.subTest(ordinal=ordinal, profile=profile_index), tempfile.TemporaryDirectory() as temporary:
-                values = self.ready_task(Path(temporary) / "repository")
+        cases = (
+            (2, 1, 0, True), (2, 2, 1, True), (2, 3, 0, False),
+            (4, 1, 0, True), (4, 2, 1, True), (4, 3, 2, True), (4, 4, 3, True), (4, 5, 3, False),
+            (4, 1, 1, False), (4, 2, 0, False), (4, 3, 1, False), (4, 4, 2, False),
+        )
+        for profile_count, ordinal, profile_index, accepted in cases:
+            with self.subTest(profiles=profile_count, ordinal=ordinal, profile=profile_index), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository", supervisor_count=profile_count)
                 repository, identity, lease, context, binding, now = values
                 implementation, seal = self.implement(values)
                 review_context = self.review_context(identity, context, seal)
                 for verification in (CandidateVerification("map-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64), CandidateVerification("map-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64)):
                     record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
-                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, review_round=4, review_policy=ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE), lease=lease, now=now)
+                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, review_round=4, review_policy=ReviewPolicy(3, 10, profile_count, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE), lease=lease, now=now)
                 if not accepted:
                     with self.assertRaises(CandidateReviewError):
                         _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
@@ -180,7 +185,7 @@ class CandidateReviewTests(unittest.TestCase):
                 self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).selected_profile_identity, arguments["selected_profile_identity"])
                 self.assertEqual((dispatch.within_round_attempt, dispatch.selected_profile_identity), (ordinal, arguments["selected_profile_identity"]))
                 self.assertEqual(candidate_review._read_diff_dispatch(repository, identity, dispatch.diff_review_attempt_id), dispatch)
-                for column, replacement in (("within_round_attempt", 0), ("selected_profile_identity", "")):
+                for column, replacement in (("within_round_attempt", 0), ("selected_profile_identity", ""), ("selected_profile_identity", context.runtime_binding.supervisor_profile_identities[(ordinal % profile_count)]), ("input_digest", "f" * 64)):
                     connection = sqlite3.connect(database_path(repository))
                     try:
                         connection.execute(f"UPDATE diff_review_attempts SET {column} = ? WHERE diff_review_attempt_id = ?", (replacement, dispatch.diff_review_attempt_id))
@@ -239,6 +244,51 @@ class CandidateReviewTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(provider_digest, artifact_digest)
             self.assertNotEqual(provider_digest, raw_digest)
+
+    def test_diff_review_rejects_provider_profile_or_input_drift_before_findings_route(self):
+        for column, replacement in (("selected_profile_identity", "sha256:" + "d" * 64), ("input_fingerprint", "f" * 64)):
+            with self.subTest(column=column), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, context, binding, now = values
+                implementation, seal = self.implement(values)
+                review_context = self.review_context(identity, context, seal)
+                for verification in (
+                    CandidateVerification("provider-drift-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64),
+                    CandidateVerification("provider-drift-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64),
+                ):
+                    record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+                dispatch = dispatch_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id="provider-drift", implementation_attempt_id=implementation.implementation_attempt_id,
+                    provider_attempt_id="provider-drift-supervisor", supervisor_session_identity="provider-drift-session",
+                    external_turn_identity="provider-drift-turn", message_identity="provider-drift-message",
+                    process_lease_id="provider-drift-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+                )
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute(f"UPDATE provider_attempts SET {column} = ? WHERE attempt_id = ?", (replacement, dispatch.provider_attempt_id))
+                    connection.commit()
+                finally:
+                    connection.close()
+                output = DiffReviewOutput(
+                    dispatch.diff_review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity,
+                    dispatch.external_turn_identity, dispatch.message_identity, seal.base_sha, seal.candidate_sha,
+                    DiffReviewVerdict.FINDINGS, ("provider evidence drift",),
+                )
+                with self.assertRaisesRegex(CandidateReviewError, "provider attempt"):
+                    record_diff_review(
+                        repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id,
+                        output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now,
+                    )
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertIsNone(
+                        connection.execute(
+                            "SELECT 1 FROM diff_review_routes WHERE diff_review_attempt_id = ?", (dispatch.diff_review_attempt_id,)
+                        ).fetchone()
+                    )
+                finally:
+                    connection.close()
 
     def test_final_review_limit_repair_rejects_wrong_bound_identity(self):
         cases = (

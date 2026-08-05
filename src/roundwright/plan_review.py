@@ -167,6 +167,7 @@ def dispatch_plan_review(
     plan_attempt_id: str,
     process_lease_id: str,
     process_lease_expires_at: int,
+    selected_profile_identity: str | None = None,
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> PlanReviewDispatch:
@@ -206,7 +207,7 @@ def dispatch_plan_review(
     provider = prepare_attempt(
         repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.SUPERVISOR,
         process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
-        input_fingerprint=input_digest, lease=lease, now=now,
+        input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity, lease=lease, now=now,
     )
     if provider.role is not ProviderRole.SUPERVISOR:
         raise PlanReviewError("review provider attempt has the wrong role")

@@ -400,6 +400,7 @@ def dispatch_diff_review(
     message_identity: str,
     process_lease_id: str,
     process_lease_expires_at: int,
+    selected_profile_identity: str | None = None,
     lease: TransitionLease | None,
     now: int | None = None,
 ) -> DiffReviewDispatch:
@@ -428,7 +429,7 @@ def dispatch_diff_review(
         return existing
     provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.SUPERVISOR,
                                process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
-                               input_fingerprint=input_digest, lease=lease, now=now)
+                               input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity, lease=lease, now=now)
     if provider.state is AttemptState.PREPARED:
         record_session_identity(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, lease=lease, now=now)
         record_external_turn(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, external_turn_identity=external_turn_identity, lease=lease, now=now)

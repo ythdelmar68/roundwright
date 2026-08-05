@@ -88,7 +88,11 @@ def _initialize(output: object) -> int:
         require_safe_entrypoint_identity(sys.argv[0])
         configuration = load_configuration(cwd=Path.cwd())
         preflight(configuration, PreflightMode.READ_ONLY)
-        repository = configuration.repository
+        repository = (
+            RepositoryIdentity.from_root(configuration.repository_configuration_root)
+            if configuration.repository_configuration_root is not None
+            else configuration.repository
+        )
         if repository is None:
             raise ConfigurationError("repository-local state requires a repository root")
         status = initialize(repository)

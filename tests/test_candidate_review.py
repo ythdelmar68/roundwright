@@ -159,6 +159,24 @@ class CandidateReviewTests(unittest.TestCase):
         )
         return repository, identity, lease, context, binding, now, findings.digest, repair_seal
 
+    def test_diff_dispatch_requires_the_exact_within_round_profile(self):
+        cases = ((1, 0, True), (2, 1, True), (3, 2, True), (0, 0, False), (4, 0, False), (1, 1, False), (1, 2, False), (2, 0, False), (2, 2, False), (3, 0, False), (3, 1, False))
+        for ordinal, profile_index, accepted in cases:
+            with self.subTest(ordinal=ordinal, profile=profile_index), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, context, binding, now = values
+                implementation, seal = self.implement(values)
+                review_context = self.review_context(identity, context, seal)
+                for verification in (CandidateVerification("map-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64), CandidateVerification("map-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64)):
+                    record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+                arguments = dict(diff_review_attempt_id="mapping-review", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id="mapping-supervisor", supervisor_session_identity="mapping-session", external_turn_identity="mapping-turn", message_identity="mapping-message", process_lease_id="mapping-lease", process_lease_expires_at=now + 60, selected_profile_identity=context.runtime_binding.supervisor_profile_identities[profile_index], within_round_attempt=ordinal, lease=lease, now=now)
+                if not accepted:
+                    with self.assertRaises(CandidateReviewError):
+                        _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
+                    continue
+                dispatch = _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
+                self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).selected_profile_identity, arguments["selected_profile_identity"])
+
     def test_final_review_limit_repair_is_candidate_bound_idempotent_and_blocks_later_supervisor(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, binding, now, findings, repair_seal = self.final_review_limit_repair(Path(temporary) / "repository")

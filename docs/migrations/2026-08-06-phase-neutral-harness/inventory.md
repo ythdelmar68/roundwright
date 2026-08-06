@@ -20,7 +20,7 @@ The owner scope comment and open issues #2, #3, #4, and #42-#51 were read on
 | #2 umbrella P0 | Material scheduling surface | Add one canonical-link scheduling sentence; no duplicated contract. |
 | #3 umbrella P1 | Material scheduling surface | Add one canonical-link scheduling sentence; no duplicated contract. |
 | #4 umbrella P2 | Material scheduling surface | Add one canonical-link scheduling sentence; no duplicated contract. |
-| #42 provider health | Material | `harness`, live read-only provider qualification. Owner selected content `52b1ad81ca2e13b40f4244f431fad9c231ab4c28` and its factory only for candidate `b1279ff00547c84980bd413076c0b0f9fbbde432`; owner login only if the typed gate requests it. |
+| #42 provider health | Material | `harness`, live read-only provider qualification. Repaired PR #3 content `e5ec738c67130b17a8e723b89a4b567e1873838d` is pending fresh authenticated owner selection for the resulting candidate; historical `52b1ad81ca2e13b40f4244f431fad9c231ab4c28` selection cannot be reused. Owner login only if the typed gate requests it. |
 | #43 Worker adapter | Material | `harness`, bounded live Codex evidence separate from hermetic coverage. |
 | #44 Supervisor adapter | Material | `harness`, bounded live Codex evidence separate from hermetic coverage. |
 | #45 provider accounting | Material | `harness`, candidate-bound provider evidence only. |

@@ -29,13 +29,14 @@ below because its body uses a different heading.
 
 The historical #42 harness content pin
 `681c7e9359a3767892a615ffa032d42b51e7be15` is non-qualifying and must not be
-invoked. For the owner-selected #42 run only, content
-`52b1ad81ca2e13b40f4244f431fad9c231ab4c28` and factory
-`roundwright_harness.native:native_factory` are bound to candidate
-`b1279ff00547c84980bd413076c0b0f9fbbde432` by owner comment `5205387378`.
-It remains distinct from canonical harness main merge
-`2d412311d8ddbeb1db538111126a6e5dd62297b1`; any future candidate requires a
-fresh explicit selection. The public forward-test canonical main currently read back is
+invoked. Historical content `52b1ad81ca2e13b40f4244f431fad9c231ab4c28` and
+merge `2d412311d8ddbeb1db538111126a6e5dd62297b1` are previously-selected
+evidence only. Repaired PR #3 content
+`e5ec738c67130b17a8e723b89a4b567e1873838d`, canonical merge
+`42830db90acbba499989cd434cdc46b4627042e2`, and factory
+`roundwright_harness.native:native_factory` are pending fresh authenticated
+owner selection for the new candidate; no proposal treats them as invocation
+authority. The public forward-test canonical main currently read back is
 `4f39ef0e4e616eb896950d3756c433b624771a97`. These values are recorded as
 exact identities, never as floating references.
 
@@ -51,7 +52,7 @@ exact identities, never as floating references.
 
 | Issue | Route | Class | Owner input | Target note |
 | --- | --- | --- | --- | --- |
-| #42 | `harness` | live read-only SDK/provider qualification | `yes, only if the typed gate blocks for owner login in the approved harness` | `For candidate b1279ff00547c84980bd413076c0b0f9fbbde432, use selected content 52b1ad81ca2e13b40f4244f431fad9c231ab4c28 and factory roundwright_harness.native:native_factory; no forward-test target is selected. A moved candidate requires fresh owner selection.` |
+| #42 | `harness` | live read-only SDK/provider qualification | `yes, only if the typed gate blocks for owner login in the approved harness` | `Require a fresh owner-selected exact harness pin and factory for the resulting candidate. PR #3 content e5ec738c67130b17a8e723b89a4b567e1873838d is pending only; historical 52b1ad81ca2e13b40f4244f431fad9c231ab4c28 cannot be reused. No forward-test target is selected.` |
 | #43 | `harness` | bounded live Codex Worker adapter qualification | `yes, only if a typed provider gate requires it` | `Use the selected exact harness content commit; no remote mutation target.` |
 | #44 | `harness` | bounded live Codex Supervisor attempt qualification | `yes, only if a typed provider gate requires it` | `Use the selected exact harness content commit; no remote mutation target.` |
 | #45 | `harness` | candidate-bound provider/accounting qualification | `yes, only if a typed provider gate requires it` | `Use the selected exact harness content commit; no remote mutation target.` |

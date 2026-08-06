@@ -14,36 +14,52 @@ bounded environment or a disposable test target.
 
 | Role | Public repository | Approved identity | Use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | Selected content: `52b1ad81ca2e13b40f4244f431fad9c231ab4c28`; canonical main merge: `2d412311d8ddbeb1db538111126a6e5dd62297b1`; historical non-qualifying pin: `681c7e9359a3767892a615ffa032d42b51e7be15` | Bounded native read-only provider-health and typed Shadow sequence for the separately bound Roundwright candidate | A Roundwright authority source, a credential store, a floating `main` ref, or an invocation of the historical pin |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | Reviewed pending content: `e5ec738c67130b17a8e723b89a4b567e1873838d`; canonical main merge: `42830db90acbba499989cd434cdc46b4627042e2`; historical prior selection: `52b1ad81ca2e13b40f4244f431fad9c231ab4c28`; historical non-qualifying pin: `681c7e9359a3767892a615ffa032d42b51e7be15` | A future exact candidate-bound selection may use the repaired content only after fresh authenticated owner approval | A Roundwright authority source, a credential store, a floating `main` ref, or an invocation without fresh selection |
 | Remote mutation target | `ythdelmar68/roundlet-forward-test` | Canonical main: `4f39ef0e4e616eb896950d3756c433b624771a97` | A public, disposable target for explicitly approved remote lifecycle/mutation tests | Production, a unique-work target, or authority over Roundwright |
 
-The historical qualification content pin is intentionally **not** silently
-replaced by harness main. `681c7e9359a3767892a615ffa032d42b51e7be15` remains
-non-qualifying and must not be invoked for this or any future candidate. The
-owner selected `52b1ad81ca2e13b40f4244f431fad9c231ab4c28` from merged harness
-PR #2 for one exact Roundwright binding only. Its canonical harness main merge
-is `2d412311d8ddbeb1db538111126a6e5dd62297b1`, whose parents are
-`50230b38aa8cfc371792286f6a14a2b92545c720` and the selected content commit;
-both selected content and merge resolve to tree
-`ec5bdd3f3bafbfdc9d473b2b46f4f3ec9e83c891`. All other superseded PR #2 heads
-remain unselected. A branch name, tag, or `main` is never an authorization or
-evidence identity.
+Historical pins are never silently replaced by harness main. The original
+`681c7e9359a3767892a615ffa032d42b51e7be15` pin remains non-qualifying and must
+not be invoked. The prior content
+`52b1ad81ca2e13b40f4244f431fad9c231ab4c28`, its merge
+`2d412311d8ddbeb1db538111126a6e5dd62297b1`, and factory
+`roundwright_harness.native:native_factory` are historical previously-selected
+evidence for candidate `b1279ff00547c84980bd413076c0b0f9fbbde432`, not current
+invocation authority.
 
-The selected factory is `roundwright_harness.native:native_factory` at the
-selected content commit. The authenticated owner selected it in issue #42
-comment `5205387378` for Roundwright candidate
-`b1279ff00547c84980bd413076c0b0f9fbbde432`; exact-head CI run `31104589401`
-and an independent COMPLETE PASS are supporting evidence, not a waiver. The
-selection permits only the bounded native read-only provider-health and typed
-Shadow sequence for that exact candidate. It does not invoke either gate
-automatically, authorize credentials, provider work, review, CI, merge, or any
-mutation. Once the candidate moves, a later run must reconcile and persist a
-fresh owner-bound selection; it cannot reuse this record by inference.
+Harness PR #3 repaired content
+`e5ec738c67130b17a8e723b89a4b567e1873838d`; its canonical main merge is
+`42830db90acbba499989cd434cdc46b4627042e2`, with parents
+`2d412311d8ddbeb1db538111126a6e5dd62297b1` and the repaired content. Both
+resolve to tree `4107953c2d9a97c0446a5a9789bd823493cf4839`. Exact-head CI run
+`31115923833` succeeded and independent COMPLETE review reported VALID/PASS
+without findings, as curated in Roundwright PR #57 comment `5207059725`.
+Those facts record reviewed repair content only. The repaired harness and its
+factory remain pending a fresh authenticated owner selection bound to the new
+resulting Roundwright candidate; all superseded PR #2 heads remain unselected. A
+branch name, tag, or `main` is never an authorization or evidence identity.
 
 Any selected factory consumes already-resolved native channels; it does not
 discover credentials, load tokens, or automate login. `uv` may be global or
 per-user; Python environments and all packages remain inside the harness
 repository's repo-local `.venv`, with no global Python package installation.
+
+## Windows execution boundary
+
+The approved Windows host is an ordinary low-privilege user. `uv` is global or
+per-user only; the repository-local `.venv` owns Python and packages. When an
+agent filesystem sandbox denies child execution, the separately authorized live
+host process may permit Python to launch hermetic Git and the pinned Codex
+runtime outside that filesystem sandbox. This is neither administrator
+elevation nor global Python/package installation. The SDK remains deny-all,
+read-only, and ephemeral; this boundary neither selects nor invokes a live
+gate.
+
+## Pre-selection diagnostic evidence
+
+The pre-review/pre-selection READY 5/5 observations, receipts, and manifest
+are non-qualifying diagnostic evidence only. They cannot be carried forward as
+the formal provider-health gate for the resulting candidate. A later selected
+gate must produce and bind its own exact fresh evidence.
 
 ## Routing decision
 

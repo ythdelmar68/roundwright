@@ -29,9 +29,13 @@ below because its body uses a different heading.
 
 The historical #42 harness content pin
 `681c7e9359a3767892a615ffa032d42b51e7be15` is non-qualifying and must not be
-invoked; it remains distinct from canonical harness main
-`50230b38aa8cfc371792286f6a14a2b92545c720`. A future exact replacement needs
-explicit owner selection. The public forward-test canonical main currently read back is
+invoked. For the owner-selected #42 run only, content
+`52b1ad81ca2e13b40f4244f431fad9c231ab4c28` and factory
+`roundwright_harness.native:native_factory` are bound to candidate
+`b1279ff00547c84980bd413076c0b0f9fbbde432` by owner comment `5205387378`.
+It remains distinct from canonical harness main merge
+`2d412311d8ddbeb1db538111126a6e5dd62297b1`; any future candidate requires a
+fresh explicit selection. The public forward-test canonical main currently read back is
 `4f39ef0e4e616eb896950d3756c433b624771a97`. These values are recorded as
 exact identities, never as floating references.
 
@@ -47,7 +51,7 @@ exact identities, never as floating references.
 
 | Issue | Route | Class | Owner input | Target note |
 | --- | --- | --- | --- | --- |
-| #42 | `harness` | live read-only SDK/provider qualification | `yes, only if the typed gate blocks for owner login in the approved harness` | `Use the selected exact harness content commit; no forward-test target is selected for the provider probe.` |
+| #42 | `harness` | live read-only SDK/provider qualification | `yes, only if the typed gate blocks for owner login in the approved harness` | `For candidate b1279ff00547c84980bd413076c0b0f9fbbde432, use selected content 52b1ad81ca2e13b40f4244f431fad9c231ab4c28 and factory roundwright_harness.native:native_factory; no forward-test target is selected. A moved candidate requires fresh owner selection.` |
 | #43 | `harness` | bounded live Codex Worker adapter qualification | `yes, only if a typed provider gate requires it` | `Use the selected exact harness content commit; no remote mutation target.` |
 | #44 | `harness` | bounded live Codex Supervisor attempt qualification | `yes, only if a typed provider gate requires it` | `Use the selected exact harness content commit; no remote mutation target.` |
 | #45 | `harness` | candidate-bound provider/accounting qualification | `yes, only if a typed provider gate requires it` | `Use the selected exact harness content commit; no remote mutation target.` |

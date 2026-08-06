@@ -145,6 +145,28 @@ class ProviderRecoveryTests(unittest.TestCase):
                 record_session_identity(repository, identity, blocked, attempt_id="bound-health", session_identity="blocked-session", lease=lease)
             self.assertIsNone(read_attempt(repository, identity, "bound-health").session_identity)
 
+    def test_existing_dispatched_attempt_never_recreates_a_deleted_health_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("deleted-health"); self.admit(repository, identity, lease)
+            context = self.context(identity); self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="dispatched-health")
+            record_session_identity(repository, identity, context, attempt_id="dispatched-health", session_identity="health-session", lease=lease)
+            record_external_turn(repository, identity, context, attempt_id="dispatched-health", session_identity="health-session", external_turn_identity="health-turn", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("dispatched-health",)); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(ProviderRecoveryError):
+                prepare_attempt(repository, identity, context, attempt_id="dispatched-health", role=ProviderRole.WORKER, process_lease_id="lease-dispatched-health", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            with self.assertRaises(ProviderRecoveryError):
+                record_external_turn(repository, identity, context, attempt_id="dispatched-health", session_identity="health-session", external_turn_identity="health-turn", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertIsNone(connection.execute("SELECT 1 FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("dispatched-health",)).fetchone())
+            finally:
+                connection.close()
+
     def test_external_turn_without_verified_completion_blocks_without_duplicate_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))

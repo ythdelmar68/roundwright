@@ -1,10 +1,12 @@
 """Explicit, bounded provider-health qualification fixture; no environment harness."""
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import dataclass
 
 from .configuration import Configuration
-import re
 from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationReport, RoleBoundCodexCredentialStore, required_provider_selections
 from .provider_recovery import ProviderRole
 
@@ -30,7 +32,7 @@ class LiveProviderHealthFixtureResult:
             raise ProviderHealthError("live provider health fixture result is invalid") from error
 
     def owner_safe_evidence(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema": "roundwright-live-provider-health/v1", "ready_at": self.ready_at,
             "ready": self.report.ready_at(self.ready_at), "contract_commit": self.contract_commit,
             "candidate_sha": self.candidate_sha, "case_id": self.case_id,
@@ -41,6 +43,18 @@ class LiveProviderHealthFixtureResult:
             "receipts": tuple(receipt.evidence() for receipt in self.receipts),
             "receipt_digests": tuple(receipt.receipt_digest for receipt in self.receipts),
         }
+        shadow_case_identity = _digest({"contract_commit": self.contract_commit, "candidate_sha": self.candidate_sha,
+                                        "case_id": self.case_id, "configuration": self.report.configuration.complete_columns()})
+        return {**payload, "manifest": {
+            "schema": "roundwright-live-provider-health-manifest/v1",
+            "shadow_case_identity": shadow_case_identity,
+            "reference_identity": shadow_case_identity,
+            "comparator_version": "provider-health-receipt/v1",
+            "normalizer_version": "roundwright-json-tuples/v1",
+            "environment_identity": "native-read-only",
+            "retention_identity": "orchestrator-capture-required",
+            "bundle_digest": _digest(payload),
+        }}
 
 
 def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:
@@ -65,3 +79,7 @@ def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStor
         return LiveProviderHealthFixtureResult(report, tuple(receipts), now, contract_commit, candidate_sha, case_id)
     except Exception as error:
         raise ProviderHealthError("live provider health fixture is blocked") from error
+
+
+def _digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

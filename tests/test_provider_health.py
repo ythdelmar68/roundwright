@@ -286,6 +286,14 @@ class ProviderHealthTests(unittest.TestCase):
         with self.assertRaises(ProviderHealthError):
             ProviderHealthAuditIdentity.from_evidence(tampered)
 
+    def test_audit_evidence_excludes_profile_names_and_rejects_private_capabilities(self):
+        named = ProviderHealthAuditIdentity(self.audit, ProviderProfile(self.profile.model, self.profile.reasoning_effort, "secret-token C:/private/payload"))
+        rendered = repr(named.evidence()).lower()
+        self.assertFalse(any(value in rendered for value in ("secret-token", "c:/private", "payload")))
+        unsafe_audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(self.profile.model, "high"), CodexCapability("secret-token", "high")))
+        with self.assertRaises(ProviderHealthError):
+            ProviderHealthAuditIdentity(unsafe_audit, self.profile)
+
     def test_role_bound_credential_identity_denies_every_other_role(self):
         identity = RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.WORKER, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.WORKER))
         self.assertEqual(RoleBoundCredentialIdentity.from_evidence(identity.evidence()), identity)

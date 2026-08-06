@@ -77,11 +77,23 @@ class ShadowTests(unittest.TestCase):
                        "observations": tuple(item.observation.evidence() for item in receipts)},
             "receipts": tuple(item.evidence() for item in receipts), "receipt_digests": tuple(item.receipt_digest for item in receipts),
         }
+        case_identity = "sha256:" + hashlib.sha256(json.dumps({"contract_commit": emitted["contract_commit"], "candidate_sha": emitted["candidate_sha"], "case_id": emitted["case_id"], "configuration": binding.complete_columns()}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        emitted["manifest"] = {"schema": "roundwright-live-provider-health-manifest/v1", "shadow_case_identity": case_identity, "reference_identity": case_identity, "comparator_version": "provider-health-receipt/v1", "normalizer_version": "roundwright-json-tuples/v1", "environment_identity": "native-read-only", "retention_identity": "orchestrator-capture-required", "bundle_digest": ""}
+        emitted["manifest"]["bundle_digest"] = "sha256:" + hashlib.sha256(json.dumps({key: value for key, value in emitted.items() if key != "manifest"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         replayed = rehydrate_live_provider_health_evidence(json.loads(json.dumps(emitted)))
         self.assertEqual(len(replayed), 3)
         self.assertEqual(compare_provider_health_receipt(receipt.evidence(), replayed[0].evidence(), now=101).outcome, ComparisonOutcome.MATCH)
         for mutate in (lambda value: value["receipts"][0].__setitem__("receipt_digest", "sha256:" + "0" * 64), lambda value: value.__setitem__("extra", True)):
             tampered = json.loads(json.dumps(emitted)); mutate(tampered)
+            with self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(tampered)
+        def refresh_manifest(value):
+            value["manifest"]["bundle_digest"] = "sha256:" + hashlib.sha256(json.dumps({key: item for key, item in value.items() if key != "manifest"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        timestamp = json.loads(json.dumps(emitted)); timestamp["ready_at"] = 102
+        manifest_digest = json.loads(json.dumps(emitted)); manifest_digest["manifest"]["bundle_digest"] = "sha256:" + "0" * 64
+        noncanonical = json.loads(json.dumps(emitted)); noncanonical["report"]["configuration"][3] = json.dumps([supervisor_id], separators=(",", ":")) + " "; refresh_manifest(noncanonical)
+        ignored_value = json.loads(json.dumps(emitted)); ignored_value["report"]["configuration"][3] = '{"ignored":"secret-token"}'; refresh_manifest(ignored_value)
+        for tampered in (timestamp, manifest_digest, noncanonical, ignored_value):
             with self.assertRaises(Exception):
                 rehydrate_live_provider_health_evidence(tampered)
     def identity(self) -> ShadowIdentity:

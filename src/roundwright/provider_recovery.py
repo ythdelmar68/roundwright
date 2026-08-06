@@ -202,7 +202,7 @@ def prepare_attempt(
         if existing is not None:
             row = _attempt_row(connection, identity.task_id, attempt_id)
             _require_persisted_context(connection, attempt_id, context)
-            _persist_health_authorization(connection, attempt_id, receipt)
+            _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
             if (
                 row.role is not role
                 or row.process_lease_id != process_lease_id
@@ -862,18 +862,22 @@ def _persist_health_authorization(connection, attempt_id: str, receipt) -> None:
         "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
-    if existing is None:
-        connection.execute(
-            "INSERT INTO provider_attempt_health_authorizations(attempt_id, contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (attempt_id, *expected),
-        )
-    elif existing != expected:
-        raise ProviderRecoveryError("provider health authorization has drifted")
+    if existing is not None:
+        raise ProviderRecoveryError("provider health authorization already exists")
+    connection.execute(
+        "INSERT INTO provider_attempt_health_authorizations(attempt_id, contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (attempt_id, *expected),
+    )
 
 
 def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> None:
     receipt = _require_health_authorization(context, role, profile_identity, observed)
-    _persist_health_authorization(connection, attempt_id, receipt)
+    existing = connection.execute(
+        "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if existing != _health_authorization_values(receipt):
+        raise ProviderRecoveryError("provider health authorization is unavailable or has drifted")
 
 
 def _require_session_checkpoint(

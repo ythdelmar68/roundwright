@@ -107,11 +107,16 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
     try:
         from .provider_health import ProviderHealthReceipt, ProviderHealthObservation, required_provider_selections
         from .runtime_binding import RuntimeBinding
-        required = {"schema", "ready_at", "ready", "contract_commit", "candidate_sha", "case_id", "report", "receipts", "receipt_digests"}
+        required = {"schema", "ready_at", "ready", "contract_commit", "candidate_sha", "case_id", "report", "receipts", "receipt_digests", "manifest"}
         if type(evidence) is not dict or set(evidence) != required or evidence["schema"] != "roundwright-live-provider-health/v1" or type(evidence["ready_at"]) is not int or evidence["ready"] is not True:
             raise ValueError
         value = normalize(evidence)
-        if type(value) is not dict or type(value["report"]) is not dict or set(value["report"]) != {"health_contract_identity", "configuration", "selections", "observations"} or type(value["receipts"]) is not tuple or type(value["receipt_digests"]) is not tuple:
+        if type(value) is not dict or type(value["report"]) is not dict or set(value["report"]) != {"health_contract_identity", "configuration", "selections", "observations"} or type(value["receipts"]) is not tuple or type(value["receipt_digests"]) is not tuple or type(value["manifest"]) is not dict:
+            raise ValueError
+        manifest = value["manifest"]
+        manifest_keys = {"schema", "shadow_case_identity", "reference_identity", "comparator_version", "normalizer_version", "environment_identity", "retention_identity", "bundle_digest"}
+        payload = {key: item for key, item in value.items() if key != "manifest"}
+        if set(manifest) != manifest_keys or manifest["schema"] != "roundwright-live-provider-health-manifest/v1" or manifest["comparator_version"] != "provider-health-receipt/v1" or manifest["normalizer_version"] != "roundwright-json-tuples/v1" or manifest["environment_identity"] != "native-read-only" or manifest["retention_identity"] != "orchestrator-capture-required" or type(manifest["bundle_digest"]) is not str or manifest["bundle_digest"] != _live_digest(payload):
             raise ValueError
         receipts = tuple(ProviderHealthReceipt.from_evidence(item) for item in value["receipts"])
         report = value["report"]
@@ -119,7 +124,13 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
         columns = report["configuration"]
         if type(columns) is not tuple or len(columns) != 9 or type(columns[3]) is not str:
             raise ValueError
-        binding = RuntimeBinding(columns[0], columns[1], columns[2], tuple(json.loads(columns[3])), *columns[4:])
+        supervisor_profiles = json.loads(columns[3])
+        if type(supervisor_profiles) is not list or not supervisor_profiles or any(type(item) is not str for item in supervisor_profiles) or json.dumps(supervisor_profiles, separators=(",", ":")) != columns[3]:
+            raise ValueError
+        binding = RuntimeBinding(columns[0], columns[1], columns[2], tuple(supervisor_profiles), *columns[4:])
+        shadow_case_identity = _live_digest({"contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "configuration": binding.complete_columns()})
+        if manifest["shadow_case_identity"] != shadow_case_identity or manifest["reference_identity"] != shadow_case_identity:
+            raise ValueError
         if report["health_contract_identity"] != receipts[0].observation.health_contract_identity or tuple((item[0], item[1], item[2]) for item in selections) != tuple((ordinal, role.value, profile) for ordinal, role, profile in required_provider_selections(binding)):
             raise ValueError
         if not receipts or len(receipts) != len(selections) or len(receipts) != len(observations) or len(receipts) != len(value["receipt_digests"]):
@@ -134,6 +145,10 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
         return receipts
     except Exception as error:
         raise ShadowError("live provider health evidence is invalid") from error
+
+
+def _live_digest(value: object) -> str:
+    return "sha256:" + _digest(value)
 
 
 class MismatchDisposition(StrEnum):

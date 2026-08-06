@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Mapping, Protocol
 
@@ -49,6 +49,8 @@ class ProbeKind(StrEnum):
 _SEMVER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_PUBLIC_MODELS = frozenset({"gpt-5.6-terra", "gpt-5.6-sol"})
+_PUBLIC_REASONING_EFFORTS = frozenset(item.value for item in ReasoningEffort)
 
 
 @dataclass(frozen=True)
@@ -120,15 +122,22 @@ class ProviderHealthAuditIdentity:
     """Exact, redacted audit/profile identity for later receipt binding."""
 
     audit: CodexRuntimeAudit
-    profile: ProviderProfile
+    profile: ProviderProfile = field(compare=False)
+    profile_identity_value: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
-        if type(self.audit) is not CodexRuntimeAudit or type(self.profile) is not ProviderProfile or not self.audit.supports(self.profile):
+        if (
+            type(self.audit) is not CodexRuntimeAudit or type(self.profile) is not ProviderProfile
+            or (self.profile_identity_value != "" and (type(self.profile_identity_value) is not str or not _DIGEST.fullmatch(self.profile_identity_value)))
+            or self.profile.model not in _PUBLIC_MODELS or self.profile.reasoning_effort.value not in _PUBLIC_REASONING_EFFORTS
+            or any(item.model not in _PUBLIC_MODELS or item.reasoning_effort not in _PUBLIC_REASONING_EFFORTS for item in self.audit.capabilities)
+            or not self.audit.supports(self.profile)
+        ):
             raise ProviderHealthError("provider audit identity is invalid")
 
     @property
     def profile_identity(self) -> str:
-        return profile_fingerprint(self.profile)
+        return self.profile_identity_value or profile_fingerprint(self.profile)
 
     @property
     def runtime_fingerprint(self) -> str:
@@ -138,17 +147,17 @@ class ProviderHealthAuditIdentity:
         return {"sdk_version": self.audit.sdk_version, "runtime_version": self.audit.runtime_version,
                 "capabilities": tuple((item.model, item.reasoning_effort) for item in self.audit.capabilities),
                 "model": self.profile.model, "reasoning_effort": self.profile.reasoning_effort.value,
-                "name": self.profile.name, "profile_identity": self.profile_identity,
+                "profile_identity": self.profile_identity,
                 "runtime_fingerprint": self.runtime_fingerprint}
 
     @classmethod
     def from_evidence(cls, evidence: Mapping[str, object]) -> "ProviderHealthAuditIdentity":
-        keys = {"sdk_version", "runtime_version", "capabilities", "model", "reasoning_effort", "name", "profile_identity", "runtime_fingerprint"}
-        if type(evidence) is not dict or set(evidence) != keys or type(evidence["capabilities"]) is not tuple or type(evidence["name"]) not in {str, type(None)}:
+        keys = {"sdk_version", "runtime_version", "capabilities", "model", "reasoning_effort", "profile_identity", "runtime_fingerprint"}
+        if type(evidence) is not dict or set(evidence) != keys or type(evidence["capabilities"]) is not tuple:
             raise ProviderHealthError("provider audit identity evidence is invalid")
         try:
             capabilities = tuple(CodexCapability(model, effort) for model, effort in evidence["capabilities"])
-            identity = cls(CodexRuntimeAudit(evidence["sdk_version"], evidence["runtime_version"], capabilities), ProviderProfile(evidence["model"], ReasoningEffort(evidence["reasoning_effort"]), evidence["name"]))
+            identity = cls(CodexRuntimeAudit(evidence["sdk_version"], evidence["runtime_version"], capabilities), ProviderProfile(evidence["model"], ReasoningEffort(evidence["reasoning_effort"])), evidence["profile_identity"])
         except (TypeError, ValueError) as error:
             raise ProviderHealthError("provider audit identity evidence is invalid") from error
         if type(evidence["profile_identity"]) is not str or type(evidence["runtime_fingerprint"]) is not str or (identity.profile_identity, identity.runtime_fingerprint) != (evidence["profile_identity"], evidence["runtime_fingerprint"]):
@@ -241,7 +250,10 @@ class ProviderHealthReceipt:
         try:
             if len(values) != 9 or type(values[3]) is not str:
                 raise ValueError
-            binding = RuntimeBinding(values[0], values[1], values[2], tuple(json.loads(values[3])), *values[4:])
+            supervisor_profiles = json.loads(values[3])
+            if type(supervisor_profiles) is not list or not supervisor_profiles or any(type(item) is not str for item in supervisor_profiles) or json.dumps(supervisor_profiles, separators=(",", ":")) != values[3]:
+                raise ValueError
+            binding = RuntimeBinding(values[0], values[1], values[2], tuple(supervisor_profiles), *values[4:])
             observation = ProviderHealthObservation.from_evidence(evidence["observation"])
             return cls(evidence["contract_commit"], evidence["candidate_sha"], evidence["case_id"], evidence["selection_ordinal"], binding, ProviderRole(evidence["role"]), evidence["profile_identity"], observation, ProviderHealthAuditIdentity.from_evidence(evidence["audit_identity"]), evidence["schema"], evidence["receipt_digest"])
         except (TypeError, ValueError) as error:

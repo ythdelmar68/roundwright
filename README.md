@@ -100,6 +100,11 @@ keeps implementation phase separate from operational maturity. The
 the permanent read-only comparison layer; neither document grants runtime or
 repository mutation authority.
 
+The [qualification test infrastructure](docs/operations/qualification-test-infrastructure.md)
+is the single routing source for separately approved external credentials,
+cross-environment execution, and disposable remote lifecycle tests. It pins
+toolbox and target commits and remains non-authoritative.
+
 ## Development check
 
 Use Python 3.12:

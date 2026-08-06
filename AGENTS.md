@@ -7,6 +7,14 @@
 - Read and use [Conventional Branch](https://conventional-branch.github.io/) to create descriptive branch names.
 - Update `.gitignore` for new build artifacts or dependencies.
 
+## External validation routing
+
+Before a task or gate that may require external credentials, cross-environment
+execution, or remote GitHub lifecycle testing, read
+[`docs/operations/qualification-test-infrastructure.md`](docs/operations/qualification-test-infrastructure.md).
+That document is routing and evidence guidance only: it does not grant
+Roundwright authority or activate its disabled runtime surface.
+
 <!-- roundlet-bootstrap-policy:start -->
 ## Temporary Roundlet Bootstrap Policy
 

@@ -30,6 +30,10 @@ required evidence, rollback, and owner-only promotion decisions. The
 read-only regression layer. They do not activate Roundwright or weaken the
 active Roundlet bootstrap policy in the root [`AGENTS.md`](../../AGENTS.md).
 
+External credential, environment, and disposable-target routing is defined
+once in the [qualification test infrastructure](../operations/qualification-test-infrastructure.md);
+its commit pins and public-safe evidence requirements do not grant authority.
+
 Exactly one repository-scoped dispatcher may be authoritative for Roundwright
 at a time. A controlled forward-test repository may have only separately
 approved, bounded authority over its own actions; it never becomes a second

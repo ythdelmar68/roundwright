@@ -35,6 +35,15 @@ clean itself.
 state. `ACTIVE` is unavailable unless the owner explicitly establishes it;
 this Phase 3 document does not establish it.
 
+## External qualification routing
+
+The [qualification test infrastructure](qualification-test-infrastructure.md)
+is the single source for selecting the external execution toolbox and, when a
+remote mutation is separately approved, the disposable target. Every gate
+pins an exact candidate and exact infrastructure commits; a floating branch or
+`main` reference is never evidence. The document is routing-only and does not
+change the Phase 2 boundaries or authority matrix below.
+
 ## Phase plan
 
 | Phase | Entry criteria | Work and required evidence | Exit criteria | Authority and rollback | Owner decision |
@@ -48,6 +57,11 @@ this Phase 3 document does not establish it.
 The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
 then #40, #41, #42, #46, and #47. The Phase 3 qualification result may produce
 `PROMOTION_READY` only; it cannot start a canary.
+
+Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for
+canary and cross-environment work; Phase 5 for operations, migration, and
+promotion evaluation; and Phase 6 for release-readiness validation. These are
+evidence routes only and never expand the authority stated in this roadmap.
 
 ## Deferred Phase 5 dependency-review lifecycle
 

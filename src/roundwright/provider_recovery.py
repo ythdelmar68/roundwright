@@ -57,6 +57,7 @@ class RecoveryAction(StrEnum):
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -223,8 +224,8 @@ def prepare_attempt(
             (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, selected_profile),
         )
         _persist_context(connection, attempt_id, context)
-        _persist_health_authorization(connection, attempt_id, receipt)
-        _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, observed)
+        authorization_fingerprint = _persist_health_authorization(connection, attempt_id, receipt, role, selected_profile)
+        _checkpoint(connection, identity.task_id, role, "before-dispatch", attempt_id, context, authorization_fingerprint, observed)
         connection.commit()
     except sqlite3.IntegrityError as error:
         connection.rollback()
@@ -263,19 +264,19 @@ def record_external_turn(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
-        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.state is AttemptState.DISPATCHED and (row.session_identity, row.external_turn_identity) == (session_identity, external_turn_identity):
-            _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context)
+            _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context, authorization_fingerprint)
             connection.commit()
             return row
         if row.state is not AttemptState.PREPARED or row.session_identity != session_identity:
             raise ProviderRecoveryError("external turn identity cannot be replayed for this attempt")
-        _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context)
+        _require_session_checkpoint(connection, identity.task_id, attempt_id, session_identity, context, authorization_fingerprint)
         connection.execute(
             "UPDATE provider_attempts SET external_turn_identity = ?, state = ? WHERE attempt_id = ?",
             (external_turn_identity, AttemptState.DISPATCHED.value, attempt_id),
         )
-        _checkpoint(connection, identity.task_id, row.role, "after-dispatch", attempt_id, context, observed)
+        _checkpoint(connection, identity.task_id, row.role, "after-dispatch", attempt_id, context, authorization_fingerprint, observed)
         connection.commit()
     except sqlite3.IntegrityError as error:
         connection.rollback()
@@ -312,7 +313,7 @@ def record_session_identity(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
-        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.state is not AttemptState.PREPARED:
             raise ProviderRecoveryError("session identity cannot be recorded for this attempt")
         if row.session_identity is not None and row.session_identity != session_identity:
@@ -324,7 +325,7 @@ def record_session_identity(
             "SELECT task_id, session_identity, identity_fingerprint FROM provider_session_checkpoints WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone()
-        expected = (identity.task_id, session_identity, _context_fingerprint(context))
+        expected = (identity.task_id, session_identity, _checkpoint_fingerprint(context, authorization_fingerprint))
         if checkpoint is None:
             connection.execute(
                 "INSERT INTO provider_session_checkpoints(attempt_id, task_id, session_identity, identity_fingerprint, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -604,10 +605,10 @@ def recover_attempt(
             connection.rollback()
             return _projection(row, RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift")
         _validate_context(identity, context)
-        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.state is AttemptState.PREPARED and row.session_identity is not None:
             try:
-                _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context)
+                _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context, authorization_fingerprint)
             except ProviderRecoveryError:
                 connection.rollback()
                 return _projection(row, RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "session-checkpoint-unavailable")
@@ -765,23 +766,23 @@ def _attempt_row(connection, task_id: str, attempt_id: str) -> ProviderAttempt:
         raise ProviderRecoveryError("provider attempt is malformed") from error
 
 
-def _checkpoint(connection, task_id: str, role: ProviderRole, phase: str, attempt_id: str, context: RecoveryContext, observed: int) -> None:
+def _checkpoint(connection, task_id: str, role: ProviderRole, phase: str, attempt_id: str, context: RecoveryContext, authorization_fingerprint: str, observed: int) -> None:
     checkpoint_id = f"{attempt_id}:{phase}"
     connection.execute(
         "INSERT INTO provider_checkpoints(checkpoint_id, task_id, provider_role, checkpoint_phase, attempt_id, identity_fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (checkpoint_id, task_id, role.value, phase, attempt_id, _context_fingerprint(context), observed),
+        (checkpoint_id, task_id, role.value, phase, attempt_id, _checkpoint_fingerprint(context, authorization_fingerprint), observed),
     )
 
 
 def _persist_context(connection, attempt_id: str, context: RecoveryContext) -> None:
     existing = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM provider_attempt_contexts WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     expected = (context.task_id, *_context_values(context))
     if existing is None:
         connection.execute(
-        "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO provider_attempt_contexts(attempt_id, task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (attempt_id, *expected),
         )
     elif existing != expected:
@@ -794,14 +795,14 @@ def _context_matches(connection, identity: TaskIdentity, attempt_id: str, contex
     if not isinstance(context, RecoveryContext) or context.task_id != identity.task_id:
         return False
     existing = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM provider_attempt_contexts WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     expected = (identity.task_id, *_context_values(context))
     return existing == expected
 
 
-def _context_values(context: RecoveryContext) -> tuple[str | None, ...]:
+def _context_values(context: RecoveryContext) -> tuple[object, ...]:
     return (
         context.repository_fingerprint,
         context.worktree_fingerprint,
@@ -810,7 +811,7 @@ def _context_values(context: RecoveryContext) -> tuple[str | None, ...]:
         context.candidate_fingerprint,
         context.policy_fingerprint,
         context.deployment_fingerprint,
-        *context.runtime_binding.columns(),
+        *context.runtime_binding.complete_columns(),
     )
 
 
@@ -855,61 +856,78 @@ def _require_persisted_context(connection, attempt_id: str, context: RecoveryCon
     _persist_context(connection, attempt_id, context)
 
 
-def _health_authorization_values(receipt) -> tuple[object, ...]:
+def _health_authorization_values(receipt, role: ProviderRole, profile_identity: str) -> tuple[object, ...]:
     return (
         receipt.contract_commit, receipt.candidate_sha, receipt.case_id,
         receipt.receipt_digest, receipt.selection_ordinal,
         receipt.observation.fresh_until, receipt.observation.health_contract_identity,
+        role.value, profile_identity,
     )
 
 
-def _persist_health_authorization(connection, attempt_id: str, receipt) -> None:
-    expected = _health_authorization_values(receipt)
+def _health_authorization_fingerprint(attempt_id: str, values: tuple[object, ...]) -> str:
+    if type(attempt_id) is not str or any(type(value) not in {str, int, type(None)} for value in values):
+        raise ProviderRecoveryError("provider health authorization is invalid")
+    return _fingerprint("\x00".join((attempt_id, *("" if value is None else str(value) for value in values))))
+
+
+def _persist_health_authorization(connection, attempt_id: str, receipt, role: ProviderRole, profile_identity: str) -> str:
+    expected = _health_authorization_values(receipt, role, profile_identity)
     existing = connection.execute(
-        "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
+        "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity, provider_role, profile_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     if existing is not None:
         raise ProviderRecoveryError("provider health authorization already exists")
     connection.execute(
-        "INSERT INTO provider_attempt_health_authorizations(attempt_id, contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO provider_attempt_health_authorizations(attempt_id, contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity, provider_role, profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (attempt_id, *expected),
     )
+    fingerprint = _health_authorization_fingerprint(attempt_id, expected)
+    connection.execute(
+        "INSERT INTO provider_attempt_health_seals(attempt_id, authorization_fingerprint) VALUES (?, ?)",
+        (attempt_id, fingerprint),
+    )
+    return fingerprint
 
 
-def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> None:
+def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> str:
     existing = connection.execute(
-        "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
+        "SELECT authorization.contract_commit, authorization.candidate_sha, authorization.case_id, authorization.receipt_digest, authorization.selection_ordinal, authorization.fresh_until, authorization.health_contract_identity, authorization.provider_role, authorization.profile_identity, seals.authorization_fingerprint FROM provider_attempt_health_authorizations AS authorization LEFT JOIN provider_attempt_health_seals AS seals ON seals.attempt_id = authorization.attempt_id WHERE authorization.attempt_id = ?",
         (attempt_id,),
     ).fetchone()
     if (
-        type(existing) is not tuple or len(existing) != 7
+        type(existing) is not tuple or len(existing) != 10
         or type(existing[0]) is not str or not _COMMIT.fullmatch(existing[0])
         or (existing[1] is not None and (type(existing[1]) is not str or not _COMMIT.fullmatch(existing[1])))
         or type(existing[2]) is not str or not _TOKEN.fullmatch(existing[2])
-        or type(existing[3]) is not str or not existing[3].startswith("sha256:")
+        or type(existing[3]) is not str or not _DIGEST.fullmatch(existing[3])
         or type(existing[4]) is not int or existing[4] < 0
         or type(existing[5]) is not int or existing[5] <= observed
-        or type(existing[6]) is not str or not existing[6].startswith("sha256:")
-        # The health receipt is deliberately absent from later checkpoint
-        # contexts: the immutable authorization row created with the attempt
-        # is the evidence being re-used.  Candidate identity is also part of
-        # the sealed recovery context, so it must still agree here; contract
-        # and case are bound by the persisted row itself rather than supplied
-        # again by a caller that could substitute fresh evidence.
+        or type(existing[6]) is not str or not _DIGEST.fullmatch(existing[6])
+        or existing[7] != role.value or existing[8] != profile_identity
         or existing[1] != context.candidate_sha
+        or type(existing[9]) is not str or not _FINGERPRINT.fullmatch(existing[9])
+        or existing[9] != _health_authorization_fingerprint(attempt_id, existing[:9])
     ):
         raise ProviderRecoveryError("provider health authorization is unavailable or has drifted")
+    checkpoint = connection.execute(
+        "SELECT task_id, provider_role, checkpoint_phase, identity_fingerprint FROM provider_checkpoints WHERE checkpoint_id = ?",
+        (f"{attempt_id}:before-dispatch",),
+    ).fetchone()
+    if checkpoint != (context.task_id, role.value, "before-dispatch", _checkpoint_fingerprint(context, existing[9])):
+        raise ProviderRecoveryError("provider health authorization is unavailable or has drifted")
+    return existing[9]
 
 
 def _require_session_checkpoint(
-    connection, task_id: str, attempt_id: str, session_identity: str, context: RecoveryContext
+    connection, task_id: str, attempt_id: str, session_identity: str, context: RecoveryContext, authorization_fingerprint: str
 ) -> None:
     row = connection.execute(
         "SELECT task_id, session_identity, identity_fingerprint FROM provider_session_checkpoints WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
-    if row != (task_id, session_identity, _context_fingerprint(context)):
+    if row != (task_id, session_identity, _checkpoint_fingerprint(context, authorization_fingerprint)):
         raise ProviderRecoveryError("session checkpoint is unavailable or has drifted")
 
 
@@ -975,7 +993,13 @@ def _fingerprint(value: str) -> str:
 
 
 def _context_fingerprint(context: RecoveryContext) -> str:
-    return _fingerprint("\x00".join("" if value is None else value for value in _context_values(context)))
+    return _fingerprint("\x00".join("" if value is None else str(value) for value in _context_values(context)))
+
+
+def _checkpoint_fingerprint(context: RecoveryContext, authorization_fingerprint: str) -> str:
+    if type(authorization_fingerprint) is not str or not _FINGERPRINT.fullmatch(authorization_fingerprint):
+        raise ProviderRecoveryError("provider health authorization is invalid")
+    return _fingerprint(f"{_context_fingerprint(context)}\x00{authorization_fingerprint}")
 
 
 def _clock(now: int | None) -> int:

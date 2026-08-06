@@ -61,7 +61,10 @@ class ShadowTests(unittest.TestCase):
         worker = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         supervisor = ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH)
         worker_id, supervisor_id = profile_fingerprint(worker), profile_fingerprint(supervisor)
-        binding = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, worker_id, (supervisor_id,))
+        binding = RuntimeBinding(
+            "roundwright-runtime/v1", "sha256:" + "a" * 64, worker_id, (supervisor_id,),
+            1, 2, 1, "worker-final-repair-then-merge", "d" * 64,
+        )
         audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(worker.model, "high"), CodexCapability(supervisor.model, "xhigh")))
         receipts = []
         for ordinal, (role, profile, profile_id) in enumerate(((ProviderRole.PLANNING, worker, worker_id), (ProviderRole.WORKER, worker, worker_id), (ProviderRole.SUPERVISOR, supervisor, supervisor_id))):
@@ -101,6 +104,16 @@ class ShadowTests(unittest.TestCase):
             tampered = json.loads(json.dumps(emitted)); tampered["manifest"][field] = replacement
             with self.subTest(manifest_field=field), self.assertRaises(Exception):
                 rehydrate_live_provider_health_evidence(tampered)
+        def refresh_policy_manifest(value):
+            configuration = value["report"]["configuration"]
+            value["manifest"]["shadow_case_identity"] = "sha256:" + hashlib.sha256(json.dumps({"contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "configuration": configuration}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            value["manifest"]["reference_identity"] = "sha256:" + hashlib.sha256(json.dumps({"schema": "roundwright-live-provider-health-reference/v1", "contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "report": value["report"], "receipt_digests": value["receipt_digests"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            value["manifest"]["bundle_digest"] = "sha256:" + hashlib.sha256(json.dumps({"payload": {key: item for key, item in value.items() if key != "manifest"}, "manifest": {key: item for key, item in value["manifest"].items() if key != "bundle_digest"}}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        for index, replacement in ((4, 2), (5, 3), (6, 2), (7, "drift"), (8, "f" * 64)):
+            policy_drift = {**emitted, "report": {**emitted["report"], "configuration": tuple((*emitted["report"]["configuration"][:index], replacement, *emitted["report"]["configuration"][index + 1:]))}, "manifest": dict(emitted["manifest"])}
+            refresh_policy_manifest(policy_drift)
+            with self.subTest(policy_column=index), self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(policy_drift)
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",

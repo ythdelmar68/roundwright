@@ -141,9 +141,10 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
             if type(selection) is not tuple or len(selection) != 3 or selection[0] != ordinal or type(digest) is not str or receipt.receipt_digest != digest:
                 raise ValueError
             observation = ProviderHealthObservation.from_evidence(raw_observation)
-            if (receipt.contract_commit, receipt.candidate_sha, receipt.case_id, receipt.selection_ordinal, receipt.configuration, receipt.role.value, receipt.profile_identity, receipt.observation) != (value["contract_commit"], value["candidate_sha"], value["case_id"], ordinal, binding, selection[1], selection[2], observation) or observation.health_contract_identity != report["health_contract_identity"]:
+            if (receipt.contract_commit, receipt.candidate_sha, receipt.case_id, receipt.selection_ordinal, receipt.role.value, receipt.profile_identity, receipt.observation) != (value["contract_commit"], value["candidate_sha"], value["case_id"], ordinal, selection[1], selection[2], observation) or observation.health_contract_identity != report["health_contract_identity"]:
                 raise ValueError
-            receipt.authorize(receipt.configuration, receipt.role, receipt.profile_identity, contract_commit=value["contract_commit"], candidate_sha=value["candidate_sha"], case_id=value["case_id"], now=value["ready_at"])
+            binding.require_matches(receipt.configuration)
+            receipt.authorize(binding, receipt.role, receipt.profile_identity, contract_commit=value["contract_commit"], candidate_sha=value["candidate_sha"], case_id=value["case_id"], now=value["ready_at"])
         return receipts
     except Exception as error:
         raise ShadowError("live provider health evidence is invalid") from error

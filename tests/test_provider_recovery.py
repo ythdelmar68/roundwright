@@ -40,7 +40,10 @@ from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database
 class ProviderRecoveryTests(unittest.TestCase):
     def runtime_binding(self) -> RuntimeBinding:
         profile = profile_fingerprint(ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH))
-        return RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, profile, (profile, profile, profile))
+        return RuntimeBinding(
+            "roundwright-runtime/v1", "sha256:" + "a" * 64, profile, (profile, profile, profile),
+            1, 3, 3, "worker-final-repair-then-merge", "b" * 64,
+        )
 
     def repository(self, root: Path) -> RepositoryIdentity:
         identity = object.__new__(RepositoryIdentity)
@@ -161,6 +164,16 @@ class ProviderRecoveryTests(unittest.TestCase):
                 connection.execute("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("dispatched-health",)); connection.commit()
             finally:
                 connection.close()
+            with self.assertRaises(ProviderRecoveryError):
+                prepare_attempt(repository, identity, context, attempt_id="dispatched-health", role=ProviderRole.WORKER, process_lease_id="lease-dispatched-health", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            with self.assertRaises(ProviderRecoveryError):
+                record_external_turn(repository, identity, context, attempt_id="dispatched-health", session_identity="health-session", external_turn_identity="health-turn", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertIsNone(connection.execute("SELECT 1 FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("dispatched-health",)).fetchone())
+                self.assertIsNotNone(connection.execute("SELECT 1 FROM provider_attempt_health_seals WHERE attempt_id = ?", ("dispatched-health",)).fetchone())
+            finally:
+                connection.close()
 
     def test_every_later_transition_fails_when_its_authorization_row_is_deleted(self) -> None:
         for operation in ("complete", "invalid", "accept", "invalidate", "recover"):
@@ -186,6 +199,59 @@ class ProviderRecoveryTests(unittest.TestCase):
                     elif operation == "accept": accept_supervisor_review(repository, identity, context, attempt_id=attempt, accepted_review_identity="accepted", lease=lease)
                     elif operation == "invalidate": invalidate_supervisor_attempt(repository, identity, context, attempt_id=attempt, lease=lease)
                     else: recover_attempt(repository, identity, context, attempt_id=attempt, max_attempts=2, lease=lease)
+
+    def test_every_authorization_field_is_sealed_against_later_transition_drift(self) -> None:
+        mutations = (
+            ("contract_commit", "a" * 40, "not-a-commit"), ("candidate_sha", "a" * 40, "not-a-commit"),
+            ("case_id", "case-drift", ""), ("receipt_digest", "sha256:" + "f" * 64, "malformed"),
+            ("selection_ordinal", 0, -1), ("fresh_until", 2_000_000_001, 0),
+            ("health_contract_identity", "sha256:" + "f" * 64, "malformed"),
+            ("provider_role", ProviderRole.PLANNING.value, "invalid-role"),
+            ("profile_identity", "sha256:" + "f" * 64, "malformed"),
+        )
+        operations = ("complete", "invalid", "accept", "invalidate", "recover")
+        for operation in operations:
+            for column, valid_drift, malformed in mutations:
+                for variant, replacement in (("drift", valid_drift), ("malformed", malformed)):
+                    with self.subTest(operation=operation, column=column, variant=variant), tempfile.TemporaryDirectory() as temporary:
+                        repository = self.repository(Path(temporary)); initialize(repository)
+                        lease = self.lease(repository)
+                        role = ProviderRole.SUPERVISOR if operation in {"accept", "invalidate"} else ProviderRole.WORKER
+                        identity = self.identity(f"sealed-{operation}-{column}"); self.admit(repository, identity, lease)
+                        context = self.context(identity, role=role); attempt = f"sealed-{operation}"
+                        self.prepare(repository, identity, lease, role=role, attempt=attempt)
+                        if operation in {"complete", "invalid", "accept"}:
+                            record_session_identity(repository, identity, context, attempt_id=attempt, session_identity="sealed-session", lease=lease)
+                            record_external_turn(repository, identity, context, attempt_id=attempt, session_identity="sealed-session", external_turn_identity="sealed-turn", lease=lease)
+                        if operation == "accept":
+                            record_completed_output(repository, identity, context, attempt_id=attempt, output_pointer="sealed-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+                        connection = sqlite3.connect(database_path(repository))
+                        try:
+                            connection.execute(f"UPDATE provider_attempt_health_authorizations SET {column} = ? WHERE attempt_id = ?", (replacement, attempt)); connection.commit()
+                        finally:
+                            connection.close()
+                        with self.assertRaises(ProviderRecoveryError):
+                            if operation == "complete": record_completed_output(repository, identity, context, attempt_id=attempt, output_pointer="output", completion_evidence_fingerprint="e" * 64, lease=lease)
+                            elif operation == "invalid": record_invalid_output(repository, identity, context, attempt_id=attempt, output_pointer="output", output_fingerprint="f" * 64, reason_fingerprint="e" * 64, lease=lease)
+                            elif operation == "accept": accept_supervisor_review(repository, identity, context, attempt_id=attempt, accepted_review_identity="accepted", lease=lease)
+                            elif operation == "invalidate": invalidate_supervisor_attempt(repository, identity, context, attempt_id=attempt, lease=lease)
+                            else: recover_attempt(repository, identity, context, attempt_id=attempt, max_attempts=2, lease=lease)
+
+    def test_original_checkpoint_rejects_a_recomputed_authorization_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("recomputed-seal"); self.admit(repository, identity, lease)
+            context = self.context(identity); self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="sealed-attempt")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_attempt_health_authorizations SET contract_commit = ? WHERE attempt_id = ?", ("a" * 40, "sealed-attempt"))
+                values = connection.execute("SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity, provider_role, profile_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("sealed-attempt",)).fetchone()
+                replacement = hashlib.sha256("\x00".join(("sealed-attempt", *("" if value is None else str(value) for value in values))).encode()).hexdigest()
+                connection.execute("UPDATE provider_attempt_health_seals SET authorization_fingerprint = ? WHERE attempt_id = ?", (replacement, "sealed-attempt")); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(ProviderRecoveryError):
+                recover_attempt(repository, identity, context, attempt_id="sealed-attempt", max_attempts=1, lease=lease)
     def test_external_turn_without_verified_completion_blocks_without_duplicate_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))
@@ -365,6 +431,16 @@ class ProviderRecoveryTests(unittest.TestCase):
                     )
                     self.assertEqual(recovery.next_action, RecoveryAction.BLOCKED_IDENTITY_DRIFT)
                     self.assertEqual(recovery.blocker, "identity-drift")
+            for field, value in (
+                ("review_complete_rounds", 2), ("review_max_rounds", 4),
+                ("review_max_supervisor_attempts_per_round", 2),
+                ("review_on_final_findings", "drift"), ("review_policy_digest", "f" * 64),
+            ):
+                drifted_binding = replace(context.runtime_binding)
+                object.__setattr__(drifted_binding, field, value)
+                with self.subTest(field=field):
+                    recovery = recover_attempt(repository, identity, replace(context, runtime_binding=drifted_binding), attempt_id="candidate-drift", max_attempts=1, lease=lease)
+                    self.assertEqual((recovery.next_action, recovery.blocker), (RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift"))
             self.assertEqual(read_attempt(repository, identity, "candidate-drift").state, AttemptState.PREPARED)
             self.assertNotIn(identity.worktree, repr(recovery))
             connection = sqlite3.connect(database_path(repository))

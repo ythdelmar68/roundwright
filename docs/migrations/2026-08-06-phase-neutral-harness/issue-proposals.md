@@ -8,9 +8,10 @@ name is a substitute.
 
 ## Shared leaf declaration
 
-For a material leaf, insert the following heading immediately before its
-existing `## Shadow impact` heading, replacing the bracketed values with the
-row-specific values below:
+For material leaves #42-#50, insert the following heading immediately before
+the existing `## Shadow impact` heading, replacing the bracketed values with
+the row-specific values below. Issue #51 has the dedicated deterministic patch
+below because its body uses a different heading.
 
 ```markdown
 ## External validation declaration
@@ -26,10 +27,11 @@ row-specific values below:
   raw provider/CLI payloads or prose, raw logs, or private paths.
 ```
 
-For the current #42 qualification run, the already-approved harness content
-pin is `681c7e9359a3767892a615ffa032d42b51e7be15`; it remains distinct from
-canonical harness main `50230b38aa8cfc371792286f6a14a2b92545c720`. The public
-forward-test canonical main currently read back is
+The historical #42 harness content pin
+`681c7e9359a3767892a615ffa032d42b51e7be15` is non-qualifying and must not be
+invoked; it remains distinct from canonical harness main
+`50230b38aa8cfc371792286f6a14a2b92545c720`. A future exact replacement needs
+explicit owner selection. The public forward-test canonical main currently read back is
 `4f39ef0e4e616eb896950d3756c433b624771a97`. These values are recorded as
 exact identities, never as floating references.
 
@@ -55,6 +57,27 @@ exact identities, never as floating references.
 | #49 | `harness+forward-test` | live read-only Shadow against a disposable target | `yes, only if a typed harness/provider or GitHub gate requires owner input` | `Select exact harness and forward-test commits; the target is public, disposable, read-only for this Phase 3 Shadow scope, and never production or unique work.` |
 | #50 | `harness+forward-test` | integrated external-boundary proof | `yes, only in the approved harness when a typed gate requires it` | `Select exact harness and forward-test commits; any remote mutation remains separately denied or owner-authorized.` |
 | #51 | `none` | qualification-gate evidence consumption | `no` | `Cite already-selected exact candidate/harness/target evidence; the gate itself does not invoke a provider or remote target.` |
+
+## #51 dedicated declaration patch
+
+Insert this complete section immediately before the existing
+`## Shadow protocol and qualification references` heading in #51:
+
+```markdown
+## External validation declaration
+
+- External validation: `none` for this evidence-consumption gate.
+- Gate/evidence class: qualification-gate evidence consumption.
+- Owner input/login required: `no`; any prior live gate retains its own typed
+  owner-input boundary.
+- Exact candidate/target identity: cite the already-persisted Roundwright
+  base/candidate SHA, exact owner-selected harness commit, and exact
+  forward-test commit when one was used. Never use a floating ref or replace a
+  prior pin.
+- Public-safe evidence boundary: exact public commit/case/receipt-or-manifest
+  digest, typed result, and semantic read-back only; never credentials, tokens,
+  raw provider/CLI payloads or prose, raw logs, or private paths.
+```
 
 ## #49 stale-wording replacement
 

@@ -107,8 +107,8 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
     try:
         from .provider_health import ProviderHealthReceipt, ProviderHealthObservation, required_provider_selections
         from .runtime_binding import RuntimeBinding
-        required = {"schema", "ready_at", "ready", "contract_commit", "candidate_sha", "case_id", "report", "receipts", "receipt_digests", "manifest"}
-        if type(evidence) is not dict or set(evidence) != required or evidence["schema"] != "roundwright-live-provider-health/v1" or type(evidence["ready_at"]) is not int or evidence["ready"] is not True:
+        required = {"schema", "ready_at", "ready", "status", "contract_commit", "candidate_sha", "case_id", "report", "receipts", "receipt_digests", "manifest"}
+        if type(evidence) is not dict or set(evidence) != required or evidence["schema"] != "roundwright-live-provider-health/v1" or type(evidence["ready_at"]) is not int or evidence["ready"] is not True or evidence["status"] != "ready":
             raise ValueError
         value = normalize(evidence)
         if type(value) is not dict or type(value["report"]) is not dict or set(value["report"]) != {"health_contract_identity", "configuration", "selections", "observations"} or type(value["receipts"]) is not tuple or type(value["receipt_digests"]) is not tuple or type(value["manifest"]) is not dict:

@@ -14,7 +14,7 @@
 ## Pin and wording checks
 
 - Harness canonical main: `50230b38aa8cfc371792286f6a14a2b92545c720`.
-- Current qualification content pin: `681c7e9359a3767892a615ffa032d42b51e7be15`.
+- Historical non-qualifying qualification pin: `681c7e9359a3767892a615ffa032d42b51e7be15`; it must not be invoked.
 - Forward-test canonical main: `4f39ef0e4e616eb896950d3756c433b624771a97`.
 - All future leaves/gates must select exact commits; no document permits a
   floating main ref.

@@ -24,7 +24,8 @@ def main() -> int:
         module, name = factory_name.split(":"); factory = getattr(importlib.import_module(module), name); value = factory()
         if type(value) is not tuple or len(value) != 3 or type(value[0]) is not RoleBoundCodexCredentialStore or type(value[1]) is not CodexHealthContract or type(value[2]) is not Configuration or value[1].contract_commit != commit: raise ValueError
         result = run_bounded_live_provider_health_fixture(*value, enabled=True, contract_commit=commit, candidate_sha=candidate, case_id=case, now=int(time.time()), freshness_seconds=60)
-        sys.stdout.write(json.dumps(result.owner_safe_evidence(), sort_keys=True, separators=(",", ":")) + "\n"); return 0
+        evidence = result.owner_safe_evidence()
+        sys.stdout.write(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"); return 0 if evidence["status"] == "ready" else 1
     except Exception:
         _emit("blocked"); return 1
 if __name__ == "__main__": raise SystemExit(main())

@@ -56,15 +56,17 @@ excluded.
 python tests/live_provider_health.py
 ```
 
-Exit `0` emits one canonical owner-safe JSON receipt bundle; exit `1` emits
-fixed blocked JSON; exit `2` emits fixed disabled JSON. No exception or
-provider prose, credential path, token, raw payload, or private path is
-emitted. Each configured role/profile receives at most one content-free,
-read-only qualification; receipt construction may repeat only the typed
-runtime audit and never probes or dispatches tasks. The resulting receipt
-evidence is intended for the existing typed Shadow comparator and must be
-externally captured and cited before issue closure. This documentation does
-not claim that a live run occurred.
+Exit `0` emits one canonical owner-safe READY JSON receipt bundle. A typed
+qualification block emits a schema-validated owner-safe blocked bundle with
+every selection observation and receipts only for fresh READY selections, then
+exits `1`; malformed infrastructure emits only fixed blocked JSON. Exit `2`
+emits fixed disabled JSON. No exception or provider prose, credential path,
+token, raw payload, or private path is emitted. Each configured role/profile
+receives at most one content-free, read-only qualification; receipt construction
+may repeat only the typed runtime audit and never probes or dispatches tasks.
+The resulting receipt evidence is intended for the existing typed Shadow
+comparator and must be externally captured and cited before issue closure. This
+documentation does not claim that a live run occurred.
 
 The policy boundary is also pure and typed. A later Orchestrator must supply an
 externally verified immutable control-source snapshot plus an owner activation

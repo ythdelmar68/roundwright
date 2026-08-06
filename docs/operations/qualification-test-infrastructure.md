@@ -14,24 +14,32 @@ bounded environment or a disposable test target.
 
 | Role | Public repository | Approved identity | Use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | Canonical main: `50230b38aa8cfc371792286f6a14a2b92545c720`; current qualification content pin: `681c7e9359a3767892a615ffa032d42b51e7be15` | `uv` 0.12.2, repo-local Python 3.12.13, locked `openai-codex`/`openai-codex-cli-bin` 0.144.4, future GitHub client, test runners, and owner-safe evidence | A Roundwright authority source, a credential store, or a floating `main` ref |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | Canonical main: `50230b38aa8cfc371792286f6a14a2b92545c720`; historical non-qualifying content pin: `681c7e9359a3767892a615ffa032d42b51e7be15` | A future separately reviewed exact commit may provide `uv`, repo-local Python, SDK/runtime tooling, GitHub client, test runners, and owner-safe evidence | A Roundwright authority source, a credential store, a floating `main` ref, or an invocation of the historical pin |
 | Remote mutation target | `ythdelmar68/roundlet-forward-test` | Canonical main: `4f39ef0e4e616eb896950d3756c433b624771a97` | A public, disposable target for explicitly approved remote lifecycle/mutation tests | Production, a unique-work target, or authority over Roundwright |
 
-The current qualification content pin is intentionally **not** silently
+The historical qualification content pin is intentionally **not** silently
 replaced by harness main. It is a verified ancestor and second parent of the
 harness merge commit `50230b38aa8cfc371792286f6a14a2b92545c720` (parents
 `63b93ca461dbd25dd8a0edd896983ec258d5dc31` and
-`681c7e9359a3767892a615ffa032d42b51e7be15`); harness PR #1 is merged. Each future leaf or gate must
-select and persist its own exact harness commit and, when it uses the remote
-target, its exact forward-test commit. A branch name, tag, or `main` is never
-an authorization or evidence identity.
+`681c7e9359a3767892a615ffa032d42b51e7be15`); harness PR #1 is merged. Owner
+review has classified that historical pin as **non-qualifying** for provider
+health: it must not be invoked for this or any future candidate. A future leaf
+or gate must wait for explicit owner selection of a new separately reviewed
+exact harness commit, then persist it and, when applicable, the exact
+forward-test commit. A branch name, tag, or `main` is never an authorization or
+evidence identity.
 
-The approved factory binding for the current read-only qualification is
-`roundwright_harness.native:native_factory` at the current qualification
-content pin. It consumes already-resolved native channels; it does not discover
-credentials, load tokens, or automate login. `uv` may be global or per-user;
-Python environments and all packages remain inside the harness repository's
-repo-local `.venv`, with no global Python package installation.
+The historical factory binding
+`roundwright_harness.native:native_factory` at the non-qualifying pin is
+recorded for audit only and must not be invoked. A replacement requires explicit
+owner selection and review proving stable SDK types/status fields, typed
+authentication-state distinction, factual capability reporting, and `UNKNOWN`
+for untyped failures. It must not inspect exception text, infer authentication,
+or advertise a hard-coded product capability. Any selected factory consumes
+already-resolved native channels; it does not discover credentials, load tokens,
+or automate login. `uv` may be global or per-user; Python environments and all
+packages remain inside the harness repository's repo-local `.venv`, with no
+global Python package installation.
 
 ## Routing decision
 

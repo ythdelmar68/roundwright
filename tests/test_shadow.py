@@ -72,7 +72,7 @@ class ShadowTests(unittest.TestCase):
             receipts.append(ProviderHealthReceipt("a" * 40, "b" * 40, "case-42", ordinal, binding, role, profile_id, observation, ProviderHealthAuditIdentity(audit, profile)))
         receipt = receipts[0]
         emitted = {
-            "schema": "roundwright-live-provider-health/v1", "ready_at": 101, "ready": True,
+            "schema": "roundwright-live-provider-health/v1", "ready_at": 101, "ready": True, "status": "ready",
             "contract_commit": receipt.contract_commit, "candidate_sha": receipt.candidate_sha, "case_id": receipt.case_id,
             "report": {"health_contract_identity": receipt.observation.health_contract_identity,
                        "configuration": receipt.configuration.complete_columns(),

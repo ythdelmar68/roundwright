@@ -24,6 +24,7 @@ from roundwright.provider_recovery import (
     RecoveryAction,
     RecoveryContext,
     accept_supervisor_review,
+    invalidate_supervisor_attempt,
     prepare_attempt,
     read_attempt,
     record_completed_output,
@@ -139,10 +140,13 @@ class ProviderRecoveryTests(unittest.TestCase):
                 connection.close()
             receipt = context.health_receipt
             self.assertEqual(row, (receipt.contract_commit, receipt.candidate_sha, receipt.case_id, receipt.receipt_digest, receipt.selection_ordinal, receipt.observation.fresh_until, receipt.observation.health_contract_identity))
-            expired = replace(receipt.observation, fresh_until=int(time.time()))
-            blocked = replace(context, health_receipt=replace(receipt, observation=expired, receipt_digest=""))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_attempt_health_authorizations SET fresh_until = ? WHERE attempt_id = ?", (int(time.time()), "bound-health")); connection.commit()
+            finally:
+                connection.close()
             with self.assertRaises(ProviderRecoveryError):
-                record_session_identity(repository, identity, blocked, attempt_id="bound-health", session_identity="blocked-session", lease=lease)
+                record_session_identity(repository, identity, context, attempt_id="bound-health", session_identity="blocked-session", lease=lease)
             self.assertIsNone(read_attempt(repository, identity, "bound-health").session_identity)
 
     def test_existing_dispatched_attempt_never_recreates_a_deleted_health_authorization(self) -> None:
@@ -157,16 +161,31 @@ class ProviderRecoveryTests(unittest.TestCase):
                 connection.execute("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("dispatched-health",)); connection.commit()
             finally:
                 connection.close()
-            with self.assertRaises(ProviderRecoveryError):
-                prepare_attempt(repository, identity, context, attempt_id="dispatched-health", role=ProviderRole.WORKER, process_lease_id="lease-dispatched-health", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
-            with self.assertRaises(ProviderRecoveryError):
-                record_external_turn(repository, identity, context, attempt_id="dispatched-health", session_identity="health-session", external_turn_identity="health-turn", lease=lease)
-            connection = sqlite3.connect(database_path(repository))
-            try:
-                self.assertIsNone(connection.execute("SELECT 1 FROM provider_attempt_health_authorizations WHERE attempt_id = ?", ("dispatched-health",)).fetchone())
-            finally:
-                connection.close()
 
+    def test_every_later_transition_fails_when_its_authorization_row_is_deleted(self) -> None:
+        for operation in ("complete", "invalid", "accept", "invalidate", "recover"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary)); initialize(repository)
+                lease = self.lease(repository); role = ProviderRole.SUPERVISOR if operation in {"accept", "invalidate"} else ProviderRole.WORKER
+                identity = self.identity(operation); self.admit(repository, identity, lease)
+                context = self.context(identity, role=role); attempt = f"health-{operation}"
+                self.prepare(repository, identity, lease, role=role, attempt=attempt)
+                if operation in {"complete", "invalid", "accept"}:
+                    record_session_identity(repository, identity, context, attempt_id=attempt, session_identity=f"session-{operation}", lease=lease)
+                    record_external_turn(repository, identity, context, attempt_id=attempt, session_identity=f"session-{operation}", external_turn_identity=f"turn-{operation}", lease=lease)
+                if operation == "accept":
+                    record_completed_output(repository, identity, context, attempt_id=attempt, output_pointer="review-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id = ?", (attempt,)); connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(ProviderRecoveryError):
+                    if operation == "complete": record_completed_output(repository, identity, context, attempt_id=attempt, output_pointer="output", completion_evidence_fingerprint="e" * 64, lease=lease)
+                    elif operation == "invalid": record_invalid_output(repository, identity, context, attempt_id=attempt, output_pointer="output", output_fingerprint="f" * 64, reason_fingerprint="e" * 64, lease=lease)
+                    elif operation == "accept": accept_supervisor_review(repository, identity, context, attempt_id=attempt, accepted_review_identity="accepted", lease=lease)
+                    elif operation == "invalidate": invalidate_supervisor_attempt(repository, identity, context, attempt_id=attempt, lease=lease)
+                    else: recover_attempt(repository, identity, context, attempt_id=attempt, max_attempts=2, lease=lease)
     def test_external_turn_without_verified_completion_blocks_without_duplicate_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))

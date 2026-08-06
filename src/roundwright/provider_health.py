@@ -260,11 +260,16 @@ class ProviderHealthReceipt:
             raise ProviderHealthError("provider health receipt evidence is invalid") from error
 
     def authorize(self, binding: RuntimeBinding, role: ProviderRole, profile_identity: str, *, contract_commit: str, candidate_sha: str | None, case_id: str, now: int) -> None:
+        try:
+            self.configuration.require_matches(binding)
+            matching_binding = True
+        except Exception:
+            matching_binding = False
         if (
             type(binding) is not RuntimeBinding or type(role) is not ProviderRole or not _commit(contract_commit)
             or (candidate_sha is not None and not _commit(candidate_sha)) or not _safe_identifier(case_id) or type(now) is not int
             or (self.contract_commit, self.candidate_sha, self.case_id, self.role, self.profile_identity) != (contract_commit, candidate_sha, case_id, role, profile_identity)
-            or self.configuration != binding or self.observation.state is not HealthState.READY or not self.observation.is_fresh_at(now)
+            or not matching_binding or self.observation.state is not HealthState.READY or not self.observation.is_fresh_at(now)
         ):
             raise ProviderHealthError("provider health receipt does not authorize dispatch")
 

@@ -45,16 +45,19 @@ class LiveProviderHealthFixtureResult:
         }
         shadow_case_identity = _digest({"contract_commit": self.contract_commit, "candidate_sha": self.candidate_sha,
                                         "case_id": self.case_id, "configuration": self.report.configuration.complete_columns()})
-        return {**payload, "manifest": {
+        reference_identity = _digest({"schema": "roundwright-live-provider-health-reference/v1", "contract_commit": self.contract_commit,
+                                      "candidate_sha": self.candidate_sha, "case_id": self.case_id,
+                                      "report": payload["report"], "receipt_digests": payload["receipt_digests"]})
+        manifest = {
             "schema": "roundwright-live-provider-health-manifest/v1",
             "shadow_case_identity": shadow_case_identity,
-            "reference_identity": shadow_case_identity,
+            "reference_identity": reference_identity,
             "comparator_version": "provider-health-receipt/v1",
             "normalizer_version": "roundwright-json-tuples/v1",
             "environment_identity": "native-read-only",
             "retention_identity": "orchestrator-capture-required",
-            "bundle_digest": _digest(payload),
-        }}
+        }
+        return {**payload, "manifest": {**manifest, "bundle_digest": _digest({"payload": payload, "manifest": manifest})}}
 
 
 def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:

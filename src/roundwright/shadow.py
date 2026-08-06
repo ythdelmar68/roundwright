@@ -116,7 +116,8 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
         manifest = value["manifest"]
         manifest_keys = {"schema", "shadow_case_identity", "reference_identity", "comparator_version", "normalizer_version", "environment_identity", "retention_identity", "bundle_digest"}
         payload = {key: item for key, item in value.items() if key != "manifest"}
-        if set(manifest) != manifest_keys or manifest["schema"] != "roundwright-live-provider-health-manifest/v1" or manifest["comparator_version"] != "provider-health-receipt/v1" or manifest["normalizer_version"] != "roundwright-json-tuples/v1" or manifest["environment_identity"] != "native-read-only" or manifest["retention_identity"] != "orchestrator-capture-required" or type(manifest["bundle_digest"]) is not str or manifest["bundle_digest"] != _live_digest(payload):
+        frozen_manifest = {key: item for key, item in manifest.items() if key != "bundle_digest"}
+        if set(manifest) != manifest_keys or manifest["schema"] != "roundwright-live-provider-health-manifest/v1" or manifest["comparator_version"] != "provider-health-receipt/v1" or manifest["normalizer_version"] != "roundwright-json-tuples/v1" or manifest["environment_identity"] != "native-read-only" or manifest["retention_identity"] != "orchestrator-capture-required" or type(manifest["bundle_digest"]) is not str or manifest["bundle_digest"] != _live_digest({"payload": payload, "manifest": frozen_manifest}):
             raise ValueError
         receipts = tuple(ProviderHealthReceipt.from_evidence(item) for item in value["receipts"])
         report = value["report"]
@@ -129,7 +130,8 @@ def rehydrate_live_provider_health_evidence(evidence: object) -> tuple["Provider
             raise ValueError
         binding = RuntimeBinding(columns[0], columns[1], columns[2], tuple(supervisor_profiles), *columns[4:])
         shadow_case_identity = _live_digest({"contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "configuration": binding.complete_columns()})
-        if manifest["shadow_case_identity"] != shadow_case_identity or manifest["reference_identity"] != shadow_case_identity:
+        reference_identity = _live_digest({"schema": "roundwright-live-provider-health-reference/v1", "contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "report": report, "receipt_digests": value["receipt_digests"]})
+        if manifest["shadow_case_identity"] != shadow_case_identity or manifest["reference_identity"] != reference_identity:
             raise ValueError
         if report["health_contract_identity"] != receipts[0].observation.health_contract_identity or tuple((item[0], item[1], item[2]) for item in selections) != tuple((ordinal, role.value, profile) for ordinal, role, profile in required_provider_selections(binding)):
             raise ValueError

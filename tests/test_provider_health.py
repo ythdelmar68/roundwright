@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 
 from pathlib import Path
 
@@ -226,6 +227,11 @@ class ProviderHealthTests(unittest.TestCase):
             receipt.authorize(binding, ProviderRole.WORKER, observation.profile_identity, contract_commit="b" * 40, candidate_sha=None, case_id="case-42", now=101)
         with self.assertRaises(ProviderHealthError):
             ProviderHealthReceipt("a" * 40, None, "case-42", 0, binding, ProviderRole.WORKER, observation.profile_identity, observation, ProviderHealthAuditIdentity(self.audit, self.profile), receipt_digest="sha256:" + "0" * 64)
+        for field, value in (("review_complete_rounds", 99), ("review_max_rounds", 99), ("review_max_supervisor_attempts_per_round", 99), ("review_on_final_findings", "drift"), ("review_policy_digest", "0" * 64)):
+            drifted = replace(binding)
+            object.__setattr__(drifted, field, value)
+            with self.subTest(field=field), self.assertRaises(ProviderHealthError):
+                receipt.authorize(drifted, ProviderRole.WORKER, observation.profile_identity, contract_commit="a" * 40, candidate_sha=None, case_id="case-42", now=101)
 
     def test_untyped_exception_and_malformed_response_never_use_message_text_for_classification(self):
         unknown = self.service((RuntimeError("token at C:/private/path is denied"),)).qualify(ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)

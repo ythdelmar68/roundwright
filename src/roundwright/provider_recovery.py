@@ -365,13 +365,15 @@ def record_completed_output(
     _require_fingerprint(completion_evidence_fingerprint, "completion evidence fingerprint")
     if output_fingerprint:
         _require_fingerprint(output_fingerprint, "output fingerprint")
+    observed = _clock(now)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, identity.repository_id, _clock(now))
+        _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         expected = (output_pointer, completion_evidence_fingerprint)
         binding = connection.execute(
             "SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?",
@@ -438,6 +440,7 @@ def record_invalid_output(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         existing = connection.execute(
             "SELECT output_fingerprint, reason_fingerprint FROM provider_invalid_outputs WHERE attempt_id = ?",
             (attempt_id,),
@@ -483,13 +486,15 @@ def accept_supervisor_review(
     _validate_context(identity, context)
     _require_token(attempt_id, "attempt identity")
     _require_token(accepted_review_identity, "accepted review identity")
+    observed = _clock(now)
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_current_lease(connection, lease, identity.repository_id, _clock(now))
+        _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.role is ProviderRole.SUPERVISOR and row.state is AttemptState.ACCEPTED and row.accepted_review_identity == accepted_review_identity:
             connection.commit()
             return row
@@ -540,6 +545,7 @@ def invalidate_supervisor_attempt(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.role is not ProviderRole.SUPERVISOR:
             raise ProviderRecoveryError("only a Supervisor attempt can be invalidated")
         if row.state is AttemptState.ACCEPTED:
@@ -598,6 +604,7 @@ def recover_attempt(
             connection.rollback()
             return _projection(row, RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift")
         _validate_context(identity, context)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.state is AttemptState.PREPARED and row.session_identity is not None:
             try:
                 _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context)
@@ -871,12 +878,27 @@ def _persist_health_authorization(connection, attempt_id: str, receipt) -> None:
 
 
 def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> None:
-    receipt = _require_health_authorization(context, role, profile_identity, observed)
     existing = connection.execute(
         "SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?",
         (attempt_id,),
     ).fetchone()
-    if existing != _health_authorization_values(receipt):
+    if (
+        type(existing) is not tuple or len(existing) != 7
+        or type(existing[0]) is not str or not _COMMIT.fullmatch(existing[0])
+        or (existing[1] is not None and (type(existing[1]) is not str or not _COMMIT.fullmatch(existing[1])))
+        or type(existing[2]) is not str or not _TOKEN.fullmatch(existing[2])
+        or type(existing[3]) is not str or not existing[3].startswith("sha256:")
+        or type(existing[4]) is not int or existing[4] < 0
+        or type(existing[5]) is not int or existing[5] <= observed
+        or type(existing[6]) is not str or not existing[6].startswith("sha256:")
+        # The health receipt is deliberately absent from later checkpoint
+        # contexts: the immutable authorization row created with the attempt
+        # is the evidence being re-used.  Candidate identity is also part of
+        # the sealed recovery context, so it must still agree here; contract
+        # and case are bound by the persisted row itself rather than supplied
+        # again by a caller that could substitute fresh evidence.
+        or existing[1] != context.candidate_sha
+    ):
         raise ProviderRecoveryError("provider health authorization is unavailable or has drifted")
 
 

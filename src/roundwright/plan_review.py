@@ -28,6 +28,7 @@ from .provider_recovery import (
     record_external_turn,
     record_invalid_output,
     record_session_identity,
+    _require_persisted_health_authorization,
 )
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task
 from .worker_planning import (
@@ -323,6 +324,7 @@ def recover_plan_review(
     try:
         _require_matching_task(connection, identity)
         _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
+        _require_sealed_provider_authorization(connection, identity, dispatch.provider_attempt_id, context, now)
         artifact = connection.execute(
             "SELECT verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, content_digest FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?",
             (review_attempt_id, identity.task_id),
@@ -428,6 +430,7 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
         _require_current_lease(connection, lease, identity.repository_id, _clock(now))
         _require_matching_task(connection, identity, "plan-review")
         _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
+        _require_sealed_provider_authorization(connection, identity, dispatch.provider_attempt_id, context, now)
         submitted = connection.execute("SELECT plan_attempt_id, plan_digest FROM submitted_plan_reviews WHERE task_id = ?", (identity.task_id,)).fetchone()
         expected = (dispatch.plan_attempt_id, dispatch.review_attempt_id, dispatch.plan_digest)
         if submitted != (dispatch.plan_attempt_id, dispatch.plan_digest):
@@ -435,18 +438,18 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
         artifact = connection.execute("SELECT verdict FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?", (dispatch.review_attempt_id, identity.task_id)).fetchone()
         if artifact != (PlanReviewVerdict.PASS.value,):
             raise PlanReviewError("only a recorded PASS can be accepted")
-        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
+        provider = connection.execute("SELECT provider_role, state, accepted_review_identity, completion_evidence_fingerprint, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
         if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[3] is None:
             raise PlanReviewError("accepted PASS provider attempt is incomplete")
         if provider[1] == AttemptState.COMPLETED.value:
             connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = ? WHERE attempt_id = ?", (dispatch.review_attempt_id, AttemptState.ACCEPTED.value, dispatch.provider_attempt_id))
-            provider = (provider[0], AttemptState.ACCEPTED.value, dispatch.review_attempt_id, provider[3])
+            provider = (provider[0], AttemptState.ACCEPTED.value, dispatch.review_attempt_id, provider[3], provider[4])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != dispatch.review_attempt_id:
             raise PlanReviewError("accepted PASS provider attempt conflicts with committed state")
-        provider_review = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (dispatch.review_attempt_id,)).fetchone()
-        expected_provider_review = (identity.task_id, dispatch.provider_attempt_id, provider[3], *context.runtime_binding.columns())
+        provider_review = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (dispatch.review_attempt_id,)).fetchone()
+        expected_provider_review = (identity.task_id, dispatch.provider_attempt_id, provider[3], *context.runtime_binding.complete_columns())
         if provider_review is None:
-            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (dispatch.review_attempt_id, *expected_provider_review))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dispatch.review_attempt_id, *expected_provider_review))
         elif provider_review != expected_provider_review:
             raise PlanReviewError("accepted provider review conflicts with committed state")
         existing = connection.execute("SELECT plan_attempt_id, review_identity, review_digest FROM accepted_plan_reviews WHERE task_id = ?", (identity.task_id,)).fetchone()
@@ -544,14 +547,29 @@ def _require_exact_provider_context(connection, identity, provider_attempt_id, c
     expected = (
         identity.task_id, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint,
         context.base_fingerprint, context.candidate_fingerprint, context.policy_fingerprint, context.deployment_fingerprint,
-        *context.runtime_binding.columns(),
+        *context.runtime_binding.complete_columns(),
     )
     row = connection.execute(
-        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?",
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM provider_attempt_contexts WHERE attempt_id = ?",
         (provider_attempt_id,),
     ).fetchone()
     if row != expected:
         raise PlanReviewError("review recovery context has drifted")
+
+
+def _require_sealed_provider_authorization(connection, identity, provider_attempt_id, context, now) -> None:
+    row = connection.execute(
+        "SELECT provider_role, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+        (provider_attempt_id, identity.task_id),
+    ).fetchone()
+    try:
+        if row is None:
+            raise ValueError
+        _require_persisted_health_authorization(
+            connection, provider_attempt_id, context, ProviderRole(row[0]), row[1], _clock(now),
+        )
+    except Exception as error:
+        raise PlanReviewError("review provider authorization is unavailable or has drifted") from error
 
 
 def _finding_ids(identity, plan_attempt_id, findings) -> tuple[str, ...]:

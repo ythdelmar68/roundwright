@@ -294,6 +294,102 @@ class CandidateReviewTests(unittest.TestCase):
             self.assertEqual(provider_digest, artifact_digest)
             self.assertNotEqual(provider_digest, raw_digest)
 
+    def test_public_diff_lifecycle_requires_sealed_authorization_and_complete_policy(self):
+        def recorded_review(root):
+            values = self.ready_task(root)
+            repository, identity, lease, context, binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("sealed-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64),
+                CandidateVerification("sealed-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            review = dispatch_diff_review(
+                repository, identity, review_context, binding, seal,
+                diff_review_attempt_id="sealed-review", implementation_attempt_id=implementation.implementation_attempt_id,
+                provider_attempt_id="sealed-supervisor", supervisor_session_identity="sealed-session",
+                external_turn_identity="sealed-turn", message_identity="sealed-message",
+                process_lease_id="sealed-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            output = DiffReviewOutput(
+                review.diff_review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity,
+                review.external_turn_identity, review.message_identity, seal.base_sha, seal.candidate_sha,
+                DiffReviewVerdict.PASS,
+            )
+            with patch.object(candidate_review, "_accept_diff_pass"):
+                record_diff_review(
+                    repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id,
+                    output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now,
+                )
+            return repository, identity, lease, review_context, binding, seal, now, review, output
+
+        authorization_columns = (
+            ("contract_commit", "b" * 40), ("candidate_sha", "b" * 40), ("case_id", "case-drift"),
+            ("receipt_digest", "sha256:" + "e" * 64), ("selection_ordinal", 0),
+            ("fresh_until", 2_000_000_001), ("health_contract_identity", "sha256:" + "e" * 64),
+            ("provider_role", ProviderRole.WORKER.value), ("profile_identity", "sha256:" + "e" * 64),
+        )
+        for column, replacement in authorization_columns:
+            with self.subTest(authorization_column=column), tempfile.TemporaryDirectory() as temporary:
+                repository, identity, lease, context, binding, seal, now, review, output = recorded_review(Path(temporary) / "repository")
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute(f"UPDATE provider_attempt_health_authorizations SET {column} = ? WHERE attempt_id = ?", (replacement, review.provider_attempt_id)); connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(CandidateReviewError, "authorization"):
+                    with patch.object(candidate_review, "record_completed_output"):
+                        record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, binding, seal, now, review, output = recorded_review(Path(temporary) / "repository")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_attempt_health_authorizations SET contract_commit = ? WHERE attempt_id = ?", ("b" * 40, review.provider_attempt_id))
+                values = connection.execute("SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity, provider_role, profile_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?", (review.provider_attempt_id,)).fetchone()
+                seal_value = hashlib.sha256("\x00".join((review.provider_attempt_id, *("" if value is None else str(value) for value in values))).encode()).hexdigest()
+                connection.execute("UPDATE provider_attempt_health_seals SET authorization_fingerprint = ? WHERE attempt_id = ?", (seal_value, review.provider_attempt_id)); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(CandidateReviewError, "authorization"):
+                with patch.object(candidate_review, "record_completed_output"):
+                    record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+
+        for column, replacement in (
+            ("review_complete_rounds", 2), ("review_max_rounds", 3),
+            ("review_max_supervisor_attempts_per_round", 2), ("review_on_final_findings", "block"),
+            ("review_policy_digest", "sha256:" + "e" * 64),
+        ):
+            with self.subTest(review_policy_column=column), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, _, binding, now = values
+                seal, context, review = self.accepted_diff_review(values, review_id=f"policy-{column}", provider_id=f"provider-{column}")
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute(f"UPDATE accepted_provider_reviews SET {column} = ? WHERE attempt_id = ?", (replacement, review.provider_attempt_id)); connection.commit()
+                finally:
+                    connection.close()
+                persisted = read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
+                self.assertFalse(persisted.accepted)
+
+        for lifecycle in ("read", "recover"):
+            with self.subTest(authorization_deleted_lifecycle=lifecycle), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, _, binding, now = values
+                seal, context, review = self.accepted_diff_review(values, review_id=f"deleted-{lifecycle}", provider_id=f"deleted-provider-{lifecycle}")
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id = ?", (review.provider_attempt_id,)); connection.commit()
+                finally:
+                    connection.close()
+                if lifecycle == "read":
+                    with self.assertRaisesRegex(CandidateReviewError, "authorization"):
+                        read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
+                else:
+                    with self.assertRaisesRegex(CandidateReviewError, "authorization"):
+                        recover_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, max_attempts=1, lease=lease, now=now)
+
     def test_diff_review_rejects_provider_profile_or_input_drift_before_findings_route(self):
         for column, replacement in (("selected_profile_identity", "sha256:" + "d" * 64), ("input_fingerprint", "f" * 64)):
             with self.subTest(column=column), tempfile.TemporaryDirectory() as temporary:

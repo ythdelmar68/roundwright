@@ -606,6 +606,19 @@ MIGRATIONS = (
             ("provider_attempt_health_seals", "CREATE TABLE provider_attempt_health_seals (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), authorization_fingerprint TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        47,
+        (
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_complete_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_max_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_on_final_findings TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 

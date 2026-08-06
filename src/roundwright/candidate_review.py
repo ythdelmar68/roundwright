@@ -22,7 +22,7 @@ from typing import Iterable
 
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
-from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
+from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
 
@@ -677,8 +677,9 @@ def read_diff_review(
             raise CandidateReviewError("diff review dispatch is unavailable")
         provider = connection.execute("SELECT state, accepted_review_identity, output_pointer, completion_evidence_fingerprint, selected_profile_identity, input_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (row[8],)).fetchone()
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
         _require_exact_provider_context(connection, identity, row[8], context)
+        _require_sealed_provider_authorization(connection, identity, row[8], context, None)
     finally:
         connection.close()
     current_snapshot = _verification_snapshot(repository, identity, row[4])
@@ -693,7 +694,7 @@ def read_diff_review(
         and output == (row[11],)
         and provider[4] == dispatch.selected_profile_identity
         and provider[5] == dispatch.input_digest
-        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt)
+        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt, *context.runtime_binding.complete_columns()[4:])
         and current_snapshot == row[5]
     )
     if not accepted and row[6] == "accepted":
@@ -1055,6 +1056,7 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
         _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "diff-review")
         _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
+        _require_sealed_provider_authorization(connection, identity, dispatch.provider_attempt_id, context, now)
         row = connection.execute("SELECT state, accepted_review_identity, verification_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
         if row is None or row[2] != dispatch.verification_digest:
             raise CandidateReviewError("diff review acceptance does not match its dispatch")
@@ -1077,10 +1079,10 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
             provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3], provider[4], provider[5], provider[6])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != accepted_identity:
             raise CandidateReviewError("accepted PASS provider attempt conflicts with committed state")
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
-        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt)
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
+        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt, *context.runtime_binding.complete_columns()[4:])
         if accepted_provider is None:
-            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
         elif accepted_provider != expected_provider:
             raise CandidateReviewError("accepted provider review conflicts with committed state")
         if row[0] in ("recorded", "accepted") and row[1] in (None, accepted_identity):
@@ -1113,7 +1115,7 @@ def _require_diff_review_context(repository, identity, context, seal, implementa
         connection = sqlite3.connect(f"{database_path(repository).as_uri()}?mode=ro", uri=True)
         try:
             row = connection.execute(
-                "SELECT contexts.task_id, contexts.repository_fingerprint, contexts.worktree_fingerprint, contexts.branch_fingerprint, contexts.base_fingerprint, contexts.policy_fingerprint, contexts.deployment_fingerprint, contexts.configuration_schema_version, contexts.configuration_digest, contexts.worker_profile_identity, contexts.supervisor_profile_identities FROM implementation_attempts AS implementations JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = implementations.provider_attempt_id WHERE implementations.implementation_attempt_id = ? AND implementations.task_id = ?",
+                "SELECT contexts.task_id, contexts.repository_fingerprint, contexts.worktree_fingerprint, contexts.branch_fingerprint, contexts.base_fingerprint, contexts.policy_fingerprint, contexts.deployment_fingerprint, contexts.configuration_schema_version, contexts.configuration_digest, contexts.worker_profile_identity, contexts.supervisor_profile_identities, contexts.review_complete_rounds, contexts.review_max_rounds, contexts.review_max_supervisor_attempts_per_round, contexts.review_on_final_findings, contexts.review_policy_digest FROM implementation_attempts AS implementations JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = implementations.provider_attempt_id WHERE implementations.implementation_attempt_id = ? AND implementations.task_id = ?",
                 (implementation_attempt_id, identity.task_id),
             ).fetchone()
         finally:
@@ -1149,7 +1151,7 @@ def _implementation_context_projection(context):
         context.base_fingerprint,
         context.policy_fingerprint,
         context.deployment_fingerprint,
-        *context.runtime_binding.columns(),
+        *context.runtime_binding.complete_columns(),
     )
 
 
@@ -1158,11 +1160,26 @@ def _require_exact_provider_context(connection, identity, attempt_id, context):
         identity.task_id, context.repository_fingerprint, context.worktree_fingerprint,
         context.branch_fingerprint, context.base_fingerprint, context.candidate_fingerprint,
         context.policy_fingerprint, context.deployment_fingerprint,
-        *context.runtime_binding.columns(),
+        *context.runtime_binding.complete_columns(),
     )
-    row = connection.execute("SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities FROM provider_attempt_contexts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+    row = connection.execute("SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM provider_attempt_contexts WHERE attempt_id = ?", (attempt_id,)).fetchone()
     if row != expected:
         raise CandidateReviewError("diff review recovery context has drifted")
+
+
+def _require_sealed_provider_authorization(connection, identity, attempt_id, context, now) -> None:
+    row = connection.execute(
+        "SELECT provider_role, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+        (attempt_id, identity.task_id),
+    ).fetchone()
+    try:
+        if row is None:
+            raise ValueError
+        _require_persisted_health_authorization(
+            connection, attempt_id, context, ProviderRole(row[0]), row[1], _clock(now),
+        )
+    except Exception as error:
+        raise CandidateReviewError("diff review provider authorization is unavailable or has drifted") from error
 
 
 def _verification_snapshot_connection(connection, identity, candidate_sha):

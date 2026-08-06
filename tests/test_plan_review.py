@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -43,7 +44,10 @@ from tests.provider_health_fixture import provider_context, runtime_binding
 
 class PlanReviewTests(unittest.TestCase):
     def runtime_binding(self) -> RuntimeBinding:
-        return runtime_binding()
+        return runtime_binding(
+            complete_rounds=1, max_rounds=2,
+            final_policy="worker-final-repair-then-merge", policy_digest="f" * 64,
+        )
 
     def repository(self, root):
         identity = object.__new__(RepositoryIdentity)
@@ -83,6 +87,68 @@ class PlanReviewTests(unittest.TestCase):
             self.assertEqual(completion.plan_digest, persisted.content_digest)
             self.assertEqual(task_projection(repository, identity).state, "implementing")
 
+    def test_public_plan_acceptance_recovery_requires_sealed_authorization_and_complete_policy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            with mock.patch.object(plan_review, "_accept_pass_atomically"):
+                record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            authorization_columns = (
+                ("contract_commit", "b" * 40), ("candidate_sha", "b" * 40), ("case_id", "case-drift"),
+                ("receipt_digest", "sha256:" + "e" * 64), ("selection_ordinal", 0),
+                ("fresh_until", 2_000_000_001), ("health_contract_identity", "sha256:" + "e" * 64),
+                ("provider_role", ProviderRole.PLANNING.value), ("profile_identity", "sha256:" + "e" * 64),
+            )
+            connection = _open_writable_connection(repository)
+            try:
+                original = connection.execute("SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity, provider_role, profile_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()
+                for index, (column, replacement) in enumerate(authorization_columns):
+                    with self.subTest(authorization_column=column):
+                        connection.execute(f"UPDATE provider_attempt_health_authorizations SET {column} = ? WHERE attempt_id = ?", (replacement, dispatch.provider_attempt_id)); connection.commit()
+                        with self.assertRaisesRegex(PlanReviewError, "authorization"):
+                            recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+                        connection.execute(f"UPDATE provider_attempt_health_authorizations SET {column} = ? WHERE attempt_id = ?", (original[index], dispatch.provider_attempt_id)); connection.commit()
+                connection.execute("UPDATE provider_attempt_health_authorizations SET contract_commit = ? WHERE attempt_id = ?", ("b" * 40, dispatch.provider_attempt_id))
+                values = connection.execute("SELECT contract_commit, candidate_sha, case_id, receipt_digest, selection_ordinal, fresh_until, health_contract_identity, provider_role, profile_identity FROM provider_attempt_health_authorizations WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()
+                replacement_seal = hashlib.sha256("\x00".join((dispatch.provider_attempt_id, *("" if value is None else str(value) for value in values))).encode()).hexdigest()
+                connection.execute("UPDATE provider_attempt_health_seals SET authorization_fingerprint = ? WHERE attempt_id = ?", (replacement_seal, dispatch.provider_attempt_id)); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(PlanReviewError, "authorization"):
+                recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            for column, replacement in (
+                ("review_complete_rounds", 2), ("review_max_rounds", 3),
+                ("review_max_supervisor_attempts_per_round", 2),
+                ("review_on_final_findings", "block"), ("review_policy_digest", "sha256:" + "e" * 64),
+            ):
+                with self.subTest(review_policy_column=column):
+                    connection = _open_writable_connection(repository)
+                    try:
+                        original = connection.execute(f"SELECT {column} FROM accepted_provider_reviews WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()[0]
+                        connection.execute(f"UPDATE accepted_provider_reviews SET {column} = ? WHERE attempt_id = ?", (replacement, dispatch.provider_attempt_id)); connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaisesRegex(PlanReviewError, "accepted provider review"):
+                        recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+                    connection = _open_writable_connection(repository)
+                    try:
+                        connection.execute(f"UPDATE accepted_provider_reviews SET {column} = ? WHERE attempt_id = ?", (original, dispatch.provider_attempt_id)); connection.commit()
+                    finally:
+                        connection.close()
+
+            connection = _open_writable_connection(repository)
+            try:
+                connection.execute("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id = ?", (dispatch.provider_attempt_id,)); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(PlanReviewError, "authorization"):
+                recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+
     def test_findings_route_to_the_same_worker_thread_and_pass_cannot_contain_findings(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
@@ -111,7 +177,7 @@ class PlanReviewTests(unittest.TestCase):
             try:
                 evidence = connection.execute("SELECT completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()[0]
                 connection.execute("UPDATE provider_attempts SET accepted_review_identity = ?, state = 'accepted' WHERE attempt_id = ?", (dispatch.review_attempt_id, dispatch.provider_attempt_id))
-                connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (dispatch.review_attempt_id, identity.task_id, dispatch.provider_attempt_id, evidence, *context.runtime_binding.columns()))
+                connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dispatch.review_attempt_id, identity.task_id, dispatch.provider_attempt_id, evidence, *context.runtime_binding.complete_columns()))
                 connection.commit()
             finally:
                 connection.close()

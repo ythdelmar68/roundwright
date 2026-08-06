@@ -303,7 +303,7 @@ def record_plan_review(
         _persist_route(repository, identity, dispatch, finding_ids, lease)
     else:
         _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
-    return read_plan_review(repository, identity, review_attempt_id)
+    return read_plan_review(repository, identity, review_attempt_id, context=context, now=now)
 
 
 def recover_plan_review(
@@ -332,7 +332,7 @@ def recover_plan_review(
         task_state = connection.execute("SELECT state FROM tasks WHERE task_id = ?", (identity.task_id,)).fetchone()
     finally:
         connection.close()
-    attempt = read_attempt(repository, identity, dispatch.provider_attempt_id)
+    attempt = read_attempt(repository, identity, dispatch.provider_attempt_id, context=context, now=now)
     if artifact is not None and artifact[0] == PlanReviewVerdict.FINDINGS.value:
         _recover_routed_findings(repository, identity, dispatch, artifact, task_state[0] if task_state else None, lease, now)
     elif attempt.state is AttemptState.ACCEPTED:
@@ -351,10 +351,17 @@ def recover_plan_review(
             raise
         finally:
             connection.close()
-    return read_plan_review(repository, identity, review_attempt_id)
+    return read_plan_review(repository, identity, review_attempt_id, context=context, now=now)
 
 
-def read_plan_review(repository: RepositoryIdentity, identity: TaskIdentity, review_attempt_id: str) -> PersistedPlanReview:
+def read_plan_review(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    review_attempt_id: str,
+    *,
+    context: RecoveryContext | None = None,
+    now: int | None = None,
+) -> PersistedPlanReview:
     _require_token(review_attempt_id, "review attempt identity")
     connection = _open_writable_connection(repository)
     try:
@@ -365,6 +372,21 @@ def read_plan_review(repository: RepositoryIdentity, identity: TaskIdentity, rev
         ).fetchone()
         if row is None or row[4] is None:
             raise PlanReviewError("review result is unavailable")
+        accepted = connection.execute(
+            "SELECT accepted.task_id, accepted.attempt_id, accepted.completion_evidence_fingerprint, accepted.configuration_schema_version, accepted.configuration_digest, accepted.worker_profile_identity, accepted.supervisor_profile_identities, accepted.review_complete_rounds, accepted.review_max_rounds, accepted.review_max_supervisor_attempts_per_round, accepted.review_on_final_findings, accepted.review_policy_digest FROM plan_review_attempts AS attempts JOIN accepted_provider_reviews AS accepted ON accepted.accepted_review_identity = attempts.review_attempt_id WHERE attempts.review_attempt_id = ? AND attempts.task_id = ?",
+            (review_attempt_id, identity.task_id),
+        ).fetchone()
+        if accepted is not None:
+            if not isinstance(context, RecoveryContext):
+                raise PlanReviewError("accepted plan review requires exact recovery context")
+            expected = (identity.task_id, accepted[1], *connection.execute(
+                "SELECT completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+                (accepted[1], identity.task_id),
+            ).fetchone(), *context.runtime_binding.complete_columns())
+            if accepted != expected:
+                raise PlanReviewError("accepted provider review conflicts with committed state")
+            _require_exact_provider_context(connection, identity, accepted[1], context)
+            _require_sealed_provider_authorization(connection, identity, accepted[1], context, now)
         return PersistedPlanReview(review_attempt_id, row[0], row[1], row[2], PlanReviewVerdict(row[4]), PlanReviewState(row[3]), tuple(json.loads(row[5] or "[]")))
     finally:
         connection.close()

@@ -497,6 +497,7 @@ def accept_supervisor_review(
         row = _attempt_row(connection, identity.task_id, attempt_id)
         _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
         if row.role is ProviderRole.SUPERVISOR and row.state is AttemptState.ACCEPTED and row.accepted_review_identity == accepted_review_identity:
+            _require_accepted_supervisor_review(connection, identity, row, context)
             connection.commit()
             return row
         if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.COMPLETED:
@@ -509,8 +510,8 @@ def accept_supervisor_review(
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
         )
         connection.execute(
-            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (accepted_review_identity, identity.task_id, attempt_id, row.completion_evidence_fingerprint, *context.runtime_binding.columns(), row.selected_profile_identity),
+            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (accepted_review_identity, *_accepted_supervisor_review_values(identity, row, context)),
         )
         connection.commit()
     except sqlite3.IntegrityError as error:
@@ -521,7 +522,7 @@ def accept_supervisor_review(
         raise
     finally:
         connection.close()
-    return read_attempt(repository, identity, attempt_id)
+    return read_attempt(repository, identity, attempt_id, context=context, now=observed)
 
 
 def invalidate_supervisor_attempt(
@@ -606,6 +607,8 @@ def recover_attempt(
             return _projection(row, RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift")
         _validate_context(identity, context)
         authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if _is_generic_accepted_supervisor_review(row):
+            _require_accepted_supervisor_review(connection, identity, row, context)
         if row.state is AttemptState.PREPARED and row.session_identity is not None:
             try:
                 _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context, authorization_fingerprint)
@@ -640,7 +643,14 @@ def recover_attempt(
     return _projection(row, action, blocker)
 
 
-def read_attempt(repository: RepositoryIdentity, identity: TaskIdentity, attempt_id: str) -> ProviderAttempt:
+def read_attempt(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    attempt_id: str,
+    *,
+    context: RecoveryContext | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
     """Read a persisted attempt without exposing it through an owner report."""
 
     _validate_task(identity)
@@ -648,9 +658,63 @@ def read_attempt(repository: RepositoryIdentity, identity: TaskIdentity, attempt
     connection = _open_writable_connection(repository)
     try:
         _require_matching_task(connection, identity)
-        return _attempt_row(connection, identity.task_id, attempt_id)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        if _is_generic_accepted_supervisor_review(row):
+            if not isinstance(context, RecoveryContext) or not _context_matches(connection, identity, attempt_id, context):
+                raise ProviderRecoveryError("accepted supervisor review requires exact recovery context")
+            _validate_context(identity, context)
+            _require_persisted_health_authorization(
+                connection, attempt_id, context, row.role, row.selected_profile_identity, _clock(now),
+            )
+            _require_accepted_supervisor_review(connection, identity, row, context)
+        return row
     finally:
         connection.close()
+
+
+def _accepted_supervisor_review_values(
+    identity: TaskIdentity,
+    row: ProviderAttempt,
+    context: RecoveryContext,
+) -> tuple[object, ...]:
+    return (
+        identity.task_id,
+        row.attempt_id,
+        row.completion_evidence_fingerprint,
+        *context.runtime_binding.columns(),
+        row.selected_profile_identity,
+        0,
+        *context.runtime_binding.complete_columns()[4:],
+    )
+
+
+def _is_generic_accepted_supervisor_review(row: ProviderAttempt) -> bool:
+    return (
+        row.role is ProviderRole.SUPERVISOR
+        and row.state is AttemptState.ACCEPTED
+        and not (row.output_pointer or "").startswith(("plan-review:", "diff-review:"))
+    )
+
+
+def _require_accepted_supervisor_review(
+    connection,
+    identity: TaskIdentity,
+    row: ProviderAttempt,
+    context: RecoveryContext,
+) -> None:
+    if (
+        row.role is not ProviderRole.SUPERVISOR
+        or row.state is not AttemptState.ACCEPTED
+        or row.accepted_review_identity is None
+        or row.completion_evidence_fingerprint is None
+    ):
+        raise ProviderRecoveryError("accepted supervisor review is invalid")
+    persisted = connection.execute(
+        "SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity = ?",
+        (row.accepted_review_identity,),
+    ).fetchone()
+    if persisted != _accepted_supervisor_review_values(identity, row, context):
+        raise ProviderRecoveryError("accepted supervisor review has drifted")
 
 
 def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_evidence: str | None, max_attempts: int, observed: int):

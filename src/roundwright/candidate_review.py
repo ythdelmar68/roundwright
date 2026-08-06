@@ -593,7 +593,7 @@ def record_diff_review(
     _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
     if _verification_snapshot(repository, identity, seal.candidate_sha) != dispatch.verification_digest:
         raise CandidateReviewError("diff review verification evidence has changed")
-    provider = read_attempt(repository, identity, dispatch.provider_attempt_id)
+    provider = read_attempt(repository, identity, dispatch.provider_attempt_id, context=context, now=now)
     if (
         provider.role is not ProviderRole.SUPERVISOR
         or provider.selected_profile_identity != dispatch.selected_profile_identity
@@ -736,7 +736,7 @@ def recover_diff_review(
             return recover_attempt(repository, identity, context, attempt_id=dispatch.provider_attempt_id,
                                    verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts,
                                    lease=lease, now=now)
-        provider = read_attempt(repository, identity, dispatch.provider_attempt_id)
+        provider = read_attempt(repository, identity, dispatch.provider_attempt_id, context=context, now=now)
         if provider.state is AttemptState.ACCEPTED and provider.accepted_review_identity == diff_review_attempt_id:
             return RecoveryProjection(
                 provider.attempt_id, provider.role, provider.state, provider.process_lease_id,

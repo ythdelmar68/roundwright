@@ -352,6 +352,35 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(accepted.accepted_review_identity, "accepted-cycle-one")
             recovery = recover_attempt(repository, identity, self.context(identity), attempt_id="review-one", max_attempts=1, lease=lease)
             self.assertEqual(recovery.next_action, RecoveryAction.ACCEPTED_REVIEW)
+            self.assertEqual(
+                read_attempt(repository, identity, "review-one", context=self.context(identity)).state,
+                AttemptState.ACCEPTED,
+            )
+            with self.assertRaisesRegex(ProviderRecoveryError, "exact recovery context"):
+                read_attempt(repository, identity, "review-one")
+            for column, replacement in (
+                ("review_complete_rounds", 2), ("review_max_rounds", 4),
+                ("review_max_supervisor_attempts_per_round", 2), ("review_on_final_findings", "block"),
+                ("review_policy_digest", "f" * 64),
+            ):
+                with self.subTest(review_policy_column=column):
+                    connection = sqlite3.connect(database_path(repository))
+                    try:
+                        original = connection.execute(f"SELECT {column} FROM accepted_provider_reviews WHERE attempt_id = ?", ("review-one",)).fetchone()[0]
+                        connection.execute(f"UPDATE accepted_provider_reviews SET {column} = ? WHERE attempt_id = ?", (replacement, "review-one")); connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaisesRegex(ProviderRecoveryError, "accepted supervisor review"):
+                        accept_supervisor_review(repository, identity, self.context(identity), attempt_id="review-one", accepted_review_identity="accepted-cycle-one", lease=lease)
+                    with self.assertRaisesRegex(ProviderRecoveryError, "accepted supervisor review"):
+                        recover_attempt(repository, identity, self.context(identity), attempt_id="review-one", max_attempts=1, lease=lease)
+                    with self.assertRaisesRegex(ProviderRecoveryError, "accepted supervisor review"):
+                        read_attempt(repository, identity, "review-one", context=self.context(identity))
+                    connection = sqlite3.connect(database_path(repository))
+                    try:
+                        connection.execute(f"UPDATE accepted_provider_reviews SET {column} = ? WHERE attempt_id = ?", (original, "review-one")); connection.commit()
+                    finally:
+                        connection.close()
 
     def test_invalid_outputs_and_recovery_attempts_are_counted_separately(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

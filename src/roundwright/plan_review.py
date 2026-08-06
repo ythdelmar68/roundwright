@@ -372,21 +372,31 @@ def read_plan_review(
         ).fetchone()
         if row is None or row[4] is None:
             raise PlanReviewError("review result is unavailable")
+        provider = connection.execute(
+            "SELECT attempts.provider_attempt_id, provider.provider_role, provider.state, provider.accepted_review_identity, provider.completion_evidence_fingerprint FROM plan_review_attempts AS attempts LEFT JOIN provider_attempts AS provider ON provider.attempt_id = attempts.provider_attempt_id AND provider.task_id = attempts.task_id WHERE attempts.review_attempt_id = ? AND attempts.task_id = ?",
+            (review_attempt_id, identity.task_id),
+        ).fetchone()
         accepted = connection.execute(
             "SELECT accepted.task_id, accepted.attempt_id, accepted.completion_evidence_fingerprint, accepted.configuration_schema_version, accepted.configuration_digest, accepted.worker_profile_identity, accepted.supervisor_profile_identities, accepted.review_complete_rounds, accepted.review_max_rounds, accepted.review_max_supervisor_attempts_per_round, accepted.review_on_final_findings, accepted.review_policy_digest FROM plan_review_attempts AS attempts JOIN accepted_provider_reviews AS accepted ON accepted.accepted_review_identity = attempts.review_attempt_id WHERE attempts.review_attempt_id = ? AND attempts.task_id = ?",
             (review_attempt_id, identity.task_id),
         ).fetchone()
-        if accepted is not None:
+        acceptance_indicated = accepted is not None or (
+            provider is not None and (provider[2] == AttemptState.ACCEPTED.value or provider[3] is not None)
+        )
+        if acceptance_indicated:
             if not isinstance(context, RecoveryContext):
                 raise PlanReviewError("accepted plan review requires exact recovery context")
-            expected = (identity.task_id, accepted[1], *connection.execute(
-                "SELECT completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
-                (accepted[1], identity.task_id),
-            ).fetchone(), *context.runtime_binding.complete_columns())
+            if (
+                provider is None
+                or provider[1:4] != (ProviderRole.SUPERVISOR.value, AttemptState.ACCEPTED.value, review_attempt_id)
+                or accepted is None
+            ):
+                raise PlanReviewError("accepted provider review conflicts with committed state")
+            expected = (identity.task_id, provider[0], provider[4], *context.runtime_binding.complete_columns())
             if accepted != expected:
                 raise PlanReviewError("accepted provider review conflicts with committed state")
-            _require_exact_provider_context(connection, identity, accepted[1], context)
-            _require_sealed_provider_authorization(connection, identity, accepted[1], context, now)
+            _require_exact_provider_context(connection, identity, provider[0], context)
+            _require_sealed_provider_authorization(connection, identity, provider[0], context, now)
         return PersistedPlanReview(review_attempt_id, row[0], row[1], row[2], PlanReviewVerdict(row[4]), PlanReviewState(row[3]), tuple(json.loads(row[5] or "[]")))
     finally:
         connection.close()

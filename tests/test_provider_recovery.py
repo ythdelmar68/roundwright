@@ -382,6 +382,43 @@ class ProviderRecoveryTests(unittest.TestCase):
                     finally:
                         connection.close()
 
+    def test_generic_supervisor_acceptance_rejects_specialized_pointers_and_pointer_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity()
+            self.admit(repository, identity, lease)
+            context = self.context(identity, role=ProviderRole.SUPERVISOR)
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="reserved-review")
+            record_session_identity(repository, identity, context, attempt_id="reserved-review", session_identity="reserved-session", lease=lease)
+            record_external_turn(repository, identity, context, attempt_id="reserved-review", session_identity="reserved-session", external_turn_identity="reserved-turn", lease=lease)
+            record_completed_output(repository, identity, context, attempt_id="reserved-review", output_pointer="reserved-output", completion_evidence_fingerprint="e" * 64, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_attempts SET output_pointer = ? WHERE attempt_id = ?", ("plan-review:forged", "reserved-review")); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ProviderRecoveryError, "generic review evidence"):
+                accept_supervisor_review(repository, identity, context, attempt_id="reserved-review", accepted_review_identity="reserved-accepted", lease=lease)
+            with self.assertRaisesRegex(ProviderRecoveryError, "accepted supervisor review is invalid"):
+                read_attempt(repository, identity, "reserved-review")
+
+            self.prepare(repository, identity, lease, role=ProviderRole.SUPERVISOR, attempt="generic-review")
+            record_session_identity(repository, identity, context, attempt_id="generic-review", session_identity="generic-session", lease=lease)
+            record_external_turn(repository, identity, context, attempt_id="generic-review", session_identity="generic-session", external_turn_identity="generic-turn", lease=lease)
+            record_completed_output(repository, identity, context, attempt_id="generic-review", output_pointer="generic-output", completion_evidence_fingerprint="f" * 64, lease=lease)
+            accept_supervisor_review(repository, identity, context, attempt_id="generic-review", accepted_review_identity="generic-accepted", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_attempts SET output_pointer = ? WHERE attempt_id = ?", ("diff-review:forged", "generic-review")); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ProviderRecoveryError, "accepted supervisor review is invalid"):
+                read_attempt(repository, identity, "generic-review", context=context)
+            with self.assertRaisesRegex(ProviderRecoveryError, "accepted supervisor review is invalid"):
+                recover_attempt(repository, identity, context, attempt_id="generic-review", max_attempts=1, lease=lease)
+
     def test_invalid_outputs_and_recovery_attempts_are_counted_separately(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))

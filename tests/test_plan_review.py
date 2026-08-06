@@ -187,6 +187,18 @@ class PlanReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(PlanReviewError, "authorization"):
                 read_plan_review(repository, identity, dispatch.review_attempt_id, context=context, now=now)
 
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            connection = _open_writable_connection(repository)
+            try:
+                connection.execute("DELETE FROM accepted_provider_reviews WHERE attempt_id = ?", (dispatch.provider_attempt_id,)); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(PlanReviewError, "accepted provider review"):
+                read_plan_review(repository, identity, dispatch.review_attempt_id, context=context, now=now)
+
     def test_findings_route_to_the_same_worker_thread_and_pass_cannot_contain_findings(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, now, persisted = self.setup(Path(temporary))

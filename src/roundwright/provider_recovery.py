@@ -496,6 +496,8 @@ def accept_supervisor_review(
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
         _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if _accepted_review_kind(connection, identity, row) != "generic":
+            raise ProviderRecoveryError("generic supervisor acceptance requires generic review evidence")
         if row.role is ProviderRole.SUPERVISOR and row.state is AttemptState.ACCEPTED and row.accepted_review_identity == accepted_review_identity:
             _require_accepted_supervisor_review(connection, identity, row, context)
             connection.commit()
@@ -607,7 +609,9 @@ def recover_attempt(
             return _projection(row, RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift")
         _validate_context(identity, context)
         authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
-        if _is_generic_accepted_supervisor_review(row):
+        if _accepted_review_kind(connection, identity, row) == "invalid":
+            raise ProviderRecoveryError("accepted supervisor review is invalid")
+        if _accepted_review_kind(connection, identity, row) == "generic" and row.state is AttemptState.ACCEPTED:
             _require_accepted_supervisor_review(connection, identity, row, context)
         if row.state is AttemptState.PREPARED and row.session_identity is not None:
             try:
@@ -659,7 +663,10 @@ def read_attempt(
     try:
         _require_matching_task(connection, identity)
         row = _attempt_row(connection, identity.task_id, attempt_id)
-        if _is_generic_accepted_supervisor_review(row):
+        kind = _accepted_review_kind(connection, identity, row)
+        if kind == "invalid":
+            raise ProviderRecoveryError("accepted supervisor review is invalid")
+        if kind == "generic" and row.state is AttemptState.ACCEPTED:
             if not isinstance(context, RecoveryContext) or not _context_matches(connection, identity, attempt_id, context):
                 raise ProviderRecoveryError("accepted supervisor review requires exact recovery context")
             _validate_context(identity, context)
@@ -688,12 +695,38 @@ def _accepted_supervisor_review_values(
     )
 
 
-def _is_generic_accepted_supervisor_review(row: ProviderAttempt) -> bool:
-    return (
-        row.role is ProviderRole.SUPERVISOR
-        and row.state is AttemptState.ACCEPTED
-        and not (row.output_pointer or "").startswith(("plan-review:", "diff-review:"))
-    )
+def _accepted_review_kind(connection, identity: TaskIdentity, row: ProviderAttempt) -> str:
+    """Classify an accepted Supervisor from immutable review relationships only."""
+
+    if row.role is not ProviderRole.SUPERVISOR:
+        return "generic"
+    plan = connection.execute(
+        "SELECT review_attempt_id FROM plan_review_attempts WHERE provider_attempt_id = ? AND task_id = ?",
+        (row.attempt_id, identity.task_id),
+    ).fetchone()
+    diff = connection.execute(
+        "SELECT diff_review_attempt_id FROM diff_review_attempts WHERE provider_attempt_id = ? AND task_id = ?",
+        (row.attempt_id, identity.task_id),
+    ).fetchone()
+    if plan is not None and diff is not None:
+        return "invalid"
+    if plan is not None:
+        if row.state is not AttemptState.ACCEPTED:
+            return "plan"
+        return "plan" if (
+            row.accepted_review_identity == plan[0]
+            and row.output_pointer == f"plan-review:{plan[0]}"
+        ) else "invalid"
+    if diff is not None:
+        if row.state is not AttemptState.ACCEPTED:
+            return "diff"
+        return "diff" if (
+            row.accepted_review_identity == diff[0]
+            and row.output_pointer == f"diff-review:{diff[0]}"
+        ) else "invalid"
+    if (row.output_pointer or "").startswith(("plan-review:", "diff-review:")):
+        return "invalid"
+    return "generic"
 
 
 def _require_accepted_supervisor_review(

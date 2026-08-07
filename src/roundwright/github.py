@@ -47,6 +47,7 @@ class GitHubReadOperation(StrEnum):
 
 class GitHubMutationOperation(StrEnum):
     CREATE_BRANCH = "create-branch"
+    UPDATE_BRANCH = "update-branch"
     CREATE_PULL_REQUEST = "create-pull-request"
     COMMENT = "comment"
     REQUEST_REVIEW = "request-review"
@@ -492,7 +493,7 @@ class GitHubMutationIntent:
         number_required = {GitHubMutationOperation.COMMENT, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE}
         if self.operation in number_required and self.target_number is None:
             raise GitHubContractError("mutation intent requires a target number")
-        if self.operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} and self.target_ref is None:
+        if self.operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} and self.target_ref is None:
             raise GitHubContractError("branch mutation requires a reference")
         _validate_mutation_payload(self.operation, self.target_number, self.expected_sha, self.target_ref, self.payload)
 
@@ -506,12 +507,14 @@ class MutationReceipt:
     operation: GitHubMutationOperation
     disposition: MutationDisposition
     affected_identity: str
+    semantic_readback_digest: str
 
     def __post_init__(self) -> None:
         _validate_digest(self.intent_identity, "intent identity")
         if type(self.operation) is not GitHubMutationOperation or type(self.disposition) is not MutationDisposition:
             raise GitHubContractError("mutation receipt is invalid")
         _validate_token(self.affected_identity, "affected identity")
+        _validate_digest(self.semantic_readback_digest, "semantic read-back digest")
 
 
 @dataclass(frozen=True)
@@ -557,6 +560,7 @@ class FakeGitHubScenario:
     stale: bool = False
     duplicate_receipt: bool = False
     affected_identity: str = "fixture"
+    semantic_readback_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.response is not None and self.failure is not None:
@@ -566,6 +570,10 @@ class FakeGitHubScenario:
         if type(self.stale) is not bool or type(self.duplicate_receipt) is not bool:
             raise GitHubContractError("fake scenario flags are invalid")
         _validate_token(self.affected_identity, "fake affected identity")
+        if self.duplicate_receipt != (self.semantic_readback_digest is not None):
+            raise GitHubContractError("fake accepted mutation requires one semantic read-back digest")
+        if self.semantic_readback_digest is not None:
+            _validate_digest(self.semantic_readback_digest, "fake semantic read-back digest")
 
 
 class FakeGitHubAdapter:
@@ -618,10 +626,11 @@ class FakeGitHubAdapter:
             return _mutation_failure(intent, GitHubFailureKind.STALE_RESPONSE, "fixture receipt is stale")
         prior = self._receipts.get(identity)
         if prior is not None:
-            return GitHubMutationResult(intent, receipt=MutationReceipt(identity, intent.operation, MutationDisposition.ALREADY_APPLIED, prior.affected_identity))
+            return GitHubMutationResult(intent, receipt=MutationReceipt(identity, intent.operation, MutationDisposition.ALREADY_APPLIED, prior.affected_identity, prior.semantic_readback_digest))
         if not scenario.duplicate_receipt:
             return _mutation_failure(intent, GitHubFailureKind.POLICY_DENIED, "fixture mutation execution is disabled")
-        receipt = MutationReceipt(identity, intent.operation, MutationDisposition.ACCEPTED, scenario.affected_identity)
+        assert scenario.semantic_readback_digest is not None
+        receipt = MutationReceipt(identity, intent.operation, MutationDisposition.ACCEPTED, scenario.affected_identity, scenario.semantic_readback_digest)
         self._receipts[identity] = receipt
         return GitHubMutationResult(intent, receipt=receipt)
 
@@ -852,6 +861,7 @@ def _validate_mutation_payload(
     fields = set(values)
     required: dict[GitHubMutationOperation, set[str]] = {
         GitHubMutationOperation.CREATE_BRANCH: set(),
+        GitHubMutationOperation.UPDATE_BRANCH: {"previous_sha"},
         GitHubMutationOperation.DELETE_BRANCH: set(),
         GitHubMutationOperation.CREATE_PULL_REQUEST: {"base_ref", "base_sha", "body_digest", "head_ref", "head_sha", "title_digest"},
         GitHubMutationOperation.COMMENT: {"body_digest"},
@@ -865,6 +875,10 @@ def _validate_mutation_payload(
     if operation is GitHubMutationOperation.CREATE_BRANCH:
         if target_number is not None or expected_sha is None:
             raise GitHubContractError("branch creation identity is invalid")
+    elif operation is GitHubMutationOperation.UPDATE_BRANCH:
+        if target_number is not None or expected_sha is None:
+            raise GitHubContractError("branch update identity is invalid")
+        _validate_sha(values["previous_sha"], "branch previous sha")
     elif operation is GitHubMutationOperation.DELETE_BRANCH:
         if target_number is not None or expected_sha is None:
             raise GitHubContractError("branch deletion identity is invalid")

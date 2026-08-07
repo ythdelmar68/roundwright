@@ -24,6 +24,7 @@ from roundwright.github import (
 
 SHA = "a" * 40
 DIGEST = "sha256:" + "b" * 64
+READBACK_DIGEST = "sha256:" + "c" * 64
 REPOSITORY = RepositoryRef("example", "roundwright")
 
 
@@ -152,16 +153,17 @@ class GitHubAdapterTests(unittest.TestCase):
 
     def test_duplicate_receipts_are_idempotent_not_second_external_actions(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-40", target_number=40, payload=(("body_digest", DIGEST),))
-        adapter = FakeGitHubAdapter({intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-40")})
+        adapter = FakeGitHubAdapter({intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-40", semantic_readback_digest=READBACK_DIGEST)})
         first = adapter.submit(intent)
         second = adapter.submit(intent)
         self.assertEqual(first.receipt.disposition, MutationDisposition.ACCEPTED)  # type: ignore[union-attr]
         self.assertEqual(second.receipt.disposition, MutationDisposition.ALREADY_APPLIED)  # type: ignore[union-attr]
         self.assertEqual(first.receipt.affected_identity, second.receipt.affected_identity)  # type: ignore[union-attr]
+        self.assertEqual(first.receipt.semantic_readback_digest, second.receipt.semantic_readback_digest)  # type: ignore[union-attr]
 
     def test_rejected_receipts_are_not_successes(self) -> None:
         intent = self.intent(GitHubMutationOperation.MARK_READY)
-        receipt = MutationReceipt(intent.identity(), intent.operation, MutationDisposition.REJECTED, "pr-40")
+        receipt = MutationReceipt(intent.identity(), intent.operation, MutationDisposition.REJECTED, "pr-40", READBACK_DIGEST)
         result = GitHubMutationResult(intent, receipt=receipt)
         self.assertFalse(result.ok)
 
@@ -169,7 +171,7 @@ class GitHubAdapterTests(unittest.TestCase):
         first = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-40", target_number=40, payload=(("body_digest", DIGEST),))
         changed = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-40", target_number=40, payload=(("body_digest", "sha256:" + "c" * 64),))
         self.assertNotEqual(first.identity(), changed.identity())
-        adapter = FakeGitHubAdapter({first.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-40")})
+        adapter = FakeGitHubAdapter({first.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-40", semantic_readback_digest=READBACK_DIGEST)})
         self.assertTrue(adapter.submit(first).ok)
         self.assertFalse(adapter.submit(changed).ok)
         with self.assertRaises(GitHubContractError):
@@ -203,12 +205,39 @@ class GitHubAdapterTests(unittest.TestCase):
         changed_payload = tuple((key, "b" * 40 if key == "head_sha" else value) for key, value in create_pr.payload)
         changed_pr = GitHubMutationIntent(create_pr.operation, create_pr.repository, create_pr.idempotency_key, payload=changed_payload)
         self.assertNotEqual(create_pr.identity(), changed_pr.identity())
-        for operation in (GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST):
+        for operation in (GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST):
             with self.subTest(operation=operation):
                 intent = self.intent(operation)
                 self.assertEqual(intent.expected_sha, SHA)
         with self.assertRaises(GitHubContractError):
             GitHubMutationIntent(GitHubMutationOperation.DELETE_BRANCH, REPOSITORY, "unbound-delete", target_ref="codex/issue-40")
+
+    def test_request_review_and_branch_mutations_require_semantic_readback_receipts(self) -> None:
+        for operation in (
+            GitHubMutationOperation.REQUEST_REVIEW,
+            GitHubMutationOperation.CREATE_BRANCH,
+            GitHubMutationOperation.UPDATE_BRANCH,
+            GitHubMutationOperation.DELETE_BRANCH,
+        ):
+            intent = self.intent(operation)
+            adapter = FakeGitHubAdapter({
+                intent.identity(): FakeGitHubScenario(
+                    duplicate_receipt=True,
+                    affected_identity=f"effect-{operation.value}",
+                    semantic_readback_digest=READBACK_DIGEST,
+                )
+            })
+            with self.subTest(operation=operation):
+                result = adapter.submit(intent)
+                self.assertTrue(result.ok)
+                self.assertEqual(result.receipt.semantic_readback_digest, READBACK_DIGEST)  # type: ignore[union-attr]
+                stale = FakeGitHubAdapter({
+                    intent.identity(): FakeGitHubScenario(failure=GitHubFailureKind.STALE_RESPONSE)
+                }).submit(intent)
+                self.assertFalse(stale.ok)
+                self.assertEqual(stale.failure.kind, GitHubFailureKind.STALE_RESPONSE)  # type: ignore[union-attr]
+        with self.assertRaises(GitHubContractError):
+            FakeGitHubScenario(duplicate_receipt=True)
 
     def test_repository_path_segments_and_request_applicability_fail_closed(self) -> None:
         with self.assertRaises(GitHubContractError):
@@ -246,6 +275,7 @@ class GitHubAdapterTests(unittest.TestCase):
     def intent(self, operation: GitHubMutationOperation) -> GitHubMutationIntent:
         payloads = {
             GitHubMutationOperation.CREATE_BRANCH: (),
+            GitHubMutationOperation.UPDATE_BRANCH: (("previous_sha", "b" * 40),),
             GitHubMutationOperation.DELETE_BRANCH: (),
             GitHubMutationOperation.CREATE_PULL_REQUEST: (("base_ref", "main"), ("base_sha", SHA), ("body_digest", DIGEST), ("head_ref", "codex/issue-40"), ("head_sha", SHA), ("title_digest", DIGEST)),
             GitHubMutationOperation.COMMENT: (("body_digest", DIGEST),),
@@ -256,9 +286,9 @@ class GitHubAdapterTests(unittest.TestCase):
         }
         return GitHubMutationIntent(
             operation, REPOSITORY, f"intent-{operation.value}",
-            target_number=40 if operation not in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.CREATE_PULL_REQUEST} else None,
-            expected_sha=SHA if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST} else None,
-            target_ref="codex/issue-40" if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} else None,
+            target_number=40 if operation not in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.CREATE_PULL_REQUEST} else None,
+            expected_sha=SHA if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST} else None,
+            target_ref="codex/issue-40" if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} else None,
             payload=payloads[operation],
         )
 

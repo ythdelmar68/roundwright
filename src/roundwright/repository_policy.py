@@ -9,21 +9,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping
 
+from roundwright.github import GitHubMutationOperation
 
-REPOSITORY_POLICY_SCHEMA_VERSION = 1
+
+REPOSITORY_POLICY_SCHEMA_VERSION = 2
 _FINGERPRINT_LENGTH = 64
 _COMMIT_SHA_LENGTHS = frozenset((40, 64))
 _POLICY_KEYS = frozenset((
-    "schema_version", "enabled", "allow_issue_comment", "allow_push_branch",
-    "allow_create_draft_pr", "allow_mark_pr_ready", "allow_merge_pr",
-    "allow_close_leaf_issue", "allow_delete_remote_branch",
-    "allow_delete_local_branch", "allow_remove_worktree",
+    "schema_version", "enabled", "allow_issue_comment",
+    "allow_create_remote_branch", "allow_update_remote_branch",
+    "allow_delete_remote_branch", "allow_create_draft_pr",
+    "allow_request_review", "allow_mark_pr_ready", "allow_merge_pr",
+    "allow_close_leaf_issue", "allow_delete_local_branch",
+    "allow_remove_worktree",
 ))
+_POLICY_ACTION_KEYS = _POLICY_KEYS - {"schema_version", "enabled"}
+_ROUNDLET_AUTHORITY_START = "# roundlet:repository-authority"
+_ROUNDLET_AUTHORITY_END = "# roundlet:end-repository-authority"
+_ROUNDWRIGHT_AUTHORITY_START = "# roundwright:repository-authority"
+_ROUNDWRIGHT_AUTHORITY_END = "# roundwright:end-repository-authority"
+_AUTHORITY_VALUE = re.compile(r"  ([a-z][a-z0-9_]*): (true|false|0|[1-9][0-9]*)\Z")
 
 
 class RepositoryPolicyError(ValueError):
@@ -34,12 +46,14 @@ class RepositoryMutationOperation(str, Enum):
     """The only repository mutations this Phase 3 contract can describe."""
 
     ISSUE_COMMENT = "issue-comment"
-    PUSH_BRANCH = "push-branch"
+    CREATE_REMOTE_BRANCH = "create-remote-branch"
+    UPDATE_REMOTE_BRANCH = "update-remote-branch"
+    DELETE_REMOTE_BRANCH = "delete-remote-branch"
     CREATE_DRAFT_PR = "create-draft-pr"
+    REQUEST_REVIEW = "request-review"
     MARK_PR_READY = "mark-pr-ready"
     MERGE_PR = "merge-pr"
     CLOSE_LEAF_ISSUE = "close-leaf-issue"
-    DELETE_REMOTE_BRANCH = "delete-remote-branch"
     DELETE_LOCAL_BRANCH = "delete-local-branch"
     REMOVE_WORKTREE = "remove-worktree"
 
@@ -74,12 +88,14 @@ class RepositoryMutationPolicy:
     schema_version: int
     enabled: bool
     allow_issue_comment: bool
-    allow_push_branch: bool
+    allow_create_remote_branch: bool
+    allow_update_remote_branch: bool
+    allow_delete_remote_branch: bool
     allow_create_draft_pr: bool
+    allow_request_review: bool
     allow_mark_pr_ready: bool
     allow_merge_pr: bool
     allow_close_leaf_issue: bool
-    allow_delete_remote_branch: bool
     allow_delete_local_branch: bool
     allow_remove_worktree: bool
 
@@ -145,6 +161,35 @@ class RepositoryMutationContext:
 
 
 @dataclass(frozen=True)
+class RepositoryDispatcherTransition:
+    """Externally observed exclusive-dispatch state for one candidate."""
+
+    evidence_fingerprint: str
+    repository_fingerprint: str
+    deployment_fingerprint: str
+    candidate_sha: str
+    roundlet_mutation_capable: bool
+    roundlet_reconciled: bool
+    roundwright_mutation_capable: bool
+
+    def __post_init__(self) -> None:
+        _validate_dispatcher_transition(self)
+
+    @property
+    def digest(self) -> str:
+        payload = {
+            "evidence_fingerprint": self.evidence_fingerprint,
+            "repository_fingerprint": self.repository_fingerprint,
+            "deployment_fingerprint": self.deployment_fingerprint,
+            "candidate_sha": self.candidate_sha,
+            "roundlet_mutation_capable": self.roundlet_mutation_capable,
+            "roundlet_reconciled": self.roundlet_reconciled,
+            "roundwright_mutation_capable": self.roundwright_mutation_capable,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
 class RepositoryActivationReceipt:
     """Owner receipt bound to one source, policy, and repository mutation target."""
 
@@ -158,6 +203,7 @@ class RepositoryActivationReceipt:
     deployment_fingerprint: str
     task_fingerprint: str
     candidate_sha: str
+    dispatcher_transition_digest: str
     activated_at: datetime
     expires_at: datetime
 
@@ -192,6 +238,8 @@ class RepositoryMutationBinding:
     deployment_fingerprint: str
     task_fingerprint: str
     candidate_sha: str
+    dispatcher_transition_fingerprint: str
+    dispatcher_transition_digest: str
     receipt_verification_fingerprint: str
     receipt_binding_digest: str
     receipt_status: RepositoryReceiptStatus
@@ -212,6 +260,8 @@ class RepositoryMutationBinding:
             "deployment_fingerprint": self.deployment_fingerprint,
             "task_fingerprint": self.task_fingerprint,
             "candidate_sha": self.candidate_sha,
+            "dispatcher_transition_fingerprint": self.dispatcher_transition_fingerprint,
+            "dispatcher_transition_digest": self.dispatcher_transition_digest,
             "receipt_verification_fingerprint": self.receipt_verification_fingerprint,
             "receipt_binding_digest": self.receipt_binding_digest,
             "receipt_status": self.receipt_status.value,
@@ -274,17 +324,127 @@ class RepositoryMutationDecision:
         }
 
 
-_OPERATION_SWITCH = {
+REPOSITORY_OPERATION_SWITCH = MappingProxyType({
     RepositoryMutationOperation.ISSUE_COMMENT: "allow_issue_comment",
-    RepositoryMutationOperation.PUSH_BRANCH: "allow_push_branch",
+    RepositoryMutationOperation.CREATE_REMOTE_BRANCH: "allow_create_remote_branch",
+    RepositoryMutationOperation.UPDATE_REMOTE_BRANCH: "allow_update_remote_branch",
+    RepositoryMutationOperation.DELETE_REMOTE_BRANCH: "allow_delete_remote_branch",
     RepositoryMutationOperation.CREATE_DRAFT_PR: "allow_create_draft_pr",
+    RepositoryMutationOperation.REQUEST_REVIEW: "allow_request_review",
     RepositoryMutationOperation.MARK_PR_READY: "allow_mark_pr_ready",
     RepositoryMutationOperation.MERGE_PR: "allow_merge_pr",
     RepositoryMutationOperation.CLOSE_LEAF_ISSUE: "allow_close_leaf_issue",
-    RepositoryMutationOperation.DELETE_REMOTE_BRANCH: "allow_delete_remote_branch",
     RepositoryMutationOperation.DELETE_LOCAL_BRANCH: "allow_delete_local_branch",
     RepositoryMutationOperation.REMOVE_WORKTREE: "allow_remove_worktree",
-}
+})
+
+GITHUB_REPOSITORY_OPERATION = MappingProxyType({
+    GitHubMutationOperation.CREATE_BRANCH: RepositoryMutationOperation.CREATE_REMOTE_BRANCH,
+    GitHubMutationOperation.UPDATE_BRANCH: RepositoryMutationOperation.UPDATE_REMOTE_BRANCH,
+    GitHubMutationOperation.DELETE_BRANCH: RepositoryMutationOperation.DELETE_REMOTE_BRANCH,
+    GitHubMutationOperation.CREATE_PULL_REQUEST: RepositoryMutationOperation.CREATE_DRAFT_PR,
+    GitHubMutationOperation.COMMENT: RepositoryMutationOperation.ISSUE_COMMENT,
+    GitHubMutationOperation.REQUEST_REVIEW: RepositoryMutationOperation.REQUEST_REVIEW,
+    GitHubMutationOperation.MARK_READY: RepositoryMutationOperation.MARK_PR_READY,
+    GitHubMutationOperation.MERGE_PULL_REQUEST: RepositoryMutationOperation.MERGE_PR,
+    GitHubMutationOperation.CLOSE_ISSUE: RepositoryMutationOperation.CLOSE_LEAF_ISSUE,
+})
+
+_OPERATION_SWITCH = REPOSITORY_OPERATION_SWITCH
+
+
+@dataclass(frozen=True)
+class RoundletAuthorityState:
+    """Only the Roundlet block's enabled state, never its action vocabulary."""
+
+    enabled: bool
+    block_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise RepositoryPolicyError("Roundlet authority enabled state is invalid")
+        _require_fingerprint(self.block_digest, "Roundlet authority block")
+
+
+def validate_repository_mutation_vocabulary(
+    repository_switches: Mapping[object, object] = REPOSITORY_OPERATION_SWITCH,
+    github_operations: Mapping[object, object] = GITHUB_REPOSITORY_OPERATION,
+) -> None:
+    """Reject non-total, duplicate, extra, or nullable operation mappings."""
+
+    _validate_total_mapping(
+        repository_switches,
+        frozenset(RepositoryMutationOperation),
+        _POLICY_ACTION_KEYS,
+        RepositoryMutationOperation,
+        str,
+        "repository operation/Boolean",
+    )
+    _validate_total_mapping(
+        github_operations,
+        frozenset(GitHubMutationOperation),
+        frozenset(RepositoryMutationOperation),
+        GitHubMutationOperation,
+        RepositoryMutationOperation,
+        "GitHub/repository operation",
+        require_all_values=False,
+    )
+
+
+def repository_operation_for_github(operation: GitHubMutationOperation) -> RepositoryMutationOperation:
+    """Return the one canonical repository-policy operation for GitHub."""
+
+    if type(operation) is not GitHubMutationOperation:
+        raise RepositoryPolicyError("GitHub mutation operation is invalid")
+    return GITHUB_REPOSITORY_OPERATION[operation]
+
+
+def parse_roundlet_authority_state(contents: bytes | str) -> RoundletAuthorityState:
+    """Read only the exact Roundlet marker block for transition exclusivity."""
+
+    raw = _parse_marked_authority_block(
+        contents, _ROUNDLET_AUTHORITY_START, _ROUNDLET_AUTHORITY_END, "roundlet"
+    )
+    if "enabled" not in raw or type(raw["enabled"]) is not bool:
+        raise RepositoryPolicyError("Roundlet authority block has no strict enabled state")
+    if any(type(value) is not bool for value in raw.values()):
+        raise RepositoryPolicyError("Roundlet authority block contains an unsupported value")
+    digest = hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    return RoundletAuthorityState(raw["enabled"], digest)
+
+
+def parse_roundwright_authority_block(contents: bytes | str) -> RepositoryMutationPolicy:
+    """Parse only the exact Roundwright proposal markers using schema v2."""
+
+    raw = _parse_marked_authority_block(
+        contents, _ROUNDWRIGHT_AUTHORITY_START, _ROUNDWRIGHT_AUTHORITY_END, "roundwright"
+    )
+    if set(raw) != _POLICY_KEYS:
+        raise RepositoryPolicyError("Roundwright authority block has missing or unsupported keys")
+    try:
+        return RepositoryMutationPolicy(**raw)
+    except (TypeError, RepositoryPolicyError) as error:
+        raise RepositoryPolicyError("Roundwright authority block is invalid") from error
+
+
+def validate_dispatcher_exclusivity(
+    roundlet: RoundletAuthorityState,
+    roundwright: RepositoryMutationPolicy,
+    *,
+    roundlet_reconciled: bool,
+) -> None:
+    """Require stop/reconcile before Roundwright can become mutation-capable."""
+
+    if (
+        type(roundlet) is not RoundletAuthorityState
+        or type(roundwright) is not RepositoryMutationPolicy
+        or type(roundlet_reconciled) is not bool
+    ):
+        raise RepositoryPolicyError("dispatcher exclusivity evidence is invalid")
+    if roundlet.enabled and roundwright.enabled:
+        raise RepositoryPolicyError("Roundlet and Roundwright cannot both be mutation-capable")
+    if roundwright.enabled and not roundlet_reconciled:
+        raise RepositoryPolicyError("Roundlet must be stopped and reconciled before Roundwright activation")
 
 
 def parse_repository_mutation_policy(contents: bytes | str) -> RepositoryMutationPolicy:
@@ -309,29 +469,40 @@ def evaluate_repository_mutation_policy(
     operation: RepositoryMutationOperation | None,
     *,
     standing_authority: StandingRepositoryAuthority | None,
+    dispatcher_transition: RepositoryDispatcherTransition | None,
     receipt_verification: RepositoryReceiptVerification | None,
     now: datetime | None,
 ) -> RepositoryMutationDecision:
     """Authorize only an exact, fresh, externally activated Boolean switch."""
 
+    denial_evidence = (
+        snapshot,
+        receipt,
+        operation,
+        context,
+        dispatcher_transition,
+        receipt_verification,
+    )
     if type(operation) is not RepositoryMutationOperation:
-        return _denied("repository mutation operation is unavailable", snapshot, receipt)
+        return _denied("repository mutation operation is unavailable", *denial_evidence)
     if type(snapshot) is not TrustedRepositoryPolicySnapshot or not _snapshot_is_valid(snapshot):
-        return _denied("trusted repository policy evidence is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("trusted repository policy evidence is unavailable or invalid", *denial_evidence)
     if type(receipt) is not RepositoryActivationReceipt or not _receipt_is_valid(receipt):
-        return _denied("repository policy activation receipt is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("repository policy activation receipt is unavailable or invalid", *denial_evidence)
     if type(context) is not RepositoryMutationContext or not _context_is_valid(context):
-        return _denied("repository mutation context is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("repository mutation context is unavailable or invalid", *denial_evidence)
     if type(standing_authority) is not StandingRepositoryAuthority or not _standing_authority_is_valid(standing_authority):
-        return _denied("standing repository authority is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("standing repository authority is unavailable or invalid", *denial_evidence)
+    if type(dispatcher_transition) is not RepositoryDispatcherTransition or not _dispatcher_transition_is_valid(dispatcher_transition):
+        return _denied("exclusive dispatcher transition evidence is unavailable or invalid", *denial_evidence)
     if type(receipt_verification) is not RepositoryReceiptVerification or not _receipt_verification_is_valid(receipt_verification):
-        return _denied("repository policy receipt lifecycle verification is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("repository policy receipt lifecycle verification is unavailable or invalid", *denial_evidence)
     if type(now) is not datetime or now.tzinfo is not timezone.utc:
-        return _denied("repository policy evaluation time is unavailable or invalid", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("repository policy evaluation time is unavailable or invalid", *denial_evidence)
 
     document = snapshot.document
     if not _policy_narrows(document, standing_authority.policy):
-        return _denied("repository policy would widen standing authority", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("repository policy would widen standing authority", *denial_evidence)
     checks = (
         (receipt.source_fingerprint == snapshot.source.source_fingerprint, "repository policy source does not match activation receipt"),
         (receipt.revision_fingerprint == snapshot.source.revision_fingerprint, "repository policy revision does not match activation receipt"),
@@ -341,6 +512,13 @@ def evaluate_repository_mutation_policy(
         (receipt.deployment_fingerprint == context.deployment_fingerprint, "activation receipt is not bound to this deployment"),
         (receipt.task_fingerprint == context.task_fingerprint, "activation receipt is not bound to this task"),
         (receipt.candidate_sha == context.candidate_sha, "activation receipt is not bound to this candidate"),
+        (receipt.dispatcher_transition_digest == dispatcher_transition.digest, "activation receipt is not bound to this dispatcher transition"),
+        (dispatcher_transition.repository_fingerprint == context.repository_fingerprint, "dispatcher transition is not bound to this repository"),
+        (dispatcher_transition.deployment_fingerprint == context.deployment_fingerprint, "dispatcher transition is not bound to this deployment"),
+        (dispatcher_transition.candidate_sha == context.candidate_sha, "dispatcher transition is not bound to this candidate"),
+        (not dispatcher_transition.roundlet_mutation_capable, "Roundlet remains mutation-capable"),
+        (dispatcher_transition.roundlet_reconciled, "Roundlet has not been reconciled"),
+        (dispatcher_transition.roundwright_mutation_capable, "Roundwright is not the selected mutation-capable dispatcher"),
         (receipt.activated_at <= now < receipt.expires_at, "repository policy activation receipt is stale or not yet active"),
         (receipt_verification.receipt_fingerprint == receipt.receipt_fingerprint, "repository policy lifecycle verification is not bound to this receipt"),
         (receipt_verification.receipt_binding_digest == _receipt_binding_digest(receipt), "repository policy lifecycle verification does not match this receipt binding"),
@@ -348,12 +526,12 @@ def evaluate_repository_mutation_policy(
     )
     for passed, reason in checks:
         if not passed:
-            return _denied(reason, snapshot, receipt, operation, context, receipt_verification)
+            return _denied(reason, *denial_evidence)
     if not document.enabled:
-        return _denied("repository mutation policy is disabled", snapshot, receipt, operation, context, receipt_verification)
+        return _denied("repository mutation policy is disabled", *denial_evidence)
     if not _action_switch_is_enabled(document, operation):
-        return _denied("repository mutation action is disabled", snapshot, receipt, operation, context, receipt_verification)
-    return RepositoryMutationDecision(operation, True, "repository mutation policy is active for this exact operation", snapshot.policy_digest, snapshot.source.source_fingerprint, receipt.receipt_fingerprint, True, True, "mutation-adapter-may-attempt-readback", _binding_from_evidence(snapshot, receipt, context, receipt_verification))
+        return _denied("repository mutation action is disabled", *denial_evidence)
+    return RepositoryMutationDecision(operation, True, "repository mutation policy is active for this exact operation", snapshot.policy_digest, snapshot.source.source_fingerprint, receipt.receipt_fingerprint, True, True, "mutation-adapter-may-attempt-readback", _binding_from_evidence(snapshot, receipt, context, dispatcher_transition, receipt_verification))
 
 
 def evaluate_shadow_mutation_policy(operation: RepositoryMutationOperation | None) -> RepositoryMutationDecision:
@@ -364,7 +542,15 @@ def evaluate_shadow_mutation_policy(operation: RepositoryMutationOperation | Non
     return RepositoryMutationDecision(operation, False, "shadow replay is read-only and all repository mutation switches are disabled", None, None, None, False, False, "retain-zero-mutation-evidence")
 
 
-def _denied(reason: str, snapshot: object = None, receipt: object = None, operation: object = None, context: object = None, receipt_verification: object = None) -> RepositoryMutationDecision:
+def _denied(
+    reason: str,
+    snapshot: object = None,
+    receipt: object = None,
+    operation: object = None,
+    context: object = None,
+    dispatcher_transition: object = None,
+    receipt_verification: object = None,
+) -> RepositoryMutationDecision:
     valid_snapshot = type(snapshot) is TrustedRepositoryPolicySnapshot and _snapshot_is_valid(snapshot)
     valid_receipt = type(receipt) is RepositoryActivationReceipt and _receipt_is_valid(receipt)
     policy = snapshot.document if valid_snapshot else None
@@ -378,12 +564,16 @@ def _denied(reason: str, snapshot: object = None, receipt: object = None, operat
         bool(policy.enabled) if policy is not None else False,
         _action_switch_is_enabled(policy, operation) if policy is not None and type(operation) is RepositoryMutationOperation else False,
         "resolve-policy-or-owner-receipt",
-        _binding_from_evidence(snapshot, receipt, context, receipt_verification),
+        _binding_from_evidence(snapshot, receipt, context, dispatcher_transition, receipt_verification),
     )
 
 
 def _binding_from_evidence(
-    snapshot: object, receipt: object, context: object, receipt_verification: object
+    snapshot: object,
+    receipt: object,
+    context: object,
+    dispatcher_transition: object,
+    receipt_verification: object,
 ) -> RepositoryMutationBinding | None:
     if (
         type(snapshot) is not TrustedRepositoryPolicySnapshot
@@ -392,6 +582,8 @@ def _binding_from_evidence(
         or not _receipt_is_valid(receipt)
         or type(context) is not RepositoryMutationContext
         or not _context_is_valid(context)
+        or type(dispatcher_transition) is not RepositoryDispatcherTransition
+        or not _dispatcher_transition_is_valid(dispatcher_transition)
         or type(receipt_verification) is not RepositoryReceiptVerification
         or not _receipt_verification_is_valid(receipt_verification)
     ):
@@ -407,6 +599,8 @@ def _binding_from_evidence(
         context.deployment_fingerprint,
         context.task_fingerprint,
         context.candidate_sha,
+        dispatcher_transition.evidence_fingerprint,
+        dispatcher_transition.digest,
         receipt_verification.verification_fingerprint,
         receipt_verification.receipt_binding_digest,
         receipt_verification.status,
@@ -422,6 +616,70 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _parse_marked_authority_block(
+    contents: bytes | str,
+    start_marker: str,
+    end_marker: str,
+    root_key: str,
+) -> dict[str, bool | int]:
+    try:
+        if type(contents) is bytes:
+            text = contents.decode("utf-8", errors="strict")
+        elif type(contents) is str:
+            text = contents
+        else:
+            raise TypeError("authority document must be bytes or text")
+    except (TypeError, UnicodeDecodeError) as error:
+        raise RepositoryPolicyError("repository authority document is malformed") from error
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == start_marker]
+    ends = [index for index, line in enumerate(lines) if line == end_marker]
+    if len(starts) != 1 or len(ends) != 1 or ends[0] <= starts[0] + 1:
+        raise RepositoryPolicyError(f"{root_key} authority markers are missing, duplicated, or malformed")
+    block = lines[starts[0] + 1:ends[0]]
+    if not block or block[0] != f"{root_key}:":
+        raise RepositoryPolicyError(f"{root_key} authority root is malformed")
+    result: dict[str, bool | int] = {}
+    for line in block[1:]:
+        match = _AUTHORITY_VALUE.fullmatch(line)
+        if match is None:
+            raise RepositoryPolicyError(f"{root_key} authority value is malformed")
+        key, token = match.groups()
+        if key in result:
+            raise RepositoryPolicyError(f"{root_key} authority block contains duplicate keys")
+        result[key] = token == "true" if token in {"true", "false"} else int(token)
+    return result
+
+
+def _validate_total_mapping(
+    mapping: Mapping[object, object],
+    required_keys: frozenset[object],
+    allowed_values: frozenset[object],
+    key_type: type,
+    value_type: type,
+    description: str,
+    *,
+    require_all_values: bool = True,
+) -> None:
+    if not isinstance(mapping, Mapping):
+        raise RepositoryPolicyError(f"{description} mapping is unavailable")
+    try:
+        items = tuple(mapping.items())
+        keys = tuple(key for key, _ in items)
+        values = tuple(value for _, value in items)
+        if (
+            any(type(key) is not key_type for key in keys)
+            or frozenset(keys) != required_keys
+            or any(value is None or type(value) is not value_type for value in values)
+            or any(value not in allowed_values for value in values)
+            or len(values) != len(set(values))
+            or (require_all_values and frozenset(values) != allowed_values)
+        ):
+            raise RepositoryPolicyError(f"{description} mapping is not total and one-to-one")
+    except (AttributeError, TypeError) as error:
+        raise RepositoryPolicyError(f"{description} mapping is malformed") from error
+
+
 def _canonical_policy_bytes(policy: RepositoryMutationPolicy) -> bytes:
     return json.dumps({name: getattr(policy, name) for name in sorted(_POLICY_KEYS)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
@@ -435,25 +693,9 @@ def _action_switch_is_enabled(
 ) -> bool:
     """Read only validated fields; never dispatch through an evidence method."""
 
-    if operation is RepositoryMutationOperation.ISSUE_COMMENT:
-        return policy.allow_issue_comment
-    if operation is RepositoryMutationOperation.PUSH_BRANCH:
-        return policy.allow_push_branch
-    if operation is RepositoryMutationOperation.CREATE_DRAFT_PR:
-        return policy.allow_create_draft_pr
-    if operation is RepositoryMutationOperation.MARK_PR_READY:
-        return policy.allow_mark_pr_ready
-    if operation is RepositoryMutationOperation.MERGE_PR:
-        return policy.allow_merge_pr
-    if operation is RepositoryMutationOperation.CLOSE_LEAF_ISSUE:
-        return policy.allow_close_leaf_issue
-    if operation is RepositoryMutationOperation.DELETE_REMOTE_BRANCH:
-        return policy.allow_delete_remote_branch
-    if operation is RepositoryMutationOperation.DELETE_LOCAL_BRANCH:
-        return policy.allow_delete_local_branch
-    if operation is RepositoryMutationOperation.REMOVE_WORKTREE:
-        return policy.allow_remove_worktree
-    raise RepositoryPolicyError("repository mutation operation is invalid")
+    if type(operation) is not RepositoryMutationOperation:
+        raise RepositoryPolicyError("repository mutation operation is invalid")
+    return bool(getattr(policy, REPOSITORY_OPERATION_SWITCH[operation]))
 
 
 def _policy_is_valid(policy: object) -> bool:
@@ -491,6 +733,16 @@ def _context_is_valid(context: object) -> bool:
         return False
     try:
         RepositoryMutationContext(context.repository_fingerprint, context.deployment_fingerprint, context.task_fingerprint, context.candidate_sha)
+    except (AttributeError, TypeError, RepositoryPolicyError):
+        return False
+    return True
+
+
+def _dispatcher_transition_is_valid(transition: object) -> bool:
+    if type(transition) is not RepositoryDispatcherTransition:
+        return False
+    try:
+        _validate_dispatcher_transition(transition)
     except (AttributeError, TypeError, RepositoryPolicyError):
         return False
     return True
@@ -536,6 +788,7 @@ def _validate_receipt(receipt: RepositoryActivationReceipt) -> None:
         (receipt.source_fingerprint, "receipt source"), (receipt.revision_fingerprint, "receipt revision"),
         (receipt.policy_digest, "receipt policy digest"), (receipt.repository_fingerprint, "receipt repository"),
         (receipt.deployment_fingerprint, "receipt deployment"), (receipt.task_fingerprint, "receipt task"),
+        (receipt.dispatcher_transition_digest, "receipt dispatcher transition"),
     ):
         _require_fingerprint(value, description)
     if type(receipt.schema_version) is not int or receipt.schema_version != REPOSITORY_POLICY_SCHEMA_VERSION:
@@ -545,6 +798,27 @@ def _validate_receipt(receipt: RepositoryActivationReceipt) -> None:
         raise RepositoryPolicyError("repository policy receipt activation time is invalid")
     if type(receipt.expires_at) is not datetime or receipt.expires_at.tzinfo is not timezone.utc or receipt.expires_at <= receipt.activated_at:
         raise RepositoryPolicyError("repository policy receipt validity window is invalid")
+
+
+def _validate_dispatcher_transition(transition: RepositoryDispatcherTransition) -> None:
+    for value, description in (
+        (transition.evidence_fingerprint, "dispatcher transition evidence"),
+        (transition.repository_fingerprint, "dispatcher transition repository"),
+        (transition.deployment_fingerprint, "dispatcher transition deployment"),
+    ):
+        _require_fingerprint(value, description)
+    _require_commit_sha(transition.candidate_sha, "dispatcher transition candidate")
+    for value in (
+        transition.roundlet_mutation_capable,
+        transition.roundlet_reconciled,
+        transition.roundwright_mutation_capable,
+    ):
+        if type(value) is not bool:
+            raise RepositoryPolicyError("dispatcher transition state is invalid")
+    if transition.roundlet_mutation_capable and transition.roundwright_mutation_capable:
+        raise RepositoryPolicyError("Roundlet and Roundwright cannot both be mutation-capable")
+    if transition.roundwright_mutation_capable and not transition.roundlet_reconciled:
+        raise RepositoryPolicyError("Roundlet must be reconciled before Roundwright becomes mutation-capable")
 
 
 def _validate_receipt_verification(verification: RepositoryReceiptVerification) -> None:
@@ -572,6 +846,7 @@ def _receipt_binding_digest(receipt: RepositoryActivationReceipt) -> str:
         "deployment_fingerprint": receipt.deployment_fingerprint,
         "task_fingerprint": receipt.task_fingerprint,
         "candidate_sha": receipt.candidate_sha,
+        "dispatcher_transition_digest": receipt.dispatcher_transition_digest,
         "activated_at": receipt.activated_at.isoformat(),
         "expires_at": receipt.expires_at.isoformat(),
     }
@@ -588,6 +863,8 @@ def _validate_binding(binding: RepositoryMutationBinding) -> None:
         (binding.repository_fingerprint, "binding repository"),
         (binding.deployment_fingerprint, "binding deployment"),
         (binding.task_fingerprint, "binding task"),
+        (binding.dispatcher_transition_fingerprint, "binding dispatcher transition evidence"),
+        (binding.dispatcher_transition_digest, "binding dispatcher transition"),
         (binding.receipt_verification_fingerprint, "binding receipt lifecycle verification"),
         (binding.receipt_binding_digest, "binding receipt identity"),
     ):
@@ -607,3 +884,6 @@ def _require_fingerprint(value: object, description: str) -> None:
 def _require_commit_sha(value: object, description: str) -> None:
     if type(value) is not str or len(value) not in _COMMIT_SHA_LENGTHS or any(character not in "0123456789abcdef" for character in value):
         raise RepositoryPolicyError(f"{description} commit identity is invalid")
+
+
+validate_repository_mutation_vocabulary()

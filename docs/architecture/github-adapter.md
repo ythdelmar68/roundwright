@@ -22,7 +22,17 @@ payload carries public references and content digests only, and is bound into
 the intent and receipt identity. Outcomes distinguish unavailable
 capability, permission denial, authentication failure, transport failure,
 malformed response, stale response, and policy denial. A later `gh` adapter
-must bind its semantic read-back receipt to the full intent identity.
+must bind its semantic read-back receipt to the full intent identity. A
+successful receipt is invalid without a semantic read-back digest.
+
+The Python `RepositoryMutationOperation` vocabulary and schema v2 Boolean
+names are canonical. Every `GitHubMutationOperation` has one immutable,
+one-to-one mapping to it; every repository operation has one Boolean switch.
+The mapping is validated for totality at import and in CI, so missing, extra,
+duplicate, or `None` entries fail before a mutation can be considered.
+Remote branch creation, non-force update, and deletion are distinct actions.
+An update binds both the previously observed SHA and the desired exact SHA;
+request-review binds the exact pull-request head SHA and reviewers digest.
 
 ## `gh` runtime seam and semantic receipts
 
@@ -70,5 +80,6 @@ normal responses, each failure class, stale responses, and duplicate semantic
 receipts. It records every attempted adapter call. Mutation intents are denied
 unless a fixture explicitly supplies a receipt, and a duplicate returns the
 same semantic identity as `ALREADY_APPLIED`; it never represents a second
-external action. This makes shadow fixtures capable of proving both the
+external action. An accepted fixture must explicitly supply its semantic
+read-back digest. This makes shadow fixtures capable of proving both the
 requested operation and an adapter-call count of zero.

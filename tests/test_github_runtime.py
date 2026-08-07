@@ -12,6 +12,8 @@ import unittest
 
 from roundwright.deployment import DeploymentAuthorityDecision, DeploymentMode
 from roundwright.github import (
+    CommentSnapshot,
+    CommentsSnapshot,
     FakeGitHubAdapter,
     FakeGitHubScenario,
     GitHubFailureKind,
@@ -25,6 +27,7 @@ from roundwright.github import (
 from roundwright.github_runtime import (
     CapabilityState,
     BrokerMutationCommand,
+    CollectionPage,
     GhCommandResult,
     DurableMutationJournal,
     GhGitHubAdapter,
@@ -38,6 +41,7 @@ from roundwright.github_runtime import (
     SemanticPostcondition,
     SemanticReadback,
     _broker_semantic_plan,
+    _complete_broker_read,
     schema_v2_authorization_bundle,
     unavailable_capability_health,
 )
@@ -77,6 +81,19 @@ class Runner:
         return self.results.pop(0)
 
 
+class PagedFakeGitHubAdapter(FakeGitHubAdapter):
+    """Hermetic typed collection-page fixture; it never invokes a provider."""
+
+    def __init__(self, scenarios: dict[str, FakeGitHubScenario], pages: dict[str | None, object]) -> None:
+        super().__init__(scenarios)
+        self.pages = pages
+        self.page_requests: list[tuple[GitHubReadRequest, str | None]] = []
+
+    def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> object:
+        self.page_requests.append((request, cursor))
+        return self.pages.get(cursor)
+
+
 def health(*available: object) -> GitHubCapabilityHealth:
     return GitHubCapabilityHealth(
         tuple(
@@ -96,6 +113,26 @@ def comments_payload() -> dict[str, object]:
         "issue_number": 46,
         "comments": [{"id": "comment-46", "author_id": "owner-1", "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}],
     }
+
+
+def gh_comments_page(*, present: bool = True) -> dict[str, object]:
+    return {
+        "items": ([] if not present else [{"id": 17, "user": {"id": 4}, "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}]),
+        "next_cursor": None,
+        "total_count": 1 if present else 0,
+    }
+
+
+def comment(identifier: str, body_digest: str = COMMENT_DIGEST) -> CommentSnapshot:
+    return CommentSnapshot(identifier, "owner-1", body_digest, "2026-08-07T00:00:00Z")
+
+
+def comments_page(
+    cursor: str | None, next_cursor: str | None, total: int, *items: CommentSnapshot,
+    request: GitHubReadRequest | None = None,
+) -> CollectionPage:
+    actual_request = request or comments_request()
+    return CollectionPage(actual_request, cursor, next_cursor, total, CommentsSnapshot(REPOSITORY, 46, items))
 
 
 def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationOperation.ISSUE_COMMENT) -> MutationBrokerContext:
@@ -350,6 +387,68 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls, [("api", "--method", "GET", "repos/example/roundwright/issues/46/comments")])
         self.assertNotIn("curated evidence", repr(result.snapshot))
 
+    def test_collection_completeness_consumes_single_and_multi_page_typed_results(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "paged-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        bundle = schema_v2_authorization_bundle(context)
+        plan = _broker_semantic_plan(intent)
+        request = comments_request()
+        single = PagedFakeGitHubAdapter({}, {None: comments_page(None, None, 1, comment("comment-01"))})
+        one, one_receipt = _complete_broker_read(single, request, context, bundle, plan, None)
+        self.assertTrue(one.ok)
+        self.assertTrue(one_receipt.startswith("sha256:"))
+        self.assertEqual([item.comment_id for item in one.snapshot.comments], ["comment-01"])  # type: ignore[union-attr]
+
+        multi = PagedFakeGitHubAdapter({}, {
+            None: comments_page(None, "cursor-1", 2, comment("comment-01")),
+            "cursor-1": comments_page("cursor-1", None, 2, comment("comment-01"), comment("comment-02", DIGEST)),
+        })
+        complete, receipt = _complete_broker_read(multi, request, context, bundle, plan, None)
+        self.assertTrue(complete.ok)
+        self.assertEqual([item.comment_id for item in complete.snapshot.comments], ["comment-01", "comment-02"])  # type: ignore[union-attr]
+        self.assertNotEqual(one_receipt, receipt)
+        self.assertEqual(multi.page_requests, [(request, None), (request, "cursor-1")])
+
+    def test_incomplete_or_drifting_collection_pages_deny_before_mutation(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "reject-paging-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        request = comments_request()
+        other_request = GitHubReadRequest(GitHubReadOperation.COMMENTS, REPOSITORY, number=47)
+        over_limit: dict[str | None, object] = {}
+        for index in range(33):
+            cursor = None if index == 0 else f"cursor-{index - 1:02d}"
+            next_cursor = None if index == 32 else f"cursor-{index:02d}"
+            over_limit[cursor] = comments_page(cursor, next_cursor, 33, comment(f"comment-{index:02d}"))
+        cases: dict[str, dict[str | None, object]] = {
+            "missing": {None: None},
+            "request-drift": {None: comments_page(None, None, 1, comment("comment-01"), request=other_request)},
+            "truncated": {None: comments_page(None, None, 2, comment("comment-01"))},
+            "cyclic": {
+                None: comments_page(None, "cursor-1", 2, comment("comment-01")),
+                "cursor-1": comments_page("cursor-1", "cursor-1", 2, comment("comment-02", DIGEST)),
+            },
+            "inconsistent-total": {
+                None: comments_page(None, "cursor-1", 2, comment("comment-01")),
+                "cursor-1": comments_page("cursor-1", None, 1, comment("comment-02", DIGEST)),
+            },
+            "duplicate-conflict": {
+                None: comments_page(None, "cursor-1", 1, comment("comment-01")),
+                "cursor-1": comments_page("cursor-1", None, 1, comment("comment-01", DIGEST)),
+            },
+            "unstable-order": {
+                None: comments_page(None, "cursor-1", 2, comment("comment-02", DIGEST)),
+                "cursor-1": comments_page("cursor-1", None, 2, comment("comment-01")),
+            },
+            "over-limit": over_limit,
+        }
+        for name, pages in cases.items():
+            with self.subTest(name=name):
+                adapter = PagedFakeGitHubAdapter(
+                    {intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST)}, pages,
+                )
+                result = GitHubMutationBroker(adapter).submit(intent, allowed_context())
+                self.assertFalse(result.ok)
+                self.assertEqual(adapter.call_count(kind="mutation"), 0)
+
     def test_gh_adapter_projects_rest_comment_schema_and_rejects_identity_drift(self) -> None:
         raw = [{"id": 17, "user": {"id": 4}, "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}]
         runner = Runner(GhCommandResult(0, json.dumps(raw)), GhCommandResult(0, json.dumps({"number": 47, "state": "OPEN", "id": 46})))
@@ -496,9 +595,9 @@ class GitHubRuntimeTests(unittest.TestCase):
         body = "curated evidence"
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         runner = Runner(
-            GhCommandResult(0, json.dumps(comments_payload())),
+            GhCommandResult(0, json.dumps(gh_comments_page())),
             GhCommandResult(0, "ignored provider output"),
-            GhCommandResult(0, json.dumps(comments_payload())),
+            GhCommandResult(0, json.dumps(gh_comments_page())),
         )
         adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT))
         broker = GitHubMutationBroker(adapter)
@@ -517,7 +616,7 @@ class GitHubRuntimeTests(unittest.TestCase):
     def test_brokered_gh_ambiguous_readback_reconciles_without_duplicate_write(self) -> None:
         request = comments_request()
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
-        empty = {**comments_payload(), "comments": []}
+        empty = gh_comments_page(present=False)
         runner = Runner(
             GhCommandResult(0, json.dumps(empty)),
             GhCommandResult(0, "ignored provider output"),

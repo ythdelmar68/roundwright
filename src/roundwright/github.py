@@ -612,6 +612,20 @@ class FakeGitHubAdapter:
         except GitHubContractError:
             return _read_failure(request, GitHubFailureKind.MALFORMED_RESPONSE, "fixture response is malformed")
 
+    def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> object:
+        """Expose an explicit terminal page for typed hermetic fixtures only."""
+
+        if request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS} or cursor is not None:
+            return None
+        result = self.read(request)
+        if not result.ok or type(result.snapshot) not in {CommentsSnapshot, ReviewsSnapshot}:
+            return None
+        # Delayed import avoids making the core contracts depend on the runtime
+        # process boundary while still giving tests explicit page metadata.
+        from .github_runtime import CollectionPage
+        count = len(result.snapshot.comments if type(result.snapshot) is CommentsSnapshot else result.snapshot.reviews)
+        return CollectionPage(request, None, None, count, result.snapshot)
+
     def submit(self, intent: GitHubMutationIntent) -> GitHubMutationResult:
         if type(intent) is not GitHubMutationIntent:
             raise GitHubContractError("mutation intent is invalid")

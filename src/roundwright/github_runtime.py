@@ -207,6 +207,34 @@ class GhGitHubAdapter:
         except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "gh read response is malformed"))
 
+    def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
+        """Read one explicitly paginated collection envelope, or fail closed."""
+
+        if type(request) is not GitHubReadRequest or request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
+            return None
+        if cursor is not None and (type(cursor) is not str or not _IDENTIFIER.fullmatch(cursor)):
+            return None
+        self.calls.append(("collection-read", request.operation.value))
+        if _health_failure(request.operation, self._health) is not None:
+            return None
+        command = _read_command(request) + (() if cursor is None else ("-f", f"cursor={cursor}"))
+        outcome = self._runner.run(command)
+        if outcome.exit_code != 0:
+            return None
+        try:
+            raw = json.loads(outcome.stdout)
+            if type(raw) is not dict or set(raw) != {"items", "next_cursor", "total_count"}:
+                return None
+            next_cursor, total_count = raw["next_cursor"], raw["total_count"]
+            if next_cursor is not None and (type(next_cursor) is not str or not _IDENTIFIER.fullmatch(next_cursor)):
+                return None
+            if type(total_count) is not int or type(total_count) is bool or total_count < 0 or type(raw["items"]) is not list:
+                return None
+            snapshot = normalize_github_response(request, _project_gh_response(request, raw["items"]))
+            return CollectionPage(request, cursor, next_cursor, total_count, snapshot)
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return None
+
     def submit(self, intent: GitHubMutationIntent) -> GitHubMutationResult:
         """Refuse direct writes; only the broker-only seam may execute one."""
 
@@ -347,6 +375,62 @@ class SemanticReadback:
     @property
     def identity(self) -> str:
         return _sha256((self.request.identity(), self.condition.value))
+
+
+@dataclass(frozen=True)
+class CollectionPage:
+    """One explicit typed collection page; ``next_cursor=None`` is terminal."""
+
+    request: GitHubReadRequest
+    cursor: str | None
+    next_cursor: str | None
+    total_count: int
+    snapshot: CommentsSnapshot | ReviewsSnapshot
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not GitHubReadRequest or self.request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
+            raise GitHubRuntimeError("collection page request is invalid")
+        for value, name in ((self.cursor, "collection cursor"), (self.next_cursor, "collection continuation")):
+            if value is not None and (type(value) is not str or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", value)):
+                raise GitHubRuntimeError(f"{name} is invalid")
+        if type(self.total_count) is not int or self.total_count < 0 or type(self.snapshot) not in {CommentsSnapshot, ReviewsSnapshot}:
+            raise GitHubRuntimeError("collection page is invalid")
+        if self.snapshot.repository != self.request.repository:
+            raise GitHubRuntimeError("collection page repository does not match request")
+        object.__setattr__(self, "identity", _sha256((self.request.identity(), self.cursor, self.next_cursor, self.total_count, _collection_snapshot_payload(self.snapshot))))
+
+
+@dataclass(frozen=True)
+class CollectionCompletenessReceipt:
+    """Public-safe proof that all typed pages formed one deterministic result."""
+
+    request_identity: str
+    page_identities: tuple[str, ...]
+    normalized_result_identity: str
+    candidate_sha: str
+    configuration_digest: str
+    gate_identity: str
+    authorization_bundle_identity: str
+    semantic_plan_identity: str
+    journal_identity: str
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.request_identity, "completeness request"), (self.normalized_result_identity, "completeness result"),
+            (self.configuration_digest, "completeness configuration"), (self.gate_identity, "completeness gate"),
+            (self.authorization_bundle_identity, "completeness bundle"), (self.semantic_plan_identity, "completeness plan"),
+            (self.journal_identity, "completeness journal"),
+        ):
+            _digest(value, name)
+        if type(self.page_identities) is not tuple or not self.page_identities:
+            raise GitHubRuntimeError("completeness pages are invalid")
+        for page in self.page_identities:
+            _digest(page, "completeness page")
+        if type(self.candidate_sha) is not str or len(self.candidate_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in self.candidate_sha):
+            raise GitHubRuntimeError("completeness candidate is invalid")
+        object.__setattr__(self, "identity", _sha256(tuple(getattr(self, name) for name in self.__dataclass_fields__ if name != "identity")))
 
 
 class BrokerMutationCommand(StrEnum):
@@ -552,6 +636,8 @@ class SemanticMutationReceipt:
     intent_identity: str
     semantic_plan_identity: str
     semantic_readback_identity: str
+    pre_state_completeness_identity: str
+    post_state_completeness_identity: str
     public_payload_digest: str
     policy_binding_digest: str
     configuration_digest: str
@@ -573,6 +659,8 @@ class SemanticMutationReceipt:
             (self.authorization_bundle_identity, "authorization bundle"),
             (self.intent_identity, "intent"), (self.semantic_plan_identity, "semantic plan"),
             (self.semantic_readback_identity, "semantic read-back"),
+            (self.pre_state_completeness_identity, "pre-state completeness"),
+            (self.post_state_completeness_identity, "post-state completeness"),
             (self.public_payload_digest, "payload"), (self.configuration_digest, "configuration"),
             (self.gate_identity, "gate"), (self.pre_state_digest, "pre-state"),
             (self.post_state_digest, "post-state"),
@@ -875,6 +963,83 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
     )
 
 
+def _collection_snapshot_payload(snapshot: CommentsSnapshot | ReviewsSnapshot) -> tuple[object, ...]:
+    if type(snapshot) is CommentsSnapshot:
+        return ("comments", snapshot.repository.slug, snapshot.issue_number, tuple((item.comment_id, item.author_id, item.body_digest, item.created_at) for item in snapshot.comments))
+    if type(snapshot) is ReviewsSnapshot:
+        return ("reviews", snapshot.repository.slug, snapshot.pull_request_number, snapshot.head_sha, tuple((item.review_id, item.reviewer_id, item.state.value, item.commit_sha) for item in snapshot.reviews))
+    raise GitHubRuntimeError("collection snapshot is invalid")
+
+
+def _complete_broker_read(
+    adapter: GitHubAdapter, request: GitHubReadRequest, context: MutationBrokerContext,
+    bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
+    journal_entry: MutationJournalEntry | None,
+) -> tuple[GitHubReadResult, str]:
+    """Read every typed collection page and return its completeness receipt."""
+
+    if request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
+        result = adapter.read(request)
+        return result, _sha256(("not-a-collection", request.identity(), plan.identity))
+    read_page = getattr(adapter, "read_collection_page", None)
+    cursor: str | None = None
+    pages: list[CollectionPage] = []
+    while True:
+        if len(pages) >= 32:
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection page limit is exceeded")), ""
+        if callable(read_page):
+            page = read_page(request, cursor)
+            if type(page) is not CollectionPage:
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection pagination metadata is unavailable")), ""
+        else:
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection pagination metadata is unavailable")), ""
+        if page.request != request or page.cursor != cursor:
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection page request drifted")), ""
+        if pages and page.total_count != pages[0].total_count:
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection total is inconsistent")), ""
+        if page.next_cursor is not None and (
+            any(prior.cursor == page.next_cursor for prior in pages)
+            or page.next_cursor == cursor
+        ):
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection cursor is repeated or cyclic")), ""
+        pages.append(page)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+    first = pages[0]
+    items: dict[str, object] = {}
+    ordered: list[object] = []
+    last_unique_identifier: str | None = None
+    for page in pages:
+        collection = page.snapshot.comments if type(page.snapshot) is CommentsSnapshot else page.snapshot.reviews
+        identifiers = [item.comment_id if type(page.snapshot) is CommentsSnapshot else item.review_id for item in collection]
+        if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable")), ""
+        for identifier, item in zip(identifiers, collection):
+            prior = items.get(identifier)
+            if prior is not None and prior != item:
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection duplicate conflicts")), ""
+            if prior is None:
+                if last_unique_identifier is not None and identifier <= last_unique_identifier:
+                    return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable")), ""
+                items[identifier] = item
+                ordered.append(item)
+                last_unique_identifier = identifier
+    if len(ordered) != first.total_count:
+        return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection is incomplete")), ""
+    if type(first.snapshot) is CommentsSnapshot:
+        normalized: CommentsSnapshot | ReviewsSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, tuple(ordered))  # type: ignore[arg-type]
+    else:
+        normalized = ReviewsSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.head_sha, tuple(ordered))  # type: ignore[arg-type]
+    result = GitHubReadResult(request, snapshot=normalized)
+    receipt = CollectionCompletenessReceipt(
+        request.identity(), tuple(page.identity for page in pages), _sha256(_collection_snapshot_payload(normalized)),
+        context.candidate_sha, context.configuration_digest, context.gate_identity, bundle.identity,
+        plan.identity, journal_entry.key if journal_entry is not None else _sha256(("no-journal", plan.intent_identity)),
+    )
+    return result, receipt.identity
+
+
 class GitHubMutationBroker:
     """The sole mutation seam; rejects before a write when evidence is absent."""
 
@@ -922,7 +1087,7 @@ class GitHubMutationBroker:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if not created:
                 return self._reconcile_journal(intent, context, bundle, plan, evidence, journal_entry)
-        before = self._adapter.read(plan.pre_state)
+        before, pre_completeness = _complete_broker_read(self._adapter, plan.pre_state, context, bundle, plan, evidence)
         if not before.ok:
             if evidence is not None and self._journal is not None:
                 self._journal_transition(evidence, JournalLifecycle.FAILED)
@@ -935,14 +1100,14 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation durability is uncertain"), reconciliation_required=True)
-        after = self._adapter.read(plan.readback.request)
+        after, post_completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
         if not after.ok or not _matches(plan.readback, intent, after.snapshot):
             if self._journal is not None:
                 assert evidence is not None
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         assert outcome.receipt is not None
-        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, outcome.receipt.affected_identity, outcome.receipt.disposition)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, pre_completeness, post_completeness, outcome.receipt.affected_identity, outcome.receipt.disposition)
         self._completed[intent.identity()] = receipt
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             self._completed.pop(intent.identity(), None)
@@ -953,7 +1118,8 @@ class GitHubMutationBroker:
     def _semantic_receipt(
         intent: GitHubMutationIntent, context: MutationBrokerContext,
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
-        pre_state_digest: str, post_state_digest: str, affected_identity: str,
+        pre_state_digest: str, post_state_digest: str, pre_state_completeness_identity: str,
+        post_state_completeness_identity: str, affected_identity: str,
         disposition: MutationDisposition,
     ) -> SemanticMutationReceipt:
         binding = context.policy.binding
@@ -961,6 +1127,7 @@ class GitHubMutationBroker:
         return SemanticMutationReceipt(
             intent.repository.slug, intent.operation, intent.idempotency_key, bundle.identity,
             intent.identity(), plan.identity, plan.readback.identity,
+            pre_state_completeness_identity, post_state_completeness_identity,
             _sha256(("public-payload", intent.payload)), binding.digest,
             context.configuration_digest, binding.deployment_fingerprint,
             binding.task_fingerprint, context.base_sha, context.candidate_sha,
@@ -992,11 +1159,12 @@ class GitHubMutationBroker:
             return BrokerMutationResult(receipt=entry.receipt)
         if entry.lifecycle in {JournalLifecycle.DENIED, JournalLifecycle.FAILED}:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation lifecycle is terminally denied or failed"))
-        observed = self._adapter.read(plan.readback.request)
+        observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
         if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation requires semantic reconciliation"), reconciliation_required=True)
         receipt = self._semantic_receipt(
             intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest,
+            completeness, completeness,
             "reconciled", MutationDisposition.ALREADY_APPLIED,
         )
         if not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
@@ -1050,10 +1218,10 @@ class GitHubMutationBroker:
             if entry is None:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is missing"))
             return self._reconcile_journal(intent, context, bundle, plan, evidence, entry)
-        observed = self._adapter.read(plan.readback.request)
+        observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
         if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
-        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, "reconciled", MutationDisposition.ALREADY_APPLIED)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, completeness, completeness, "reconciled", MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
         return BrokerMutationResult(receipt=receipt)
 

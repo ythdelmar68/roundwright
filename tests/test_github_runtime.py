@@ -187,6 +187,99 @@ class GitHubRuntimeTests(unittest.TestCase):
         ):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 schema_v2_authorization_bundle(build())
+
+    def test_schema_v2_pre_run_gate_allows_only_canonical_evidence(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "schema-v2-comment-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        request = comments_request()
+        fake = FakeGitHubAdapter({
+            request.identity(): FakeGitHubScenario(response=comments_payload()),
+            intent.identity(): FakeGitHubScenario(
+                duplicate_receipt=True, affected_identity="comment-46",
+                semantic_readback_digest=DIGEST,
+            ),
+        })
+        result = GitHubMutationBroker(fake).submit(
+            intent, allowed_context(), pre_state=request,
+            readback=SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(fake.call_count(kind="mutation"), 1)
+
+    def test_schema_v2_pre_run_gate_rejects_drift_before_any_adapter_call(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "schema-v2-denied-comment-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        request = comments_request()
+
+        def policy_drift(context: MutationBrokerContext) -> None:
+            document = replace(context.policy_snapshot.document, enabled=False)
+            object.__setattr__(context, "policy_snapshot", TrustedRepositoryPolicySnapshot(context.policy_snapshot.source, document))
+
+        def missing_receipt(context: MutationBrokerContext) -> None:
+            object.__setattr__(context, "activation_receipt", None)
+
+        def invalid_receipt(context: MutationBrokerContext) -> None:
+            object.__setattr__(context.activation_receipt, "candidate_sha", "not-a-commit")
+
+        def stale_receipt(context: MutationBrokerContext) -> None:
+            object.__setattr__(context, "receipt_verification", replace(context.receipt_verification, status=RepositoryReceiptStatus.STALE))
+
+        def standing_authority_drift(context: MutationBrokerContext) -> None:
+            policy = replace(context.standing_authority.policy, allow_issue_comment=False)
+            object.__setattr__(context, "standing_authority", StandingRepositoryAuthority(policy))
+
+        def mutation_context_drift(context: MutationBrokerContext) -> None:
+            object.__setattr__(context, "mutation_context", replace(context.mutation_context, candidate_sha=BASE))
+
+        def dispatcher_transition_drift(context: MutationBrokerContext) -> None:
+            object.__setattr__(context, "dispatcher_transition", replace(context.dispatcher_transition, candidate_sha=BASE))
+
+        def configuration_drift(context: MutationBrokerContext) -> None:
+            object.__setattr__(context, "configuration_digest", "not-a-digest")
+
+        for name, drift in (
+            ("policy", policy_drift),
+            ("missing receipt", missing_receipt),
+            ("invalid receipt", invalid_receipt),
+            ("stale receipt", stale_receipt),
+            ("standing authority", standing_authority_drift),
+            ("mutation context", mutation_context_drift),
+            ("dispatcher transition", dispatcher_transition_drift),
+            ("configuration", configuration_drift),
+        ):
+            with self.subTest(name=name):
+                context = allowed_context()
+                drift(context)
+                fake = FakeGitHubAdapter({})
+                broker = GitHubMutationBroker(fake)
+                result = broker.submit(
+                    intent, context, pre_state=request,
+                    readback=SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT),
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(fake.call_count(), 0)
+
+    def test_schema_v2_pre_run_gate_blocks_reconciliation_before_any_adapter_call(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "schema-v2-reconcile-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        context = allowed_context()
+        object.__setattr__(context, "dispatcher_transition", replace(context.dispatcher_transition, candidate_sha=BASE))
+        fake = FakeGitHubAdapter({})
+        result = GitHubMutationBroker(fake).reconcile(
+            intent, context,
+            readback=SemanticReadback(comments_request(), SemanticPostcondition.COMMENT_PRESENT),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+        self.assertEqual(fake.call_count(), 0)
+
     def test_default_gh_adapter_is_all_operations_unavailable_without_running_gh(self) -> None:
         runner = Runner(GhCommandResult(0, "{}"))
         adapter = GhGitHubAdapter(runner)

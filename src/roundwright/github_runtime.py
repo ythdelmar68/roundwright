@@ -392,7 +392,7 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2A
     if context.candidate_sha != context.mutation_context.candidate_sha:
         raise GitHubRuntimeError("broker candidate does not match mutation context")
     binding = decision.binding
-    if not decision.authorized or binding is None or decision.operation is None:
+    if not decision.authorized or type(binding) is not RepositoryMutationBinding or decision.operation is None:
         raise GitHubRuntimeError("broker policy decision is not authorized canonical evidence")
     receipt = context.activation_receipt
     canonical = evaluate_repository_mutation_policy(
@@ -704,6 +704,18 @@ class GitHubMutationBroker:
 def _authorize(intent: object, context: object) -> GitHubFailure | None:
     if type(intent) is not GitHubMutationIntent or type(context) is not MutationBrokerContext:
         raise GitHubRuntimeError("broker request is invalid")
+    try:
+        # This is deliberately before every adapter read or mutation.  The
+        # bundle is built only from exact canonical evidence and rejects any
+        # receipt, authority, context, or dispatcher drift before a runner can
+        # observe an intent.
+        schema_v2_authorization_bundle(context)
+    except (AttributeError, TypeError, ValueError):
+        return GitHubFailure(
+            GitHubFailureKind.POLICY_DENIED,
+            intent.operation,
+            "schema-v2 authorization evidence denies this mutation",
+        )
     operation = _repository_operation(intent.operation)
     policy = context.policy
     binding = policy.binding

@@ -49,6 +49,7 @@ from .github import (
     normalize_github_response,
 )
 from .repository_policy import (
+    GITHUB_REPOSITORY_OPERATION,
     RepositoryMutationBinding,
     RepositoryMutationDecision,
     RepositoryMutationOperation,
@@ -263,6 +264,7 @@ class GhMutationPayload:
             raise GitHubRuntimeError("gh mutation payload is not canonical")
         required = {
             GitHubMutationOperation.CREATE_BRANCH: set(),
+            GitHubMutationOperation.UPDATE_BRANCH: set(),
             GitHubMutationOperation.DELETE_BRANCH: set(),
             GitHubMutationOperation.CREATE_PULL_REQUEST: {"body", "title"},
             GitHubMutationOperation.COMMENT: {"body"},
@@ -510,17 +512,12 @@ def _authorize(intent: object, context: object) -> GitHubFailure | None:
     return None
 
 
-def _repository_operation(operation: GitHubMutationOperation) -> RepositoryMutationOperation | None:
-    return {
-        GitHubMutationOperation.CREATE_BRANCH: RepositoryMutationOperation.PUSH_BRANCH,
-        GitHubMutationOperation.CREATE_PULL_REQUEST: RepositoryMutationOperation.CREATE_DRAFT_PR,
-        GitHubMutationOperation.COMMENT: RepositoryMutationOperation.ISSUE_COMMENT,
-        GitHubMutationOperation.REQUEST_REVIEW: None,
-        GitHubMutationOperation.MARK_READY: RepositoryMutationOperation.MARK_PR_READY,
-        GitHubMutationOperation.MERGE_PULL_REQUEST: RepositoryMutationOperation.MERGE_PR,
-        GitHubMutationOperation.CLOSE_ISSUE: RepositoryMutationOperation.CLOSE_LEAF_ISSUE,
-        GitHubMutationOperation.DELETE_BRANCH: RepositoryMutationOperation.DELETE_REMOTE_BRANCH,
-    }[operation]
+def _repository_operation(operation: GitHubMutationOperation) -> RepositoryMutationOperation:
+    """Use the schema-v2 policy's canonical, total GitHub-operation mapping."""
+
+    if type(operation) is not GitHubMutationOperation:
+        raise GitHubRuntimeError("github mutation operation is invalid")
+    return GITHUB_REPOSITORY_OPERATION[operation]
 
 
 def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot: GitHubSnapshot | None) -> bool:
@@ -588,6 +585,8 @@ def _mutation_command(intent: GitHubMutationIntent, payload: GhMutationPayload) 
     operation = intent.operation
     if operation is GitHubMutationOperation.CREATE_BRANCH:
         return ("api", "--method", "POST", f"repos/{repository}/git/refs", "-f", f"ref=refs/heads/{intent.target_ref}", "-f", f"sha={intent.expected_sha}")
+    if operation is GitHubMutationOperation.UPDATE_BRANCH:
+        return ("api", "--method", "PATCH", f"repos/{repository}/git/refs/heads/{intent.target_ref}", "-f", f"sha={intent.expected_sha}", "-F", "force=false")
     if operation is GitHubMutationOperation.DELETE_BRANCH:
         return ("api", "--method", "DELETE", f"repos/{repository}/git/refs/heads/{intent.target_ref}")
     if operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
@@ -608,7 +607,7 @@ def _mutation_command(intent: GitHubMutationIntent, payload: GhMutationPayload) 
 def _broker_receipt(intent: GitHubMutationIntent) -> MutationReceipt:
     """Make a non-semantic transport receipt; read-back establishes success."""
 
-    return MutationReceipt(intent.identity(), intent.operation, MutationDisposition.ACCEPTED, f"gh-{intent.operation.value}")
+    return MutationReceipt(intent.identity(), intent.operation, MutationDisposition.ACCEPTED, f"gh-{intent.operation.value}", _sha256(("transport", intent.identity())))
 
 
 def _health_failure(operation: GitHubOperation, health: GitHubCapabilityHealth) -> GitHubFailure | None:

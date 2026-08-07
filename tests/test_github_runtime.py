@@ -82,8 +82,8 @@ def comments_payload() -> dict[str, object]:
 
 def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationOperation.ISSUE_COMMENT) -> MutationBrokerContext:
     binding = RepositoryMutationBinding(
-        "0" * 64, "1" * 64, "2" * 64, 1, "3" * 64, "4" * 64,
-        "5" * 64, "6" * 64, "7" * 64, SHA, "8" * 64, "9" * 64,
+        "0" * 64, "1" * 64, "2" * 64, 2, "3" * 64, "4" * 64,
+        "5" * 64, "6" * 64, "7" * 64, SHA, "8" * 64, "9" * 64, "a" * 64, "b" * 64,
         RepositoryReceiptStatus.FRESH,
     )
     policy = RepositoryMutationDecision(operation, True, "authorized fixture", "2" * 64, "0" * 64, "4" * 64, True, True, "mutation-adapter-may-attempt-readback", binding)
@@ -119,7 +119,7 @@ class GitHubRuntimeTests(unittest.TestCase):
 
     def test_broker_requires_policy_deployment_candidate_and_prestate_before_adapter_mutation(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", DIGEST),))
-        fake = FakeGitHubAdapter({intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46")})
+        fake = FakeGitHubAdapter({intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST)})
         result = GitHubMutationBroker(fake).submit(intent, allowed_context(RepositoryMutationOperation.MARK_PR_READY), pre_state=comments_request(), readback=SemanticReadback(comments_request(), SemanticPostcondition.COMMENT_PRESENT))
         self.assertFalse(result.ok)
         self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
@@ -130,7 +130,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         request = comments_request()
         fake = FakeGitHubAdapter({
             request.identity(): FakeGitHubScenario(response=comments_payload()),
-            intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46"),
+            intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
         })
         broker = GitHubMutationBroker(fake)
         readback = SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT)
@@ -149,7 +149,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         request = comments_request()
         fake = FakeGitHubAdapter({
             request.identity(): FakeGitHubScenario(response={**comments_payload(), "comments": []}),
-            intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46"),
+            intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
         })
         result = GitHubMutationBroker(fake).submit(intent, allowed_context(), pre_state=request, readback=SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT))
         self.assertFalse(result.ok)
@@ -210,6 +210,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         reviewers_digest = "sha256:" + hashlib.sha256(json.dumps(("reviewers", (reviewers,)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
         intents = (
             (GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "branch-46", expected_sha=SHA, target_ref="codex/issue-46"), GhMutationPayload(GitHubMutationOperation.CREATE_BRANCH)),
+            (GitHubMutationIntent(GitHubMutationOperation.UPDATE_BRANCH, REPOSITORY, "branch-update-46", expected_sha=SHA, target_ref="codex/issue-46", payload=(("previous_sha", BASE),)), GhMutationPayload(GitHubMutationOperation.UPDATE_BRANCH)),
             (GitHubMutationIntent(GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY, "pr-46", payload=(("base_ref", "main"), ("base_sha", SHA), ("body_digest", body_digest), ("head_ref", "codex/issue-46"), ("head_sha", SHA), ("title_digest", title_digest))), GhMutationPayload(GitHubMutationOperation.CREATE_PULL_REQUEST, (("body", body), ("title", title)))),
             (GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),)), GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))),
             (GitHubMutationIntent(GitHubMutationOperation.REQUEST_REVIEW, REPOSITORY, "review-46", target_number=46, expected_sha=SHA, payload=(("reviewers_digest", reviewers_digest),)), GhMutationPayload(GitHubMutationOperation.REQUEST_REVIEW, (("reviewers", reviewers),))),

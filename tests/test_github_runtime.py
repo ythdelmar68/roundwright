@@ -32,6 +32,7 @@ from roundwright.github_runtime import (
     OperationHealth,
     SemanticPostcondition,
     SemanticReadback,
+    SchemaV2AuthorizationBundle,
     unavailable_capability_health,
 )
 from roundwright.repository_policy import (
@@ -94,7 +95,28 @@ def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationO
     return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST)
 
 
+def authorization_bundle(**replace: str) -> SchemaV2AuthorizationBundle:
+    values = {
+        "standing_authority_identity": "0" * 64, "verified_policy_receipt_identity": "1" * 64,
+        "repository_identity": "2" * 64, "deployment_identity": "3" * 64, "task_identity": "4" * 64,
+        "configuration_digest": DIGEST, "base_sha": BASE, "candidate_sha": SHA, "gate_identity": DIGEST,
+        "receipt_lifecycle_identity": "5" * 64, "dispatcher_transition_identity": "6" * 64,
+    }
+    values.update(replace)
+    return SchemaV2AuthorizationBundle(**values)
+
+
 class GitHubRuntimeTests(unittest.TestCase):
+    def test_schema_v2_authorization_bundle_is_immutable_deterministic_and_rejects_empty_bindings(self) -> None:
+        bundle = authorization_bundle()
+        self.assertEqual(bundle, authorization_bundle())
+        self.assertEqual(bundle.identity, authorization_bundle().identity)
+        self.assertEqual(bundle.serialize()["candidate_sha"], SHA)
+        with self.assertRaises((AttributeError, TypeError)):
+            bundle.candidate_sha = BASE  # type: ignore[misc]
+        for field in ("standing_authority_identity", "verified_policy_receipt_identity", "repository_identity", "deployment_identity", "task_identity", "configuration_digest", "base_sha", "candidate_sha", "gate_identity", "receipt_lifecycle_identity", "dispatcher_transition_identity"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                authorization_bundle(**{field: ""})
     def test_default_gh_adapter_is_all_operations_unavailable_without_running_gh(self) -> None:
         runner = Runner(GhCommandResult(0, "{}"))
         adapter = GhGitHubAdapter(runner)

@@ -357,6 +357,47 @@ class MutationBrokerContext:
 
 
 @dataclass(frozen=True)
+class SchemaV2AuthorizationBundle:
+    """Immutable public-safe identity bundle for a future broker preflight.
+
+    This is deliberately evidence-only: it carries fixed fingerprints/digests
+    from the schema-v2 policy evaluator and no provider response text.
+    """
+
+    standing_authority_identity: str
+    verified_policy_receipt_identity: str
+    repository_identity: str
+    deployment_identity: str
+    task_identity: str
+    configuration_digest: str
+    base_sha: str
+    candidate_sha: str
+    gate_identity: str
+    receipt_lifecycle_identity: str
+    dispatcher_transition_identity: str
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.standing_authority_identity, "standing authority"),
+            (self.verified_policy_receipt_identity, "policy receipt"),
+            (self.repository_identity, "repository"), (self.deployment_identity, "deployment"),
+            (self.task_identity, "task"), (self.receipt_lifecycle_identity, "receipt lifecycle"),
+            (self.dispatcher_transition_identity, "dispatcher transition"),
+        ):
+            _fingerprint(value, name)
+        _digest(self.configuration_digest, "configuration")
+        _digest(self.gate_identity, "gate")
+        for value, name in ((self.base_sha, "base sha"), (self.candidate_sha, "candidate sha")):
+            if type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
+                raise GitHubRuntimeError(f"authorization bundle {name} is invalid")
+        object.__setattr__(self, "identity", _sha256(tuple(getattr(self, name) for name in self.__dataclass_fields__ if name != "identity")))
+
+    def serialize(self) -> Mapping[str, str]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+@dataclass(frozen=True)
 class SemanticMutationReceipt:
     """Curated receipt binding a mutation to its authorization and read-back."""
 

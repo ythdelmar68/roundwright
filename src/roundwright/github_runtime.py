@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
+from pathlib import Path
 from typing import Mapping, Protocol
 
 from .deployment import DeploymentAuthorityDecision, DeploymentMode
@@ -191,7 +193,7 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, failure=GitHubFailure(_failure_kind(outcome.exit_code), request.operation, "gh read did not return a usable response"))
         try:
             raw = json.loads(outcome.stdout)
-            snapshot = normalize_github_response(request, raw)
+            snapshot = normalize_github_response(request, _project_gh_response(request, raw))
             return GitHubReadResult(request, snapshot=snapshot)
         except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "gh read response is malformed"))
@@ -207,12 +209,12 @@ class GhGitHubAdapter:
             return GitHubMutationResult(intent, failure=blocked)
         return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "direct gh mutation is forbidden; use the mutation broker"))
 
-    def _broker_capability(self) -> object:
+    def _issue_broker_capability(self) -> object:
         """Return the unforgeable in-process capability consumed by the broker."""
 
         return self._broker_token
 
-    def execute_brokered(
+    def _execute_brokered(
         self, intent: GitHubMutationIntent, payload: "GhMutationPayload", *, capability: object
     ) -> GitHubMutationResult:
         """Execute one authorized intent without retaining provider output.
@@ -409,16 +411,77 @@ class BrokerMutationResult:
         return self.receipt is not None
 
 
+class DurableMutationJournal:
+    """Atomic public-safe idempotency state for an Orchestrator composition root.
+
+    Records contain only repository, operation, idempotency key, intent digest,
+    and lifecycle state.  A restarted broker therefore reconciles instead of
+    issuing another write after an interrupted attempt.
+    """
+
+    def __init__(self, path: Path) -> None:
+        if not isinstance(path, Path) or not path.parent.is_dir():
+            raise GitHubRuntimeError("mutation journal path is invalid")
+        self._path = path
+
+    def begin(self, intent: GitHubMutationIntent) -> str:
+        records = self._load()
+        key, digest = self._key(intent), intent.identity()
+        prior = records.get(key)
+        if prior is not None:
+            if prior.get("intent_digest") != digest:
+                return "conflict"
+            return str(prior.get("state"))
+        records[key] = {"repository": intent.repository.slug, "operation": intent.operation.value, "idempotency_key": intent.idempotency_key, "intent_digest": digest, "state": "started"}
+        self._store(records)
+        return "started"
+
+    def transition(self, intent: GitHubMutationIntent, state: str) -> None:
+        if state not in {"applied", "ambiguous"}:
+            raise GitHubRuntimeError("mutation journal state is invalid")
+        records = self._load()
+        key = self._key(intent)
+        prior = records.get(key)
+        if prior is None or prior.get("intent_digest") != intent.identity():
+            raise GitHubRuntimeError("mutation journal record is missing")
+        prior["state"] = state
+        self._store(records)
+
+    def _load(self) -> dict[str, dict[str, str]]:
+        if not self._path.exists():
+            return {}
+        try:
+            value = json.loads(self._path.read_text(encoding="utf-8"))
+            if type(value) is not dict or any(type(key) is not str or type(record) is not dict or set(record) != {"repository", "operation", "idempotency_key", "intent_digest", "state"} or any(type(item) is not str for item in record.values()) for key, record in value.items()):
+                raise ValueError
+            return value
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise GitHubRuntimeError("mutation journal is malformed") from error
+
+    def _store(self, records: Mapping[str, Mapping[str, str]]) -> None:
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        try:
+            temporary.write_text(json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True), encoding="utf-8")
+            os.replace(temporary, self._path)
+        except OSError as error:
+            raise GitHubRuntimeError("mutation journal cannot be persisted") from error
+
+    @staticmethod
+    def _key(intent: GitHubMutationIntent) -> str:
+        return _sha256((intent.repository.slug, intent.operation.value, intent.idempotency_key))
+
+
 class GitHubMutationBroker:
     """The sole mutation seam; rejects before a write when evidence is absent."""
 
-    def __init__(self, adapter: GitHubAdapter) -> None:
+    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None) -> None:
         if not hasattr(adapter, "read") or not hasattr(adapter, "submit"):
             raise GitHubRuntimeError("GitHub adapter is invalid")
         self._adapter = adapter
-        issuer = getattr(adapter, "_broker_capability", None)
+        issuer = getattr(adapter, "_issue_broker_capability", None)
         self._broker_capability = issuer() if callable(issuer) else None
         self._completed: dict[str, SemanticMutationReceipt] = {}
+        self._journal = journal
 
     def submit(
         self,
@@ -437,6 +500,12 @@ class GitHubMutationBroker:
         prior = self._completed.get(intent.identity())
         if prior is not None:
             return BrokerMutationResult(receipt=prior)
+        if self._journal is not None:
+            journal_state = self._journal.begin(intent)
+            if journal_state == "conflict":
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "idempotency key conflicts with a different mutation intent"))
+            if journal_state != "started":
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation state requires semantic reconciliation"), reconciliation_required=True)
         if pre_state.repository != intent.repository or readback.request.repository != intent.repository:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "semantic reads must target the mutation repository"))
         before = self._adapter.read(pre_state)
@@ -447,6 +516,8 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
         after = self._adapter.read(readback.request)
         if not after.ok or not _matches(readback, intent, after.snapshot):
+            if self._journal is not None:
+                self._journal.transition(intent, "ambiguous")
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         binding = context.policy.binding
         assert binding is not None  # established by _authorize
@@ -459,10 +530,12 @@ class GitHubMutationBroker:
             outcome.receipt.affected_identity, outcome.receipt.disposition,
         )
         self._completed[intent.identity()] = receipt
+        if self._journal is not None:
+            self._journal.transition(intent, "applied")
         return BrokerMutationResult(receipt=receipt)
 
     def _execute(self, intent: GitHubMutationIntent, payload: GhMutationPayload | None) -> GitHubMutationResult:
-        execute = getattr(self._adapter, "execute_brokered", None)
+        execute = getattr(self._adapter, "_execute_brokered", None)
         if callable(execute):
             if type(payload) is not GhMutationPayload:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable"))
@@ -492,6 +565,9 @@ class GitHubMutationBroker:
         assert binding is not None
         receipt = SemanticMutationReceipt(intent.repository.slug, intent.operation, intent.idempotency_key, _sha256(("public-payload", intent.payload)), binding.digest, context.configuration_digest, binding.deployment_fingerprint, binding.task_fingerprint, context.base_sha, context.candidate_sha, context.gate_identity, observed.snapshot_digest, observed.snapshot_digest, "reconciled", MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
+        if self._journal is not None:
+            self._journal.begin(intent)
+            self._journal.transition(intent, "applied")
         return BrokerMutationResult(receipt=receipt)
 
 
@@ -541,6 +617,150 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
     if condition is SemanticPostcondition.REMOTE_HEAD_AT_EXPECTED_SHA:
         return isinstance(snapshot, RemoteHeadSnapshot) and snapshot.sha == intent.expected_sha
     return False
+
+
+def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
+    """Project one REST response into the exact core schema.
+
+    Provider objects never cross this boundary.  The request supplies the
+    authoritative repository/number/ref identities and any contradictory raw
+    identity is rejected.  Collection endpoints accept at most ten slurped
+    pages; a different shape is incomplete rather than silently partial.
+    """
+
+    if type(raw) is dict and "repository" in raw:
+        return raw
+    repository = {"owner": request.repository.owner, "name": request.repository.name}
+    operation = request.operation
+    if operation is GitHubReadOperation.REPOSITORY:
+        item = _raw_mapping(raw)
+        _raw_repository_matches(item, request)
+        return {"repository": repository, "id": _raw_id(item, "id"), "default_branch": _raw_text(item, "default_branch"), "default_branch_sha": _raw_text(item, "default_branch_sha")}
+    if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
+        item = _raw_mapping(raw)
+        _raw_repository_matches(item, request)
+        _raw_number_matches(item, request)
+        parent = item.get("parent_issue")
+        parent_number = _raw_integer(_raw_mapping(parent), "number") if parent is not None else None
+        children = item.get("sub_issues", [])
+        if type(children) is not list:
+            raise GitHubRuntimeError("gh issue sub-issues are incomplete")
+        return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": _raw_text(item, "state"), "parent_number": parent_number, "sub_issue_numbers": [_raw_integer(_raw_mapping(child), "number") for child in children]}
+    if operation is GitHubReadOperation.COMMENTS:
+        return {"repository": repository, "issue_number": request.number, "comments": [{"id": _raw_id(item, "id"), "author_id": _raw_id(_raw_mapping(item.get("user")), "id"), "body": _raw_text(item, "body"), "created_at": _raw_text(item, "created_at")} for item in _raw_collection(raw, "comments")]}
+    if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
+        item = _raw_mapping(raw)
+        name = _raw_text(item, "name")
+        if name != request.ref:
+            raise GitHubRuntimeError("gh branch reference does not match request")
+        projected = {"repository": repository, "ref": name, "sha": _raw_text(_raw_mapping(item.get("commit")), "sha")}
+        return projected
+    if operation is GitHubReadOperation.PULL_REQUEST:
+        item = _raw_mapping(raw)
+        _raw_repository_matches(item, request)
+        _raw_number_matches(item, request)
+        base, head = _raw_mapping(item.get("base")), _raw_mapping(item.get("head"))
+        return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": _raw_text(item, "state"), "base_ref": _raw_text(base, "ref"), "base_sha": _raw_text(base, "sha"), "head_ref": _raw_text(head, "ref"), "head_sha": _raw_text(head, "sha"), "draft": _raw_bool(item, "draft")}
+    if operation is GitHubReadOperation.REVIEWS:
+        items = _raw_collection(raw, "reviews")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": request.expected_sha, "reviews": [{"id": _raw_id(item, "id"), "reviewer_id": _raw_id(_raw_mapping(item.get("user")), "id"), "state": _raw_text(item, "state").upper(), "commit_sha": _raw_text(item, "commit_id")} for item in items]}
+    if operation is GitHubReadOperation.CHECKS:
+        item = _raw_mapping(raw)
+        runs = item.get("check_runs")
+        if type(runs) is not list:
+            raise GitHubRuntimeError("gh check-runs response is incomplete")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": request.expected_sha, "checks": [{"id": _raw_id(run, "id"), "name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": request.expected_sha} for run in runs]}
+    if operation is GitHubReadOperation.WORKFLOW_RUNS:
+        item = _raw_mapping(raw)
+        runs = item.get("workflow_runs")
+        if type(runs) is not list:
+            raise GitHubRuntimeError("gh workflow-runs response is incomplete")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": request.expected_sha, "runs": [{"id": _raw_id(run, "id"), "workflow_name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": request.expected_sha} for run in runs]}
+    if operation is GitHubReadOperation.MERGEABILITY:
+        item = _raw_mapping(raw)
+        _raw_number_matches(item, request)
+        head = _raw_mapping(item.get("head"))
+        state = {"clean": "MERGEABLE", "dirty": "CONFLICTING", "unknown": "UNKNOWN"}.get(_raw_text(item, "mergeable_state"))
+        if state is None:
+            raise GitHubRuntimeError("gh mergeability is incomplete")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": _raw_text(head, "sha"), "mergeability": state}
+    # Timeline closing semantics cannot be reconstructed from REST event text
+    # without a complete, authenticated parser; reject rather than infer.
+    raise GitHubRuntimeError("gh response projection is unavailable")
+
+
+def _raw_mapping(value: object) -> Mapping[str, object]:
+    if type(value) is not dict:
+        raise GitHubRuntimeError("gh response object is malformed")
+    return value
+
+
+def _raw_collection(value: object, name: str) -> list[Mapping[str, object]]:
+    if type(value) is list and all(type(item) is dict for item in value):
+        return [_raw_mapping(item) for item in value]
+    pages = value if type(value) is list else [value]
+    if not 1 <= len(pages) <= 10:
+        raise GitHubRuntimeError("gh pagination is incomplete")
+    flattened: list[Mapping[str, object]] = []
+    for page in pages:
+        if type(page) is list:
+            flattened.extend(_raw_mapping(item) for item in page)
+        elif type(page) is dict and type(page.get(name)) is list:
+            flattened.extend(_raw_mapping(item) for item in page[name])
+        else:
+            raise GitHubRuntimeError("gh collection response is malformed")
+    return flattened
+
+
+def _raw_text(mapping: Mapping[str, object], key: str) -> str:
+    value = mapping.get(key)
+    if type(value) is not str:
+        raise GitHubRuntimeError("gh response field is malformed")
+    return value
+
+
+def _raw_optional_text(mapping: Mapping[str, object], key: str, *, upper: bool = False) -> str | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise GitHubRuntimeError("gh response field is malformed")
+    return value.upper() if upper else value
+
+
+def _raw_id(mapping: Mapping[str, object], key: str) -> str:
+    value = mapping.get(key)
+    if type(value) not in (str, int) or isinstance(value, bool):
+        raise GitHubRuntimeError("gh response identity is malformed")
+    return str(value)
+
+
+def _raw_integer(mapping: Mapping[str, object], key: str) -> int:
+    value = mapping.get(key)
+    if type(value) is not int:
+        raise GitHubRuntimeError("gh response number is malformed")
+    return value
+
+
+def _raw_bool(mapping: Mapping[str, object], key: str) -> bool:
+    value = mapping.get(key)
+    if type(value) is not bool:
+        raise GitHubRuntimeError("gh response Boolean is malformed")
+    return value
+
+
+def _raw_number_matches(mapping: Mapping[str, object], request: GitHubReadRequest) -> None:
+    if request.number is None or _raw_integer(mapping, "number") != request.number:
+        raise GitHubRuntimeError("gh response number does not match request")
+
+
+def _raw_repository_matches(mapping: Mapping[str, object], request: GitHubReadRequest) -> None:
+    owner, name = mapping.get("owner"), mapping.get("name")
+    if owner is None and name is None:
+        return
+    owner_map = _raw_mapping(owner)
+    if _raw_text(owner_map, "login") != request.repository.owner or _raw_text(mapping, "name") != request.repository.name:
+        raise GitHubRuntimeError("gh response repository does not match request")
 
 
 def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:

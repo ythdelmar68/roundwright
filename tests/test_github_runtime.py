@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from roundwright.deployment import DeploymentAuthorityDecision, DeploymentMode
@@ -21,6 +23,7 @@ from roundwright.github import (
 from roundwright.github_runtime import (
     CapabilityState,
     GhCommandResult,
+    DurableMutationJournal,
     GhGitHubAdapter,
     GhMutationPayload,
     GitHubCapabilityHealth,
@@ -111,11 +114,29 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls, [("api", "--method", "GET", "repos/example/roundwright/issues/46/comments")])
         self.assertNotIn("curated evidence", repr(result.snapshot))
 
+    def test_gh_adapter_projects_rest_comment_schema_and_rejects_identity_drift(self) -> None:
+        raw = [{"id": 17, "user": {"id": 4}, "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}]
+        runner = Runner(GhCommandResult(0, json.dumps(raw)), GhCommandResult(0, json.dumps({"number": 47, "state": "OPEN", "id": 46})))
+        adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS, GitHubReadOperation.ISSUE))
+        self.assertTrue(adapter.read(comments_request()).ok)
+        self.assertFalse(adapter.read(GitHubReadRequest(GitHubReadOperation.ISSUE, REPOSITORY, number=46)).ok)
+
     def test_malformed_or_partial_capability_matrix_fails_closed(self) -> None:
         with self.assertRaises(ValueError):
             GitHubCapabilityHealth(())
         matrix = unavailable_capability_health(now=NOW)
         self.assertFalse(matrix.for_operation(GitHubMutationOperation.MERGE_PULL_REQUEST).available)
+
+    def test_durable_journal_rejects_conflict_and_requires_restart_reconciliation(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "branch-46", expected_sha=SHA, target_ref="codex/issue-46")
+        conflicting = GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "branch-46", expected_sha=BASE, target_ref="codex/issue-46")
+        with tempfile.TemporaryDirectory() as directory:
+            first = DurableMutationJournal(Path(directory) / "journal.json")
+            self.assertEqual(first.begin(intent), "started")
+            self.assertEqual(first.begin(conflicting), "conflict")
+            first.transition(intent, "ambiguous")
+            restarted = DurableMutationJournal(Path(directory) / "journal.json")
+            self.assertEqual(restarted.begin(intent), "ambiguous")
 
     def test_broker_requires_policy_deployment_candidate_and_prestate_before_adapter_mutation(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", DIGEST),))
@@ -203,7 +224,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertTrue(reconciled.reconciliation_required)
         self.assertEqual(len(runner.calls), 4)
 
-    def test_broker_execution_seam_maps_every_declared_mutation(self) -> None:
+    def test_direct_execution_surface_is_absent_for_every_declared_mutation(self) -> None:
         title, body, reviewers = "draft title", "draft body", "octocat"
         title_digest = "sha256:" + hashlib.sha256(json.dumps(("pull-request-title", title), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
         body_digest = "sha256:" + hashlib.sha256(json.dumps(("pull-request-body", body), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
@@ -221,10 +242,11 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         runner = Runner(*(GhCommandResult(0, "unretained output") for _ in intents))
         adapter = GhGitHubAdapter(runner, health(*GitHubMutationOperation))
+        self.assertFalse(hasattr(adapter, "execute_brokered"))
         for intent, payload in intents:
             with self.subTest(operation=intent.operation):
-                self.assertTrue(adapter.execute_brokered(intent, payload, capability=adapter._broker_capability()).ok)
-        self.assertEqual(len(runner.calls), len(intents))
+                self.assertFalse(adapter.submit(intent).ok)
+        self.assertEqual(runner.calls, [])
 
 
 if __name__ == "__main__":

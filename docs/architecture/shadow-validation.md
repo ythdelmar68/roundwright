@@ -51,6 +51,12 @@ only safe identities, a retention reference, explicit read-only proof, and a
 protocol mismatch disposition; private/path-shaped identifiers are replaced by
 one-way public-safe digests.
 
+When a Shadow case consumes a separately run external qualification bundle, its
+toolbox, target (if any), candidate, and commit pins are selected through the
+[qualification test infrastructure](../operations/qualification-test-infrastructure.md).
+That routing record is immutable replay input; it is neither authority nor an
+invocation permission.
+
 ## Deterministic comparison
 
 Comparison normalizes only protocol-declared, non-semantic variation before

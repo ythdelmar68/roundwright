@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from dataclasses import replace
 
 from roundwright.shadow import (
@@ -19,7 +20,13 @@ from roundwright.shadow import (
     ShadowExecutor,
     ShadowIdentity,
     ShadowObservation,
+    compare_provider_health_receipt,
+    rehydrate_live_provider_health_evidence,
 )
+from roundwright.configuration import ProviderProfile, ReasoningEffort
+from roundwright.runtime_binding import RuntimeBinding
+from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
+from roundwright.provider_recovery import ProviderRole
 import hashlib
 
 
@@ -29,6 +36,84 @@ STATES = ("queued", "planning", "plan-review", "implementing", "diff-review", "r
 
 
 class ShadowTests(unittest.TestCase):
+    def receipt(self, *, commit="a" * 40, candidate=None, case="case-42", ordinal=0, state=HealthState.READY, fresh_until=200):
+        profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        profile_id = profile_fingerprint(profile)
+        binding = RuntimeBinding("roundwright-runtime/v1", "sha256:" + "a" * 64, profile_id, (profile_id,))
+        audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),))
+        observation = ProviderHealthObservation(ProviderRole.WORKER, profile_id, CodexHealthContract(audit.sdk_version, audit.runtime_version, commit).fingerprint, audit.fingerprint, state, None if state is HealthState.READY else __import__("roundwright.provider_health", fromlist=["CodexFailure"]).CodexFailure.UNKNOWN, 100, fresh_until, 1)
+        return ProviderHealthReceipt(commit, candidate, case, ordinal, binding, ProviderRole.WORKER, profile_id, observation, ProviderHealthAuditIdentity(audit, profile))
+
+    def test_provider_health_receipt_comparator_is_safe_and_deterministic(self):
+        receipt = self.receipt(candidate="b" * 40)
+        matched = compare_provider_health_receipt(receipt.evidence(), receipt.evidence(), now=101)
+        self.assertEqual((matched.outcome, matched.differing_fields), (ComparisonOutcome.MATCH, ()))
+        self.assertEqual(matched.curated_summary()["contract_commit"], "a" * 40)
+        changed = self.receipt(commit="c" * 40)
+        mismatch = compare_provider_health_receipt(receipt.evidence(), changed.evidence(), now=101)
+        self.assertEqual(mismatch.outcome, ComparisonOutcome.MISMATCH)
+        self.assertIn("contract_commit", mismatch.differing_fields)
+        self.assertEqual(compare_provider_health_receipt(receipt.evidence(), self.receipt(fresh_until=101).evidence(), now=101).differing_fields, ("invalid-evidence",))
+        tampered = receipt.evidence(); tampered.pop("case_id")
+        self.assertEqual(compare_provider_health_receipt(receipt.evidence(), tampered, now=101).outcome, ComparisonOutcome.INVALID)
+
+    def test_live_json_receipt_evidence_rehydrates_before_typed_shadow_comparison(self):
+        worker = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        supervisor = ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH)
+        worker_id, supervisor_id = profile_fingerprint(worker), profile_fingerprint(supervisor)
+        binding = RuntimeBinding(
+            "roundwright-runtime/v1", "sha256:" + "a" * 64, worker_id, (supervisor_id,),
+            1, 2, 1, "worker-final-repair-then-merge", "d" * 64,
+        )
+        audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(worker.model, "high"), CodexCapability(supervisor.model, "xhigh")))
+        receipts = []
+        for ordinal, (role, profile, profile_id) in enumerate(((ProviderRole.PLANNING, worker, worker_id), (ProviderRole.WORKER, worker, worker_id), (ProviderRole.SUPERVISOR, supervisor, supervisor_id))):
+            observation = ProviderHealthObservation(role, profile_id, CodexHealthContract(audit.sdk_version, audit.runtime_version, "a" * 40).fingerprint, audit.fingerprint, HealthState.READY, None, 100, 200, 1)
+            receipts.append(ProviderHealthReceipt("a" * 40, "b" * 40, "case-42", ordinal, binding, role, profile_id, observation, ProviderHealthAuditIdentity(audit, profile)))
+        receipt = receipts[0]
+        emitted = {
+            "schema": "roundwright-live-provider-health/v1", "ready_at": 101, "ready": True, "status": "ready",
+            "contract_commit": receipt.contract_commit, "candidate_sha": receipt.candidate_sha, "case_id": receipt.case_id,
+            "report": {"health_contract_identity": receipt.observation.health_contract_identity,
+                       "configuration": receipt.configuration.complete_columns(),
+                       "selections": tuple((item.selection_ordinal, item.role.value, item.profile_identity) for item in receipts),
+                       "observations": tuple(item.observation.evidence() for item in receipts)},
+            "receipts": tuple(item.evidence() for item in receipts), "receipt_digests": tuple(item.receipt_digest for item in receipts),
+        }
+        case_identity = "sha256:" + hashlib.sha256(json.dumps({"contract_commit": emitted["contract_commit"], "candidate_sha": emitted["candidate_sha"], "case_id": emitted["case_id"], "configuration": binding.complete_columns()}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        reference_identity = "sha256:" + hashlib.sha256(json.dumps({"schema": "roundwright-live-provider-health-reference/v1", "contract_commit": emitted["contract_commit"], "candidate_sha": emitted["candidate_sha"], "case_id": emitted["case_id"], "report": emitted["report"], "receipt_digests": emitted["receipt_digests"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        emitted["manifest"] = {"schema": "roundwright-live-provider-health-manifest/v1", "shadow_case_identity": case_identity, "reference_identity": reference_identity, "comparator_version": "provider-health-receipt/v1", "normalizer_version": "roundwright-json-tuples/v1", "environment_identity": "native-read-only", "retention_identity": "orchestrator-capture-required", "bundle_digest": ""}
+        emitted["manifest"]["bundle_digest"] = "sha256:" + hashlib.sha256(json.dumps({"payload": {key: value for key, value in emitted.items() if key != "manifest"}, "manifest": {key: value for key, value in emitted["manifest"].items() if key != "bundle_digest"}}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        replayed = rehydrate_live_provider_health_evidence(json.loads(json.dumps(emitted)))
+        self.assertEqual(len(replayed), 3)
+        self.assertEqual(compare_provider_health_receipt(receipt.evidence(), replayed[0].evidence(), now=101).outcome, ComparisonOutcome.MATCH)
+        for mutate in (lambda value: value["receipts"][0].__setitem__("receipt_digest", "sha256:" + "0" * 64), lambda value: value.__setitem__("extra", True)):
+            tampered = json.loads(json.dumps(emitted)); mutate(tampered)
+            with self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(tampered)
+        def refresh_manifest(value):
+            value["manifest"]["bundle_digest"] = "sha256:" + hashlib.sha256(json.dumps({"payload": {key: item for key, item in value.items() if key != "manifest"}, "manifest": {key: item for key, item in value["manifest"].items() if key != "bundle_digest"}}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        timestamp = json.loads(json.dumps(emitted)); timestamp["ready_at"] = 102
+        manifest_digest = json.loads(json.dumps(emitted)); manifest_digest["manifest"]["bundle_digest"] = "sha256:" + "0" * 64
+        noncanonical = json.loads(json.dumps(emitted)); noncanonical["report"]["configuration"][3] = json.dumps([supervisor_id], separators=(",", ":")) + " "; refresh_manifest(noncanonical)
+        ignored_value = json.loads(json.dumps(emitted)); ignored_value["report"]["configuration"][3] = '{"ignored":"secret-token"}'; refresh_manifest(ignored_value)
+        for tampered in (timestamp, manifest_digest, noncanonical, ignored_value):
+            with self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(tampered)
+        for field, replacement in (("shadow_case_identity", "sha256:" + "0" * 64), ("reference_identity", "sha256:" + "1" * 64), ("comparator_version", "drift"), ("normalizer_version", "drift"), ("environment_identity", "drift"), ("retention_identity", "drift")):
+            tampered = json.loads(json.dumps(emitted)); tampered["manifest"][field] = replacement
+            with self.subTest(manifest_field=field), self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(tampered)
+        def refresh_policy_manifest(value):
+            configuration = value["report"]["configuration"]
+            value["manifest"]["shadow_case_identity"] = "sha256:" + hashlib.sha256(json.dumps({"contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "configuration": configuration}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            value["manifest"]["reference_identity"] = "sha256:" + hashlib.sha256(json.dumps({"schema": "roundwright-live-provider-health-reference/v1", "contract_commit": value["contract_commit"], "candidate_sha": value["candidate_sha"], "case_id": value["case_id"], "report": value["report"], "receipt_digests": value["receipt_digests"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            value["manifest"]["bundle_digest"] = "sha256:" + hashlib.sha256(json.dumps({"payload": {key: item for key, item in value.items() if key != "manifest"}, "manifest": {key: item for key, item in value["manifest"].items() if key != "bundle_digest"}}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        for index, replacement in ((4, 2), (5, 3), (6, 2), (7, "drift"), (8, "f" * 64)):
+            policy_drift = {**emitted, "report": {**emitted["report"], "configuration": tuple((*emitted["report"]["configuration"][:index], replacement, *emitted["report"]["configuration"][index + 1:]))}, "manifest": dict(emitted["manifest"])}
+            refresh_policy_manifest(policy_drift)
+            with self.subTest(policy_column=index), self.assertRaises(Exception):
+                rehydrate_live_provider_health_evidence(policy_drift)
     def identity(self) -> ShadowIdentity:
         return ShadowIdentity(
             "source-38", "task-38", BASE, CANDIDATE, "policy-38", "provider-38", "review-38", "gate-38", "owner-review", "worktree-38",

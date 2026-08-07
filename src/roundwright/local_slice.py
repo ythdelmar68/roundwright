@@ -12,7 +12,7 @@ import hashlib
 import os
 import sqlite3
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -45,7 +45,8 @@ from .gates import (
 from .git_identity import CandidateSeal, provision_worktree, resolve_canonical_base, transition_lease
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
-from .provider_recovery import RecoveryContext
+from .provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
+from .provider_recovery import ProviderRole, RecoveryContext
 from .state import SourceSnapshot, StateError, TaskIdentity, TaskProjection, admit_task, check_database, database_path, initialize, record_artifact, set_next_action, task_projection
 from .worker_planning import (
     PlanReviewReceipt,
@@ -141,7 +142,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -166,7 +167,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime_binding):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -200,7 +201,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
         (),
     )
     plan_dispatch = dispatch_plan(
-        repository, identity, context, planning_input,
+        repository, identity, _health_context(context, identity, ProviderRole.PLANNING, configuration.worker.value, epoch), planning_input,
         plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
         worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
         process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
@@ -219,7 +220,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
     submit_plan_for_review(repository, identity, plan_attempt_id=persisted_plan.plan_attempt_id, evidence_fingerprint=_fingerprint("submit-plan", identity.task_id), lease=lease)
 
     plan_review = dispatch_plan_review(
-        repository, identity, context,
+        repository, identity, _health_context(context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch),
         review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
         supervisor_session_identity="local-plan-supervisor-session", external_turn_identity="local-plan-review-turn",
         plan_attempt_id=persisted_plan.plan_attempt_id, process_lease_id="local-plan-review-lease",
@@ -244,7 +245,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
 
     binding = provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease)
     implementation = begin_implementation(
-        repository, identity, context,
+        repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
         implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
         plan_attempt_id=persisted_plan.plan_attempt_id, worker_thread_identity=plan_dispatch.worker_thread_identity,
         external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
@@ -268,7 +269,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, runtime
         runtime_binding=runtime_binding,
     )
     diff_review = dispatch_diff_review(
-        repository, identity, candidate_context, binding, seal,
+        repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
         diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
         provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
         external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
@@ -423,6 +424,33 @@ def _completed_result(repository, identity, fixture, runtime_binding):
         ):
             raise LocalSliceError("completed local slice gate evidence does not match the fixture contract")
     return LocalSliceResult(task, CandidateSeal(identity.task_id, *row), decision.outcome, plan[0], diff[0])
+
+
+def _health_context(context, identity, role, profile, now):
+    """Attach fixture-only typed preflight evidence for one local pseudo-turn."""
+
+    audit = CodexRuntimeAudit(
+        "1.2.3", "4.5.6",
+        (CodexCapability(profile.model, profile.reasoning_effort.value),),
+    )
+    contract = CodexHealthContract(audit.sdk_version, audit.runtime_version, identity.base_sha)
+    profile_identity = profile_fingerprint(profile)
+    observation = ProviderHealthObservation(
+        role, profile_identity, contract.fingerprint, audit.fingerprint,
+        HealthState.READY, None, now, now + 60, 1,
+    )
+    ordinal = 0 if role is ProviderRole.PLANNING else 1 if role is ProviderRole.WORKER else 2 + context.runtime_binding.supervisor_profile_identities.index(profile_identity)
+    receipt = ProviderHealthReceipt(
+        identity.base_sha, context.candidate_sha, "local-slice-provider-health", ordinal,
+        context.runtime_binding, role, profile_identity, observation,
+        ProviderHealthAuditIdentity(audit, profile),
+    )
+    return replace(
+        context,
+        health_contract_commit=identity.base_sha,
+        shadow_case_id="local-slice-provider-health",
+        health_receipt=receipt,
+    )
 
 
 def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot: object, trusted_review_floor: object):

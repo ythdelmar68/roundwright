@@ -579,6 +579,46 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
         ),
     ),
+    Migration(
+        45,
+        (
+            "CREATE TABLE provider_attempt_health_authorizations (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), contract_commit TEXT NOT NULL, candidate_sha TEXT, case_id TEXT NOT NULL, receipt_digest TEXT NOT NULL, selection_ordinal INTEGER NOT NULL, fresh_until INTEGER NOT NULL, health_contract_identity TEXT NOT NULL)",
+        ),
+        (
+            ("provider_attempt_health_authorizations", "CREATE TABLE provider_attempt_health_authorizations (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), contract_commit TEXT NOT NULL, candidate_sha TEXT, case_id TEXT NOT NULL, receipt_digest TEXT NOT NULL, selection_ordinal INTEGER NOT NULL, fresh_until INTEGER NOT NULL, health_contract_identity TEXT NOT NULL)"),
+        ),
+    ),
+    Migration(
+        46,
+        (
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN review_complete_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN review_max_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN review_on_final_findings TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_contexts ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_health_authorizations ADD COLUMN provider_role TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_attempt_health_authorizations ADD COLUMN profile_identity TEXT NOT NULL DEFAULT ''",
+            "CREATE TABLE provider_attempt_health_seals (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), authorization_fingerprint TEXT NOT NULL)",
+        ),
+        (
+            ("provider_attempt_contexts", "CREATE TABLE provider_attempt_contexts (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_fingerprint TEXT NOT NULL, worktree_fingerprint TEXT NOT NULL, branch_fingerprint TEXT NOT NULL, base_fingerprint TEXT NOT NULL, candidate_fingerprint TEXT, policy_fingerprint TEXT NOT NULL, deployment_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
+            ("provider_attempt_health_authorizations", "CREATE TABLE provider_attempt_health_authorizations (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), contract_commit TEXT NOT NULL, candidate_sha TEXT, case_id TEXT NOT NULL, receipt_digest TEXT NOT NULL, selection_ordinal INTEGER NOT NULL, fresh_until INTEGER NOT NULL, health_contract_identity TEXT NOT NULL, provider_role TEXT NOT NULL DEFAULT '', profile_identity TEXT NOT NULL DEFAULT '')"),
+            ("provider_attempt_health_seals", "CREATE TABLE provider_attempt_health_seals (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), authorization_fingerprint TEXT NOT NULL)"),
+        ),
+    ),
+    Migration(
+        47,
+        (
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_complete_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_max_rounds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_on_final_findings TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_policy_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
+        ),
+    ),
 )
 
 

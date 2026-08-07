@@ -47,3 +47,9 @@ Parent: #<umbrella-or-none>
 The declaration is a routing and evidence record. It never authorizes a live
 provider call, remote mutation, promotion, or a change to the disabled
 Roundwright authority surface.
+
+If a leaf adds a `GitHubMutationOperation`, that same reviewed change must add
+exactly one canonical `RepositoryMutationOperation`, exactly one strict
+Boolean, the immutable mapping, denied/allowed/stale/wrong-candidate coverage,
+and semantic read-back coverage. Missing, duplicate, extra, inferred, alias,
+fallback, or `None` mappings are not deferrable follow-up work and must fail CI.

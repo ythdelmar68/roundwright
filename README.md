@@ -79,6 +79,17 @@ path-free denial rather than an implementation exception, including malformed
 trusted source, policy-document, and activation-receipt structures. Invalid
 receipt fields are not copied into owner-facing diagnostics.
 
+The GitHub runtime seam is `roundwright.github_runtime`. Its documented default
+adapter is `gh`; MCP is optional. The adapter requires independent health for
+every declared operation and defaults to an all-unavailable matrix. It keeps
+raw command output and credential handling outside model-visible contract
+objects. The centralized broker requires exact Boolean repository policy,
+deployment authority, candidate/gate evidence, idempotency, a pre-state read,
+and semantic post-state read-back before producing a curated receipt. Direct
+adapter mutations are denied, and the disabled Roundwright authority policy
+causes Shadow evaluation to block before any broker execution. Hermetic fixtures
+remain the only mutation validation in this phase.
+
 For the Phase 2 positive proof, `roundwright.local_slice` exposes one explicit
 test-fixture boundary. It joins the existing SQLite, local-Git, Worker, fresh
 Supervisor, candidate, and gate contracts for a single isolated source. It is

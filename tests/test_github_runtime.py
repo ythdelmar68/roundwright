@@ -19,6 +19,7 @@ from roundwright.github import (
     GitHubMutationOperation,
     GitHubReadOperation,
     GitHubReadRequest,
+    MutationDisposition,
     RepositoryRef,
 )
 from roundwright.github_runtime import (
@@ -30,6 +31,8 @@ from roundwright.github_runtime import (
     GhMutationPayload,
     GitHubCapabilityHealth,
     GitHubMutationBroker,
+    JournalLifecycle,
+    MutationJournalEntry,
     MutationBrokerContext,
     OperationHealth,
     SemanticPostcondition,
@@ -360,16 +363,95 @@ class GitHubRuntimeTests(unittest.TestCase):
         matrix = unavailable_capability_health(now=NOW)
         self.assertFalse(matrix.for_operation(GitHubMutationOperation.MERGE_PULL_REQUEST).available)
 
-    def test_durable_journal_rejects_conflict_and_requires_restart_reconciliation(self) -> None:
-        intent = GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "branch-46", expected_sha=SHA, target_ref="codex/issue-46")
-        conflicting = GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "branch-46", expected_sha=BASE, target_ref="codex/issue-46")
+    def test_durable_journal_binds_full_evidence_and_rejects_conflicts(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        conflicting = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-46", target_number=46, payload=(("body_digest", DIGEST),))
+        context = allowed_context()
+        bundle = schema_v2_authorization_bundle(context)
+        entry = MutationJournalEntry.from_evidence(intent, context, bundle, _broker_semantic_plan(intent))
         with tempfile.TemporaryDirectory() as directory:
             first = DurableMutationJournal(Path(directory) / "journal.json")
-            self.assertEqual(first.begin(intent), "started")
-            self.assertEqual(first.begin(conflicting), "conflict")
-            first.transition(intent, "ambiguous")
+            claimed, created = first.claim(entry)
+            self.assertTrue(created)
+            self.assertIs(claimed.lifecycle, JournalLifecycle.PENDING)
+            with self.assertRaises(ValueError):
+                first.claim(MutationJournalEntry.from_evidence(conflicting, context, bundle, _broker_semantic_plan(conflicting)))
+            first.transition(entry, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
+            with self.assertRaises(ValueError):
+                first.transition(entry, JournalLifecycle.FAILED)
             restarted = DurableMutationJournal(Path(directory) / "journal.json")
-            self.assertEqual(restarted.begin(intent), "ambiguous")
+            observed = restarted.find(entry)
+            self.assertIsNotNone(observed)
+            self.assertIs(observed.lifecycle, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)  # type: ignore[union-attr]
+
+    def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        request = comments_request()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            fake = FakeGitHubAdapter({
+                request.identity(): FakeGitHubScenario(response=comments_payload()),
+                intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
+            })
+            first = GitHubMutationBroker(fake, journal=journal).submit(intent, allowed_context())
+            self.assertTrue(first.ok)
+            self.assertEqual(fake.call_count(kind="mutation"), 1)
+            restarted_fake = FakeGitHubAdapter()
+            retry = GitHubMutationBroker(restarted_fake, journal=DurableMutationJournal(Path(directory) / "journal.json")).submit(intent, allowed_context())
+            self.assertTrue(retry.ok)
+            self.assertEqual(retry.receipt, first.receipt)
+            self.assertEqual(restarted_fake.call_count(), 0)
+
+    def test_journal_ambiguous_retry_reconciles_without_duplicate_mutation(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-ambiguous-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        request = comments_request()
+        empty = {**comments_payload(), "comments": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            first_fake = FakeGitHubAdapter({
+                request.identity(): FakeGitHubScenario(response=empty),
+                intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
+            })
+            first = GitHubMutationBroker(first_fake, journal=DurableMutationJournal(path)).submit(intent, allowed_context())
+            self.assertFalse(first.ok)
+            self.assertTrue(first.reconciliation_required)
+            self.assertEqual(first_fake.call_count(kind="mutation"), 1)
+            reconciler = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=comments_payload())})
+            retry = GitHubMutationBroker(reconciler, journal=DurableMutationJournal(path)).submit(intent, allowed_context())
+            self.assertTrue(retry.ok)
+            self.assertEqual(retry.receipt.disposition, MutationDisposition.ALREADY_APPLIED)  # type: ignore[union-attr]
+            self.assertEqual(reconciler.call_count(kind="mutation"), 0)
+
+    def test_journal_applied_awaiting_verification_recovers_without_second_mutation(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-applied-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        bundle = schema_v2_authorization_bundle(context)
+        evidence = MutationJournalEntry.from_evidence(intent, context, bundle, _broker_semantic_plan(intent))
+        request = comments_request()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            journal = DurableMutationJournal(path)
+            journal.claim(evidence)
+            journal.transition(evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
+            reconciler = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=comments_payload())})
+            result = GitHubMutationBroker(reconciler, journal=DurableMutationJournal(path)).submit(intent, context)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.receipt.disposition, MutationDisposition.ALREADY_APPLIED)  # type: ignore[union-attr]
+            self.assertEqual(reconciler.call_count(kind="mutation"), 0)
+
+    def test_journal_corruption_and_missing_reconciliation_fail_closed_before_adapter_calls(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-corrupt-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            path.write_text("{not-json", encoding="utf-8")
+            fake = FakeGitHubAdapter()
+            denied = GitHubMutationBroker(fake, journal=DurableMutationJournal(path)).submit(intent, allowed_context())
+            self.assertFalse(denied.ok)
+            self.assertEqual(fake.call_count(), 0)
+            path.unlink()
+            missing = GitHubMutationBroker(fake, journal=DurableMutationJournal(path)).reconcile(intent, allowed_context())
+            self.assertFalse(missing.ok)
+            self.assertEqual(fake.call_count(), 0)
 
     def test_broker_requires_policy_deployment_candidate_and_prestate_before_adapter_mutation(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", DIGEST),))

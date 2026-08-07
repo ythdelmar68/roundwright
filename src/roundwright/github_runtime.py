@@ -19,7 +19,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -607,64 +607,216 @@ class BrokerMutationResult:
         return self.receipt is not None
 
 
-class DurableMutationJournal:
-    """Atomic public-safe idempotency state for an Orchestrator composition root.
+class JournalLifecycle(StrEnum):
+    """Durable mutation states; uncertainty is never a success state."""
 
-    Records contain only repository, operation, idempotency key, intent digest,
-    and lifecycle state.  A restarted broker therefore reconciles instead of
-    issuing another write after an interrupted attempt.
-    """
+    PENDING = "pending"
+    APPLIED_AWAITING_VERIFICATION = "applied-awaiting-verification"
+    VERIFIED = "verified"
+    DENIED = "denied"
+    FAILED = "failed"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class MutationJournalEntry:
+    """Public-safe durable evidence for exactly one broker-owned mutation."""
+
+    repository: str
+    operation: GitHubMutationOperation
+    idempotency_key: str
+    target_identity: str
+    idempotency_identity: str
+    intent_identity: str
+    authorization_bundle_identity: str
+    candidate_sha: str
+    configuration_digest: str
+    gate_identity: str
+    semantic_plan_identity: str
+    command: BrokerMutationCommand
+    semantic_readback_identity: str
+    lifecycle: JournalLifecycle
+    receipt: SemanticMutationReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.repository) is not str or "/" not in self.repository or type(self.operation) is not GitHubMutationOperation or type(self.idempotency_key) is not str:
+            raise GitHubRuntimeError("mutation journal identity is invalid")
+        for value, name in (
+            (self.target_identity, "journal target"), (self.idempotency_identity, "journal idempotency"),
+            (self.intent_identity, "journal intent"), (self.authorization_bundle_identity, "journal authorization bundle"),
+            (self.configuration_digest, "journal configuration"), (self.gate_identity, "journal gate"),
+            (self.semantic_plan_identity, "journal semantic plan"), (self.semantic_readback_identity, "journal semantic read-back"),
+        ):
+            _digest(value, name)
+        if type(self.candidate_sha) is not str or len(self.candidate_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in self.candidate_sha):
+            raise GitHubRuntimeError("mutation journal candidate is invalid")
+        if type(self.command) is not BrokerMutationCommand or type(self.lifecycle) is not JournalLifecycle:
+            raise GitHubRuntimeError("mutation journal lifecycle is invalid")
+        if (self.lifecycle is JournalLifecycle.VERIFIED) != (type(self.receipt) is SemanticMutationReceipt):
+            raise GitHubRuntimeError("mutation journal receipt lifecycle is invalid")
+        if self.receipt is not None and (
+            self.receipt.repository != self.repository or self.receipt.operation is not self.operation
+            or self.receipt.idempotency_key != self.idempotency_key
+            or self.receipt.authorization_bundle_identity != self.authorization_bundle_identity
+            or self.receipt.intent_identity != self.intent_identity
+            or self.receipt.semantic_plan_identity != self.semantic_plan_identity
+            or self.receipt.semantic_readback_identity != self.semantic_readback_identity
+            or self.receipt.candidate_sha != self.candidate_sha
+            or self.receipt.configuration_digest != self.configuration_digest
+            or self.receipt.gate_identity != self.gate_identity
+        ):
+            raise GitHubRuntimeError("mutation journal receipt does not match durable evidence")
+
+    @classmethod
+    def from_evidence(
+        cls, intent: GitHubMutationIntent, context: MutationBrokerContext,
+        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
+    ) -> "MutationJournalEntry":
+        if (
+            type(intent) is not GitHubMutationIntent or type(context) is not MutationBrokerContext
+            or type(bundle) is not SchemaV2AuthorizationBundle or type(plan) is not BrokerSemanticPlan
+            or plan.operation is not intent.operation or plan.intent_identity != intent.identity()
+        ):
+            raise GitHubRuntimeError("mutation journal evidence is invalid")
+        return cls(
+            intent.repository.slug, intent.operation, intent.idempotency_key,
+            plan.target_identity, plan.idempotency_identity, intent.identity(), bundle.identity,
+            context.candidate_sha, context.configuration_digest, context.gate_identity,
+            plan.identity, plan.command, plan.readback.identity, JournalLifecycle.PENDING,
+        )
+
+    @property
+    def key(self) -> str:
+        return _sha256((self.repository, self.operation.value, self.idempotency_key))
+
+    def evidence_matches(self, other: "MutationJournalEntry") -> bool:
+        return type(other) is MutationJournalEntry and all(
+            getattr(self, name) == getattr(other, name)
+            for name in self.__dataclass_fields__ if name not in {"lifecycle", "receipt"}
+        )
+
+    def serialize(self) -> Mapping[str, object]:
+        return {
+            "repository": self.repository, "operation": self.operation.value,
+            "idempotency_key": self.idempotency_key, "target_identity": self.target_identity,
+            "idempotency_identity": self.idempotency_identity, "intent_identity": self.intent_identity,
+            "authorization_bundle_identity": self.authorization_bundle_identity,
+            "candidate_sha": self.candidate_sha, "configuration_digest": self.configuration_digest,
+            "gate_identity": self.gate_identity, "semantic_plan_identity": self.semantic_plan_identity,
+            "command": self.command.value, "semantic_readback_identity": self.semantic_readback_identity,
+            "lifecycle": self.lifecycle.value,
+            "receipt": None if self.receipt is None else self.receipt._payload(),
+        }
+
+    @classmethod
+    def deserialize(cls, value: object) -> "MutationJournalEntry":
+        required = {
+            "repository", "operation", "idempotency_key", "target_identity", "idempotency_identity",
+            "intent_identity", "authorization_bundle_identity", "candidate_sha", "configuration_digest",
+            "gate_identity", "semantic_plan_identity", "command", "semantic_readback_identity",
+            "lifecycle", "receipt",
+        }
+        if type(value) is not dict or set(value) != required:
+            raise GitHubRuntimeError("mutation journal entry is malformed")
+        receipt_value = value["receipt"]
+        if receipt_value is not None:
+            if type(receipt_value) is not dict:
+                raise GitHubRuntimeError("mutation journal receipt is malformed")
+            receipt_values = dict(receipt_value)
+            try:
+                receipt_values["operation"] = GitHubMutationOperation(receipt_values["operation"])
+                receipt_values["disposition"] = MutationDisposition(receipt_values["disposition"])
+                receipt = SemanticMutationReceipt(**receipt_values)
+            except (KeyError, TypeError, ValueError) as error:
+                raise GitHubRuntimeError("mutation journal receipt is malformed") from error
+        else:
+            receipt = None
+        try:
+            return cls(
+                value["repository"], GitHubMutationOperation(value["operation"]), value["idempotency_key"],
+                value["target_identity"], value["idempotency_identity"], value["intent_identity"],
+                value["authorization_bundle_identity"], value["candidate_sha"], value["configuration_digest"],
+                value["gate_identity"], value["semantic_plan_identity"], BrokerMutationCommand(value["command"]),
+                value["semantic_readback_identity"], JournalLifecycle(value["lifecycle"]), receipt,
+            )
+        except (TypeError, ValueError) as error:
+            raise GitHubRuntimeError("mutation journal entry is malformed") from error
+
+
+class DurableMutationJournal:
+    """Atomic local journal that preserves uncertainty for broker reconciliation."""
 
     def __init__(self, path: Path) -> None:
         if not isinstance(path, Path) or not path.parent.is_dir():
             raise GitHubRuntimeError("mutation journal path is invalid")
         self._path = path
 
-    def begin(self, intent: GitHubMutationIntent) -> str:
+    def claim(self, evidence: MutationJournalEntry) -> tuple[MutationJournalEntry, bool]:
+        if type(evidence) is not MutationJournalEntry:
+            raise GitHubRuntimeError("mutation journal evidence is invalid")
         records = self._load()
-        key, digest = self._key(intent), intent.identity()
-        prior = records.get(key)
+        prior = records.get(evidence.key)
         if prior is not None:
-            if prior.get("intent_digest") != digest:
-                return "conflict"
-            return str(prior.get("state"))
-        records[key] = {"repository": intent.repository.slug, "operation": intent.operation.value, "idempotency_key": intent.idempotency_key, "intent_digest": digest, "state": "started"}
+            if not prior.evidence_matches(evidence):
+                raise GitHubRuntimeError("mutation journal idempotency identity conflicts")
+            return prior, False
+        records[evidence.key] = evidence
         self._store(records)
-        return "started"
+        return evidence, True
 
-    def transition(self, intent: GitHubMutationIntent, state: str) -> None:
-        if state not in {"applied", "ambiguous"}:
-            raise GitHubRuntimeError("mutation journal state is invalid")
+    def transition(
+        self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
+        receipt: SemanticMutationReceipt | None = None,
+    ) -> MutationJournalEntry:
+        if type(evidence) is not MutationJournalEntry or type(lifecycle) is not JournalLifecycle:
+            raise GitHubRuntimeError("mutation journal transition is invalid")
         records = self._load()
-        key = self._key(intent)
-        prior = records.get(key)
-        if prior is None or prior.get("intent_digest") != intent.identity():
-            raise GitHubRuntimeError("mutation journal record is missing")
-        prior["state"] = state
+        prior = records.get(evidence.key)
+        if prior is None or not prior.evidence_matches(evidence):
+            raise GitHubRuntimeError("mutation journal evidence is missing or conflicting")
+        allowed = {
+            JournalLifecycle.PENDING: {JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.DENIED, JournalLifecycle.FAILED, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.APPLIED_AWAITING_VERIFICATION: {JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.AMBIGUOUS: {JournalLifecycle.VERIFIED},
+            JournalLifecycle.VERIFIED: set(), JournalLifecycle.DENIED: set(), JournalLifecycle.FAILED: set(),
+        }
+        if lifecycle not in allowed[prior.lifecycle]:
+            raise GitHubRuntimeError("mutation journal transition is impossible")
+        updated = replace(prior, lifecycle=lifecycle, receipt=receipt)
+        records[evidence.key] = updated
         self._store(records)
+        return updated
 
-    def _load(self) -> dict[str, dict[str, str]]:
+    def find(self, evidence: MutationJournalEntry) -> MutationJournalEntry | None:
+        if type(evidence) is not MutationJournalEntry:
+            raise GitHubRuntimeError("mutation journal evidence is invalid")
+        prior = self._load().get(evidence.key)
+        if prior is not None and not prior.evidence_matches(evidence):
+            raise GitHubRuntimeError("mutation journal idempotency identity conflicts")
+        return prior
+
+    def _load(self) -> dict[str, MutationJournalEntry]:
         if not self._path.exists():
             return {}
         try:
             value = json.loads(self._path.read_text(encoding="utf-8"))
-            if type(value) is not dict or any(type(key) is not str or type(record) is not dict or set(record) != {"repository", "operation", "idempotency_key", "intent_digest", "state"} or any(type(item) is not str for item in record.values()) for key, record in value.items()):
+            if type(value) is not dict or any(type(key) is not str for key in value):
                 raise ValueError
-            return value
+            records = {key: MutationJournalEntry.deserialize(record) for key, record in value.items()}
+            if any(entry.key != key for key, entry in records.items()):
+                raise ValueError
+            return records
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
             raise GitHubRuntimeError("mutation journal is malformed") from error
 
-    def _store(self, records: Mapping[str, Mapping[str, str]]) -> None:
+    def _store(self, records: Mapping[str, MutationJournalEntry]) -> None:
         temporary = self._path.with_suffix(self._path.suffix + ".tmp")
         try:
-            temporary.write_text(json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True), encoding="utf-8")
+            value = {key: entry.serialize() for key, entry in records.items()}
+            temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True), encoding="utf-8")
             os.replace(temporary, self._path)
         except OSError as error:
             raise GitHubRuntimeError("mutation journal cannot be persisted") from error
-
-    @staticmethod
-    def _key(intent: GitHubMutationIntent) -> str:
-        return _sha256((intent.repository.slug, intent.operation.value, intent.idempotency_key))
 
 
 _MUTATION_COMMAND_BY_OPERATION: Mapping[GitHubMutationOperation, BrokerMutationCommand] = MappingProxyType({
@@ -761,37 +913,95 @@ class GitHubMutationBroker:
         prior = self._completed.get(intent.identity())
         if prior is not None:
             return BrokerMutationResult(receipt=prior)
+        evidence: MutationJournalEntry | None = None
         if self._journal is not None:
-            journal_state = self._journal.begin(intent)
-            if journal_state == "conflict":
-                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "idempotency key conflicts with a different mutation intent"))
-            if journal_state != "started":
-                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation state requires semantic reconciliation"), reconciliation_required=True)
+            try:
+                evidence = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
+                journal_entry, created = self._journal.claim(evidence)
+            except (AttributeError, TypeError, ValueError):
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
+            if not created:
+                return self._reconcile_journal(intent, context, bundle, plan, evidence, journal_entry)
         before = self._adapter.read(plan.pre_state)
         if not before.ok:
+            if evidence is not None and self._journal is not None:
+                self._journal_transition(evidence, JournalLifecycle.FAILED)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-mutation semantic state is unavailable"))
         outcome = self._execute(intent, payload, plan)
         if not outcome.ok:
+            if evidence is not None and self._journal is not None:
+                lifecycle = JournalLifecycle.DENIED if outcome.failure is not None and outcome.failure.kind is GitHubFailureKind.POLICY_DENIED else JournalLifecycle.FAILED
+                self._journal_transition(evidence, lifecycle)
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
+        if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION):
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation durability is uncertain"), reconciliation_required=True)
         after = self._adapter.read(plan.readback.request)
         if not after.ok or not _matches(plan.readback, intent, after.snapshot):
             if self._journal is not None:
-                self._journal.transition(intent, "ambiguous")
+                assert evidence is not None
+                self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
+        assert outcome.receipt is not None
+        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, outcome.receipt.affected_identity, outcome.receipt.disposition)
+        self._completed[intent.identity()] = receipt
+        if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
+            self._completed.pop(intent.identity(), None)
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "verified mutation receipt was not persisted"), reconciliation_required=True)
+        return BrokerMutationResult(receipt=receipt)
+
+    @staticmethod
+    def _semantic_receipt(
+        intent: GitHubMutationIntent, context: MutationBrokerContext,
+        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
+        pre_state_digest: str, post_state_digest: str, affected_identity: str,
+        disposition: MutationDisposition,
+    ) -> SemanticMutationReceipt:
         binding = context.policy.binding
         assert binding is not None  # established by _authorize
-        receipt = SemanticMutationReceipt(
+        return SemanticMutationReceipt(
             intent.repository.slug, intent.operation, intent.idempotency_key, bundle.identity,
             intent.identity(), plan.identity, plan.readback.identity,
             _sha256(("public-payload", intent.payload)), binding.digest,
             context.configuration_digest, binding.deployment_fingerprint,
             binding.task_fingerprint, context.base_sha, context.candidate_sha,
-            context.gate_identity, before.snapshot_digest, after.snapshot_digest,
-            outcome.receipt.affected_identity, outcome.receipt.disposition,
+            context.gate_identity, pre_state_digest, post_state_digest,
+            affected_identity, disposition,
         )
+
+    def _journal_transition(
+        self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
+        receipt: SemanticMutationReceipt | None = None,
+    ) -> bool:
+        assert self._journal is not None
+        try:
+            self._journal.transition(evidence, lifecycle, receipt)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return True
+
+    def _reconcile_journal(
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext,
+        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
+        evidence: MutationJournalEntry, entry: MutationJournalEntry,
+    ) -> BrokerMutationResult:
+        """Resolve a durable uncertain state only from broker-owned read-back."""
+
+        if entry.lifecycle is JournalLifecycle.VERIFIED:
+            assert entry.receipt is not None
+            self._completed[intent.identity()] = entry.receipt
+            return BrokerMutationResult(receipt=entry.receipt)
+        if entry.lifecycle in {JournalLifecycle.DENIED, JournalLifecycle.FAILED}:
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation lifecycle is terminally denied or failed"))
+        observed = self._adapter.read(plan.readback.request)
+        if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation requires semantic reconciliation"), reconciliation_required=True)
+        receipt = self._semantic_receipt(
+            intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest,
+            "reconciled", MutationDisposition.ALREADY_APPLIED,
+        )
+        if not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "reconciled receipt was not persisted"), reconciliation_required=True)
         self._completed[intent.identity()] = receipt
-        if self._journal is not None:
-            self._journal.transition(intent, "applied")
         return BrokerMutationResult(receipt=receipt)
 
     def _execute(
@@ -831,16 +1041,20 @@ class GitHubMutationBroker:
             plan = _broker_semantic_plan(intent)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
+        if self._journal is not None:
+            try:
+                evidence = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
+                entry = self._journal.find(evidence)
+            except (AttributeError, TypeError, ValueError):
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
+            if entry is None:
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is missing"))
+            return self._reconcile_journal(intent, context, bundle, plan, evidence, entry)
         observed = self._adapter.read(plan.readback.request)
         if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
-        binding = context.policy.binding
-        assert binding is not None
-        receipt = SemanticMutationReceipt(intent.repository.slug, intent.operation, intent.idempotency_key, bundle.identity, intent.identity(), plan.identity, plan.readback.identity, _sha256(("public-payload", intent.payload)), binding.digest, context.configuration_digest, binding.deployment_fingerprint, binding.task_fingerprint, context.base_sha, context.candidate_sha, context.gate_identity, observed.snapshot_digest, observed.snapshot_digest, "reconciled", MutationDisposition.ALREADY_APPLIED)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, "reconciled", MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
-        if self._journal is not None:
-            self._journal.begin(intent)
-            self._journal.transition(intent, "applied")
         return BrokerMutationResult(receipt=receipt)
 
 

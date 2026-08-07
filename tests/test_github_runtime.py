@@ -23,6 +23,7 @@ from roundwright.github import (
 )
 from roundwright.github_runtime import (
     CapabilityState,
+    BrokerMutationCommand,
     GhCommandResult,
     DurableMutationJournal,
     GhGitHubAdapter,
@@ -33,10 +34,12 @@ from roundwright.github_runtime import (
     OperationHealth,
     SemanticPostcondition,
     SemanticReadback,
+    _broker_semantic_plan,
     schema_v2_authorization_bundle,
     unavailable_capability_health,
 )
 from roundwright.repository_policy import (
+    GITHUB_REPOSITORY_OPERATION,
     RepositoryDispatcherTransition,
     RepositoryActivationReceipt,
     RepositoryMutationContext,
@@ -201,12 +204,63 @@ class GitHubRuntimeTests(unittest.TestCase):
                 semantic_readback_digest=DIGEST,
             ),
         })
-        result = GitHubMutationBroker(fake).submit(
-            intent, allowed_context(), pre_state=request,
-            readback=SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT),
-        )
+        context = allowed_context()
+        result = GitHubMutationBroker(fake).submit(intent, context)
         self.assertTrue(result.ok)
         self.assertEqual(fake.call_count(kind="mutation"), 1)
+        assert result.receipt is not None
+        plan = _broker_semantic_plan(intent)
+        self.assertEqual(result.receipt.authorization_bundle_identity, schema_v2_authorization_bundle(context).identity)
+        self.assertEqual(result.receipt.intent_identity, intent.identity())
+        self.assertEqual(result.receipt.semantic_plan_identity, plan.identity)
+        self.assertEqual(result.receipt.semantic_readback_identity, plan.readback.identity)
+
+    def test_broker_semantic_plan_is_total_for_every_supported_operation(self) -> None:
+        reviewers = "octocat"
+        reviewers_digest = "sha256:" + hashlib.sha256(json.dumps(("reviewers", (reviewers,)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        cases = (
+            (GitHubMutationIntent(GitHubMutationOperation.UPDATE_BRANCH, REPOSITORY, "update-46", expected_sha=SHA, target_ref="codex/issue-46", payload=(("previous_sha", BASE),)), GitHubReadOperation.BRANCH, SemanticPostcondition.BRANCH_AT_EXPECTED_SHA),
+            (GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),)), GitHubReadOperation.COMMENTS, SemanticPostcondition.COMMENT_PRESENT),
+            (GitHubMutationIntent(GitHubMutationOperation.REQUEST_REVIEW, REPOSITORY, "review-46", target_number=46, expected_sha=SHA, payload=(("reviewers_digest", reviewers_digest),)), GitHubReadOperation.REVIEWS, SemanticPostcondition.REVIEW_AT_CANDIDATE),
+            (GitHubMutationIntent(GitHubMutationOperation.MARK_READY, REPOSITORY, "ready-46", target_number=46, expected_sha=SHA), GitHubReadOperation.PULL_REQUEST, SemanticPostcondition.PULL_REQUEST_READY),
+            (GitHubMutationIntent(GitHubMutationOperation.MERGE_PULL_REQUEST, REPOSITORY, "merge-46", target_number=46, expected_sha=SHA, payload=(("method", "merge"),)), GitHubReadOperation.PULL_REQUEST, SemanticPostcondition.PULL_REQUEST_MERGED),
+            (GitHubMutationIntent(GitHubMutationOperation.CLOSE_ISSUE, REPOSITORY, "close-46", target_number=46, payload=(("reason", "COMPLETED"),)), GitHubReadOperation.ISSUE, SemanticPostcondition.ISSUE_CLOSED),
+        )
+        for intent, read_operation, condition in cases:
+            with self.subTest(operation=intent.operation):
+                plan = _broker_semantic_plan(intent)
+                self.assertIs(plan.command, BrokerMutationCommand(intent.operation.value))
+                self.assertIs(plan.pre_state.operation, read_operation)
+                self.assertIs(plan.readback.condition, condition)
+                self.assertEqual(plan.intent_identity, intent.identity())
+
+    def test_broker_rejects_caller_semantic_overrides_and_incomplete_operations_before_adapter_calls(self) -> None:
+        comment = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "override-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        incomplete = (
+            GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "create-46", expected_sha=SHA, target_ref="codex/issue-46"),
+            GitHubMutationIntent(GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY, "pr-46", payload=(("base_ref", "main"), ("base_sha", SHA), ("body_digest", COMMENT_DIGEST), ("head_ref", "codex/issue-46"), ("head_sha", SHA), ("title_digest", COMMENT_DIGEST))),
+            GitHubMutationIntent(GitHubMutationOperation.DELETE_BRANCH, REPOSITORY, "delete-46", expected_sha=SHA, target_ref="codex/issue-46"),
+        )
+        override = _broker_semantic_plan(comment)
+        for name, arguments in (
+            ("pre-state", {"pre_state": comments_request()}),
+            ("read-back", {"readback": SemanticReadback(comments_request(), SemanticPostcondition.COMMENT_PRESENT)}),
+            ("plan", {"semantic_plan": override}),
+            ("command", {"command": BrokerMutationCommand.COMMENT}),
+        ):
+            with self.subTest(override=name):
+                fake = FakeGitHubAdapter()
+                result = GitHubMutationBroker(fake).submit(comment, allowed_context(), **arguments)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(fake.call_count(), 0)
+        for intent in incomplete:
+            with self.subTest(operation=intent.operation):
+                fake = FakeGitHubAdapter()
+                result = GitHubMutationBroker(fake).submit(intent, allowed_context(GITHUB_REPOSITORY_OPERATION[intent.operation]))
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(fake.call_count(), 0)
 
     def test_schema_v2_pre_run_gate_rejects_drift_before_any_adapter_call(self) -> None:
         intent = GitHubMutationIntent(
@@ -256,10 +310,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 drift(context)
                 fake = FakeGitHubAdapter({})
                 broker = GitHubMutationBroker(fake)
-                result = broker.submit(
-                    intent, context, pre_state=request,
-                    readback=SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT),
-                )
+                result = broker.submit(intent, context)
                 self.assertFalse(result.ok)
                 self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
                 self.assertEqual(fake.call_count(), 0)
@@ -272,10 +323,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         context = allowed_context()
         object.__setattr__(context, "dispatcher_transition", replace(context.dispatcher_transition, candidate_sha=BASE))
         fake = FakeGitHubAdapter({})
-        result = GitHubMutationBroker(fake).reconcile(
-            intent, context,
-            readback=SemanticReadback(comments_request(), SemanticPostcondition.COMMENT_PRESENT),
-        )
+        result = GitHubMutationBroker(fake).reconcile(intent, context)
         self.assertFalse(result.ok)
         self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
         self.assertEqual(fake.call_count(), 0)
@@ -326,7 +374,7 @@ class GitHubRuntimeTests(unittest.TestCase):
     def test_broker_requires_policy_deployment_candidate_and_prestate_before_adapter_mutation(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", DIGEST),))
         fake = FakeGitHubAdapter({intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST)})
-        result = GitHubMutationBroker(fake).submit(intent, allowed_context(RepositoryMutationOperation.MARK_PR_READY), pre_state=comments_request(), readback=SemanticReadback(comments_request(), SemanticPostcondition.COMMENT_PRESENT))
+        result = GitHubMutationBroker(fake).submit(intent, allowed_context(RepositoryMutationOperation.MARK_PR_READY))
         self.assertFalse(result.ok)
         self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
         self.assertEqual(fake.call_count(), 0)
@@ -339,13 +387,12 @@ class GitHubRuntimeTests(unittest.TestCase):
             intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
         })
         broker = GitHubMutationBroker(fake)
-        readback = SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT)
-        first = broker.submit(intent, allowed_context(), pre_state=request, readback=readback)
+        first = broker.submit(intent, allowed_context())
         self.assertTrue(first.ok)
         self.assertEqual(first.receipt.candidate_sha, SHA)  # type: ignore[union-attr]
         self.assertTrue(first.receipt.receipt_digest.startswith("sha256:"))  # type: ignore[union-attr]
         self.assertEqual(fake.call_count(kind="mutation"), 1)
-        second = broker.submit(intent, allowed_context(), pre_state=request, readback=readback)
+        second = broker.submit(intent, allowed_context())
         self.assertTrue(second.ok)
         self.assertEqual(second.receipt, first.receipt)
         self.assertEqual(fake.call_count(kind="mutation"), 1)
@@ -357,7 +404,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             request.identity(): FakeGitHubScenario(response={**comments_payload(), "comments": []}),
             intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
         })
-        result = GitHubMutationBroker(fake).submit(intent, allowed_context(), pre_state=request, readback=SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT))
+        result = GitHubMutationBroker(fake).submit(intent, allowed_context())
         self.assertFalse(result.ok)
         self.assertTrue(result.reconciliation_required)
         self.assertEqual(fake.call_count(kind="mutation"), 1)
@@ -373,8 +420,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT))
         broker = GitHubMutationBroker(adapter)
-        readback = SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT)
-        result = broker.submit(intent, allowed_context(), pre_state=request, readback=readback, payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
+        result = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
         self.assertTrue(result.ok)
         self.assertEqual(len(runner.calls), 3)
         self.assertEqual(runner.calls[1][:5], ("api", "--method", "POST", "repos/example/roundwright/issues/46/comments", "-f"))
@@ -382,7 +428,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertFalse(direct.ok)
         self.assertEqual(direct.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
         self.assertEqual(len(runner.calls), 3)
-        retry = broker.submit(intent, allowed_context(), pre_state=request, readback=readback, payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
+        retry = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
         self.assertTrue(retry.ok)
         self.assertEqual(len(runner.calls), 3)
 
@@ -398,13 +444,12 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT))
         broker = GitHubMutationBroker(adapter)
-        readback = SemanticReadback(request, SemanticPostcondition.COMMENT_PRESENT)
         payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
-        first = broker.submit(intent, allowed_context(), pre_state=request, readback=readback, payload=payload)
+        first = broker.submit(intent, allowed_context(), payload=payload)
         self.assertFalse(first.ok)
         self.assertTrue(first.reconciliation_required)
         self.assertEqual(len(runner.calls), 3)
-        reconciled = broker.reconcile(intent, allowed_context(), readback=readback)
+        reconciled = broker.reconcile(intent, allowed_context())
         self.assertFalse(reconciled.ok)
         self.assertTrue(reconciled.reconciliation_required)
         self.assertEqual(len(runner.calls), 4)

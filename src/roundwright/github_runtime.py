@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping, Protocol
 
 from .deployment import DeploymentAuthorityDecision, DeploymentMode
@@ -223,7 +224,8 @@ class GhGitHubAdapter:
         return self._broker_token
 
     def _execute_brokered(
-        self, intent: GitHubMutationIntent, payload: "GhMutationPayload", *, capability: object
+        self, intent: GitHubMutationIntent, payload: "GhMutationPayload", *,
+        command: "BrokerMutationCommand", capability: object,
     ) -> GitHubMutationResult:
         """Execute one authorized intent without retaining provider output.
 
@@ -235,7 +237,7 @@ class GhGitHubAdapter:
 
         if capability is not self._broker_token:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "unbrokered gh mutation execution is forbidden"))
-        if type(intent) is not GitHubMutationIntent or type(payload) is not GhMutationPayload:
+        if type(intent) is not GitHubMutationIntent or type(payload) is not GhMutationPayload or type(command) is not BrokerMutationCommand:
             raise GitHubRuntimeError("brokered gh mutation request is invalid")
         self.calls.append(("brokered-mutation", intent.operation.value))
         blocked = _health_failure(intent.operation, self._health)
@@ -243,7 +245,7 @@ class GhGitHubAdapter:
             return GitHubMutationResult(intent, failure=blocked)
         try:
             payload.require_matches(intent)
-            outcome = self._runner.run(_mutation_command(intent, payload))
+            outcome = self._runner.run(_mutation_command(intent, payload, command))
         except GitHubRuntimeError:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
         if outcome.exit_code != 0:
@@ -341,6 +343,59 @@ class SemanticReadback:
     def __post_init__(self) -> None:
         if type(self.request) is not GitHubReadRequest or type(self.condition) is not SemanticPostcondition:
             raise GitHubRuntimeError("semantic read-back is invalid")
+
+    @property
+    def identity(self) -> str:
+        return _sha256((self.request.identity(), self.condition.value))
+
+
+class BrokerMutationCommand(StrEnum):
+    """One broker-owned outbound command shape for each typed mutation."""
+
+    CREATE_BRANCH = "create-branch"
+    UPDATE_BRANCH = "update-branch"
+    CREATE_PULL_REQUEST = "create-pull-request"
+    COMMENT = "comment"
+    REQUEST_REVIEW = "request-review"
+    MARK_READY = "mark-ready"
+    MERGE_PULL_REQUEST = "merge-pull-request"
+    CLOSE_ISSUE = "close-issue"
+    DELETE_BRANCH = "delete-branch"
+
+
+@dataclass(frozen=True)
+class BrokerSemanticPlan:
+    """Immutable command and read-back semantics derived only by the broker."""
+
+    operation: GitHubMutationOperation
+    command: BrokerMutationCommand
+    target_identity: str
+    idempotency_identity: str
+    intent_identity: str
+    pre_state: GitHubReadRequest
+    readback: SemanticReadback
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not GitHubMutationOperation or type(self.command) is not BrokerMutationCommand:
+            raise GitHubRuntimeError("broker semantic plan operation is invalid")
+        if self.command is not _MUTATION_COMMAND_BY_OPERATION[self.operation]:
+            raise GitHubRuntimeError("broker semantic plan command is invalid")
+        for value, name in (
+            (self.target_identity, "semantic target"),
+            (self.idempotency_identity, "semantic idempotency"),
+            (self.intent_identity, "semantic intent"),
+        ):
+            _digest(value, name)
+        if type(self.pre_state) is not GitHubReadRequest or type(self.readback) is not SemanticReadback:
+            raise GitHubRuntimeError("broker semantic plan read-back is invalid")
+        if self.pre_state.repository != self.readback.request.repository:
+            raise GitHubRuntimeError("broker semantic plan repositories do not match")
+        object.__setattr__(self, "identity", _sha256((
+            self.operation.value, self.command.value, self.target_identity,
+            self.idempotency_identity, self.intent_identity,
+            self.pre_state.identity(), self.readback.identity,
+        )))
 
 
 @dataclass(frozen=True)
@@ -493,6 +548,10 @@ class SemanticMutationReceipt:
     repository: str
     operation: GitHubMutationOperation
     idempotency_key: str
+    authorization_bundle_identity: str
+    intent_identity: str
+    semantic_plan_identity: str
+    semantic_readback_identity: str
     public_payload_digest: str
     policy_binding_digest: str
     configuration_digest: str
@@ -510,7 +569,14 @@ class SemanticMutationReceipt:
     def __post_init__(self) -> None:
         if type(self.repository) is not str or "/" not in self.repository or type(self.operation) is not GitHubMutationOperation or type(self.idempotency_key) is not str:
             raise GitHubRuntimeError("semantic receipt identity is invalid")
-        for value, name in ((self.public_payload_digest, "payload"), (self.configuration_digest, "configuration"), (self.gate_identity, "gate"), (self.pre_state_digest, "pre-state"), (self.post_state_digest, "post-state")):
+        for value, name in (
+            (self.authorization_bundle_identity, "authorization bundle"),
+            (self.intent_identity, "intent"), (self.semantic_plan_identity, "semantic plan"),
+            (self.semantic_readback_identity, "semantic read-back"),
+            (self.public_payload_digest, "payload"), (self.configuration_digest, "configuration"),
+            (self.gate_identity, "gate"), (self.pre_state_digest, "pre-state"),
+            (self.post_state_digest, "post-state"),
+        ):
             _digest(value, name)
         for value, name in ((self.policy_binding_digest, "policy binding"), (self.deployment_fingerprint, "deployment"), (self.task_fingerprint, "task")):
             _fingerprint(value, name)
@@ -601,6 +667,62 @@ class DurableMutationJournal:
         return _sha256((intent.repository.slug, intent.operation.value, intent.idempotency_key))
 
 
+_MUTATION_COMMAND_BY_OPERATION: Mapping[GitHubMutationOperation, BrokerMutationCommand] = MappingProxyType({
+    GitHubMutationOperation.CREATE_BRANCH: BrokerMutationCommand.CREATE_BRANCH,
+    GitHubMutationOperation.UPDATE_BRANCH: BrokerMutationCommand.UPDATE_BRANCH,
+    GitHubMutationOperation.CREATE_PULL_REQUEST: BrokerMutationCommand.CREATE_PULL_REQUEST,
+    GitHubMutationOperation.COMMENT: BrokerMutationCommand.COMMENT,
+    GitHubMutationOperation.REQUEST_REVIEW: BrokerMutationCommand.REQUEST_REVIEW,
+    GitHubMutationOperation.MARK_READY: BrokerMutationCommand.MARK_READY,
+    GitHubMutationOperation.MERGE_PULL_REQUEST: BrokerMutationCommand.MERGE_PULL_REQUEST,
+    GitHubMutationOperation.CLOSE_ISSUE: BrokerMutationCommand.CLOSE_ISSUE,
+    GitHubMutationOperation.DELETE_BRANCH: BrokerMutationCommand.DELETE_BRANCH,
+})
+
+
+def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
+    """Derive the sole command and typed read-back plan for an intent.
+
+    An operation without enough typed target information to prove its own
+    postcondition is deliberately rejected before the adapter sees it.
+    """
+
+    if type(intent) is not GitHubMutationIntent or type(intent.operation) is not GitHubMutationOperation:
+        raise GitHubRuntimeError("broker semantic plan intent is invalid")
+    if set(_MUTATION_COMMAND_BY_OPERATION) != set(GitHubMutationOperation):
+        raise GitHubRuntimeError("broker mutation command mapping is incomplete")
+    command = _MUTATION_COMMAND_BY_OPERATION.get(intent.operation)
+    if type(command) is not BrokerMutationCommand:
+        raise GitHubRuntimeError("broker mutation command mapping is invalid")
+    payload = dict(intent.payload)
+    operation = intent.operation
+    if operation is GitHubMutationOperation.UPDATE_BRANCH:
+        pre_state = GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=payload["previous_sha"])
+        readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha), SemanticPostcondition.BRANCH_AT_EXPECTED_SHA)
+    elif operation is GitHubMutationOperation.COMMENT:
+        pre_state = GitHubReadRequest(GitHubReadOperation.COMMENTS, intent.repository, number=intent.target_number)
+        readback = SemanticReadback(pre_state, SemanticPostcondition.COMMENT_PRESENT)
+    elif operation is GitHubMutationOperation.REQUEST_REVIEW:
+        pre_state = GitHubReadRequest(GitHubReadOperation.REVIEWS, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
+        readback = SemanticReadback(pre_state, SemanticPostcondition.REVIEW_AT_CANDIDATE)
+    elif operation is GitHubMutationOperation.MARK_READY:
+        pre_state = GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
+        readback = SemanticReadback(pre_state, SemanticPostcondition.PULL_REQUEST_READY)
+    elif operation is GitHubMutationOperation.MERGE_PULL_REQUEST:
+        pre_state = GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
+        readback = SemanticReadback(pre_state, SemanticPostcondition.PULL_REQUEST_MERGED)
+    elif operation is GitHubMutationOperation.CLOSE_ISSUE:
+        pre_state = GitHubReadRequest(GitHubReadOperation.ISSUE, intent.repository, number=intent.target_number)
+        readback = SemanticReadback(pre_state, SemanticPostcondition.ISSUE_CLOSED)
+    else:
+        raise GitHubRuntimeError("broker semantic plan is incomplete for this mutation operation")
+    return BrokerSemanticPlan(
+        operation, command,
+        _sha256((intent.repository.slug, intent.target_number, intent.target_ref, intent.expected_sha)),
+        _sha256(("idempotency", intent.idempotency_key)), intent.identity(), pre_state, readback,
+    )
+
+
 class GitHubMutationBroker:
     """The sole mutation seam; rejects before a write when evidence is absent."""
 
@@ -618,15 +740,24 @@ class GitHubMutationBroker:
         intent: GitHubMutationIntent,
         context: MutationBrokerContext,
         *,
-        pre_state: GitHubReadRequest,
-        readback: SemanticReadback,
         payload: GhMutationPayload | None = None,
+        pre_state: GitHubReadRequest | None = None,
+        readback: SemanticReadback | None = None,
+        semantic_plan: BrokerSemanticPlan | None = None,
+        command: BrokerMutationCommand | None = None,
     ) -> BrokerMutationResult:
-        """Read pre-state, authorize, submit once, then demand semantic read-back."""
+        """Derive semantics, authorize, submit once, then demand read-back."""
 
+        if pre_state is not None or readback is not None or semantic_plan is not None or command is not None:
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         failure = _authorize(intent, context)
         if failure is not None:
             return BrokerMutationResult(failure=failure)
+        try:
+            bundle = schema_v2_authorization_bundle(context)
+            plan = _broker_semantic_plan(intent)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         prior = self._completed.get(intent.identity())
         if prior is not None:
             return BrokerMutationResult(receipt=prior)
@@ -636,23 +767,22 @@ class GitHubMutationBroker:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "idempotency key conflicts with a different mutation intent"))
             if journal_state != "started":
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation state requires semantic reconciliation"), reconciliation_required=True)
-        if pre_state.repository != intent.repository or readback.request.repository != intent.repository:
-            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "semantic reads must target the mutation repository"))
-        before = self._adapter.read(pre_state)
+        before = self._adapter.read(plan.pre_state)
         if not before.ok:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-mutation semantic state is unavailable"))
-        outcome = self._execute(intent, payload)
+        outcome = self._execute(intent, payload, plan)
         if not outcome.ok:
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
-        after = self._adapter.read(readback.request)
-        if not after.ok or not _matches(readback, intent, after.snapshot):
+        after = self._adapter.read(plan.readback.request)
+        if not after.ok or not _matches(plan.readback, intent, after.snapshot):
             if self._journal is not None:
                 self._journal.transition(intent, "ambiguous")
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         binding = context.policy.binding
         assert binding is not None  # established by _authorize
         receipt = SemanticMutationReceipt(
-            intent.repository.slug, intent.operation, intent.idempotency_key,
+            intent.repository.slug, intent.operation, intent.idempotency_key, bundle.identity,
+            intent.identity(), plan.identity, plan.readback.identity,
             _sha256(("public-payload", intent.payload)), binding.digest,
             context.configuration_digest, binding.deployment_fingerprint,
             binding.task_fingerprint, context.base_sha, context.candidate_sha,
@@ -664,20 +794,26 @@ class GitHubMutationBroker:
             self._journal.transition(intent, "applied")
         return BrokerMutationResult(receipt=receipt)
 
-    def _execute(self, intent: GitHubMutationIntent, payload: GhMutationPayload | None) -> GitHubMutationResult:
+    def _execute(
+        self, intent: GitHubMutationIntent, payload: GhMutationPayload | None, plan: BrokerSemanticPlan
+    ) -> GitHubMutationResult:
+        if type(plan) is not BrokerSemanticPlan or plan.operation is not intent.operation or plan.command is not _MUTATION_COMMAND_BY_OPERATION[intent.operation]:
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic command is invalid"))
         execute = getattr(self._adapter, "_execute_brokered", None)
         if callable(execute):
             if type(payload) is not GhMutationPayload:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable"))
             if self._broker_capability is None:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker execution capability is unavailable"))
-            return execute(intent, payload, capability=self._broker_capability)
+            return execute(intent, payload, command=plan.command, capability=self._broker_capability)
         if payload is not None:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads"))
         return self._adapter.submit(intent)
 
     def reconcile(
-        self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, readback: SemanticReadback
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext, *,
+        readback: SemanticReadback | None = None, semantic_plan: BrokerSemanticPlan | None = None,
+        command: BrokerMutationCommand | None = None,
     ) -> BrokerMutationResult:
         """Safely classify an interrupted attempt from post-state only.
 
@@ -685,15 +821,22 @@ class GitHubMutationBroker:
         ``ALREADY_APPLIED`` receipt; anything else remains blocked.
         """
 
+        if readback is not None or semantic_plan is not None or command is not None:
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         failure = _authorize(intent, context)
         if failure is not None:
             return BrokerMutationResult(failure=failure)
-        observed = self._adapter.read(readback.request)
-        if not observed.ok or not _matches(readback, intent, observed.snapshot):
+        try:
+            bundle = schema_v2_authorization_bundle(context)
+            plan = _broker_semantic_plan(intent)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
+        observed = self._adapter.read(plan.readback.request)
+        if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
         binding = context.policy.binding
         assert binding is not None
-        receipt = SemanticMutationReceipt(intent.repository.slug, intent.operation, intent.idempotency_key, _sha256(("public-payload", intent.payload)), binding.digest, context.configuration_digest, binding.deployment_fingerprint, binding.task_fingerprint, context.base_sha, context.candidate_sha, context.gate_identity, observed.snapshot_digest, observed.snapshot_digest, "reconciled", MutationDisposition.ALREADY_APPLIED)
+        receipt = SemanticMutationReceipt(intent.repository.slug, intent.operation, intent.idempotency_key, bundle.identity, intent.identity(), plan.identity, plan.readback.identity, _sha256(("public-payload", intent.payload)), binding.digest, context.configuration_digest, binding.deployment_fingerprint, binding.task_fingerprint, context.base_sha, context.candidate_sha, context.gate_identity, observed.snapshot_digest, observed.snapshot_digest, "reconciled", MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
         if self._journal is not None:
             self._journal.begin(intent)
@@ -934,7 +1077,9 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     return ("api", "--method", "GET", path)
 
 
-def _mutation_command(intent: GitHubMutationIntent, payload: GhMutationPayload) -> tuple[str, ...]:
+def _mutation_command(
+    intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand
+) -> tuple[str, ...]:
     """Map each declared mutation to one fixed ``gh`` command shape.
 
     The only variable outbound text comes from the validated, digest-bound
@@ -942,6 +1087,13 @@ def _mutation_command(intent: GitHubMutationIntent, payload: GhMutationPayload) 
     shell and no result text is returned from this function.
     """
 
+    if (
+        type(intent) is not GitHubMutationIntent
+        or type(payload) is not GhMutationPayload
+        or type(command) is not BrokerMutationCommand
+        or command is not _MUTATION_COMMAND_BY_OPERATION[intent.operation]
+    ):
+        raise GitHubRuntimeError("broker mutation command is invalid")
     repository = intent.repository.slug
     values = dict(intent.payload)
     operation = intent.operation

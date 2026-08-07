@@ -52,13 +52,17 @@ from .github import (
 )
 from .repository_policy import (
     GITHUB_REPOSITORY_OPERATION,
+    RepositoryActivationReceipt,
     RepositoryDispatcherTransition,
     RepositoryMutationBinding,
     RepositoryMutationContext,
     RepositoryMutationDecision,
     RepositoryMutationOperation,
     RepositoryReceiptVerification,
+    RepositoryReceiptStatus,
     StandingRepositoryAuthority,
+    TrustedRepositoryPolicySnapshot,
+    evaluate_repository_mutation_policy,
 )
 
 
@@ -353,11 +357,14 @@ class MutationBrokerContext:
     receipt_verification: RepositoryReceiptVerification
     mutation_context: RepositoryMutationContext
     dispatcher_transition: RepositoryDispatcherTransition
+    policy_snapshot: TrustedRepositoryPolicySnapshot
+    activation_receipt: RepositoryActivationReceipt
 
     def __post_init__(self) -> None:
         if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
                 or type(self.standing_authority) is not StandingRepositoryAuthority or type(self.receipt_verification) is not RepositoryReceiptVerification
-                or type(self.mutation_context) is not RepositoryMutationContext or type(self.dispatcher_transition) is not RepositoryDispatcherTransition):
+                or type(self.mutation_context) is not RepositoryMutationContext or type(self.dispatcher_transition) is not RepositoryDispatcherTransition
+                or type(self.policy_snapshot) is not TrustedRepositoryPolicySnapshot or type(self.activation_receipt) is not RepositoryActivationReceipt):
             raise GitHubRuntimeError("broker authority evidence is invalid")
         for value, name in ((self.configuration_digest, "configuration"), (self.gate_identity, "gate")):
             _digest(value, name)
@@ -371,12 +378,51 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2A
 
     if type(context) is not MutationBrokerContext:
         raise GitHubRuntimeError("broker context is invalid")
+    decision = context.policy
+    if (
+        type(decision) is not RepositoryMutationDecision
+        or type(context.standing_authority) is not StandingRepositoryAuthority
+        or type(context.receipt_verification) is not RepositoryReceiptVerification
+        or type(context.mutation_context) is not RepositoryMutationContext
+        or type(context.dispatcher_transition) is not RepositoryDispatcherTransition
+        or type(context.policy_snapshot) is not TrustedRepositoryPolicySnapshot
+        or type(context.activation_receipt) is not RepositoryActivationReceipt
+    ):
+        raise GitHubRuntimeError("broker canonical evidence is unavailable or invalid")
+    if context.candidate_sha != context.mutation_context.candidate_sha:
+        raise GitHubRuntimeError("broker candidate does not match mutation context")
+    binding = decision.binding
+    if not decision.authorized or binding is None or decision.operation is None:
+        raise GitHubRuntimeError("broker policy decision is not authorized canonical evidence")
+    receipt = context.activation_receipt
+    canonical = evaluate_repository_mutation_policy(
+        context.policy_snapshot,
+        receipt,
+        context.mutation_context,
+        decision.operation,
+        standing_authority=context.standing_authority,
+        dispatcher_transition=context.dispatcher_transition,
+        receipt_verification=context.receipt_verification,
+        now=receipt.activated_at,
+    )
+    if not canonical.authorized or canonical != decision or canonical.binding is None:
+        raise GitHubRuntimeError("broker policy decision does not match canonical evidence")
+    if binding != canonical.binding or not binding.matches_context(context.mutation_context, context.receipt_verification):
+        raise GitHubRuntimeError("broker policy binding is not coherently bound")
     return SchemaV2AuthorizationBundle(
-        context.standing_authority.policy.digest, context.receipt_verification.verification_fingerprint,
+        context.standing_authority.policy.digest,
+        context.policy_snapshot.source.source_fingerprint,
+        context.policy_snapshot.source.revision_fingerprint,
+        context.policy_snapshot.policy_digest,
+        receipt.receipt_fingerprint,
         context.mutation_context.repository_fingerprint, context.mutation_context.deployment_fingerprint,
         context.mutation_context.task_fingerprint, context.configuration_digest, context.base_sha,
-        context.candidate_sha, context.gate_identity, context.receipt_verification.verification_fingerprint,
+        context.mutation_context.candidate_sha, context.gate_identity,
+        context.receipt_verification.verification_fingerprint,
+        context.receipt_verification.receipt_binding_digest,
+        context.receipt_verification.status,
         context.dispatcher_transition.evidence_fingerprint,
+        context.dispatcher_transition.digest,
     )
 
 
@@ -389,7 +435,10 @@ class SchemaV2AuthorizationBundle:
     """
 
     standing_authority_identity: str
-    verified_policy_receipt_identity: str
+    policy_source_identity: str
+    policy_revision_identity: str
+    policy_identity: str
+    receipt_identity: str
     repository_identity: str
     deployment_identity: str
     task_identity: str
@@ -397,28 +446,44 @@ class SchemaV2AuthorizationBundle:
     base_sha: str
     candidate_sha: str
     gate_identity: str
-    receipt_lifecycle_identity: str
+    receipt_verification_identity: str
+    receipt_binding_digest: str
+    receipt_status: RepositoryReceiptStatus
     dispatcher_transition_identity: str
+    dispatcher_transition_digest: str
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
         for value, name in (
             (self.standing_authority_identity, "standing authority"),
-            (self.verified_policy_receipt_identity, "policy receipt"),
+            (self.policy_source_identity, "policy source"),
+            (self.policy_revision_identity, "policy revision"),
+            (self.policy_identity, "policy"),
+            (self.receipt_identity, "policy receipt"),
             (self.repository_identity, "repository"), (self.deployment_identity, "deployment"),
-            (self.task_identity, "task"), (self.receipt_lifecycle_identity, "receipt lifecycle"),
+            (self.task_identity, "task"), (self.receipt_verification_identity, "receipt lifecycle"),
+            (self.receipt_binding_digest, "receipt binding"),
             (self.dispatcher_transition_identity, "dispatcher transition"),
+            (self.dispatcher_transition_digest, "dispatcher transition digest"),
         ):
             _fingerprint(value, name)
+        if type(self.receipt_status) is not RepositoryReceiptStatus:
+            raise GitHubRuntimeError("authorization bundle receipt lifecycle status is invalid")
         _digest(self.configuration_digest, "configuration")
         _digest(self.gate_identity, "gate")
         for value, name in ((self.base_sha, "base sha"), (self.candidate_sha, "candidate sha")):
             if type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
                 raise GitHubRuntimeError(f"authorization bundle {name} is invalid")
-        object.__setattr__(self, "identity", _sha256(tuple(getattr(self, name) for name in self.__dataclass_fields__ if name != "identity")))
+        object.__setattr__(self, "identity", _sha256(tuple(
+            getattr(self, name).value if name == "receipt_status" else getattr(self, name)
+            for name in self.__dataclass_fields__ if name != "identity"
+        )))
 
     def serialize(self) -> Mapping[str, str]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        return {
+            name: getattr(self, name).value if name == "receipt_status" else getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
 
 
 @dataclass(frozen=True)

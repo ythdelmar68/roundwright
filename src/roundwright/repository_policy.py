@@ -210,6 +210,12 @@ class RepositoryActivationReceipt:
     def __post_init__(self) -> None:
         _validate_receipt(self)
 
+    @property
+    def binding_digest(self) -> str:
+        """Return the canonical receipt identity consumed by lifecycle evidence."""
+
+        return _receipt_binding_digest(self)
+
 
 @dataclass(frozen=True)
 class RepositoryReceiptVerification:

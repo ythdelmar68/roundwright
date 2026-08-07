@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -32,20 +33,21 @@ from roundwright.github_runtime import (
     OperationHealth,
     SemanticPostcondition,
     SemanticReadback,
-    SchemaV2AuthorizationBundle,
     schema_v2_authorization_bundle,
     unavailable_capability_health,
 )
 from roundwright.repository_policy import (
     RepositoryDispatcherTransition,
+    RepositoryActivationReceipt,
     RepositoryMutationContext,
-    RepositoryMutationBinding,
-    RepositoryMutationDecision,
     RepositoryMutationOperation,
+    RepositoryPolicySource,
     RepositoryReceiptStatus,
     RepositoryReceiptVerification,
     RepositoryMutationPolicy,
     StandingRepositoryAuthority,
+    TrustedRepositoryPolicySnapshot,
+    evaluate_repository_mutation_policy,
 )
 
 
@@ -91,48 +93,100 @@ def comments_payload() -> dict[str, object]:
 
 
 def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationOperation.ISSUE_COMMENT) -> MutationBrokerContext:
-    binding = RepositoryMutationBinding(
-        "0" * 64, "1" * 64, "2" * 64, 2, "3" * 64, "4" * 64,
-        "5" * 64, "6" * 64, "7" * 64, SHA, "8" * 64, "9" * 64, "a" * 64, "b" * 64,
-        RepositoryReceiptStatus.FRESH,
-    )
-    policy = RepositoryMutationDecision(operation, True, "authorized fixture", "2" * 64, "0" * 64, "4" * 64, True, True, "mutation-adapter-may-attempt-readback", binding)
-    deployment = DeploymentAuthorityDecision(DeploymentMode.AUTHORITATIVE, True, "authorized fixture", "f" * 64)
-    standing = StandingRepositoryAuthority(RepositoryMutationPolicy(2, True, True, True, True, True, True, True, True, True, True, True, True))
-    verification = RepositoryReceiptVerification("a" * 64, "4" * 64, "b" * 64, RepositoryReceiptStatus.FRESH)
+    document = RepositoryMutationPolicy(2, True, True, True, True, True, True, True, True, True, True, True, True)
+    snapshot = TrustedRepositoryPolicySnapshot(RepositoryPolicySource("0" * 64, "1" * 64), document)
     mutation_context = RepositoryMutationContext("5" * 64, "6" * 64, "7" * 64, SHA)
-    transition = RepositoryDispatcherTransition("8" * 64, "5" * 64, "6" * 64, SHA, True, True, False)
-    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition)
-
-
-def authorization_bundle(**replace: str) -> SchemaV2AuthorizationBundle:
-    values = {
-        "standing_authority_identity": "0" * 64, "verified_policy_receipt_identity": "1" * 64,
-        "repository_identity": "2" * 64, "deployment_identity": "3" * 64, "task_identity": "4" * 64,
-        "configuration_digest": DIGEST, "base_sha": BASE, "candidate_sha": SHA, "gate_identity": DIGEST,
-        "receipt_lifecycle_identity": "5" * 64, "dispatcher_transition_identity": "6" * 64,
-    }
-    values.update(replace)
-    return SchemaV2AuthorizationBundle(**values)
+    transition = RepositoryDispatcherTransition("8" * 64, mutation_context.repository_fingerprint, mutation_context.deployment_fingerprint, mutation_context.candidate_sha, False, True, True)
+    receipt = RepositoryActivationReceipt(
+        "3" * 64, "4" * 64, snapshot.source.source_fingerprint, snapshot.source.revision_fingerprint,
+        snapshot.policy_digest, document.schema_version, mutation_context.repository_fingerprint,
+        mutation_context.deployment_fingerprint, mutation_context.task_fingerprint, mutation_context.candidate_sha,
+        transition.digest, NOW, NOW + timedelta(hours=1),
+    )
+    standing = StandingRepositoryAuthority(document)
+    verification = RepositoryReceiptVerification("a" * 64, receipt.receipt_fingerprint, receipt.binding_digest, RepositoryReceiptStatus.FRESH)
+    policy = evaluate_repository_mutation_policy(
+        snapshot, receipt, mutation_context, operation, standing_authority=standing,
+        dispatcher_transition=transition, receipt_verification=verification, now=NOW,
+    )
+    assert policy.authorized
+    deployment = DeploymentAuthorityDecision(DeploymentMode.AUTHORITATIVE, True, "authorized fixture", "f" * 64)
+    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition, snapshot, receipt)
 
 
 class GitHubRuntimeTests(unittest.TestCase):
-    def test_schema_v2_authorization_bundle_is_immutable_deterministic_and_rejects_empty_bindings(self) -> None:
-        bundle = authorization_bundle()
-        self.assertEqual(bundle, authorization_bundle())
-        self.assertEqual(bundle.identity, authorization_bundle().identity)
+    def test_schema_v2_authorization_bundle_is_immutable_and_deterministic(self) -> None:
+        bundle = schema_v2_authorization_bundle(allowed_context())
+        self.assertEqual(bundle, schema_v2_authorization_bundle(allowed_context()))
+        self.assertEqual(bundle.identity, schema_v2_authorization_bundle(allowed_context()).identity)
         self.assertEqual(bundle.serialize()["candidate_sha"], SHA)
         with self.assertRaises((AttributeError, TypeError)):
             bundle.candidate_sha = BASE  # type: ignore[misc]
-        for field in ("standing_authority_identity", "verified_policy_receipt_identity", "repository_identity", "deployment_identity", "task_identity", "configuration_digest", "base_sha", "candidate_sha", "gate_identity", "receipt_lifecycle_identity", "dispatcher_transition_identity"):
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                authorization_bundle(**{field: ""})
 
     def test_context_constructs_schema_v2_bundle_from_canonical_evidence(self) -> None:
         context = allowed_context()
         bundle = schema_v2_authorization_bundle(context)
         self.assertEqual(bundle.repository_identity, context.mutation_context.repository_fingerprint)
         self.assertEqual(bundle.dispatcher_transition_identity, context.dispatcher_transition.evidence_fingerprint)
+        self.assertEqual(bundle.dispatcher_transition_digest, context.dispatcher_transition.digest)
+        self.assertEqual(bundle.receipt_identity, context.activation_receipt.receipt_fingerprint)
+        self.assertEqual(bundle.receipt_binding_digest, context.activation_receipt.binding_digest)
+        self.assertIs(bundle.receipt_status, RepositoryReceiptStatus.FRESH)
+
+    def test_schema_v2_authorization_bundle_rejects_each_mismatched_evidence_input(self) -> None:
+        def mismatched_policy() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context, "policy_snapshot", TrustedRepositoryPolicySnapshot(RepositoryPolicySource("c" * 64, "1" * 64), context.policy_snapshot.document))
+            return context
+
+        def mismatched_receipt() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context, "activation_receipt", replace(context.activation_receipt, candidate_sha=BASE))
+            return context
+
+        def mismatched_transition() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context, "dispatcher_transition", replace(context.dispatcher_transition, candidate_sha=BASE))
+            return context
+
+        def mismatched_context() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context, "mutation_context", replace(context.mutation_context, candidate_sha=BASE))
+            return context
+
+        def mismatched_standing_authority() -> MutationBrokerContext:
+            context = allowed_context()
+            narrowed = replace(context.standing_authority.policy, allow_issue_comment=False)
+            object.__setattr__(context, "standing_authority", StandingRepositoryAuthority(narrowed))
+            return context
+
+        def mismatched_binding() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context.policy, "binding", None)
+            return context
+
+        def missing_receipt() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context, "activation_receipt", None)
+            return context
+
+        def mismatched_broker_candidate() -> MutationBrokerContext:
+            context = allowed_context()
+            object.__setattr__(context, "candidate_sha", BASE)
+            return context
+
+        for name, build in (
+            ("policy snapshot", mismatched_policy),
+            ("receipt", mismatched_receipt),
+            ("dispatcher transition", mismatched_transition),
+            ("mutation context", mismatched_context),
+            ("standing authority", mismatched_standing_authority),
+            ("policy binding", mismatched_binding),
+            ("missing receipt", missing_receipt),
+            ("broker candidate", mismatched_broker_candidate),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                schema_v2_authorization_bundle(build())
     def test_default_gh_adapter_is_all_operations_unavailable_without_running_gh(self) -> None:
         runner = Runner(GhCommandResult(0, "{}"))
         adapter = GhGitHubAdapter(runner)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,6 +41,7 @@ from .github import (
     IssueSnapshot,
     IssueState,
     MutationDisposition,
+    MutationReceipt,
     PullRequestSnapshot,
     PullRequestState,
     RemoteHeadSnapshot,
@@ -169,6 +171,7 @@ class GhGitHubAdapter:
             raise GitHubRuntimeError("gh runner is invalid")
         self._runner = runner
         self._health = health or unavailable_capability_health()
+        self._broker_token = object()
         self.calls: list[tuple[str, str]] = []
 
     @property
@@ -193,7 +196,7 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "gh read response is malformed"))
 
     def submit(self, intent: GitHubMutationIntent) -> GitHubMutationResult:
-        """Refuse direct writes; only the broker may authorize a future runner."""
+        """Refuse direct writes; only the broker-only seam may execute one."""
 
         if type(intent) is not GitHubMutationIntent:
             raise GitHubContractError("mutation intent is invalid")
@@ -202,6 +205,101 @@ class GhGitHubAdapter:
         if blocked is not None:
             return GitHubMutationResult(intent, failure=blocked)
         return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "direct gh mutation is forbidden; use the mutation broker"))
+
+    def _broker_capability(self) -> object:
+        """Return the unforgeable in-process capability consumed by the broker."""
+
+        return self._broker_token
+
+    def execute_brokered(
+        self, intent: GitHubMutationIntent, payload: "GhMutationPayload", *, capability: object
+    ) -> GitHubMutationResult:
+        """Execute one authorized intent without retaining provider output.
+
+        This method is deliberately separate from ``submit``.  The broker calls
+        it only after the exact policy/deployment/candidate/gate checks and
+        captures semantic read-back itself.  It accepts no token, executable,
+        shell string, or arbitrary command line.
+        """
+
+        if capability is not self._broker_token:
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "unbrokered gh mutation execution is forbidden"))
+        if type(intent) is not GitHubMutationIntent or type(payload) is not GhMutationPayload:
+            raise GitHubRuntimeError("brokered gh mutation request is invalid")
+        self.calls.append(("brokered-mutation", intent.operation.value))
+        blocked = _health_failure(intent.operation, self._health)
+        if blocked is not None:
+            return GitHubMutationResult(intent, failure=blocked)
+        try:
+            payload.require_matches(intent)
+            outcome = self._runner.run(_mutation_command(intent, payload))
+        except GitHubRuntimeError:
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
+        if outcome.exit_code != 0:
+            return GitHubMutationResult(intent, failure=GitHubFailure(_failure_kind(outcome.exit_code), intent.operation, "gh mutation did not return a usable status"))
+        # Command output is deliberately discarded.  The broker's typed
+        # postcondition read is the only success signal it may retain.
+        return GitHubMutationResult(intent, receipt=_broker_receipt(intent))
+
+
+@dataclass(frozen=True, repr=False)
+class GhMutationPayload:
+    """Ephemeral outbound material held by the credential-owning Orchestrator.
+
+    It is a typed value rather than a command string.  Its raw text is never
+    put into adapter calls, receipts, exceptions, or diagnostics; only the
+    matching public digest from ``GitHubMutationIntent`` crosses into the core.
+    """
+
+    operation: GitHubMutationOperation
+    values: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not GitHubMutationOperation or type(self.values) is not tuple:
+            raise GitHubRuntimeError("gh mutation payload is invalid")
+        if any(type(item) is not tuple or len(item) != 2 or any(type(value) is not str or "\x00" in value for value in item) for item in self.values):
+            raise GitHubRuntimeError("gh mutation payload values are invalid")
+        if tuple(sorted(self.values)) != self.values or len({key for key, _ in self.values}) != len(self.values):
+            raise GitHubRuntimeError("gh mutation payload is not canonical")
+        required = {
+            GitHubMutationOperation.CREATE_BRANCH: set(),
+            GitHubMutationOperation.DELETE_BRANCH: set(),
+            GitHubMutationOperation.CREATE_PULL_REQUEST: {"body", "title"},
+            GitHubMutationOperation.COMMENT: {"body"},
+            GitHubMutationOperation.REQUEST_REVIEW: {"reviewers"},
+            GitHubMutationOperation.MARK_READY: set(),
+            GitHubMutationOperation.MERGE_PULL_REQUEST: set(),
+            GitHubMutationOperation.CLOSE_ISSUE: set(),
+        }[self.operation]
+        if set(dict(self.values)) != required:
+            raise GitHubRuntimeError("gh mutation payload fields are invalid")
+        if self.operation is GitHubMutationOperation.REQUEST_REVIEW:
+            reviewers = self.value("reviewers").split(",")
+            if not reviewers or any(not re.fullmatch(r"[A-Za-z0-9-]{1,39}", reviewer) for reviewer in reviewers):
+                raise GitHubRuntimeError("gh mutation reviewers are invalid")
+
+    def value(self, key: str) -> str:
+        try:
+            return dict(self.values)[key]
+        except KeyError as error:
+            raise GitHubRuntimeError("gh mutation payload field is unavailable") from error
+
+    def require_matches(self, intent: GitHubMutationIntent) -> None:
+        if type(intent) is not GitHubMutationIntent or intent.operation is not self.operation:
+            raise GitHubRuntimeError("gh mutation payload operation does not match intent")
+        expected = dict(intent.payload)
+        if self.operation is GitHubMutationOperation.COMMENT:
+            if expected.get("body_digest") != _sha256(("comment-body", self.value("body"))):
+                raise GitHubRuntimeError("gh comment payload does not match intent")
+        elif self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+            if (
+                expected.get("title_digest") != _sha256(("pull-request-title", self.value("title")))
+                or expected.get("body_digest") != _sha256(("pull-request-body", self.value("body")))
+            ):
+                raise GitHubRuntimeError("gh pull request payload does not match intent")
+        elif self.operation is GitHubMutationOperation.REQUEST_REVIEW:
+            if expected.get("reviewers_digest") != _sha256(("reviewers", tuple(self.value("reviewers").split(",")))):
+                raise GitHubRuntimeError("gh reviewer payload does not match intent")
 
 
 def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapabilityHealth:
@@ -316,6 +414,8 @@ class GitHubMutationBroker:
         if not hasattr(adapter, "read") or not hasattr(adapter, "submit"):
             raise GitHubRuntimeError("GitHub adapter is invalid")
         self._adapter = adapter
+        issuer = getattr(adapter, "_broker_capability", None)
+        self._broker_capability = issuer() if callable(issuer) else None
         self._completed: dict[str, SemanticMutationReceipt] = {}
 
     def submit(
@@ -325,6 +425,7 @@ class GitHubMutationBroker:
         *,
         pre_state: GitHubReadRequest,
         readback: SemanticReadback,
+        payload: GhMutationPayload | None = None,
     ) -> BrokerMutationResult:
         """Read pre-state, authorize, submit once, then demand semantic read-back."""
 
@@ -339,7 +440,7 @@ class GitHubMutationBroker:
         before = self._adapter.read(pre_state)
         if not before.ok:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-mutation semantic state is unavailable"))
-        outcome = self._adapter.submit(intent)
+        outcome = self._execute(intent, payload)
         if not outcome.ok:
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
         after = self._adapter.read(readback.request)
@@ -357,6 +458,18 @@ class GitHubMutationBroker:
         )
         self._completed[intent.identity()] = receipt
         return BrokerMutationResult(receipt=receipt)
+
+    def _execute(self, intent: GitHubMutationIntent, payload: GhMutationPayload | None) -> GitHubMutationResult:
+        execute = getattr(self._adapter, "execute_brokered", None)
+        if callable(execute):
+            if type(payload) is not GhMutationPayload:
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable"))
+            if self._broker_capability is None:
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker execution capability is unavailable"))
+            return execute(intent, payload, capability=self._broker_capability)
+        if payload is not None:
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads"))
+        return self._adapter.submit(intent)
 
     def reconcile(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, readback: SemanticReadback
@@ -460,6 +573,42 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     else:
         raise GitHubRuntimeError("unsupported gh read operation")
     return ("api", "--method", "GET", path)
+
+
+def _mutation_command(intent: GitHubMutationIntent, payload: GhMutationPayload) -> tuple[str, ...]:
+    """Map each declared mutation to one fixed ``gh`` command shape.
+
+    The only variable outbound text comes from the validated, digest-bound
+    payload supplied by the Orchestrator.  No command is passed through a
+    shell and no result text is returned from this function.
+    """
+
+    repository = intent.repository.slug
+    values = dict(intent.payload)
+    operation = intent.operation
+    if operation is GitHubMutationOperation.CREATE_BRANCH:
+        return ("api", "--method", "POST", f"repos/{repository}/git/refs", "-f", f"ref=refs/heads/{intent.target_ref}", "-f", f"sha={intent.expected_sha}")
+    if operation is GitHubMutationOperation.DELETE_BRANCH:
+        return ("api", "--method", "DELETE", f"repos/{repository}/git/refs/heads/{intent.target_ref}")
+    if operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+        return ("pr", "create", "--repo", repository, "--base", values["base_ref"], "--head", values["head_ref"], "--title", payload.value("title"), "--body", payload.value("body"), "--draft")
+    if operation is GitHubMutationOperation.COMMENT:
+        return ("api", "--method", "POST", f"repos/{repository}/issues/{intent.target_number}/comments", "-f", f"body={payload.value('body')}")
+    if operation is GitHubMutationOperation.REQUEST_REVIEW:
+        return ("pr", "edit", str(intent.target_number), "--repo", repository, "--add-reviewer", payload.value("reviewers"))
+    if operation is GitHubMutationOperation.MARK_READY:
+        return ("pr", "ready", str(intent.target_number), "--repo", repository)
+    if operation is GitHubMutationOperation.MERGE_PULL_REQUEST:
+        return ("pr", "merge", str(intent.target_number), "--repo", repository, f"--{values['method']}")
+    if operation is GitHubMutationOperation.CLOSE_ISSUE:
+        return ("issue", "close", str(intent.target_number), "--repo", repository, "--reason", values["reason"].lower())
+    raise GitHubRuntimeError("unsupported gh mutation operation")
+
+
+def _broker_receipt(intent: GitHubMutationIntent) -> MutationReceipt:
+    """Make a non-semantic transport receipt; read-back establishes success."""
+
+    return MutationReceipt(intent.identity(), intent.operation, MutationDisposition.ACCEPTED, f"gh-{intent.operation.value}")
 
 
 def _health_failure(operation: GitHubOperation, health: GitHubCapabilityHealth) -> GitHubFailure | None:

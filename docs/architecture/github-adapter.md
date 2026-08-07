@@ -39,7 +39,14 @@ Every declared read and mutation operation requires its own
 invalid; an unavailable row fails before a command is run. The default matrix
 marks every operation unavailable, so constructing the adapter does not create
 authority. Direct `submit` calls are denied even when health is available:
-only `GitHubMutationBroker` can consider a typed intent.
+only `GitHubMutationBroker` can consider a typed intent. The adapter's separate
+broker-only execution seam maps every declared mutation operation to one fixed
+`gh` command shape. It accepts an ephemeral, digest-bound
+`GhMutationPayload` from the credential-owning Orchestrator, rejects a missing
+or mismatched payload before starting a process, and discards command output.
+It does not accept a shell string, executable override, token, or arbitrary
+command line. An unforgeable in-process capability is issued only to the
+broker, so invoking the execution seam without the broker is denied too.
 
 The broker requires an already-authorized exact Boolean repository-policy
 decision, an authoritative deployment decision, a matching candidate, a gate

@@ -16,7 +16,7 @@ That document is routing and evidence guidance only: it does not grant
 Roundwright authority or activate its disabled runtime surface.
 
 <!-- roundlet-bootstrap-policy:start -->
-## Temporary Roundlet Bootstrap Policy
+## ACTIVE Roundlet Authority
 
 Until Roundwright completes its Phase 2 vertical slice, passes shadow/read-only comparison, and is externally promoted as the active immutable runtime, Roundlet is this repository's sole mutation-capable development orchestrator.
 
@@ -45,7 +45,7 @@ roundlet:
 <!-- roundlet-bootstrap-policy:end -->
 
 <!-- roundwright-proposed-authority:start -->
-## Disabled Roundwright Authority Surface
+## INACTIVE Roundwright Proposed Authority
 
 This is a machine-readable, disabled-by-default proposal for a later,
 owner-reviewed transition. It grants no current authority. The active Roundlet
@@ -56,19 +56,24 @@ fail closed. A candidate cannot make this block effective or use it to widen
 standing authority. An effective policy may only narrow reviewed standing
 authority. Activation requires an allowlisted owner's separate, external,
 candidate-bound decision after the Phase gate; this block is not that decision.
+The Roundlet parser consumes only the exact `roundlet:` marker pair, and the
+Roundwright parser consumes only the exact `roundwright:` marker pair. Neither
+parser may fall back to, merge, infer, or borrow values from the other block.
 
 # roundwright:repository-authority
 roundwright:
+  schema_version: 2
   enabled: false
-  runtime_enabled: false
   allow_issue_comment: false
-  allow_remote_branch_creation_push: false
-  allow_draft_pull_request_creation: false
+  allow_create_remote_branch: false
+  allow_update_remote_branch: false
+  allow_delete_remote_branch: false
+  allow_create_draft_pr: false
+  allow_request_review: false
   allow_mark_pr_ready: false
   allow_merge_pr: false
   allow_close_leaf_issue: false
   allow_delete_local_branch: false
-  allow_delete_remote_branch: false
   allow_remove_worktree: false
 # roundwright:end-repository-authority
 <!-- roundwright-proposed-authority:end -->

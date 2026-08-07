@@ -39,6 +39,23 @@ at a time. A controlled forward-test repository may have only separately
 approved, bounded authority over its own actions; it never becomes a second
 Roundwright dispatcher.
 
+### Repository mutation vocabulary and transition
+
+The Python schema v2 names in `roundwright.repository_policy` are the only
+canonical Roundwright action vocabulary. `AGENTS.md` carries two deliberately
+different marker pairs: the ACTIVE Roundlet authority and the INACTIVE
+Roundwright standing-authority proposal. Each parser reads only its own exact
+pair; absence, duplication, malformed values, fallback, inference, or values
+borrowed from the other block fail closed.
+
+Every GitHub mutation maps exactly once to a repository mutation, and every
+repository mutation maps exactly once to a strict Boolean. Remote branch
+create, non-force update, and delete are separate operations, and review
+request has its own switch. A future Roundwright activation receipt must bind
+external dispatcher-transition evidence proving Roundlet is no longer
+mutation-capable, has been reconciled, and Roundwright is the selected exact
+candidate. Dual-capable evidence is unrepresentable and rejected.
+
 ## Phase 0 non-goals
 
 - An MCP-first runtime

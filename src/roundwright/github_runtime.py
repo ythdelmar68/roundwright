@@ -52,9 +52,13 @@ from .github import (
 )
 from .repository_policy import (
     GITHUB_REPOSITORY_OPERATION,
+    RepositoryDispatcherTransition,
     RepositoryMutationBinding,
+    RepositoryMutationContext,
     RepositoryMutationDecision,
     RepositoryMutationOperation,
+    RepositoryReceiptVerification,
+    StandingRepositoryAuthority,
 )
 
 
@@ -345,15 +349,35 @@ class MutationBrokerContext:
     base_sha: str
     candidate_sha: str
     gate_identity: str
+    standing_authority: StandingRepositoryAuthority
+    receipt_verification: RepositoryReceiptVerification
+    mutation_context: RepositoryMutationContext
+    dispatcher_transition: RepositoryDispatcherTransition
 
     def __post_init__(self) -> None:
-        if type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision:
+        if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
+                or type(self.standing_authority) is not StandingRepositoryAuthority or type(self.receipt_verification) is not RepositoryReceiptVerification
+                or type(self.mutation_context) is not RepositoryMutationContext or type(self.dispatcher_transition) is not RepositoryDispatcherTransition):
             raise GitHubRuntimeError("broker authority evidence is invalid")
         for value, name in ((self.configuration_digest, "configuration"), (self.gate_identity, "gate")):
             _digest(value, name)
         for value, name in ((self.base_sha, "base sha"), (self.candidate_sha, "candidate sha")):
             if type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
                 raise GitHubRuntimeError(f"broker {name} is invalid")
+
+
+def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2AuthorizationBundle":
+    """Construct the single public-safe bundle from canonical typed evidence."""
+
+    if type(context) is not MutationBrokerContext:
+        raise GitHubRuntimeError("broker context is invalid")
+    return SchemaV2AuthorizationBundle(
+        context.standing_authority.policy.digest, context.receipt_verification.verification_fingerprint,
+        context.mutation_context.repository_fingerprint, context.mutation_context.deployment_fingerprint,
+        context.mutation_context.task_fingerprint, context.configuration_digest, context.base_sha,
+        context.candidate_sha, context.gate_identity, context.receipt_verification.verification_fingerprint,
+        context.dispatcher_transition.evidence_fingerprint,
+    )
 
 
 @dataclass(frozen=True)

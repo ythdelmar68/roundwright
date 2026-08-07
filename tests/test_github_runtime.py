@@ -33,13 +33,19 @@ from roundwright.github_runtime import (
     SemanticPostcondition,
     SemanticReadback,
     SchemaV2AuthorizationBundle,
+    schema_v2_authorization_bundle,
     unavailable_capability_health,
 )
 from roundwright.repository_policy import (
+    RepositoryDispatcherTransition,
+    RepositoryMutationContext,
     RepositoryMutationBinding,
     RepositoryMutationDecision,
     RepositoryMutationOperation,
     RepositoryReceiptStatus,
+    RepositoryReceiptVerification,
+    RepositoryMutationPolicy,
+    StandingRepositoryAuthority,
 )
 
 
@@ -92,7 +98,11 @@ def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationO
     )
     policy = RepositoryMutationDecision(operation, True, "authorized fixture", "2" * 64, "0" * 64, "4" * 64, True, True, "mutation-adapter-may-attempt-readback", binding)
     deployment = DeploymentAuthorityDecision(DeploymentMode.AUTHORITATIVE, True, "authorized fixture", "f" * 64)
-    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST)
+    standing = StandingRepositoryAuthority(RepositoryMutationPolicy(2, True, True, True, True, True, True, True, True, True, True, True, True))
+    verification = RepositoryReceiptVerification("a" * 64, "4" * 64, "b" * 64, RepositoryReceiptStatus.FRESH)
+    mutation_context = RepositoryMutationContext("5" * 64, "6" * 64, "7" * 64, SHA)
+    transition = RepositoryDispatcherTransition("8" * 64, "5" * 64, "6" * 64, SHA, True, True, False)
+    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition)
 
 
 def authorization_bundle(**replace: str) -> SchemaV2AuthorizationBundle:
@@ -117,6 +127,12 @@ class GitHubRuntimeTests(unittest.TestCase):
         for field in ("standing_authority_identity", "verified_policy_receipt_identity", "repository_identity", "deployment_identity", "task_identity", "configuration_digest", "base_sha", "candidate_sha", "gate_identity", "receipt_lifecycle_identity", "dispatcher_transition_identity"):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 authorization_bundle(**{field: ""})
+
+    def test_context_constructs_schema_v2_bundle_from_canonical_evidence(self) -> None:
+        context = allowed_context()
+        bundle = schema_v2_authorization_bundle(context)
+        self.assertEqual(bundle.repository_identity, context.mutation_context.repository_fingerprint)
+        self.assertEqual(bundle.dispatcher_transition_identity, context.dispatcher_transition.evidence_fingerprint)
     def test_default_gh_adapter_is_all_operations_unavailable_without_running_gh(self) -> None:
         runner = Runner(GhCommandResult(0, "{}"))
         adapter = GhGitHubAdapter(runner)

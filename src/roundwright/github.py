@@ -490,7 +490,7 @@ class GitHubMutationIntent:
             _validate_sha(self.expected_sha, "mutation expected sha")
         if self.target_ref is not None and (type(self.target_ref) is not str or not _IDENTIFIER.fullmatch(self.target_ref)):
             raise GitHubContractError("mutation target reference is invalid")
-        number_required = {GitHubMutationOperation.COMMENT, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE}
+        number_required = {GitHubMutationOperation.CREATE_PULL_REQUEST, GitHubMutationOperation.COMMENT, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE}
         if self.operation in number_required and self.target_number is None:
             raise GitHubContractError("mutation intent requires a target number")
         if self.operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} and self.target_ref is None:
@@ -897,7 +897,7 @@ def _validate_mutation_payload(
         if target_number is not None or expected_sha is None:
             raise GitHubContractError("branch deletion identity is invalid")
     elif operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
-        if target_number is not None or expected_sha is not None or target_ref is not None:
+        if target_number is None or expected_sha is not None or target_ref is not None:
             raise GitHubContractError("pull request creation identity is invalid")
         for field in ("base_ref", "head_ref"):
             if not _IDENTIFIER.fullmatch(values[field]):

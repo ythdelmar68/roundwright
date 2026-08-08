@@ -203,7 +203,7 @@ class GitHubAdapterTests(unittest.TestCase):
     def test_ref_sensitive_mutations_bind_exact_commits_and_stale_heads(self) -> None:
         create_pr = self.intent(GitHubMutationOperation.CREATE_PULL_REQUEST)
         changed_payload = tuple((key, "b" * 40 if key == "head_sha" else value) for key, value in create_pr.payload)
-        changed_pr = GitHubMutationIntent(create_pr.operation, create_pr.repository, create_pr.idempotency_key, payload=changed_payload)
+        changed_pr = GitHubMutationIntent(create_pr.operation, create_pr.repository, create_pr.idempotency_key, target_number=create_pr.target_number, payload=changed_payload)
         self.assertNotEqual(create_pr.identity(), changed_pr.identity())
         for operation in (GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST):
             with self.subTest(operation=operation):
@@ -286,7 +286,7 @@ class GitHubAdapterTests(unittest.TestCase):
         }
         return GitHubMutationIntent(
             operation, REPOSITORY, f"intent-{operation.value}",
-            target_number=40 if operation not in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.CREATE_PULL_REQUEST} else None,
+            target_number=40 if operation not in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} else None,
             expected_sha=SHA if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST} else None,
             target_ref="codex/issue-40" if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} else None,
             payload=payloads[operation],

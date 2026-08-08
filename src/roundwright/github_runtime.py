@@ -26,7 +26,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
-from .deployment import DeploymentAuthorityDecision, DeploymentMode
+from .deployment import (
+    AuthorityReceiptVerification, DeploymentAuthorityDecision,
+    DeploymentAuthorityReceipt, DeploymentIdentity, DeploymentMode,
+    evaluate_deployment_authority,
+)
 from .github import (
     BranchSnapshot,
     CommentsSnapshot,
@@ -155,12 +159,20 @@ class SubprocessGhRunner:
     def run(self, arguments: tuple[str, ...]) -> GhCommandResult:
         if type(arguments) is not tuple or any(type(value) is not str or not value or "\x00" in value for value in arguments):
             raise GitHubRuntimeError("gh command arguments are invalid")
-        # No shell, inherited credential lookup only, and stderr is discarded.
+        # No shell, only explicit credential/configuration variables, and no
+        # stderr retention.  Provider output never reaches diagnostics.
         try:
+            child_environment = {
+                key: os.environ[key] for key in (
+                    "APPDATA", "COMSPEC", "GH_CONFIG_DIR", "GH_ENTERPRISE_TOKEN", "GH_TOKEN",
+                    "HOME", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PATHEXT",
+                    "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
+                ) if key in os.environ
+            }
             completed = subprocess.run(
                 (self._executable, *arguments), check=False, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                encoding="utf-8", errors="strict", timeout=30,
+                encoding="utf-8", errors="strict", timeout=30, env=child_environment,
             )
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return GhCommandResult(127, "")
@@ -181,9 +193,8 @@ class GhGitHubAdapter:
     def __init__(self, runner: GhRunner, health: GitHubCapabilityHealth | None = None) -> None:
         if not hasattr(runner, "run"):
             raise GitHubRuntimeError("gh runner is invalid")
-        self._runner = runner
+        self.__runner = runner
         self._health = health or unavailable_capability_health()
-        self._broker_token = object()
         self.calls: list[tuple[str, str]] = []
 
     @property
@@ -197,8 +208,17 @@ class GhGitHubAdapter:
         blocked = _health_failure(request.operation, self._health)
         if blocked is not None:
             return GitHubReadResult(request, failure=blocked)
-        outcome = self._runner.run(_read_command(request))
+        outcome = self.__runner.run(_read_command(request))
         if outcome.exit_code != 0:
+            try:
+                missing = json.loads(outcome.stdout)
+            except (json.JSONDecodeError, TypeError):
+                missing = None
+            if (
+                request.operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
+                and type(missing) is dict and missing.get("message") == "Not Found"
+            ):
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, request.operation, "requested branch is absent"))
             return GitHubReadResult(request, failure=GitHubFailure(_failure_kind(outcome.exit_code), request.operation, "gh read did not return a usable response"))
         try:
             raw = json.loads(outcome.stdout)
@@ -218,7 +238,7 @@ class GhGitHubAdapter:
         if _health_failure(request.operation, self._health) is not None:
             return None
         command = _read_command(request) + (() if cursor is None else ("-f", f"cursor={cursor}"))
-        outcome = self._runner.run(command)
+        outcome = self.__runner.run(command)
         if outcome.exit_code != 0:
             return None
         try:
@@ -246,41 +266,6 @@ class GhGitHubAdapter:
             return GitHubMutationResult(intent, failure=blocked)
         return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "direct gh mutation is forbidden; use the mutation broker"))
 
-    def _issue_broker_capability(self) -> object:
-        """Return the unforgeable in-process capability consumed by the broker."""
-
-        return self._broker_token
-
-    def _execute_brokered(
-        self, intent: GitHubMutationIntent, payload: "GhMutationPayload", *,
-        command: "BrokerMutationCommand", capability: object,
-    ) -> GitHubMutationResult:
-        """Execute one authorized intent without retaining provider output.
-
-        This method is deliberately separate from ``submit``.  The broker calls
-        it only after the exact policy/deployment/candidate/gate checks and
-        captures semantic read-back itself.  It accepts no token, executable,
-        shell string, or arbitrary command line.
-        """
-
-        if capability is not self._broker_token:
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "unbrokered gh mutation execution is forbidden"))
-        if type(intent) is not GitHubMutationIntent or type(payload) is not GhMutationPayload or type(command) is not BrokerMutationCommand:
-            raise GitHubRuntimeError("brokered gh mutation request is invalid")
-        self.calls.append(("brokered-mutation", intent.operation.value))
-        blocked = _health_failure(intent.operation, self._health)
-        if blocked is not None:
-            return GitHubMutationResult(intent, failure=blocked)
-        try:
-            payload.require_matches(intent)
-            outcome = self._runner.run(_mutation_command(intent, payload, command))
-        except GitHubRuntimeError:
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
-        if outcome.exit_code != 0:
-            return GitHubMutationResult(intent, failure=GitHubFailure(_failure_kind(outcome.exit_code), intent.operation, "gh mutation did not return a usable status"))
-        # Command output is deliberately discarded.  The broker's typed
-        # postcondition read is the only success signal it may retain.
-        return GitHubMutationResult(intent, receipt=_broker_receipt(intent))
 
 
 @dataclass(frozen=True, repr=False)
@@ -340,7 +325,8 @@ class GhMutationPayload:
             ):
                 raise GitHubRuntimeError("gh pull request payload does not match intent")
         elif self.operation is GitHubMutationOperation.REQUEST_REVIEW:
-            if expected.get("reviewers_digest") != _sha256(("reviewers", tuple(self.value("reviewers").split(",")))):
+            reviewers = tuple(self.value("reviewers").split(","))
+            if not reviewers or tuple(sorted(reviewers)) != reviewers or len(set(reviewers)) != len(reviewers) or expected.get("reviewers_digest") != _sha256(("reviewers", reviewers)):
                 raise GitHubRuntimeError("gh reviewer payload does not match intent")
 
 
@@ -355,10 +341,13 @@ def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapab
 class SemanticPostcondition(StrEnum):
     COMMENT_PRESENT = "comment-present"
     BRANCH_AT_EXPECTED_SHA = "branch-at-expected-sha"
+    BRANCH_ABSENT = "branch-absent"
     PULL_REQUEST_DRAFT = "pull-request-draft"
+    PULL_REQUEST_DRAFT_AT_CANDIDATE = "pull-request-draft-at-candidate"
     PULL_REQUEST_READY = "pull-request-ready"
     PULL_REQUEST_MERGED = "pull-request-merged"
     REVIEW_AT_CANDIDATE = "review-at-candidate"
+    REVIEWERS_EXACT_AT_CANDIDATE = "reviewers-exact-at-candidate"
     ISSUE_CLOSED = "issue-closed"
     REMOTE_HEAD_AT_EXPECTED_SHA = "remote-head-at-expected-sha"
 
@@ -498,12 +487,19 @@ class MutationBrokerContext:
     dispatcher_transition: RepositoryDispatcherTransition
     policy_snapshot: TrustedRepositoryPolicySnapshot
     activation_receipt: RepositoryActivationReceipt
+    deployment_identity: DeploymentIdentity
+    deployment_receipt: DeploymentAuthorityReceipt
+    deployment_verification: AuthorityReceiptVerification
+    evaluated_at: datetime
 
     def __post_init__(self) -> None:
         if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
                 or type(self.standing_authority) is not StandingRepositoryAuthority or type(self.receipt_verification) is not RepositoryReceiptVerification
                 or type(self.mutation_context) is not RepositoryMutationContext or type(self.dispatcher_transition) is not RepositoryDispatcherTransition
-                or type(self.policy_snapshot) is not TrustedRepositoryPolicySnapshot or type(self.activation_receipt) is not RepositoryActivationReceipt):
+                or type(self.policy_snapshot) is not TrustedRepositoryPolicySnapshot or type(self.activation_receipt) is not RepositoryActivationReceipt
+                or type(self.deployment_identity) is not DeploymentIdentity or type(self.deployment_receipt) is not DeploymentAuthorityReceipt
+                or type(self.deployment_verification) is not AuthorityReceiptVerification
+                or type(self.evaluated_at) is not datetime or self.evaluated_at.tzinfo is not timezone.utc):
             raise GitHubRuntimeError("broker authority evidence is invalid")
         for value, name in ((self.configuration_digest, "configuration"), (self.gate_identity, "gate")):
             _digest(value, name)
@@ -542,12 +538,18 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2A
         standing_authority=context.standing_authority,
         dispatcher_transition=context.dispatcher_transition,
         receipt_verification=context.receipt_verification,
-        now=receipt.activated_at,
+        now=context.evaluated_at,
     )
     if not canonical.authorized or canonical != decision or canonical.binding is None:
         raise GitHubRuntimeError("broker policy decision does not match canonical evidence")
     if binding != canonical.binding or not binding.matches_context(context.mutation_context, context.receipt_verification):
         raise GitHubRuntimeError("broker policy binding is not coherently bound")
+    canonical_deployment = evaluate_deployment_authority(
+        context.deployment_identity, context.deployment_receipt,
+        context.deployment_verification, now=context.evaluated_at,
+    )
+    if not canonical_deployment.authorized or canonical_deployment != context.deployment:
+        raise GitHubRuntimeError("broker deployment authority does not match canonical evidence")
     return SchemaV2AuthorizationBundle(
         context.standing_authority.policy.digest,
         context.policy_snapshot.source.source_fingerprint,
@@ -562,6 +564,8 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2A
         context.receipt_verification.status,
         context.dispatcher_transition.evidence_fingerprint,
         context.dispatcher_transition.digest,
+        context.deployment_receipt.receipt_fingerprint,
+        context.deployment_verification.receipt_binding_fingerprint,
     )
 
 
@@ -590,6 +594,8 @@ class SchemaV2AuthorizationBundle:
     receipt_status: RepositoryReceiptStatus
     dispatcher_transition_identity: str
     dispatcher_transition_digest: str
+    deployment_receipt_identity: str
+    deployment_verification_identity: str
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -604,6 +610,8 @@ class SchemaV2AuthorizationBundle:
             (self.receipt_binding_digest, "receipt binding"),
             (self.dispatcher_transition_identity, "dispatcher transition"),
             (self.dispatcher_transition_digest, "dispatcher transition digest"),
+            (self.deployment_receipt_identity, "deployment receipt"),
+            (self.deployment_verification_identity, "deployment verification"),
         ):
             _fingerprint(value, name)
         if type(self.receipt_status) is not RepositoryReceiptStatus:
@@ -936,15 +944,24 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
         raise GitHubRuntimeError("broker mutation command mapping is invalid")
     payload = dict(intent.payload)
     operation = intent.operation
-    if operation is GitHubMutationOperation.UPDATE_BRANCH:
+    if operation is GitHubMutationOperation.CREATE_BRANCH:
+        pre_state = GitHubReadRequest(GitHubReadOperation.REPOSITORY, intent.repository)
+        readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha), SemanticPostcondition.BRANCH_AT_EXPECTED_SHA)
+    elif operation is GitHubMutationOperation.UPDATE_BRANCH:
         pre_state = GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=payload["previous_sha"])
         readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha), SemanticPostcondition.BRANCH_AT_EXPECTED_SHA)
+    elif operation is GitHubMutationOperation.DELETE_BRANCH:
+        pre_state = GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha)
+        readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.REMOTE_HEAD, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha), SemanticPostcondition.BRANCH_ABSENT)
+    elif operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+        pre_state = GitHubReadRequest(GitHubReadOperation.REPOSITORY, intent.repository)
+        readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, intent.repository, number=intent.target_number, expected_sha=payload["head_sha"]), SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE)
     elif operation is GitHubMutationOperation.COMMENT:
         pre_state = GitHubReadRequest(GitHubReadOperation.COMMENTS, intent.repository, number=intent.target_number)
         readback = SemanticReadback(pre_state, SemanticPostcondition.COMMENT_PRESENT)
     elif operation is GitHubMutationOperation.REQUEST_REVIEW:
         pre_state = GitHubReadRequest(GitHubReadOperation.REVIEWS, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
-        readback = SemanticReadback(pre_state, SemanticPostcondition.REVIEW_AT_CANDIDATE)
+        readback = SemanticReadback(pre_state, SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE)
     elif operation is GitHubMutationOperation.MARK_READY:
         pre_state = GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
         readback = SemanticReadback(pre_state, SemanticPostcondition.PULL_REQUEST_READY)
@@ -1040,17 +1057,49 @@ def _complete_broker_read(
     return result, receipt.identity
 
 
+class _GhBrokerExecutor:
+    """Private credential-owning seam; only broker construction creates it."""
+
+    def __init__(self, runner: GhRunner, health: GitHubCapabilityHealth) -> None:
+        self.__runner = runner
+        self.__health = health
+
+    def execute(
+        self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
+    ) -> GitHubMutationResult:
+        blocked = _health_failure(intent.operation, self.__health)
+        if blocked is not None:
+            return GitHubMutationResult(intent, failure=blocked)
+        try:
+            payload.require_matches(intent)
+            outcome = self.__runner.run(_mutation_command(intent, payload, command))
+        except GitHubRuntimeError:
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
+        if outcome.exit_code != 0:
+            return GitHubMutationResult(intent, failure=GitHubFailure(_failure_kind(outcome.exit_code), intent.operation, "gh mutation did not return a usable status"))
+        return GitHubMutationResult(intent, receipt=_broker_receipt(intent))
+
+
 class GitHubMutationBroker:
     """The sole mutation seam; rejects before a write when evidence is absent."""
 
-    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None) -> None:
+    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None, _executor: _GhBrokerExecutor | None = None) -> None:
         if not hasattr(adapter, "read") or not hasattr(adapter, "submit"):
             raise GitHubRuntimeError("GitHub adapter is invalid")
         self._adapter = adapter
-        issuer = getattr(adapter, "_issue_broker_capability", None)
-        self._broker_capability = issuer() if callable(issuer) else None
+        self.__executor = _executor
         self._completed: dict[str, SemanticMutationReceipt] = {}
         self._journal = journal
+
+    @classmethod
+    def with_gh_runner(
+        cls, runner: GhRunner, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal,
+    ) -> "GitHubMutationBroker":
+        """Create the only production mutation path without exposing its executor."""
+
+        if type(journal) is not DurableMutationJournal:
+            raise GitHubRuntimeError("live broker requires a durable journal")
+        return cls(GhGitHubAdapter(runner, health), journal=journal, _executor=_GhBrokerExecutor(runner, health))
 
     def submit(
         self,
@@ -1101,7 +1150,7 @@ class GitHubMutationBroker:
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation durability is uncertain"), reconciliation_required=True)
         after, post_completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
-        if not after.ok or not _matches(plan.readback, intent, after.snapshot):
+        if not _readback_matches(plan.readback, intent, after):
             if self._journal is not None:
                 assert evidence is not None
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
@@ -1160,7 +1209,7 @@ class GitHubMutationBroker:
         if entry.lifecycle in {JournalLifecycle.DENIED, JournalLifecycle.FAILED}:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation lifecycle is terminally denied or failed"))
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
-        if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
+        if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation requires semantic reconciliation"), reconciliation_required=True)
         receipt = self._semantic_receipt(
             intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest,
@@ -1177,13 +1226,12 @@ class GitHubMutationBroker:
     ) -> GitHubMutationResult:
         if type(plan) is not BrokerSemanticPlan or plan.operation is not intent.operation or plan.command is not _MUTATION_COMMAND_BY_OPERATION[intent.operation]:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic command is invalid"))
-        execute = getattr(self._adapter, "_execute_brokered", None)
-        if callable(execute):
+        if self.__executor is not None:
             if type(payload) is not GhMutationPayload:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable"))
-            if self._broker_capability is None:
-                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker execution capability is unavailable"))
-            return execute(intent, payload, command=plan.command, capability=self._broker_capability)
+            if self._journal is None:
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence"))
+            return self.__executor.execute(intent, payload, plan.command)
         if payload is not None:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads"))
         return self._adapter.submit(intent)
@@ -1219,7 +1267,7 @@ class GitHubMutationBroker:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is missing"))
             return self._reconcile_journal(intent, context, bundle, plan, evidence, entry)
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
-        if not observed.ok or not _matches(plan.readback, intent, observed.snapshot):
+        if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
         receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, completeness, completeness, "reconciled", MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
@@ -1271,19 +1319,38 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
         return isinstance(snapshot, CommentsSnapshot) and dict(intent.payload).get("body_digest") in {item.body_digest for item in snapshot.comments}
     if condition is SemanticPostcondition.BRANCH_AT_EXPECTED_SHA:
         return isinstance(snapshot, BranchSnapshot) and snapshot.sha == intent.expected_sha
+    if condition is SemanticPostcondition.BRANCH_ABSENT:
+        return snapshot is None
     if condition is SemanticPostcondition.PULL_REQUEST_DRAFT:
         return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.OPEN and snapshot.draft
+    if condition is SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE:
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.OPEN and snapshot.draft and snapshot.head_sha == dict(intent.payload).get("head_sha") and snapshot.base_sha == dict(intent.payload).get("base_sha") and snapshot.head_ref == dict(intent.payload).get("head_ref") and snapshot.base_ref == dict(intent.payload).get("base_ref")
     if condition is SemanticPostcondition.PULL_REQUEST_READY:
         return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.OPEN and not snapshot.draft and snapshot.head_sha == intent.expected_sha
     if condition is SemanticPostcondition.PULL_REQUEST_MERGED:
         return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha
     if condition is SemanticPostcondition.REVIEW_AT_CANDIDATE:
         return isinstance(snapshot, ReviewsSnapshot) and snapshot.head_sha == intent.expected_sha and bool(snapshot.reviews)
+    if condition is SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE:
+        return isinstance(snapshot, ReviewsSnapshot) and snapshot.head_sha == intent.expected_sha and _sha256(("reviewers", tuple(sorted(review.reviewer_id for review in snapshot.reviews)))) == dict(intent.payload).get("reviewers_digest")
     if condition is SemanticPostcondition.ISSUE_CLOSED:
         return isinstance(snapshot, IssueSnapshot) and snapshot.state is IssueState.CLOSED
     if condition is SemanticPostcondition.REMOTE_HEAD_AT_EXPECTED_SHA:
         return isinstance(snapshot, RemoteHeadSnapshot) and snapshot.sha == intent.expected_sha
     return False
+
+
+def _readback_matches(
+    readback: SemanticReadback, intent: GitHubMutationIntent, result: GitHubReadResult,
+) -> bool:
+    """Interpret the one explicit branch-absence result without inventing success."""
+
+    if readback.condition is SemanticPostcondition.BRANCH_ABSENT:
+        return (
+            result.failure is not None
+            and result.failure.kind is GitHubFailureKind.STALE_RESPONSE
+        )
+    return result.ok and _matches(readback, intent, result.snapshot)
 
 
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:

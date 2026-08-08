@@ -397,7 +397,7 @@ class ClosingReferenceSnapshot:
     def __post_init__(self) -> None:
         _validate_number(self.issue_number, "closing issue number")
         _validate_number(self.pull_request_number, "closing pull request number")
-        if type(self.keyword) is not str or self.keyword not in {"close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"}:
+        if type(self.keyword) is not str or self.keyword not in {"close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved", "closing-reference"}:
             raise GitHubContractError("closing keyword is invalid")
         _validate_sha(self.head_sha, "closing reference head sha")
 

@@ -121,11 +121,17 @@ def comments_payload() -> dict[str, object]:
     }
 
 
-def gh_comments_page(*, present: bool = True) -> dict[str, object]:
+def gh_comments_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None) -> dict[str, object]:
+    count = (1 if present else 0) if total is None else total
     return {
-        "items": ([] if not present else [{"id": 17, "user": {"id": 4}, "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}]),
-        "next_cursor": None,
-        "total_count": 1 if present else 0,
+        "data": {"repository": {
+            "name": "roundwright", "owner": {"login": "example"},
+            "issue": {"number": 46, "comments": {
+                "totalCount": count,
+                "nodes": ([] if not present else [{"id": "17", "author": {"id": "4"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
+                "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
+            }},
+        }},
     }
 
 
@@ -413,11 +419,11 @@ class GitHubRuntimeTests(unittest.TestCase):
     def test_gh_adapter_uses_read_only_api_and_normalizes_only_typed_response(self) -> None:
         import json
 
-        runner = Runner(GhCommandResult(0, json.dumps(comments_payload())))
+        runner = Runner(GhCommandResult(0, json.dumps(gh_comments_page())))
         adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS))
         result = adapter.read(comments_request())
         self.assertTrue(result.ok)
-        self.assertEqual(runner.calls, [("api", "--method", "GET", "repos/example/roundwright/issues/46/comments")])
+        self.assertEqual(runner.calls[0][:2], ("api", "graphql"))
         self.assertNotIn("curated evidence", repr(result.snapshot))
 
     def test_collection_completeness_consumes_single_and_multi_page_typed_results(self) -> None:
@@ -483,11 +489,44 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertEqual(adapter.call_count(kind="mutation"), 0)
 
     def test_gh_adapter_projects_rest_comment_schema_and_rejects_identity_drift(self) -> None:
-        raw = [{"id": 17, "user": {"id": 4}, "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}]
+        raw = gh_comments_page()
         runner = Runner(GhCommandResult(0, json.dumps(raw)), GhCommandResult(0, json.dumps({"number": 47, "state": "OPEN", "id": 46})))
         adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS, GitHubReadOperation.ISSUE))
         self.assertTrue(adapter.read(comments_request()).ok)
         self.assertFalse(adapter.read(GitHubReadRequest(GitHubReadOperation.ISSUE, REPOSITORY, number=46)).ok)
+
+    def test_gh_adapter_requires_native_collection_pageinfo_and_binds_each_page(self) -> None:
+        first = gh_comments_page(next_cursor="cursor-1", total=2)
+        second = gh_comments_page(present=False, total=2)
+        malformed = gh_comments_page(next_cursor="cursor-2", total=1)
+        malformed["data"]["repository"]["owner"]["login"] = "drift"  # type: ignore[index]
+        runner = Runner(GhCommandResult(0, json.dumps(first)), GhCommandResult(0, json.dumps(second)), GhCommandResult(0, json.dumps(malformed)))
+        adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS))
+        initial = adapter.read_collection_page(comments_request(), None)
+        terminal = adapter.read_collection_page(comments_request(), "cursor-1")
+        rejected = adapter.read_collection_page(comments_request(), "cursor-2")
+        self.assertEqual(initial.next_cursor, "cursor-1")  # type: ignore[union-attr]
+        self.assertIsNone(terminal.next_cursor)  # type: ignore[union-attr]
+        self.assertIsNone(rejected)
+        self.assertEqual(runner.calls[0][:2], ("api", "graphql"))
+
+    def test_gh_adapter_projects_terminal_graphql_closing_references(self) -> None:
+        request = GitHubReadRequest(GitHubReadOperation.CLOSING_REFERENCES, REPOSITORY, number=46, expected_sha=SHA)
+        raw = {
+            "data": {"repository": {
+                "name": "roundwright", "owner": {"login": "example"},
+                "pullRequest": {"number": 46, "headRefOid": SHA, "closingIssuesReferences": {
+                    "nodes": [{"number": 46}], "pageInfo": {"hasNextPage": False, "endCursor": "Y3Vyc29yOjE="},
+                }},
+            }},
+        }
+        runner = Runner(GhCommandResult(0, json.dumps(raw)), GhCommandResult(0, json.dumps({**raw, "data": {"repository": {**raw["data"]["repository"], "pullRequest": {**raw["data"]["repository"]["pullRequest"], "closingIssuesReferences": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"}}}}}})))
+        adapter = GhGitHubAdapter(runner, health(GitHubReadOperation.CLOSING_REFERENCES))
+        result = adapter.read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.references[0].issue_number, 46)  # type: ignore[union-attr]
+        self.assertEqual(runner.calls[0][:2], ("api", "graphql"))
+        self.assertFalse(adapter.read(request).ok)
 
     def test_malformed_or_partial_capability_matrix_fails_closed(self) -> None:
         with self.assertRaises(ValueError):

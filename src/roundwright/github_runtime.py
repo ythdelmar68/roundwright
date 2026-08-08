@@ -71,6 +71,11 @@ from .repository_policy import (
 )
 
 
+# GraphQL cursors are opaque provider values (typically base64 and therefore
+# allowed to contain ``=``).  They are never interpolated into a shell.
+_CURSOR = re.compile(r"[^\x00-\x1f\x7f]{1,1024}\Z")
+
+
 class GitHubRuntimeError(ValueError):
     """Raised when runtime-only adapter evidence is malformed."""
 
@@ -228,29 +233,30 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "gh read response is malformed"))
 
     def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
-        """Read one explicitly paginated collection envelope, or fail closed."""
+        """Read one native GraphQL connection page, or fail closed.
+
+        GitHub's REST list responses deliberately do not carry a JSON terminal
+        marker.  The broker must not infer completeness from that absence, so
+        collection reads use the provider's typed GraphQL connection instead.
+        ``pageInfo`` and ``totalCount`` are projected only after the repository,
+        target, and candidate identities have been checked.
+        """
 
         if type(request) is not GitHubReadRequest or request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
             return None
-        if cursor is not None and (type(cursor) is not str or not _IDENTIFIER.fullmatch(cursor)):
+        if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
             return None
         self.calls.append(("collection-read", request.operation.value))
         if _health_failure(request.operation, self._health) is not None:
             return None
-        command = _read_command(request) + (() if cursor is None else ("-f", f"cursor={cursor}"))
+        command = _collection_read_command(request, cursor)
         outcome = self.__runner.run(command)
         if outcome.exit_code != 0:
             return None
         try:
             raw = json.loads(outcome.stdout)
-            if type(raw) is not dict or set(raw) != {"items", "next_cursor", "total_count"}:
-                return None
-            next_cursor, total_count = raw["next_cursor"], raw["total_count"]
-            if next_cursor is not None and (type(next_cursor) is not str or not _IDENTIFIER.fullmatch(next_cursor)):
-                return None
-            if type(total_count) is not int or type(total_count) is bool or total_count < 0 or type(raw["items"]) is not list:
-                return None
-            snapshot = normalize_github_response(request, _project_gh_response(request, raw["items"]))
+            projected, next_cursor, total_count = _project_gh_collection_page(request, raw)
+            snapshot = normalize_github_response(request, projected)
             return CollectionPage(request, cursor, next_cursor, total_count, snapshot)
         except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
             return None
@@ -381,7 +387,7 @@ class CollectionPage:
         if type(self.request) is not GitHubReadRequest or self.request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
             raise GitHubRuntimeError("collection page request is invalid")
         for value, name in ((self.cursor, "collection cursor"), (self.next_cursor, "collection continuation")):
-            if value is not None and (type(value) is not str or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", value)):
+            if value is not None and (type(value) is not str or not _CURSOR.fullmatch(value)):
                 raise GitHubRuntimeError(f"{name} is invalid")
         if type(self.total_count) is not int or self.total_count < 0 or type(self.snapshot) not in {CommentsSnapshot, ReviewsSnapshot}:
             raise GitHubRuntimeError("collection page is invalid")
@@ -1362,10 +1368,37 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
     pages; a different shape is incomplete rather than silently partial.
     """
 
-    if type(raw) is dict and "repository" in raw:
-        return raw
     repository = {"owner": request.repository.owner, "name": request.repository.name}
     operation = request.operation
+    if operation is GitHubReadOperation.CLOSING_REFERENCES:
+        root = _raw_mapping(raw)
+        data = _raw_mapping(root.get("data"))
+        graph_repository = _raw_mapping(data.get("repository"))
+        owner = _raw_mapping(graph_repository.get("owner"))
+        pull_request = _raw_mapping(graph_repository.get("pullRequest"))
+        if _raw_text(owner, "login") != request.repository.owner or _raw_text(graph_repository, "name") != request.repository.name:
+            raise GitHubRuntimeError("gh closing-reference repository does not match request")
+        if _raw_integer(pull_request, "number") != request.number or _raw_text(pull_request, "headRefOid") != request.expected_sha:
+            raise GitHubRuntimeError("gh closing-reference pull request does not match request")
+        connection = _raw_mapping(pull_request.get("closingIssuesReferences"))
+        page_info = _raw_mapping(connection.get("pageInfo"))
+        if _raw_bool(page_info, "hasNextPage"):
+            raise GitHubRuntimeError("gh closing-reference pagination is incomplete")
+        closing_cursor = page_info.get("endCursor")
+        if closing_cursor is not None and (type(closing_cursor) is not str or not _CURSOR.fullmatch(closing_cursor)):
+            raise GitHubRuntimeError("gh closing-reference terminal cursor is malformed")
+        nodes = connection.get("nodes")
+        if type(nodes) is not list:
+            raise GitHubRuntimeError("gh closing-reference nodes are malformed")
+        return {
+            "repository": repository, "pull_request_number": request.number,
+            "head_sha": request.expected_sha,
+            "references": [
+                {"issue_number": _raw_integer(_raw_mapping(node), "number"), "pull_request_number": request.number,
+                 "keyword": "closing-reference", "head_sha": request.expected_sha}
+                for node in nodes
+            ],
+        }
     if operation is GitHubReadOperation.REPOSITORY:
         item = _raw_mapping(raw)
         _raw_repository_matches(item, request)
@@ -1381,12 +1414,18 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
             raise GitHubRuntimeError("gh issue sub-issues are incomplete")
         return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": _raw_text(item, "state"), "parent_number": parent_number, "sub_issue_numbers": [_raw_integer(_raw_mapping(child), "number") for child in children]}
     if operation is GitHubReadOperation.COMMENTS:
+        if type(raw) is dict and "data" in raw:
+            projected, next_cursor, _ = _project_gh_collection_page(request, raw)
+            if next_cursor is not None:
+                raise GitHubRuntimeError("gh comment response is not terminal")
+            return projected
         return {"repository": repository, "issue_number": request.number, "comments": [{"id": _raw_id(item, "id"), "author_id": _raw_id(_raw_mapping(item.get("user")), "id"), "body": _raw_text(item, "body"), "created_at": _raw_text(item, "created_at")} for item in _raw_collection(raw, "comments")]}
     if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
         item = _raw_mapping(raw)
         name = _raw_text(item, "name")
         if name != request.ref:
             raise GitHubRuntimeError("gh branch reference does not match request")
+        _raw_branch_repository_matches(item, request)
         projected = {"repository": repository, "ref": name, "sha": _raw_text(_raw_mapping(item.get("commit")), "sha")}
         return projected
     if operation is GitHubReadOperation.PULL_REQUEST:
@@ -1396,30 +1435,49 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
         base, head = _raw_mapping(item.get("base")), _raw_mapping(item.get("head"))
         return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": _raw_text(item, "state"), "base_ref": _raw_text(base, "ref"), "base_sha": _raw_text(base, "sha"), "head_ref": _raw_text(head, "ref"), "head_sha": _raw_text(head, "sha"), "draft": _raw_bool(item, "draft")}
     if operation is GitHubReadOperation.REVIEWS:
+        if type(raw) is dict and "data" in raw:
+            projected, next_cursor, _ = _project_gh_collection_page(request, raw)
+            if next_cursor is not None:
+                raise GitHubRuntimeError("gh review response is not terminal")
+            return projected
         items = _raw_collection(raw, "reviews")
-        return {"repository": repository, "pull_request_number": request.number, "head_sha": request.expected_sha, "reviews": [{"id": _raw_id(item, "id"), "reviewer_id": _raw_id(_raw_mapping(item.get("user")), "id"), "state": _raw_text(item, "state").upper(), "commit_sha": _raw_text(item, "commit_id")} for item in items]}
+        if not items:
+            raise GitHubRuntimeError("gh review response cannot establish candidate identity")
+        head_sha = _raw_text(items[0], "commit_id")
+        if head_sha != request.expected_sha or any(_raw_text(item, "commit_id") != head_sha for item in items):
+            raise GitHubRuntimeError("gh review candidate does not match request")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": head_sha, "reviews": [{"id": _raw_id(item, "id"), "reviewer_id": _raw_id(_raw_mapping(item.get("user")), "id"), "state": _raw_text(item, "state").upper(), "commit_sha": _raw_text(item, "commit_id")} for item in items]}
     if operation is GitHubReadOperation.CHECKS:
         item = _raw_mapping(raw)
+        _raw_repository_matches(item, request)
         runs = item.get("check_runs")
         if type(runs) is not list:
             raise GitHubRuntimeError("gh check-runs response is incomplete")
-        return {"repository": repository, "pull_request_number": request.number, "head_sha": request.expected_sha, "checks": [{"id": _raw_id(run, "id"), "name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": request.expected_sha} for run in runs]}
+        head_sha = _raw_text(item, "head_sha")
+        if head_sha != request.expected_sha or any(_raw_text(_raw_mapping(run), "head_sha") != head_sha for run in runs):
+            raise GitHubRuntimeError("gh checks candidate does not match request")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": head_sha, "checks": [{"id": _raw_id(run, "id"), "name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": _raw_text(run, "head_sha")} for run in runs]}
     if operation is GitHubReadOperation.WORKFLOW_RUNS:
         item = _raw_mapping(raw)
+        _raw_repository_matches(item, request)
         runs = item.get("workflow_runs")
         if type(runs) is not list:
             raise GitHubRuntimeError("gh workflow-runs response is incomplete")
-        return {"repository": repository, "pull_request_number": request.number, "head_sha": request.expected_sha, "runs": [{"id": _raw_id(run, "id"), "workflow_name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": request.expected_sha} for run in runs]}
+        if not runs:
+            raise GitHubRuntimeError("gh workflow response cannot establish candidate identity")
+        head_sha = _raw_text(_raw_mapping(runs[0]), "head_sha")
+        if head_sha != request.expected_sha or any(_raw_text(_raw_mapping(run), "head_sha") != head_sha for run in runs):
+            raise GitHubRuntimeError("gh workflow candidate does not match request")
+        return {"repository": repository, "pull_request_number": request.number, "head_sha": head_sha, "runs": [{"id": _raw_id(run, "id"), "workflow_name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": _raw_text(run, "head_sha")} for run in runs]}
     if operation is GitHubReadOperation.MERGEABILITY:
         item = _raw_mapping(raw)
+        _raw_repository_matches(item, request)
         _raw_number_matches(item, request)
         head = _raw_mapping(item.get("head"))
         state = {"clean": "MERGEABLE", "dirty": "CONFLICTING", "unknown": "UNKNOWN"}.get(_raw_text(item, "mergeable_state"))
         if state is None:
             raise GitHubRuntimeError("gh mergeability is incomplete")
         return {"repository": repository, "pull_request_number": request.number, "head_sha": _raw_text(head, "sha"), "mergeability": state}
-    # Timeline closing semantics cannot be reconstructed from REST event text
-    # without a complete, authenticated parser; reject rather than infer.
     raise GitHubRuntimeError("gh response projection is unavailable")
 
 
@@ -1427,6 +1485,73 @@ def _raw_mapping(value: object) -> Mapping[str, object]:
     if type(value) is not dict:
         raise GitHubRuntimeError("gh response object is malformed")
     return value
+
+
+def _project_gh_collection_page(
+    request: GitHubReadRequest, raw: object,
+) -> tuple[Mapping[str, object], str | None, int]:
+    """Project one provider-native GraphQL connection with explicit terminality."""
+
+    root = _raw_mapping(raw)
+    data = _raw_mapping(root.get("data"))
+    graph_repository = _raw_mapping(data.get("repository"))
+    owner = _raw_mapping(graph_repository.get("owner"))
+    if (
+        _raw_text(owner, "login") != request.repository.owner
+        or _raw_text(graph_repository, "name") != request.repository.name
+    ):
+        raise GitHubRuntimeError("gh collection repository does not match request")
+    target_key = "issue" if request.operation is GitHubReadOperation.COMMENTS else "pullRequest"
+    target = _raw_mapping(graph_repository.get(target_key))
+    if _raw_integer(target, "number") != request.number:
+        raise GitHubRuntimeError("gh collection target does not match request")
+    if request.operation is GitHubReadOperation.REVIEWS:
+        if _raw_text(target, "headRefOid") != request.expected_sha:
+            raise GitHubRuntimeError("gh review candidate does not match request")
+        connection_name, output_name = "reviews", "reviews"
+    else:
+        connection_name, output_name = "comments", "comments"
+    connection = _raw_mapping(target.get(connection_name))
+    page_info = _raw_mapping(connection.get("pageInfo"))
+    has_next = _raw_bool(page_info, "hasNextPage")
+    end_cursor = page_info.get("endCursor")
+    if has_next:
+        if type(end_cursor) is not str or not _CURSOR.fullmatch(end_cursor):
+            raise GitHubRuntimeError("gh collection continuation is malformed")
+        next_cursor: str | None = end_cursor
+    else:
+        if end_cursor is not None and (type(end_cursor) is not str or not _CURSOR.fullmatch(end_cursor)):
+            raise GitHubRuntimeError("gh terminal collection cursor is malformed")
+        next_cursor = None
+    total_count = _raw_integer(connection, "totalCount")
+    nodes = connection.get("nodes")
+    if type(nodes) is not list:
+        raise GitHubRuntimeError("gh collection nodes are malformed")
+    repository = {"owner": request.repository.owner, "name": request.repository.name}
+    if request.operation is GitHubReadOperation.COMMENTS:
+        projected = {
+            "repository": repository, "issue_number": request.number,
+            output_name: [
+                {"id": _raw_id(_raw_mapping(node), "id"),
+                 "author_id": _raw_id(_raw_mapping(_raw_mapping(node).get("author")), "id"),
+                 "body": _raw_text(_raw_mapping(node), "body"),
+                 "created_at": _raw_text(_raw_mapping(node), "createdAt")}
+                for node in nodes
+            ],
+        }
+    else:
+        projected = {
+            "repository": repository, "pull_request_number": request.number,
+            "head_sha": _raw_text(target, "headRefOid"),
+            output_name: [
+                {"id": _raw_id(_raw_mapping(node), "id"),
+                 "reviewer_id": _raw_id(_raw_mapping(_raw_mapping(node).get("author")), "id"),
+                 "state": _raw_text(_raw_mapping(node), "state").upper(),
+                 "commit_sha": _raw_text(_raw_mapping(_raw_mapping(node).get("commit")), "oid")}
+                for node in nodes
+            ],
+        }
+    return projected, next_cursor, total_count
 
 
 def _raw_collection(value: object, name: str) -> list[Mapping[str, object]]:
@@ -1489,12 +1614,31 @@ def _raw_number_matches(mapping: Mapping[str, object], request: GitHubReadReques
 
 
 def _raw_repository_matches(mapping: Mapping[str, object], request: GitHubReadRequest) -> None:
-    owner, name = mapping.get("owner"), mapping.get("name")
-    if owner is None and name is None:
+    """Require provider-established repository identity; never borrow request data."""
+
+    candidate = mapping
+    if "repository" in mapping:
+        candidate = _raw_mapping(mapping.get("repository"))
+    elif "base" in mapping:
+        candidate = _raw_mapping(_raw_mapping(mapping.get("base")).get("repo"))
+    owner, name = candidate.get("owner"), candidate.get("name")
+    if owner is not None and name is not None:
+        owner_map = _raw_mapping(owner)
+        if _raw_text(owner_map, "login") == request.repository.owner and _raw_text(candidate, "name") == request.repository.name:
+            return
+    repository_url = mapping.get("repository_url")
+    if type(repository_url) is str and repository_url.rstrip("/").endswith(f"/repos/{request.repository.slug}"):
         return
-    owner_map = _raw_mapping(owner)
-    if _raw_text(owner_map, "login") != request.repository.owner or _raw_text(mapping, "name") != request.repository.name:
-        raise GitHubRuntimeError("gh response repository does not match request")
+    raise GitHubRuntimeError("gh response repository does not match request")
+
+
+def _raw_branch_repository_matches(mapping: Mapping[str, object], request: GitHubReadRequest) -> None:
+    """A REST branch response establishes its repository through commit URLs."""
+
+    commit = _raw_mapping(mapping.get("commit"))
+    url = commit.get("url")
+    if type(url) is not str or f"/repos/{request.repository.slug}/commits/" not in url:
+        raise GitHubRuntimeError("gh branch response repository does not match request")
 
 
 def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
@@ -1506,13 +1650,13 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     elif request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
         path = f"{base}/issues/{request.number}"
     elif request.operation is GitHubReadOperation.COMMENTS:
-        path = f"{base}/issues/{request.number}/comments"
+        return _collection_read_command(request, None)
     elif request.operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
         path = f"{base}/branches/{request.ref}"
     elif request.operation is GitHubReadOperation.PULL_REQUEST:
         path = f"{base}/pulls/{request.number}"
     elif request.operation is GitHubReadOperation.REVIEWS:
-        path = f"{base}/pulls/{request.number}/reviews"
+        return _collection_read_command(request, None)
     elif request.operation is GitHubReadOperation.CHECKS:
         path = f"{base}/commits/{request.expected_sha}/check-runs"
     elif request.operation is GitHubReadOperation.WORKFLOW_RUNS:
@@ -1520,10 +1664,33 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     elif request.operation is GitHubReadOperation.MERGEABILITY:
         path = f"{base}/pulls/{request.number}"
     elif request.operation is GitHubReadOperation.CLOSING_REFERENCES:
-        path = f"{base}/issues/{request.number}/timeline"
+        query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){name owner{login} pullRequest(number:$number){number headRefOid closingIssuesReferences(first:100){nodes{number} pageInfo{hasNextPage endCursor}}}}}"
+        return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}", "-F", f"number={request.number}")
     else:
         raise GitHubRuntimeError("unsupported gh read operation")
     return ("api", "--method", "GET", path)
+
+
+def _collection_read_command(request: GitHubReadRequest, cursor: str | None) -> tuple[str, ...]:
+    """Build the sole native-provider collection query shape.
+
+    GraphQL connections expose terminality in the response itself.  This is
+    intentionally separate from ordinary GET commands so a caller cannot tack
+    a cursor onto an unrelated endpoint and manufacture collection evidence.
+    """
+
+    if request.operation is GitHubReadOperation.COMMENTS:
+        target = "issue(number:$number){number comments(first:100,after:$cursor){totalCount nodes{id author{id} body createdAt} pageInfo{hasNextPage endCursor}}}"
+    elif request.operation is GitHubReadOperation.REVIEWS:
+        target = "pullRequest(number:$number){number headRefOid reviews(first:100,after:$cursor){totalCount nodes{id author{id} state commit{oid}} pageInfo{hasNextPage endCursor}}}"
+    else:
+        raise GitHubRuntimeError("unsupported gh collection read operation")
+    query = f"query($owner:String!,$name:String!,$number:Int!,$cursor:String){{repository(owner:$owner,name:$name){{name owner{{login}} {target}}}}}"
+    arguments: tuple[str, ...] = (
+        "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+        "-F", f"name={request.repository.name}", "-F", f"number={request.number}",
+    )
+    return arguments if cursor is None else arguments + ("-F", f"cursor={cursor}")
 
 
 def _mutation_command(

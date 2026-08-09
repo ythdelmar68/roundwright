@@ -20,7 +20,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -103,6 +103,7 @@ class OperationHealth:
     state: CapabilityState
     observed_at: datetime
     evidence_digest: str
+    fresh_until: datetime | None = None
 
     def __post_init__(self) -> None:
         if type(self.operation) not in (GitHubReadOperation, GitHubMutationOperation):
@@ -110,10 +111,17 @@ class OperationHealth:
         if type(self.state) is not CapabilityState or type(self.observed_at) is not datetime or self.observed_at.tzinfo is not timezone.utc:
             raise GitHubRuntimeError("operation health is invalid")
         _digest(self.evidence_digest, "operation health evidence")
+        expiry = self.observed_at + timedelta(minutes=5) if self.fresh_until is None else self.fresh_until
+        if type(expiry) is not datetime or expiry.tzinfo is not timezone.utc or expiry <= self.observed_at:
+            raise GitHubRuntimeError("operation health freshness is invalid")
+        object.__setattr__(self, "fresh_until", expiry)
 
     @property
     def available(self) -> bool:
         return self.state is CapabilityState.AVAILABLE
+
+    def fresh_at(self, now: datetime) -> bool:
+        return type(now) is datetime and now.tzinfo is timezone.utc and now <= self.fresh_until
 
 
 @dataclass(frozen=True)
@@ -619,6 +627,7 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext, *, now: datet
         context.dispatcher_transition.digest,
         context.deployment_receipt.receipt_fingerprint,
         context.deployment_verification.receipt_binding_fingerprint,
+        _sha256((trusted_now.isoformat(),)),
     )
 
 
@@ -649,6 +658,7 @@ class SchemaV2AuthorizationBundle:
     dispatcher_transition_digest: str
     deployment_receipt_identity: str
     deployment_verification_identity: str
+    evaluation_time_identity: str
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -667,6 +677,7 @@ class SchemaV2AuthorizationBundle:
             (self.deployment_verification_identity, "deployment verification"),
         ):
             _fingerprint(value, name)
+        _digest(self.evaluation_time_identity, "evaluation time")
         if type(self.receipt_status) is not RepositoryReceiptStatus:
             raise GitHubRuntimeError("authorization bundle receipt lifecycle status is invalid")
         _digest(self.configuration_digest, "configuration")
@@ -1121,11 +1132,13 @@ class _GhBrokerExecutor:
 
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
-        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal_identity: str,
+        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal_identity: str, now: datetime,
     ) -> GitHubMutationResult:
         blocked = _health_failure(intent.operation, self.__health)
         if blocked is not None:
             return GitHubMutationResult(intent, failure=blocked)
+        if not self.__health.for_operation(intent.operation).fresh_at(now):
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "operation health is stale"))
         try:
             payload.require_matches(intent)
             if command is not plan.command:
@@ -1202,7 +1215,8 @@ class GitHubMutationBroker:
         if failure is not None:
             return BrokerMutationResult(failure=failure)
         try:
-            bundle = schema_v2_authorization_bundle(context, now=self._now(context))
+            now = self._now(context)
+            bundle = schema_v2_authorization_bundle(context, now=now)
             plan = _broker_semantic_plan(intent)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
@@ -1223,7 +1237,7 @@ class GitHubMutationBroker:
             if evidence is not None and self._journal is not None:
                 self._journal_transition(evidence, JournalLifecycle.FAILED)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-mutation semantic state is unavailable"))
-        outcome = self._execute(intent, payload, plan, bundle, evidence)
+        outcome = self._execute(intent, payload, plan, bundle, evidence, now)
         if not outcome.ok:
             if evidence is not None and self._journal is not None:
                 lifecycle = JournalLifecycle.DENIED if outcome.failure is not None and outcome.failure.kind is GitHubFailureKind.POLICY_DENIED else JournalLifecycle.FAILED
@@ -1305,7 +1319,7 @@ class GitHubMutationBroker:
 
     def _execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload | None, plan: BrokerSemanticPlan,
-        bundle: SchemaV2AuthorizationBundle, evidence: MutationJournalEntry | None,
+        bundle: SchemaV2AuthorizationBundle, evidence: MutationJournalEntry | None, now: datetime,
     ) -> GitHubMutationResult:
         if type(plan) is not BrokerSemanticPlan or plan.operation is not intent.operation or plan.command is not _MUTATION_COMMAND_BY_OPERATION[intent.operation]:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic command is invalid"))
@@ -1316,7 +1330,7 @@ class GitHubMutationBroker:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence"))
             if type(evidence) is not MutationJournalEntry:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks sealed journal entry"))
-            return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence.key)
+            return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence.key, now)
         if payload is not None:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads"))
         return self._adapter.submit(intent)

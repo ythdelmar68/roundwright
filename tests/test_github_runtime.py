@@ -241,6 +241,44 @@ def comment_locator(*, comment_id: str = "comment-46", marker_digest: str = COMM
     )
 
 
+def checkpointed_journal_entry(
+    intent: GitHubMutationIntent, context: MutationBrokerContext,
+    lifecycle: JournalLifecycle, *, locator: CreatedResourceLocator | None = None,
+) -> MutationJournalEntry:
+    """Build only legal durable checkpoints for recovery-contract tests."""
+
+    plan = _broker_semantic_plan(intent)
+    entry = MutationJournalEntry.from_evidence(
+        intent, context, schema_v2_authorization_bundle(context), plan,
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        journal = DurableMutationJournal(Path(directory) / "journal.json")
+        claimed, _ = journal.claim(entry)
+        if lifecycle is JournalLifecycle.CLAIMED:
+            return claimed
+        captured = journal.transition(
+            claimed, JournalLifecycle.PRESTATE_CAPTURED,
+            pre_state_digest=DIGEST, pre_state_completeness_identity=DIGEST,
+        )
+        if lifecycle is JournalLifecycle.PRESTATE_CAPTURED:
+            return captured
+        started = journal.transition(captured, JournalLifecycle.EXECUTION_STARTED)
+        if lifecycle is JournalLifecycle.EXECUTION_STARTED:
+            return started
+        accepted = journal.transition(
+            started, JournalLifecycle.TRANSPORT_ACCEPTED,
+            created_resource=locator,
+        )
+        if lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
+            return accepted
+        applied = journal.transition(accepted, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
+        if lifecycle is JournalLifecycle.APPLIED_AWAITING_VERIFICATION:
+            return applied
+        if lifecycle is JournalLifecycle.AMBIGUOUS:
+            return journal.transition(applied, JournalLifecycle.AMBIGUOUS)
+    raise AssertionError("test helper cannot fabricate a verified journal entry")
+
+
 def repository_payload() -> dict[str, object]:
     return {
         "repository": {"owner": "example", "name": "roundwright"},
@@ -495,9 +533,9 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             replace(entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED)
-        accepted = replace(
-            entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED,
-            created_resource=comment_locator(),
+        accepted = checkpointed_journal_entry(
+            intent, context, JournalLifecycle.TRANSPORT_ACCEPTED,
+            locator=comment_locator(),
         )
         receipt = GitHubMutationBroker._semantic_receipt(
             intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
@@ -1983,16 +2021,85 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertIs(claimed.lifecycle, JournalLifecycle.PENDING)
             with self.assertRaises(ValueError):
                 first.claim(MutationJournalEntry.from_evidence(conflicting, context, bundle, _broker_semantic_plan(conflicting)))
-            first.transition(
-                entry, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
+            captured = first.transition(
+                claimed, JournalLifecycle.PRESTATE_CAPTURED,
+                pre_state_digest=DIGEST, pre_state_completeness_identity=DIGEST,
+            )
+            started = first.transition(captured, JournalLifecycle.EXECUTION_STARTED)
+            accepted = first.transition(
+                started, JournalLifecycle.TRANSPORT_ACCEPTED,
                 created_resource=comment_locator(),
             )
+            first.transition(accepted, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
             with self.assertRaises(ValueError):
                 first.transition(entry, JournalLifecycle.FAILED)
             restarted = DurableMutationJournal(Path(directory) / "journal.json")
             observed = restarted.find(entry)
             self.assertIsNotNone(observed)
             self.assertIs(observed.lifecycle, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)  # type: ignore[union-attr]
+
+    def test_prestate_provenance_must_be_complete_and_stale_callers_cannot_skip_it(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "prestate-contract-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        context = allowed_context()
+        evidence = MutationJournalEntry.from_evidence(
+            intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            claimed, _ = journal.claim(evidence)
+            with self.assertRaises(ValueError):
+                journal.transition(claimed, JournalLifecycle.EXECUTION_STARTED)
+            with self.assertRaises(ValueError):
+                journal.transition(
+                    claimed, JournalLifecycle.PRESTATE_CAPTURED,
+                    pre_state_digest=DIGEST,
+                )
+            captured = journal.transition(
+                claimed, JournalLifecycle.PRESTATE_CAPTURED,
+                pre_state_digest=DIGEST, pre_state_completeness_identity=DIGEST,
+            )
+            with self.assertRaises(ValueError):
+                journal.transition(claimed, JournalLifecycle.EXECUTION_STARTED)
+            started = journal.transition(captured, JournalLifecycle.EXECUTION_STARTED)
+            self.assertTrue(started.pre_state_complete)
+            self.assertEqual(started.pre_state_read_identity, _broker_semantic_plan(intent).pre_state.identity())
+            with self.assertRaises(ValueError):
+                journal.find_recovery(intent, replace(context, candidate_sha=BASE), _broker_semantic_plan(intent))
+            encoded = dict(started.serialize())
+            encoded["pre_state_digest"] = "sha256:" + "f" * 64
+            with self.assertRaises(ValueError):
+                MutationJournalEntry.deserialize(encoded)
+            encoded = dict(started.serialize())
+            encoded["pre_state_completeness_identity"] = "sha256:" + "e" * 64
+            with self.assertRaises(ValueError):
+                MutationJournalEntry.deserialize(encoded)
+
+    def test_exact_already_satisfied_prestate_is_verified_without_dispatch(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.CLOSE_ISSUE, REPOSITORY, "preclosed-46",
+            target_number=46, payload=(("reason", "COMPLETED"),),
+        )
+        context = allowed_context(RepositoryMutationOperation.CLOSE_LEAF_ISSUE)
+        plan = _broker_semantic_plan(intent)
+        closed = {
+            "repository": {"owner": "example", "name": "roundwright"},
+            "id": "issue-46", "number": 46, "state": "CLOSED",
+            "parent_number": None, "sub_issue_numbers": [],
+            "issue_evidence_identity": DIGEST,
+            "relationship_evidence_identity": "sha256:" + "d" * 64,
+        }
+        adapter = FakeGitHubAdapter({plan.pre_state.identity(): FakeGitHubScenario(response=closed)})
+        with tempfile.TemporaryDirectory() as directory:
+            result = GitHubMutationBroker(
+                adapter, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+            ).submit(intent, context)
+            self.assertTrue(result.ok)
+            self.assertEqual(adapter.call_count(kind="mutation"), 0)
+            self.assertEqual(adapter.call_count(kind="read"), 1)
+            self.assertEqual(result.receipt.disposition, MutationDisposition.ALREADY_APPLIED)  # type: ignore[union-attr]
 
     def test_journal_time_fields_reject_individual_and_recomputed_drift(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "time-drift-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
@@ -2017,9 +2124,9 @@ class GitHubRuntimeTests(unittest.TestCase):
         bundle = schema_v2_authorization_bundle(context)
         plan = _broker_semantic_plan(intent)
         entry = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
-        accepted = replace(
-            entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED,
-            created_resource=comment_locator(),
+        accepted = checkpointed_journal_entry(
+            intent, context, JournalLifecycle.TRANSPORT_ACCEPTED,
+            locator=comment_locator(),
         )
         receipt = GitHubMutationBroker._semantic_receipt(
             intent, context, bundle, plan, DIGEST, DIGEST, DIGEST, DIGEST,
@@ -2038,10 +2145,9 @@ class GitHubRuntimeTests(unittest.TestCase):
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "fresh-boundary-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         initial = allowed_context()
         bundle, plan = schema_v2_authorization_bundle(initial), _broker_semantic_plan(intent)
-        entry = MutationJournalEntry.from_evidence(intent, initial, bundle, plan)
-        entry = replace(
-            entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED,
-            created_resource=comment_locator(),
+        entry = checkpointed_journal_entry(
+            intent, initial, JournalLifecycle.TRANSPORT_ACCEPTED,
+            locator=comment_locator(),
         )
         now = NOW + timedelta(minutes=5) - timedelta(microseconds=1)
         context = replace(initial, evaluated_at=now)
@@ -2068,26 +2174,29 @@ class GitHubRuntimeTests(unittest.TestCase):
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-state-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         context = allowed_context()
         bundle, plan = schema_v2_authorization_bundle(context), _broker_semantic_plan(intent)
-        claimed = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
+        claimed = checkpointed_journal_entry(intent, context, JournalLifecycle.CLAIMED)
         for state in (JournalLifecycle.CLAIMED, JournalLifecycle.PRESTATE_CAPTURED):
             adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
-            result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, claimed, replace(claimed, lifecycle=state))
+            entry = checkpointed_journal_entry(intent, context, state)
+            result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
             self.assertFalse(result.ok)
             self.assertEqual(adapter.call_count(), 0)
-        started = replace(claimed, lifecycle=JournalLifecycle.EXECUTION_STARTED)
+        started = checkpointed_journal_entry(intent, context, JournalLifecycle.EXECUTION_STARTED)
         adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, started, started)
         self.assertFalse(result.ok)
         self.assertEqual(adapter.call_count(), 0)
         for state in (JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.AMBIGUOUS):
             adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
-            entry = replace(claimed, lifecycle=state, created_resource=comment_locator())
+            entry = checkpointed_journal_entry(intent, context, state, locator=comment_locator())
             result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
             self.assertTrue(result.ok)
             self.assertNotEqual(result.receipt.affected_identity, "reconciled")  # type: ignore[union-attr]
         empty = {**comments_payload(), "comments": []}
         adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=empty)})
-        ambiguous = replace(claimed, lifecycle=JournalLifecycle.AMBIGUOUS, created_resource=comment_locator())
+        ambiguous = checkpointed_journal_entry(
+            intent, context, JournalLifecycle.AMBIGUOUS, locator=comment_locator(),
+        )
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, ambiguous, ambiguous)
         self.assertFalse(result.ok)
         self.assertTrue(result.reconciliation_required)
@@ -2121,20 +2230,29 @@ class GitHubRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             journal = DurableMutationJournal(Path(directory) / "journal.json")
             adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            transport = OwnerTransport()
             def crash(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.EXECUTION_STARTED:
                     raise RuntimeError("crash")
-            result = GitHubMutationBroker(adapter, journal=journal, checkpoint_observer=crash).submit(intent, context)
-            self.assertFalse(result.ok)
+            with self.assertRaises(RuntimeError):
+                GitHubMutationBroker(
+                    adapter, journal=journal,
+                    _executor=_GhBrokerExecutor(transport, health(
+                        GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                    )), checkpoint_observer=crash,
+                ).submit(intent, context, payload=GhMutationPayload(
+                    GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+                ))
             stored = journal.find(evidence)
-            self.assertIs(stored.lifecycle, JournalLifecycle.PENDING)  # type: ignore[union-attr]
-            self.assertFalse(stored.pre_state_complete)  # type: ignore[union-attr]
+            self.assertIs(stored.lifecycle, JournalLifecycle.EXECUTION_STARTED)  # type: ignore[union-attr]
+            self.assertTrue(stored.pre_state_complete)  # type: ignore[union-attr]
             self.assertEqual(adapter.call_count(kind="mutation"), 0)
             restart = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
             result = GitHubMutationBroker(restart, journal=DurableMutationJournal(Path(directory) / "journal.json")).submit(intent, context)
             self.assertFalse(result.ok)
             self.assertEqual(restart.call_count(kind="mutation"), 0)
             self.assertEqual(restart.call_count(kind="read"), 0)
+            self.assertEqual(transport.requests, [])
 
     def test_transport_accepted_crash_recovers_without_second_transport(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "accepted-crash-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
@@ -2164,11 +2282,44 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertEqual(restart_transport.requests, [])
             self.assertEqual(result.receipt.pre_state_digest, stored.pre_state_digest)  # type: ignore[union-attr]
 
+    def test_applied_awaiting_verification_crash_recovers_without_duplicate_transport(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "applied-crash-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        context = allowed_context()
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            transport = OwnerTransport()
+            def crash(entry: MutationJournalEntry) -> None:
+                if entry.lifecycle is JournalLifecycle.APPLIED_AWAITING_VERIFICATION:
+                    raise RuntimeError("crash after application checkpoint")
+            with self.assertRaises(RuntimeError):
+                GitHubMutationBroker(
+                    FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())}),
+                    journal=DurableMutationJournal(path),
+                    _executor=_GhBrokerExecutor(transport, matrix), checkpoint_observer=crash,
+                ).submit(intent, context, payload=GhMutationPayload(
+                    GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+                ))
+            evidence = MutationJournalEntry.from_evidence(
+                intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
+            )
+            stored = DurableMutationJournal(path).find(evidence)
+            self.assertIs(stored.lifecycle, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)  # type: ignore[union-attr]
+            recovered = GitHubMutationBroker(
+                FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())}),
+                journal=DurableMutationJournal(path),
+            ).submit(intent, context)
+            self.assertTrue(recovered.ok)
+            self.assertEqual(len(transport.requests), 1)
+
     def test_execution_started_incomplete_postread_remains_blocked(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "started-incomplete-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         context = allowed_context()
         bundle, plan = schema_v2_authorization_bundle(context), _broker_semantic_plan(intent)
-        entry = replace(MutationJournalEntry.from_evidence(intent, context, bundle, plan), lifecycle=JournalLifecycle.EXECUTION_STARTED)
+        entry = checkpointed_journal_entry(intent, context, JournalLifecycle.EXECUTION_STARTED)
         adapter = FakeGitHubAdapter()
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
         self.assertFalse(result.ok)
@@ -2242,11 +2393,17 @@ class GitHubRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "journal.json"
             journal = DurableMutationJournal(path)
-            journal.claim(evidence)
-            journal.transition(
-                evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
+            claimed, _ = journal.claim(evidence)
+            captured = journal.transition(
+                claimed, JournalLifecycle.PRESTATE_CAPTURED,
+                pre_state_digest=DIGEST, pre_state_completeness_identity=DIGEST,
+            )
+            started = journal.transition(captured, JournalLifecycle.EXECUTION_STARTED)
+            accepted = journal.transition(
+                started, JournalLifecycle.TRANSPORT_ACCEPTED,
                 created_resource=comment_locator(),
             )
+            journal.transition(accepted, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
             reconciler = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=comments_payload())})
             result = GitHubMutationBroker(reconciler, journal=DurableMutationJournal(path)).submit(intent, context)
             self.assertTrue(result.ok)
@@ -2265,6 +2422,10 @@ class GitHubRuntimeTests(unittest.TestCase):
             path.unlink()
             missing = GitHubMutationBroker(fake, journal=DurableMutationJournal(path)).reconcile(intent, allowed_context())
             self.assertFalse(missing.ok)
+            self.assertEqual(fake.call_count(), 0)
+            path.with_suffix(path.suffix + ".tmp").write_text("{}", encoding="utf-8")
+            torn = GitHubMutationBroker(fake, journal=DurableMutationJournal(path)).submit(intent, allowed_context())
+            self.assertFalse(torn.ok)
             self.assertEqual(fake.call_count(), 0)
 
     def test_broker_requires_policy_deployment_candidate_and_prestate_before_adapter_mutation(self) -> None:

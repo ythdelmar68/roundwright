@@ -55,7 +55,7 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41]},
             GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
             GitHubReadOperation.BRANCH: {"repository": repository, "ref": "main", "sha": SHA},
-            GitHubReadOperation.PULL_REQUEST: {"repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True},
+            GitHubReadOperation.PULL_REQUEST: {"repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True, "merge_commit_sha": None},
             GitHubReadOperation.REVIEWS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "reviews": [{"id": "review-1", "reviewer_id": "reviewer-1", "state": "APPROVED", "commit_sha": SHA}]},
             GitHubReadOperation.CHECKS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "checks": [{"id": "check-1", "name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
             GitHubReadOperation.WORKFLOW_RUNS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "runs": [{"id": "run-1", "workflow_name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
@@ -86,6 +86,22 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
         snapshot = normalize_github_response(request, self.payload(GitHubReadOperation.COMMENTS))
         self.assertNotIn("public evidence", repr(snapshot))
+
+    def test_merged_pull_request_requires_exact_merge_commit_sha(self) -> None:
+        request = self.request(GitHubReadOperation.PULL_REQUEST)
+        merged = self.payload(GitHubReadOperation.PULL_REQUEST)
+        merged.update({"state": "MERGED", "draft": False, "merge_commit_sha": "d" * 40})
+        snapshot = normalize_github_response(request, merged)
+        self.assertEqual(snapshot.merge_commit_sha, "d" * 40)
+        for field, value in (("merge_commit_sha", None), ("merge_commit_sha", "not-a-sha"), ("merge_commit_sha", "d" * 64)):
+            malformed = dict(merged)
+            malformed[field] = value
+            with self.subTest(value=value), self.assertRaises(GitHubContractError):
+                normalize_github_response(request, malformed)
+        open_with_merge = self.payload(GitHubReadOperation.PULL_REQUEST)
+        open_with_merge["merge_commit_sha"] = "d" * 40
+        with self.assertRaises(GitHubContractError):
+            normalize_github_response(request, open_with_merge)
 
     def test_collection_response_identity_is_never_synthesized_from_the_request(self) -> None:
         request = self.request(GitHubReadOperation.COMMENTS)

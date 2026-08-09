@@ -178,11 +178,12 @@ def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
     )
 
 
-def pull_request_payload(*, number: int = 58, base_sha: str = BASE, head_sha: str = SHA, draft: bool = True) -> dict[str, object]:
+def pull_request_payload(*, number: int = 58, base_sha: str = BASE, head_sha: str = SHA, draft: bool = True, state: str = "OPEN", merge_commit_sha: str | None = None) -> dict[str, object]:
     return {
         "repository": {"owner": "example", "name": "roundwright"}, "id": f"pr-{number}",
-        "number": number, "state": "OPEN", "base_ref": "main", "base_sha": base_sha,
+        "number": number, "state": state, "base_ref": "main", "base_sha": base_sha,
         "head_ref": "codex/issue-46", "head_sha": head_sha, "draft": draft,
+        "merge_commit_sha": merge_commit_sha,
     }
 
 
@@ -683,6 +684,70 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
         self.assertEqual(adapter.call_count(kind="mutation"), 1)
+
+    def test_merged_pull_request_binds_merge_commit_and_reuses_receipt_on_restart(self) -> None:
+        merge_sha = "d" * 40
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.MERGE_PULL_REQUEST, REPOSITORY, "merge-46",
+            target_number=46, expected_sha=SHA, payload=(("method", "merge"),),
+        )
+        context, plan = allowed_context(RepositoryMutationOperation.MERGE_PR), _broker_semantic_plan(intent)
+        merged = pull_request_payload(number=46, draft=False, state="MERGED", merge_commit_sha=merge_sha)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            adapter = FakeGitHubAdapter({
+                plan.pre_state.identity(): FakeGitHubScenario(response=merged),
+                intent.identity(): FakeGitHubScenario(
+                    duplicate_receipt=True, affected_identity="merge-46", semantic_readback_digest=DIGEST,
+                ),
+            })
+            first = GitHubMutationBroker(adapter, journal=journal).submit(intent, context)
+            self.assertTrue(first.ok)
+            self.assertTrue(first.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
+            restarted = FakeGitHubAdapter()
+            retry = GitHubMutationBroker(restarted, journal=DurableMutationJournal(Path(directory) / "journal.json")).reconcile(intent, context)
+            self.assertTrue(retry.ok)
+            self.assertEqual(retry.receipt, first.receipt)
+            self.assertEqual(restarted.call_count(), 0)
+
+    def test_merged_pull_request_rejects_missing_or_drifted_merge_evidence(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.MERGE_PULL_REQUEST, REPOSITORY, "merge-drift-46",
+            target_number=46, expected_sha=SHA, payload=(("method", "merge"),),
+        )
+        context, plan = allowed_context(RepositoryMutationOperation.MERGE_PR), _broker_semantic_plan(intent)
+        for response in (
+            pull_request_payload(number=46, draft=False, state="MERGED"),
+            pull_request_payload(number=46, head_sha=BASE, draft=False, state="MERGED", merge_commit_sha="d" * 40),
+            pull_request_payload(number=46, draft=False, state="MERGED", merge_commit_sha="not-a-sha"),
+        ):
+            with self.subTest(response=response):
+                adapter = FakeGitHubAdapter({
+                    plan.pre_state.identity(): FakeGitHubScenario(response=response),
+                    intent.identity(): FakeGitHubScenario(
+                        duplicate_receipt=True, affected_identity="merge-46", semantic_readback_digest=DIGEST,
+                    ),
+                })
+                result = GitHubMutationBroker(adapter).submit(intent, context)
+                self.assertFalse(result.ok)
+                self.assertEqual(adapter.call_count(kind="mutation"), 0)
+
+    def test_native_pull_request_projection_requires_merge_commit_for_merged_state(self) -> None:
+        request = GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=46, expected_sha=SHA)
+        raw = {
+            "repository_url": "https://api.github.example/repos/example/roundwright", "id": 46,
+            "number": 46, "state": "closed", "merged": True, "draft": False, "merge_commit_sha": "d" * 40,
+            "base": {"ref": "main", "sha": BASE, "repo": {"owner": {"login": "example"}, "name": "roundwright"}},
+            "head": {"ref": "codex/issue-46", "sha": SHA},
+        }
+        adapter = GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(raw))), health(GitHubReadOperation.PULL_REQUEST))
+        result = adapter.read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.merge_commit_sha, "d" * 40)  # type: ignore[union-attr]
+        missing = dict(raw)
+        missing["merge_commit_sha"] = None
+        denied = GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(missing))), health(GitHubReadOperation.PULL_REQUEST)).read(request)
+        self.assertFalse(denied.ok)
 
     def test_broker_rejects_caller_semantic_overrides_and_incomplete_operations_before_adapter_calls(self) -> None:
         comment = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "override-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))

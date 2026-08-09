@@ -253,6 +253,7 @@ class PullRequestSnapshot:
     head_ref: str
     head_sha: str
     draft: bool
+    merge_commit_sha: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryRef:
@@ -266,6 +267,11 @@ class PullRequestSnapshot:
                 raise GitHubContractError(f"{name} is invalid")
         _validate_sha(self.base_sha, "base sha")
         _validate_sha(self.head_sha, "head sha")
+        if self.state is PullRequestState.MERGED:
+            if type(self.merge_commit_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.merge_commit_sha):
+                raise GitHubContractError("merge commit sha is invalid")
+        elif self.merge_commit_sha is not None:
+            raise GitHubContractError("unmerged pull request merge commit is invalid")
 
 
 @dataclass(frozen=True)
@@ -706,8 +712,8 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
             _exact_shape(response, {"repository", "ref", "sha"})
             return BranchSnapshot(_repository(response), _string(response, "ref"), _string(response, "sha"))
         if operation is GitHubReadOperation.PULL_REQUEST:
-            _exact_shape(response, {"repository", "id", "number", "state", "base_ref", "base_sha", "head_ref", "head_sha", "draft"})
-            return PullRequestSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), PullRequestState(_string(response, "state")), _string(response, "base_ref"), _string(response, "base_sha"), _string(response, "head_ref"), _string(response, "head_sha"), _boolean(response, "draft"))
+            _exact_shape(response, {"repository", "id", "number", "state", "base_ref", "base_sha", "head_ref", "head_sha", "draft", "merge_commit_sha"})
+            return PullRequestSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), PullRequestState(_string(response, "state")), _string(response, "base_ref"), _string(response, "base_sha"), _string(response, "head_ref"), _string(response, "head_sha"), _boolean(response, "draft"), _optional_string(response, "merge_commit_sha"))
         if operation is GitHubReadOperation.REVIEWS:
             _exact_shape(response, {"repository", "pull_request_number", "head_sha", "reviews"})
             head_sha = _string(response, "head_sha")

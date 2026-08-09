@@ -1796,7 +1796,7 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
     if condition is SemanticPostcondition.PULL_REQUEST_READY:
         return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and not snapshot.draft and snapshot.head_sha == intent.expected_sha
     if condition is SemanticPostcondition.PULL_REQUEST_MERGED:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha and type(snapshot.merge_commit_sha) is str
     if condition is SemanticPostcondition.REVIEW_AT_CANDIDATE:
         return isinstance(snapshot, ReviewsSnapshot) and snapshot.repository == intent.repository and snapshot.pull_request_number == intent.target_number and snapshot.head_sha == intent.expected_sha and bool(snapshot.reviews)
     if condition is SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE:
@@ -1885,11 +1885,13 @@ def _affected_identity(
                 ))
         raise GitHubRuntimeError("allocated comment affected identity is unavailable")
     if intent.operation in {GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST} and type(result.snapshot) is PullRequestSnapshot:
+        if intent.operation is GitHubMutationOperation.MERGE_PULL_REQUEST and type(result.snapshot.merge_commit_sha) is not str:
+            raise GitHubRuntimeError("merged pull request affected identity is unavailable")
         return _sha256((
             "affected", intent.operation.value, result.snapshot.repository.slug,
             result.snapshot.pull_request_id, result.snapshot.number, result.snapshot.state.value,
             result.snapshot.base_ref, result.snapshot.base_sha, result.snapshot.head_ref,
-            result.snapshot.head_sha, result.snapshot.draft,
+            result.snapshot.head_sha, result.snapshot.draft, result.snapshot.merge_commit_sha,
         ))
     if intent.operation is GitHubMutationOperation.REQUEST_REVIEW and type(result.snapshot) is RequestedReviewersSnapshot:
         return _sha256((
@@ -2020,7 +2022,14 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
         _raw_repository_matches(item, request)
         _raw_number_matches(item, request)
         base, head = _raw_mapping(item.get("base")), _raw_mapping(item.get("head"))
-        return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": _raw_text(item, "state"), "base_ref": _raw_text(base, "ref"), "base_sha": _raw_text(base, "sha"), "head_ref": _raw_text(head, "ref"), "head_sha": _raw_text(head, "sha"), "draft": _raw_bool(item, "draft")}
+        state = _raw_text(item, "state").upper()
+        merged = item.get("merged")
+        if merged is not None:
+            if type(merged) is not bool:
+                raise GitHubRuntimeError("gh pull request merged state is malformed")
+            if merged:
+                state = "MERGED"
+        return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": state, "base_ref": _raw_text(base, "ref"), "base_sha": _raw_text(base, "sha"), "head_ref": _raw_text(head, "ref"), "head_sha": _raw_text(head, "sha"), "draft": _raw_bool(item, "draft"), "merge_commit_sha": _raw_optional_text(item, "merge_commit_sha")}
     if operation is GitHubReadOperation.REVIEWS:
         if type(raw) is dict and "data" in raw:
             projected, next_cursor, _ = _project_gh_collection_page(request, raw)

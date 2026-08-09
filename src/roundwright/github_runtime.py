@@ -18,7 +18,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -148,7 +147,7 @@ class GitHubCapabilityHealth:
 
 
 @dataclass(frozen=True)
-class GhCommandResult:
+class _GhCommandResult:
     """Ephemeral result from a preconfigured ``gh`` process invocation.
 
     ``stdout`` is parsed immediately by the adapter and never appears in a
@@ -163,63 +162,10 @@ class GhCommandResult:
             raise GitHubRuntimeError("gh command result is invalid")
 
 
-class GhRunner(Protocol):
-    """Credential-owning process boundary supplied only by the Orchestrator."""
+class _FixedGhReadRunner(Protocol):
+    """Private owner-host process boundary for pre-derived read commands."""
 
-    def run(self, arguments: tuple[str, ...]) -> GhCommandResult: ...
-
-
-class _SubprocessGhReadRunner:
-    """Owner-host implementation for read-only adapter traffic only.
-
-    This deliberately is not a mutation capability.  Mutation transport is a
-    separately injected fixed-protocol endpoint below.
-    """
-
-    def __init__(self, executable: str = "gh") -> None:
-        if type(executable) is not str or executable != "gh":
-            raise GitHubRuntimeError("gh executable must be the configured default")
-        self._executable = executable
-
-    def run(self, arguments: tuple[str, ...]) -> GhCommandResult:
-        if type(arguments) is not tuple or any(type(value) is not str or not value or "\x00" in value for value in arguments):
-            raise GitHubRuntimeError("gh command arguments are invalid")
-        if not _is_fixed_read_command(arguments):
-            raise GitHubRuntimeError("gh read runner rejects non-read command")
-        # No shell, only explicit credential/configuration variables, and no
-        # stderr retention.  Provider output never reaches diagnostics.
-        try:
-            child_environment = {
-                key: os.environ[key] for key in (
-                    "APPDATA", "COMSPEC", "GH_CONFIG_DIR", "GH_ENTERPRISE_TOKEN", "GH_TOKEN",
-                    "HOME", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PATHEXT",
-                    "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
-                ) if key in os.environ
-            }
-            completed = subprocess.run(
-                (self._executable, *arguments), check=False, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                encoding="utf-8", errors="strict", timeout=30, env=child_environment,
-            )
-        except (OSError, subprocess.SubprocessError, UnicodeError):
-            return GhCommandResult(127, "")
-        return GhCommandResult(completed.returncode, completed.stdout)
-
-
-def _is_fixed_read_command(arguments: tuple[str, ...]) -> bool:
-    """Accept only the inert command shapes emitted by typed read builders.
-
-    The read runner is deliberately not a general ``gh`` process facility:
-    even direct imports cannot turn it into a mutation path by supplying a
-    POST/PUT command or a GraphQL mutation document.
-    """
-
-    if len(arguments) >= 4 and arguments[:3] == ("api", "--method", "GET"):
-        return all(value != "--method" for value in arguments[3:])
-    if len(arguments) >= 4 and arguments[:2] == ("api", "graphql"):
-        query = next((value.removeprefix("query=") for value in arguments if value.startswith("query=")), None)
-        return query is not None and query.lstrip().startswith("query(")
-    return False
+    def run(self, arguments: tuple[str, ...]) -> _GhCommandResult: ...
 
 
 @dataclass(frozen=True)
@@ -387,7 +333,16 @@ class OwnerMutationTransport(Protocol):
     def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact: ...
 
 
-class GhGitHubAdapter:
+class OwnerGitHubReadEndpoint(Protocol):
+    """Role-visible owner-host read surface: typed requests and curated facts only."""
+
+    @property
+    def health(self) -> GitHubCapabilityHealth: ...
+
+    def read(self, request: GitHubReadRequest) -> GitHubReadResult: ...
+
+
+class _OwnerGitHubReadHostEndpoint:
     """``gh api`` adapter with explicit health gating and no mutation fallback.
 
     The adapter intentionally accepts the normalized JSON response schema from
@@ -398,7 +353,7 @@ class GhGitHubAdapter:
     unavailable, which is the safe construction for workers and tests.
     """
 
-    def __init__(self, runner: GhRunner, health: GitHubCapabilityHealth | None = None) -> None:
+    def __init__(self, runner: _FixedGhReadRunner, health: GitHubCapabilityHealth | None = None) -> None:
         if not hasattr(runner, "run"):
             raise GitHubRuntimeError("gh runner is invalid")
         self.__runner = runner
@@ -1599,10 +1554,90 @@ class OwnerMutationSealRegistry(Protocol):
     def resolve_and_consume(self, request: OwnerMutationRequest) -> OwnerMutationSealRecord | None: ...
 
 
-class _OwnerMutationHostExecutor(Protocol):
-    """Private fixed-command host executor; it accepts no provider arguments."""
+@dataclass(frozen=True)
+class OwnerFixedMutationCommand:
+    """Host-internal fixed mutation shape, never caller-provided argv."""
 
-    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact: ...
+    operation: GitHubMutationOperation
+    command: BrokerMutationCommand
+    repository: RepositoryRef
+    target_number: int | None
+    candidate_sha: str
+    idempotency_identity: str
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.operation) is not GitHubMutationOperation
+            or type(self.command) is not BrokerMutationCommand
+            or self.command is not _MUTATION_COMMAND_BY_OPERATION[self.operation]
+            or type(self.repository) is not RepositoryRef
+            or type(self.candidate_sha) is not str
+            or len(self.candidate_sha) not in {40, 64}
+            or any(character not in "0123456789abcdef" for character in self.candidate_sha)
+        ):
+            raise GitHubRuntimeError("owner fixed mutation command is invalid")
+        if self.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST, GitHubMutationOperation.COMMENT,
+            GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY,
+            GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE,
+        }:
+            if type(self.target_number) is not int or self.target_number <= 0:
+                raise GitHubRuntimeError("owner fixed mutation target is invalid")
+        elif self.target_number is not None:
+            raise GitHubRuntimeError("owner fixed branch command target is invalid")
+        _digest(self.idempotency_identity, "owner fixed idempotency")
+        object.__setattr__(self, "identity", _sha256((
+            self.operation.value, self.command.value, self.repository.slug,
+            self.target_number, self.candidate_sha, self.idempotency_identity,
+        )))
+
+
+def _owner_fixed_mutation_command(record: OwnerMutationSealRecord) -> OwnerFixedMutationCommand:
+    """Derive the exhaustive host command shape solely from an exact seal."""
+
+    if type(record) is not OwnerMutationSealRecord or not record.matches(record.request):
+        raise GitHubRuntimeError("owner fixed mutation seal is invalid")
+    command = _MUTATION_COMMAND_BY_OPERATION.get(record.operation)
+    if command is not record.command or command is not record.request.command:
+        raise GitHubRuntimeError("owner fixed mutation command drifted")
+    return OwnerFixedMutationCommand(
+        record.operation, command, record.repository, record.request.target_number,
+        record.candidate_sha, record.idempotency_identity,
+    )
+
+
+class _OwnerFixedMutationCommandHandler(Protocol):
+    """Private host-only implementation with no argv, output, or environment API."""
+
+    def execute_fixed_command(
+        self, command: OwnerFixedMutationCommand, record: OwnerMutationSealRecord,
+    ) -> OwnerMutationAcceptedFact: ...
+
+
+class OwnerFixedMutationHostExecutor:
+    """Concrete disabled owner-host executor for sealed fixed command shapes.
+
+    It deliberately has no default handler.  Deployment must inject a host
+    implementation outside Worker/Supervisor code; absent injection remains a
+    denial before any credential or process access.
+    """
+
+    def __init__(self, handler: _OwnerFixedMutationCommandHandler) -> None:
+        if not hasattr(handler, "execute_fixed_command"):
+            raise GitHubRuntimeError("owner fixed mutation handler is unavailable")
+        self.__handler = handler
+
+    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact:
+        command = _owner_fixed_mutation_command(record)
+        fact = self.__handler.execute_fixed_command(command, record)
+        if (
+            type(fact) is not OwnerMutationAcceptedFact
+            or fact.request_identity != record.request.identity
+            or fact.operation is not record.operation
+        ):
+            raise GitHubRuntimeError("owner fixed mutation result is invalid")
+        return fact
 
 
 class InMemoryOwnerMutationSealRegistry:
@@ -1627,10 +1662,10 @@ class OwnerMutationHostEndpoint:
     """Disabled host-side fixed protocol; no process, credentials, or raw output."""
 
     def __init__(
-        self, registry: OwnerMutationSealRegistry, executor: _OwnerMutationHostExecutor,
+        self, registry: OwnerMutationSealRegistry, executor: OwnerFixedMutationHostExecutor,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if not hasattr(registry, "resolve_and_consume") or not hasattr(executor, "execute_fixed"):
+        if not hasattr(registry, "resolve_and_consume") or type(executor) is not OwnerFixedMutationHostExecutor:
             raise GitHubRuntimeError("owner mutation host endpoint is unavailable")
         self.__registry = registry
         self.__executor = executor
@@ -2004,15 +2039,17 @@ class GitHubMutationBroker:
 
     @classmethod
     def with_owner_transport(
-        cls, read_runner: GhRunner, transport: OwnerMutationHostEndpoint, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
+        cls, read_endpoint: OwnerGitHubReadEndpoint, transport: OwnerMutationHostEndpoint, *, journal: DurableMutationJournal, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
-        """Create the only production mutation path without exposing its executor."""
+        """Create the only production path from owner-host typed endpoints."""
 
         if type(journal) is not DurableMutationJournal:
             raise GitHubRuntimeError("live broker requires a durable journal")
         if type(transport) is not OwnerMutationHostEndpoint:
             raise GitHubRuntimeError("live broker requires an owner mutation host endpoint")
-        return cls(GhGitHubAdapter(read_runner, health), journal=journal, _executor=_GhBrokerExecutor(transport, health), checkpoint_observer=checkpoint_observer)
+        if type(read_endpoint) is not _OwnerGitHubReadHostEndpoint:
+            raise GitHubRuntimeError("live broker requires an owner github read endpoint")
+        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health), checkpoint_observer=checkpoint_observer)
 
     def submit(
         self,

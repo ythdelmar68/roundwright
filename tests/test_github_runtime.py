@@ -35,9 +35,9 @@ from roundwright.github_runtime import (
     BrokerMutationCommand,
     CollectionPage,
     CreatedResourceLocator,
-    GhCommandResult,
+    _GhCommandResult as GhCommandResult,
     DurableMutationJournal,
-    GhGitHubAdapter,
+    _OwnerGitHubReadHostEndpoint as GhGitHubAdapter,
     GhMutationPayload,
     GitHubCapabilityHealth,
     GitHubMutationBroker,
@@ -49,6 +49,8 @@ from roundwright.github_runtime import (
     OwnerMutationHostEndpoint,
     OwnerMutationRequest,
     OwnerMutationSealRecord,
+    OwnerFixedMutationCommand,
+    OwnerFixedMutationHostExecutor,
     InMemoryOwnerMutationSealRegistry,
     OperationHealth,
     SemanticPostcondition,
@@ -102,6 +104,7 @@ class OwnerTransport:
         self.accepted = accepted
         self.created_resource = created_resource
         self.requests: list[OwnerMutationRequest] = []
+        self.commands: list[OwnerFixedMutationCommand] = []
 
     def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         self.requests.append(request)
@@ -124,7 +127,10 @@ class OwnerTransport:
             locator = self.created_resource
         return OwnerMutationAcceptedFact(identity, request.operation, locator)
 
-    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact:
+    def execute_fixed_command(
+        self, command: OwnerFixedMutationCommand, record: OwnerMutationSealRecord,
+    ) -> OwnerMutationAcceptedFact:
+        self.commands.append(command)
         result = self.dispatch(record.request)
         assert type(result) is OwnerMutationAcceptedFact
         return result
@@ -146,7 +152,13 @@ class FixtureOwnerSealRegistry:
 
 def owner_endpoint(transport: OwnerTransport | None = None) -> OwnerMutationHostEndpoint:
     host = transport or OwnerTransport()
-    return OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), host, clock=lambda: NOW)
+    return OwnerMutationHostEndpoint(
+        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), clock=lambda: NOW,
+    )
+
+
+def owner_read_endpoint(runner: Runner, matrix: GitHubCapabilityHealth) -> GhGitHubAdapter:
+    return GhGitHubAdapter(runner, matrix)
 
 
 def sealed_owner_request(*, evaluated_at: datetime = NOW, fresh_until: datetime | None = None) -> OwnerMutationRequest:
@@ -475,7 +487,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         request = sealed_owner_request()
         transport = OwnerTransport()
         endpoint = OwnerMutationHostEndpoint(
-            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), transport,
+            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport),
             clock=lambda: NOW,
         )
         accepted = endpoint.dispatch(request)
@@ -515,10 +527,65 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(record=record is None):
                 denied_transport = OwnerTransport()
                 denied = OwnerMutationHostEndpoint(
-                    StaticRegistry(record), denied_transport, clock=lambda: NOW,
+                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), clock=lambda: NOW,
                 ).dispatch(request)
                 self.assertIsInstance(denied, OwnerMutationFact)
                 self.assertEqual(denied_transport.requests, [])
+                self.assertEqual(denied_transport.commands, [])
+
+    def test_owner_fixed_executor_has_total_sealed_operation_mapping_without_process_access(self) -> None:
+        """Every operation reaches the host only as a sealed fixed command shape."""
+        import roundwright.github_runtime as runtime
+
+        self.assertEqual(set(runtime._MUTATION_COMMAND_BY_OPERATION), set(GitHubMutationOperation))
+        numbered = {
+            GitHubMutationOperation.CREATE_PULL_REQUEST, GitHubMutationOperation.COMMENT,
+            GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY,
+            GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE,
+        }
+        for operation, command in runtime._MUTATION_COMMAND_BY_OPERATION.items():
+            values: dict[str, object] = {
+                "candidate_sha": SHA, "idempotency_identity": DIGEST, "command": command,
+                "deployment_identity": "a" * 64, "pre_state_identity": DIGEST,
+                "evaluated_at": NOW.isoformat(), "fresh_until": (NOW + timedelta(minutes=5)).isoformat(),
+                "time_identity": "sha256:" + hashlib.sha256(
+                    json.dumps((NOW.isoformat(), (NOW + timedelta(minutes=5)).isoformat()), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+                ).hexdigest(),
+            }
+            if operation in numbered:
+                values["target_number"] = 46
+            if operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+                values.update({"base_sha": BASE, "head_sha": SHA, "marker_digest": COMMENT_DIGEST})
+            elif operation is GitHubMutationOperation.COMMENT:
+                values["marker_digest"] = COMMENT_DIGEST
+            request = OwnerMutationRequest(DIGEST, operation, DIGEST, DIGEST, DIGEST, REPOSITORY, **values)
+            transport = OwnerTransport()
+            fact = OwnerFixedMutationHostExecutor(transport).execute_fixed(sealed_owner_record(request))
+            with self.subTest(operation=operation):
+                self.assertIsInstance(fact, OwnerMutationAcceptedFact)
+                self.assertEqual(transport.commands[0].command, command)
+                self.assertEqual(transport.commands[0].operation, operation)
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_role_visible_runtime_has_no_generic_runner_or_raw_command_result(self) -> None:
+        """Public role code sees typed endpoints, never a generic gh process API."""
+        import roundwright.github_runtime as runtime
+
+        for name in ("GhRunner", "GhCommandResult", "GhGitHubAdapter", "_SubprocessGhReadRunner"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(runtime, name))
+        runner = Runner()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                GitHubMutationBroker.with_owner_transport(
+                    runner, owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                )
+        self.assertEqual(runner.calls, [])
+
+        with self.assertRaises(ValueError):
+            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport())  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
 
     def test_created_resource_locator_binds_to_fixed_request_and_plan(self) -> None:
         comment_intent = GitHubMutationIntent(
@@ -1841,7 +1908,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             def crash(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
                     raise RuntimeError("crash")
-            broker = GitHubMutationBroker.with_owner_transport(runner, owner_endpoint(transport), matrix, journal=journal, checkpoint_observer=crash)
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=journal, checkpoint_observer=crash)
             with self.assertRaises(RuntimeError):
                 broker.submit(intent, context, payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),)))
             entry = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent))
@@ -1983,7 +2050,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
             transport = OwnerTransport()
-            broker = GitHubMutationBroker.with_owner_transport(runner, owner_endpoint(transport), matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=DurableMutationJournal(Path(directory) / "journal.json"))
             result = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
             self.assertTrue(result.ok)
             self.assertEqual(len(runner.calls), 2)
@@ -2007,7 +2074,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
-            broker = GitHubMutationBroker.with_owner_transport(runner, owner_endpoint(), matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"))
             payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
             first = broker.submit(intent, allowed_context(), payload=payload)
             self.assertFalse(first.ok)
@@ -2044,25 +2111,12 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertFalse(adapter.submit(intent).ok)
         self.assertEqual(runner.calls, [])
 
-    def test_direct_read_runner_cannot_be_repurposed_as_a_mutation_process(self) -> None:
-        """Even a direct private import accepts only typed read command shapes."""
-        from unittest import mock
+    def test_role_runtime_has_no_process_or_credential_runner(self) -> None:
+        """This role-visible module owns no subprocess or credential capability."""
         import roundwright.github_runtime as runtime
 
-        class GuardedEnvironment(dict[str, str]):
-            def __getitem__(self, key: str) -> str:
-                raise AssertionError(f"credential environment read: {key}")
-
-        runner = runtime._SubprocessGhReadRunner()
-        with mock.patch.object(runtime.os, "environ", GuardedEnvironment({"GH_TOKEN": "secret"})), \
-             mock.patch.object(runtime.subprocess, "run") as process:
-            for arguments in (
-                ("api", "--method", "POST", "repos/example/roundwright/issues/46/comments"),
-                ("api", "graphql", "-f", "query=mutation($x:String!){noop(value:$x){clientMutationId}}"),
-            ):
-                with self.subTest(arguments=arguments), self.assertRaises(ValueError):
-                    runner.run(arguments)
-        process.assert_not_called()
+        self.assertFalse(hasattr(runtime, "subprocess"))
+        self.assertFalse(hasattr(runtime, "_OwnerFixedGhReadExecutor"))
 
     def test_missing_owner_transport_denies_payload_before_reads_or_adapter_mutation(self) -> None:
         """Payload never activates the legacy adapter when no owner endpoint exists."""

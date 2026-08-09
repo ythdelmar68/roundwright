@@ -34,6 +34,7 @@ from roundwright.github_runtime import (
     CapabilityState,
     BrokerMutationCommand,
     CollectionPage,
+    CreatedResourceLocator,
     GhCommandResult,
     DurableMutationJournal,
     GhGitHubAdapter,
@@ -196,6 +197,44 @@ def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationO
 
 
 class GitHubRuntimeTests(unittest.TestCase):
+    def test_created_resource_locator_is_total_and_canonical(self) -> None:
+        pull_request = CreatedResourceLocator(
+            GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
+            pull_request_number=58, base_sha=BASE, head_sha=SHA, draft=True,
+            marker_digest=COMMENT_DIGEST,
+        )
+        comment = CreatedResourceLocator(
+            GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+            comment_id="comment-46", marker_digest=COMMENT_DIGEST,
+        )
+        self.assertEqual(pull_request.identity, CreatedResourceLocator(
+            GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
+            pull_request_number=58, base_sha=BASE, head_sha=SHA, draft=True,
+            marker_digest=COMMENT_DIGEST,
+        ).identity)
+        self.assertNotEqual(pull_request.identity, comment.identity)
+        for locator in (
+            lambda: CreatedResourceLocator(
+                GitHubMutationOperation.REQUEST_REVIEW, REPOSITORY,
+                marker_digest=COMMENT_DIGEST,
+            ),
+            lambda: CreatedResourceLocator(
+                GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
+                pull_request_number=58, base_sha=BASE, head_sha=SHA, draft=False,
+                marker_digest=COMMENT_DIGEST,
+            ),
+            lambda: CreatedResourceLocator(
+                GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+                comment_id="comment-46", draft=True, marker_digest=COMMENT_DIGEST,
+            ),
+            lambda: CreatedResourceLocator(
+                GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+                marker_digest=COMMENT_DIGEST,
+            ),
+        ):
+            with self.subTest(locator=locator), self.assertRaises(ValueError):
+                locator()
+
     def test_schema_v2_authorization_bundle_is_immutable_and_deterministic(self) -> None:
         bundle = schema_v2_authorization_bundle(allowed_context())
         self.assertEqual(bundle, schema_v2_authorization_bundle(allowed_context()))

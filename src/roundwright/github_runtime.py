@@ -54,6 +54,7 @@ from .github import (
     RemoteHeadSnapshot,
     ReviewsSnapshot,
     RequestedReviewersSnapshot,
+    RepositoryRef,
     normalize_github_response,
 )
 from .repository_policy import (
@@ -229,6 +230,47 @@ class OwnerMutationFact:
         if type(self.accepted) is not bool:
             raise GitHubRuntimeError("owner mutation fact is invalid")
         _digest(self.request_identity, "owner request")
+
+
+@dataclass(frozen=True)
+class CreatedResourceLocator:
+    """Curated immutable identity allocated by one identity-creating mutation."""
+
+    operation: GitHubMutationOperation
+    repository: RepositoryRef
+    pull_request_number: int | None = None
+    issue_number: int | None = None
+    comment_id: str | None = None
+    base_sha: str | None = None
+    head_sha: str | None = None
+    draft: bool | None = None
+    marker_digest: str | None = None
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.repository) is not RepositoryRef or self.operation not in {GitHubMutationOperation.CREATE_PULL_REQUEST, GitHubMutationOperation.COMMENT}:
+            raise GitHubRuntimeError("created resource operation is invalid")
+        _digest(self.marker_digest, "created resource marker")
+        if self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+            if type(self.pull_request_number) is not int or self.pull_request_number <= 0 or self.issue_number is not None or self.comment_id is not None or type(self.draft) is not bool or not self.draft:
+                raise GitHubRuntimeError("created pull request locator is invalid")
+            for value in (self.base_sha, self.head_sha):
+                if type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
+                    raise GitHubRuntimeError("created pull request locator sha is invalid")
+        else:
+            if type(self.issue_number) is not int or self.issue_number <= 0 or type(self.comment_id) is not str or not self.comment_id or any(value is not None for value in (self.pull_request_number, self.base_sha, self.head_sha, self.draft)):
+                raise GitHubRuntimeError("created comment locator is invalid")
+        object.__setattr__(self, "identity", _sha256({
+            "operation": self.operation.value,
+            "repository": self.repository.slug,
+            "pull_request_number": self.pull_request_number,
+            "issue_number": self.issue_number,
+            "comment_id": self.comment_id,
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+            "draft": self.draft,
+            "marker_digest": self.marker_digest,
+        }))
 
 
 class OwnerMutationTransport(Protocol):

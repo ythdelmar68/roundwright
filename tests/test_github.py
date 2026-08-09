@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 
 from roundwright.github import (
@@ -18,6 +20,9 @@ from roundwright.github import (
     MutationDisposition,
     MutationReceipt,
     RepositoryRef,
+    RequestedReviewersSnapshot,
+    _is_snapshot,
+    _validate_snapshot_for,
     normalize_github_response,
 )
 
@@ -35,13 +40,14 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS,
             GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST,
             GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS,
+            GitHubReadOperation.REQUESTED_REVIEWERS,
             GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY,
             GitHubReadOperation.CLOSING_REFERENCES,
         }:
             values["number"] = 40
         if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
             values["ref"] = "main"
-        if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}:
+        if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}:
             values["expected_sha"] = SHA
         values.update(changes)
         return GitHubReadRequest(**values)  # type: ignore[arg-type]
@@ -49,15 +55,16 @@ class GitHubAdapterTests(unittest.TestCase):
     def payload(self, operation: GitHubReadOperation) -> dict[str, object]:
         repository = {"owner": "example", "name": "roundwright"}
         payloads: dict[GitHubReadOperation, dict[str, object]] = {
-            GitHubReadOperation.REPOSITORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "default_branch_sha": SHA},
-            GitHubReadOperation.ISSUE: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": []},
-            GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41]},
-            GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
+            GitHubReadOperation.REPOSITORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "default_branch_sha": SHA, "repository_evidence_identity": DIGEST, "default_branch_evidence_identity": READBACK_DIGEST},
+            GitHubReadOperation.ISSUE: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
+            GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
+            GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "target_kind": "ISSUE", "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
             GitHubReadOperation.BRANCH: {"repository": repository, "ref": "main", "sha": SHA},
-            GitHubReadOperation.PULL_REQUEST: {"repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True},
+            GitHubReadOperation.PULL_REQUEST: {"repository": repository, "base_repository": repository, "head_repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True, "merge_commit_sha": None},
             GitHubReadOperation.REVIEWS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "reviews": [{"id": "review-1", "reviewer_id": "reviewer-1", "state": "APPROVED", "commit_sha": SHA}]},
-            GitHubReadOperation.CHECKS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "checks": [{"id": "check-1", "name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
-            GitHubReadOperation.WORKFLOW_RUNS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "runs": [{"id": "run-1", "workflow_name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
+            GitHubReadOperation.REQUESTED_REVIEWERS: {"repository": repository, "pull_request_number": 40, "candidate_sha": SHA, "reviewers": ["octocat"], "reviewer_set_digest": "sha256:" + hashlib.sha256(json.dumps(("reviewers", ("octocat",)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest(), "complete": True, "next_cursor": None, "raw_evidence_identity": DIGEST},
+            GitHubReadOperation.CHECKS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "check_evidence_identity": DIGEST, "candidate_evidence_identity": READBACK_DIGEST, "checks": [{"id": "check-1", "name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
+            GitHubReadOperation.WORKFLOW_RUNS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "workflow_evidence_identity": DIGEST, "candidate_evidence_identity": READBACK_DIGEST, "runs": [{"id": "run-1", "workflow_name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
             GitHubReadOperation.MERGEABILITY: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "mergeability": "MERGEABLE"},
             GitHubReadOperation.CLOSING_REFERENCES: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "references": [{"issue_number": 40, "pull_request_number": 40, "keyword": "closes", "head_sha": SHA}]},
             GitHubReadOperation.REMOTE_HEAD: {"repository": repository, "ref": "main", "sha": SHA},
@@ -75,14 +82,61 @@ class GitHubAdapterTests(unittest.TestCase):
                 self.assertEqual(result.snapshot, snapshot)
                 self.assertTrue(result.snapshot_digest.startswith("sha256:"))
 
+    def test_requested_reviewer_snapshot_map_is_total_and_rejects_other_snapshot_types(self) -> None:
+        request = self.request(GitHubReadOperation.REQUESTED_REVIEWERS)
+        snapshot = normalize_github_response(request, self.payload(request.operation))
+        self.assertIs(type(snapshot), RequestedReviewersSnapshot)
+        self.assertTrue(_is_snapshot(snapshot))
+        _validate_snapshot_for(request, snapshot)
+        wrong_snapshot = normalize_github_response(
+            self.request(GitHubReadOperation.COMMENTS), self.payload(GitHubReadOperation.COMMENTS),
+        )
+        with self.assertRaises(GitHubContractError):
+            _validate_snapshot_for(request, wrong_snapshot)
+        rejected = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=self.payload(GitHubReadOperation.COMMENTS))}).read(request)
+        self.assertFalse(rejected.ok)
+
     def test_response_shapes_fail_closed_without_preserving_comment_bodies(self) -> None:
         request = self.request(GitHubReadOperation.COMMENTS)
-        fake = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response={"repository": {"owner": "example", "name": "roundwright"}, "issue_number": 40, "comments": [{"id": "comment-1"}]})})
+        fake = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response={"repository": {"owner": "example", "name": "roundwright"}, "issue_number": 40, "target_kind": "ISSUE", "comments": [{"id": "comment-1"}]})})
         result = fake.read(request)
         self.assertFalse(result.ok)
         self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
         snapshot = normalize_github_response(request, self.payload(GitHubReadOperation.COMMENTS))
         self.assertNotIn("public evidence", repr(snapshot))
+
+    def test_merged_pull_request_requires_exact_merge_commit_sha(self) -> None:
+        request = self.request(GitHubReadOperation.PULL_REQUEST)
+        merged = self.payload(GitHubReadOperation.PULL_REQUEST)
+        merged.update({"state": "MERGED", "draft": False, "merge_commit_sha": "d" * 40})
+        snapshot = normalize_github_response(request, merged)
+        self.assertEqual(snapshot.merge_commit_sha, "d" * 40)
+        for field, value in (("merge_commit_sha", None), ("merge_commit_sha", "not-a-sha"), ("merge_commit_sha", "d" * 64)):
+            malformed = dict(merged)
+            malformed[field] = value
+            with self.subTest(value=value), self.assertRaises(GitHubContractError):
+                normalize_github_response(request, malformed)
+        open_with_merge = self.payload(GitHubReadOperation.PULL_REQUEST)
+        open_with_merge["merge_commit_sha"] = "d" * 40
+        self.assertEqual(normalize_github_response(request, open_with_merge).merge_commit_sha, "d" * 40)
+        for state, draft in (("OPEN", True), ("OPEN", False), ("CLOSED", False)):
+            ordinary = self.payload(GitHubReadOperation.PULL_REQUEST)
+            ordinary.update({"state": state, "draft": draft, "merge_commit_sha": "d" * 40})
+            with self.subTest(state=state, draft=draft):
+                self.assertEqual(normalize_github_response(request, ordinary).merge_commit_sha, "d" * 40)
+        drifted = dict(open_with_merge)
+        drifted["head_repository"] = {"owner": "other", "name": "repository"}
+        self.assertEqual(normalize_github_response(request, drifted).head_repository.slug, "other/repository")
+
+    def test_requested_reviewer_snapshot_accepts_provider_user_and_team_identities(self) -> None:
+        request = self.request(GitHubReadOperation.REQUESTED_REVIEWERS)
+        payload = self.payload(GitHubReadOperation.REQUESTED_REVIEWERS)
+        reviewers = ["dependabot[bot]", "example/core-team"]
+        payload["reviewers"] = reviewers
+        payload["reviewer_set_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(("reviewers", tuple(reviewers)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+        ).hexdigest()
+        self.assertEqual(normalize_github_response(request, payload).reviewers, tuple(reviewers))
 
     def test_collection_response_identity_is_never_synthesized_from_the_request(self) -> None:
         request = self.request(GitHubReadOperation.COMMENTS)
@@ -203,7 +257,7 @@ class GitHubAdapterTests(unittest.TestCase):
     def test_ref_sensitive_mutations_bind_exact_commits_and_stale_heads(self) -> None:
         create_pr = self.intent(GitHubMutationOperation.CREATE_PULL_REQUEST)
         changed_payload = tuple((key, "b" * 40 if key == "head_sha" else value) for key, value in create_pr.payload)
-        changed_pr = GitHubMutationIntent(create_pr.operation, create_pr.repository, create_pr.idempotency_key, payload=changed_payload)
+        changed_pr = GitHubMutationIntent(create_pr.operation, create_pr.repository, create_pr.idempotency_key, target_number=create_pr.target_number, payload=changed_payload)
         self.assertNotEqual(create_pr.identity(), changed_pr.identity())
         for operation in (GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST):
             with self.subTest(operation=operation):
@@ -286,7 +340,7 @@ class GitHubAdapterTests(unittest.TestCase):
         }
         return GitHubMutationIntent(
             operation, REPOSITORY, f"intent-{operation.value}",
-            target_number=40 if operation not in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.CREATE_PULL_REQUEST} else None,
+            target_number=40 if operation not in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} else None,
             expected_sha=SHA if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST} else None,
             target_ref="codex/issue-40" if operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} else None,
             payload=payloads[operation],

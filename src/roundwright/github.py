@@ -21,7 +21,8 @@ from typing import Mapping, Protocol, TypeAlias
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
-_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,255}\Z")
+_REVIEWER = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[[A-Za-z0-9-]{1,39}\])?|[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9-]{0,99})\Z")
 _PUBLIC_TEXT = re.compile(r"[^\x00-\x1f\x7f]{1,512}\Z")
 _COMMENT_TEXT = re.compile(r"(?s)[^\x00\x7f]{1,65536}\Z")
 
@@ -38,6 +39,7 @@ class GitHubReadOperation(StrEnum):
     BRANCH = "branch"
     PULL_REQUEST = "pull-request"
     REVIEWS = "reviews"
+    REQUESTED_REVIEWERS = "requested-reviewers"
     CHECKS = "checks"
     WORKFLOW_RUNS = "workflow-runs"
     MERGEABILITY = "mergeability"
@@ -145,9 +147,9 @@ class GitHubReadRequest:
             raise GitHubContractError("read request reference is invalid")
         if self.expected_sha is not None:
             _validate_sha(self.expected_sha, "expected sha")
-        numbered = {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS, GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
+        numbered = {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS, GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
         ref_required = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
-        candidate_bound = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
+        candidate_bound = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
         if self.operation in numbered and self.number is None:
             raise GitHubContractError("read request requires a number")
         if self.operation not in numbered and self.number is not None:
@@ -171,12 +173,17 @@ class RepositorySnapshot:
     repository: RepositoryRef
     default_branch: str
     default_branch_sha: str
+    repository_evidence_identity: str
+    default_branch_evidence_identity: str
 
     def __post_init__(self) -> None:
         _validate_token(self.repository_id, "repository id")
         if type(self.repository) is not RepositoryRef or type(self.default_branch) is not str or not _IDENTIFIER.fullmatch(self.default_branch):
             raise GitHubContractError("repository snapshot is invalid")
-        _validate_sha(self.default_branch_sha, "default branch sha")
+        if type(self.default_branch_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.default_branch_sha):
+            raise GitHubContractError("default branch sha is invalid")
+        _validate_digest(self.repository_evidence_identity, "repository evidence")
+        _validate_digest(self.default_branch_evidence_identity, "default branch evidence")
 
 
 @dataclass(frozen=True)
@@ -185,6 +192,8 @@ class IssueSnapshot:
     issue_id: str
     number: int
     state: IssueState
+    issue_evidence_identity: str
+    relationship_evidence_identity: str
     parent_number: int | None = None
     sub_issue_numbers: tuple[int, ...] = ()
 
@@ -198,6 +207,8 @@ class IssueSnapshot:
         _validate_numbers(self.sub_issue_numbers, "sub issue numbers")
         if self.number == self.parent_number or self.number in self.sub_issue_numbers:
             raise GitHubContractError("issue relationship is invalid")
+        _validate_digest(self.issue_evidence_identity, "issue evidence")
+        _validate_digest(self.relationship_evidence_identity, "issue relationship evidence")
 
 
 @dataclass(frozen=True)
@@ -218,12 +229,15 @@ class CommentSnapshot:
 class CommentsSnapshot:
     repository: RepositoryRef
     issue_number: int
+    target_kind: str
     comments: tuple[CommentSnapshot, ...]
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryRef:
             raise GitHubContractError("comments repository is invalid")
         _validate_number(self.issue_number, "issue number")
+        if type(self.target_kind) is not str or self.target_kind not in {"ISSUE", "PULL_REQUEST"}:
+            raise GitHubContractError("comments target kind is invalid")
         if type(self.comments) is not tuple or any(type(item) is not CommentSnapshot for item in self.comments):
             raise GitHubContractError("comments snapshot is invalid")
         _unique((item.comment_id for item in self.comments), "comment identities")
@@ -244,6 +258,8 @@ class BranchSnapshot:
 @dataclass(frozen=True)
 class PullRequestSnapshot:
     repository: RepositoryRef
+    base_repository: RepositoryRef
+    head_repository: RepositoryRef
     pull_request_id: str
     number: int
     state: PullRequestState
@@ -252,10 +268,13 @@ class PullRequestSnapshot:
     head_ref: str
     head_sha: str
     draft: bool
+    merge_commit_sha: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.repository) is not RepositoryRef:
+        if any(type(value) is not RepositoryRef for value in (self.repository, self.base_repository, self.head_repository)):
             raise GitHubContractError("pull request repository is invalid")
+        if self.base_repository != self.repository:
+            raise GitHubContractError("pull request base repository is invalid")
         _validate_token(self.pull_request_id, "pull request id")
         _validate_number(self.number, "pull request number")
         if type(self.state) is not PullRequestState or type(self.draft) is not bool:
@@ -265,6 +284,13 @@ class PullRequestSnapshot:
                 raise GitHubContractError(f"{name} is invalid")
         _validate_sha(self.base_sha, "base sha")
         _validate_sha(self.head_sha, "head sha")
+        if self.state is PullRequestState.MERGED:
+            if type(self.merge_commit_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.merge_commit_sha):
+                raise GitHubContractError("merge commit sha is invalid")
+        elif self.merge_commit_sha is not None and (
+            type(self.merge_commit_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.merge_commit_sha)
+        ):
+            raise GitHubContractError("pull request merge commit is invalid")
 
 
 @dataclass(frozen=True)
@@ -300,6 +326,36 @@ class ReviewsSnapshot:
 
 
 @dataclass(frozen=True)
+class RequestedReviewersSnapshot:
+    """Complete, provider-evidenced requested-reviewer state for one PR."""
+
+    repository: RepositoryRef
+    pull_request_number: int
+    candidate_sha: str
+    reviewers: tuple[str, ...]
+    reviewer_set_digest: str
+    complete: bool
+    next_cursor: str | None
+    raw_evidence_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.repository) is not RepositoryRef:
+            raise GitHubContractError("requested reviewers repository is invalid")
+        _validate_number(self.pull_request_number, "pull request number")
+        _validate_sha(self.candidate_sha, "requested reviewers candidate")
+        if type(self.reviewers) is not tuple or any(type(login) is not str or not _REVIEWER.fullmatch(login) for login in self.reviewers):
+            raise GitHubContractError("requested reviewer logins are invalid")
+        if tuple(sorted(self.reviewers)) != self.reviewers or len(set(self.reviewers)) != len(self.reviewers):
+            raise GitHubContractError("requested reviewer logins are not canonical")
+        _validate_digest(self.reviewer_set_digest, "requested reviewer digest")
+        if self.reviewer_set_digest != _digest(("reviewers", self.reviewers)):
+            raise GitHubContractError("requested reviewer digest does not match logins")
+        if type(self.complete) is not bool or (self.complete and self.next_cursor is not None) or (not self.complete and (type(self.next_cursor) is not str or not self.next_cursor)):
+            raise GitHubContractError("requested reviewer completeness is invalid")
+        _validate_digest(self.raw_evidence_identity, "requested reviewer evidence")
+
+
+@dataclass(frozen=True)
 class CheckSnapshot:
     check_id: str
     name: str
@@ -323,6 +379,8 @@ class ChecksSnapshot:
     repository: RepositoryRef
     pull_request_number: int
     head_sha: str
+    check_evidence_identity: str
+    candidate_evidence_identity: str
     checks: tuple[CheckSnapshot, ...]
 
     def __post_init__(self) -> None:
@@ -330,6 +388,8 @@ class ChecksSnapshot:
             raise GitHubContractError("checks repository is invalid")
         _validate_number(self.pull_request_number, "pull request number")
         _validate_sha(self.head_sha, "checks head sha")
+        _validate_digest(self.check_evidence_identity, "check evidence")
+        _validate_digest(self.candidate_evidence_identity, "check candidate evidence")
         if type(self.checks) is not tuple or any(type(item) is not CheckSnapshot for item in self.checks):
             raise GitHubContractError("checks snapshot is invalid")
         _unique((item.check_id for item in self.checks), "check identities")
@@ -359,6 +419,8 @@ class WorkflowRunsSnapshot:
     repository: RepositoryRef
     pull_request_number: int
     head_sha: str
+    workflow_evidence_identity: str
+    candidate_evidence_identity: str
     runs: tuple[WorkflowRunSnapshot, ...]
 
     def __post_init__(self) -> None:
@@ -366,6 +428,8 @@ class WorkflowRunsSnapshot:
             raise GitHubContractError("workflow runs repository is invalid")
         _validate_number(self.pull_request_number, "pull request number")
         _validate_sha(self.head_sha, "workflow runs head sha")
+        _validate_digest(self.workflow_evidence_identity, "workflow evidence")
+        _validate_digest(self.candidate_evidence_identity, "workflow candidate evidence")
         if type(self.runs) is not tuple or any(type(item) is not WorkflowRunSnapshot for item in self.runs):
             raise GitHubContractError("workflow runs snapshot is invalid")
         _unique((item.run_id for item in self.runs), "workflow run identities")
@@ -397,7 +461,7 @@ class ClosingReferenceSnapshot:
     def __post_init__(self) -> None:
         _validate_number(self.issue_number, "closing issue number")
         _validate_number(self.pull_request_number, "closing pull request number")
-        if type(self.keyword) is not str or self.keyword not in {"close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"}:
+        if type(self.keyword) is not str or self.keyword not in {"close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved", "closing-reference"}:
             raise GitHubContractError("closing keyword is invalid")
         _validate_sha(self.head_sha, "closing reference head sha")
 
@@ -431,7 +495,7 @@ class RemoteHeadSnapshot:
         _validate_sha(self.sha, "remote head sha")
 
 
-GitHubSnapshot: TypeAlias = RepositorySnapshot | IssueSnapshot | CommentsSnapshot | BranchSnapshot | PullRequestSnapshot | ReviewsSnapshot | ChecksSnapshot | WorkflowRunsSnapshot | MergeabilitySnapshot | ClosingReferencesSnapshot | RemoteHeadSnapshot
+GitHubSnapshot: TypeAlias = RepositorySnapshot | IssueSnapshot | CommentsSnapshot | BranchSnapshot | PullRequestSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot | ChecksSnapshot | WorkflowRunsSnapshot | MergeabilitySnapshot | ClosingReferencesSnapshot | RemoteHeadSnapshot
 
 
 @dataclass(frozen=True)
@@ -490,7 +554,7 @@ class GitHubMutationIntent:
             _validate_sha(self.expected_sha, "mutation expected sha")
         if self.target_ref is not None and (type(self.target_ref) is not str or not _IDENTIFIER.fullmatch(self.target_ref)):
             raise GitHubContractError("mutation target reference is invalid")
-        number_required = {GitHubMutationOperation.COMMENT, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE}
+        number_required = {GitHubMutationOperation.CREATE_PULL_REQUEST, GitHubMutationOperation.COMMENT, GitHubMutationOperation.REQUEST_REVIEW, GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST, GitHubMutationOperation.CLOSE_ISSUE}
         if self.operation in number_required and self.target_number is None:
             raise GitHubContractError("mutation intent requires a target number")
         if self.operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH} and self.target_ref is None:
@@ -612,6 +676,20 @@ class FakeGitHubAdapter:
         except GitHubContractError:
             return _read_failure(request, GitHubFailureKind.MALFORMED_RESPONSE, "fixture response is malformed")
 
+    def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> object:
+        """Expose an explicit terminal page for typed hermetic fixtures only."""
+
+        if request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS} or cursor is not None:
+            return None
+        result = self.read(request)
+        if not result.ok or type(result.snapshot) not in {CommentsSnapshot, ReviewsSnapshot}:
+            return None
+        # Delayed import avoids making the core contracts depend on the runtime
+        # process boundary while still giving tests explicit page metadata.
+        from .github_runtime import CollectionPage
+        count = len(result.snapshot.comments if type(result.snapshot) is CommentsSnapshot else result.snapshot.reviews)
+        return CollectionPage(request, None, None, count, result.snapshot)
+
     def submit(self, intent: GitHubMutationIntent) -> GitHubMutationResult:
         if type(intent) is not GitHubMutationIntent:
             raise GitHubContractError("mutation intent is invalid")
@@ -648,39 +726,54 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
     try:
         operation = request.operation
         if operation is GitHubReadOperation.REPOSITORY:
-            _exact_shape(response, {"repository", "id", "default_branch", "default_branch_sha"})
+            _exact_shape(response, {"repository", "id", "default_branch", "default_branch_sha", "repository_evidence_identity", "default_branch_evidence_identity"})
             repository = _repository(response)
-            return RepositorySnapshot(_string(response, "id"), repository, _string(response, "default_branch"), _string(response, "default_branch_sha"))
+            return RepositorySnapshot(
+                _string(response, "id"), repository, _string(response, "default_branch"),
+                _string(response, "default_branch_sha"), _string(response, "repository_evidence_identity"),
+                _string(response, "default_branch_evidence_identity"),
+            )
         if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
-            _exact_shape(response, {"repository", "id", "number", "state", "parent_number", "sub_issue_numbers"})
-            return IssueSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), IssueState(_string(response, "state")), _optional_integer(response, "parent_number"), _integer_tuple(response, "sub_issue_numbers"))
+            _exact_shape(response, {"repository", "id", "number", "state", "parent_number", "sub_issue_numbers", "issue_evidence_identity", "relationship_evidence_identity"})
+            return IssueSnapshot(
+                _repository(response), _string(response, "id"), _integer(response, "number"),
+                IssueState(_string(response, "state")), _string(response, "issue_evidence_identity"),
+                _string(response, "relationship_evidence_identity"), _optional_integer(response, "parent_number"),
+                _integer_tuple(response, "sub_issue_numbers"),
+            )
         if operation is GitHubReadOperation.COMMENTS:
-            _exact_shape(response, {"repository", "issue_number", "comments"})
-            return CommentsSnapshot(_repository(response), _integer(response, "issue_number"), tuple(CommentSnapshot(_string(item, "id"), _string(item, "author_id"), _digest_text(_string(item, "body")), _string(item, "created_at")) for item in _mappings(response, "comments", {"id", "author_id", "body", "created_at"})))
+            _exact_shape(response, {"repository", "issue_number", "target_kind", "comments"})
+            return CommentsSnapshot(_repository(response), _integer(response, "issue_number"), _string(response, "target_kind"), tuple(CommentSnapshot(_string(item, "id"), _string(item, "author_id"), _digest_text(_string(item, "body")), _string(item, "created_at")) for item in _mappings(response, "comments", {"id", "author_id", "body", "created_at"})))
         if operation is GitHubReadOperation.BRANCH:
             _exact_shape(response, {"repository", "ref", "sha"})
             return BranchSnapshot(_repository(response), _string(response, "ref"), _string(response, "sha"))
         if operation is GitHubReadOperation.PULL_REQUEST:
-            _exact_shape(response, {"repository", "id", "number", "state", "base_ref", "base_sha", "head_ref", "head_sha", "draft"})
-            return PullRequestSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), PullRequestState(_string(response, "state")), _string(response, "base_ref"), _string(response, "base_sha"), _string(response, "head_ref"), _string(response, "head_sha"), _boolean(response, "draft"))
+            _exact_shape(response, {"repository", "base_repository", "head_repository", "id", "number", "state", "base_ref", "base_sha", "head_ref", "head_sha", "draft", "merge_commit_sha"})
+            return PullRequestSnapshot(_repository(response), _repository(response, "base_repository"), _repository(response, "head_repository"), _string(response, "id"), _integer(response, "number"), PullRequestState(_string(response, "state")), _string(response, "base_ref"), _string(response, "base_sha"), _string(response, "head_ref"), _string(response, "head_sha"), _boolean(response, "draft"), _optional_string(response, "merge_commit_sha"))
         if operation is GitHubReadOperation.REVIEWS:
             _exact_shape(response, {"repository", "pull_request_number", "head_sha", "reviews"})
             head_sha = _string(response, "head_sha")
             reviews = tuple(ReviewSnapshot(_string(item, "id"), _string(item, "reviewer_id"), ReviewState(_string(item, "state")), _string(item, "commit_sha")) for item in _mappings(response, "reviews", {"id", "reviewer_id", "state", "commit_sha"}))
             _validate_collection_head(head_sha, tuple(item.commit_sha for item in reviews))
             return ReviewsSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, reviews)
+        if operation is GitHubReadOperation.REQUESTED_REVIEWERS:
+            _exact_shape(response, {"repository", "pull_request_number", "candidate_sha", "reviewers", "reviewer_set_digest", "complete", "next_cursor", "raw_evidence_identity"})
+            snapshot = RequestedReviewersSnapshot(_repository(response), _integer(response, "pull_request_number"), _string(response, "candidate_sha"), tuple(_strings(response, "reviewers")), _string(response, "reviewer_set_digest"), _boolean(response, "complete"), _optional_string(response, "next_cursor"), _string(response, "raw_evidence_identity"))
+            if snapshot.repository != request.repository or snapshot.pull_request_number != request.number or snapshot.candidate_sha != request.expected_sha:
+                raise GitHubContractError("requested reviewer identity drifted")
+            return snapshot
         if operation is GitHubReadOperation.CHECKS:
-            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "checks"})
+            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "check_evidence_identity", "candidate_evidence_identity", "checks"})
             head_sha = _string(response, "head_sha")
             checks = tuple(CheckSnapshot(_string(item, "id"), _string(item, "name"), CheckState(_string(item, "state")), _optional_enum(item, "conclusion", CheckConclusion), _string(item, "head_sha")) for item in _mappings(response, "checks", {"id", "name", "state", "conclusion", "head_sha"}))
             _validate_collection_head(head_sha, tuple(item.head_sha for item in checks))
-            return ChecksSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, checks)
+            return ChecksSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, _string(response, "check_evidence_identity"), _string(response, "candidate_evidence_identity"), checks)
         if operation is GitHubReadOperation.WORKFLOW_RUNS:
-            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "runs"})
+            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "workflow_evidence_identity", "candidate_evidence_identity", "runs"})
             head_sha = _string(response, "head_sha")
             runs = tuple(WorkflowRunSnapshot(_string(item, "id"), _string(item, "workflow_name"), CheckState(_string(item, "state")), _optional_enum(item, "conclusion", CheckConclusion), _string(item, "head_sha")) for item in _mappings(response, "runs", {"id", "workflow_name", "state", "conclusion", "head_sha"}))
             _validate_collection_head(head_sha, tuple(item.head_sha for item in runs))
-            return WorkflowRunsSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, runs)
+            return WorkflowRunsSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, _string(response, "workflow_evidence_identity"), _string(response, "candidate_evidence_identity"), runs)
         if operation is GitHubReadOperation.MERGEABILITY:
             _exact_shape(response, {"repository", "pull_request_number", "head_sha", "mergeability"})
             return MergeabilitySnapshot(_repository(response), _integer(response, "pull_request_number"), _string(response, "head_sha"), Mergeability(_string(response, "mergeability")))
@@ -710,6 +803,7 @@ def _validate_snapshot_for(request: GitHubReadRequest, snapshot: GitHubSnapshot)
         GitHubReadOperation.BRANCH: BranchSnapshot,
         GitHubReadOperation.PULL_REQUEST: PullRequestSnapshot,
         GitHubReadOperation.REVIEWS: ReviewsSnapshot,
+        GitHubReadOperation.REQUESTED_REVIEWERS: RequestedReviewersSnapshot,
         GitHubReadOperation.CHECKS: ChecksSnapshot,
         GitHubReadOperation.WORKFLOW_RUNS: WorkflowRunsSnapshot,
         GitHubReadOperation.MERGEABILITY: MergeabilitySnapshot,
@@ -737,7 +831,7 @@ def _validate_snapshot_for(request: GitHubReadRequest, snapshot: GitHubSnapshot)
 
 
 def _snapshot_sha(snapshot: GitHubSnapshot) -> str | None:
-    for name in ("sha", "head_sha", "default_branch_sha"):
+    for name in ("sha", "head_sha", "candidate_sha", "default_branch_sha"):
         value = getattr(snapshot, name, None)
         if type(value) is str:
             return value
@@ -769,7 +863,7 @@ def _mutation_failure(intent: GitHubMutationIntent, kind: GitHubFailureKind, rea
 
 
 def _is_snapshot(value: object) -> bool:
-    return type(value) in {RepositorySnapshot, IssueSnapshot, CommentsSnapshot, BranchSnapshot, PullRequestSnapshot, ReviewsSnapshot, ChecksSnapshot, WorkflowRunsSnapshot, MergeabilitySnapshot, ClosingReferencesSnapshot, RemoteHeadSnapshot}
+    return type(value) in {RepositorySnapshot, IssueSnapshot, CommentsSnapshot, BranchSnapshot, PullRequestSnapshot, ReviewsSnapshot, RequestedReviewersSnapshot, ChecksSnapshot, WorkflowRunsSnapshot, MergeabilitySnapshot, ClosingReferencesSnapshot, RemoteHeadSnapshot}
 
 
 def _string(mapping: Mapping[str, object], key: str) -> str:
@@ -777,6 +871,20 @@ def _string(mapping: Mapping[str, object], key: str) -> str:
     if type(value) is not str:
         raise GitHubContractError("response field is invalid")
     return value
+
+
+def _optional_string(mapping: Mapping[str, object], key: str) -> str | None:
+    value = mapping[key]
+    if value is not None and type(value) is not str:
+        raise GitHubContractError("response string is invalid")
+    return value
+
+
+def _strings(mapping: Mapping[str, object], key: str) -> tuple[str, ...]:
+    value = mapping[key]
+    if type(value) is not list or any(type(item) is not str for item in value):
+        raise GitHubContractError("response strings are invalid")
+    return tuple(value)
 
 
 def _integer(mapping: Mapping[str, object], key: str) -> int:
@@ -827,8 +935,8 @@ def _optional_enum(mapping: Mapping[str, object], key: str, enum: type[StrEnum])
     return enum(value)
 
 
-def _repository(mapping: Mapping[str, object]) -> RepositoryRef:
-    value = mapping["repository"]
+def _repository(mapping: Mapping[str, object], key: str = "repository") -> RepositoryRef:
+    value = mapping[key]
     if type(value) is not dict:
         raise GitHubContractError("response repository is invalid")
     _exact_shape(value, {"owner", "name"})
@@ -883,7 +991,7 @@ def _validate_mutation_payload(
         if target_number is not None or expected_sha is None:
             raise GitHubContractError("branch deletion identity is invalid")
     elif operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
-        if target_number is not None or expected_sha is not None or target_ref is not None:
+        if target_number is None or expected_sha is not None or target_ref is not None:
             raise GitHubContractError("pull request creation identity is invalid")
         for field in ("base_ref", "head_ref"):
             if not _IDENTIFIER.fullmatch(values[field]):

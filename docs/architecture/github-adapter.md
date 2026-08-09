@@ -34,6 +34,47 @@ Remote branch creation, non-force update, and deletion are distinct actions.
 An update binds both the previously observed SHA and the desired exact SHA;
 request-review binds the exact pull-request head SHA and reviewers digest.
 
+## `gh` runtime seam and semantic receipts
+
+`roundwright.github_runtime` supplies that narrow `gh` seam. `gh` is the
+documented default live adapter; MCP remains optional. The subprocess runner
+accepts only the literal `gh` executable, uses no shell or token argument,
+discards stderr, and returns no raw output beyond the adapter's immediate
+normalization step. It never calls `gh auth status`, discovers credentials, or
+places credentials, raw output, paths, or payload text in a typed result,
+diagnostic, or receipt.
+
+Every declared read and mutation operation requires its own
+`OperationHealth` observation in `GitHubCapabilityHealth`. A missing row is
+invalid; an unavailable row fails before a command is run. The default matrix
+marks every operation unavailable, so constructing the adapter does not create
+authority. Direct `submit` calls are denied even when health is available:
+only `GitHubMutationBroker` can consider a typed intent. The adapter's separate
+broker-only execution seam maps every declared mutation operation to one fixed
+`gh` command shape. It accepts an ephemeral, digest-bound
+`GhMutationPayload` from the credential-owning Orchestrator, rejects a missing
+or mismatched payload before starting a process, and discards command output.
+It does not accept a shell string, executable override, token, or arbitrary
+command line. An unforgeable in-process capability is issued only to the
+broker, so invoking the execution seam without the broker is denied too.
+
+The broker requires an already-authorized exact Boolean repository-policy
+decision, an authoritative deployment decision, a matching candidate, a gate
+identity, configuration/base/candidate identities, and a pre-state read before
+it invokes an adapter. A success exit code is insufficient: it requires an
+operation-specific post-state read and produces a `SemanticMutationReceipt`
+only if the exact semantic condition matches. The receipt binds repository,
+operation, idempotency key, public payload digest, policy/configuration/
+deployment/task/base/candidate/gate identities, pre- and post-state digests,
+affected identity, and disposition. A repeat returns the retained receipt
+without another mutation; an interrupted or mismatched post-state is marked
+for reconciliation and is never reported as success.
+
+The active repository policy keeps Roundwright disabled. Therefore the Phase 3
+Shadow path evaluates these requirements counterfactually and denies before
+broker execution. Live use is limited to separately approved read-only
+observations; mutation fixtures remain hermetic and prove zero live mutation.
+
 `FakeGitHubAdapter` is test-only and fully deterministic. Fixtures specify
 normal responses, each failure class, stale responses, and duplicate semantic
 receipts. It records every attempted adapter call. Mutation intents are denied

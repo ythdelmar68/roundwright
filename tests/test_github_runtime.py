@@ -145,6 +145,7 @@ class FixtureOwnerSealRegistry:
             request.deployment_identity, request.semantic_plan_identity,
             request.journal_identity, request.pre_state_identity,
             request.evaluated_at, request.fresh_until, request.time_identity,
+            request.capability_health_identity,
             request.operation, request.repository, request.candidate_sha,
             request.idempotency_identity, request.command,
         )
@@ -173,6 +174,7 @@ def sealed_owner_request(*, evaluated_at: datetime = NOW, fresh_until: datetime 
         idempotency_identity=DIGEST, command=BrokerMutationCommand.COMMENT,
         deployment_identity="a" * 64, pre_state_identity=DIGEST,
         evaluated_at=evaluated_text, fresh_until=expires_at, time_identity=time_identity,
+        capability_health_identity=DIGEST,
     )
 
 
@@ -182,6 +184,7 @@ def sealed_owner_record(request: OwnerMutationRequest) -> OwnerMutationSealRecor
         request.deployment_identity, request.semantic_plan_identity,
         request.journal_identity, request.pre_state_identity,
         request.evaluated_at, request.fresh_until, request.time_identity,
+        request.capability_health_identity,
         request.operation, request.repository, request.candidate_sha,
         request.idempotency_identity, request.command,
     )
@@ -200,10 +203,15 @@ class PagedFakeGitHubAdapter(FakeGitHubAdapter):
         return self.pages.get(cursor)
 
 
-def health(*available: object) -> GitHubCapabilityHealth:
+def health(
+    *available: object, observed_at: datetime = NOW, fresh_until: datetime | None = None,
+) -> GitHubCapabilityHealth:
     return GitHubCapabilityHealth(
         tuple(
-            OperationHealth(operation, CapabilityState.AVAILABLE if operation in available else CapabilityState.UNAVAILABLE, NOW, "sha256:" + hashlib.sha256(str(index).encode("utf-8")).hexdigest())
+            OperationHealth(
+                operation, CapabilityState.AVAILABLE if operation in available else CapabilityState.UNAVAILABLE,
+                observed_at, "sha256:" + hashlib.sha256(str(index).encode("utf-8")).hexdigest(), fresh_until,
+            )
             for index, operation in enumerate((*GitHubReadOperation, *GitHubMutationOperation))
         )
     )
@@ -385,7 +393,9 @@ def comments_page(
     return CollectionPage(actual_request, cursor, next_cursor, total, CommentsSnapshot(REPOSITORY, 46, items))
 
 
-def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationOperation.ISSUE_COMMENT) -> MutationBrokerContext:
+def allowed_context(
+    operation: RepositoryMutationOperation = RepositoryMutationOperation.ISSUE_COMMENT, *, now: datetime = NOW,
+) -> MutationBrokerContext:
     document = RepositoryMutationPolicy(2, True, True, True, True, True, True, True, True, True, True, True, True)
     snapshot = TrustedRepositoryPolicySnapshot(RepositoryPolicySource("0" * 64, "1" * 64), document)
     mutation_context = RepositoryMutationContext("5" * 64, "6" * 64, "7" * 64, SHA)
@@ -394,13 +404,13 @@ def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationO
         "3" * 64, "4" * 64, snapshot.source.source_fingerprint, snapshot.source.revision_fingerprint,
         snapshot.policy_digest, document.schema_version, mutation_context.repository_fingerprint,
         mutation_context.deployment_fingerprint, mutation_context.task_fingerprint, mutation_context.candidate_sha,
-        transition.digest, NOW, NOW + timedelta(hours=1),
+        transition.digest, now, now + timedelta(hours=1),
     )
     standing = StandingRepositoryAuthority(document)
     verification = RepositoryReceiptVerification("a" * 64, receipt.receipt_fingerprint, receipt.binding_digest, RepositoryReceiptStatus.FRESH)
     policy = evaluate_repository_mutation_policy(
         snapshot, receipt, mutation_context, operation, standing_authority=standing,
-        dispatcher_transition=transition, receipt_verification=verification, now=NOW,
+        dispatcher_transition=transition, receipt_verification=verification, now=now,
     )
     assert policy.authorized
     runtime = RuntimeBinding("roundwright-runtime/v1", DIGEST, "sha256:" + "d" * 64, ("sha256:" + "e" * 64,))
@@ -408,15 +418,15 @@ def allowed_context(operation: RepositoryMutationOperation = RepositoryMutationO
         mutation_context.repository_fingerprint, "9" * 64, "a" * 64,
         UUID("12345678-1234-5678-1234-567812345678"), mutation_context.deployment_fingerprint, runtime,
     )
-    deployment_receipt = DeploymentAuthorityReceipt("f" * 64, deployment_identity, DeploymentMode.AUTHORITATIVE, NOW - timedelta(minutes=1), NOW + timedelta(minutes=1))
+    deployment_receipt = DeploymentAuthorityReceipt("f" * 64, deployment_identity, DeploymentMode.AUTHORITATIVE, now - timedelta(minutes=1), now + timedelta(minutes=1))
     deployment_verification = AuthorityReceiptVerification(
         deployment_receipt.receipt_fingerprint, _receipt_binding_fingerprint(deployment_receipt),
         deployment_identity.repository_fingerprint, deployment_identity.state_id,
         deployment_identity.deployment_fingerprint, AuthorityReceiptStatus.FRESH, runtime,
     )
-    deployment = evaluate_deployment_authority(deployment_identity, deployment_receipt, deployment_verification, now=NOW)
+    deployment = evaluate_deployment_authority(deployment_identity, deployment_receipt, deployment_verification, now=now)
     assert deployment.authorized
-    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition, snapshot, receipt, deployment_identity, deployment_receipt, deployment_verification, NOW)
+    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition, snapshot, receipt, deployment_identity, deployment_receipt, deployment_verification, now)
 
 
 class GitHubRuntimeTests(unittest.TestCase):
@@ -511,6 +521,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             command=BrokerMutationCommand.CLOSE_ISSUE, deployment_identity="a" * 64,
             pre_state_identity=DIGEST, evaluated_at=request.evaluated_at,
             fresh_until=request.fresh_until, time_identity=request.time_identity,
+            capability_health_identity=DIGEST,
         )
         drifted = (
             replace(request, authorization_bundle_identity="sha256:" + "e" * 64),
@@ -518,6 +529,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             replace(request, idempotency_identity="sha256:" + "e" * 64),
             replace(request, semantic_plan_identity="sha256:" + "e" * 64),
             replace(request, journal_identity="sha256:" + "e" * 64),
+            replace(request, capability_health_identity="sha256:" + "e" * 64),
         )
         cases: tuple[OwnerMutationSealRecord | None, ...] = (
             None, *(sealed_owner_record(value) for value in drifted),
@@ -551,6 +563,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 "time_identity": "sha256:" + hashlib.sha256(
                     json.dumps((NOW.isoformat(), (NOW + timedelta(minutes=5)).isoformat()), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
                 ).hexdigest(),
+                "capability_health_identity": DIGEST,
             }
             if operation in numbered:
                 values["target_number"] = 46
@@ -586,6 +599,104 @@ class GitHubRuntimeTests(unittest.TestCase):
             OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
+
+    def test_production_clock_and_health_boundaries_fail_before_owner_or_read_calls(self) -> None:
+        """Only the injected broker clock selects authorization evaluation time."""
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "clock-boundary-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
+        context = allowed_context()
+        cases = (
+            ("caller-backdate", NOW, NOW + timedelta(minutes=5), NOW, NOW - timedelta(microseconds=1)),
+            ("before-observed", NOW + timedelta(microseconds=1), NOW + timedelta(minutes=5), NOW, NOW),
+            ("fresh-until", NOW, NOW + timedelta(minutes=5), NOW + timedelta(minutes=5), NOW + timedelta(minutes=5)),
+        )
+        for name, observed_at, fresh_until, clock_now, context_now in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                matrix = health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                    observed_at=observed_at, fresh_until=fresh_until,
+                )
+                runner, transport = Runner(), OwnerTransport()
+                broker = GitHubMutationBroker.with_owner_transport(
+                    owner_read_endpoint(runner, matrix), owner_endpoint(transport),
+                    journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: clock_now,
+                )
+                result = broker.submit(intent, replace(context, evaluated_at=context_now), payload=payload)
+                self.assertFalse(result.ok)
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(transport.requests, [])
+                self.assertEqual(transport.commands, [])
+
+    def test_production_health_half_open_interval_allows_observed_and_pre_expiry(self) -> None:
+        """The validity interval is [observed_at, fresh_until), never inclusive at expiry."""
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "clock-allowed-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
+        fresh_until = NOW + timedelta(minutes=5)
+        for now in (NOW, fresh_until - timedelta(microseconds=1)):
+            with self.subTest(now=now), tempfile.TemporaryDirectory() as directory:
+                matrix = health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                    observed_at=NOW, fresh_until=fresh_until,
+                )
+                runner = Runner(
+                    GhCommandResult(0, json.dumps(gh_comments_page())),
+                    GhCommandResult(0, json.dumps(gh_comments_page())),
+                )
+                transport = OwnerTransport()
+                result = GitHubMutationBroker.with_owner_transport(
+                    owner_read_endpoint(runner, matrix), owner_endpoint(transport),
+                    journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: now,
+                ).submit(intent, allowed_context(now=now), payload=payload)
+                self.assertTrue(result.ok)
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_production_restart_revalidates_original_freshness_before_any_downstream_call(self) -> None:
+        """Restart may read before expiry, but the exact expiry is denied before read/host dispatch."""
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "clock-restart-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
+        fresh_until = NOW + timedelta(minutes=5)
+        matrix = health(
+            GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+            observed_at=NOW, fresh_until=fresh_until,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            def crash(entry: MutationJournalEntry) -> None:
+                if entry.lifecycle is JournalLifecycle.EXECUTION_STARTED:
+                    raise RuntimeError("crash")
+            with self.assertRaises(RuntimeError):
+                GitHubMutationBroker.with_owner_transport(
+                    owner_read_endpoint(Runner(GhCommandResult(0, json.dumps(gh_comments_page()))), matrix),
+                    owner_endpoint(OwnerTransport()), journal=DurableMutationJournal(path),
+                    clock=lambda: NOW, checkpoint_observer=crash,
+                ).submit(intent, allowed_context(), payload=payload)
+
+            before_expiry = fresh_until - timedelta(microseconds=1)
+            restart_runner, restart_transport = Runner(GhCommandResult(0, json.dumps(gh_comments_page()))), OwnerTransport()
+            recovered = GitHubMutationBroker.with_owner_transport(
+                owner_read_endpoint(restart_runner, matrix), owner_endpoint(restart_transport),
+                journal=DurableMutationJournal(path), clock=lambda: before_expiry,
+            ).reconcile(intent, allowed_context(now=before_expiry))
+            self.assertTrue(recovered.ok)
+            self.assertEqual(restart_transport.requests, [])
+
+            expired_runner, expired_transport = Runner(), OwnerTransport()
+            expired = GitHubMutationBroker.with_owner_transport(
+                owner_read_endpoint(expired_runner, matrix), owner_endpoint(expired_transport),
+                journal=DurableMutationJournal(path), clock=lambda: fresh_until,
+            ).reconcile(intent, allowed_context(now=fresh_until))
+            self.assertFalse(expired.ok)
+            self.assertEqual(expired_runner.calls, [])
+            self.assertEqual(expired_transport.requests, [])
 
     def test_created_resource_locator_binds_to_fixed_request_and_plan(self) -> None:
         comment_intent = GitHubMutationIntent(
@@ -828,6 +939,18 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(bundle.serialize()["candidate_sha"], SHA)
         with self.assertRaises((AttributeError, TypeError)):
             bundle.candidate_sha = BASE  # type: ignore[misc]
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        bound = schema_v2_authorization_bundle(allowed_context(), now=NOW, health=matrix)
+        self.assertEqual(bound.capability_health_identity, matrix.identity)
+        self.assertNotEqual(bound.identity, bundle.identity)
+        with self.assertRaises(ValueError):
+            replace(bound, time_identity=DIGEST)
+        future = health(
+            GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+            observed_at=NOW + timedelta(microseconds=1), fresh_until=NOW + timedelta(minutes=5),
+        )
+        with self.assertRaises(ValueError):
+            schema_v2_authorization_bundle(allowed_context(), now=NOW, health=future)
 
     def test_context_constructs_schema_v2_bundle_from_canonical_evidence(self) -> None:
         context = allowed_context()
@@ -1908,17 +2031,21 @@ class GitHubRuntimeTests(unittest.TestCase):
             def crash(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
                     raise RuntimeError("crash")
-            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=journal, checkpoint_observer=crash)
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=journal, clock=lambda: NOW, checkpoint_observer=crash)
             with self.assertRaises(RuntimeError):
                 broker.submit(intent, context, payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),)))
-            entry = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent))
+            entry = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context, health=matrix), _broker_semantic_plan(intent))
             stored = journal.find(entry)
             self.assertIs(stored.lifecycle, JournalLifecycle.TRANSPORT_ACCEPTED)  # type: ignore[union-attr]
             self.assertEqual(len(transport.requests), 1)
-            restart = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
-            result = GitHubMutationBroker(restart, journal=DurableMutationJournal(Path(directory) / "journal.json")).submit(intent, context)
+            restart_runner = Runner(GhCommandResult(0, json.dumps(gh_comments_page())))
+            restart_transport = OwnerTransport()
+            result = GitHubMutationBroker.with_owner_transport(
+                owner_read_endpoint(restart_runner, matrix), owner_endpoint(restart_transport),
+                journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW,
+            ).submit(intent, context)
             self.assertTrue(result.ok)
-            self.assertEqual(restart.call_count(kind="mutation"), 0)
+            self.assertEqual(restart_transport.requests, [])
             self.assertEqual(result.receipt.pre_state_digest, stored.pre_state_digest)  # type: ignore[union-attr]
 
     def test_execution_started_incomplete_postread_remains_blocked(self) -> None:
@@ -2050,7 +2177,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
             transport = OwnerTransport()
-            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW)
             result = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
             self.assertTrue(result.ok)
             self.assertEqual(len(runner.calls), 2)
@@ -2074,7 +2201,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
-            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW)
             payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
             first = broker.submit(intent, allowed_context(), payload=payload)
             self.assertFalse(first.ok)

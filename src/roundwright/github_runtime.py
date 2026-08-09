@@ -124,7 +124,11 @@ class OperationHealth:
         return self.state is CapabilityState.AVAILABLE
 
     def fresh_at(self, now: datetime) -> bool:
-        return type(now) is datetime and now.tzinfo is timezone.utc and now <= self.fresh_until
+        return (
+            type(now) is datetime
+            and now.tzinfo is timezone.utc
+            and self.observed_at <= now < self.fresh_until
+        )
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,32 @@ class GitHubCapabilityHealth:
         if type(operation) not in (GitHubReadOperation, GitHubMutationOperation):
             raise GitHubRuntimeError("capability operation is invalid")
         return next(item for item in self.observations if item.operation is operation)
+
+    @property
+    def identity(self) -> str:
+        """Bind the complete observed capability profile, including validity."""
+
+        return _sha256(tuple(
+            (item.operation.value, item.state.value, item.observed_at.isoformat(),
+             item.fresh_until.isoformat(), item.evidence_digest)
+            for item in self.observations
+        ))
+
+    def fresh_at(self, now: datetime) -> bool:
+        return type(now) is datetime and now.tzinfo is timezone.utc and all(
+            item.fresh_at(now) for item in self.observations
+        )
+
+
+def _require_fresh_capabilities(
+    health: GitHubCapabilityHealth, operations: tuple[GitHubOperation, ...], now: datetime,
+) -> None:
+    """Reject unavailable, future, or expired required capability evidence."""
+
+    if type(health) is not GitHubCapabilityHealth or not health.fresh_at(now):
+        raise GitHubRuntimeError("capability health evidence is stale or malformed")
+    if any(not health.for_operation(operation).available for operation in operations):
+        raise GitHubRuntimeError("required capability health is unavailable")
 
 
 @dataclass(frozen=True)
@@ -190,6 +220,7 @@ class OwnerMutationRequest:
     evaluated_at: str | None = None
     fresh_until: str | None = None
     time_identity: str | None = None
+    capability_health_identity: str | None = None
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -212,7 +243,7 @@ class OwnerMutationRequest:
         sealed_values = (
             self.candidate_sha, self.idempotency_identity, self.command,
             self.deployment_identity, self.pre_state_identity, self.evaluated_at,
-            self.fresh_until, self.time_identity,
+            self.fresh_until, self.time_identity, self.capability_health_identity,
         )
         if any(value is not None for value in sealed_values) and any(value is None for value in sealed_values):
             raise GitHubRuntimeError("owner mutation seal is incomplete")
@@ -223,6 +254,7 @@ class OwnerMutationRequest:
                 (self.idempotency_identity, "owner idempotency"),
                 (self.pre_state_identity, "owner pre-state"),
                 (self.time_identity, "owner time"),
+                (self.capability_health_identity, "owner capability health"),
             ):
                 _digest(value, name)
             _fingerprint(self.deployment_identity, "owner deployment")
@@ -941,7 +973,10 @@ class MutationBrokerContext:
                 raise GitHubRuntimeError(f"broker {name} is invalid")
 
 
-def schema_v2_authorization_bundle(context: MutationBrokerContext, *, now: datetime | None = None) -> "SchemaV2AuthorizationBundle":
+def schema_v2_authorization_bundle(
+    context: MutationBrokerContext, *, now: datetime | None = None,
+    health: GitHubCapabilityHealth | None = None,
+) -> "SchemaV2AuthorizationBundle":
     """Construct the single public-safe bundle from canonical typed evidence."""
 
     if type(context) is not MutationBrokerContext:
@@ -949,6 +984,9 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext, *, now: datet
     trusted_now = context.evaluated_at if now is None else now
     if type(trusted_now) is not datetime or trusted_now.tzinfo is not timezone.utc:
         raise GitHubRuntimeError("broker evaluation time is invalid")
+    capability_health = unavailable_capability_health(now=trusted_now) if health is None else health
+    if type(capability_health) is not GitHubCapabilityHealth or not capability_health.fresh_at(trusted_now):
+        raise GitHubRuntimeError("broker capability health evidence is stale or malformed")
     decision = context.policy
     if (
         type(decision) is not RepositoryMutationDecision
@@ -986,6 +1024,9 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext, *, now: datet
     )
     if not canonical_deployment.authorized or canonical_deployment != context.deployment:
         raise GitHubRuntimeError("broker deployment authority does not match canonical evidence")
+    fresh_until = min(item.fresh_until for item in capability_health.observations)
+    evaluated_at = trusted_now.isoformat()
+    fresh_until_text = fresh_until.isoformat()
     return SchemaV2AuthorizationBundle(
         context.standing_authority.policy.digest,
         context.policy_snapshot.source.source_fingerprint,
@@ -1002,7 +1043,8 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext, *, now: datet
         context.dispatcher_transition.digest,
         context.deployment_receipt.receipt_fingerprint,
         context.deployment_verification.receipt_binding_fingerprint,
-        _sha256((trusted_now.isoformat(),)),
+        evaluated_at, fresh_until_text, _sha256((evaluated_at, fresh_until_text)),
+        capability_health.identity,
     )
 
 
@@ -1033,7 +1075,11 @@ class SchemaV2AuthorizationBundle:
     dispatcher_transition_digest: str
     deployment_receipt_identity: str
     deployment_verification_identity: str
-    evaluation_time_identity: str
+    evaluated_at: str
+    fresh_until: str
+    time_identity: str
+    capability_health_identity: str
+    capability_health_identity: str
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1052,7 +1098,19 @@ class SchemaV2AuthorizationBundle:
             (self.deployment_verification_identity, "deployment verification"),
         ):
             _fingerprint(value, name)
-        _digest(self.evaluation_time_identity, "evaluation time")
+        for value, name in ((self.evaluated_at, "authorization evaluated time"), (self.fresh_until, "authorization fresh until")):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError) as error:
+                raise GitHubRuntimeError(f"{name} is invalid") from error
+            if parsed.tzinfo is not timezone.utc:
+                raise GitHubRuntimeError(f"{name} is invalid")
+        if datetime.fromisoformat(self.fresh_until) <= datetime.fromisoformat(self.evaluated_at):
+            raise GitHubRuntimeError("authorization freshness interval is invalid")
+        _digest(self.time_identity, "authorization time")
+        if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
+            raise GitHubRuntimeError("authorization time identity drifted")
+        _digest(self.capability_health_identity, "authorization capability health")
         if type(self.receipt_status) is not RepositoryReceiptStatus:
             raise GitHubRuntimeError("authorization bundle receipt lifecycle status is invalid")
         _digest(self.configuration_digest, "configuration")
@@ -1267,9 +1325,8 @@ class MutationJournalEntry:
             intent.repository.slug, intent.operation, intent.idempotency_key,
             plan.target_identity, plan.idempotency_identity, intent.identity(), bundle.identity,
             context.candidate_sha, context.configuration_digest, context.gate_identity,
-            plan.identity, plan.command, plan.readback.identity, context.evaluated_at.isoformat(),
-            (context.evaluated_at + timedelta(minutes=5)).isoformat(),
-            _sha256((context.evaluated_at.isoformat(), (context.evaluated_at + timedelta(minutes=5)).isoformat())), JournalLifecycle.PENDING,
+            plan.identity, plan.command, plan.readback.identity, bundle.evaluated_at,
+            bundle.fresh_until, bundle.time_identity, JournalLifecycle.PENDING,
         )
 
     @property
@@ -1431,6 +1488,30 @@ class DurableMutationJournal:
             raise GitHubRuntimeError("mutation journal idempotency identity conflicts")
         return prior
 
+    def find_recovery(
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext, plan: BrokerSemanticPlan,
+    ) -> MutationJournalEntry | None:
+        """Load only an exact durable attempt; current authority is re-evaluated separately."""
+
+        if type(intent) is not GitHubMutationIntent or type(context) is not MutationBrokerContext or type(plan) is not BrokerSemanticPlan:
+            raise GitHubRuntimeError("mutation journal recovery evidence is invalid")
+        key = _sha256((intent.repository.slug, intent.operation.value, intent.idempotency_key))
+        entry = self._load().get(key)
+        if entry is None:
+            return None
+        if (
+            entry.repository != intent.repository.slug or entry.operation is not intent.operation
+            or entry.idempotency_key != intent.idempotency_key or entry.intent_identity != intent.identity()
+            or entry.target_identity != plan.target_identity or entry.idempotency_identity != plan.idempotency_identity
+            or entry.semantic_plan_identity != plan.identity or entry.command is not plan.command
+            or entry.semantic_readback_identity != plan.readback.identity
+            or entry.candidate_sha != context.candidate_sha
+            or entry.configuration_digest != context.configuration_digest
+            or entry.gate_identity != context.gate_identity
+        ):
+            raise GitHubRuntimeError("mutation journal recovery evidence drifted")
+        return entry
+
     def _load(self) -> dict[str, MutationJournalEntry]:
         if not self._path.exists():
             return {}
@@ -1487,6 +1568,7 @@ class OwnerMutationSealRecord:
     evaluated_at: str
     fresh_until: str
     time_identity: str
+    capability_health_identity: str
     operation: GitHubMutationOperation
     repository: RepositoryRef
     candidate_sha: str
@@ -1503,7 +1585,7 @@ class OwnerMutationSealRecord:
             (self.intent_identity, "host intent"), (self.authorization_bundle_identity, "host bundle"),
             (self.semantic_plan_identity, "host plan"), (self.journal_identity, "host journal"),
             (self.pre_state_identity, "host pre-state"), (self.idempotency_identity, "host idempotency"),
-            (self.time_identity, "host time"),
+            (self.time_identity, "host time"), (self.capability_health_identity, "host capability health"),
         ):
             _digest(value, name)
         _fingerprint(self.deployment_identity, "host deployment")
@@ -1541,6 +1623,7 @@ class OwnerMutationSealRecord:
             and request.evaluated_at == self.evaluated_at
             and request.fresh_until == self.fresh_until
             and request.time_identity == self.time_identity
+            and request.capability_health_identity == self.capability_health_identity
             and request.operation is self.operation and request.repository == self.repository
             and request.candidate_sha == self.candidate_sha
             and request.idempotency_identity == self.idempotency_identity
@@ -1956,14 +2039,23 @@ class _GhBrokerExecutor:
         self.__transport = transport
         self.__health = health
 
+    @property
+    def health(self) -> GitHubCapabilityHealth:
+        return self.__health
+
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal: MutationJournalEntry, now: datetime,
+        *, health_bound: bool = True,
     ) -> tuple[GitHubMutationResult, CreatedResourceLocator | None]:
         blocked = _health_failure(intent.operation, self.__health)
         if blocked is not None:
             return GitHubMutationResult(intent, failure=blocked), None
-        if not self.__health.for_operation(intent.operation).fresh_at(now):
+        if health_bound and (
+            bundle.capability_health_identity != self.__health.identity
+            or not self.__health.fresh_at(now)
+            or not self.__health.for_operation(intent.operation).fresh_at(now)
+        ):
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "operation health is stale")), None
         try:
             payload.require_matches(intent)
@@ -1985,6 +2077,7 @@ class _GhBrokerExecutor:
                 bundle.candidate_sha, plan.idempotency_identity, plan.command,
                 bundle.deployment_identity, journal.pre_state_identity,
                 journal.evaluated_at, journal.fresh_until, journal.time_identity,
+                bundle.capability_health_identity,
             )
             fact = self.__transport.dispatch(request)
             request_identity = request.identity
@@ -2014,6 +2107,7 @@ class GitHubMutationBroker:
         self.__executor = _executor
         self.__clock = _trusted_utc_now if clock is None else clock
         self.__clock_is_default = clock is None
+        self.__health = _executor.health if _executor is not None else None
         self.__checkpoint_observer = checkpoint_observer
         self._completed: dict[str, SemanticMutationReceipt] = {}
         self._journal = journal
@@ -2037,9 +2131,19 @@ class GitHubMutationBroker:
             raise GitHubRuntimeError("caller authorization time does not match broker clock")
         return now
 
+    def _require_capabilities(self, intent: GitHubMutationIntent, plan: BrokerSemanticPlan, now: datetime) -> None:
+        """Gate every broker-owned read and dispatch on one fresh health profile."""
+
+        if self.__health is None:
+            return
+        _require_fresh_capabilities(
+            self.__health,
+            (plan.pre_state.operation, plan.readback.request.operation, intent.operation), now,
+        )
+
     @classmethod
     def with_owner_transport(
-        cls, read_endpoint: OwnerGitHubReadEndpoint, transport: OwnerMutationHostEndpoint, *, journal: DurableMutationJournal, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
+        cls, read_endpoint: OwnerGitHubReadEndpoint, transport: OwnerMutationHostEndpoint, *, journal: DurableMutationJournal, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
         """Create the only production path from owner-host typed endpoints."""
 
@@ -2049,7 +2153,9 @@ class GitHubMutationBroker:
             raise GitHubRuntimeError("live broker requires an owner mutation host endpoint")
         if type(read_endpoint) is not _OwnerGitHubReadHostEndpoint:
             raise GitHubRuntimeError("live broker requires an owner github read endpoint")
-        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health), checkpoint_observer=checkpoint_observer)
+        if clock is None:
+            raise GitHubRuntimeError("live broker requires an injected trusted clock")
+        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health), clock=clock, checkpoint_observer=checkpoint_observer)
 
     def submit(
         self,
@@ -2066,15 +2172,17 @@ class GitHubMutationBroker:
 
         if pre_state is not None or readback is not None or semantic_plan is not None or command is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
-        failure = _authorize(intent, context)
-        if failure is not None:
-            return BrokerMutationResult(failure=failure)
         try:
             now = self._now(context)
-            bundle = schema_v2_authorization_bundle(context, now=now)
             plan = _broker_semantic_plan(intent)
+            self._require_capabilities(intent, plan, now)
+            bound_health = self.__health if not self.__clock_is_default else None
+            bundle = schema_v2_authorization_bundle(context, now=now, health=bound_health)
+            failure = _authorize(intent, context, now=now, health=bound_health)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
+        if failure is not None:
+            return BrokerMutationResult(failure=failure)
         # A caller carrying outbound payload proves it is attempting the
         # owner-host mutation route.  Do not even open a semantic read when
         # that capability was not injected; reads must not become a fallback
@@ -2150,20 +2258,24 @@ class GitHubMutationBroker:
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
         pre_state_digest: str, post_state_digest: str, pre_state_completeness_identity: str,
         post_state_completeness_identity: str, affected_identity: str,
-        disposition: MutationDisposition,
+        disposition: MutationDisposition, durable_entry: MutationJournalEntry | None = None,
     ) -> SemanticMutationReceipt:
         binding = context.policy.binding
         assert binding is not None  # established by _authorize
         return SemanticMutationReceipt(
-            intent.repository.slug, intent.operation, intent.idempotency_key, bundle.identity,
+            intent.repository.slug, intent.operation, intent.idempotency_key,
+            bundle.identity if durable_entry is None else durable_entry.authorization_bundle_identity,
             intent.identity(), plan.identity, plan.readback.identity,
             pre_state_completeness_identity, post_state_completeness_identity,
             _sha256(("public-payload", intent.payload)), binding.digest,
             context.configuration_digest, binding.deployment_fingerprint,
             binding.task_fingerprint, context.base_sha, context.candidate_sha,
             context.gate_identity, pre_state_digest, post_state_digest,
-            affected_identity, context.evaluated_at.isoformat(), (context.evaluated_at + timedelta(minutes=5)).isoformat(),
-            _sha256((context.evaluated_at.isoformat(), (context.evaluated_at + timedelta(minutes=5)).isoformat())), disposition,
+            affected_identity,
+            bundle.evaluated_at if durable_entry is None else durable_entry.evaluated_at,
+            bundle.fresh_until if durable_entry is None else durable_entry.fresh_until,
+            bundle.time_identity if durable_entry is None else durable_entry.time_identity,
+            disposition,
         )
 
     def _journal_transition(
@@ -2198,11 +2310,18 @@ class GitHubMutationBroker:
 
         try:
             now = self._now(context)
+            evaluated_at = datetime.fromisoformat(entry.evaluated_at)
             fresh_until = datetime.fromisoformat(entry.fresh_until)
         except (TypeError, ValueError, GitHubRuntimeError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable authorization time evidence is invalid"))
-        if now >= fresh_until:
+        if now < evaluated_at or now >= fresh_until:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable authorization evidence has expired"))
+        try:
+            self._require_capabilities(intent, plan, now)
+            if not self.__clock_is_default and self.__health is not None and bundle.capability_health_identity != self.__health.identity:
+                raise GitHubRuntimeError("durable capability health evidence drifted")
+        except (TypeError, ValueError):
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable capability health evidence is unavailable"))
 
         if entry.lifecycle in {JournalLifecycle.CLAIMED, JournalLifecycle.PRESTATE_CAPTURED}:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation has not started execution"))
@@ -2223,6 +2342,7 @@ class GitHubMutationBroker:
             intent, context, bundle, plan, entry.pre_state_digest or observed.snapshot_digest, _post_state_digest(intent, observed),
             completeness, completeness,
             _affected_identity(intent, observed, entry.created_resource), MutationDisposition.ALREADY_APPLIED,
+            durable_entry=entry,
         )
         if self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "reconciled receipt was not persisted"), reconciliation_required=True)
@@ -2242,7 +2362,10 @@ class GitHubMutationBroker:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence")), None
             if type(evidence) is not MutationJournalEntry:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks sealed journal entry")), None
-            return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence, now)
+            return self.__executor.execute(
+                intent, payload, plan.command, bundle, plan, evidence, now,
+                health_bound=not self.__clock_is_default,
+            )
         if payload is not None:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads")), None
         return self._adapter.submit(intent), None
@@ -2260,23 +2383,25 @@ class GitHubMutationBroker:
 
         if readback is not None or semantic_plan is not None or command is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
-        failure = _authorize(intent, context)
-        if failure is not None:
-            return BrokerMutationResult(failure=failure)
         try:
-            bundle = schema_v2_authorization_bundle(context, now=self._now(context))
+            now = self._now(context)
             plan = _broker_semantic_plan(intent)
+            self._require_capabilities(intent, plan, now)
+            bound_health = self.__health if not self.__clock_is_default else None
+            bundle = schema_v2_authorization_bundle(context, now=now, health=bound_health)
+            failure = _authorize(intent, context, now=now, health=bound_health)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
+        if failure is not None:
+            return BrokerMutationResult(failure=failure)
         if self._journal is not None:
             try:
-                evidence = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
-                entry = self._journal.find(evidence)
+                entry = self._journal.find_recovery(intent, context, plan)
             except (AttributeError, TypeError, ValueError):
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if entry is None:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is missing"))
-            return self._reconcile_journal(intent, context, bundle, plan, evidence, entry)
+            return self._reconcile_journal(intent, context, bundle, plan, entry, entry)
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
         if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
@@ -2285,7 +2410,10 @@ class GitHubMutationBroker:
         return BrokerMutationResult(receipt=receipt)
 
 
-def _authorize(intent: object, context: object) -> GitHubFailure | None:
+def _authorize(
+    intent: object, context: object, *, now: datetime | None = None,
+    health: GitHubCapabilityHealth | None = None,
+) -> GitHubFailure | None:
     if type(intent) is not GitHubMutationIntent or type(context) is not MutationBrokerContext:
         raise GitHubRuntimeError("broker request is invalid")
     try:
@@ -2293,7 +2421,7 @@ def _authorize(intent: object, context: object) -> GitHubFailure | None:
         # bundle is built only from exact canonical evidence and rejects any
         # receipt, authority, context, or dispatcher drift before a runner can
         # observe an intent.
-        schema_v2_authorization_bundle(context)
+        schema_v2_authorization_bundle(context, now=now, health=health)
     except (AttributeError, TypeError, ValueError):
         return GitHubFailure(
             GitHubFailureKind.POLICY_DENIED,

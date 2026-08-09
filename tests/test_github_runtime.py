@@ -436,6 +436,15 @@ class GitHubRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46)
 
+    def test_requested_reviewers_command_uses_typed_graphql_variants(self) -> None:
+        from roundwright.github_runtime import _read_command
+        command = _read_command(GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46, expected_sha=SHA))
+        query = next(value for value in command if value.startswith("query="))
+        self.assertIn("reviewRequests(first:100,after:$cursor)", query)
+        self.assertIn("... on User{login}", query)
+        self.assertIn("... on Team{slug organization{login}}", query)
+        self.assertNotIn("Actor.id", query)
+
     def test_requested_reviewers_snapshot_requires_canonical_complete_evidence(self) -> None:
         digest = "sha256:" + hashlib.sha256(json.dumps(("reviewers", ("octocat",)), separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
         evidence = "sha256:" + "d" * 64

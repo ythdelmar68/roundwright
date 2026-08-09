@@ -1840,6 +1840,9 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
         path = f"{base}/pulls/{request.number}"
     elif request.operation is GitHubReadOperation.REVIEWS:
         return _collection_read_command(request, None)
+    elif request.operation is GitHubReadOperation.REQUESTED_REVIEWERS:
+        query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} pullRequest(number:$number){number headRefOid reviewRequests(first:100,after:$cursor){nodes{requestedReviewer{... on User{login} ... on Team{slug organization{login}}}} pageInfo{hasNextPage endCursor}}}}}"
+        return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}", "-F", f"number={request.number}")
     elif request.operation is GitHubReadOperation.CHECKS:
         path = f"{base}/commits/{request.expected_sha}/check-runs"
     elif request.operation is GitHubReadOperation.WORKFLOW_RUNS:

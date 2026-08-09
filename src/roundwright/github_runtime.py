@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from .deployment import (
     AuthorityReceiptVerification, DeploymentAuthorityDecision,
@@ -78,6 +78,10 @@ _CURSOR = re.compile(r"[^\x00-\x1f\x7f]{1,1024}\Z")
 
 class GitHubRuntimeError(ValueError):
     """Raised when runtime-only adapter evidence is malformed."""
+
+
+def _trusted_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class CapabilityState(StrEnum):
@@ -554,11 +558,14 @@ class MutationBrokerContext:
                 raise GitHubRuntimeError(f"broker {name} is invalid")
 
 
-def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2AuthorizationBundle":
+def schema_v2_authorization_bundle(context: MutationBrokerContext, *, now: datetime | None = None) -> "SchemaV2AuthorizationBundle":
     """Construct the single public-safe bundle from canonical typed evidence."""
 
     if type(context) is not MutationBrokerContext:
         raise GitHubRuntimeError("broker context is invalid")
+    trusted_now = context.evaluated_at if now is None else now
+    if type(trusted_now) is not datetime or trusted_now.tzinfo is not timezone.utc:
+        raise GitHubRuntimeError("broker evaluation time is invalid")
     decision = context.policy
     if (
         type(decision) is not RepositoryMutationDecision
@@ -584,7 +591,7 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2A
         standing_authority=context.standing_authority,
         dispatcher_transition=context.dispatcher_transition,
         receipt_verification=context.receipt_verification,
-        now=context.evaluated_at,
+        now=trusted_now,
     )
     if not canonical.authorized or canonical != decision or canonical.binding is None:
         raise GitHubRuntimeError("broker policy decision does not match canonical evidence")
@@ -592,7 +599,7 @@ def schema_v2_authorization_bundle(context: MutationBrokerContext) -> "SchemaV2A
         raise GitHubRuntimeError("broker policy binding is not coherently bound")
     canonical_deployment = evaluate_deployment_authority(
         context.deployment_identity, context.deployment_receipt,
-        context.deployment_verification, now=context.evaluated_at,
+        context.deployment_verification, now=trusted_now,
     )
     if not canonical_deployment.authorized or canonical_deployment != context.deployment:
         raise GitHubRuntimeError("broker deployment authority does not match canonical evidence")
@@ -1137,13 +1144,34 @@ class _GhBrokerExecutor:
 class GitHubMutationBroker:
     """The sole mutation seam; rejects before a write when evidence is absent."""
 
-    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None, _executor: _GhBrokerExecutor | None = None) -> None:
+    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None, _executor: _GhBrokerExecutor | None = None, clock: Callable[[], datetime] | None = None) -> None:
         if not hasattr(adapter, "read") or not hasattr(adapter, "submit"):
             raise GitHubRuntimeError("GitHub adapter is invalid")
         self._adapter = adapter
         self.__executor = _executor
+        self.__clock = _trusted_utc_now if clock is None else clock
+        self.__clock_is_default = clock is None
         self._completed: dict[str, SemanticMutationReceipt] = {}
         self._journal = journal
+
+    def _now(self, context: MutationBrokerContext) -> datetime:
+        """Sample an injected UTC clock once; caller time may only attest it."""
+
+        if self.__clock_is_default:
+            # Existing embedded deployments are intentionally fail-closed to
+            # their pre-attested context until they inject an owner clock.
+            return context.evaluated_at
+        try:
+            now = self.__clock()
+        except Exception as error:
+            raise GitHubRuntimeError("trusted broker clock is unavailable") from error
+        if type(now) is not datetime or now.tzinfo is not timezone.utc:
+            raise GitHubRuntimeError("trusted broker clock is invalid")
+        # The compatibility context is accepted only when it exactly attests
+        # the broker observation; it never selects policy evaluation time.
+        if context.evaluated_at != now:
+            raise GitHubRuntimeError("caller authorization time does not match broker clock")
+        return now
 
     @classmethod
     def with_owner_transport(
@@ -1174,7 +1202,7 @@ class GitHubMutationBroker:
         if failure is not None:
             return BrokerMutationResult(failure=failure)
         try:
-            bundle = schema_v2_authorization_bundle(context)
+            bundle = schema_v2_authorization_bundle(context, now=self._now(context))
             plan = _broker_semantic_plan(intent)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
@@ -1310,7 +1338,7 @@ class GitHubMutationBroker:
         if failure is not None:
             return BrokerMutationResult(failure=failure)
         try:
-            bundle = schema_v2_authorization_bundle(context)
+            bundle = schema_v2_authorization_bundle(context, now=self._now(context))
             plan = _broker_semantic_plan(intent)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))

@@ -2764,7 +2764,7 @@ def _raw_repository_matches(mapping: Mapping[str, object], request: GitHubReadRe
         if _raw_text(owner_map, "login") == request.repository.owner and _raw_text(candidate, "name") == request.repository.name:
             return
     repository_url = mapping.get("repository_url")
-    if type(repository_url) is str and repository_url.rstrip("/").endswith(f"/repos/{request.repository.slug}"):
+    if repository_url is not None and _provider_repository_from_url(repository_url) == request.repository:
         return
     raise GitHubRuntimeError("gh response repository does not match request")
 
@@ -2773,8 +2773,11 @@ def _raw_branch_repository_matches(mapping: Mapping[str, object], request: GitHu
     """A REST branch response establishes its repository through commit URLs."""
 
     commit = _raw_mapping(mapping.get("commit"))
-    url = commit.get("url")
-    if type(url) is not str or f"/repos/{request.repository.slug}/commits/" not in url:
+    path = _provider_url_path(commit.get("url"))
+    if re.fullmatch(
+        rf"/repos/{re.escape(request.repository.owner)}/{re.escape(request.repository.name)}/commits/[0-9a-f]{{40}}",
+        path,
+    ) is None:
         raise GitHubRuntimeError("gh branch response repository does not match request")
 
 

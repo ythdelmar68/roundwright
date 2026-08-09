@@ -1002,6 +1002,58 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][:2], ("api", "graphql"))
         self.assertNotIn("curated evidence", repr(result.snapshot))
 
+    def test_native_single_response_reads_bind_exact_provider_identities(self) -> None:
+        """Branch, PR, mergeability, and remote-head reads use raw provider identities."""
+        import json
+
+        branch_request = GitHubReadRequest(
+            GitHubReadOperation.BRANCH, REPOSITORY, ref="main", expected_sha=BASE,
+        )
+        remote_head_request = GitHubReadRequest(
+            GitHubReadOperation.REMOTE_HEAD, REPOSITORY, ref="main", expected_sha=BASE,
+        )
+        pull_request = GitHubReadRequest(
+            GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=46, expected_sha=SHA,
+        )
+        mergeability_request = GitHubReadRequest(
+            GitHubReadOperation.MERGEABILITY, REPOSITORY, number=46, expected_sha=SHA,
+        )
+        pull_raw = {
+            "id": 58, "number": 46, "state": "open", "merged": False, "draft": True,
+            "base": {"ref": "main", "sha": BASE, "repo": {"name": "roundwright", "owner": {"login": "example"}}},
+            "head": {"ref": "codex/issue-46", "sha": SHA}, "merge_commit_sha": None,
+        }
+        mergeability_raw = {
+            "number": 46, "mergeable_state": "clean",
+            "base": {"repo": {"name": "roundwright", "owner": {"login": "example"}}},
+            "head": {"sha": SHA},
+        }
+        cases = (
+            (branch_request, gh_default_branch()),
+            (remote_head_request, gh_default_branch()),
+            (pull_request, pull_raw),
+            (mergeability_request, mergeability_raw),
+        )
+        for request, raw in cases:
+            with self.subTest(operation=request.operation):
+                result = GhGitHubAdapter(
+                    Runner(GhCommandResult(0, json.dumps(raw))), health(request.operation),
+                ).read(request)
+                self.assertTrue(result.ok)
+
+        malformed_branch = gh_default_branch()
+        malformed_branch["commit"]["url"] = f"https://api.github.com/repos/example/roundwright/commits/{BASE}/extra"  # type: ignore[index]
+        malformed_mergeability = dict(mergeability_raw)
+        malformed_mergeability["repository_url"] = "https://api.github.com/evil/repos/example/roundwright"
+        malformed_mergeability["base"] = {"repo": {}}
+        for request, raw in ((branch_request, malformed_branch), (mergeability_request, malformed_mergeability)):
+            with self.subTest(rejected=request.operation):
+                result = GhGitHubAdapter(
+                    Runner(GhCommandResult(0, json.dumps(raw))), health(request.operation),
+                ).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+
     def test_native_repository_read_composes_default_head_from_two_bound_rest_responses(self) -> None:
         import json
 

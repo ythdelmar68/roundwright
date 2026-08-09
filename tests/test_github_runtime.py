@@ -656,6 +656,21 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.reconciliation_required)
 
+    def test_checkpoint_observer_stops_after_persisted_prestate(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "observer-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            def stop(entry: MutationJournalEntry) -> None:
+                if entry.lifecycle is JournalLifecycle.PRESTATE_CAPTURED:
+                    raise RuntimeError("crash")
+            broker = GitHubMutationBroker(adapter, journal=journal, checkpoint_observer=stop)
+            with self.assertRaises(RuntimeError):
+                broker.submit(intent, allowed_context())
+            stored = journal.find(MutationJournalEntry.from_evidence(intent, allowed_context(), schema_v2_authorization_bundle(allowed_context()), _broker_semantic_plan(intent)))
+            self.assertIs(stored.lifecycle, JournalLifecycle.PRESTATE_CAPTURED)  # type: ignore[union-attr]
+            self.assertEqual(adapter.call_count(kind="mutation"), 0)
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

@@ -1207,13 +1207,14 @@ class _GhBrokerExecutor:
 class GitHubMutationBroker:
     """The sole mutation seam; rejects before a write when evidence is absent."""
 
-    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None, _executor: _GhBrokerExecutor | None = None, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(self, adapter: GitHubAdapter, *, journal: DurableMutationJournal | None = None, _executor: _GhBrokerExecutor | None = None, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None) -> None:
         if not hasattr(adapter, "read") or not hasattr(adapter, "submit"):
             raise GitHubRuntimeError("GitHub adapter is invalid")
         self._adapter = adapter
         self.__executor = _executor
         self.__clock = _trusted_utc_now if clock is None else clock
         self.__clock_is_default = clock is None
+        self.__checkpoint_observer = checkpoint_observer
         self._completed: dict[str, SemanticMutationReceipt] = {}
         self._journal = journal
 
@@ -1352,9 +1353,12 @@ class GitHubMutationBroker:
         # Reconstruct from the serialized public-safe record before returning:
         # callers never retain an in-memory value that was not durably stored.
         try:
-            return MutationJournalEntry.deserialize(updated.serialize())
+            persisted = MutationJournalEntry.deserialize(updated.serialize())
         except (AttributeError, TypeError, ValueError):
             return None
+        if self.__checkpoint_observer is not None:
+            self.__checkpoint_observer(persisted)
+        return persisted
 
     def _reconcile_journal(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext,

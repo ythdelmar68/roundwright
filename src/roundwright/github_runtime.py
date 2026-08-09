@@ -1553,6 +1553,34 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
 
     repository = {"owner": request.repository.owner, "name": request.repository.name}
     operation = request.operation
+    if operation is GitHubReadOperation.REQUESTED_REVIEWERS:
+        root = _raw_mapping(raw)
+        graph_repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+        pull_request = _raw_mapping(graph_repository.get("pullRequest"))
+        if _raw_text(_raw_mapping(graph_repository.get("owner")), "login") != request.repository.owner or _raw_text(graph_repository, "name") != request.repository.name or _raw_integer(pull_request, "number") != request.number or _raw_text(pull_request, "headRefOid") != request.expected_sha:
+            raise GitHubRuntimeError("gh requested-reviewer identity does not match request")
+        connection = _raw_mapping(pull_request.get("reviewRequests"))
+        page_info = _raw_mapping(connection.get("pageInfo"))
+        has_next = _raw_bool(page_info, "hasNextPage")
+        cursor = page_info.get("endCursor")
+        if (has_next and (type(cursor) is not str or not _CURSOR.fullmatch(cursor))) or (not has_next and cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor))):
+            raise GitHubRuntimeError("gh requested-reviewer pagination is malformed")
+        nodes = connection.get("nodes")
+        if type(nodes) is not list:
+            raise GitHubRuntimeError("gh requested-reviewer nodes are malformed")
+        reviewers: list[str] = []
+        for node in nodes:
+            reviewer = _raw_mapping(_raw_mapping(node).get("requestedReviewer"))
+            if type(reviewer.get("login")) is str:
+                reviewers.append(_raw_text(reviewer, "login"))
+            elif type(reviewer.get("slug")) is str:
+                reviewers.append(f"{_raw_text(_raw_mapping(reviewer.get('organization')), 'login')}/{_raw_text(reviewer, 'slug')}")
+            else:
+                raise GitHubRuntimeError("gh requested-reviewer variant is malformed")
+        if len(set(reviewers)) != len(reviewers):
+            raise GitHubRuntimeError("gh requested-reviewer entries are duplicated")
+        reviewers.sort()
+        return {"repository": repository, "pull_request_number": request.number, "candidate_sha": request.expected_sha, "reviewers": reviewers, "reviewer_set_digest": _sha256(("reviewers", tuple(reviewers))), "complete": not has_next, "next_cursor": cursor if has_next else None, "raw_evidence_identity": _sha256(raw)}
     if operation is GitHubReadOperation.CLOSING_REFERENCES:
         root = _raw_mapping(raw)
         data = _raw_mapping(root.get("data"))

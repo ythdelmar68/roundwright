@@ -1075,7 +1075,7 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
         pre_state = GitHubReadRequest(GitHubReadOperation.COMMENTS, intent.repository, number=intent.target_number)
         readback = SemanticReadback(pre_state, SemanticPostcondition.COMMENT_PRESENT)
     elif operation is GitHubMutationOperation.REQUEST_REVIEW:
-        pre_state = GitHubReadRequest(GitHubReadOperation.REVIEWS, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
+        pre_state = GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
         readback = SemanticReadback(pre_state, SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE)
     elif operation is GitHubMutationOperation.MARK_READY:
         pre_state = GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, intent.repository, number=intent.target_number, expected_sha=intent.expected_sha)
@@ -1525,7 +1525,7 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
     if condition is SemanticPostcondition.REVIEW_AT_CANDIDATE:
         return isinstance(snapshot, ReviewsSnapshot) and snapshot.head_sha == intent.expected_sha and bool(snapshot.reviews)
     if condition is SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE:
-        return isinstance(snapshot, ReviewsSnapshot) and snapshot.head_sha == intent.expected_sha and _sha256(("reviewers", tuple(sorted(review.reviewer_id for review in snapshot.reviews)))) == dict(intent.payload).get("reviewers_digest")
+        return isinstance(snapshot, RequestedReviewersSnapshot) and snapshot.repository == intent.repository and snapshot.pull_request_number == intent.target_number and snapshot.candidate_sha == intent.expected_sha and snapshot.complete and snapshot.reviewer_set_digest == dict(intent.payload).get("reviewers_digest")
     if condition is SemanticPostcondition.ISSUE_CLOSED:
         return isinstance(snapshot, IssueSnapshot) and snapshot.state is IssueState.CLOSED
     if condition is SemanticPostcondition.REMOTE_HEAD_AT_EXPECTED_SHA:

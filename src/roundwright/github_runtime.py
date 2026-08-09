@@ -53,6 +53,7 @@ from .github import (
     PullRequestState,
     RemoteHeadSnapshot,
     ReviewsSnapshot,
+    RequestedReviewersSnapshot,
     normalize_github_response,
 )
 from .repository_policy import (
@@ -432,16 +433,16 @@ class CollectionPage:
     cursor: str | None
     next_cursor: str | None
     total_count: int
-    snapshot: CommentsSnapshot | ReviewsSnapshot
+    snapshot: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if type(self.request) is not GitHubReadRequest or self.request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
+        if type(self.request) is not GitHubReadRequest or self.request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS}:
             raise GitHubRuntimeError("collection page request is invalid")
         for value, name in ((self.cursor, "collection cursor"), (self.next_cursor, "collection continuation")):
             if value is not None and (type(value) is not str or not _CURSOR.fullmatch(value)):
                 raise GitHubRuntimeError(f"{name} is invalid")
-        if type(self.total_count) is not int or self.total_count < 0 or type(self.snapshot) not in {CommentsSnapshot, ReviewsSnapshot}:
+        if type(self.total_count) is not int or self.total_count < 0 or type(self.snapshot) not in {CommentsSnapshot, ReviewsSnapshot, RequestedReviewersSnapshot}:
             raise GitHubRuntimeError("collection page is invalid")
         if self.snapshot.repository != self.request.repository:
             raise GitHubRuntimeError("collection page repository does not match request")
@@ -1094,11 +1095,13 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
     )
 
 
-def _collection_snapshot_payload(snapshot: CommentsSnapshot | ReviewsSnapshot) -> tuple[object, ...]:
+def _collection_snapshot_payload(snapshot: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot) -> tuple[object, ...]:
     if type(snapshot) is CommentsSnapshot:
         return ("comments", snapshot.repository.slug, snapshot.issue_number, tuple((item.comment_id, item.author_id, item.body_digest, item.created_at) for item in snapshot.comments))
     if type(snapshot) is ReviewsSnapshot:
         return ("reviews", snapshot.repository.slug, snapshot.pull_request_number, snapshot.head_sha, tuple((item.review_id, item.reviewer_id, item.state.value, item.commit_sha) for item in snapshot.reviews))
+    if type(snapshot) is RequestedReviewersSnapshot:
+        return ("requested-reviewers", snapshot.repository.slug, snapshot.pull_request_number, snapshot.candidate_sha, snapshot.reviewers, snapshot.reviewer_set_digest, snapshot.complete, snapshot.next_cursor, snapshot.raw_evidence_identity)
     raise GitHubRuntimeError("collection snapshot is invalid")
 
 

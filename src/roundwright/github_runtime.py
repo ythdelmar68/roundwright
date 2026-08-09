@@ -904,6 +904,7 @@ class MutationJournalEntry:
     pre_state_digest: str | None = None
     pre_state_complete: bool = False
     pre_state_identity: str | None = None
+    created_resource: CreatedResourceLocator | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository) is not str or "/" not in self.repository or type(self.operation) is not GitHubMutationOperation or type(self.idempotency_key) is not str:
@@ -938,6 +939,17 @@ class MutationJournalEntry:
                 raise GitHubRuntimeError("journal pre-state identity drifted")
         elif self.pre_state_digest is not None or self.pre_state_identity is not None:
             raise GitHubRuntimeError("incomplete journal pre-state evidence")
+        requires_locator = self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST and self.lifecycle in {
+            JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
+            JournalLifecycle.AMBIGUOUS, JournalLifecycle.VERIFIED,
+        }
+        if requires_locator != (type(self.created_resource) is CreatedResourceLocator):
+            raise GitHubRuntimeError("mutation journal created resource evidence is invalid")
+        if self.created_resource is not None and (
+            self.created_resource.operation is not self.operation
+            or self.created_resource.repository.slug != self.repository
+        ):
+            raise GitHubRuntimeError("mutation journal created resource drifted")
         if self.receipt is not None and (
             self.receipt.repository != self.repository or self.receipt.operation is not self.operation
             or self.receipt.idempotency_key != self.idempotency_key
@@ -981,7 +993,7 @@ class MutationJournalEntry:
     def evidence_matches(self, other: "MutationJournalEntry") -> bool:
         return type(other) is MutationJournalEntry and all(
             getattr(self, name) == getattr(other, name)
-            for name in self.__dataclass_fields__ if name not in {"lifecycle", "receipt", "pre_state_digest", "pre_state_complete", "pre_state_identity"}
+            for name in self.__dataclass_fields__ if name not in {"lifecycle", "receipt", "pre_state_digest", "pre_state_complete", "pre_state_identity", "created_resource"}
         )
 
     def serialize(self) -> Mapping[str, object]:
@@ -997,6 +1009,18 @@ class MutationJournalEntry:
             "lifecycle": self.lifecycle.value,
             "pre_state_digest": self.pre_state_digest, "pre_state_complete": self.pre_state_complete,
             "pre_state_identity": self.pre_state_identity,
+            "created_resource": None if self.created_resource is None else {
+                "operation": self.created_resource.operation.value,
+                "repository": self.created_resource.repository.slug,
+                "pull_request_number": self.created_resource.pull_request_number,
+                "issue_number": self.created_resource.issue_number,
+                "comment_id": self.created_resource.comment_id,
+                "base_sha": self.created_resource.base_sha,
+                "head_sha": self.created_resource.head_sha,
+                "draft": self.created_resource.draft,
+                "marker_digest": self.created_resource.marker_digest,
+                "identity": self.created_resource.identity,
+            },
             "receipt": None if self.receipt is None else self.receipt._payload(),
         }
 
@@ -1007,7 +1031,7 @@ class MutationJournalEntry:
             "intent_identity", "authorization_bundle_identity", "candidate_sha", "configuration_digest",
             "gate_identity", "semantic_plan_identity", "command", "semantic_readback_identity",
             "evaluated_at", "fresh_until", "time_identity",
-            "lifecycle", "receipt", "pre_state_digest", "pre_state_complete", "pre_state_identity",
+            "lifecycle", "receipt", "pre_state_digest", "pre_state_complete", "pre_state_identity", "created_resource",
         }
         if type(value) is not dict or set(value) != required:
             raise GitHubRuntimeError("mutation journal entry is malformed")
@@ -1024,16 +1048,40 @@ class MutationJournalEntry:
                 raise GitHubRuntimeError("mutation journal receipt is malformed") from error
         else:
             receipt = None
+        locator_value = value["created_resource"]
+        if locator_value is not None:
+            if type(locator_value) is not dict or set(locator_value) != {
+                "operation", "repository", "pull_request_number", "issue_number", "comment_id",
+                "base_sha", "head_sha", "draft", "marker_digest", "identity",
+            }:
+                raise GitHubRuntimeError("mutation journal created resource is malformed")
+            try:
+                owner, name = locator_value["repository"].split("/", 1)
+                locator = CreatedResourceLocator(
+                    GitHubMutationOperation(locator_value["operation"]), RepositoryRef(owner, name),
+                    locator_value["pull_request_number"], locator_value["issue_number"],
+                    locator_value["comment_id"], locator_value["base_sha"], locator_value["head_sha"],
+                    locator_value["draft"], locator_value["marker_digest"],
+                )
+            except (AttributeError, TypeError, ValueError) as error:
+                raise GitHubRuntimeError("mutation journal created resource is malformed") from error
+            if locator.identity != locator_value["identity"]:
+                raise GitHubRuntimeError("mutation journal created resource identity drifted")
+        else:
+            locator = None
         try:
             return cls(
                 value["repository"], GitHubMutationOperation(value["operation"]), value["idempotency_key"],
                 value["target_identity"], value["idempotency_identity"], value["intent_identity"],
                 value["authorization_bundle_identity"], value["candidate_sha"], value["configuration_digest"],
                 value["gate_identity"], value["semantic_plan_identity"], BrokerMutationCommand(value["command"]),
-                value["semantic_readback_identity"], value["evaluated_at"], value["fresh_until"], value["time_identity"], JournalLifecycle(value["lifecycle"]), receipt, value["pre_state_digest"], value["pre_state_complete"], value["pre_state_identity"],
+                value["semantic_readback_identity"], value["evaluated_at"], value["fresh_until"], value["time_identity"], JournalLifecycle(value["lifecycle"]), receipt, value["pre_state_digest"], value["pre_state_complete"], value["pre_state_identity"], locator,
             )
         except (TypeError, ValueError) as error:
             raise GitHubRuntimeError("mutation journal entry is malformed") from error
+
+
+_KEEP_CREATED_RESOURCE = object()
 
 
 class DurableMutationJournal:
@@ -1060,6 +1108,7 @@ class DurableMutationJournal:
     def transition(
         self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
         receipt: SemanticMutationReceipt | None = None, *, pre_state_digest: str | None = None,
+        created_resource: CreatedResourceLocator | None | object = _KEEP_CREATED_RESOURCE,
     ) -> MutationJournalEntry:
         if type(evidence) is not MutationJournalEntry or type(lifecycle) is not JournalLifecycle:
             raise GitHubRuntimeError("mutation journal transition is invalid")
@@ -1078,9 +1127,11 @@ class DurableMutationJournal:
         }
         if lifecycle not in allowed[prior.lifecycle]:
             raise GitHubRuntimeError("mutation journal transition is impossible")
-        updated = replace(prior, lifecycle=lifecycle, receipt=receipt) if pre_state_digest is None else replace(
+        next_created_resource = prior.created_resource if created_resource is _KEEP_CREATED_RESOURCE else created_resource
+        updated = replace(prior, lifecycle=lifecycle, receipt=receipt, created_resource=next_created_resource) if pre_state_digest is None else replace(
             prior, lifecycle=lifecycle, receipt=receipt, pre_state_digest=pre_state_digest,
             pre_state_complete=True, pre_state_identity=_sha256((prior.intent_identity, pre_state_digest)),
+            created_resource=next_created_resource,
         )
         records[evidence.key] = updated
         self._store(records)
@@ -1308,6 +1359,49 @@ def _validate_created_resource_locator(
         raise GitHubRuntimeError("created comment locator does not match fixed request")
 
 
+def _post_readback_for_locator(
+    intent: GitHubMutationIntent, plan: BrokerSemanticPlan,
+    locator: CreatedResourceLocator | None,
+) -> SemanticReadback | None:
+    """Use an allocated identity for creation reads; caller targets never select it."""
+
+    if intent.operation is not GitHubMutationOperation.CREATE_PULL_REQUEST:
+        return plan.readback
+    if not _created_pull_request_locator_matches_intent(intent, plan, locator):
+        return None
+    return SemanticReadback(
+        GitHubReadRequest(
+            GitHubReadOperation.PULL_REQUEST, intent.repository,
+            number=locator.pull_request_number, expected_sha=locator.head_sha,
+        ),
+        SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE,
+    )
+
+
+def _created_pull_request_locator_matches_intent(
+    intent: GitHubMutationIntent, plan: BrokerSemanticPlan,
+    locator: CreatedResourceLocator | None,
+) -> bool:
+    """Revalidate durable allocation evidence before any allocated-PR read."""
+
+    if (
+        type(locator) is not CreatedResourceLocator
+        or intent.operation is not GitHubMutationOperation.CREATE_PULL_REQUEST
+        or plan.operation is not intent.operation
+        or plan.intent_identity != intent.identity()
+        or locator.operation is not intent.operation
+        or locator.repository != intent.repository
+        or locator.draft is not True
+    ):
+        return False
+    payload = dict(intent.payload)
+    return (
+        locator.base_sha == payload.get("base_sha")
+        and locator.head_sha == payload.get("head_sha")
+        and locator.marker_digest == payload.get("body_digest")
+    )
+
+
 class _GhBrokerExecutor:
     """Private credential-owning seam; only broker construction creates it."""
 
@@ -1320,12 +1414,12 @@ class _GhBrokerExecutor:
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal_identity: str, now: datetime,
-    ) -> GitHubMutationResult:
+    ) -> tuple[GitHubMutationResult, CreatedResourceLocator | None]:
         blocked = _health_failure(intent.operation, self.__health)
         if blocked is not None:
-            return GitHubMutationResult(intent, failure=blocked)
+            return GitHubMutationResult(intent, failure=blocked), None
         if not self.__health.for_operation(intent.operation).fresh_at(now):
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "operation health is stale"))
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "operation health is stale")), None
         try:
             payload.require_matches(intent)
             if command is not plan.command:
@@ -1349,10 +1443,10 @@ class _GhBrokerExecutor:
             else:
                 raise GitHubRuntimeError("owner mutation fact is not bound to request")
         except GitHubRuntimeError:
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid")), None
         if type(fact) is OwnerMutationFact and not fact.accepted:
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "owner mutation transport denied fixed request"))
-        return GitHubMutationResult(intent, receipt=_broker_receipt(intent))
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "owner mutation transport denied fixed request")), None
+        return GitHubMutationResult(intent, receipt=_broker_receipt(intent)), fact.created_resource
 
 
 class GitHubMutationBroker:
@@ -1446,18 +1540,27 @@ class GitHubMutationBroker:
             evidence = self._journal_transition(evidence, JournalLifecycle.EXECUTION_STARTED)
             if evidence is None:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "execution checkpoint was not persisted"))
-        outcome = self._execute(intent, payload, plan, bundle, evidence, now)
+        outcome, created_resource = self._execute(intent, payload, plan, bundle, evidence, now)
         if not outcome.ok:
             if evidence is not None and self._journal is not None:
                 lifecycle = JournalLifecycle.DENIED if outcome.failure is not None and outcome.failure.kind is GitHubFailureKind.POLICY_DENIED else JournalLifecycle.FAILED
                 self._journal_transition(evidence, lifecycle)
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
         if evidence is not None and self._journal is not None:
-            evidence = self._journal_transition(evidence, JournalLifecycle.TRANSPORT_ACCEPTED)
+            if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+                evidence = self._journal_transition(
+                    evidence, JournalLifecycle.TRANSPORT_ACCEPTED,
+                    created_resource=created_resource,
+                )
+            else:
+                evidence = self._journal_transition(evidence, JournalLifecycle.TRANSPORT_ACCEPTED)
         if evidence is None and self._journal is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation durability is uncertain"), reconciliation_required=True)
-        after, post_completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
-        if not _readback_matches(plan.readback, intent, after):
+        post_readback = _post_readback_for_locator(intent, plan, created_resource)
+        if post_readback is None:
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "created resource locator is unavailable"))
+        after, post_completeness = _complete_broker_read(self._adapter, post_readback.request, context, bundle, plan, evidence)
+        if not _readback_matches(post_readback, intent, after, created_resource):
             if self._journal is not None:
                 assert evidence is not None
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
@@ -1495,10 +1598,14 @@ class GitHubMutationBroker:
     def _journal_transition(
         self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
         receipt: SemanticMutationReceipt | None = None, *, pre_state_digest: str | None = None,
+        created_resource: CreatedResourceLocator | None | object = _KEEP_CREATED_RESOURCE,
     ) -> MutationJournalEntry | None:
         assert self._journal is not None
         try:
-            updated = self._journal.transition(evidence, lifecycle, receipt, pre_state_digest=pre_state_digest)
+            updated = self._journal.transition(
+                evidence, lifecycle, receipt, pre_state_digest=pre_state_digest,
+                created_resource=created_resource,
+            )
         except (AttributeError, TypeError, ValueError):
             return None
         # Reconstruct from the serialized public-safe record before returning:
@@ -1535,8 +1642,11 @@ class GitHubMutationBroker:
             return BrokerMutationResult(receipt=entry.receipt)
         if entry.lifecycle in {JournalLifecycle.DENIED, JournalLifecycle.FAILED}:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation lifecycle is terminally denied or failed"))
-        observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
-        if not _readback_matches(plan.readback, intent, observed):
+        post_readback = _post_readback_for_locator(intent, plan, entry.created_resource)
+        if post_readback is None:
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable created resource locator is unavailable"))
+        observed, completeness = _complete_broker_read(self._adapter, post_readback.request, context, bundle, plan, evidence)
+        if not _readback_matches(post_readback, intent, observed, entry.created_resource):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation requires semantic reconciliation"), reconciliation_required=True)
         receipt = self._semantic_receipt(
             intent, context, bundle, plan, entry.pre_state_digest or observed.snapshot_digest, observed.snapshot_digest,
@@ -1551,20 +1661,20 @@ class GitHubMutationBroker:
     def _execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload | None, plan: BrokerSemanticPlan,
         bundle: SchemaV2AuthorizationBundle, evidence: MutationJournalEntry | None, now: datetime,
-    ) -> GitHubMutationResult:
+    ) -> tuple[GitHubMutationResult, CreatedResourceLocator | None]:
         if type(plan) is not BrokerSemanticPlan or plan.operation is not intent.operation or plan.command is not _MUTATION_COMMAND_BY_OPERATION[intent.operation]:
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic command is invalid"))
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic command is invalid")), None
         if self.__executor is not None:
             if type(payload) is not GhMutationPayload:
-                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable"))
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable")), None
             if self._journal is None:
-                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence"))
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence")), None
             if type(evidence) is not MutationJournalEntry:
-                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks sealed journal entry"))
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks sealed journal entry")), None
             return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence.key, now)
         if payload is not None:
-            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads"))
-        return self._adapter.submit(intent)
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads")), None
+        return self._adapter.submit(intent), None
 
     def reconcile(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext, *,
@@ -1672,6 +1782,7 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
 
 def _readback_matches(
     readback: SemanticReadback, intent: GitHubMutationIntent, result: GitHubReadResult,
+    locator: CreatedResourceLocator | None = None,
 ) -> bool:
     """Interpret the one explicit branch-absence result without inventing success."""
 
@@ -1680,7 +1791,24 @@ def _readback_matches(
             result.failure is not None
             and result.failure.kind is GitHubFailureKind.STALE_RESPONSE
         )
-    return result.ok and _matches(readback, intent, result.snapshot)
+    if not result.ok:
+        return False
+    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+        if type(locator) is not CreatedResourceLocator or type(result.snapshot) is not PullRequestSnapshot:
+            return False
+        payload = dict(intent.payload)
+        return (
+            result.snapshot.repository == intent.repository
+            and result.snapshot.number == locator.pull_request_number
+            and result.snapshot.state is PullRequestState.OPEN
+            and result.snapshot.draft is locator.draft
+            and result.snapshot.base_sha == locator.base_sha == payload.get("base_sha")
+            and result.snapshot.head_sha == locator.head_sha == payload.get("head_sha")
+            and locator.marker_digest == payload.get("body_digest")
+            and result.snapshot.base_ref == payload.get("base_ref")
+            and result.snapshot.head_ref == payload.get("head_ref")
+        )
+    return _matches(readback, intent, result.snapshot)
 
 
 def _affected_identity(intent: GitHubMutationIntent, result: GitHubReadResult) -> str:
@@ -1688,6 +1816,13 @@ def _affected_identity(intent: GitHubMutationIntent, result: GitHubReadResult) -
 
     if type(intent) is not GitHubMutationIntent or type(result) is not GitHubReadResult or not result.ok or result.snapshot is None:
         raise GitHubRuntimeError("semantic affected identity is unavailable")
+    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST and type(result.snapshot) is PullRequestSnapshot:
+        return _sha256((
+            "affected", intent.operation.value, result.snapshot.repository.slug,
+            result.snapshot.pull_request_id, result.snapshot.number, result.snapshot.state.value,
+            result.snapshot.base_ref, result.snapshot.base_sha, result.snapshot.head_ref,
+            result.snapshot.head_sha, result.snapshot.draft,
+        ))
     # The typed snapshot digest commits repository, target, candidate and the
     # operation-specific normalized fields selected by the broker read-back.
     return _sha256(("affected", intent.operation.value, intent.repository.slug, intent.target_ref, intent.target_number, result.snapshot_digest))

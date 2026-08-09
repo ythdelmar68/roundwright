@@ -52,6 +52,7 @@ from roundwright.github_runtime import (
     SemanticReadback,
     _broker_semantic_plan,
     _complete_broker_read,
+    _GhBrokerExecutor,
     _validate_created_resource_locator,
     schema_v2_authorization_bundle,
     unavailable_capability_health,
@@ -94,8 +95,9 @@ class Runner:
 
 
 class OwnerTransport:
-    def __init__(self, accepted: bool = True) -> None:
+    def __init__(self, accepted: bool = True, created_resource: CreatedResourceLocator | None = None) -> None:
         self.accepted = accepted
+        self.created_resource = created_resource
         self.requests: list[OwnerMutationRequest] = []
 
     def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
@@ -115,6 +117,8 @@ class OwnerTransport:
                 request.operation, request.repository, issue_number=request.target_number,
                 comment_id="comment-46", marker_digest=request.marker_digest,
             )
+        if self.created_resource is not None:
+            locator = self.created_resource
         return OwnerMutationAcceptedFact(identity, request.operation, locator)
 
 
@@ -149,6 +153,36 @@ def comments_payload() -> dict[str, object]:
         "repository": {"owner": "example", "name": "roundwright"},
         "issue_number": 46,
         "comments": [{"id": "comment-46", "author_id": "owner-1", "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}],
+    }
+
+
+def repository_payload() -> dict[str, object]:
+    return {
+        "repository": {"owner": "example", "name": "roundwright"},
+        "id": "repository-1", "default_branch": "main", "default_branch_sha": BASE,
+    }
+
+
+def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
+    title, body = "draft title", "draft body"
+    title_digest = "sha256:" + hashlib.sha256(json.dumps(("pull-request-title", title), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    body_digest = "sha256:" + hashlib.sha256(json.dumps(("pull-request-body", body), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    return (
+        GitHubMutationIntent(
+            GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY, "allocate-pr-46",
+            target_number=46,
+            payload=(("base_ref", "main"), ("base_sha", BASE), ("body_digest", body_digest),
+                     ("head_ref", "codex/issue-46"), ("head_sha", SHA), ("title_digest", title_digest)),
+        ),
+        GhMutationPayload(GitHubMutationOperation.CREATE_PULL_REQUEST, (("body", body), ("title", title))),
+    )
+
+
+def pull_request_payload(*, number: int = 58, base_sha: str = BASE, head_sha: str = SHA, draft: bool = True) -> dict[str, object]:
+    return {
+        "repository": {"owner": "example", "name": "roundwright"}, "id": f"pr-{number}",
+        "number": number, "state": "OPEN", "base_ref": "main", "base_sha": base_sha,
+        "head_ref": "codex/issue-46", "head_sha": head_sha, "draft": draft,
     }
 
 
@@ -324,6 +358,104 @@ class GitHubRuntimeTests(unittest.TestCase):
             else:
                 with self.subTest(locator=locator), self.assertRaises(ValueError):
                     _validate_created_resource_locator(fact, pull_request_request, pull_request_intent, _broker_semantic_plan(pull_request_intent))
+
+    def test_created_pull_request_reads_only_the_allocated_locator_identity(self) -> None:
+        intent, payload = pull_request_intent()
+        context = allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR)
+        plan = _broker_semantic_plan(intent)
+        allocated_request = GitHubReadRequest(
+            GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=58, expected_sha=SHA,
+        )
+        adapter = FakeGitHubAdapter({
+            plan.pre_state.identity(): FakeGitHubScenario(response=repository_payload()),
+            allocated_request.identity(): FakeGitHubScenario(response=pull_request_payload()),
+        })
+        transport = OwnerTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            broker = GitHubMutationBroker(
+                adapter, journal=journal,
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.REPOSITORY, GitHubReadOperation.PULL_REQUEST,
+                    GitHubMutationOperation.CREATE_PULL_REQUEST,
+                )),
+            )
+            result = broker.submit(intent, context, payload=payload)
+            self.assertTrue(result.ok)
+            self.assertEqual([call.identity for call in adapter.calls if call.kind == "read"], [
+                plan.pre_state.identity(), allocated_request.identity(),
+            ])
+            self.assertEqual(len(transport.requests), 1)
+            stored = journal.find(MutationJournalEntry.from_evidence(
+                intent, context, schema_v2_authorization_bundle(context), plan,
+            ))
+            self.assertEqual(stored.created_resource.pull_request_number, 58)  # type: ignore[union-attr]
+            self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
+
+    def test_created_pull_request_locator_and_post_state_drift_fail_closed(self) -> None:
+        intent, payload = pull_request_intent()
+        context = allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR)
+        plan = _broker_semantic_plan(intent)
+        allocated_request = GitHubReadRequest(
+            GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=58, expected_sha=SHA,
+        )
+        body_digest = dict(intent.payload)["body_digest"]
+        wrong_locator = CreatedResourceLocator(
+            GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
+            pull_request_number=58, base_sha=SHA, head_sha=SHA, draft=True,
+            marker_digest=body_digest,
+        )
+        for transport, post_state in (
+            (OwnerTransport(created_resource=wrong_locator), None),
+            (OwnerTransport(), pull_request_payload(number=46)),
+        ):
+            with self.subTest(transport=transport, post_state=post_state), tempfile.TemporaryDirectory() as directory:
+                scenarios = {plan.pre_state.identity(): FakeGitHubScenario(response=repository_payload())}
+                if post_state is not None:
+                    scenarios[allocated_request.identity()] = FakeGitHubScenario(response=post_state)
+                adapter = FakeGitHubAdapter(scenarios)
+                result = GitHubMutationBroker(
+                    adapter, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                    _executor=_GhBrokerExecutor(transport, health(
+                        GitHubReadOperation.REPOSITORY, GitHubReadOperation.PULL_REQUEST,
+                        GitHubMutationOperation.CREATE_PULL_REQUEST,
+                    )),
+                ).submit(intent, context, payload=payload)
+                self.assertFalse(result.ok)
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_created_pull_request_acceptance_crash_recovers_without_second_transport(self) -> None:
+        intent, payload = pull_request_intent()
+        context = allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR)
+        plan = _broker_semantic_plan(intent)
+        allocated_request = GitHubReadRequest(
+            GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=58, expected_sha=SHA,
+        )
+        transport = OwnerTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            initial = FakeGitHubAdapter({plan.pre_state.identity(): FakeGitHubScenario(response=repository_payload())})
+            def crash(entry: MutationJournalEntry) -> None:
+                if entry.lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
+                    raise RuntimeError("crash after allocated acceptance")
+            broker = GitHubMutationBroker(
+                initial, journal=DurableMutationJournal(path),
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.REPOSITORY, GitHubReadOperation.PULL_REQUEST,
+                    GitHubMutationOperation.CREATE_PULL_REQUEST,
+                )), checkpoint_observer=crash,
+            )
+            with self.assertRaises(RuntimeError):
+                broker.submit(intent, context, payload=payload)
+            evidence = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), plan)
+            stored = DurableMutationJournal(path).find(evidence)
+            self.assertIs(stored.lifecycle, JournalLifecycle.TRANSPORT_ACCEPTED)  # type: ignore[union-attr]
+            self.assertIsNotNone(stored.created_resource)  # type: ignore[union-attr]
+            restarted = FakeGitHubAdapter({allocated_request.identity(): FakeGitHubScenario(response=pull_request_payload())})
+            result = GitHubMutationBroker(restarted, journal=DurableMutationJournal(path)).submit(intent, context)
+            self.assertTrue(result.ok)
+            self.assertEqual(restarted.call_count(kind="mutation"), 0)
+            self.assertEqual(len(transport.requests), 1)
 
     def test_schema_v2_authorization_bundle_is_immutable_and_deterministic(self) -> None:
         bundle = schema_v2_authorization_bundle(allowed_context())

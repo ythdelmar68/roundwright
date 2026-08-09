@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 
 from roundwright.github import (
@@ -18,6 +20,9 @@ from roundwright.github import (
     MutationDisposition,
     MutationReceipt,
     RepositoryRef,
+    RequestedReviewersSnapshot,
+    _is_snapshot,
+    _validate_snapshot_for,
     normalize_github_response,
 )
 
@@ -57,6 +62,7 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.BRANCH: {"repository": repository, "ref": "main", "sha": SHA},
             GitHubReadOperation.PULL_REQUEST: {"repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True, "merge_commit_sha": None},
             GitHubReadOperation.REVIEWS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "reviews": [{"id": "review-1", "reviewer_id": "reviewer-1", "state": "APPROVED", "commit_sha": SHA}]},
+            GitHubReadOperation.REQUESTED_REVIEWERS: {"repository": repository, "pull_request_number": 40, "candidate_sha": SHA, "reviewers": ["octocat"], "reviewer_set_digest": "sha256:" + hashlib.sha256(json.dumps(("reviewers", ("octocat",)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest(), "complete": True, "next_cursor": None, "raw_evidence_identity": DIGEST},
             GitHubReadOperation.CHECKS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "check_evidence_identity": DIGEST, "candidate_evidence_identity": READBACK_DIGEST, "checks": [{"id": "check-1", "name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
             GitHubReadOperation.WORKFLOW_RUNS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "workflow_evidence_identity": DIGEST, "candidate_evidence_identity": READBACK_DIGEST, "runs": [{"id": "run-1", "workflow_name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
             GitHubReadOperation.MERGEABILITY: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "mergeability": "MERGEABLE"},
@@ -67,8 +73,6 @@ class GitHubAdapterTests(unittest.TestCase):
 
     def test_every_declared_read_normalizes_to_the_expected_immutable_snapshot(self) -> None:
         for operation in GitHubReadOperation:
-            if operation is GitHubReadOperation.REQUESTED_REVIEWERS:
-                continue  # projection is introduced in the following increment
             with self.subTest(operation=operation):
                 request = self.request(operation)
                 snapshot = normalize_github_response(request, self.payload(operation))
@@ -77,6 +81,20 @@ class GitHubAdapterTests(unittest.TestCase):
                 self.assertTrue(result.ok)
                 self.assertEqual(result.snapshot, snapshot)
                 self.assertTrue(result.snapshot_digest.startswith("sha256:"))
+
+    def test_requested_reviewer_snapshot_map_is_total_and_rejects_other_snapshot_types(self) -> None:
+        request = self.request(GitHubReadOperation.REQUESTED_REVIEWERS)
+        snapshot = normalize_github_response(request, self.payload(request.operation))
+        self.assertIs(type(snapshot), RequestedReviewersSnapshot)
+        self.assertTrue(_is_snapshot(snapshot))
+        _validate_snapshot_for(request, snapshot)
+        wrong_snapshot = normalize_github_response(
+            self.request(GitHubReadOperation.COMMENTS), self.payload(GitHubReadOperation.COMMENTS),
+        )
+        with self.assertRaises(GitHubContractError):
+            _validate_snapshot_for(request, wrong_snapshot)
+        rejected = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=self.payload(GitHubReadOperation.COMMENTS))}).read(request)
+        self.assertFalse(rejected.ok)
 
     def test_response_shapes_fail_closed_without_preserving_comment_bodies(self) -> None:
         request = self.request(GitHubReadOperation.COMMENTS)

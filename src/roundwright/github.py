@@ -793,6 +793,7 @@ def _validate_snapshot_for(request: GitHubReadRequest, snapshot: GitHubSnapshot)
         GitHubReadOperation.BRANCH: BranchSnapshot,
         GitHubReadOperation.PULL_REQUEST: PullRequestSnapshot,
         GitHubReadOperation.REVIEWS: ReviewsSnapshot,
+        GitHubReadOperation.REQUESTED_REVIEWERS: RequestedReviewersSnapshot,
         GitHubReadOperation.CHECKS: ChecksSnapshot,
         GitHubReadOperation.WORKFLOW_RUNS: WorkflowRunsSnapshot,
         GitHubReadOperation.MERGEABILITY: MergeabilitySnapshot,
@@ -820,7 +821,7 @@ def _validate_snapshot_for(request: GitHubReadRequest, snapshot: GitHubSnapshot)
 
 
 def _snapshot_sha(snapshot: GitHubSnapshot) -> str | None:
-    for name in ("sha", "head_sha", "default_branch_sha"):
+    for name in ("sha", "head_sha", "candidate_sha", "default_branch_sha"):
         value = getattr(snapshot, name, None)
         if type(value) is str:
             return value
@@ -852,7 +853,7 @@ def _mutation_failure(intent: GitHubMutationIntent, kind: GitHubFailureKind, rea
 
 
 def _is_snapshot(value: object) -> bool:
-    return type(value) in {RepositorySnapshot, IssueSnapshot, CommentsSnapshot, BranchSnapshot, PullRequestSnapshot, ReviewsSnapshot, ChecksSnapshot, WorkflowRunsSnapshot, MergeabilitySnapshot, ClosingReferencesSnapshot, RemoteHeadSnapshot}
+    return type(value) in {RepositorySnapshot, IssueSnapshot, CommentsSnapshot, BranchSnapshot, PullRequestSnapshot, ReviewsSnapshot, RequestedReviewersSnapshot, ChecksSnapshot, WorkflowRunsSnapshot, MergeabilitySnapshot, ClosingReferencesSnapshot, RemoteHeadSnapshot}
 
 
 def _string(mapping: Mapping[str, object], key: str) -> str:

@@ -46,7 +46,10 @@ from roundwright.github_runtime import (
     MutationBrokerContext,
     OwnerMutationFact,
     OwnerMutationAcceptedFact,
+    OwnerMutationHostEndpoint,
     OwnerMutationRequest,
+    OwnerMutationSealRecord,
+    InMemoryOwnerMutationSealRegistry,
     OperationHealth,
     SemanticPostcondition,
     SemanticReadback,
@@ -102,7 +105,7 @@ class OwnerTransport:
 
     def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         self.requests.append(request)
-        identity = "sha256:" + hashlib.sha256(json.dumps((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        identity = request.identity
         if not self.accepted:
             return OwnerMutationFact(False, identity)
         locator: CreatedResourceLocator | None = None
@@ -120,6 +123,56 @@ class OwnerTransport:
         if self.created_resource is not None:
             locator = self.created_resource
         return OwnerMutationAcceptedFact(identity, request.operation, locator)
+
+    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact:
+        result = self.dispatch(record.request)
+        assert type(result) is OwnerMutationAcceptedFact
+        return result
+
+
+class FixtureOwnerSealRegistry:
+    """Hermetic endpoint registry; production registry records are pre-provisioned."""
+
+    def resolve_and_consume(self, request: OwnerMutationRequest) -> OwnerMutationSealRecord:
+        return OwnerMutationSealRecord(
+            request, request.intent_identity, request.authorization_bundle_identity,
+            request.deployment_identity, request.semantic_plan_identity,
+            request.journal_identity, request.pre_state_identity,
+            request.evaluated_at, request.fresh_until, request.time_identity,
+            request.operation, request.repository, request.candidate_sha,
+            request.idempotency_identity, request.command,
+        )
+
+
+def owner_endpoint(transport: OwnerTransport | None = None) -> OwnerMutationHostEndpoint:
+    host = transport or OwnerTransport()
+    return OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), host, clock=lambda: NOW)
+
+
+def sealed_owner_request(*, evaluated_at: datetime = NOW, fresh_until: datetime | None = None) -> OwnerMutationRequest:
+    evaluated_text = evaluated_at.isoformat()
+    expires_at = (evaluated_at + timedelta(minutes=5) if fresh_until is None else fresh_until).isoformat()
+    time_identity = "sha256:" + hashlib.sha256(
+        json.dumps((evaluated_text, expires_at), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+    ).hexdigest()
+    return OwnerMutationRequest(
+        DIGEST, GitHubMutationOperation.COMMENT, DIGEST, DIGEST, DIGEST, REPOSITORY,
+        46, marker_digest=COMMENT_DIGEST, candidate_sha=SHA,
+        idempotency_identity=DIGEST, command=BrokerMutationCommand.COMMENT,
+        deployment_identity="a" * 64, pre_state_identity=DIGEST,
+        evaluated_at=evaluated_text, fresh_until=expires_at, time_identity=time_identity,
+    )
+
+
+def sealed_owner_record(request: OwnerMutationRequest) -> OwnerMutationSealRecord:
+    return OwnerMutationSealRecord(
+        request, request.intent_identity, request.authorization_bundle_identity,
+        request.deployment_identity, request.semantic_plan_identity,
+        request.journal_identity, request.pre_state_identity,
+        request.evaluated_at, request.fresh_until, request.time_identity,
+        request.operation, request.repository, request.candidate_sha,
+        request.idempotency_identity, request.command,
+    )
 
 
 class PagedFakeGitHubAdapter(FakeGitHubAdapter):
@@ -414,6 +467,56 @@ class GitHubRuntimeTests(unittest.TestCase):
         ):
             with self.subTest(fact=fact), self.assertRaises(ValueError):
                 fact()
+
+    def test_owner_host_endpoint_consumes_exact_seals_before_fixed_execution(self) -> None:
+        """The owner endpoint, not the broker, rejects every missing or drifted seal."""
+        request = sealed_owner_request()
+        transport = OwnerTransport()
+        endpoint = OwnerMutationHostEndpoint(
+            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), transport,
+            clock=lambda: NOW,
+        )
+        accepted = endpoint.dispatch(request)
+        self.assertIsInstance(accepted, OwnerMutationAcceptedFact)
+        self.assertEqual(len(transport.requests), 1)
+        reused = endpoint.dispatch(request)
+        self.assertIsInstance(reused, OwnerMutationFact)
+        self.assertEqual(len(transport.requests), 1)
+
+        class StaticRegistry:
+            def __init__(self, record: OwnerMutationSealRecord | None) -> None:
+                self.record = record
+
+            def resolve_and_consume(self, _: OwnerMutationRequest) -> OwnerMutationSealRecord | None:
+                return self.record
+
+        stale = sealed_owner_request(evaluated_at=NOW - timedelta(minutes=1), fresh_until=NOW)
+        wrong_operation = OwnerMutationRequest(
+            DIGEST, GitHubMutationOperation.CLOSE_ISSUE, DIGEST, DIGEST, DIGEST, REPOSITORY,
+            46, candidate_sha=SHA, idempotency_identity=DIGEST,
+            command=BrokerMutationCommand.CLOSE_ISSUE, deployment_identity="a" * 64,
+            pre_state_identity=DIGEST, evaluated_at=request.evaluated_at,
+            fresh_until=request.fresh_until, time_identity=request.time_identity,
+        )
+        drifted = (
+            replace(request, authorization_bundle_identity="sha256:" + "e" * 64),
+            replace(request, candidate_sha=BASE),
+            replace(request, idempotency_identity="sha256:" + "e" * 64),
+            replace(request, semantic_plan_identity="sha256:" + "e" * 64),
+            replace(request, journal_identity="sha256:" + "e" * 64),
+        )
+        cases: tuple[OwnerMutationSealRecord | None, ...] = (
+            None, *(sealed_owner_record(value) for value in drifted),
+            sealed_owner_record(stale), sealed_owner_record(wrong_operation),
+        )
+        for record in cases:
+            with self.subTest(record=record is None):
+                denied_transport = OwnerTransport()
+                denied = OwnerMutationHostEndpoint(
+                    StaticRegistry(record), denied_transport, clock=lambda: NOW,
+                ).dispatch(request)
+                self.assertIsInstance(denied, OwnerMutationFact)
+                self.assertEqual(denied_transport.requests, [])
 
     def test_created_resource_locator_binds_to_fixed_request_and_plan(self) -> None:
         comment_intent = GitHubMutationIntent(
@@ -1686,7 +1789,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             def crash(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
                     raise RuntimeError("crash")
-            broker = GitHubMutationBroker.with_owner_transport(runner, transport, matrix, journal=journal, checkpoint_observer=crash)
+            broker = GitHubMutationBroker.with_owner_transport(runner, owner_endpoint(transport), matrix, journal=journal, checkpoint_observer=crash)
             with self.assertRaises(RuntimeError):
                 broker.submit(intent, context, payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),)))
             entry = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent))
@@ -1828,7 +1931,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
             transport = OwnerTransport()
-            broker = GitHubMutationBroker.with_owner_transport(runner, transport, matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(runner, owner_endpoint(transport), matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
             result = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
             self.assertTrue(result.ok)
             self.assertEqual(len(runner.calls), 2)
@@ -1852,7 +1955,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
-            broker = GitHubMutationBroker.with_owner_transport(runner, OwnerTransport(), matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(runner, owner_endpoint(), matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
             payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
             first = broker.submit(intent, allowed_context(), payload=payload)
             self.assertFalse(first.ok)

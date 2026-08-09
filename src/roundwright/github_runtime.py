@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from threading import RLock
 from typing import Callable, Mapping, Protocol
 from urllib.parse import urlparse
 
@@ -235,6 +236,15 @@ class OwnerMutationRequest:
     base_sha: str | None = None
     head_sha: str | None = None
     marker_digest: str | None = None
+    candidate_sha: str | None = None
+    idempotency_identity: str | None = None
+    command: BrokerMutationCommand | None = None
+    deployment_identity: str | None = None
+    pre_state_identity: str | None = None
+    evaluated_at: str | None = None
+    fresh_until: str | None = None
+    time_identity: str | None = None
+    identity: str = field(init=False)
 
     def __post_init__(self) -> None:
         if type(self.operation) is not GitHubMutationOperation:
@@ -253,6 +263,39 @@ class OwnerMutationRequest:
             _digest(self.marker_digest, "owner comment marker")
         elif any(value is not None for value in (self.base_sha, self.head_sha, self.marker_digest)):
             raise GitHubRuntimeError("owner non-allocating request resource evidence is invalid")
+        sealed_values = (
+            self.candidate_sha, self.idempotency_identity, self.command,
+            self.deployment_identity, self.pre_state_identity, self.evaluated_at,
+            self.fresh_until, self.time_identity,
+        )
+        if any(value is not None for value in sealed_values) and any(value is None for value in sealed_values):
+            raise GitHubRuntimeError("owner mutation seal is incomplete")
+        if all(value is not None for value in sealed_values):
+            if type(self.candidate_sha) is not str or len(self.candidate_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in self.candidate_sha):
+                raise GitHubRuntimeError("owner mutation candidate is invalid")
+            for value, name in (
+                (self.idempotency_identity, "owner idempotency"),
+                (self.pre_state_identity, "owner pre-state"),
+                (self.time_identity, "owner time"),
+            ):
+                _digest(value, name)
+            _fingerprint(self.deployment_identity, "owner deployment")
+            if type(self.command) is not BrokerMutationCommand or self.command is not _MUTATION_COMMAND_BY_OPERATION[self.operation]:
+                raise GitHubRuntimeError("owner mutation command is invalid")
+            for value, name in ((self.evaluated_at, "owner evaluated time"), (self.fresh_until, "owner fresh until")):
+                try:
+                    parsed = datetime.fromisoformat(value)
+                except (TypeError, ValueError) as error:
+                    raise GitHubRuntimeError(f"{name} is invalid") from error
+                if parsed.tzinfo is not timezone.utc:
+                    raise GitHubRuntimeError(f"{name} is invalid")
+            if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
+                raise GitHubRuntimeError("owner mutation time seal drifted")
+        object.__setattr__(self, "identity", _sha256(tuple(
+            self.operation.value if name == "operation" else self.repository.slug if name == "repository"
+            else self.command.value if name == "command" and self.command is not None else getattr(self, name)
+            for name in self.__dataclass_fields__ if name != "identity"
+        )))
 
 
 @dataclass(frozen=True)
@@ -1470,6 +1513,153 @@ _MUTATION_COMMAND_BY_OPERATION: Mapping[GitHubMutationOperation, BrokerMutationC
 })
 
 
+@dataclass(frozen=True)
+class OwnerMutationSealRecord:
+    """One owner-provisioned, single-use sealed mutation authorization.
+
+    This is deliberately an identity-only record.  It contains neither a
+    provider command nor credential material; the host may execute only its
+    own fixed mapping after every broker seal has been compared.
+    """
+
+    request: OwnerMutationRequest
+    intent_identity: str
+    authorization_bundle_identity: str
+    deployment_identity: str
+    semantic_plan_identity: str
+    journal_identity: str
+    pre_state_identity: str
+    evaluated_at: str
+    fresh_until: str
+    time_identity: str
+    operation: GitHubMutationOperation
+    repository: RepositoryRef
+    candidate_sha: str
+    idempotency_identity: str
+    command: BrokerMutationCommand
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not OwnerMutationRequest or type(self.operation) is not GitHubMutationOperation or type(self.repository) is not RepositoryRef or type(self.command) is not BrokerMutationCommand:
+            raise GitHubRuntimeError("owner mutation seal record is invalid")
+        if self.command is not _MUTATION_COMMAND_BY_OPERATION[self.operation]:
+            raise GitHubRuntimeError("owner mutation seal command is invalid")
+        for value, name in (
+            (self.intent_identity, "host intent"), (self.authorization_bundle_identity, "host bundle"),
+            (self.semantic_plan_identity, "host plan"), (self.journal_identity, "host journal"),
+            (self.pre_state_identity, "host pre-state"), (self.idempotency_identity, "host idempotency"),
+            (self.time_identity, "host time"),
+        ):
+            _digest(value, name)
+        _fingerprint(self.deployment_identity, "host deployment")
+        if type(self.candidate_sha) is not str or len(self.candidate_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in self.candidate_sha):
+            raise GitHubRuntimeError("owner mutation seal candidate is invalid")
+        for value, name in ((self.evaluated_at, "host evaluated time"), (self.fresh_until, "host fresh until")):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError) as error:
+                raise GitHubRuntimeError(f"{name} is invalid") from error
+            if parsed.tzinfo is not timezone.utc:
+                raise GitHubRuntimeError(f"{name} is invalid")
+        if datetime.fromisoformat(self.fresh_until) <= datetime.fromisoformat(self.evaluated_at):
+            raise GitHubRuntimeError("owner mutation seal freshness is invalid")
+        if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
+            raise GitHubRuntimeError("owner mutation seal time drifted")
+        if not self.matches(self.request):
+            raise GitHubRuntimeError("owner mutation seal does not bind request")
+        object.__setattr__(self, "identity", _sha256(tuple(
+            self.request.identity if name == "request" else self.operation.value if name == "operation"
+            else self.repository.slug if name == "repository" else self.command.value if name == "command"
+            else getattr(self, name)
+            for name in self.__dataclass_fields__ if name != "identity"
+        )))
+
+    def matches(self, request: OwnerMutationRequest) -> bool:
+        return type(request) is OwnerMutationRequest and (
+            request.identity == self.request.identity
+            and request.intent_identity == self.intent_identity
+            and request.authorization_bundle_identity == self.authorization_bundle_identity
+            and request.deployment_identity == self.deployment_identity
+            and request.semantic_plan_identity == self.semantic_plan_identity
+            and request.journal_identity == self.journal_identity
+            and request.pre_state_identity == self.pre_state_identity
+            and request.evaluated_at == self.evaluated_at
+            and request.fresh_until == self.fresh_until
+            and request.time_identity == self.time_identity
+            and request.operation is self.operation and request.repository == self.repository
+            and request.candidate_sha == self.candidate_sha
+            and request.idempotency_identity == self.idempotency_identity
+            and request.command is self.command
+        )
+
+
+class OwnerMutationSealRegistry(Protocol):
+    """Owner-host storage that resolves and consumes one exact request once."""
+
+    def resolve_and_consume(self, request: OwnerMutationRequest) -> OwnerMutationSealRecord | None: ...
+
+
+class _OwnerMutationHostExecutor(Protocol):
+    """Private fixed-command host executor; it accepts no provider arguments."""
+
+    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact: ...
+
+
+class InMemoryOwnerMutationSealRegistry:
+    """Hermetic owner registry with atomic single-use consumption semantics."""
+
+    def __init__(self, records: tuple[OwnerMutationSealRecord, ...]) -> None:
+        if type(records) is not tuple or any(type(record) is not OwnerMutationSealRecord for record in records):
+            raise GitHubRuntimeError("owner mutation seal registry is invalid")
+        if len({record.request.identity for record in records}) != len(records):
+            raise GitHubRuntimeError("owner mutation seal registry has duplicate requests")
+        self.__records = {record.request.identity: record for record in records}
+        self.__lock = RLock()
+
+    def resolve_and_consume(self, request: OwnerMutationRequest) -> OwnerMutationSealRecord | None:
+        if type(request) is not OwnerMutationRequest:
+            raise GitHubRuntimeError("owner mutation registry request is invalid")
+        with self.__lock:
+            return self.__records.pop(request.identity, None)
+
+
+class OwnerMutationHostEndpoint:
+    """Disabled host-side fixed protocol; no process, credentials, or raw output."""
+
+    def __init__(
+        self, registry: OwnerMutationSealRegistry, executor: _OwnerMutationHostExecutor,
+        *, clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not hasattr(registry, "resolve_and_consume") or not hasattr(executor, "execute_fixed"):
+            raise GitHubRuntimeError("owner mutation host endpoint is unavailable")
+        self.__registry = registry
+        self.__executor = executor
+        self.__clock = _trusted_utc_now if clock is None else clock
+
+    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
+        if type(request) is not OwnerMutationRequest:
+            raise GitHubRuntimeError("owner mutation host request is invalid")
+        record = self.__registry.resolve_and_consume(request)
+        if type(record) is not OwnerMutationSealRecord or not record.matches(request):
+            return OwnerMutationFact(False, request.identity)
+        if request.command is not _MUTATION_COMMAND_BY_OPERATION[request.operation]:
+            return OwnerMutationFact(False, request.identity)
+        try:
+            now = self.__clock()
+            fresh_until = datetime.fromisoformat(record.fresh_until)
+        except (TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
+        if type(now) is not datetime or now.tzinfo is not timezone.utc or now >= fresh_until:
+            return OwnerMutationFact(False, request.identity)
+        try:
+            fact = self.__executor.execute_fixed(record)
+        except (AttributeError, TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
+        if type(fact) is not OwnerMutationAcceptedFact or fact.request_identity != request.identity or fact.operation is not request.operation:
+            return OwnerMutationFact(False, request.identity)
+        return fact
+
+
 def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
     """Derive the sole command and typed read-back plan for an intent.
 
@@ -1733,7 +1923,7 @@ class _GhBrokerExecutor:
 
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
-        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal_identity: str, now: datetime,
+        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal: MutationJournalEntry, now: datetime,
     ) -> tuple[GitHubMutationResult, CreatedResourceLocator | None]:
         blocked = _health_failure(intent.operation, self.__health)
         if blocked is not None:
@@ -1744,15 +1934,25 @@ class _GhBrokerExecutor:
             payload.require_matches(intent)
             if command is not plan.command:
                 raise GitHubRuntimeError("broker command does not match semantic plan")
+            if (
+                type(journal) is not MutationJournalEntry
+                or journal.lifecycle is not JournalLifecycle.EXECUTION_STARTED
+                or not journal.pre_state_complete
+                or journal.pre_state_identity is None
+            ):
+                raise GitHubRuntimeError("broker journal execution seal is unavailable")
             intent_payload = dict(intent.payload)
             request = OwnerMutationRequest(
-                intent.identity(), intent.operation, bundle.identity, plan.identity, journal_identity,
+                intent.identity(), intent.operation, bundle.identity, plan.identity, journal.key,
                 intent.repository, intent.target_number,
                 intent_payload.get("base_sha"), intent_payload.get("head_sha"),
                 intent_payload.get("body_digest"),
+                bundle.candidate_sha, plan.idempotency_identity, plan.command,
+                bundle.deployment_identity, journal.pre_state_identity,
+                journal.evaluated_at, journal.fresh_until, journal.time_identity,
             )
             fact = self.__transport.dispatch(request)
-            request_identity = _sha256((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity))
+            request_identity = request.identity
             if type(fact) is OwnerMutationFact:
                 if fact.request_identity != request_identity:
                     raise GitHubRuntimeError("owner mutation fact is not bound to request")
@@ -1804,12 +2004,14 @@ class GitHubMutationBroker:
 
     @classmethod
     def with_owner_transport(
-        cls, read_runner: GhRunner, transport: OwnerMutationTransport, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
+        cls, read_runner: GhRunner, transport: OwnerMutationHostEndpoint, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
         """Create the only production mutation path without exposing its executor."""
 
         if type(journal) is not DurableMutationJournal:
             raise GitHubRuntimeError("live broker requires a durable journal")
+        if type(transport) is not OwnerMutationHostEndpoint:
+            raise GitHubRuntimeError("live broker requires an owner mutation host endpoint")
         return cls(GhGitHubAdapter(read_runner, health), journal=journal, _executor=_GhBrokerExecutor(transport, health), checkpoint_observer=checkpoint_observer)
 
     def submit(
@@ -2003,7 +2205,7 @@ class GitHubMutationBroker:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence")), None
             if type(evidence) is not MutationJournalEntry:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks sealed journal entry")), None
-            return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence.key, now)
+            return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence, now)
         if payload is not None:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads")), None
         return self._adapter.submit(intent), None

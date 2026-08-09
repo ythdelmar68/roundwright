@@ -1239,13 +1239,13 @@ class GitHubMutationBroker:
 
     @classmethod
     def with_owner_transport(
-        cls, read_runner: GhRunner, transport: OwnerMutationTransport, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal,
+        cls, read_runner: GhRunner, transport: OwnerMutationTransport, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
         """Create the only production mutation path without exposing its executor."""
 
         if type(journal) is not DurableMutationJournal:
             raise GitHubRuntimeError("live broker requires a durable journal")
-        return cls(GhGitHubAdapter(read_runner, health), journal=journal, _executor=_GhBrokerExecutor(transport, health))
+        return cls(GhGitHubAdapter(read_runner, health), journal=journal, _executor=_GhBrokerExecutor(transport, health), checkpoint_observer=checkpoint_observer)
 
     def submit(
         self,
@@ -1388,7 +1388,7 @@ class GitHubMutationBroker:
         if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation requires semantic reconciliation"), reconciliation_required=True)
         receipt = self._semantic_receipt(
-            intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest,
+            intent, context, bundle, plan, entry.pre_state_digest or observed.snapshot_digest, observed.snapshot_digest,
             completeness, completeness,
             _affected_identity(intent, observed), MutationDisposition.ALREADY_APPLIED,
         )

@@ -191,6 +191,8 @@ class IssueSnapshot:
     issue_id: str
     number: int
     state: IssueState
+    issue_evidence_identity: str
+    relationship_evidence_identity: str
     parent_number: int | None = None
     sub_issue_numbers: tuple[int, ...] = ()
 
@@ -204,6 +206,8 @@ class IssueSnapshot:
         _validate_numbers(self.sub_issue_numbers, "sub issue numbers")
         if self.number == self.parent_number or self.number in self.sub_issue_numbers:
             raise GitHubContractError("issue relationship is invalid")
+        _validate_digest(self.issue_evidence_identity, "issue evidence")
+        _validate_digest(self.relationship_evidence_identity, "issue relationship evidence")
 
 
 @dataclass(frozen=True)
@@ -712,8 +716,13 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
                 _string(response, "default_branch_evidence_identity"),
             )
         if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
-            _exact_shape(response, {"repository", "id", "number", "state", "parent_number", "sub_issue_numbers"})
-            return IssueSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), IssueState(_string(response, "state")), _optional_integer(response, "parent_number"), _integer_tuple(response, "sub_issue_numbers"))
+            _exact_shape(response, {"repository", "id", "number", "state", "parent_number", "sub_issue_numbers", "issue_evidence_identity", "relationship_evidence_identity"})
+            return IssueSnapshot(
+                _repository(response), _string(response, "id"), _integer(response, "number"),
+                IssueState(_string(response, "state")), _string(response, "issue_evidence_identity"),
+                _string(response, "relationship_evidence_identity"), _optional_integer(response, "parent_number"),
+                _integer_tuple(response, "sub_issue_numbers"),
+            )
         if operation is GitHubReadOperation.COMMENTS:
             _exact_shape(response, {"repository", "issue_number", "comments"})
             return CommentsSnapshot(_repository(response), _integer(response, "issue_number"), tuple(CommentSnapshot(_string(item, "id"), _string(item, "author_id"), _digest_text(_string(item, "body")), _string(item, "created_at")) for item in _mappings(response, "comments", {"id", "author_id", "body", "created_at"})))

@@ -186,6 +186,34 @@ def gh_default_branch(*, name: str = "main", sha: str = BASE, repository: str = 
     return branch
 
 
+def gh_issue_metadata(*, parent_number: int | None = None, child_total: int | None = None, state: str = "open", repository: str = "example/roundwright", number: int = 46) -> dict[str, object]:
+    item: dict[str, object] = {
+        "id": f"issue-{number}", "number": number, "state": state,
+        "repository_url": f"https://api.github.com/repos/{repository}",
+        "url": f"https://api.github.com/repos/{repository}/issues/{number}",
+        "html_url": f"https://github.com/{repository}/issues/{number}",
+    }
+    if parent_number is not None:
+        item["parent_issue_url"] = f"https://api.github.com/repos/{repository}/issues/{parent_number}"
+    if child_total is not None:
+        item["sub_issues_summary"] = {"total": child_total, "completed": 0, "percent_completed": 0}
+    return item
+
+
+def gh_issue_relationship_page(*children: int, total: int | None = None, next_cursor: str | None = None, repository: str = "example/roundwright", number: int = 46) -> dict[str, object]:
+    count = len(children) if total is None else total
+    owner, name = repository.split("/", 1)
+    return {
+        "data": {"repository": {
+            "name": name, "owner": {"login": owner},
+            "issue": {"number": number, "subIssues": {
+                "totalCount": count, "nodes": [{"number": child} for child in children],
+                "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
+            }},
+        }},
+    }
+
+
 def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
     title, body = "draft title", "draft body"
     title_digest = "sha256:" + hashlib.sha256(json.dumps(("pull-request-title", title), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
@@ -975,6 +1003,79 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
                 self.assertEqual(len(runner.calls), 1 if branch is None else 2)
+
+    def test_native_issue_read_normalizes_lowercase_state_and_binds_complete_relationship_evidence(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.ISSUE_RELATIONSHIPS, REPOSITORY, number=46)
+        runner = Runner(
+            GhCommandResult(0, json.dumps(gh_issue_metadata(parent_number=2, child_total=2))),
+            GhCommandResult(0, json.dumps(gh_issue_relationship_page(47, 48, total=2))),
+        )
+        result = GhGitHubAdapter(runner, health(GitHubReadOperation.ISSUE_RELATIONSHIPS)).read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.state.value, "OPEN")  # type: ignore[union-attr]
+        self.assertEqual(result.snapshot.parent_number, 2)  # type: ignore[union-attr]
+        self.assertEqual(result.snapshot.sub_issue_numbers, (47, 48))  # type: ignore[union-attr]
+        self.assertNotEqual(result.snapshot.issue_evidence_identity, result.snapshot.relationship_evidence_identity)  # type: ignore[union-attr]
+        self.assertEqual(runner.calls[0], ("api", "--method", "GET", "repos/example/roundwright/issues/46"))
+        query = next(value for value in runner.calls[1] if value.startswith("query="))
+        self.assertIn("subIssues(first:100,after:$cursor)", query)
+        self.assertIn("totalCount", query)
+
+    def test_native_issue_read_accepts_no_relationships_and_bounded_multi_page_relationships(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.ISSUE, REPOSITORY, number=46)
+        empty = GhGitHubAdapter(Runner(
+            GhCommandResult(0, json.dumps(gh_issue_metadata(child_total=0, state="closed"))),
+            GhCommandResult(0, json.dumps(gh_issue_relationship_page(total=0))),
+        ), health(GitHubReadOperation.ISSUE)).read(request)
+        self.assertTrue(empty.ok)
+        self.assertEqual(empty.snapshot.state.value, "CLOSED")  # type: ignore[union-attr]
+        self.assertEqual(empty.snapshot.sub_issue_numbers, ())  # type: ignore[union-attr]
+
+        runner = Runner(
+            GhCommandResult(0, json.dumps(gh_issue_metadata(child_total=2))),
+            GhCommandResult(0, json.dumps(gh_issue_relationship_page(47, total=2, next_cursor="cursor-1"))),
+            GhCommandResult(0, json.dumps(gh_issue_relationship_page(48, total=2))),
+        )
+        multi = GhGitHubAdapter(runner, health(GitHubReadOperation.ISSUE)).read(request)
+        self.assertTrue(multi.ok)
+        self.assertEqual(multi.snapshot.sub_issue_numbers, (47, 48))  # type: ignore[union-attr]
+        self.assertIn("cursor=cursor-1", runner.calls[2])
+
+    def test_native_issue_read_rejects_url_summary_and_pagination_drift(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.ISSUE_RELATIONSHIPS, REPOSITORY, number=46)
+        malformed_parent = gh_issue_metadata()
+        malformed_parent["parent_issue_url"] = "https://api.github.com/repos/other/repository/issues/2"
+        malformed_parent_url = gh_issue_metadata()
+        malformed_parent_url["parent_issue_url"] = "not-a-provider-url"
+        malformed_html = gh_issue_metadata()
+        malformed_html["html_url"] = "https://github.com/other/repository/issues/46"
+        drifting_page = gh_issue_relationship_page(47, total=1)
+        drifting_page["data"]["repository"]["issue"]["number"] = 47  # type: ignore[index]
+        cases = (
+            ("cross-repository-parent", malformed_parent, []),
+            ("malformed-parent-url", malformed_parent_url, []),
+            ("cross-repository-html", malformed_html, []),
+            ("relationship-number-drift", gh_issue_metadata(), [drifting_page]),
+            ("summary-mismatch", gh_issue_metadata(child_total=2), [gh_issue_relationship_page(47, total=1)]),
+            ("terminal-truncation", gh_issue_metadata(), [gh_issue_relationship_page(47, total=2)]),
+            ("duplicate-child", gh_issue_metadata(), [gh_issue_relationship_page(47, 47, total=2)]),
+            ("cursor-loop", gh_issue_metadata(), [gh_issue_relationship_page(47, total=2, next_cursor="loop"), gh_issue_relationship_page(48, total=2, next_cursor="loop")]),
+        )
+        for name, metadata, pages in cases:
+            with self.subTest(name=name):
+                runner = Runner(*(
+                    [GhCommandResult(0, json.dumps(metadata))]
+                    + [GhCommandResult(0, json.dumps(page)) for page in pages]
+                ))
+                result = GhGitHubAdapter(runner, health(GitHubReadOperation.ISSUE_RELATIONSHIPS)).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
 
     def test_native_comment_and_review_actor_queries_use_only_concrete_login_shapes(self) -> None:
         from roundwright.github_runtime import _collection_read_command

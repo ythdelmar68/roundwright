@@ -25,6 +25,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
+from urllib.parse import urlparse
 
 from .deployment import (
     AuthorityReceiptVerification, DeploymentAuthorityDecision,
@@ -356,6 +357,8 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, failure=blocked)
         if request.operation is GitHubReadOperation.REPOSITORY:
             return self._read_repository(request)
+        if request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
+            return self._read_issue_with_relationships(request)
         outcome = self.__runner.run(_read_command(request))
         if outcome.exit_code != 0:
             try:
@@ -409,6 +412,64 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
                 "gh default branch response is malformed",
+            ))
+
+    def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
+        """Compose REST issue metadata with every native GraphQL child page."""
+
+        metadata_outcome = self.__runner.run(_read_command(request))
+        if metadata_outcome.exit_code != 0:
+            return GitHubReadResult(request, failure=GitHubFailure(
+                _failure_kind(metadata_outcome.exit_code), request.operation,
+                "gh issue read did not return a usable response",
+            ))
+        try:
+            metadata_raw = json.loads(metadata_outcome.stdout)
+            metadata = _project_issue_metadata(request, metadata_raw)
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh issue response is malformed",
+            ))
+        try:
+            children: list[int] = []
+            page_evidence: list[str] = []
+            expected_total: int | None = None
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            for _ in range(32):
+                page_outcome = self.__runner.run(_issue_relationship_command(request, cursor))
+                if page_outcome.exit_code != 0:
+                    return GitHubReadResult(request, failure=GitHubFailure(
+                        _failure_kind(page_outcome.exit_code), request.operation,
+                        "gh issue relationship read did not return a usable response",
+                    ))
+                page_raw = json.loads(page_outcome.stdout)
+                page_numbers, next_cursor, total_count = _project_issue_relationship_page(request, page_raw)
+                if expected_total is None:
+                    expected_total = total_count
+                elif expected_total != total_count:
+                    raise GitHubRuntimeError("gh issue relationship total changed during pagination")
+                if any(number in children for number in page_numbers):
+                    raise GitHubRuntimeError("gh issue relationship children are duplicated")
+                children.extend(page_numbers)
+                if len(children) > 3200:
+                    raise GitHubRuntimeError("gh issue relationship item limit exceeded")
+                page_evidence.append(_sha256(page_raw))
+                if next_cursor is None:
+                    if expected_total != len(children):
+                        raise GitHubRuntimeError("gh issue relationship collection is truncated")
+                    projected = _compose_issue_relationships(request, metadata, metadata_raw, children, page_evidence)
+                    return GitHubReadResult(request, snapshot=normalize_github_response(request, projected))
+                if next_cursor in seen_cursors:
+                    raise GitHubRuntimeError("gh issue relationship cursor loop detected")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            raise GitHubRuntimeError("gh issue relationship page limit exceeded")
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh issue relationship response is malformed",
             ))
 
     def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
@@ -2000,6 +2061,119 @@ def _compose_repository_default_head(
     }
 
 
+def _provider_url_path(value: object) -> str:
+    if type(value) is not str:
+        raise GitHubRuntimeError("gh provider url is malformed")
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+        raise GitHubRuntimeError("gh provider url is malformed")
+    return parsed.path.rstrip("/")
+
+
+def _provider_repository_from_url(value: object) -> RepositoryRef:
+    match = re.fullmatch(r"/repos/([A-Za-z0-9][A-Za-z0-9._-]{0,99})/([A-Za-z0-9][A-Za-z0-9._-]{0,99})", _provider_url_path(value))
+    if match is None:
+        raise GitHubRuntimeError("gh repository url is malformed")
+    return RepositoryRef(match.group(1), match.group(2))
+
+
+def _provider_issue_number_from_url(value: object, repository: RepositoryRef) -> int:
+    match = re.fullmatch(
+        rf"/(?:repos/)?{re.escape(repository.owner)}/{re.escape(repository.name)}/issues/([1-9][0-9]*)",
+        _provider_url_path(value),
+    )
+    if match is None:
+        raise GitHubRuntimeError("gh issue url is malformed")
+    return int(match.group(1))
+
+
+def _project_issue_metadata(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
+    """Project provider-established issue metadata without relationship inference."""
+
+    item = _raw_mapping(raw)
+    repository = _provider_repository_from_url(_raw_text(item, "repository_url"))
+    if repository != request.repository:
+        raise GitHubRuntimeError("gh issue repository does not match request")
+    number = _raw_integer(item, "number")
+    if number <= 0 or number != request.number:
+        raise GitHubRuntimeError("gh issue number does not match request")
+    if _provider_issue_number_from_url(_raw_text(item, "url"), repository) != number:
+        raise GitHubRuntimeError("gh issue api url does not match response")
+    if _provider_issue_number_from_url(_raw_text(item, "html_url"), repository) != number:
+        raise GitHubRuntimeError("gh issue html url does not match response")
+    state = {"open": "OPEN", "closed": "CLOSED"}.get(_raw_text(item, "state"))
+    if state is None:
+        raise GitHubRuntimeError("gh issue state is malformed")
+    parent_value = item.get("parent_issue_url")
+    parent_number = None if parent_value is None else _provider_issue_number_from_url(parent_value, repository)
+    if parent_number == number:
+        raise GitHubRuntimeError("gh issue parent cannot be self")
+    summary = item.get("sub_issues_summary")
+    if summary is None:
+        summary_total = None
+    else:
+        summary_total = _raw_integer(_raw_mapping(summary), "total")
+        if summary_total < 0:
+            raise GitHubRuntimeError("gh issue sub-issue summary is malformed")
+    return {
+        "repository": {"owner": repository.owner, "name": repository.name},
+        "id": _raw_id(item, "id"), "number": number, "state": state,
+        "parent_number": parent_number, "summary_total": summary_total,
+    }
+
+
+def _project_issue_relationship_page(
+    request: GitHubReadRequest, raw: object,
+) -> tuple[list[int], str | None, int]:
+    root = _raw_mapping(raw)
+    data = _raw_mapping(root.get("data"))
+    repository = _raw_mapping(data.get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    issue = _raw_mapping(repository.get("issue"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name or _raw_integer(issue, "number") != request.number:
+        raise GitHubRuntimeError("gh issue relationship identity does not match request")
+    connection = _raw_mapping(issue.get("subIssues"))
+    total_count = _raw_integer(connection, "totalCount")
+    if total_count < 0:
+        raise GitHubRuntimeError("gh issue relationship total is malformed")
+    page_info = _raw_mapping(connection.get("pageInfo"))
+    has_next = _raw_bool(page_info, "hasNextPage")
+    end_cursor = page_info.get("endCursor")
+    if has_next:
+        if type(end_cursor) is not str or not _CURSOR.fullmatch(end_cursor):
+            raise GitHubRuntimeError("gh issue relationship continuation is malformed")
+        next_cursor: str | None = end_cursor
+    else:
+        if end_cursor is not None and (type(end_cursor) is not str or not _CURSOR.fullmatch(end_cursor)):
+            raise GitHubRuntimeError("gh issue relationship terminal cursor is malformed")
+        next_cursor = None
+    nodes = connection.get("nodes")
+    if type(nodes) is not list:
+        raise GitHubRuntimeError("gh issue relationship nodes are malformed")
+    numbers = [_raw_integer(_raw_mapping(node), "number") for node in nodes]
+    if any(number <= 0 or number == request.number for number in numbers) or len(set(numbers)) != len(numbers):
+        raise GitHubRuntimeError("gh issue relationship children are malformed")
+    return numbers, next_cursor, total_count
+
+
+def _compose_issue_relationships(
+    request: GitHubReadRequest, metadata: Mapping[str, object], metadata_raw: object,
+    children: list[int], relationship_page_evidence: list[str],
+) -> Mapping[str, object]:
+    summary_total = metadata.get("summary_total")
+    if summary_total is not None and (type(summary_total) is not int or summary_total != len(children)):
+        raise GitHubRuntimeError("gh issue sub-issue summary does not match complete child collection")
+    if len(set(children)) != len(children):
+        raise GitHubRuntimeError("gh issue relationship children are duplicated")
+    return {
+        "repository": _raw_mapping(metadata.get("repository")), "id": _raw_id(metadata, "id"),
+        "number": _raw_integer(metadata, "number"), "state": _raw_text(metadata, "state"),
+        "parent_number": metadata.get("parent_number"), "sub_issue_numbers": sorted(children),
+        "issue_evidence_identity": _sha256(metadata_raw),
+        "relationship_evidence_identity": _sha256(("issue-relationship-pages", tuple(relationship_page_evidence))),
+    }
+
+
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
     """Project one REST response into the exact core schema.
 
@@ -2071,15 +2245,7 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
     if operation is GitHubReadOperation.REPOSITORY:
         raise GitHubRuntimeError("repository reads require default-head composition")
     if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
-        item = _raw_mapping(raw)
-        _raw_repository_matches(item, request)
-        _raw_number_matches(item, request)
-        parent = item.get("parent_issue")
-        parent_number = _raw_integer(_raw_mapping(parent), "number") if parent is not None else None
-        children = item.get("sub_issues", [])
-        if type(children) is not list:
-            raise GitHubRuntimeError("gh issue sub-issues are incomplete")
-        return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": _raw_text(item, "state"), "parent_number": parent_number, "sub_issue_numbers": [_raw_integer(_raw_mapping(child), "number") for child in children]}
+        raise GitHubRuntimeError("issue reads require native relationship composition")
     if operation is GitHubReadOperation.COMMENTS:
         if type(raw) is dict and "data" in raw:
             projected, next_cursor, _ = _project_gh_collection_page(request, raw)
@@ -2373,6 +2539,21 @@ def _repository_default_branch_command(repository: RepositoryRef, default_branch
     if type(repository) is not RepositoryRef or type(default_branch) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", default_branch):
         raise GitHubRuntimeError("repository default branch command is invalid")
     return ("api", "--method", "GET", f"repos/{repository.slug}/branches/{default_branch}")
+
+
+def _issue_relationship_command(request: GitHubReadRequest, cursor: str | None) -> tuple[str, ...]:
+    """Read one native ``subIssues`` page selected by validated issue metadata."""
+
+    if type(request) is not GitHubReadRequest or request.operation not in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS} or request.number is None:
+        raise GitHubRuntimeError("issue relationship request is invalid")
+    if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
+        raise GitHubRuntimeError("issue relationship cursor is invalid")
+    query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} issue(number:$number){number subIssues(first:100,after:$cursor){totalCount nodes{number} pageInfo{hasNextPage endCursor}}}}}"
+    command: tuple[str, ...] = (
+        "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+        "-F", f"name={request.repository.name}", "-F", f"number={request.number}",
+    )
+    return command if cursor is None else command + ("-F", f"cursor={cursor}")
 
 
 def _collection_read_command(request: GitHubReadRequest, cursor: str | None) -> tuple[str, ...]:

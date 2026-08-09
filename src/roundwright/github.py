@@ -301,6 +301,36 @@ class ReviewsSnapshot:
 
 
 @dataclass(frozen=True)
+class RequestedReviewersSnapshot:
+    """Complete, provider-evidenced requested-reviewer state for one PR."""
+
+    repository: RepositoryRef
+    pull_request_number: int
+    candidate_sha: str
+    reviewers: tuple[str, ...]
+    reviewer_set_digest: str
+    complete: bool
+    next_cursor: str | None
+    raw_evidence_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.repository) is not RepositoryRef:
+            raise GitHubContractError("requested reviewers repository is invalid")
+        _validate_number(self.pull_request_number, "pull request number")
+        _validate_sha(self.candidate_sha, "requested reviewers candidate")
+        if type(self.reviewers) is not tuple or any(type(login) is not str or not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login) for login in self.reviewers):
+            raise GitHubContractError("requested reviewer logins are invalid")
+        if tuple(sorted(self.reviewers)) != self.reviewers or len(set(self.reviewers)) != len(self.reviewers):
+            raise GitHubContractError("requested reviewer logins are not canonical")
+        _validate_digest(self.reviewer_set_digest, "requested reviewer digest")
+        if self.reviewer_set_digest != _digest(("reviewers", self.reviewers)):
+            raise GitHubContractError("requested reviewer digest does not match logins")
+        if type(self.complete) is not bool or (self.complete and self.next_cursor is not None) or (not self.complete and (type(self.next_cursor) is not str or not self.next_cursor)):
+            raise GitHubContractError("requested reviewer completeness is invalid")
+        _validate_digest(self.raw_evidence_identity, "requested reviewer evidence")
+
+
+@dataclass(frozen=True)
 class CheckSnapshot:
     check_id: str
     name: str

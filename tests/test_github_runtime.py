@@ -28,6 +28,7 @@ from roundwright.github import (
     GitHubReadRequest,
     MutationDisposition,
     RepositoryRef,
+    RequestedReviewersSnapshot,
 )
 from roundwright.github_runtime import (
     CapabilityState,
@@ -434,6 +435,14 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertTrue(request.identity().startswith("sha256:"))
         with self.assertRaises(ValueError):
             GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46)
+
+    def test_requested_reviewers_snapshot_requires_canonical_complete_evidence(self) -> None:
+        digest = "sha256:" + hashlib.sha256(json.dumps(("reviewers", ("octocat",)), separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        evidence = "sha256:" + "d" * 64
+        snapshot = RequestedReviewersSnapshot(REPOSITORY, 46, SHA, ("octocat",), digest, True, None, evidence)
+        self.assertTrue(snapshot.complete)
+        with self.assertRaises(ValueError):
+            RequestedReviewersSnapshot(REPOSITORY, 46, SHA, ("octocat", "octocat"), digest, True, None, evidence)
 
     def test_gh_adapter_uses_read_only_api_and_normalizes_only_typed_response(self) -> None:
         import json

@@ -462,7 +462,7 @@ class RemoteHeadSnapshot:
         _validate_sha(self.sha, "remote head sha")
 
 
-GitHubSnapshot: TypeAlias = RepositorySnapshot | IssueSnapshot | CommentsSnapshot | BranchSnapshot | PullRequestSnapshot | ReviewsSnapshot | ChecksSnapshot | WorkflowRunsSnapshot | MergeabilitySnapshot | ClosingReferencesSnapshot | RemoteHeadSnapshot
+GitHubSnapshot: TypeAlias = RepositorySnapshot | IssueSnapshot | CommentsSnapshot | BranchSnapshot | PullRequestSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot | ChecksSnapshot | WorkflowRunsSnapshot | MergeabilitySnapshot | ClosingReferencesSnapshot | RemoteHeadSnapshot
 
 
 @dataclass(frozen=True)
@@ -714,6 +714,12 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
             reviews = tuple(ReviewSnapshot(_string(item, "id"), _string(item, "reviewer_id"), ReviewState(_string(item, "state")), _string(item, "commit_sha")) for item in _mappings(response, "reviews", {"id", "reviewer_id", "state", "commit_sha"}))
             _validate_collection_head(head_sha, tuple(item.commit_sha for item in reviews))
             return ReviewsSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, reviews)
+        if operation is GitHubReadOperation.REQUESTED_REVIEWERS:
+            _exact_shape(response, {"repository", "pull_request_number", "candidate_sha", "reviewers", "reviewer_set_digest", "complete", "next_cursor", "raw_evidence_identity"})
+            snapshot = RequestedReviewersSnapshot(_repository(response), _integer(response, "pull_request_number"), _string(response, "candidate_sha"), tuple(_strings(response, "reviewers")), _string(response, "reviewer_set_digest"), _boolean(response, "complete"), _optional_string(response, "next_cursor"), _string(response, "raw_evidence_identity"))
+            if snapshot.repository != request.repository or snapshot.pull_request_number != request.number or snapshot.candidate_sha != request.expected_sha:
+                raise GitHubContractError("requested reviewer identity drifted")
+            return snapshot
         if operation is GitHubReadOperation.CHECKS:
             _exact_shape(response, {"repository", "pull_request_number", "head_sha", "checks"})
             head_sha = _string(response, "head_sha")
@@ -822,6 +828,20 @@ def _string(mapping: Mapping[str, object], key: str) -> str:
     if type(value) is not str:
         raise GitHubContractError("response field is invalid")
     return value
+
+
+def _optional_string(mapping: Mapping[str, object], key: str) -> str | None:
+    value = mapping[key]
+    if value is not None and type(value) is not str:
+        raise GitHubContractError("response string is invalid")
+    return value
+
+
+def _strings(mapping: Mapping[str, object], key: str) -> tuple[str, ...]:
+    value = mapping[key]
+    if type(value) is not list or any(type(item) is not str for item in value):
+        raise GitHubContractError("response strings are invalid")
+    return tuple(value)
 
 
 def _integer(mapping: Mapping[str, object], key: str) -> int:

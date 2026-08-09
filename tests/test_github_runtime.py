@@ -193,7 +193,7 @@ def gh_comments_page(*, present: bool = True, next_cursor: str | None = None, to
             "name": "roundwright", "owner": {"login": "example"},
             "issue": {"number": 46, "comments": {
                 "totalCount": count,
-                "nodes": ([] if not present else [{"id": "17", "author": {"id": "4"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
+                "nodes": ([] if not present else [{"id": "comment-46", "author": {"id": "4"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
                 "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
             }},
         }},
@@ -452,6 +452,92 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertIs(stored.lifecycle, JournalLifecycle.TRANSPORT_ACCEPTED)  # type: ignore[union-attr]
             self.assertIsNotNone(stored.created_resource)  # type: ignore[union-attr]
             restarted = FakeGitHubAdapter({allocated_request.identity(): FakeGitHubScenario(response=pull_request_payload())})
+            result = GitHubMutationBroker(restarted, journal=DurableMutationJournal(path)).submit(intent, context)
+            self.assertTrue(result.ok)
+            self.assertEqual(restarted.call_count(kind="mutation"), 0)
+            self.assertEqual(len(transport.requests), 1)
+
+    def test_allocated_comment_post_read_requires_the_exact_comment_identity(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "allocated-comment-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        context, plan = allowed_context(), _broker_semantic_plan(intent)
+        adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+        transport = OwnerTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            result = GitHubMutationBroker(
+                adapter, journal=journal,
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            ).submit(intent, context, payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
+            self.assertTrue(result.ok)
+            stored = journal.find(MutationJournalEntry.from_evidence(
+                intent, context, schema_v2_authorization_bundle(context), plan,
+            ))
+            self.assertEqual(stored.created_resource.comment_id, "comment-46")  # type: ignore[union-attr]
+            self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
+
+    def test_allocated_comment_locator_body_and_identity_drift_are_rejected(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "allocated-comment-drift-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
+        other_id = {**comments_payload(), "comments": [{
+            "id": "comment-47", "author_id": "owner-1", "body": "curated evidence",
+            "created_at": "2026-08-07T00:00:00Z",
+        }]}
+        wrong_id = CreatedResourceLocator(
+            GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+            comment_id="comment-47", marker_digest=COMMENT_DIGEST,
+        )
+        wrong_body = CreatedResourceLocator(
+            GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+            comment_id="comment-46", marker_digest=DIGEST,
+        )
+        for transport, response in (
+            (OwnerTransport(created_resource=wrong_id), comments_payload()),
+            (OwnerTransport(), other_id),
+            (OwnerTransport(created_resource=wrong_body), comments_payload()),
+        ):
+            with self.subTest(transport=transport, response=response), tempfile.TemporaryDirectory() as directory:
+                adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=response)})
+                result = GitHubMutationBroker(
+                    adapter, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                    _executor=_GhBrokerExecutor(transport, health(
+                        GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                    )),
+                ).submit(intent, allowed_context(), payload=payload)
+                self.assertFalse(result.ok)
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_allocated_comment_acceptance_crash_reconciles_without_second_transport(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "allocated-comment-crash-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        context, transport = allowed_context(), OwnerTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            initial = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            def crash(entry: MutationJournalEntry) -> None:
+                if entry.lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
+                    raise RuntimeError("crash after allocated comment")
+            with self.assertRaises(RuntimeError):
+                GitHubMutationBroker(
+                    initial, journal=DurableMutationJournal(path),
+                    _executor=_GhBrokerExecutor(transport, health(
+                        GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                    )), checkpoint_observer=crash,
+                ).submit(intent, context, payload=GhMutationPayload(
+                    GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+                ))
+            restarted = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
             result = GitHubMutationBroker(restarted, journal=DurableMutationJournal(path)).submit(intent, context)
             self.assertTrue(result.ok)
             self.assertEqual(restarted.call_count(kind="mutation"), 0)

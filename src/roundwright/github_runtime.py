@@ -943,7 +943,7 @@ class MutationJournalEntry:
             JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
             JournalLifecycle.AMBIGUOUS, JournalLifecycle.VERIFIED,
         }
-        if requires_locator != (type(self.created_resource) is CreatedResourceLocator):
+        if requires_locator and type(self.created_resource) is not CreatedResourceLocator:
             raise GitHubRuntimeError("mutation journal created resource evidence is invalid")
         if self.created_resource is not None and (
             self.created_resource.operation is not self.operation
@@ -1365,17 +1365,19 @@ def _post_readback_for_locator(
 ) -> SemanticReadback | None:
     """Use an allocated identity for creation reads; caller targets never select it."""
 
-    if intent.operation is not GitHubMutationOperation.CREATE_PULL_REQUEST:
-        return plan.readback
-    if not _created_pull_request_locator_matches_intent(intent, plan, locator):
-        return None
-    return SemanticReadback(
-        GitHubReadRequest(
-            GitHubReadOperation.PULL_REQUEST, intent.repository,
-            number=locator.pull_request_number, expected_sha=locator.head_sha,
-        ),
-        SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE,
-    )
+    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+        if not _created_pull_request_locator_matches_intent(intent, plan, locator):
+            return None
+        return SemanticReadback(
+            GitHubReadRequest(
+                GitHubReadOperation.PULL_REQUEST, intent.repository,
+                number=locator.pull_request_number, expected_sha=locator.head_sha,
+            ),
+            SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE,
+        )
+    if intent.operation is GitHubMutationOperation.COMMENT and locator is not None:
+        return plan.readback if _created_comment_locator_matches_intent(intent, plan, locator) else None
+    return plan.readback
 
 
 def _created_pull_request_locator_matches_intent(
@@ -1399,6 +1401,24 @@ def _created_pull_request_locator_matches_intent(
         locator.base_sha == payload.get("base_sha")
         and locator.head_sha == payload.get("head_sha")
         and locator.marker_digest == payload.get("body_digest")
+    )
+
+
+def _created_comment_locator_matches_intent(
+    intent: GitHubMutationIntent, plan: BrokerSemanticPlan,
+    locator: CreatedResourceLocator,
+) -> bool:
+    """Revalidate durable allocated-comment evidence before collection reads."""
+
+    return (
+        intent.operation is GitHubMutationOperation.COMMENT
+        and plan.operation is intent.operation
+        and plan.intent_identity == intent.identity()
+        and locator.operation is intent.operation
+        and locator.repository == intent.repository
+        and locator.issue_number == intent.target_number
+        and locator.marker_digest == dict(intent.payload).get("body_digest")
+        and type(locator.comment_id) is str
     )
 
 
@@ -1547,7 +1567,10 @@ class GitHubMutationBroker:
                 self._journal_transition(evidence, lifecycle)
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
         if evidence is not None and self._journal is not None:
-            if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+            if intent.operation in {
+                GitHubMutationOperation.CREATE_PULL_REQUEST,
+                GitHubMutationOperation.COMMENT,
+            }:
                 evidence = self._journal_transition(
                     evidence, JournalLifecycle.TRANSPORT_ACCEPTED,
                     created_resource=created_resource,
@@ -1566,7 +1589,7 @@ class GitHubMutationBroker:
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         assert outcome.receipt is not None
-        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, pre_completeness, post_completeness, _affected_identity(intent, after), outcome.receipt.disposition)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, pre_completeness, post_completeness, _affected_identity(intent, after, created_resource), outcome.receipt.disposition)
         self._completed[intent.identity()] = receipt
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             self._completed.pop(intent.identity(), None)
@@ -1651,7 +1674,7 @@ class GitHubMutationBroker:
         receipt = self._semantic_receipt(
             intent, context, bundle, plan, entry.pre_state_digest or observed.snapshot_digest, observed.snapshot_digest,
             completeness, completeness,
-            _affected_identity(intent, observed), MutationDisposition.ALREADY_APPLIED,
+            _affected_identity(intent, observed, entry.created_resource), MutationDisposition.ALREADY_APPLIED,
         )
         if self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "reconciled receipt was not persisted"), reconciliation_required=True)
@@ -1808,10 +1831,25 @@ def _readback_matches(
             and result.snapshot.base_ref == payload.get("base_ref")
             and result.snapshot.head_ref == payload.get("head_ref")
         )
+    if intent.operation is GitHubMutationOperation.COMMENT and locator is not None:
+        return (
+            type(locator) is CreatedResourceLocator
+            and type(result.snapshot) is CommentsSnapshot
+            and result.snapshot.repository == intent.repository
+            and result.snapshot.issue_number == locator.issue_number == intent.target_number
+            and any(
+                item.comment_id == locator.comment_id
+                and item.body_digest == locator.marker_digest
+                for item in result.snapshot.comments
+            )
+        )
     return _matches(readback, intent, result.snapshot)
 
 
-def _affected_identity(intent: GitHubMutationIntent, result: GitHubReadResult) -> str:
+def _affected_identity(
+    intent: GitHubMutationIntent, result: GitHubReadResult,
+    locator: CreatedResourceLocator | None = None,
+) -> str:
     """Bind a receipt to the exact normalized post-state, never a transport label."""
 
     if type(intent) is not GitHubMutationIntent or type(result) is not GitHubReadResult or not result.ok or result.snapshot is None:
@@ -1823,6 +1861,15 @@ def _affected_identity(intent: GitHubMutationIntent, result: GitHubReadResult) -
             result.snapshot.base_ref, result.snapshot.base_sha, result.snapshot.head_ref,
             result.snapshot.head_sha, result.snapshot.draft,
         ))
+    if intent.operation is GitHubMutationOperation.COMMENT and type(locator) is CreatedResourceLocator and type(result.snapshot) is CommentsSnapshot:
+        for comment in result.snapshot.comments:
+            if comment.comment_id == locator.comment_id and comment.body_digest == locator.marker_digest:
+                return _sha256((
+                    "affected", intent.operation.value, result.snapshot.repository.slug,
+                    result.snapshot.issue_number, comment.comment_id, comment.body_digest,
+                    comment.created_at,
+                ))
+        raise GitHubRuntimeError("allocated comment affected identity is unavailable")
     # The typed snapshot digest commits repository, target, candidate and the
     # operation-specific normalized fields selected by the broker read-back.
     return _sha256(("affected", intent.operation.value, intent.repository.slug, intent.target_ref, intent.target_number, result.snapshot_digest))

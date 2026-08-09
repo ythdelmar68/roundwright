@@ -372,6 +372,80 @@ class OwnerMutationTransport(Protocol):
     def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact: ...
 
 
+@dataclass(frozen=True)
+class OwnerMutationIpcMessage:
+    """The sole mutation message permitted across the owner IPC boundary."""
+
+    request: OwnerMutationRequest
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not OwnerMutationRequest:
+            raise GitHubRuntimeError("owner mutation IPC request is invalid")
+        object.__setattr__(self, "identity", _sha256(("owner-mutation-ipc/v1", self.request.identity)))
+
+
+@dataclass(frozen=True)
+class OwnerMutationIpcReply:
+    """Curated typed reply; IPC never returns process output or argv."""
+
+    message_identity: str
+    fact: OwnerMutationFact | OwnerMutationAcceptedFact
+
+    def __post_init__(self) -> None:
+        _digest(self.message_identity, "owner mutation IPC message")
+        if type(self.fact) not in {OwnerMutationFact, OwnerMutationAcceptedFact}:
+            raise GitHubRuntimeError("owner mutation IPC reply is invalid")
+
+
+class OwnerMutationIpcChannel(Protocol):
+    """Owner-controlled process/IPC endpoint, deliberately not a command API."""
+
+    def exchange_mutation(self, message: OwnerMutationIpcMessage) -> OwnerMutationIpcReply: ...
+
+
+class OwnerMutationIpcClient:
+    """Role-visible mutation client with an opaque, typed IPC channel only.
+
+    A production client is provisioned with an operating-system IPC channel by
+    the owner host.  No default channel exists: a missing channel is a denial.
+    The channel protocol carries one sealed message type, not commands,
+    environment values, credentials, or provider output.
+    """
+
+    __slots__ = ("__channel", "__endpoint_identity")
+
+    def __init__(self, endpoint_identity: str, channel: OwnerMutationIpcChannel | None = None) -> None:
+        _digest(endpoint_identity, "owner mutation IPC endpoint")
+        if channel is not None and not hasattr(channel, "exchange_mutation"):
+            raise GitHubRuntimeError("owner mutation IPC channel is invalid")
+        self.__endpoint_identity = endpoint_identity
+        self.__channel = channel
+
+    @property
+    def endpoint_identity(self) -> str:
+        return self.__endpoint_identity
+
+    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
+        if type(request) is not OwnerMutationRequest:
+            raise GitHubRuntimeError("owner mutation IPC request is invalid")
+        channel = self.__channel
+        if channel is None:
+            return OwnerMutationFact(False, request.identity)
+        message = OwnerMutationIpcMessage(request)
+        try:
+            reply = channel.exchange_mutation(message)
+        except (AttributeError, TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
+        if (
+            type(reply) is not OwnerMutationIpcReply
+            or reply.message_identity != message.identity
+            or reply.fact.request_identity != request.identity
+        ):
+            return OwnerMutationFact(False, request.identity)
+        return reply.fact
+
+
 class OwnerGitHubReadEndpoint(Protocol):
     """Role-visible owner-host read surface: typed requests and curated facts only."""
 
@@ -379,6 +453,77 @@ class OwnerGitHubReadEndpoint(Protocol):
     def health(self) -> GitHubCapabilityHealth: ...
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult: ...
+
+
+class OwnerGitHubReadIpcChannel(Protocol):
+    """Fixed typed read IPC; no REST path, GraphQL text, or raw response."""
+
+    def exchange_read(self, request: GitHubReadRequest) -> GitHubReadResult: ...
+
+    def exchange_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None": ...
+
+
+class OwnerGitHubReadIpcClient:
+    """Narrow role-visible client for curated read snapshots only."""
+
+    __slots__ = ("__channel", "__health")
+
+    def __init__(self, health: GitHubCapabilityHealth, channel: OwnerGitHubReadIpcChannel | None = None) -> None:
+        if type(health) is not GitHubCapabilityHealth:
+            raise GitHubRuntimeError("owner read IPC health is invalid")
+        if channel is not None and (
+            not hasattr(channel, "exchange_read") or not hasattr(channel, "exchange_collection_page")
+        ):
+            raise GitHubRuntimeError("owner read IPC channel is invalid")
+        self.__health = health
+        self.__channel = channel
+
+    @property
+    def health(self) -> GitHubCapabilityHealth:
+        return self.__health
+
+    def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+        if type(request) is not GitHubReadRequest:
+            raise GitHubContractError("read request is invalid")
+        channel = self.__channel
+        if channel is None:
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.UNAVAILABLE, request.operation, "owner read IPC capability is unavailable",
+            ))
+        try:
+            result = channel.exchange_read(request)
+        except (AttributeError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.UNAVAILABLE, request.operation, "owner read IPC response is unavailable",
+            ))
+        if type(result) is not GitHubReadResult or result.request != request:
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "owner read IPC response drifted",
+            ))
+        return result
+
+    def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
+        if type(request) is not GitHubReadRequest:
+            return None
+        channel = self.__channel
+        if channel is None:
+            return None
+        try:
+            page = channel.exchange_collection_page(request, cursor)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if type(page) is not CollectionPage or page.request != request or page.cursor != cursor:
+            return None
+        return page
+
+    def submit(self, intent: GitHubMutationIntent) -> GitHubMutationResult:
+        """The typed read client is never a mutation transport."""
+
+        if type(intent) is not GitHubMutationIntent:
+            raise GitHubContractError("mutation intent is invalid")
+        return GitHubMutationResult(intent, failure=GitHubFailure(
+            GitHubFailureKind.POLICY_DENIED, intent.operation, "owner read IPC does not execute mutations",
+        ))
 
 
 class _OwnerGitHubReadHostEndpoint:
@@ -1847,7 +1992,7 @@ class OwnerMutationHostEndpoint:
         self.__executor = executor
         self.__clock = _trusted_utc_now if clock is None else clock
 
-    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
+    def _dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         if type(request) is not OwnerMutationRequest:
             raise GitHubRuntimeError("owner mutation host request is invalid")
         record = self.__registry.resolve_and_consume(request)
@@ -1869,6 +2014,13 @@ class OwnerMutationHostEndpoint:
         if type(fact) is not OwnerMutationAcceptedFact or fact.request_identity != request.identity or fact.operation is not request.operation:
             return OwnerMutationFact(False, request.identity)
         return fact
+
+    def exchange_mutation(self, message: OwnerMutationIpcMessage) -> OwnerMutationIpcReply:
+        """Host-side typed IPC dispatch; malformed messages never reach execution."""
+
+        if type(message) is not OwnerMutationIpcMessage:
+            raise GitHubRuntimeError("owner mutation IPC message is invalid")
+        return OwnerMutationIpcReply(message.identity, self._dispatch(message.request))
 
 
 def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
@@ -2254,16 +2406,16 @@ class GitHubMutationBroker:
 
     @classmethod
     def with_owner_transport(
-        cls, read_endpoint: OwnerGitHubReadEndpoint, transport: OwnerMutationHostEndpoint, *, journal: DurableMutationJournal, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
+        cls, read_endpoint: OwnerGitHubReadIpcClient, transport: OwnerMutationIpcClient, *, journal: DurableMutationJournal, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
         """Create the only production path from owner-host typed endpoints."""
 
         if type(journal) is not DurableMutationJournal:
             raise GitHubRuntimeError("live broker requires a durable journal")
-        if type(transport) is not OwnerMutationHostEndpoint:
-            raise GitHubRuntimeError("live broker requires an owner mutation host endpoint")
-        if type(read_endpoint) is not _OwnerGitHubReadHostEndpoint:
-            raise GitHubRuntimeError("live broker requires an owner github read endpoint")
+        if type(transport) is not OwnerMutationIpcClient:
+            raise GitHubRuntimeError("live broker requires an owner mutation IPC client")
+        if type(read_endpoint) is not OwnerGitHubReadIpcClient:
+            raise GitHubRuntimeError("live broker requires an owner github read IPC client")
         if clock is None:
             raise GitHubRuntimeError("live broker requires an injected trusted clock")
         return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health), clock=clock, checkpoint_observer=checkpoint_observer)

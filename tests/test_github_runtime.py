@@ -47,8 +47,12 @@ from roundwright.github_runtime import (
     OwnerMutationFact,
     OwnerMutationAcceptedFact,
     OwnerMutationHostEndpoint,
+    OwnerMutationIpcClient,
+    OwnerMutationIpcMessage,
+    OwnerMutationIpcReply,
     OwnerMutationRequest,
     OwnerMutationSealRecord,
+    OwnerGitHubReadIpcClient,
     OwnerFixedMutationCommand,
     OwnerFixedMutationHostExecutor,
     InMemoryOwnerMutationSealRegistry,
@@ -152,15 +156,32 @@ class FixtureOwnerSealRegistry:
         )
 
 
-def owner_endpoint(transport: OwnerTransport | None = None) -> OwnerMutationHostEndpoint:
+class ReadIpcChannel:
+    """Hermetic typed IPC double; it exposes snapshots, never raw results."""
+
+    def __init__(self, endpoint: GhGitHubAdapter) -> None:
+        self._endpoint = endpoint
+        self.calls = 0
+
+    def exchange_read(self, request: GitHubReadRequest):
+        self.calls += 1
+        return self._endpoint.read(request)
+
+    def exchange_collection_page(self, request: GitHubReadRequest, cursor: str | None):
+        self.calls += 1
+        return self._endpoint.read_collection_page(request, cursor)
+
+
+def owner_endpoint(transport: OwnerTransport | None = None) -> OwnerMutationIpcClient:
     host = transport or OwnerTransport()
-    return OwnerMutationHostEndpoint(
+    endpoint = OwnerMutationHostEndpoint(
         FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), clock=lambda: NOW,
     )
+    return OwnerMutationIpcClient(DIGEST, endpoint)
 
 
-def owner_read_endpoint(runner: Runner, matrix: GitHubCapabilityHealth) -> GhGitHubAdapter:
-    return GhGitHubAdapter(runner, matrix)
+def owner_read_endpoint(runner: Runner, matrix: GitHubCapabilityHealth) -> OwnerGitHubReadIpcClient:
+    return OwnerGitHubReadIpcClient(matrix, ReadIpcChannel(GhGitHubAdapter(runner, matrix)))
 
 
 def sealed_owner_request(*, evaluated_at: datetime = NOW, fresh_until: datetime | None = None) -> OwnerMutationRequest:
@@ -588,10 +609,11 @@ class GitHubRuntimeTests(unittest.TestCase):
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport),
             clock=lambda: NOW,
         )
-        accepted = endpoint.dispatch(request)
+        self.assertFalse(hasattr(endpoint, "dispatch"))
+        accepted = endpoint.exchange_mutation(OwnerMutationIpcMessage(request)).fact
         self.assertIsInstance(accepted, OwnerMutationAcceptedFact)
         self.assertEqual(len(transport.requests), 1)
-        reused = endpoint.dispatch(request)
+        reused = endpoint.exchange_mutation(OwnerMutationIpcMessage(request)).fact
         self.assertIsInstance(reused, OwnerMutationFact)
         self.assertEqual(len(transport.requests), 1)
 
@@ -628,7 +650,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 denied_transport = OwnerTransport()
                 denied = OwnerMutationHostEndpoint(
                     StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), clock=lambda: NOW,
-                ).dispatch(request)
+                ).exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(denied, OwnerMutationFact)
                 self.assertEqual(denied_transport.requests, [])
                 self.assertEqual(denied_transport.commands, [])
@@ -687,6 +709,75 @@ class GitHubRuntimeTests(unittest.TestCase):
             OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
+
+    def test_production_ipc_clients_have_no_reachable_process_or_credential_capability(self) -> None:
+        """The broker graph retains only absent-by-default typed IPC clients."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "ipc-isolation-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        read_client = OwnerGitHubReadIpcClient(matrix)
+        mutation_client = OwnerMutationIpcClient(DIGEST)
+        with tempfile.TemporaryDirectory() as directory:
+            broker = GitHubMutationBroker.with_owner_transport(
+                read_client, mutation_client,
+                journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW,
+            )
+
+            seen: set[int] = set()
+            forbidden = ("runner", "handler", "credential", "stdout", "stderr", "argv", "commandresult")
+
+            def inspect(value: object) -> None:
+                if id(value) in seen or type(value) in {str, int, bool, type(None), bytes}:
+                    return
+                seen.add(id(value))
+                names = set(getattr(value, "__dict__", {}))
+                names.update(getattr(value, "__slots__", ()) if type(getattr(value, "__slots__", ())) in {tuple, list} else ())
+                for name in names:
+                    self.assertFalse(any(token in name.lower() for token in forbidden), name)
+                    try:
+                        inspect(getattr(value, name))
+                    except AttributeError:
+                        pass
+                if type(value) is dict:
+                    for item in value.values():
+                        inspect(item)
+
+            inspect(broker)
+            for value in (broker, read_client, mutation_client):
+                for name in ("run", "execute", "execute_fixed_command", "graphql", "api", "environ"):
+                    self.assertFalse(hasattr(value, name), name)
+            self.assertFalse(read_client.submit(intent).ok)
+            self.assertFalse(mutation_client.dispatch(sealed_owner_request()).accepted)
+
+    def test_malformed_and_cross_request_ipc_messages_do_not_reach_host_execution(self) -> None:
+        """Only an exact sealed IPC message may reach the owner fixed executor."""
+
+        request = sealed_owner_request()
+        transport = OwnerTransport()
+        host = OwnerMutationHostEndpoint(
+            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
+            OwnerFixedMutationHostExecutor(transport), clock=lambda: NOW,
+        )
+        client = OwnerMutationIpcClient(DIGEST, host)
+        with self.assertRaises(ValueError):
+            client.dispatch(object())  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            host.exchange_mutation(object())  # type: ignore[arg-type]
+        self.assertEqual(transport.requests, [])
+        self.assertEqual(transport.commands, [])
+
+        cross_request = replace(request, journal_identity="sha256:" + "e" * 64)
+        denied = client.dispatch(cross_request)
+        self.assertIsInstance(denied, OwnerMutationFact)
+        self.assertEqual(transport.requests, [])
+        self.assertEqual(transport.commands, [])
+
+        accepted = client.dispatch(request)
+        self.assertIsInstance(accepted, OwnerMutationAcceptedFact)
+        self.assertEqual(len(transport.requests), 1)
 
     def test_production_clock_and_health_boundaries_fail_before_owner_or_read_calls(self) -> None:
         """Only the injected broker clock selects authorization evaluation time."""

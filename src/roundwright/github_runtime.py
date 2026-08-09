@@ -2083,6 +2083,25 @@ def _raw_mapping(value: object) -> Mapping[str, object]:
     return value
 
 
+def _raw_actor_identity(value: object) -> str:
+    """Return the canonical, schema-proven identity of a GraphQL actor.
+
+    GitHub's ``Actor`` interface does not give the collection projection a
+    stable provider id to rely on.  The concrete actor type and login are the
+    only evidence requested from the native query, so keep that distinction in
+    the typed snapshot instead of manufacturing an id from the request.
+    """
+
+    actor = _raw_mapping(value)
+    actor_type = _raw_text(actor, "__typename")
+    if actor_type not in {"User", "Bot", "Organization", "Mannequin"}:
+        raise GitHubRuntimeError("gh collection actor type is unsupported")
+    login = _raw_text(actor, "login")
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login):
+        raise GitHubRuntimeError("gh collection actor login is malformed")
+    return f"{actor_type.lower()}:{login.lower()}"
+
+
 def _project_gh_collection_page(
     request: GitHubReadRequest, raw: object,
 ) -> tuple[Mapping[str, object], str | None, int]:
@@ -2129,7 +2148,7 @@ def _project_gh_collection_page(
             "repository": repository, "issue_number": request.number,
             output_name: [
                 {"id": _raw_id(_raw_mapping(node), "id"),
-                 "author_id": _raw_id(_raw_mapping(_raw_mapping(node).get("author")), "id"),
+                 "author_id": _raw_actor_identity(_raw_mapping(node).get("author")),
                  "body": _raw_text(_raw_mapping(node), "body"),
                  "created_at": _raw_text(_raw_mapping(node), "createdAt")}
                 for node in nodes
@@ -2141,7 +2160,7 @@ def _project_gh_collection_page(
             "head_sha": _raw_text(target, "headRefOid"),
             output_name: [
                 {"id": _raw_id(_raw_mapping(node), "id"),
-                 "reviewer_id": _raw_id(_raw_mapping(_raw_mapping(node).get("author")), "id"),
+                 "reviewer_id": _raw_actor_identity(_raw_mapping(node).get("author")),
                  "state": _raw_text(_raw_mapping(node), "state").upper(),
                  "commit_sha": _raw_text(_raw_mapping(_raw_mapping(node).get("commit")), "oid")}
                 for node in nodes
@@ -2279,9 +2298,9 @@ def _collection_read_command(request: GitHubReadRequest, cursor: str | None) -> 
     """
 
     if request.operation is GitHubReadOperation.COMMENTS:
-        target = "issue(number:$number){number comments(first:100,after:$cursor){totalCount nodes{id author{id} body createdAt} pageInfo{hasNextPage endCursor}}}"
+        target = "issue(number:$number){number comments(first:100,after:$cursor){totalCount nodes{id author{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login}} body createdAt} pageInfo{hasNextPage endCursor}}}"
     elif request.operation is GitHubReadOperation.REVIEWS:
-        target = "pullRequest(number:$number){number headRefOid reviews(first:100,after:$cursor){totalCount nodes{id author{id} state commit{oid}} pageInfo{hasNextPage endCursor}}}"
+        target = "pullRequest(number:$number){number headRefOid reviews(first:100,after:$cursor){totalCount nodes{id author{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login}} state commit{oid}} pageInfo{hasNextPage endCursor}}}"
     else:
         raise GitHubRuntimeError("unsupported gh collection read operation")
     query = f"query($owner:String!,$name:String!,$number:Int!,$cursor:String){{repository(owner:$owner,name:$name){{name owner{{login}} {target}}}}}"

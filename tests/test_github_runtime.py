@@ -148,6 +148,10 @@ def comments_request() -> GitHubReadRequest:
     return GitHubReadRequest(GitHubReadOperation.COMMENTS, REPOSITORY, number=46)
 
 
+def reviews_request() -> GitHubReadRequest:
+    return GitHubReadRequest(GitHubReadOperation.REVIEWS, REPOSITORY, number=46, expected_sha=SHA)
+
+
 def comments_payload() -> dict[str, object]:
     return {
         "repository": {"owner": "example", "name": "roundwright"},
@@ -194,7 +198,21 @@ def gh_comments_page(*, present: bool = True, next_cursor: str | None = None, to
             "name": "roundwright", "owner": {"login": "example"},
             "issue": {"number": 46, "comments": {
                 "totalCount": count,
-                "nodes": ([] if not present else [{"id": "comment-46", "author": {"id": "4"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
+                "nodes": ([] if not present else [{"id": "comment-46", "author": {"__typename": "User", "login": "OctoCat"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
+                "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
+            }},
+        }},
+    }
+
+
+def gh_reviews_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None) -> dict[str, object]:
+    count = (1 if present else 0) if total is None else total
+    return {
+        "data": {"repository": {
+            "name": "roundwright", "owner": {"login": "example"},
+            "pullRequest": {"number": 46, "headRefOid": SHA, "reviews": {
+                "totalCount": count,
+                "nodes": ([] if not present else [{"id": "review-46", "author": {"__typename": "Bot", "login": "Build-Bot"}, "state": "APPROVED", "commit": {"oid": SHA}}]),
                 "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
             }},
         }},
@@ -896,6 +914,73 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(runner.calls[0][:2], ("api", "graphql"))
         self.assertNotIn("curated evidence", repr(result.snapshot))
+
+    def test_native_comment_and_review_actor_queries_use_only_concrete_login_shapes(self) -> None:
+        from roundwright.github_runtime import _collection_read_command
+
+        for request in (comments_request(), reviews_request()):
+            with self.subTest(operation=request.operation):
+                command = _collection_read_command(request, None)
+                query = next(value for value in command if value.startswith("query="))
+                self.assertIn("author{__typename", query)
+                for actor_type in ("User", "Bot", "Organization", "Mannequin"):
+                    self.assertIn(f"... on {actor_type}{{login}}", query)
+                self.assertNotIn("author{id}", query)
+                self.assertNotIn("Actor.id", query)
+
+    def test_native_collection_actor_projection_normalizes_comments_and_reviews(self) -> None:
+        import json
+
+        comment_runner = Runner(GhCommandResult(0, json.dumps(gh_comments_page())))
+        comment_adapter = GhGitHubAdapter(comment_runner, health(GitHubReadOperation.COMMENTS))
+        comment_result = comment_adapter.read(comments_request())
+        self.assertTrue(comment_result.ok)
+        self.assertEqual(comment_result.snapshot.comments[0].author_id, "user:octocat")  # type: ignore[union-attr]
+
+        review_runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
+        review_adapter = GhGitHubAdapter(review_runner, health(GitHubReadOperation.REVIEWS))
+        review_result = review_adapter.read(reviews_request())
+        self.assertTrue(review_result.ok)
+        self.assertEqual(review_result.snapshot.reviews[0].reviewer_id, "bot:build-bot")  # type: ignore[union-attr]
+
+    def test_native_collection_actor_projection_allows_empty_terminal_pages(self) -> None:
+        import json
+
+        for request, response in (
+            (comments_request(), gh_comments_page(present=False)),
+            (reviews_request(), gh_reviews_page(present=False)),
+        ):
+            with self.subTest(operation=request.operation):
+                runner = Runner(GhCommandResult(0, json.dumps(response)))
+                adapter = GhGitHubAdapter(runner, health(request.operation))
+                page = adapter.read_collection_page(request, None)
+                self.assertIsNotNone(page)
+                self.assertIsNone(page.next_cursor)  # type: ignore[union-attr]
+                self.assertEqual(page.total_count, 0)  # type: ignore[union-attr]
+                self.assertEqual(len(runner.calls), 1)
+
+    def test_native_collection_actor_projection_rejects_malformed_unsupported_and_drifting_evidence(self) -> None:
+        import json
+
+        malformed_comment = gh_comments_page()
+        malformed_comment["data"]["repository"]["issue"]["comments"]["nodes"][0]["author"] = {"__typename": "Team", "login": "core"}  # type: ignore[index]
+        wrong_repository = gh_comments_page()
+        wrong_repository["data"]["repository"]["owner"]["login"] = "other"  # type: ignore[index]
+        malformed_review = gh_reviews_page()
+        malformed_review["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]["author"] = {"__typename": "User"}  # type: ignore[index]
+        wrong_head = gh_reviews_page()
+        wrong_head["data"]["repository"]["pullRequest"]["headRefOid"] = BASE  # type: ignore[index]
+        for request, response in (
+            (comments_request(), malformed_comment),
+            (comments_request(), wrong_repository),
+            (reviews_request(), malformed_review),
+            (reviews_request(), wrong_head),
+        ):
+            with self.subTest(operation=request.operation):
+                runner = Runner(GhCommandResult(0, json.dumps(response)))
+                result = GhGitHubAdapter(runner, health(request.operation)).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(len(runner.calls), 1)
 
     def test_collection_completeness_consumes_single_and_multi_page_typed_results(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "paged-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))

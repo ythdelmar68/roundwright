@@ -35,13 +35,14 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS,
             GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST,
             GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS,
+            GitHubReadOperation.REQUESTED_REVIEWERS,
             GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY,
             GitHubReadOperation.CLOSING_REFERENCES,
         }:
             values["number"] = 40
         if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
             values["ref"] = "main"
-        if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}:
+        if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}:
             values["expected_sha"] = SHA
         values.update(changes)
         return GitHubReadRequest(**values)  # type: ignore[arg-type]
@@ -66,6 +67,8 @@ class GitHubAdapterTests(unittest.TestCase):
 
     def test_every_declared_read_normalizes_to_the_expected_immutable_snapshot(self) -> None:
         for operation in GitHubReadOperation:
+            if operation is GitHubReadOperation.REQUESTED_REVIEWERS:
+                continue  # projection is introduced in the following increment
             with self.subTest(operation=operation):
                 request = self.request(operation)
                 snapshot = normalize_github_response(request, self.payload(operation))

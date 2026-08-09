@@ -38,6 +38,7 @@ class GitHubReadOperation(StrEnum):
     BRANCH = "branch"
     PULL_REQUEST = "pull-request"
     REVIEWS = "reviews"
+    REQUESTED_REVIEWERS = "requested-reviewers"
     CHECKS = "checks"
     WORKFLOW_RUNS = "workflow-runs"
     MERGEABILITY = "mergeability"
@@ -145,9 +146,9 @@ class GitHubReadRequest:
             raise GitHubContractError("read request reference is invalid")
         if self.expected_sha is not None:
             _validate_sha(self.expected_sha, "expected sha")
-        numbered = {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS, GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
+        numbered = {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS, GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
         ref_required = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
-        candidate_bound = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
+        candidate_bound = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
         if self.operation in numbered and self.number is None:
             raise GitHubContractError("read request requires a number")
         if self.operation not in numbered and self.number is not None:

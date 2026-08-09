@@ -429,6 +429,12 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls, [])
         self.assertEqual(len(adapter.health.observations), len(GitHubReadOperation) + len(GitHubMutationOperation))
 
+    def test_requested_reviewers_request_is_candidate_bound(self) -> None:
+        request = GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46, expected_sha=SHA)
+        self.assertTrue(request.identity().startswith("sha256:"))
+        with self.assertRaises(ValueError):
+            GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46)
+
     def test_gh_adapter_uses_read_only_api_and_normalizes_only_typed_response(self) -> None:
         import json
 

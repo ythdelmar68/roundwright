@@ -717,6 +717,17 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertEqual(restart.call_count(kind="mutation"), 0)
             self.assertEqual(result.receipt.pre_state_digest, stored.pre_state_digest)  # type: ignore[union-attr]
 
+    def test_execution_started_incomplete_postread_remains_blocked(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "started-incomplete-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        bundle, plan = schema_v2_authorization_bundle(context), _broker_semantic_plan(intent)
+        entry = replace(MutationJournalEntry.from_evidence(intent, context, bundle, plan), lifecycle=JournalLifecycle.EXECUTION_STARTED)
+        adapter = FakeGitHubAdapter()
+        result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.reconciliation_required)
+        self.assertEqual(adapter.call_count(kind="mutation"), 0)
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

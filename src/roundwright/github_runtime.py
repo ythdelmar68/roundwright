@@ -1371,6 +1371,9 @@ class GitHubMutationBroker:
         if now >= fresh_until:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable authorization evidence has expired"))
 
+        if entry.lifecycle in {JournalLifecycle.CLAIMED, JournalLifecycle.PRESTATE_CAPTURED}:
+            return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation has not started execution"))
+
         if entry.lifecycle is JournalLifecycle.VERIFIED:
             assert entry.receipt is not None
             self._completed[intent.identity()] = entry.receipt

@@ -606,6 +606,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         initial = allowed_context()
         bundle, plan = schema_v2_authorization_bundle(initial), _broker_semantic_plan(intent)
         entry = MutationJournalEntry.from_evidence(intent, initial, bundle, plan)
+        entry = replace(entry, lifecycle=JournalLifecycle.EXECUTION_STARTED)
         now = NOW + timedelta(minutes=5) - timedelta(microseconds=1)
         context = replace(initial, evaluated_at=now)
         adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})

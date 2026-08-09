@@ -568,6 +568,23 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(observed)
             self.assertIs(observed.lifecycle, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)  # type: ignore[union-attr]
 
+    def test_journal_time_fields_reject_individual_and_recomputed_drift(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "time-drift-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        entry = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent))
+        for field, value in (
+            ("evaluated_at", "2026-08-08T00:00:00+00:00"),
+            ("fresh_until", "2026-08-08T00:05:00+00:00"),
+            ("time_identity", DIGEST),
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                replace(entry, **{field: value})
+        serialized = dict(entry.serialize())
+        serialized["evaluated_at"] = "2026-08-08T00:00:00+00:00"
+        serialized["time_identity"] = "sha256:" + hashlib.sha256(json.dumps((serialized["evaluated_at"], serialized["fresh_until"]), separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        altered = MutationJournalEntry.deserialize(serialized)
+        self.assertNotEqual(altered, entry)
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

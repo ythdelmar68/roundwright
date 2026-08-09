@@ -662,6 +662,28 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertIs(plan.readback.condition, condition)
                 self.assertEqual(plan.intent_identity, intent.identity())
 
+    def test_delete_branch_uses_explicit_absence_and_affected_identity(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.DELETE_BRANCH, REPOSITORY, "delete-branch-46",
+            expected_sha=SHA, target_ref="codex/issue-46",
+        )
+        context, plan = allowed_context(RepositoryMutationOperation.DELETE_REMOTE_BRANCH), _broker_semantic_plan(intent)
+        adapter = FakeGitHubAdapter({
+            plan.pre_state.identity(): FakeGitHubScenario(response={
+                "repository": {"owner": "example", "name": "roundwright"},
+                "ref": "codex/issue-46", "sha": SHA,
+            }),
+            plan.readback.request.identity(): FakeGitHubScenario(stale=True),
+            intent.identity(): FakeGitHubScenario(
+                duplicate_receipt=True, affected_identity="deleted-branch-46",
+                semantic_readback_digest=DIGEST,
+            ),
+        })
+        result = GitHubMutationBroker(adapter).submit(intent, context)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
+        self.assertEqual(adapter.call_count(kind="mutation"), 1)
+
     def test_broker_rejects_caller_semantic_overrides_and_incomplete_operations_before_adapter_calls(self) -> None:
         comment = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "override-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         complete = (

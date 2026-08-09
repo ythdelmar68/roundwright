@@ -1589,7 +1589,7 @@ class GitHubMutationBroker:
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         assert outcome.receipt is not None
-        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, pre_completeness, post_completeness, _affected_identity(intent, after, created_resource), outcome.receipt.disposition)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, _post_state_digest(intent, after), pre_completeness, post_completeness, _affected_identity(intent, after, created_resource), outcome.receipt.disposition)
         self._completed[intent.identity()] = receipt
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             self._completed.pop(intent.identity(), None)
@@ -1672,7 +1672,7 @@ class GitHubMutationBroker:
         if not _readback_matches(post_readback, intent, observed, entry.created_resource):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "durable mutation requires semantic reconciliation"), reconciliation_required=True)
         receipt = self._semantic_receipt(
-            intent, context, bundle, plan, entry.pre_state_digest or observed.snapshot_digest, observed.snapshot_digest,
+            intent, context, bundle, plan, entry.pre_state_digest or observed.snapshot_digest, _post_state_digest(intent, observed),
             completeness, completeness,
             _affected_identity(intent, observed, entry.created_resource), MutationDisposition.ALREADY_APPLIED,
         )
@@ -1732,7 +1732,7 @@ class GitHubMutationBroker:
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
         if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
-        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, completeness, completeness, _affected_identity(intent, observed), MutationDisposition.ALREADY_APPLIED)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, _post_state_digest(intent, observed), completeness, completeness, _affected_identity(intent, observed), MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
         return BrokerMutationResult(receipt=receipt)
 
@@ -1779,27 +1779,32 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
         return False
     condition = readback.condition
     if condition is SemanticPostcondition.COMMENT_PRESENT:
-        return isinstance(snapshot, CommentsSnapshot) and dict(intent.payload).get("body_digest") in {item.body_digest for item in snapshot.comments}
+        return (
+            isinstance(snapshot, CommentsSnapshot)
+            and snapshot.repository == intent.repository
+            and snapshot.issue_number == intent.target_number
+            and dict(intent.payload).get("body_digest") in {item.body_digest for item in snapshot.comments}
+        )
     if condition is SemanticPostcondition.BRANCH_AT_EXPECTED_SHA:
-        return isinstance(snapshot, BranchSnapshot) and snapshot.sha == intent.expected_sha
+        return isinstance(snapshot, BranchSnapshot) and snapshot.repository == intent.repository and snapshot.name == intent.target_ref and snapshot.sha == intent.expected_sha
     if condition is SemanticPostcondition.BRANCH_ABSENT:
         return snapshot is None
     if condition is SemanticPostcondition.PULL_REQUEST_DRAFT:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.OPEN and snapshot.draft
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and snapshot.draft
     if condition is SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.OPEN and snapshot.draft and snapshot.head_sha == dict(intent.payload).get("head_sha") and snapshot.base_sha == dict(intent.payload).get("base_sha") and snapshot.head_ref == dict(intent.payload).get("head_ref") and snapshot.base_ref == dict(intent.payload).get("base_ref")
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and snapshot.draft and snapshot.head_sha == dict(intent.payload).get("head_sha") and snapshot.base_sha == dict(intent.payload).get("base_sha") and snapshot.head_ref == dict(intent.payload).get("head_ref") and snapshot.base_ref == dict(intent.payload).get("base_ref")
     if condition is SemanticPostcondition.PULL_REQUEST_READY:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.OPEN and not snapshot.draft and snapshot.head_sha == intent.expected_sha
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and not snapshot.draft and snapshot.head_sha == intent.expected_sha
     if condition is SemanticPostcondition.PULL_REQUEST_MERGED:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha
     if condition is SemanticPostcondition.REVIEW_AT_CANDIDATE:
-        return isinstance(snapshot, ReviewsSnapshot) and snapshot.head_sha == intent.expected_sha and bool(snapshot.reviews)
+        return isinstance(snapshot, ReviewsSnapshot) and snapshot.repository == intent.repository and snapshot.pull_request_number == intent.target_number and snapshot.head_sha == intent.expected_sha and bool(snapshot.reviews)
     if condition is SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE:
         return isinstance(snapshot, RequestedReviewersSnapshot) and snapshot.repository == intent.repository and snapshot.pull_request_number == intent.target_number and snapshot.candidate_sha == intent.expected_sha and snapshot.complete and snapshot.reviewer_set_digest == dict(intent.payload).get("reviewers_digest")
     if condition is SemanticPostcondition.ISSUE_CLOSED:
-        return isinstance(snapshot, IssueSnapshot) and snapshot.state is IssueState.CLOSED
+        return isinstance(snapshot, IssueSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is IssueState.CLOSED
     if condition is SemanticPostcondition.REMOTE_HEAD_AT_EXPECTED_SHA:
-        return isinstance(snapshot, RemoteHeadSnapshot) and snapshot.sha == intent.expected_sha
+        return isinstance(snapshot, RemoteHeadSnapshot) and snapshot.repository == intent.repository and snapshot.ref == intent.target_ref and snapshot.sha == intent.expected_sha
     return False
 
 
@@ -1813,6 +1818,7 @@ def _readback_matches(
         return (
             result.failure is not None
             and result.failure.kind is GitHubFailureKind.STALE_RESPONSE
+            and result.request == readback.request
         )
     if not result.ok:
         return False
@@ -1852,8 +1858,16 @@ def _affected_identity(
 ) -> str:
     """Bind a receipt to the exact normalized post-state, never a transport label."""
 
-    if type(intent) is not GitHubMutationIntent or type(result) is not GitHubReadResult or not result.ok or result.snapshot is None:
+    if type(intent) is not GitHubMutationIntent or type(result) is not GitHubReadResult:
         raise GitHubRuntimeError("semantic affected identity is unavailable")
+    if intent.operation is GitHubMutationOperation.DELETE_BRANCH:
+        if result.failure is not None and result.failure.kind is GitHubFailureKind.STALE_RESPONSE and result.request.repository == intent.repository and result.request.ref == intent.target_ref:
+            return _sha256(("affected", intent.operation.value, intent.repository.slug, intent.target_ref, "absent"))
+        raise GitHubRuntimeError("deleted branch affected identity is unavailable")
+    if not result.ok or result.snapshot is None:
+        raise GitHubRuntimeError("semantic affected identity is unavailable")
+    if intent.operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH} and type(result.snapshot) is BranchSnapshot:
+        return _sha256(("affected", intent.operation.value, result.snapshot.repository.slug, result.snapshot.name, result.snapshot.sha))
     if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST and type(result.snapshot) is PullRequestSnapshot:
         return _sha256((
             "affected", intent.operation.value, result.snapshot.repository.slug,
@@ -1870,9 +1884,38 @@ def _affected_identity(
                     comment.created_at,
                 ))
         raise GitHubRuntimeError("allocated comment affected identity is unavailable")
+    if intent.operation in {GitHubMutationOperation.MARK_READY, GitHubMutationOperation.MERGE_PULL_REQUEST} and type(result.snapshot) is PullRequestSnapshot:
+        return _sha256((
+            "affected", intent.operation.value, result.snapshot.repository.slug,
+            result.snapshot.pull_request_id, result.snapshot.number, result.snapshot.state.value,
+            result.snapshot.base_ref, result.snapshot.base_sha, result.snapshot.head_ref,
+            result.snapshot.head_sha, result.snapshot.draft,
+        ))
+    if intent.operation is GitHubMutationOperation.REQUEST_REVIEW and type(result.snapshot) is RequestedReviewersSnapshot:
+        return _sha256((
+            "affected", intent.operation.value, result.snapshot.repository.slug,
+            result.snapshot.pull_request_number, result.snapshot.candidate_sha,
+            result.snapshot.reviewers, result.snapshot.reviewer_set_digest,
+        ))
+    if intent.operation is GitHubMutationOperation.CLOSE_ISSUE and type(result.snapshot) is IssueSnapshot:
+        return _sha256((
+            "affected", intent.operation.value, result.snapshot.repository.slug,
+            result.snapshot.issue_id, result.snapshot.number, result.snapshot.state.value,
+        ))
     # The typed snapshot digest commits repository, target, candidate and the
     # operation-specific normalized fields selected by the broker read-back.
     return _sha256(("affected", intent.operation.value, intent.repository.slug, intent.target_ref, intent.target_number, result.snapshot_digest))
+
+
+def _post_state_digest(intent: GitHubMutationIntent, result: GitHubReadResult) -> str:
+    """Represent a verified absence without inventing a provider snapshot."""
+
+    if intent.operation is GitHubMutationOperation.DELETE_BRANCH:
+        if result.failure is not None and result.failure.kind is GitHubFailureKind.STALE_RESPONSE:
+            return _sha256(("branch-absent", intent.repository.slug, intent.target_ref))
+        raise GitHubRuntimeError("deleted branch post-state is unavailable")
+    _digest(result.snapshot_digest, "post-state")
+    return result.snapshot_digest
 
 
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:

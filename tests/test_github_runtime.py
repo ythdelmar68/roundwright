@@ -42,6 +42,8 @@ from roundwright.github_runtime import (
     JournalLifecycle,
     MutationJournalEntry,
     MutationBrokerContext,
+    OwnerMutationFact,
+    OwnerMutationRequest,
     OperationHealth,
     SemanticPostcondition,
     SemanticReadback,
@@ -85,6 +87,17 @@ class Runner:
     def run(self, arguments: tuple[str, ...]) -> GhCommandResult:
         self.calls.append(arguments)
         return self.results.pop(0)
+
+
+class OwnerTransport:
+    def __init__(self, accepted: bool = True) -> None:
+        self.accepted = accepted
+        self.requests: list[OwnerMutationRequest] = []
+
+    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact:
+        self.requests.append(request)
+        identity = "sha256:" + hashlib.sha256(json.dumps((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        return OwnerMutationFact(self.accepted, identity)
 
 
 class PagedFakeGitHubAdapter(FakeGitHubAdapter):
@@ -668,23 +681,23 @@ class GitHubRuntimeTests(unittest.TestCase):
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         runner = Runner(
             GhCommandResult(0, json.dumps(gh_comments_page())),
-            GhCommandResult(0, "ignored provider output"),
             GhCommandResult(0, json.dumps(gh_comments_page())),
         )
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
-            broker = GitHubMutationBroker.with_gh_runner(runner, matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            transport = OwnerTransport()
+            broker = GitHubMutationBroker.with_owner_transport(runner, transport, matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
             result = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
             self.assertTrue(result.ok)
-            self.assertEqual(len(runner.calls), 3)
-            self.assertEqual(runner.calls[1][:5], ("api", "--method", "POST", "repos/example/roundwright/issues/46/comments", "-f"))
+            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(len(transport.requests), 1)
             direct = GhGitHubAdapter(runner, matrix).submit(intent)
             self.assertFalse(direct.ok)
             self.assertEqual(direct.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
-            self.assertEqual(len(runner.calls), 3)
+            self.assertEqual(len(runner.calls), 2)
             retry = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
             self.assertTrue(retry.ok)
-            self.assertEqual(len(runner.calls), 3)
+            self.assertEqual(len(runner.calls), 2)
 
     def test_brokered_gh_ambiguous_readback_reconciles_without_duplicate_write(self) -> None:
         request = comments_request()
@@ -692,22 +705,21 @@ class GitHubRuntimeTests(unittest.TestCase):
         empty = gh_comments_page(present=False)
         runner = Runner(
             GhCommandResult(0, json.dumps(empty)),
-            GhCommandResult(0, "ignored provider output"),
             GhCommandResult(0, json.dumps(empty)),
             GhCommandResult(0, json.dumps(empty)),
         )
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
-            broker = GitHubMutationBroker.with_gh_runner(runner, matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
+            broker = GitHubMutationBroker.with_owner_transport(runner, OwnerTransport(), matrix, journal=DurableMutationJournal(Path(directory) / "journal.json"))
             payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
             first = broker.submit(intent, allowed_context(), payload=payload)
             self.assertFalse(first.ok)
             self.assertTrue(first.reconciliation_required)
-            self.assertEqual(len(runner.calls), 3)
+            self.assertEqual(len(runner.calls), 2)
             reconciled = broker.reconcile(intent, allowed_context())
             self.assertFalse(reconciled.ok)
             self.assertTrue(reconciled.reconciliation_required)
-            self.assertEqual(len(runner.calls), 4)
+            self.assertEqual(len(runner.calls), 3)
 
     def test_direct_execution_surface_is_absent_for_every_declared_mutation(self) -> None:
         title, body, reviewers = "draft title", "draft body", "octocat"

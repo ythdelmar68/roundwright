@@ -153,8 +153,12 @@ class GhRunner(Protocol):
     def run(self, arguments: tuple[str, ...]) -> GhCommandResult: ...
 
 
-class SubprocessGhRunner:
-    """Minimal ``gh`` runner; it does not inspect auth state or environment."""
+class _SubprocessGhReadRunner:
+    """Owner-host implementation for read-only adapter traffic only.
+
+    This deliberately is not a mutation capability.  Mutation transport is a
+    separately injected fixed-protocol endpoint below.
+    """
 
     def __init__(self, executable: str = "gh") -> None:
         if type(executable) is not str or executable != "gh":
@@ -182,6 +186,42 @@ class SubprocessGhRunner:
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return GhCommandResult(127, "")
         return GhCommandResult(completed.returncode, completed.stdout)
+
+
+@dataclass(frozen=True)
+class OwnerMutationRequest:
+    """Sealed, non-command request accepted by an owner-controlled host."""
+
+    intent_identity: str
+    operation: GitHubMutationOperation
+    authorization_bundle_identity: str
+    semantic_plan_identity: str
+    journal_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not GitHubMutationOperation:
+            raise GitHubRuntimeError("owner mutation operation is invalid")
+        for value, name in ((self.intent_identity, "owner intent"), (self.authorization_bundle_identity, "owner bundle"), (self.semantic_plan_identity, "owner plan"), (self.journal_identity, "owner journal")):
+            _digest(value, name)
+
+
+@dataclass(frozen=True)
+class OwnerMutationFact:
+    """Curated host result; provider output and process status never cross it."""
+
+    accepted: bool
+    request_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.accepted) is not bool:
+            raise GitHubRuntimeError("owner mutation fact is invalid")
+        _digest(self.request_identity, "owner request")
+
+
+class OwnerMutationTransport(Protocol):
+    """Deployment-injected fixed protocol; absent transport fails closed."""
+
+    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact: ...
 
 
 class GhGitHubAdapter:
@@ -1066,23 +1106,31 @@ def _complete_broker_read(
 class _GhBrokerExecutor:
     """Private credential-owning seam; only broker construction creates it."""
 
-    def __init__(self, runner: GhRunner, health: GitHubCapabilityHealth) -> None:
-        self.__runner = runner
+    def __init__(self, transport: OwnerMutationTransport, health: GitHubCapabilityHealth) -> None:
+        if not hasattr(transport, "dispatch"):
+            raise GitHubRuntimeError("owner mutation transport is invalid")
+        self.__transport = transport
         self.__health = health
 
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
+        bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan, journal_identity: str,
     ) -> GitHubMutationResult:
         blocked = _health_failure(intent.operation, self.__health)
         if blocked is not None:
             return GitHubMutationResult(intent, failure=blocked)
         try:
             payload.require_matches(intent)
-            outcome = self.__runner.run(_mutation_command(intent, payload, command))
+            if command is not plan.command:
+                raise GitHubRuntimeError("broker command does not match semantic plan")
+            request = OwnerMutationRequest(intent.identity(), intent.operation, bundle.identity, plan.identity, journal_identity)
+            fact = self.__transport.dispatch(request)
+            if type(fact) is not OwnerMutationFact or fact.request_identity != _sha256((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity)):
+                raise GitHubRuntimeError("owner mutation fact is not bound to request")
         except GitHubRuntimeError:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
-        if outcome.exit_code != 0:
-            return GitHubMutationResult(intent, failure=GitHubFailure(_failure_kind(outcome.exit_code), intent.operation, "gh mutation did not return a usable status"))
+        if not fact.accepted:
+            return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "owner mutation transport denied fixed request"))
         return GitHubMutationResult(intent, receipt=_broker_receipt(intent))
 
 
@@ -1098,14 +1146,14 @@ class GitHubMutationBroker:
         self._journal = journal
 
     @classmethod
-    def with_gh_runner(
-        cls, runner: GhRunner, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal,
+    def with_owner_transport(
+        cls, read_runner: GhRunner, transport: OwnerMutationTransport, health: GitHubCapabilityHealth, *, journal: DurableMutationJournal,
     ) -> "GitHubMutationBroker":
         """Create the only production mutation path without exposing its executor."""
 
         if type(journal) is not DurableMutationJournal:
             raise GitHubRuntimeError("live broker requires a durable journal")
-        return cls(GhGitHubAdapter(runner, health), journal=journal, _executor=_GhBrokerExecutor(runner, health))
+        return cls(GhGitHubAdapter(read_runner, health), journal=journal, _executor=_GhBrokerExecutor(transport, health))
 
     def submit(
         self,
@@ -1147,7 +1195,7 @@ class GitHubMutationBroker:
             if evidence is not None and self._journal is not None:
                 self._journal_transition(evidence, JournalLifecycle.FAILED)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-mutation semantic state is unavailable"))
-        outcome = self._execute(intent, payload, plan)
+        outcome = self._execute(intent, payload, plan, bundle, evidence)
         if not outcome.ok:
             if evidence is not None and self._journal is not None:
                 lifecycle = JournalLifecycle.DENIED if outcome.failure is not None and outcome.failure.kind is GitHubFailureKind.POLICY_DENIED else JournalLifecycle.FAILED
@@ -1228,7 +1276,8 @@ class GitHubMutationBroker:
         return BrokerMutationResult(receipt=receipt)
 
     def _execute(
-        self, intent: GitHubMutationIntent, payload: GhMutationPayload | None, plan: BrokerSemanticPlan
+        self, intent: GitHubMutationIntent, payload: GhMutationPayload | None, plan: BrokerSemanticPlan,
+        bundle: SchemaV2AuthorizationBundle, evidence: MutationJournalEntry | None,
     ) -> GitHubMutationResult:
         if type(plan) is not BrokerSemanticPlan or plan.operation is not intent.operation or plan.command is not _MUTATION_COMMAND_BY_OPERATION[intent.operation]:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic command is invalid"))
@@ -1237,7 +1286,9 @@ class GitHubMutationBroker:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is unavailable"))
             if self._journal is None:
                 return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks durable journal evidence"))
-            return self.__executor.execute(intent, payload, plan.command)
+            if type(evidence) is not MutationJournalEntry:
+                return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "live mutation lacks sealed journal entry"))
+            return self.__executor.execute(intent, payload, plan.command, bundle, plan, evidence.key)
         if payload is not None:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "adapter does not accept brokered mutation payloads"))
         return self._adapter.submit(intent)

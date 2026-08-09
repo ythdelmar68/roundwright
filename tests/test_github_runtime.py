@@ -115,6 +115,7 @@ class OwnerTransport:
         if request.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
             locator = CreatedResourceLocator(
                 request.operation, request.repository, pull_request_number=58,
+                pull_request_id="pr-58",
                 base_sha=request.base_sha, head_sha=request.head_sha, draft=True,
                 marker_digest=request.marker_digest,
             )
@@ -233,6 +234,13 @@ def comments_payload() -> dict[str, object]:
     }
 
 
+def comment_locator(*, comment_id: str = "comment-46", marker_digest: str = COMMENT_DIGEST) -> CreatedResourceLocator:
+    return CreatedResourceLocator(
+        GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+        comment_id=comment_id, marker_digest=marker_digest,
+    )
+
+
 def repository_payload() -> dict[str, object]:
     return {
         "repository": {"owner": "example", "name": "roundwright"},
@@ -328,11 +336,19 @@ def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
     )
 
 
-def pull_request_payload(*, number: int = 58, base_sha: str = BASE, head_sha: str = SHA, draft: bool = True, state: str = "OPEN", merge_commit_sha: str | None = None) -> dict[str, object]:
+def pull_request_payload(
+    *, number: int = 58, pull_request_id: str | None = None,
+    base_sha: str = BASE, head_sha: str = SHA, draft: bool = True,
+    state: str = "OPEN", merge_commit_sha: str | None = None,
+    base_repository: str = "example/roundwright",
+    head_repository: str = "example/roundwright",
+) -> dict[str, object]:
+    base_owner, base_name = base_repository.split("/", 1)
+    head_owner, head_name = head_repository.split("/", 1)
     return {
         "repository": {"owner": "example", "name": "roundwright"},
-        "base_repository": {"owner": "example", "name": "roundwright"},
-        "head_repository": {"owner": "example", "name": "roundwright"}, "id": f"pr-{number}",
+        "base_repository": {"owner": base_owner, "name": base_name},
+        "head_repository": {"owner": head_owner, "name": head_name}, "id": pull_request_id or f"pr-{number}",
         "number": number, "state": state, "base_ref": "main", "base_sha": base_sha,
         "head_ref": "codex/issue-46", "head_sha": head_sha, "draft": draft,
         "merge_commit_sha": merge_commit_sha,
@@ -433,7 +449,7 @@ class GitHubRuntimeTests(unittest.TestCase):
     def test_created_resource_locator_is_total_and_canonical(self) -> None:
         pull_request = CreatedResourceLocator(
             GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
-            pull_request_number=58, base_sha=BASE, head_sha=SHA, draft=True,
+            pull_request_number=58, pull_request_id="pr-58", base_sha=BASE, head_sha=SHA, draft=True,
             marker_digest=COMMENT_DIGEST,
         )
         comment = CreatedResourceLocator(
@@ -442,7 +458,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(pull_request.identity, CreatedResourceLocator(
             GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
-            pull_request_number=58, base_sha=BASE, head_sha=SHA, draft=True,
+            pull_request_number=58, pull_request_id="pr-58", base_sha=BASE, head_sha=SHA, draft=True,
             marker_digest=COMMENT_DIGEST,
         ).identity)
         self.assertNotEqual(pull_request.identity, comment.identity)
@@ -453,7 +469,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             ),
             lambda: CreatedResourceLocator(
                 GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
-                pull_request_number=58, base_sha=BASE, head_sha=SHA, draft=False,
+                pull_request_number=58, pull_request_id="pr-58", base_sha=BASE, head_sha=SHA, draft=False,
                 marker_digest=COMMENT_DIGEST,
             ),
             lambda: CreatedResourceLocator(
@@ -467,6 +483,33 @@ class GitHubRuntimeTests(unittest.TestCase):
         ):
             with self.subTest(locator=locator), self.assertRaises(ValueError):
                 locator()
+
+    def test_allocated_journal_and_receipt_reject_missing_or_drifted_locator_identity(self) -> None:
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "locator-journal-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        context = allowed_context()
+        entry = MutationJournalEntry.from_evidence(
+            intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
+        )
+        with self.assertRaises(ValueError):
+            replace(entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED)
+        accepted = replace(
+            entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED,
+            created_resource=comment_locator(),
+        )
+        receipt = GitHubMutationBroker._semantic_receipt(
+            intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
+            DIGEST, DIGEST, DIGEST, DIGEST, DIGEST, MutationDisposition.ACCEPTED,
+            durable_entry=accepted,
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                accepted, lifecycle=JournalLifecycle.VERIFIED, receipt=replace(
+                    receipt, created_resource_identity=DIGEST,
+                ),
+            )
 
     def test_owner_accepted_fact_requires_exact_locator_operation(self) -> None:
         comment = CreatedResourceLocator(
@@ -686,7 +729,8 @@ class GitHubRuntimeTests(unittest.TestCase):
                 owner_read_endpoint(restart_runner, matrix), owner_endpoint(restart_transport),
                 journal=DurableMutationJournal(path), clock=lambda: before_expiry,
             ).reconcile(intent, allowed_context(now=before_expiry))
-            self.assertTrue(recovered.ok)
+            self.assertFalse(recovered.ok)
+            self.assertEqual(restart_runner.calls, [])
             self.assertEqual(restart_transport.requests, [])
 
             expired_runner, expired_transport = Runner(), OwnerTransport()
@@ -738,6 +782,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         pull_request_locator = CreatedResourceLocator(
             pull_request_intent.operation, REPOSITORY, pull_request_number=58,
+            pull_request_id="pr-58",
             base_sha=BASE, head_sha=SHA, draft=True, marker_digest=COMMENT_DIGEST,
         )
         for locator in (pull_request_locator, replace(pull_request_locator, base_sha=SHA), replace(pull_request_locator, head_sha=BASE)):
@@ -779,6 +824,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 intent, context, schema_v2_authorization_bundle(context), plan,
             ))
             self.assertEqual(stored.created_resource.pull_request_number, 58)  # type: ignore[union-attr]
+            self.assertEqual(result.receipt.created_resource_identity, stored.created_resource.identity)  # type: ignore[union-attr]
             self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
 
     def test_created_pull_request_locator_and_post_state_drift_fail_closed(self) -> None:
@@ -791,12 +837,14 @@ class GitHubRuntimeTests(unittest.TestCase):
         body_digest = dict(intent.payload)["body_digest"]
         wrong_locator = CreatedResourceLocator(
             GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
-            pull_request_number=58, base_sha=SHA, head_sha=SHA, draft=True,
+            pull_request_number=58, pull_request_id="pr-58", base_sha=SHA, head_sha=SHA, draft=True,
             marker_digest=body_digest,
         )
         for transport, post_state in (
             (OwnerTransport(created_resource=wrong_locator), None),
             (OwnerTransport(), pull_request_payload(number=46)),
+            (OwnerTransport(), pull_request_payload(pull_request_id="pr-59")),
+            (OwnerTransport(), pull_request_payload(head_repository="fork/roundwright")),
         ):
             with self.subTest(transport=transport, post_state=post_state), tempfile.TemporaryDirectory() as directory:
                 scenarios = {plan.pre_state.identity(): FakeGitHubScenario(response=repository_payload())}
@@ -869,7 +917,41 @@ class GitHubRuntimeTests(unittest.TestCase):
                 intent, context, schema_v2_authorization_bundle(context), plan,
             ))
             self.assertEqual(stored.created_resource.comment_id, "comment-46")  # type: ignore[union-attr]
+            self.assertEqual(result.receipt.created_resource_identity, stored.created_resource.identity)  # type: ignore[union-attr]
             self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
+
+    def test_allocated_comment_locator_rejects_body_fallback_but_allows_the_exact_duplicate(self) -> None:
+        """Only the immutable locator selects one of two identical comment bodies."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "allocated-comment-duplicate-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        response = {
+            **comments_payload(), "comments": [
+                {"id": "comment-46", "author_id": "owner-1", "body": "curated evidence", "created_at": "2026-08-07T00:00:01Z"},
+                {"id": "comment-47", "author_id": "owner-1", "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=response)})
+            transport = OwnerTransport()
+            result = GitHubMutationBroker(
+                adapter, journal=journal,
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            ).submit(intent, allowed_context(), payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
+            self.assertTrue(result.ok)
+            stored = journal.find(MutationJournalEntry.from_evidence(
+                intent, allowed_context(), schema_v2_authorization_bundle(allowed_context()),
+                _broker_semantic_plan(intent),
+            ))
+            self.assertEqual(stored.created_resource.comment_id, "comment-46")  # type: ignore[union-attr]
+            self.assertEqual(result.receipt.created_resource_identity, stored.created_resource.identity)  # type: ignore[union-attr]
 
     def test_allocated_comment_locator_body_and_identity_drift_are_rejected(self) -> None:
         intent = GitHubMutationIntent(
@@ -1031,15 +1113,24 @@ class GitHubRuntimeTests(unittest.TestCase):
             ),
         })
         context = allowed_context()
-        result = GitHubMutationBroker(fake).submit(intent, context)
-        self.assertTrue(result.ok)
-        self.assertEqual(fake.call_count(kind="mutation"), 1)
-        assert result.receipt is not None
-        plan = _broker_semantic_plan(intent)
-        self.assertEqual(result.receipt.authorization_bundle_identity, schema_v2_authorization_bundle(context).identity)
-        self.assertEqual(result.receipt.intent_identity, intent.identity())
-        self.assertEqual(result.receipt.semantic_plan_identity, plan.identity)
-        self.assertEqual(result.receipt.semantic_readback_identity, plan.readback.identity)
+        with tempfile.TemporaryDirectory() as directory:
+            transport = OwnerTransport()
+            result = GitHubMutationBroker(
+                fake, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            ).submit(intent, context, payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
+            self.assertTrue(result.ok)
+            self.assertEqual(len(transport.requests), 1)
+            assert result.receipt is not None
+            plan = _broker_semantic_plan(intent)
+            self.assertEqual(result.receipt.authorization_bundle_identity, schema_v2_authorization_bundle(context).identity)
+            self.assertEqual(result.receipt.intent_identity, intent.identity())
+            self.assertEqual(result.receipt.semantic_plan_identity, plan.identity)
+            self.assertEqual(result.receipt.semantic_readback_identity, plan.readback.identity)
 
     def test_broker_semantic_plan_is_total_for_every_supported_operation(self) -> None:
         reviewers = "octocat"
@@ -1208,7 +1299,12 @@ class GitHubRuntimeTests(unittest.TestCase):
                 fake = FakeGitHubAdapter()
                 result = GitHubMutationBroker(fake).submit(intent, allowed_context(GITHUB_REPOSITORY_OPERATION[intent.operation]))
                 self.assertFalse(result.ok)
-                self.assertEqual(result.failure.kind, GitHubFailureKind.STALE_RESPONSE)  # type: ignore[union-attr]
+                expected = (
+                    GitHubFailureKind.POLICY_DENIED
+                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST
+                    else GitHubFailureKind.STALE_RESPONSE
+                )
+                self.assertEqual(result.failure.kind, expected)  # type: ignore[union-attr]
                 self.assertEqual(fake.call_count(kind="mutation"), 0)
 
     def test_schema_v2_pre_run_gate_rejects_drift_before_any_adapter_call(self) -> None:
@@ -1887,7 +1983,10 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertIs(claimed.lifecycle, JournalLifecycle.PENDING)
             with self.assertRaises(ValueError):
                 first.claim(MutationJournalEntry.from_evidence(conflicting, context, bundle, _broker_semantic_plan(conflicting)))
-            first.transition(entry, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
+            first.transition(
+                entry, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
+                created_resource=comment_locator(),
+            )
             with self.assertRaises(ValueError):
                 first.transition(entry, JournalLifecycle.FAILED)
             restarted = DurableMutationJournal(Path(directory) / "journal.json")
@@ -1918,8 +2017,15 @@ class GitHubRuntimeTests(unittest.TestCase):
         bundle = schema_v2_authorization_bundle(context)
         plan = _broker_semantic_plan(intent)
         entry = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
-        receipt = GitHubMutationBroker._semantic_receipt(intent, context, bundle, plan, DIGEST, DIGEST, DIGEST, DIGEST, "comment-46", MutationDisposition.ACCEPTED)
-        verified = replace(entry, lifecycle=JournalLifecycle.VERIFIED, receipt=receipt)
+        accepted = replace(
+            entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED,
+            created_resource=comment_locator(),
+        )
+        receipt = GitHubMutationBroker._semantic_receipt(
+            intent, context, bundle, plan, DIGEST, DIGEST, DIGEST, DIGEST,
+            "comment-46", MutationDisposition.ACCEPTED, durable_entry=accepted,
+        )
+        verified = replace(accepted, lifecycle=JournalLifecycle.VERIFIED, receipt=receipt)
         encoded = dict(verified.serialize())
         encoded_receipt = dict(encoded["receipt"])
         encoded_receipt["fresh_until"] = "2026-08-08T00:05:00+00:00"
@@ -1933,7 +2039,10 @@ class GitHubRuntimeTests(unittest.TestCase):
         initial = allowed_context()
         bundle, plan = schema_v2_authorization_bundle(initial), _broker_semantic_plan(intent)
         entry = MutationJournalEntry.from_evidence(intent, initial, bundle, plan)
-        entry = replace(entry, lifecycle=JournalLifecycle.EXECUTION_STARTED)
+        entry = replace(
+            entry, lifecycle=JournalLifecycle.TRANSPORT_ACCEPTED,
+            created_resource=comment_locator(),
+        )
         now = NOW + timedelta(minutes=5) - timedelta(microseconds=1)
         context = replace(initial, evaluated_at=now)
         adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
@@ -1968,17 +2077,17 @@ class GitHubRuntimeTests(unittest.TestCase):
         started = replace(claimed, lifecycle=JournalLifecycle.EXECUTION_STARTED)
         adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, started, started)
-        self.assertTrue(result.ok)
-        self.assertNotEqual(result.receipt.affected_identity, "reconciled")  # type: ignore[union-attr]
+        self.assertFalse(result.ok)
+        self.assertEqual(adapter.call_count(), 0)
         for state in (JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.AMBIGUOUS):
             adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
-            entry = replace(claimed, lifecycle=state)
+            entry = replace(claimed, lifecycle=state, created_resource=comment_locator())
             result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
             self.assertTrue(result.ok)
             self.assertNotEqual(result.receipt.affected_identity, "reconciled")  # type: ignore[union-attr]
         empty = {**comments_payload(), "comments": []}
         adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=empty)})
-        ambiguous = replace(claimed, lifecycle=JournalLifecycle.AMBIGUOUS)
+        ambiguous = replace(claimed, lifecycle=JournalLifecycle.AMBIGUOUS, created_resource=comment_locator())
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, ambiguous, ambiguous)
         self.assertFalse(result.ok)
         self.assertTrue(result.reconciliation_required)
@@ -1991,9 +2100,16 @@ class GitHubRuntimeTests(unittest.TestCase):
             def stop(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.PRESTATE_CAPTURED:
                     raise RuntimeError("crash")
-            broker = GitHubMutationBroker(adapter, journal=journal, checkpoint_observer=stop)
+            broker = GitHubMutationBroker(
+                adapter, journal=journal,
+                _executor=_GhBrokerExecutor(OwnerTransport(), health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )), checkpoint_observer=stop,
+            )
             with self.assertRaises(RuntimeError):
-                broker.submit(intent, allowed_context())
+                broker.submit(intent, allowed_context(), payload=GhMutationPayload(
+                    GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+                ))
             stored = journal.find(MutationJournalEntry.from_evidence(intent, allowed_context(), schema_v2_authorization_bundle(allowed_context()), _broker_semantic_plan(intent)))
             self.assertIs(stored.lifecycle, JournalLifecycle.PRESTATE_CAPTURED)  # type: ignore[union-attr]
             self.assertEqual(adapter.call_count(kind="mutation"), 0)
@@ -2008,17 +2124,17 @@ class GitHubRuntimeTests(unittest.TestCase):
             def crash(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.EXECUTION_STARTED:
                     raise RuntimeError("crash")
-            with self.assertRaises(RuntimeError):
-                GitHubMutationBroker(adapter, journal=journal, checkpoint_observer=crash).submit(intent, context)
+            result = GitHubMutationBroker(adapter, journal=journal, checkpoint_observer=crash).submit(intent, context)
+            self.assertFalse(result.ok)
             stored = journal.find(evidence)
-            self.assertIs(stored.lifecycle, JournalLifecycle.EXECUTION_STARTED)  # type: ignore[union-attr]
-            self.assertTrue(stored.pre_state_complete)  # type: ignore[union-attr]
+            self.assertIs(stored.lifecycle, JournalLifecycle.PENDING)  # type: ignore[union-attr]
+            self.assertFalse(stored.pre_state_complete)  # type: ignore[union-attr]
             self.assertEqual(adapter.call_count(kind="mutation"), 0)
             restart = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
             result = GitHubMutationBroker(restart, journal=DurableMutationJournal(Path(directory) / "journal.json")).submit(intent, context)
-            self.assertTrue(result.ok)
+            self.assertFalse(result.ok)
             self.assertEqual(restart.call_count(kind="mutation"), 0)
-            self.assertEqual(result.receipt.pre_state_digest, stored.pre_state_digest)  # type: ignore[union-attr]
+            self.assertEqual(restart.call_count(kind="read"), 0)
 
     def test_transport_accepted_crash_recovers_without_second_transport(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "accepted-crash-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
@@ -2056,7 +2172,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         adapter = FakeGitHubAdapter()
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
         self.assertFalse(result.ok)
-        self.assertTrue(result.reconciliation_required)
+        self.assertFalse(result.reconciliation_required)
         self.assertEqual(adapter.call_count(kind="mutation"), 0)
 
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
@@ -2068,11 +2184,21 @@ class GitHubRuntimeTests(unittest.TestCase):
                 request.identity(): FakeGitHubScenario(response=comments_payload()),
                 intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
             })
-            first = GitHubMutationBroker(fake, journal=journal).submit(intent, allowed_context())
+            transport = OwnerTransport()
+            first = GitHubMutationBroker(
+                fake, journal=journal,
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            ).submit(intent, allowed_context(), payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
             self.assertTrue(first.ok)
-            self.assertEqual(fake.call_count(kind="mutation"), 1)
+            self.assertEqual(len(transport.requests), 1)
             restarted_fake = FakeGitHubAdapter()
-            retry = GitHubMutationBroker(restarted_fake, journal=DurableMutationJournal(Path(directory) / "journal.json")).submit(intent, allowed_context())
+            retry = GitHubMutationBroker(
+                restarted_fake, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+            ).submit(intent, allowed_context())
             self.assertTrue(retry.ok)
             self.assertEqual(retry.receipt, first.receipt)
             self.assertEqual(restarted_fake.call_count(), 0)
@@ -2087,12 +2213,22 @@ class GitHubRuntimeTests(unittest.TestCase):
                 request.identity(): FakeGitHubScenario(response=empty),
                 intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
             })
-            first = GitHubMutationBroker(first_fake, journal=DurableMutationJournal(path)).submit(intent, allowed_context())
+            transport = OwnerTransport()
+            first = GitHubMutationBroker(
+                first_fake, journal=DurableMutationJournal(path),
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            ).submit(intent, allowed_context(), payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
             self.assertFalse(first.ok)
             self.assertTrue(first.reconciliation_required)
-            self.assertEqual(first_fake.call_count(kind="mutation"), 1)
+            self.assertEqual(len(transport.requests), 1)
             reconciler = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=comments_payload())})
-            retry = GitHubMutationBroker(reconciler, journal=DurableMutationJournal(path)).submit(intent, allowed_context())
+            retry = GitHubMutationBroker(
+                reconciler, journal=DurableMutationJournal(path),
+            ).submit(intent, allowed_context())
             self.assertTrue(retry.ok)
             self.assertEqual(retry.receipt.disposition, MutationDisposition.ALREADY_APPLIED)  # type: ignore[union-attr]
             self.assertEqual(reconciler.call_count(kind="mutation"), 0)
@@ -2107,7 +2243,10 @@ class GitHubRuntimeTests(unittest.TestCase):
             path = Path(directory) / "journal.json"
             journal = DurableMutationJournal(path)
             journal.claim(evidence)
-            journal.transition(evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION)
+            journal.transition(
+                evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
+                created_resource=comment_locator(),
+            )
             reconciler = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response=comments_payload())})
             result = GitHubMutationBroker(reconciler, journal=DurableMutationJournal(path)).submit(intent, context)
             self.assertTrue(result.ok)
@@ -2129,7 +2268,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertEqual(fake.call_count(), 0)
 
     def test_broker_requires_policy_deployment_candidate_and_prestate_before_adapter_mutation(self) -> None:
-        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", DIGEST),))
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         fake = FakeGitHubAdapter({intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST)})
         result = GitHubMutationBroker(fake).submit(intent, allowed_context(RepositoryMutationOperation.MARK_PR_READY))
         self.assertFalse(result.ok)
@@ -2143,28 +2282,48 @@ class GitHubRuntimeTests(unittest.TestCase):
             request.identity(): FakeGitHubScenario(response=comments_payload()),
             intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
         })
-        broker = GitHubMutationBroker(fake)
-        first = broker.submit(intent, allowed_context())
-        self.assertTrue(first.ok)
-        self.assertEqual(first.receipt.candidate_sha, SHA)  # type: ignore[union-attr]
-        self.assertTrue(first.receipt.receipt_digest.startswith("sha256:"))  # type: ignore[union-attr]
-        self.assertEqual(fake.call_count(kind="mutation"), 1)
-        second = broker.submit(intent, allowed_context())
-        self.assertTrue(second.ok)
-        self.assertEqual(second.receipt, first.receipt)
-        self.assertEqual(fake.call_count(kind="mutation"), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            transport = OwnerTransport()
+            broker = GitHubMutationBroker(
+                fake, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            )
+            first = broker.submit(intent, allowed_context(), payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
+            self.assertTrue(first.ok)
+            self.assertEqual(first.receipt.candidate_sha, SHA)  # type: ignore[union-attr]
+            self.assertTrue(first.receipt.receipt_digest.startswith("sha256:"))  # type: ignore[union-attr]
+            self.assertEqual(len(transport.requests), 1)
+            second = broker.submit(intent, allowed_context(), payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
+            self.assertTrue(second.ok)
+            self.assertEqual(second.receipt, first.receipt)
+            self.assertEqual(len(transport.requests), 1)
 
     def test_ambiguous_post_state_requires_reconciliation_not_invented_success(self) -> None:
-        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", DIGEST),))
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()
         fake = FakeGitHubAdapter({
             request.identity(): FakeGitHubScenario(response={**comments_payload(), "comments": []}),
             intent.identity(): FakeGitHubScenario(duplicate_receipt=True, affected_identity="comment-46", semantic_readback_digest=DIGEST),
         })
-        result = GitHubMutationBroker(fake).submit(intent, allowed_context())
-        self.assertFalse(result.ok)
-        self.assertTrue(result.reconciliation_required)
-        self.assertEqual(fake.call_count(kind="mutation"), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            transport = OwnerTransport()
+            result = GitHubMutationBroker(
+                fake, journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT,
+                )),
+            ).submit(intent, allowed_context(), payload=GhMutationPayload(
+                GitHubMutationOperation.COMMENT, (("body", "curated evidence"),),
+            ))
+            self.assertFalse(result.ok)
+            self.assertTrue(result.reconciliation_required)
+            self.assertEqual(len(transport.requests), 1)
 
     def test_brokered_gh_execution_runs_once_while_direct_submit_stays_denied(self) -> None:
         request = comments_request()

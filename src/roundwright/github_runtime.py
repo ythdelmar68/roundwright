@@ -298,6 +298,7 @@ class CreatedResourceLocator:
     operation: GitHubMutationOperation
     repository: RepositoryRef
     pull_request_number: int | None = None
+    pull_request_id: str | None = None
     issue_number: int | None = None
     comment_id: str | None = None
     base_sha: str | None = None
@@ -311,18 +312,24 @@ class CreatedResourceLocator:
             raise GitHubRuntimeError("created resource operation is invalid")
         _digest(self.marker_digest, "created resource marker")
         if self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
-            if type(self.pull_request_number) is not int or self.pull_request_number <= 0 or self.issue_number is not None or self.comment_id is not None or type(self.draft) is not bool or not self.draft:
+            if (
+                type(self.pull_request_number) is not int or self.pull_request_number <= 0
+                or type(self.pull_request_id) is not str or not self.pull_request_id
+                or self.issue_number is not None or self.comment_id is not None
+                or type(self.draft) is not bool or not self.draft
+            ):
                 raise GitHubRuntimeError("created pull request locator is invalid")
             for value in (self.base_sha, self.head_sha):
                 if type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
                     raise GitHubRuntimeError("created pull request locator sha is invalid")
         else:
-            if type(self.issue_number) is not int or self.issue_number <= 0 or type(self.comment_id) is not str or not self.comment_id or any(value is not None for value in (self.pull_request_number, self.base_sha, self.head_sha, self.draft)):
+            if type(self.issue_number) is not int or self.issue_number <= 0 or type(self.comment_id) is not str or not self.comment_id or any(value is not None for value in (self.pull_request_number, self.pull_request_id, self.base_sha, self.head_sha, self.draft)):
                 raise GitHubRuntimeError("created comment locator is invalid")
         object.__setattr__(self, "identity", _sha256({
             "operation": self.operation.value,
             "repository": self.repository.slug,
             "pull_request_number": self.pull_request_number,
+            "pull_request_id": self.pull_request_id,
             "issue_number": self.issue_number,
             "comment_id": self.comment_id,
             "base_sha": self.base_sha,
@@ -1154,6 +1161,7 @@ class SemanticMutationReceipt:
     pre_state_digest: str
     post_state_digest: str
     affected_identity: str
+    created_resource_identity: str | None
     evaluated_at: str
     fresh_until: str
     time_identity: str
@@ -1181,6 +1189,14 @@ class SemanticMutationReceipt:
             _fingerprint(value, name)
         if type(self.affected_identity) is not str or not self.affected_identity:
             raise GitHubRuntimeError("semantic receipt affected identity is invalid")
+        allocates_identity = self.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+            GitHubMutationOperation.COMMENT,
+        }
+        if allocates_identity != (type(self.created_resource_identity) is str):
+            raise GitHubRuntimeError("semantic receipt created resource identity is invalid")
+        if self.created_resource_identity is not None:
+            _digest(self.created_resource_identity, "receipt created resource")
         if type(self.disposition) is not MutationDisposition:
             raise GitHubRuntimeError("semantic receipt disposition is invalid")
         object.__setattr__(self, "receipt_digest", _sha256(self._payload()))
@@ -1283,7 +1299,10 @@ class MutationJournalEntry:
                 raise GitHubRuntimeError("journal pre-state identity drifted")
         elif self.pre_state_digest is not None or self.pre_state_identity is not None:
             raise GitHubRuntimeError("incomplete journal pre-state evidence")
-        requires_locator = self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST and self.lifecycle in {
+        requires_locator = self.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+            GitHubMutationOperation.COMMENT,
+        } and self.lifecycle in {
             JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION,
             JournalLifecycle.AMBIGUOUS, JournalLifecycle.VERIFIED,
         }
@@ -1307,6 +1326,9 @@ class MutationJournalEntry:
             or self.receipt.evaluated_at != self.evaluated_at
             or self.receipt.fresh_until != self.fresh_until
             or self.receipt.time_identity != self.time_identity
+            or self.receipt.created_resource_identity != (
+                self.created_resource.identity if self.created_resource is not None else None
+            )
         ):
             raise GitHubRuntimeError("mutation journal receipt does not match durable evidence")
 
@@ -1356,6 +1378,7 @@ class MutationJournalEntry:
                 "operation": self.created_resource.operation.value,
                 "repository": self.created_resource.repository.slug,
                 "pull_request_number": self.created_resource.pull_request_number,
+                "pull_request_id": self.created_resource.pull_request_id,
                 "issue_number": self.created_resource.issue_number,
                 "comment_id": self.created_resource.comment_id,
                 "base_sha": self.created_resource.base_sha,
@@ -1394,7 +1417,7 @@ class MutationJournalEntry:
         locator_value = value["created_resource"]
         if locator_value is not None:
             if type(locator_value) is not dict or set(locator_value) != {
-                "operation", "repository", "pull_request_number", "issue_number", "comment_id",
+                "operation", "repository", "pull_request_number", "pull_request_id", "issue_number", "comment_id",
                 "base_sha", "head_sha", "draft", "marker_digest", "identity",
             }:
                 raise GitHubRuntimeError("mutation journal created resource is malformed")
@@ -1402,9 +1425,11 @@ class MutationJournalEntry:
                 owner, name = locator_value["repository"].split("/", 1)
                 locator = CreatedResourceLocator(
                     GitHubMutationOperation(locator_value["operation"]), RepositoryRef(owner, name),
-                    locator_value["pull_request_number"], locator_value["issue_number"],
-                    locator_value["comment_id"], locator_value["base_sha"], locator_value["head_sha"],
-                    locator_value["draft"], locator_value["marker_digest"],
+                    pull_request_number=locator_value["pull_request_number"],
+                    pull_request_id=locator_value["pull_request_id"],
+                    issue_number=locator_value["issue_number"], comment_id=locator_value["comment_id"],
+                    base_sha=locator_value["base_sha"], head_sha=locator_value["head_sha"],
+                    draft=locator_value["draft"], marker_digest=locator_value["marker_digest"],
                 )
             except (AttributeError, TypeError, ValueError) as error:
                 raise GitHubRuntimeError("mutation journal created resource is malformed") from error
@@ -1983,8 +2008,11 @@ def _post_readback_for_locator(
             ),
             SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE,
         )
-    if intent.operation is GitHubMutationOperation.COMMENT and locator is not None:
-        return plan.readback if _created_comment_locator_matches_intent(intent, plan, locator) else None
+    if intent.operation is GitHubMutationOperation.COMMENT:
+        return plan.readback if (
+            type(locator) is CreatedResourceLocator
+            and _created_comment_locator_matches_intent(intent, plan, locator)
+        ) else None
     return plan.readback
 
 
@@ -2204,6 +2232,14 @@ class GitHubMutationBroker:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if not created:
                 return self._reconcile_journal(intent, context, bundle, plan, evidence, journal_entry)
+        if intent.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+            GitHubMutationOperation.COMMENT,
+        } and self.__executor is None:
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "allocated mutation requires an owner host locator capability",
+            ))
         before, pre_completeness = _complete_broker_read(self._adapter, plan.pre_state, context, bundle, plan, evidence)
         if not before.ok:
             if evidence is not None and self._journal is not None:
@@ -2245,7 +2281,11 @@ class GitHubMutationBroker:
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         assert outcome.receipt is not None
-        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, _post_state_digest(intent, after), pre_completeness, post_completeness, _affected_identity(intent, after, created_resource), outcome.receipt.disposition)
+        receipt = self._semantic_receipt(
+            intent, context, bundle, plan, before.snapshot_digest, _post_state_digest(intent, after),
+            pre_completeness, post_completeness, _affected_identity(intent, after, created_resource),
+            outcome.receipt.disposition, durable_entry=evidence,
+        )
         self._completed[intent.identity()] = receipt
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             self._completed.pop(intent.identity(), None)
@@ -2262,6 +2302,16 @@ class GitHubMutationBroker:
     ) -> SemanticMutationReceipt:
         binding = context.policy.binding
         assert binding is not None  # established by _authorize
+        created_resource_identity = (
+            durable_entry.created_resource.identity
+            if durable_entry is not None and durable_entry.created_resource is not None
+            else None
+        )
+        if intent.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+            GitHubMutationOperation.COMMENT,
+        } and created_resource_identity is None:
+            raise GitHubRuntimeError("allocated mutation receipt lacks durable locator")
         return SemanticMutationReceipt(
             intent.repository.slug, intent.operation, intent.idempotency_key,
             bundle.identity if durable_entry is None else durable_entry.authorization_bundle_identity,
@@ -2271,7 +2321,7 @@ class GitHubMutationBroker:
             context.configuration_digest, binding.deployment_fingerprint,
             binding.task_fingerprint, context.base_sha, context.candidate_sha,
             context.gate_identity, pre_state_digest, post_state_digest,
-            affected_identity,
+            affected_identity, created_resource_identity,
             bundle.evaluated_at if durable_entry is None else durable_entry.evaluated_at,
             bundle.fresh_until if durable_entry is None else durable_entry.fresh_until,
             bundle.time_identity if durable_entry is None else durable_entry.time_identity,
@@ -2394,6 +2444,14 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
+        if intent.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+            GitHubMutationOperation.COMMENT,
+        } and self._journal is None:
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "allocated mutation requires an owner host and durable locator evidence",
+            ))
         if self._journal is not None:
             try:
                 entry = self._journal.find_recovery(intent, context, plan)
@@ -2507,6 +2565,7 @@ def _readback_matches(
             and result.snapshot.base_repository == intent.repository
             and result.snapshot.head_repository == intent.repository
             and result.snapshot.number == locator.pull_request_number
+            and result.snapshot.pull_request_id == locator.pull_request_id
             and result.snapshot.state is PullRequestState.OPEN
             and result.snapshot.draft is locator.draft
             and result.snapshot.base_sha == locator.base_sha == payload.get("base_sha")
@@ -2515,7 +2574,7 @@ def _readback_matches(
             and result.snapshot.base_ref == payload.get("base_ref")
             and result.snapshot.head_ref == payload.get("head_ref")
         )
-    if intent.operation is GitHubMutationOperation.COMMENT and locator is not None:
+    if intent.operation is GitHubMutationOperation.COMMENT:
         return (
             type(locator) is CreatedResourceLocator
             and type(result.snapshot) is CommentsSnapshot
@@ -2547,6 +2606,17 @@ def _affected_identity(
     if intent.operation in {GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.UPDATE_BRANCH} and type(result.snapshot) is BranchSnapshot:
         return _sha256(("affected", intent.operation.value, result.snapshot.repository.slug, result.snapshot.name, result.snapshot.sha))
     if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST and type(result.snapshot) is PullRequestSnapshot:
+        if (
+            type(locator) is not CreatedResourceLocator
+            or locator.operation is not intent.operation
+            or locator.repository != intent.repository
+            or locator.pull_request_number != result.snapshot.number
+            or locator.pull_request_id != result.snapshot.pull_request_id
+            or result.snapshot.repository != intent.repository
+            or result.snapshot.base_repository != intent.repository
+            or result.snapshot.head_repository != intent.repository
+        ):
+            raise GitHubRuntimeError("allocated pull request affected identity is unavailable")
         return _sha256((
             "affected", intent.operation.value, result.snapshot.repository.slug,
             result.snapshot.pull_request_id, result.snapshot.number, result.snapshot.state.value,
@@ -2555,6 +2625,14 @@ def _affected_identity(
             result.snapshot.head_repository.slug, result.snapshot.draft,
         ))
     if intent.operation is GitHubMutationOperation.COMMENT and type(locator) is CreatedResourceLocator and type(result.snapshot) is CommentsSnapshot:
+        if (
+            locator.operation is not intent.operation
+            or locator.repository != intent.repository
+            or result.snapshot.repository != intent.repository
+            or result.snapshot.issue_number != locator.issue_number
+            or locator.issue_number != intent.target_number
+        ):
+            raise GitHubRuntimeError("allocated comment affected identity is unavailable")
         for comment in result.snapshot.comments:
             if comment.comment_id == locator.comment_id and comment.body_digest == locator.marker_digest:
                 return _sha256((

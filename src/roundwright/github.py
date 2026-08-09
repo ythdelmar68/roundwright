@@ -369,6 +369,8 @@ class ChecksSnapshot:
     repository: RepositoryRef
     pull_request_number: int
     head_sha: str
+    check_evidence_identity: str
+    candidate_evidence_identity: str
     checks: tuple[CheckSnapshot, ...]
 
     def __post_init__(self) -> None:
@@ -376,6 +378,8 @@ class ChecksSnapshot:
             raise GitHubContractError("checks repository is invalid")
         _validate_number(self.pull_request_number, "pull request number")
         _validate_sha(self.head_sha, "checks head sha")
+        _validate_digest(self.check_evidence_identity, "check evidence")
+        _validate_digest(self.candidate_evidence_identity, "check candidate evidence")
         if type(self.checks) is not tuple or any(type(item) is not CheckSnapshot for item in self.checks):
             raise GitHubContractError("checks snapshot is invalid")
         _unique((item.check_id for item in self.checks), "check identities")
@@ -405,6 +409,8 @@ class WorkflowRunsSnapshot:
     repository: RepositoryRef
     pull_request_number: int
     head_sha: str
+    workflow_evidence_identity: str
+    candidate_evidence_identity: str
     runs: tuple[WorkflowRunSnapshot, ...]
 
     def __post_init__(self) -> None:
@@ -412,6 +418,8 @@ class WorkflowRunsSnapshot:
             raise GitHubContractError("workflow runs repository is invalid")
         _validate_number(self.pull_request_number, "pull request number")
         _validate_sha(self.head_sha, "workflow runs head sha")
+        _validate_digest(self.workflow_evidence_identity, "workflow evidence")
+        _validate_digest(self.candidate_evidence_identity, "workflow candidate evidence")
         if type(self.runs) is not tuple or any(type(item) is not WorkflowRunSnapshot for item in self.runs):
             raise GitHubContractError("workflow runs snapshot is invalid")
         _unique((item.run_id for item in self.runs), "workflow run identities")
@@ -745,17 +753,17 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
                 raise GitHubContractError("requested reviewer identity drifted")
             return snapshot
         if operation is GitHubReadOperation.CHECKS:
-            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "checks"})
+            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "check_evidence_identity", "candidate_evidence_identity", "checks"})
             head_sha = _string(response, "head_sha")
             checks = tuple(CheckSnapshot(_string(item, "id"), _string(item, "name"), CheckState(_string(item, "state")), _optional_enum(item, "conclusion", CheckConclusion), _string(item, "head_sha")) for item in _mappings(response, "checks", {"id", "name", "state", "conclusion", "head_sha"}))
             _validate_collection_head(head_sha, tuple(item.head_sha for item in checks))
-            return ChecksSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, checks)
+            return ChecksSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, _string(response, "check_evidence_identity"), _string(response, "candidate_evidence_identity"), checks)
         if operation is GitHubReadOperation.WORKFLOW_RUNS:
-            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "runs"})
+            _exact_shape(response, {"repository", "pull_request_number", "head_sha", "workflow_evidence_identity", "candidate_evidence_identity", "runs"})
             head_sha = _string(response, "head_sha")
             runs = tuple(WorkflowRunSnapshot(_string(item, "id"), _string(item, "workflow_name"), CheckState(_string(item, "state")), _optional_enum(item, "conclusion", CheckConclusion), _string(item, "head_sha")) for item in _mappings(response, "runs", {"id", "workflow_name", "state", "conclusion", "head_sha"}))
             _validate_collection_head(head_sha, tuple(item.head_sha for item in runs))
-            return WorkflowRunsSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, runs)
+            return WorkflowRunsSnapshot(_repository(response), _integer(response, "pull_request_number"), head_sha, _string(response, "workflow_evidence_identity"), _string(response, "candidate_evidence_identity"), runs)
         if operation is GitHubReadOperation.MERGEABILITY:
             _exact_shape(response, {"repository", "pull_request_number", "head_sha", "mergeability"})
             return MergeabilitySnapshot(_repository(response), _integer(response, "pull_request_number"), _string(response, "head_sha"), Mergeability(_string(response, "mergeability")))

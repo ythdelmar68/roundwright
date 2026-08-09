@@ -214,6 +214,32 @@ def gh_issue_relationship_page(*children: int, total: int | None = None, next_cu
     }
 
 
+def gh_candidate_pull_request(*, number: int = 46, head_sha: str = SHA, base_repository: str = "example/roundwright", head_repository: str = "example/roundwright") -> dict[str, object]:
+    return {
+        "number": number,
+        "base": {"repo": {"full_name": base_repository}},
+        "head": {"sha": head_sha, "repo": {"full_name": head_repository}},
+    }
+
+
+def gh_checks_page(*, total: int | None = None, head_sha: str = SHA, suite_sha: str | None = SHA) -> dict[str, object]:
+    run: dict[str, object] = {
+        "id": 1, "name": "tests", "status": "completed", "conclusion": "success", "head_sha": head_sha,
+    }
+    if suite_sha is not None:
+        run["check_suite"] = {"head_sha": suite_sha}
+    return {"total_count": 1 if total is None else total, "check_runs": [] if total == 0 else [run]}
+
+
+def gh_workflow_page(*, total: int | None = None, head_sha: str = SHA, repository: str = "example/roundwright", head_repository: str = "example/roundwright", pull_request_number: int = 46, pull_request_head: str = SHA) -> dict[str, object]:
+    run = {
+        "id": 1, "name": "tests", "status": "completed", "conclusion": "success", "head_sha": head_sha,
+        "repository": {"full_name": repository}, "head_repository": {"full_name": head_repository},
+        "pull_requests": [{"number": pull_request_number, "head": {"sha": pull_request_head}}],
+    }
+    return {"total_count": 1 if total is None else total, "workflow_runs": [] if total == 0 else [run]}
+
+
 def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
     title, body = "draft title", "draft body"
     title_digest = "sha256:" + hashlib.sha256(json.dumps(("pull-request-title", title), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
@@ -1074,6 +1100,106 @@ class GitHubRuntimeTests(unittest.TestCase):
                     + [GhCommandResult(0, json.dumps(page)) for page in pages]
                 ))
                 result = GhGitHubAdapter(runner, health(GitHubReadOperation.ISSUE_RELATIONSHIPS)).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+
+    def test_native_checks_use_run_and_candidate_pull_request_evidence(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.CHECKS, REPOSITORY, number=46, expected_sha=SHA)
+        runner = Runner(
+            GhCommandResult(0, json.dumps(gh_candidate_pull_request())),
+            GhCommandResult(0, json.dumps(gh_checks_page())),
+        )
+        result = GhGitHubAdapter(runner, health(GitHubReadOperation.CHECKS)).read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.pull_request_number, 46)  # type: ignore[union-attr]
+        self.assertEqual(result.snapshot.head_sha, SHA)  # type: ignore[union-attr]
+        self.assertNotEqual(result.snapshot.check_evidence_identity, result.snapshot.candidate_evidence_identity)  # type: ignore[union-attr]
+        self.assertEqual(runner.calls[0], ("api", "--method", "GET", "repos/example/roundwright/pulls/46"))
+        self.assertEqual(runner.calls[1], ("api", "--method", "GET", f"repos/example/roundwright/commits/{SHA}/check-runs?per_page=100&page=1"))
+
+        empty = GhGitHubAdapter(Runner(
+            GhCommandResult(0, json.dumps(gh_candidate_pull_request())),
+            GhCommandResult(0, json.dumps(gh_checks_page(total=0))),
+        ), health(GitHubReadOperation.CHECKS)).read(request)
+        self.assertTrue(empty.ok)
+        self.assertEqual(empty.snapshot.checks, ())  # type: ignore[union-attr]
+
+    def test_native_checks_reject_mixed_candidates_and_candidate_repository_drift(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.CHECKS, REPOSITORY, number=46, expected_sha=SHA)
+        cases = (
+            ("mixed-check-head", gh_candidate_pull_request(), gh_checks_page(head_sha=BASE)),
+            ("check-suite-head", gh_candidate_pull_request(), gh_checks_page(suite_sha=BASE)),
+            ("candidate-pr-number", gh_candidate_pull_request(number=47), None),
+            ("candidate-fork", gh_candidate_pull_request(head_repository="fork/repository"), None),
+            ("truncated-page", gh_candidate_pull_request(), {"total_count": 2, "check_runs": []}),
+        )
+        for name, candidate, page in cases:
+            with self.subTest(name=name):
+                outcomes = [GhCommandResult(0, json.dumps(candidate))]
+                if page is not None:
+                    outcomes.append(GhCommandResult(0, json.dumps(page)))
+                result = GhGitHubAdapter(Runner(*outcomes), health(GitHubReadOperation.CHECKS)).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+
+    def test_native_workflow_runs_bind_provider_repository_head_and_pull_request_relationship(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.WORKFLOW_RUNS, REPOSITORY, number=46, expected_sha=SHA)
+        runner = Runner(
+            GhCommandResult(0, json.dumps(gh_candidate_pull_request())),
+            GhCommandResult(0, json.dumps(gh_workflow_page())),
+        )
+        result = GhGitHubAdapter(runner, health(GitHubReadOperation.WORKFLOW_RUNS)).read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.runs[0].head_sha, SHA)  # type: ignore[union-attr]
+        self.assertNotEqual(result.snapshot.workflow_evidence_identity, result.snapshot.candidate_evidence_identity)  # type: ignore[union-attr]
+        self.assertEqual(runner.calls[1], ("api", "--method", "GET", f"repos/example/roundwright/actions/runs?head_sha={SHA}&per_page=100&page=1"))
+
+        first_page = gh_workflow_page(total=2)
+        second_page = gh_workflow_page(total=2)
+        second_page["workflow_runs"][0]["id"] = 2  # type: ignore[index]
+        paged_runner = Runner(
+            GhCommandResult(0, json.dumps(gh_candidate_pull_request())),
+            GhCommandResult(0, json.dumps(first_page)),
+            GhCommandResult(0, json.dumps(second_page)),
+        )
+        paged = GhGitHubAdapter(paged_runner, health(GitHubReadOperation.WORKFLOW_RUNS)).read(request)
+        self.assertTrue(paged.ok)
+        self.assertEqual([run.run_id for run in paged.snapshot.runs], ["1", "2"])  # type: ignore[union-attr]
+        self.assertTrue(any("page=2" in argument for argument in paged_runner.calls[2]))
+
+    def test_native_workflow_runs_allow_empty_complete_results_and_reject_identity_or_pagination_drift(self) -> None:
+        import json
+
+        request = GitHubReadRequest(GitHubReadOperation.WORKFLOW_RUNS, REPOSITORY, number=46, expected_sha=SHA)
+        empty = GhGitHubAdapter(Runner(
+            GhCommandResult(0, json.dumps(gh_candidate_pull_request())),
+            GhCommandResult(0, json.dumps(gh_workflow_page(total=0))),
+        ), health(GitHubReadOperation.WORKFLOW_RUNS)).read(request)
+        self.assertTrue(empty.ok)
+        self.assertEqual(empty.snapshot.runs, ())  # type: ignore[union-attr]
+
+        missing_relationship = gh_workflow_page()
+        missing_relationship["workflow_runs"][0]["pull_requests"] = []  # type: ignore[index]
+        cases = (
+            ("mixed-head", gh_workflow_page(head_sha=BASE)),
+            ("repository-drift", gh_workflow_page(repository="other/repository")),
+            ("fork-drift", gh_workflow_page(head_repository="fork/repository")),
+            ("pull-request-drift", gh_workflow_page(pull_request_number=47)),
+            ("missing-relationship", missing_relationship),
+            ("truncated-page", {"total_count": 2, "workflow_runs": []}),
+        )
+        for name, page in cases:
+            with self.subTest(name=name):
+                result = GhGitHubAdapter(Runner(
+                    GhCommandResult(0, json.dumps(gh_candidate_pull_request())),
+                    GhCommandResult(0, json.dumps(page)),
+                ), health(GitHubReadOperation.WORKFLOW_RUNS)).read(request)
                 self.assertFalse(result.ok)
                 self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
 

@@ -359,6 +359,10 @@ class GhGitHubAdapter:
             return self._read_repository(request)
         if request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
             return self._read_issue_with_relationships(request)
+        if request.operation is GitHubReadOperation.CHECKS:
+            return self._read_checks_with_candidate_evidence(request)
+        if request.operation is GitHubReadOperation.WORKFLOW_RUNS:
+            return self._read_workflows_with_candidate_evidence(request)
         outcome = self.__runner.run(_read_command(request))
         if outcome.exit_code != 0:
             try:
@@ -470,6 +474,112 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
                 "gh issue relationship response is malformed",
+            ))
+
+    def _read_checks_with_candidate_evidence(self, request: GitHubReadRequest) -> GitHubReadResult:
+        candidate, candidate_failure = self._read_candidate_pull_request_evidence(request)
+        if candidate_failure is not None:
+            return candidate_failure
+        assert candidate is not None
+        try:
+            checks: list[Mapping[str, object]] = []
+            evidence: list[str] = []
+            expected_total: int | None = None
+            seen_ids: set[str] = set()
+            for page in range(1, 33):
+                outcome = self.__runner.run(_checks_page_command(request, page))
+                if outcome.exit_code != 0:
+                    return GitHubReadResult(request, failure=GitHubFailure(
+                        _failure_kind(outcome.exit_code), request.operation,
+                        "gh check-runs read did not return a usable response",
+                    ))
+                raw = json.loads(outcome.stdout)
+                items, total_count = _project_checks_page(request, raw)
+                if expected_total is None:
+                    expected_total = total_count
+                elif expected_total != total_count:
+                    raise GitHubRuntimeError("gh check-runs total changed during pagination")
+                for item in items:
+                    identifier = _raw_id(item, "id")
+                    if identifier in seen_ids:
+                        raise GitHubRuntimeError("gh check-runs are duplicated")
+                    seen_ids.add(identifier)
+                    checks.append(item)
+                if len(checks) > expected_total:
+                    raise GitHubRuntimeError("gh check-runs total is inconsistent")
+                evidence.append(_sha256(raw))
+                if len(checks) == expected_total:
+                    projected = _compose_checks(request, candidate, checks, evidence)
+                    return GitHubReadResult(request, snapshot=normalize_github_response(request, projected))
+                if not items:
+                    raise GitHubRuntimeError("gh check-runs pagination is truncated")
+            raise GitHubRuntimeError("gh check-runs page limit exceeded")
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh check-runs response is malformed",
+            ))
+
+    def _read_workflows_with_candidate_evidence(self, request: GitHubReadRequest) -> GitHubReadResult:
+        candidate, candidate_failure = self._read_candidate_pull_request_evidence(request)
+        if candidate_failure is not None:
+            return candidate_failure
+        assert candidate is not None
+        try:
+            runs: list[Mapping[str, object]] = []
+            evidence: list[str] = []
+            expected_total: int | None = None
+            seen_ids: set[str] = set()
+            for page in range(1, 33):
+                outcome = self.__runner.run(_workflow_runs_page_command(request, page))
+                if outcome.exit_code != 0:
+                    return GitHubReadResult(request, failure=GitHubFailure(
+                        _failure_kind(outcome.exit_code), request.operation,
+                        "gh workflow-runs read did not return a usable response",
+                    ))
+                raw = json.loads(outcome.stdout)
+                items, total_count = _project_workflow_runs_page(request, raw)
+                if expected_total is None:
+                    expected_total = total_count
+                elif expected_total != total_count:
+                    raise GitHubRuntimeError("gh workflow-runs total changed during pagination")
+                for item in items:
+                    identifier = _raw_id(item, "id")
+                    if identifier in seen_ids:
+                        raise GitHubRuntimeError("gh workflow-runs are duplicated")
+                    seen_ids.add(identifier)
+                    runs.append(item)
+                if len(runs) > expected_total:
+                    raise GitHubRuntimeError("gh workflow-runs total is inconsistent")
+                evidence.append(_sha256(raw))
+                if len(runs) == expected_total:
+                    projected = _compose_workflow_runs(request, candidate, runs, evidence)
+                    return GitHubReadResult(request, snapshot=normalize_github_response(request, projected))
+                if not items:
+                    raise GitHubRuntimeError("gh workflow-runs pagination is truncated")
+            raise GitHubRuntimeError("gh workflow-runs page limit exceeded")
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh workflow-runs response is malformed",
+            ))
+
+    def _read_candidate_pull_request_evidence(
+        self, request: GitHubReadRequest,
+    ) -> tuple[Mapping[str, object] | None, GitHubReadResult | None]:
+        outcome = self.__runner.run(_candidate_pull_request_command(request))
+        if outcome.exit_code != 0:
+            return None, GitHubReadResult(request, failure=GitHubFailure(
+                _failure_kind(outcome.exit_code), request.operation,
+                "gh candidate pull-request read did not return a usable response",
+            ))
+        try:
+            raw = json.loads(outcome.stdout)
+            return _project_candidate_pull_request_evidence(request, raw), None
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return None, GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh candidate pull-request response is malformed",
             ))
 
     def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
@@ -2174,6 +2284,114 @@ def _compose_issue_relationships(
     }
 
 
+def _repository_from_full_name(value: object) -> RepositoryRef:
+    if type(value) is not str or value.count("/") != 1:
+        raise GitHubRuntimeError("gh repository full name is malformed")
+    owner, name = value.split("/", 1)
+    return RepositoryRef(owner, name)
+
+
+def _project_candidate_pull_request_evidence(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
+    item = _raw_mapping(raw)
+    if _raw_integer(item, "number") != request.number:
+        raise GitHubRuntimeError("gh candidate pull-request number does not match request")
+    base_repository = _repository_from_full_name(_raw_text(_raw_mapping(_raw_mapping(item.get("base")).get("repo")), "full_name"))
+    head = _raw_mapping(item.get("head"))
+    head_repository = _repository_from_full_name(_raw_text(_raw_mapping(head.get("repo")), "full_name"))
+    if base_repository != request.repository or head_repository != request.repository:
+        raise GitHubRuntimeError("gh candidate pull-request repository does not match request")
+    head_sha = _raw_text(head, "sha")
+    if head_sha != request.expected_sha:
+        raise GitHubRuntimeError("gh candidate pull-request head does not match request")
+    return {
+        "repository": {"owner": base_repository.owner, "name": base_repository.name},
+        "pull_request_number": _raw_integer(item, "number"), "head_sha": head_sha,
+        "candidate_evidence_identity": _sha256(raw),
+    }
+
+
+def _project_checks_page(request: GitHubReadRequest, raw: object) -> tuple[list[Mapping[str, object]], int]:
+    envelope = _raw_mapping(raw)
+    total_count = _raw_integer(envelope, "total_count")
+    items = envelope.get("check_runs")
+    if total_count < 0 or type(items) is not list:
+        raise GitHubRuntimeError("gh check-runs response is incomplete")
+    projected: list[Mapping[str, object]] = []
+    for value in items:
+        check = _raw_mapping(value)
+        head_sha = _raw_text(check, "head_sha")
+        if head_sha != request.expected_sha:
+            raise GitHubRuntimeError("gh check-run candidate does not match request")
+        suite = check.get("check_suite")
+        if suite is not None and _raw_text(_raw_mapping(suite), "head_sha") != request.expected_sha:
+            raise GitHubRuntimeError("gh check-suite candidate does not match request")
+        projected.append({
+            "id": _raw_id(check, "id"), "name": _raw_text(check, "name"),
+            "state": _raw_text(check, "status").upper(),
+            "conclusion": _raw_optional_text(check, "conclusion", upper=True), "head_sha": head_sha,
+        })
+    return projected, total_count
+
+
+def _project_workflow_runs_page(request: GitHubReadRequest, raw: object) -> tuple[list[Mapping[str, object]], int]:
+    envelope = _raw_mapping(raw)
+    total_count = _raw_integer(envelope, "total_count")
+    items = envelope.get("workflow_runs")
+    if total_count < 0 or type(items) is not list:
+        raise GitHubRuntimeError("gh workflow-runs response is incomplete")
+    projected: list[Mapping[str, object]] = []
+    for value in items:
+        run = _raw_mapping(value)
+        if (
+            _repository_from_full_name(_raw_text(_raw_mapping(run.get("repository")), "full_name")) != request.repository
+            or _repository_from_full_name(_raw_text(_raw_mapping(run.get("head_repository")), "full_name")) != request.repository
+        ):
+            raise GitHubRuntimeError("gh workflow repository does not match request")
+        head_sha = _raw_text(run, "head_sha")
+        if head_sha != request.expected_sha:
+            raise GitHubRuntimeError("gh workflow candidate does not match request")
+        relationships = run.get("pull_requests")
+        if type(relationships) is not list or not relationships:
+            raise GitHubRuntimeError("gh workflow pull-request relationship is incomplete")
+        matching = []
+        for relation in relationships:
+            relationship = _raw_mapping(relation)
+            if _raw_integer(relationship, "number") == request.number:
+                matching.append(relationship)
+        if len(matching) != 1 or _raw_text(_raw_mapping(matching[0].get("head")), "sha") != request.expected_sha:
+            raise GitHubRuntimeError("gh workflow pull-request relationship does not match request")
+        projected.append({
+            "id": _raw_id(run, "id"), "workflow_name": _raw_text(run, "name"),
+            "state": _raw_text(run, "status").upper(),
+            "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": head_sha,
+        })
+    return projected, total_count
+
+
+def _compose_checks(
+    request: GitHubReadRequest, candidate: Mapping[str, object], checks: list[Mapping[str, object]], evidence: list[str],
+) -> Mapping[str, object]:
+    return {
+        "repository": _raw_mapping(candidate.get("repository")),
+        "pull_request_number": _raw_integer(candidate, "pull_request_number"),
+        "head_sha": _raw_text(candidate, "head_sha"), "checks": checks,
+        "check_evidence_identity": _sha256(("check-run-pages", tuple(evidence))),
+        "candidate_evidence_identity": _raw_text(candidate, "candidate_evidence_identity"),
+    }
+
+
+def _compose_workflow_runs(
+    request: GitHubReadRequest, candidate: Mapping[str, object], runs: list[Mapping[str, object]], evidence: list[str],
+) -> Mapping[str, object]:
+    return {
+        "repository": _raw_mapping(candidate.get("repository")),
+        "pull_request_number": _raw_integer(candidate, "pull_request_number"),
+        "head_sha": _raw_text(candidate, "head_sha"), "runs": runs,
+        "workflow_evidence_identity": _sha256(("workflow-run-pages", tuple(evidence))),
+        "candidate_evidence_identity": _raw_text(candidate, "candidate_evidence_identity"),
+    }
+
+
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
     """Project one REST response into the exact core schema.
 
@@ -2288,27 +2506,9 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
             raise GitHubRuntimeError("gh review candidate does not match request")
         return {"repository": repository, "pull_request_number": request.number, "head_sha": head_sha, "reviews": [{"id": _raw_id(item, "id"), "reviewer_id": _raw_id(_raw_mapping(item.get("user")), "id"), "state": _raw_text(item, "state").upper(), "commit_sha": _raw_text(item, "commit_id")} for item in items]}
     if operation is GitHubReadOperation.CHECKS:
-        item = _raw_mapping(raw)
-        _raw_repository_matches(item, request)
-        runs = item.get("check_runs")
-        if type(runs) is not list:
-            raise GitHubRuntimeError("gh check-runs response is incomplete")
-        head_sha = _raw_text(item, "head_sha")
-        if head_sha != request.expected_sha or any(_raw_text(_raw_mapping(run), "head_sha") != head_sha for run in runs):
-            raise GitHubRuntimeError("gh checks candidate does not match request")
-        return {"repository": repository, "pull_request_number": request.number, "head_sha": head_sha, "checks": [{"id": _raw_id(run, "id"), "name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": _raw_text(run, "head_sha")} for run in runs]}
+        raise GitHubRuntimeError("check reads require candidate evidence composition")
     if operation is GitHubReadOperation.WORKFLOW_RUNS:
-        item = _raw_mapping(raw)
-        _raw_repository_matches(item, request)
-        runs = item.get("workflow_runs")
-        if type(runs) is not list:
-            raise GitHubRuntimeError("gh workflow-runs response is incomplete")
-        if not runs:
-            raise GitHubRuntimeError("gh workflow response cannot establish candidate identity")
-        head_sha = _raw_text(_raw_mapping(runs[0]), "head_sha")
-        if head_sha != request.expected_sha or any(_raw_text(_raw_mapping(run), "head_sha") != head_sha for run in runs):
-            raise GitHubRuntimeError("gh workflow candidate does not match request")
-        return {"repository": repository, "pull_request_number": request.number, "head_sha": head_sha, "runs": [{"id": _raw_id(run, "id"), "workflow_name": _raw_text(run, "name"), "state": _raw_text(run, "status").upper(), "conclusion": _raw_optional_text(run, "conclusion", upper=True), "head_sha": _raw_text(run, "head_sha")} for run in runs]}
+        raise GitHubRuntimeError("workflow reads require candidate evidence composition")
     if operation is GitHubReadOperation.MERGEABILITY:
         item = _raw_mapping(raw)
         _raw_repository_matches(item, request)
@@ -2539,6 +2739,24 @@ def _repository_default_branch_command(repository: RepositoryRef, default_branch
     if type(repository) is not RepositoryRef or type(default_branch) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", default_branch):
         raise GitHubRuntimeError("repository default branch command is invalid")
     return ("api", "--method", "GET", f"repos/{repository.slug}/branches/{default_branch}")
+
+
+def _candidate_pull_request_command(request: GitHubReadRequest) -> tuple[str, ...]:
+    if type(request) is not GitHubReadRequest or request.operation not in {GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS} or request.number is None:
+        raise GitHubRuntimeError("candidate pull-request request is invalid")
+    return ("api", "--method", "GET", f"repos/{request.repository.slug}/pulls/{request.number}")
+
+
+def _checks_page_command(request: GitHubReadRequest, page: int) -> tuple[str, ...]:
+    if type(request) is not GitHubReadRequest or request.operation is not GitHubReadOperation.CHECKS or request.expected_sha is None or type(page) is not int or not 1 <= page <= 32:
+        raise GitHubRuntimeError("check-runs page request is invalid")
+    return ("api", "--method", "GET", f"repos/{request.repository.slug}/commits/{request.expected_sha}/check-runs?per_page=100&page={page}")
+
+
+def _workflow_runs_page_command(request: GitHubReadRequest, page: int) -> tuple[str, ...]:
+    if type(request) is not GitHubReadRequest or request.operation is not GitHubReadOperation.WORKFLOW_RUNS or request.expected_sha is None or type(page) is not int or not 1 <= page <= 32:
+        raise GitHubRuntimeError("workflow-runs page request is invalid")
+    return ("api", "--method", "GET", f"repos/{request.repository.slug}/actions/runs?head_sha={request.expected_sha}&per_page=100&page={page}")
 
 
 def _issue_relationship_command(request: GitHubReadRequest, cursor: str | None) -> tuple[str, ...]:

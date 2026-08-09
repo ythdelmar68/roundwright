@@ -1108,6 +1108,7 @@ class BrokerSemanticPlan:
     intent_identity: str
     pre_state: GitHubReadRequest
     readback: SemanticReadback
+    pre_dispatch_reads: tuple[GitHubReadRequest, ...] = ()
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1121,7 +1122,13 @@ class BrokerSemanticPlan:
             (self.intent_identity, "semantic intent"),
         ):
             _digest(value, name)
-        if type(self.pre_state) is not GitHubReadRequest or type(self.readback) is not SemanticReadback:
+        if (
+            type(self.pre_state) is not GitHubReadRequest
+            or type(self.readback) is not SemanticReadback
+            or type(self.pre_dispatch_reads) is not tuple
+            or not self.pre_dispatch_reads
+            or any(type(request) is not GitHubReadRequest for request in self.pre_dispatch_reads)
+        ):
             raise GitHubRuntimeError("broker semantic plan read-back is invalid")
         if self.pre_state.repository != self.readback.request.repository:
             raise GitHubRuntimeError("broker semantic plan repositories do not match")
@@ -1129,7 +1136,18 @@ class BrokerSemanticPlan:
             self.operation.value, self.command.value, self.target_identity,
             self.idempotency_identity, self.intent_identity,
             self.pre_state.identity(), self.readback.identity,
+            tuple(request.identity() for request in self.pre_dispatch_reads),
         )))
+
+
+def _pre_dispatch_reads_identity(plan: BrokerSemanticPlan) -> str:
+    """Seal the complete ordered pre-dispatch proof, never only its first read."""
+
+    if type(plan) is not BrokerSemanticPlan:
+        raise GitHubRuntimeError("broker semantic plan is invalid")
+    return _sha256(("pre-dispatch-reads", tuple(
+        request.identity() for request in plan.pre_dispatch_reads
+    )))
 
 
 @dataclass(frozen=True)
@@ -1153,6 +1171,10 @@ class MutationBrokerContext:
     deployment_verification: AuthorityReceiptVerification
     evaluated_at: datetime
     repository: RepositoryRef
+    base_repository: RepositoryRef
+    head_repository: RepositoryRef
+    base_ref: str
+    head_ref: str
 
     def __post_init__(self) -> None:
         if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
@@ -1162,13 +1184,20 @@ class MutationBrokerContext:
                 or type(self.deployment_identity) is not DeploymentIdentity or type(self.deployment_receipt) is not DeploymentAuthorityReceipt
                 or type(self.deployment_verification) is not AuthorityReceiptVerification
                 or type(self.evaluated_at) is not datetime or self.evaluated_at.tzinfo is not timezone.utc
-                or type(self.repository) is not RepositoryRef):
+                or type(self.repository) is not RepositoryRef
+                or type(self.base_repository) is not RepositoryRef
+                or type(self.head_repository) is not RepositoryRef):
             raise GitHubRuntimeError("broker authority evidence is invalid")
         for value, name in ((self.configuration_digest, "configuration"), (self.gate_identity, "gate")):
             _digest(value, name)
         for value, name in ((self.base_sha, "base sha"), (self.candidate_sha, "candidate sha")):
             if type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
                 raise GitHubRuntimeError(f"broker {name} is invalid")
+        try:
+            GitHubReadRequest(GitHubReadOperation.BRANCH, self.base_repository, ref=self.base_ref, expected_sha=self.base_sha)
+            GitHubReadRequest(GitHubReadOperation.BRANCH, self.head_repository, ref=self.head_ref, expected_sha=self.candidate_sha)
+        except (TypeError, ValueError) as error:
+            raise GitHubRuntimeError("broker pull request reference evidence is invalid") from error
 
 
 def schema_v2_authorization_bundle(
@@ -1244,6 +1273,8 @@ def schema_v2_authorization_bundle(
         evaluated_at, fresh_until_text, _sha256((evaluated_at, fresh_until_text)),
         capability_health.identity,
         context.repository.slug,
+        context.base_repository.slug, context.head_repository.slug,
+        context.base_ref, context.head_ref,
     )
 
 
@@ -1279,6 +1310,10 @@ class SchemaV2AuthorizationBundle:
     time_identity: str
     capability_health_identity: str
     target_repository: str
+    base_repository: str
+    head_repository: str
+    base_ref: str
+    head_ref: str
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1310,8 +1345,15 @@ class SchemaV2AuthorizationBundle:
         if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
             raise GitHubRuntimeError("authorization time identity drifted")
         _digest(self.capability_health_identity, "authorization capability health")
-        if type(self.target_repository) is not str or self.target_repository.count("/") != 1:
-            raise GitHubRuntimeError("authorization bundle target repository is invalid")
+        try:
+            target_owner, target_name = self.target_repository.split("/", 1)
+            base_owner, base_name = self.base_repository.split("/", 1)
+            head_owner, head_name = self.head_repository.split("/", 1)
+            GitHubReadRequest(GitHubReadOperation.BRANCH, RepositoryRef(target_owner, target_name), ref=self.base_ref, expected_sha=self.base_sha)
+            GitHubReadRequest(GitHubReadOperation.BRANCH, RepositoryRef(base_owner, base_name), ref=self.base_ref, expected_sha=self.base_sha)
+            GitHubReadRequest(GitHubReadOperation.BRANCH, RepositoryRef(head_owner, head_name), ref=self.head_ref, expected_sha=self.candidate_sha)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise GitHubRuntimeError("authorization bundle pull request reference evidence is invalid") from error
         if type(self.receipt_status) is not RepositoryReceiptStatus:
             raise GitHubRuntimeError("authorization bundle receipt lifecycle status is invalid")
         _digest(self.configuration_digest, "configuration")
@@ -1570,7 +1612,7 @@ class MutationJournalEntry:
             intent.repository.slug, intent.operation, intent.idempotency_key,
             plan.target_identity, plan.idempotency_identity, intent.identity(), bundle.identity,
             context.candidate_sha, context.configuration_digest, context.gate_identity,
-            plan.identity, plan.command, plan.pre_state.identity(), plan.readback.identity, bundle.evaluated_at,
+            plan.identity, plan.command, _pre_dispatch_reads_identity(plan), plan.readback.identity, bundle.evaluated_at,
             bundle.fresh_until, bundle.time_identity, JournalLifecycle.PENDING,
         )
 
@@ -1784,7 +1826,7 @@ class DurableMutationJournal:
             or entry.idempotency_key != intent.idempotency_key or entry.intent_identity != intent.identity()
             or entry.target_identity != plan.target_identity or entry.idempotency_identity != plan.idempotency_identity
             or entry.semantic_plan_identity != plan.identity or entry.command is not plan.command
-            or entry.pre_state_read_identity != plan.pre_state.identity()
+            or entry.pre_state_read_identity != _pre_dispatch_reads_identity(plan)
             or entry.semantic_readback_identity != plan.readback.identity
             or entry.candidate_sha != context.candidate_sha
             or entry.configuration_digest != context.configuration_digest
@@ -2096,6 +2138,7 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
         raise GitHubRuntimeError("broker mutation command mapping is invalid")
     payload = dict(intent.payload)
     operation = intent.operation
+    pre_dispatch_reads: tuple[GitHubReadRequest, ...]
     if operation is GitHubMutationOperation.CREATE_BRANCH:
         pre_state = GitHubReadRequest(GitHubReadOperation.REPOSITORY, intent.repository)
         readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha), SemanticPostcondition.BRANCH_AT_EXPECTED_SHA)
@@ -2106,7 +2149,17 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
         pre_state = GitHubReadRequest(GitHubReadOperation.BRANCH, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha)
         readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.REMOTE_HEAD, intent.repository, ref=intent.target_ref, expected_sha=intent.expected_sha), SemanticPostcondition.BRANCH_ABSENT)
     elif operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
-        pre_state = GitHubReadRequest(GitHubReadOperation.REPOSITORY, intent.repository)
+        pre_state = GitHubReadRequest(
+            GitHubReadOperation.BRANCH, intent.repository,
+            ref=payload["base_ref"], expected_sha=payload["base_sha"],
+        )
+        pre_dispatch_reads = (
+            pre_state,
+            GitHubReadRequest(
+                GitHubReadOperation.BRANCH, intent.repository,
+                ref=payload["head_ref"], expected_sha=payload["head_sha"],
+            ),
+        )
         readback = SemanticReadback(GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, intent.repository, number=intent.target_number, expected_sha=payload["head_sha"]), SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE)
     elif operation is GitHubMutationOperation.COMMENT:
         pre_state = GitHubReadRequest(GitHubReadOperation.COMMENTS, intent.repository, number=intent.target_number)
@@ -2125,10 +2178,13 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
         readback = SemanticReadback(pre_state, SemanticPostcondition.ISSUE_CLOSED)
     else:
         raise GitHubRuntimeError("broker semantic plan is incomplete for this mutation operation")
+    if operation is not GitHubMutationOperation.CREATE_PULL_REQUEST:
+        pre_dispatch_reads = (pre_state,)
     return BrokerSemanticPlan(
         operation, command,
         _sha256((intent.repository.slug, intent.target_number, intent.target_ref, intent.expected_sha)),
         _sha256(("idempotency", intent.idempotency_key)), intent.identity(), pre_state, readback,
+        pre_dispatch_reads,
     )
 
 
@@ -2245,6 +2301,45 @@ def _complete_broker_read(
         plan.identity, journal_entry.key if journal_entry is not None else _sha256(("no-journal", plan.intent_identity)),
     )
     return result, receipt.identity
+
+
+def _complete_pre_dispatch_state(
+    adapter: GitHubAdapter, context: MutationBrokerContext,
+    bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
+    journal_entry: MutationJournalEntry | None,
+) -> tuple[GitHubReadResult, str, str]:
+    """Capture every broker-owned pre-dispatch proof as one durable state.
+
+    Create-PR requires two independent branch proofs.  They are never
+    reconstructed from post-state and both are folded into the persisted
+    pre-state digest and completeness identity before owner IPC is reachable.
+    """
+
+    results: list[GitHubReadResult] = []
+    evidence: list[tuple[str, str, str]] = []
+    for request in plan.pre_dispatch_reads:
+        result, completeness = _complete_broker_read(
+            adapter, request, context, bundle, plan, journal_entry,
+        )
+        snapshot = result.snapshot
+        if not result.ok:
+            return result, "", ""
+        if request.operation is GitHubReadOperation.BRANCH and (
+            type(snapshot) is not BranchSnapshot
+            or snapshot.repository != request.repository
+            or snapshot.name != request.ref
+            or snapshot.sha != request.expected_sha
+        ):
+            return result, "", ""
+        results.append(result)
+        evidence.append((request.identity(), result.snapshot_digest, completeness))
+    if not results:
+        raise GitHubRuntimeError("broker pre-dispatch plan is incomplete")
+    return (
+        results[0],
+        _sha256(("broker-pre-dispatch-state", tuple(evidence))),
+        _sha256(("broker-pre-dispatch-completeness", tuple(evidence))),
+    )
 
 
 def _validate_created_resource_locator(
@@ -2385,10 +2480,20 @@ class _GhBrokerExecutor:
                 or not journal.pre_state_complete
                 or journal.pre_state_identity is None
                 or journal.pre_state_completeness_identity is None
-                or journal.pre_state_read_identity != plan.pre_state.identity()
+                or journal.pre_state_read_identity != _pre_dispatch_reads_identity(plan)
             ):
                 raise GitHubRuntimeError("broker journal execution seal is unavailable")
             intent_payload = dict(intent.payload)
+            if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST and (
+                intent.repository.slug != bundle.target_repository
+                or intent_payload.get("base_sha") != bundle.base_sha
+                or intent_payload.get("head_sha") != bundle.candidate_sha
+                or intent_payload.get("base_ref") != bundle.base_ref
+                or intent_payload.get("head_ref") != bundle.head_ref
+                or bundle.base_repository != bundle.target_repository
+                or bundle.head_repository != bundle.target_repository
+            ):
+                raise GitHubRuntimeError("broker pull request context evidence drifted")
             request = OwnerMutationRequest(
                 intent_identity=intent.identity(), operation=intent.operation,
                 authorization_bundle_identity=bundle.identity, semantic_plan_identity=plan.identity,
@@ -2407,16 +2512,10 @@ class _GhBrokerExecutor:
                 ),
                 base_ref=intent_payload.get("base_ref"),
                 head_ref=intent_payload.get("head_ref"),
-                base_repository=(
-                    intent.repository
-                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST
-                    else None
-                ),
-                head_repository=(
-                    intent.repository
-                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST
-                    else None
-                ),
+                base_repository=(RepositoryRef(*bundle.base_repository.split("/", 1))
+                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST else None),
+                head_repository=(RepositoryRef(*bundle.head_repository.split("/", 1))
+                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST else None),
             )
             fact = self.__transport.dispatch(request)
             request_identity = request.identity
@@ -2477,7 +2576,10 @@ class GitHubMutationBroker:
             return
         _require_fresh_capabilities(
             self.__health,
-            (plan.pre_state.operation, plan.readback.request.operation, intent.operation), now,
+            (
+                *(request.operation for request in plan.pre_dispatch_reads),
+                plan.readback.request.operation, intent.operation,
+            ), now,
         )
 
     @classmethod
@@ -2551,7 +2653,9 @@ class GitHubMutationBroker:
                 GitHubFailureKind.POLICY_DENIED, intent.operation,
                 "allocated mutation requires an owner host locator capability",
             ))
-        before, pre_completeness = _complete_broker_read(self._adapter, plan.pre_state, context, bundle, plan, evidence)
+        before, pre_state_digest, pre_completeness = _complete_pre_dispatch_state(
+            self._adapter, context, bundle, plan, evidence,
+        )
         if not before.ok:
             if evidence is not None and self._journal is not None:
                 self._journal_transition(evidence, JournalLifecycle.FAILED)
@@ -2559,7 +2663,7 @@ class GitHubMutationBroker:
         if evidence is not None and self._journal is not None:
             evidence = self._journal_transition(
                 evidence, JournalLifecycle.PRESTATE_CAPTURED,
-                pre_state_digest=before.snapshot_digest,
+                pre_state_digest=pre_state_digest,
                 pre_state_completeness_identity=pre_completeness,
             )
             if evidence is None:
@@ -2571,7 +2675,7 @@ class GitHubMutationBroker:
                     "already-satisfied mutation lacks durable pre-state evidence",
                 ))
             receipt = self._semantic_receipt(
-                intent, context, bundle, plan, before.snapshot_digest, _post_state_digest(intent, before),
+                intent, context, bundle, plan, pre_state_digest, _post_state_digest(intent, before),
                 pre_completeness, pre_completeness, _affected_identity(intent, before),
                 MutationDisposition.ALREADY_APPLIED, durable_entry=evidence,
             )
@@ -2632,7 +2736,7 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         assert outcome.receipt is not None
         receipt = self._semantic_receipt(
-            intent, context, bundle, plan, before.snapshot_digest, _post_state_digest(intent, after),
+            intent, context, bundle, plan, pre_state_digest, _post_state_digest(intent, after),
             pre_completeness, post_completeness, _affected_identity(intent, after, created_resource),
             outcome.receipt.disposition, durable_entry=evidence,
         )
@@ -2872,6 +2976,10 @@ def _authorize(
         if (
             payload.get("base_sha") != context.base_sha
             or payload.get("head_sha") != context.candidate_sha
+            or payload.get("base_ref") != context.base_ref
+            or payload.get("head_ref") != context.head_ref
+            or context.base_repository != context.repository
+            or context.head_repository != context.repository
         ):
             return GitHubFailure(
                 GitHubFailureKind.STALE_RESPONSE,

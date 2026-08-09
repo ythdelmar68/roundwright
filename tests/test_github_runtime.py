@@ -1889,6 +1889,45 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertFalse(adapter.submit(intent).ok)
         self.assertEqual(runner.calls, [])
 
+    def test_direct_read_runner_cannot_be_repurposed_as_a_mutation_process(self) -> None:
+        """Even a direct private import accepts only typed read command shapes."""
+        from unittest import mock
+        import roundwright.github_runtime as runtime
+
+        class GuardedEnvironment(dict[str, str]):
+            def __getitem__(self, key: str) -> str:
+                raise AssertionError(f"credential environment read: {key}")
+
+        runner = runtime._SubprocessGhReadRunner()
+        with mock.patch.object(runtime.os, "environ", GuardedEnvironment({"GH_TOKEN": "secret"})), \
+             mock.patch.object(runtime.subprocess, "run") as process:
+            for arguments in (
+                ("api", "--method", "POST", "repos/example/roundwright/issues/46/comments"),
+                ("api", "graphql", "-f", "query=mutation($x:String!){noop(value:$x){clientMutationId}}"),
+            ):
+                with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                    runner.run(arguments)
+        process.assert_not_called()
+
+    def test_missing_owner_transport_denies_payload_before_reads_or_adapter_mutation(self) -> None:
+        """Payload never activates the legacy adapter when no owner endpoint exists."""
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "no-owner-transport-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        runner = Runner(GhCommandResult(0, json.dumps(gh_comments_page())))
+        adapter = GhGitHubAdapter(
+            runner, health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT),
+        )
+        result = GitHubMutationBroker(adapter).submit(
+            intent, allowed_context(),
+            payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),)),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(adapter.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

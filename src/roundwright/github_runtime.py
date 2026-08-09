@@ -183,6 +183,8 @@ class _SubprocessGhReadRunner:
     def run(self, arguments: tuple[str, ...]) -> GhCommandResult:
         if type(arguments) is not tuple or any(type(value) is not str or not value or "\x00" in value for value in arguments):
             raise GitHubRuntimeError("gh command arguments are invalid")
+        if not _is_fixed_read_command(arguments):
+            raise GitHubRuntimeError("gh read runner rejects non-read command")
         # No shell, only explicit credential/configuration variables, and no
         # stderr retention.  Provider output never reaches diagnostics.
         try:
@@ -201,6 +203,22 @@ class _SubprocessGhReadRunner:
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return GhCommandResult(127, "")
         return GhCommandResult(completed.returncode, completed.stdout)
+
+
+def _is_fixed_read_command(arguments: tuple[str, ...]) -> bool:
+    """Accept only the inert command shapes emitted by typed read builders.
+
+    The read runner is deliberately not a general ``gh`` process facility:
+    even direct imports cannot turn it into a mutation path by supplying a
+    POST/PUT command or a GraphQL mutation document.
+    """
+
+    if len(arguments) >= 4 and arguments[:3] == ("api", "--method", "GET"):
+        return all(value != "--method" for value in arguments[3:])
+    if len(arguments) >= 4 and arguments[:2] == ("api", "graphql"):
+        query = next((value.removeprefix("query=") for value in arguments if value.startswith("query=")), None)
+        return query is not None and query.lstrip().startswith("query(")
+    return False
 
 
 @dataclass(frozen=True)
@@ -1818,6 +1836,15 @@ class GitHubMutationBroker:
             plan = _broker_semantic_plan(intent)
         except (AttributeError, KeyError, TypeError, ValueError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
+        # A caller carrying outbound payload proves it is attempting the
+        # owner-host mutation route.  Do not even open a semantic read when
+        # that capability was not injected; reads must not become a fallback
+        # mutation transport or process probe.
+        if payload is not None and self.__executor is None:
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "owner mutation transport capability is unavailable",
+            ))
         prior = self._completed.get(intent.identity())
         if prior is not None:
             return BrokerMutationResult(receipt=prior)

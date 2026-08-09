@@ -21,7 +21,8 @@ from typing import Mapping, Protocol, TypeAlias
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
-_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,255}\Z")
+_REVIEWER = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[[A-Za-z0-9-]{1,39}\])?|[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9-]{0,99})\Z")
 _PUBLIC_TEXT = re.compile(r"[^\x00-\x1f\x7f]{1,512}\Z")
 _COMMENT_TEXT = re.compile(r"(?s)[^\x00\x7f]{1,65536}\Z")
 
@@ -254,6 +255,8 @@ class BranchSnapshot:
 @dataclass(frozen=True)
 class PullRequestSnapshot:
     repository: RepositoryRef
+    base_repository: RepositoryRef
+    head_repository: RepositoryRef
     pull_request_id: str
     number: int
     state: PullRequestState
@@ -265,8 +268,10 @@ class PullRequestSnapshot:
     merge_commit_sha: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.repository) is not RepositoryRef:
+        if any(type(value) is not RepositoryRef for value in (self.repository, self.base_repository, self.head_repository)):
             raise GitHubContractError("pull request repository is invalid")
+        if self.base_repository != self.repository:
+            raise GitHubContractError("pull request base repository is invalid")
         _validate_token(self.pull_request_id, "pull request id")
         _validate_number(self.number, "pull request number")
         if type(self.state) is not PullRequestState or type(self.draft) is not bool:
@@ -279,8 +284,10 @@ class PullRequestSnapshot:
         if self.state is PullRequestState.MERGED:
             if type(self.merge_commit_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.merge_commit_sha):
                 raise GitHubContractError("merge commit sha is invalid")
-        elif self.merge_commit_sha is not None:
-            raise GitHubContractError("unmerged pull request merge commit is invalid")
+        elif self.merge_commit_sha is not None and (
+            type(self.merge_commit_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.merge_commit_sha)
+        ):
+            raise GitHubContractError("pull request merge commit is invalid")
 
 
 @dataclass(frozen=True)
@@ -333,7 +340,7 @@ class RequestedReviewersSnapshot:
             raise GitHubContractError("requested reviewers repository is invalid")
         _validate_number(self.pull_request_number, "pull request number")
         _validate_sha(self.candidate_sha, "requested reviewers candidate")
-        if type(self.reviewers) is not tuple or any(type(login) is not str or not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login) for login in self.reviewers):
+        if type(self.reviewers) is not tuple or any(type(login) is not str or not _REVIEWER.fullmatch(login) for login in self.reviewers):
             raise GitHubContractError("requested reviewer logins are invalid")
         if tuple(sorted(self.reviewers)) != self.reviewers or len(set(self.reviewers)) != len(self.reviewers):
             raise GitHubContractError("requested reviewer logins are not canonical")
@@ -738,8 +745,8 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
             _exact_shape(response, {"repository", "ref", "sha"})
             return BranchSnapshot(_repository(response), _string(response, "ref"), _string(response, "sha"))
         if operation is GitHubReadOperation.PULL_REQUEST:
-            _exact_shape(response, {"repository", "id", "number", "state", "base_ref", "base_sha", "head_ref", "head_sha", "draft", "merge_commit_sha"})
-            return PullRequestSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), PullRequestState(_string(response, "state")), _string(response, "base_ref"), _string(response, "base_sha"), _string(response, "head_ref"), _string(response, "head_sha"), _boolean(response, "draft"), _optional_string(response, "merge_commit_sha"))
+            _exact_shape(response, {"repository", "base_repository", "head_repository", "id", "number", "state", "base_ref", "base_sha", "head_ref", "head_sha", "draft", "merge_commit_sha"})
+            return PullRequestSnapshot(_repository(response), _repository(response, "base_repository"), _repository(response, "head_repository"), _string(response, "id"), _integer(response, "number"), PullRequestState(_string(response, "state")), _string(response, "base_ref"), _string(response, "base_sha"), _string(response, "head_ref"), _string(response, "head_sha"), _boolean(response, "draft"), _optional_string(response, "merge_commit_sha"))
         if operation is GitHubReadOperation.REVIEWS:
             _exact_shape(response, {"repository", "pull_request_number", "head_sha", "reviews"})
             head_sha = _string(response, "head_sha")
@@ -925,8 +932,8 @@ def _optional_enum(mapping: Mapping[str, object], key: str, enum: type[StrEnum])
     return enum(value)
 
 
-def _repository(mapping: Mapping[str, object]) -> RepositoryRef:
-    value = mapping["repository"]
+def _repository(mapping: Mapping[str, object], key: str = "repository") -> RepositoryRef:
+    value = mapping[key]
     if type(value) is not dict:
         raise GitHubContractError("response repository is invalid")
     _exact_shape(value, {"owner", "name"})

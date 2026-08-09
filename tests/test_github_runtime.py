@@ -310,7 +310,9 @@ def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
 
 def pull_request_payload(*, number: int = 58, base_sha: str = BASE, head_sha: str = SHA, draft: bool = True, state: str = "OPEN", merge_commit_sha: str | None = None) -> dict[str, object]:
     return {
-        "repository": {"owner": "example", "name": "roundwright"}, "id": f"pr-{number}",
+        "repository": {"owner": "example", "name": "roundwright"},
+        "base_repository": {"owner": "example", "name": "roundwright"},
+        "head_repository": {"owner": "example", "name": "roundwright"}, "id": f"pr-{number}",
         "number": number, "state": state, "base_ref": "main", "base_sha": base_sha,
         "head_ref": "codex/issue-46", "head_sha": head_sha, "draft": draft,
         "merge_commit_sha": merge_commit_sha,
@@ -352,7 +354,7 @@ def gh_requested_reviewers_page(*reviewers: str, next_cursor: str | None = None,
             "name": "roundwright", "owner": {"login": "example"},
             "pullRequest": {"number": 46, "headRefOid": SHA, "reviewRequests": {
                 "totalCount": count,
-                "nodes": [{"requestedReviewer": {"login": reviewer}} for reviewer in reviewers],
+                "nodes": [{"requestedReviewer": {"__typename": "User", "login": reviewer}} for reviewer in reviewers],
                 "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
             }},
         }},
@@ -945,8 +947,8 @@ class GitHubRuntimeTests(unittest.TestCase):
         raw = {
             "repository_url": "https://api.github.example/repos/example/roundwright", "id": 46,
             "number": 46, "state": "closed", "merged": True, "draft": False, "merge_commit_sha": "d" * 40,
-            "base": {"ref": "main", "sha": BASE, "repo": {"owner": {"login": "example"}, "name": "roundwright"}},
-            "head": {"ref": "codex/issue-46", "sha": SHA},
+            "base": {"ref": "main", "sha": BASE, "repo": {"full_name": "example/roundwright", "owner": {"login": "example"}, "name": "roundwright"}},
+            "head": {"ref": "codex/issue-46", "sha": SHA, "repo": {"full_name": "example/roundwright"}},
         }
         adapter = GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(raw))), health(GitHubReadOperation.PULL_REQUEST))
         result = adapter.read(request)
@@ -956,6 +958,40 @@ class GitHubRuntimeTests(unittest.TestCase):
         missing["merge_commit_sha"] = None
         denied = GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(missing))), health(GitHubReadOperation.PULL_REQUEST)).read(request)
         self.assertFalse(denied.ok)
+
+    def test_native_pull_request_projection_preserves_open_merge_sha_and_repository_evidence(self) -> None:
+        request = GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=46, expected_sha=SHA)
+        raw = {
+            "id": 46, "number": 46, "state": "open", "merged": False, "draft": True,
+            "merge_commit_sha": "d" * 40,
+            "base": {"ref": "main", "sha": BASE, "repo": {"full_name": "example/roundwright"}},
+            "head": {"ref": "codex/issue-46", "sha": SHA, "repo": {"full_name": "fork/roundwright"}},
+        }
+        result = GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(raw))), health(GitHubReadOperation.PULL_REQUEST)).read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.merge_commit_sha, "d" * 40)  # type: ignore[union-attr]
+        self.assertEqual(result.snapshot.base_repository, REPOSITORY)  # type: ignore[union-attr]
+        self.assertEqual(result.snapshot.head_repository, RepositoryRef("fork", "roundwright"))  # type: ignore[union-attr]
+
+        malformed = dict(raw)
+        malformed["head"] = {"ref": "codex/issue-46", "sha": SHA, "repo": {"full_name": "not-a-repository"}}
+        self.assertFalse(GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(malformed))), health(GitHubReadOperation.PULL_REQUEST)).read(request).ok)
+
+    def test_native_requested_reviewer_variants_preserve_users_bots_and_teams(self) -> None:
+        request = GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46, expected_sha=SHA)
+        raw = gh_requested_reviewers_page("octocat", total=3)
+        raw["data"]["repository"]["pullRequest"]["reviewRequests"]["nodes"] = [  # type: ignore[index]
+            {"requestedReviewer": {"__typename": "User", "login": "octocat"}},
+            {"requestedReviewer": {"__typename": "Bot", "login": "dependabot[bot]"}},
+            {"requestedReviewer": {"__typename": "Team", "slug": "core-team", "organization": {"login": "example"}}},
+        ]
+        result = GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(raw))), health(GitHubReadOperation.REQUESTED_REVIEWERS)).read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.reviewers, ("dependabot[bot]", "example/core-team", "octocat"))  # type: ignore[union-attr]
+
+        unsupported = json.loads(json.dumps(raw))
+        unsupported["data"]["repository"]["pullRequest"]["reviewRequests"]["nodes"][0]["requestedReviewer"] = {"__typename": "EnterpriseUserAccount", "login": "octocat"}  # type: ignore[index]
+        self.assertFalse(GhGitHubAdapter(Runner(GhCommandResult(0, json.dumps(unsupported))), health(GitHubReadOperation.REQUESTED_REVIEWERS)).read(request).ok)
 
     def test_broker_rejects_caller_semantic_overrides_and_incomplete_operations_before_adapter_calls(self) -> None:
         comment = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "override-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
@@ -1123,8 +1159,8 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         pull_raw = {
             "id": 58, "number": 46, "state": "open", "merged": False, "draft": True,
-            "base": {"ref": "main", "sha": BASE, "repo": {"name": "roundwright", "owner": {"login": "example"}}},
-            "head": {"ref": "codex/issue-46", "sha": SHA}, "merge_commit_sha": None,
+            "base": {"ref": "main", "sha": BASE, "repo": {"full_name": "example/roundwright", "name": "roundwright", "owner": {"login": "example"}}},
+            "head": {"ref": "codex/issue-46", "sha": SHA, "repo": {"full_name": "example/roundwright"}}, "merge_commit_sha": "d" * 40,
         }
         mergeability_raw = {
             "number": 46, "mergeable_state": "clean",
@@ -1399,6 +1435,22 @@ class GitHubRuntimeTests(unittest.TestCase):
         review_result = review_adapter.read(reviews_request())
         self.assertTrue(review_result.ok)
         self.assertEqual(review_result.snapshot.reviews[0].reviewer_id, "bot:build-bot")  # type: ignore[union-attr]
+
+        for actor_type, login, expected in (
+            ("Organization", "octo-org", "organization:octo-org"),
+            ("Mannequin", "former-user", "mannequin:former-user"),
+            ("Bot", "dependabot[bot]", "bot:dependabot[bot]"),
+        ):
+            page = gh_comments_page()
+            page["data"]["repository"]["issue"]["comments"]["nodes"][0]["author"] = {  # type: ignore[index]
+                "__typename": actor_type, "login": login,
+            }
+            with self.subTest(actor_type=actor_type):
+                result = GhGitHubAdapter(
+                    Runner(GhCommandResult(0, json.dumps(page))), health(GitHubReadOperation.COMMENTS),
+                ).read(comments_request())
+                self.assertTrue(result.ok)
+                self.assertEqual(result.snapshot.comments[0].author_id, expected)  # type: ignore[union-attr]
 
     def test_native_collection_actor_projection_allows_empty_terminal_pages(self) -> None:
         import json

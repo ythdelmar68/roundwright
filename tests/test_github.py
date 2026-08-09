@@ -60,7 +60,7 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
             GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
             GitHubReadOperation.BRANCH: {"repository": repository, "ref": "main", "sha": SHA},
-            GitHubReadOperation.PULL_REQUEST: {"repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True, "merge_commit_sha": None},
+            GitHubReadOperation.PULL_REQUEST: {"repository": repository, "base_repository": repository, "head_repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True, "merge_commit_sha": None},
             GitHubReadOperation.REVIEWS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "reviews": [{"id": "review-1", "reviewer_id": "reviewer-1", "state": "APPROVED", "commit_sha": SHA}]},
             GitHubReadOperation.REQUESTED_REVIEWERS: {"repository": repository, "pull_request_number": 40, "candidate_sha": SHA, "reviewers": ["octocat"], "reviewer_set_digest": "sha256:" + hashlib.sha256(json.dumps(("reviewers", ("octocat",)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest(), "complete": True, "next_cursor": None, "raw_evidence_identity": DIGEST},
             GitHubReadOperation.CHECKS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "check_evidence_identity": DIGEST, "candidate_evidence_identity": READBACK_DIGEST, "checks": [{"id": "check-1", "name": "tests", "state": "COMPLETED", "conclusion": "SUCCESS", "head_sha": SHA}]},
@@ -118,8 +118,25 @@ class GitHubAdapterTests(unittest.TestCase):
                 normalize_github_response(request, malformed)
         open_with_merge = self.payload(GitHubReadOperation.PULL_REQUEST)
         open_with_merge["merge_commit_sha"] = "d" * 40
-        with self.assertRaises(GitHubContractError):
-            normalize_github_response(request, open_with_merge)
+        self.assertEqual(normalize_github_response(request, open_with_merge).merge_commit_sha, "d" * 40)
+        for state, draft in (("OPEN", True), ("OPEN", False), ("CLOSED", False)):
+            ordinary = self.payload(GitHubReadOperation.PULL_REQUEST)
+            ordinary.update({"state": state, "draft": draft, "merge_commit_sha": "d" * 40})
+            with self.subTest(state=state, draft=draft):
+                self.assertEqual(normalize_github_response(request, ordinary).merge_commit_sha, "d" * 40)
+        drifted = dict(open_with_merge)
+        drifted["head_repository"] = {"owner": "other", "name": "repository"}
+        self.assertEqual(normalize_github_response(request, drifted).head_repository.slug, "other/repository")
+
+    def test_requested_reviewer_snapshot_accepts_provider_user_and_team_identities(self) -> None:
+        request = self.request(GitHubReadOperation.REQUESTED_REVIEWERS)
+        payload = self.payload(GitHubReadOperation.REQUESTED_REVIEWERS)
+        reviewers = ["dependabot[bot]", "example/core-team"]
+        payload["reviewers"] = reviewers
+        payload["reviewer_set_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(("reviewers", tuple(reviewers)), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+        ).hexdigest()
+        self.assertEqual(normalize_github_response(request, payload).reviewers, tuple(reviewers))
 
     def test_collection_response_identity_is_never_synthesized_from_the_request(self) -> None:
         request = self.request(GitHubReadOperation.COMMENTS)

@@ -2301,13 +2301,13 @@ def _matches(readback: SemanticReadback, intent: GitHubMutationIntent, snapshot:
     if condition is SemanticPostcondition.BRANCH_ABSENT:
         return snapshot is None
     if condition is SemanticPostcondition.PULL_REQUEST_DRAFT:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and snapshot.draft
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.base_repository == intent.repository and snapshot.head_repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and snapshot.draft
     if condition is SemanticPostcondition.PULL_REQUEST_DRAFT_AT_CANDIDATE:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and snapshot.draft and snapshot.head_sha == dict(intent.payload).get("head_sha") and snapshot.base_sha == dict(intent.payload).get("base_sha") and snapshot.head_ref == dict(intent.payload).get("head_ref") and snapshot.base_ref == dict(intent.payload).get("base_ref")
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.base_repository == intent.repository and snapshot.head_repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and snapshot.draft and snapshot.head_sha == dict(intent.payload).get("head_sha") and snapshot.base_sha == dict(intent.payload).get("base_sha") and snapshot.head_ref == dict(intent.payload).get("head_ref") and snapshot.base_ref == dict(intent.payload).get("base_ref")
     if condition is SemanticPostcondition.PULL_REQUEST_READY:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and not snapshot.draft and snapshot.head_sha == intent.expected_sha
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.base_repository == intent.repository and snapshot.head_repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.OPEN and not snapshot.draft and snapshot.head_sha == intent.expected_sha
     if condition is SemanticPostcondition.PULL_REQUEST_MERGED:
-        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha and type(snapshot.merge_commit_sha) is str
+        return isinstance(snapshot, PullRequestSnapshot) and snapshot.repository == intent.repository and snapshot.base_repository == intent.repository and snapshot.head_repository == intent.repository and snapshot.number == intent.target_number and snapshot.state is PullRequestState.MERGED and snapshot.head_sha == intent.expected_sha and type(snapshot.merge_commit_sha) is str
     if condition is SemanticPostcondition.REVIEW_AT_CANDIDATE:
         return isinstance(snapshot, ReviewsSnapshot) and snapshot.repository == intent.repository and snapshot.pull_request_number == intent.target_number and snapshot.head_sha == intent.expected_sha and bool(snapshot.reviews)
     if condition is SemanticPostcondition.REVIEWERS_EXACT_AT_CANDIDATE:
@@ -2339,6 +2339,8 @@ def _readback_matches(
         payload = dict(intent.payload)
         return (
             result.snapshot.repository == intent.repository
+            and result.snapshot.base_repository == intent.repository
+            and result.snapshot.head_repository == intent.repository
             and result.snapshot.number == locator.pull_request_number
             and result.snapshot.state is PullRequestState.OPEN
             and result.snapshot.draft is locator.draft
@@ -2384,7 +2386,8 @@ def _affected_identity(
             "affected", intent.operation.value, result.snapshot.repository.slug,
             result.snapshot.pull_request_id, result.snapshot.number, result.snapshot.state.value,
             result.snapshot.base_ref, result.snapshot.base_sha, result.snapshot.head_ref,
-            result.snapshot.head_sha, result.snapshot.draft,
+            result.snapshot.head_sha, result.snapshot.base_repository.slug,
+            result.snapshot.head_repository.slug, result.snapshot.draft,
         ))
     if intent.operation is GitHubMutationOperation.COMMENT and type(locator) is CreatedResourceLocator and type(result.snapshot) is CommentsSnapshot:
         for comment in result.snapshot.comments:
@@ -2402,7 +2405,8 @@ def _affected_identity(
             "affected", intent.operation.value, result.snapshot.repository.slug,
             result.snapshot.pull_request_id, result.snapshot.number, result.snapshot.state.value,
             result.snapshot.base_ref, result.snapshot.base_sha, result.snapshot.head_ref,
-            result.snapshot.head_sha, result.snapshot.draft, result.snapshot.merge_commit_sha,
+            result.snapshot.head_sha, result.snapshot.base_repository.slug,
+            result.snapshot.head_repository.slug, result.snapshot.draft, result.snapshot.merge_commit_sha,
         ))
     if intent.operation is GitHubMutationOperation.REQUEST_REVIEW and type(result.snapshot) is RequestedReviewersSnapshot:
         return _sha256((
@@ -2713,10 +2717,18 @@ def _project_requested_reviewers_page(request: GitHubReadRequest, raw: object) -
     reviewers: list[str] = []
     for node in nodes:
         reviewer = _raw_mapping(_raw_mapping(node).get("requestedReviewer"))
-        if type(reviewer.get("login")) is str:
-            reviewers.append(_raw_text(reviewer, "login"))
-        elif type(reviewer.get("slug")) is str:
-            reviewers.append(f"{_raw_text(_raw_mapping(reviewer.get('organization')), 'login')}/{_raw_text(reviewer, 'slug')}")
+        reviewer_type = _raw_text(reviewer, "__typename")
+        if reviewer_type in {"User", "Bot", "Organization", "Mannequin"}:
+            login = _raw_text(reviewer, "login")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[[A-Za-z0-9-]{1,39}\])?", login):
+                raise GitHubRuntimeError("gh requested-reviewer login is malformed")
+            reviewers.append(login)
+        elif reviewer_type == "Team":
+            organization = _raw_text(_raw_mapping(reviewer.get("organization")), "login")
+            slug = _raw_text(reviewer, "slug")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", organization) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,99}", slug):
+                raise GitHubRuntimeError("gh requested-reviewer team is malformed")
+            reviewers.append(f"{organization}/{slug}")
         else:
             raise GitHubRuntimeError("gh requested-reviewer variant is malformed")
     if len(set(reviewers)) != len(reviewers):
@@ -2788,9 +2800,12 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
         return projected
     if operation is GitHubReadOperation.PULL_REQUEST:
         item = _raw_mapping(raw)
-        _raw_repository_matches(item, request)
         _raw_number_matches(item, request)
         base, head = _raw_mapping(item.get("base")), _raw_mapping(item.get("head"))
+        base_repository = _repository_from_full_name(_raw_text(_raw_mapping(base.get("repo")), "full_name"))
+        head_repository = _repository_from_full_name(_raw_text(_raw_mapping(head.get("repo")), "full_name"))
+        if base_repository != request.repository:
+            raise GitHubRuntimeError("gh pull request base repository does not match request")
         state = _raw_text(item, "state").upper()
         merged = item.get("merged")
         if merged is not None:
@@ -2798,7 +2813,7 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
                 raise GitHubRuntimeError("gh pull request merged state is malformed")
             if merged:
                 state = "MERGED"
-        return {"repository": repository, "id": _raw_id(item, "id"), "number": request.number, "state": state, "base_ref": _raw_text(base, "ref"), "base_sha": _raw_text(base, "sha"), "head_ref": _raw_text(head, "ref"), "head_sha": _raw_text(head, "sha"), "draft": _raw_bool(item, "draft"), "merge_commit_sha": _raw_optional_text(item, "merge_commit_sha")}
+        return {"repository": {"owner": base_repository.owner, "name": base_repository.name}, "base_repository": {"owner": base_repository.owner, "name": base_repository.name}, "head_repository": {"owner": head_repository.owner, "name": head_repository.name}, "id": _raw_id(item, "id"), "number": _raw_integer(item, "number"), "state": state, "base_ref": _raw_text(base, "ref"), "base_sha": _raw_text(base, "sha"), "head_ref": _raw_text(head, "ref"), "head_sha": _raw_text(head, "sha"), "draft": _raw_bool(item, "draft"), "merge_commit_sha": _raw_optional_text(item, "merge_commit_sha")}
     if operation is GitHubReadOperation.REVIEWS:
         if type(raw) is dict and "data" in raw:
             projected, next_cursor, _ = _project_gh_collection_page(request, raw)
@@ -2848,7 +2863,7 @@ def _raw_actor_identity(value: object) -> str:
     if actor_type not in {"User", "Bot", "Organization", "Mannequin"}:
         raise GitHubRuntimeError("gh collection actor type is unsupported")
     login = _raw_text(actor, "login")
-    if not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[[A-Za-z0-9-]{1,39}\])?", login):
         raise GitHubRuntimeError("gh collection actor login is malformed")
     return f"{actor_type.lower()}:{login.lower()}"
 
@@ -3088,7 +3103,7 @@ def _requested_reviewers_collection_command(request: GitHubReadRequest, cursor: 
         raise GitHubRuntimeError("requested reviewer collection request is invalid")
     if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
         raise GitHubRuntimeError("requested reviewer collection cursor is invalid")
-    query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} pullRequest(number:$number){number headRefOid reviewRequests(first:100,after:$cursor){totalCount nodes{requestedReviewer{... on User{login} ... on Team{slug organization{login}}}} pageInfo{hasNextPage endCursor}}}}}"
+    query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} pullRequest(number:$number){number headRefOid reviewRequests(first:100,after:$cursor){totalCount nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login} ... on Team{slug organization{login}}}} pageInfo{hasNextPage endCursor}}}}}"
     command: tuple[str, ...] = (
         "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
         "-F", f"name={request.repository.name}", "-F", f"number={request.number}",

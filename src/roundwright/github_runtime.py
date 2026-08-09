@@ -795,6 +795,9 @@ class MutationJournalEntry:
     semantic_plan_identity: str
     command: BrokerMutationCommand
     semantic_readback_identity: str
+    evaluated_at: str
+    fresh_until: str
+    time_identity: str
     lifecycle: JournalLifecycle
     receipt: SemanticMutationReceipt | None = None
 
@@ -808,6 +811,16 @@ class MutationJournalEntry:
             (self.semantic_plan_identity, "journal semantic plan"), (self.semantic_readback_identity, "journal semantic read-back"),
         ):
             _digest(value, name)
+        for value, name in ((self.evaluated_at, "journal evaluated time"), (self.fresh_until, "journal fresh until")):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError) as error:
+                raise GitHubRuntimeError(f"{name} is invalid") from error
+            if parsed.tzinfo is not timezone.utc:
+                raise GitHubRuntimeError(f"{name} is invalid")
+        _digest(self.time_identity, "journal time identity")
+        if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
+            raise GitHubRuntimeError("journal time identity drifted")
         if type(self.candidate_sha) is not str or len(self.candidate_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in self.candidate_sha):
             raise GitHubRuntimeError("mutation journal candidate is invalid")
         if type(self.command) is not BrokerMutationCommand or type(self.lifecycle) is not JournalLifecycle:
@@ -842,7 +855,9 @@ class MutationJournalEntry:
             intent.repository.slug, intent.operation, intent.idempotency_key,
             plan.target_identity, plan.idempotency_identity, intent.identity(), bundle.identity,
             context.candidate_sha, context.configuration_digest, context.gate_identity,
-            plan.identity, plan.command, plan.readback.identity, JournalLifecycle.PENDING,
+            plan.identity, plan.command, plan.readback.identity, context.evaluated_at.isoformat(),
+            (context.evaluated_at + timedelta(minutes=5)).isoformat(),
+            _sha256((context.evaluated_at.isoformat(), (context.evaluated_at + timedelta(minutes=5)).isoformat())), JournalLifecycle.PENDING,
         )
 
     @property
@@ -864,6 +879,7 @@ class MutationJournalEntry:
             "candidate_sha": self.candidate_sha, "configuration_digest": self.configuration_digest,
             "gate_identity": self.gate_identity, "semantic_plan_identity": self.semantic_plan_identity,
             "command": self.command.value, "semantic_readback_identity": self.semantic_readback_identity,
+            "evaluated_at": self.evaluated_at, "fresh_until": self.fresh_until, "time_identity": self.time_identity,
             "lifecycle": self.lifecycle.value,
             "receipt": None if self.receipt is None else self.receipt._payload(),
         }
@@ -874,6 +890,7 @@ class MutationJournalEntry:
             "repository", "operation", "idempotency_key", "target_identity", "idempotency_identity",
             "intent_identity", "authorization_bundle_identity", "candidate_sha", "configuration_digest",
             "gate_identity", "semantic_plan_identity", "command", "semantic_readback_identity",
+            "evaluated_at", "fresh_until", "time_identity",
             "lifecycle", "receipt",
         }
         if type(value) is not dict or set(value) != required:
@@ -897,7 +914,7 @@ class MutationJournalEntry:
                 value["target_identity"], value["idempotency_identity"], value["intent_identity"],
                 value["authorization_bundle_identity"], value["candidate_sha"], value["configuration_digest"],
                 value["gate_identity"], value["semantic_plan_identity"], BrokerMutationCommand(value["command"]),
-                value["semantic_readback_identity"], JournalLifecycle(value["lifecycle"]), receipt,
+                value["semantic_readback_identity"], value["evaluated_at"], value["fresh_until"], value["time_identity"], JournalLifecycle(value["lifecycle"]), receipt,
             )
         except (TypeError, ValueError) as error:
             raise GitHubRuntimeError("mutation journal entry is malformed") from error

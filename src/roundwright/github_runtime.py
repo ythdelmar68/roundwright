@@ -363,6 +363,8 @@ class GhGitHubAdapter:
             return self._read_checks_with_candidate_evidence(request)
         if request.operation is GitHubReadOperation.WORKFLOW_RUNS:
             return self._read_workflows_with_candidate_evidence(request)
+        if request.operation in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS}:
+            return self._read_complete_collection(request)
         outcome = self.__runner.run(_read_command(request))
         if outcome.exit_code != 0:
             try:
@@ -582,6 +584,51 @@ class GhGitHubAdapter:
                 "gh candidate pull-request response is malformed",
             ))
 
+    def _read_complete_collection(self, request: GitHubReadRequest) -> GitHubReadResult:
+        """Expose only a terminal, complete native collection to direct callers."""
+
+        cursor: str | None = None
+        pages: list[CollectionPage] = []
+        while True:
+            if len(pages) >= 32:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    "collection page limit is exceeded",
+                ))
+            page = self.read_collection_page(request, cursor)
+            if type(page) is not CollectionPage:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    "collection pagination metadata is unavailable",
+                ))
+            if page.request != request or page.cursor != cursor:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    "collection page request drifted",
+                ))
+            if pages and page.total_count != pages[0].total_count:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    "collection total is inconsistent",
+                ))
+            if page.total_count > 3200:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    "collection item limit is exceeded",
+                ))
+            if page.next_cursor is not None and (
+                any(prior.cursor == page.next_cursor for prior in pages)
+                or page.next_cursor == cursor
+            ):
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    "collection cursor is repeated or cyclic",
+                ))
+            pages.append(page)
+            if page.next_cursor is None:
+                return _normalize_complete_collection_pages(request, pages)
+            cursor = page.next_cursor
+
     def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
         """Read one native GraphQL connection page, or fail closed.
 
@@ -592,20 +639,34 @@ class GhGitHubAdapter:
         target, and candidate identities have been checked.
         """
 
-        if type(request) is not GitHubReadRequest or request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
+        if type(request) is not GitHubReadRequest or request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS}:
             return None
         if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
             return None
         self.calls.append(("collection-read", request.operation.value))
         if _health_failure(request.operation, self._health) is not None:
             return None
-        command = _collection_read_command(request, cursor)
+        command = (
+            _requested_reviewers_collection_command(request, cursor)
+            if request.operation is GitHubReadOperation.REQUESTED_REVIEWERS
+            else _collection_read_command(request, cursor)
+        )
         outcome = self.__runner.run(command)
         if outcome.exit_code != 0:
             return None
         try:
             raw = json.loads(outcome.stdout)
-            projected, next_cursor, total_count = _project_gh_collection_page(request, raw)
+            if request.operation is GitHubReadOperation.REQUESTED_REVIEWERS:
+                projected = _project_requested_reviewers_page(request, raw)
+                next_cursor = projected["next_cursor"]
+                if next_cursor is not None and type(next_cursor) is not str:
+                    raise GitHubRuntimeError("requested reviewer continuation is malformed")
+                root = _raw_mapping(raw)
+                graph_repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+                pull_request = _raw_mapping(graph_repository.get("pullRequest"))
+                total_count = _raw_integer(_raw_mapping(pull_request.get("reviewRequests")), "totalCount")
+            else:
+                projected, next_cursor, total_count = _project_gh_collection_page(request, raw)
             snapshot = normalize_github_response(request, projected)
             return CollectionPage(request, cursor, next_cursor, total_count, snapshot)
         except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
@@ -1453,6 +1514,50 @@ def _collection_snapshot_payload(snapshot: CommentsSnapshot | ReviewsSnapshot | 
     raise GitHubRuntimeError("collection snapshot is invalid")
 
 
+def _normalize_complete_collection_pages(
+    request: GitHubReadRequest, pages: list[CollectionPage],
+) -> GitHubReadResult:
+    if not pages:
+        return GitHubReadResult(request, failure=GitHubFailure(
+            GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection has no pages",
+        ))
+    first = pages[0]
+    items: dict[str, object] = {}
+    ordered: list[object] = []
+    last_unique_identifier: str | None = None
+    for page in pages:
+        if type(page.snapshot) is RequestedReviewersSnapshot:
+            if page.snapshot.repository != first.snapshot.repository or page.snapshot.pull_request_number != first.snapshot.pull_request_number or page.snapshot.candidate_sha != first.snapshot.candidate_sha:
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "requested reviewer page identity drifted"))
+            collection = page.snapshot.reviewers
+            identifiers = list(collection)
+        else:
+            collection = page.snapshot.comments if type(page.snapshot) is CommentsSnapshot else page.snapshot.reviews
+            identifiers = [item.comment_id if type(page.snapshot) is CommentsSnapshot else item.review_id for item in collection]
+        if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable"))
+        for identifier, item in zip(identifiers, collection):
+            prior = items.get(identifier)
+            if prior is not None:
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection identifier is duplicated"))
+            if prior is None:
+                if last_unique_identifier is not None and identifier <= last_unique_identifier:
+                    return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable"))
+                items[identifier] = item
+                ordered.append(item)
+                last_unique_identifier = identifier
+    if len(ordered) != first.total_count:
+        return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection is incomplete"))
+    if type(first.snapshot) is CommentsSnapshot:
+        normalized: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, tuple(ordered))  # type: ignore[arg-type]
+    elif type(first.snapshot) is RequestedReviewersSnapshot:
+        reviewers = tuple(ordered)
+        normalized = RequestedReviewersSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.candidate_sha, reviewers, _sha256(("reviewers", reviewers)), True, None, _sha256(tuple(page.identity for page in pages)))  # type: ignore[arg-type]
+    else:
+        normalized = ReviewsSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.head_sha, tuple(ordered))  # type: ignore[arg-type]
+    return GitHubReadResult(request, snapshot=normalized)
+
+
 def _complete_broker_read(
     adapter: GitHubAdapter, request: GitHubReadRequest, context: MutationBrokerContext,
     bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
@@ -1479,6 +1584,8 @@ def _complete_broker_read(
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection page request drifted")), ""
         if pages and page.total_count != pages[0].total_count:
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection total is inconsistent")), ""
+        if page.total_count > 3200:
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection item limit is exceeded")), ""
         if page.next_cursor is not None and (
             any(prior.cursor == page.next_cursor for prior in pages)
             or page.next_cursor == cursor
@@ -1488,45 +1595,11 @@ def _complete_broker_read(
         if page.next_cursor is None:
             break
         cursor = page.next_cursor
-    first = pages[0]
-    items: dict[str, object] = {}
-    ordered: list[object] = []
-    last_unique_identifier: str | None = None
-    for page in pages:
-        if type(page.snapshot) is RequestedReviewersSnapshot:
-            if page.snapshot.repository != first.snapshot.repository or page.snapshot.pull_request_number != first.snapshot.pull_request_number or page.snapshot.candidate_sha != first.snapshot.candidate_sha:
-                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "requested reviewer page identity drifted")), ""
-            collection = page.snapshot.reviewers
-            identifiers = list(collection)
-        else:
-            collection = page.snapshot.comments if type(page.snapshot) is CommentsSnapshot else page.snapshot.reviews
-            identifiers = [item.comment_id if type(page.snapshot) is CommentsSnapshot else item.review_id for item in collection]
-        if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
-            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable")), ""
-        for identifier, item in zip(identifiers, collection):
-            prior = items.get(identifier)
-            if prior is not None and type(page.snapshot) is RequestedReviewersSnapshot:
-                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "requested reviewer is duplicated across pages")), ""
-            if prior is not None and prior != item:
-                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection duplicate conflicts")), ""
-            if prior is None:
-                if last_unique_identifier is not None and identifier <= last_unique_identifier:
-                    return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable")), ""
-                items[identifier] = item
-                ordered.append(item)
-                last_unique_identifier = identifier
-    if len(ordered) != first.total_count:
-        return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection is incomplete")), ""
-    if type(first.snapshot) is CommentsSnapshot:
-        normalized: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, tuple(ordered))  # type: ignore[arg-type]
-    elif type(first.snapshot) is RequestedReviewersSnapshot:
-        reviewers = tuple(ordered)
-        normalized = RequestedReviewersSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.candidate_sha, reviewers, _sha256(("reviewers", reviewers)), True, None, _sha256(tuple(page.identity for page in pages)))  # type: ignore[arg-type]
-    else:
-        normalized = ReviewsSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.head_sha, tuple(ordered))  # type: ignore[arg-type]
-    result = GitHubReadResult(request, snapshot=normalized)
+    result = _normalize_complete_collection_pages(request, pages)
+    if not result.ok or result.snapshot is None:
+        return result, ""
     receipt = CollectionCompletenessReceipt(
-        request.identity(), tuple(page.identity for page in pages), _sha256(_collection_snapshot_payload(normalized)),
+        request.identity(), tuple(page.identity for page in pages), _sha256(_collection_snapshot_payload(result.snapshot)),
         context.candidate_sha, context.configuration_digest, context.gate_identity, bundle.identity,
         plan.identity, journal_entry.key if journal_entry is not None else _sha256(("no-journal", plan.intent_identity)),
     )
@@ -2392,6 +2465,37 @@ def _compose_workflow_runs(
     }
 
 
+def _project_requested_reviewers_page(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
+    repository = {"owner": request.repository.owner, "name": request.repository.name}
+    root = _raw_mapping(raw)
+    graph_repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    pull_request = _raw_mapping(graph_repository.get("pullRequest"))
+    if _raw_text(_raw_mapping(graph_repository.get("owner")), "login") != request.repository.owner or _raw_text(graph_repository, "name") != request.repository.name or _raw_integer(pull_request, "number") != request.number or _raw_text(pull_request, "headRefOid") != request.expected_sha:
+        raise GitHubRuntimeError("gh requested-reviewer identity does not match request")
+    connection = _raw_mapping(pull_request.get("reviewRequests"))
+    page_info = _raw_mapping(connection.get("pageInfo"))
+    has_next = _raw_bool(page_info, "hasNextPage")
+    cursor = page_info.get("endCursor")
+    if (has_next and (type(cursor) is not str or not _CURSOR.fullmatch(cursor))) or (not has_next and cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor))):
+        raise GitHubRuntimeError("gh requested-reviewer pagination is malformed")
+    nodes = connection.get("nodes")
+    if type(nodes) is not list:
+        raise GitHubRuntimeError("gh requested-reviewer nodes are malformed")
+    reviewers: list[str] = []
+    for node in nodes:
+        reviewer = _raw_mapping(_raw_mapping(node).get("requestedReviewer"))
+        if type(reviewer.get("login")) is str:
+            reviewers.append(_raw_text(reviewer, "login"))
+        elif type(reviewer.get("slug")) is str:
+            reviewers.append(f"{_raw_text(_raw_mapping(reviewer.get('organization')), 'login')}/{_raw_text(reviewer, 'slug')}")
+        else:
+            raise GitHubRuntimeError("gh requested-reviewer variant is malformed")
+    if len(set(reviewers)) != len(reviewers):
+        raise GitHubRuntimeError("gh requested-reviewer entries are duplicated")
+    reviewers.sort()
+    return {"repository": repository, "pull_request_number": request.number, "candidate_sha": request.expected_sha, "reviewers": reviewers, "reviewer_set_digest": _sha256(("reviewers", tuple(reviewers))), "complete": not has_next, "next_cursor": cursor if has_next else None, "raw_evidence_identity": _sha256(raw)}
+
+
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
     """Project one REST response into the exact core schema.
 
@@ -2404,33 +2508,7 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
     repository = {"owner": request.repository.owner, "name": request.repository.name}
     operation = request.operation
     if operation is GitHubReadOperation.REQUESTED_REVIEWERS:
-        root = _raw_mapping(raw)
-        graph_repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
-        pull_request = _raw_mapping(graph_repository.get("pullRequest"))
-        if _raw_text(_raw_mapping(graph_repository.get("owner")), "login") != request.repository.owner or _raw_text(graph_repository, "name") != request.repository.name or _raw_integer(pull_request, "number") != request.number or _raw_text(pull_request, "headRefOid") != request.expected_sha:
-            raise GitHubRuntimeError("gh requested-reviewer identity does not match request")
-        connection = _raw_mapping(pull_request.get("reviewRequests"))
-        page_info = _raw_mapping(connection.get("pageInfo"))
-        has_next = _raw_bool(page_info, "hasNextPage")
-        cursor = page_info.get("endCursor")
-        if (has_next and (type(cursor) is not str or not _CURSOR.fullmatch(cursor))) or (not has_next and cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor))):
-            raise GitHubRuntimeError("gh requested-reviewer pagination is malformed")
-        nodes = connection.get("nodes")
-        if type(nodes) is not list:
-            raise GitHubRuntimeError("gh requested-reviewer nodes are malformed")
-        reviewers: list[str] = []
-        for node in nodes:
-            reviewer = _raw_mapping(_raw_mapping(node).get("requestedReviewer"))
-            if type(reviewer.get("login")) is str:
-                reviewers.append(_raw_text(reviewer, "login"))
-            elif type(reviewer.get("slug")) is str:
-                reviewers.append(f"{_raw_text(_raw_mapping(reviewer.get('organization')), 'login')}/{_raw_text(reviewer, 'slug')}")
-            else:
-                raise GitHubRuntimeError("gh requested-reviewer variant is malformed")
-        if len(set(reviewers)) != len(reviewers):
-            raise GitHubRuntimeError("gh requested-reviewer entries are duplicated")
-        reviewers.sort()
-        return {"repository": repository, "pull_request_number": request.number, "candidate_sha": request.expected_sha, "reviewers": reviewers, "reviewer_set_digest": _sha256(("reviewers", tuple(reviewers))), "complete": not has_next, "next_cursor": cursor if has_next else None, "raw_evidence_identity": _sha256(raw)}
+        return _project_requested_reviewers_page(request, raw)
     if operation is GitHubReadOperation.CLOSING_REFERENCES:
         root = _raw_mapping(raw)
         data = _raw_mapping(root.get("data"))
@@ -2717,8 +2795,7 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     elif request.operation is GitHubReadOperation.REVIEWS:
         return _collection_read_command(request, None)
     elif request.operation is GitHubReadOperation.REQUESTED_REVIEWERS:
-        query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} pullRequest(number:$number){number headRefOid reviewRequests(first:100,after:$cursor){nodes{requestedReviewer{... on User{login} ... on Team{slug organization{login}}}} pageInfo{hasNextPage endCursor}}}}}"
-        return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}", "-F", f"number={request.number}")
+        return _requested_reviewers_collection_command(request, None)
     elif request.operation is GitHubReadOperation.CHECKS:
         path = f"{base}/commits/{request.expected_sha}/check-runs"
     elif request.operation is GitHubReadOperation.WORKFLOW_RUNS:
@@ -2767,6 +2844,19 @@ def _issue_relationship_command(request: GitHubReadRequest, cursor: str | None) 
     if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
         raise GitHubRuntimeError("issue relationship cursor is invalid")
     query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} issue(number:$number){number subIssues(first:100,after:$cursor){totalCount nodes{number} pageInfo{hasNextPage endCursor}}}}}"
+    command: tuple[str, ...] = (
+        "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+        "-F", f"name={request.repository.name}", "-F", f"number={request.number}",
+    )
+    return command if cursor is None else command + ("-F", f"cursor={cursor}")
+
+
+def _requested_reviewers_collection_command(request: GitHubReadRequest, cursor: str | None) -> tuple[str, ...]:
+    if type(request) is not GitHubReadRequest or request.operation is not GitHubReadOperation.REQUESTED_REVIEWERS or request.number is None or request.expected_sha is None:
+        raise GitHubRuntimeError("requested reviewer collection request is invalid")
+    if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
+        raise GitHubRuntimeError("requested reviewer collection cursor is invalid")
+    query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){name owner{login} pullRequest(number:$number){number headRefOid reviewRequests(first:100,after:$cursor){totalCount nodes{requestedReviewer{... on User{login} ... on Team{slug organization{login}}}} pageInfo{hasNextPage endCursor}}}}}"
     command: tuple[str, ...] = (
         "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
         "-F", f"name={request.repository.name}", "-F", f"number={request.number}",

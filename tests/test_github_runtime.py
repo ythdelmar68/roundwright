@@ -264,28 +264,42 @@ def pull_request_payload(*, number: int = 58, base_sha: str = BASE, head_sha: st
     }
 
 
-def gh_comments_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None) -> dict[str, object]:
+def gh_comments_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None, identifier: str = "comment-46") -> dict[str, object]:
     count = (1 if present else 0) if total is None else total
     return {
         "data": {"repository": {
             "name": "roundwright", "owner": {"login": "example"},
             "issue": {"number": 46, "comments": {
                 "totalCount": count,
-                "nodes": ([] if not present else [{"id": "comment-46", "author": {"__typename": "User", "login": "OctoCat"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
+                "nodes": ([] if not present else [{"id": identifier, "author": {"__typename": "User", "login": "OctoCat"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
                 "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
             }},
         }},
     }
 
 
-def gh_reviews_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None) -> dict[str, object]:
+def gh_reviews_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None, identifier: str = "review-46") -> dict[str, object]:
     count = (1 if present else 0) if total is None else total
     return {
         "data": {"repository": {
             "name": "roundwright", "owner": {"login": "example"},
             "pullRequest": {"number": 46, "headRefOid": SHA, "reviews": {
                 "totalCount": count,
-                "nodes": ([] if not present else [{"id": "review-46", "author": {"__typename": "Bot", "login": "Build-Bot"}, "state": "APPROVED", "commit": {"oid": SHA}}]),
+                "nodes": ([] if not present else [{"id": identifier, "author": {"__typename": "Bot", "login": "Build-Bot"}, "state": "APPROVED", "commit": {"oid": SHA}}]),
+                "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
+            }},
+        }},
+    }
+
+
+def gh_requested_reviewers_page(*reviewers: str, next_cursor: str | None = None, total: int | None = None) -> dict[str, object]:
+    count = len(reviewers) if total is None else total
+    return {
+        "data": {"repository": {
+            "name": "roundwright", "owner": {"login": "example"},
+            "pullRequest": {"number": 46, "headRefOid": SHA, "reviewRequests": {
+                "totalCount": count,
+                "nodes": [{"requestedReviewer": {"login": reviewer}} for reviewer in reviewers],
                 "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
             }},
         }},
@@ -1270,6 +1284,91 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertEqual(len(runner.calls), 1)
 
+    def test_native_collection_reads_complete_two_pages_for_every_supported_collection(self) -> None:
+        import json
+
+        requested = GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46, expected_sha=SHA)
+        cases = (
+            (comments_request(), [gh_comments_page(next_cursor="cursor-1", total=2, identifier="comment-46"), gh_comments_page(total=2, identifier="comment-47")], ("comment-46", "comment-47")),
+            (reviews_request(), [gh_reviews_page(next_cursor="cursor-1", total=2, identifier="review-46"), gh_reviews_page(total=2, identifier="review-47")], ("review-46", "review-47")),
+            (requested, [gh_requested_reviewers_page("alice", next_cursor="cursor-1", total=2), gh_requested_reviewers_page("octocat", total=2)], ("alice", "octocat")),
+        )
+        for request, pages, expected in cases:
+            with self.subTest(operation=request.operation):
+                runner = Runner(*(GhCommandResult(0, json.dumps(page)) for page in pages))
+                result = GhGitHubAdapter(runner, health(request.operation)).read(request)
+                self.assertTrue(result.ok)
+                if request.operation is GitHubReadOperation.COMMENTS:
+                    actual = tuple(item.comment_id for item in result.snapshot.comments)  # type: ignore[union-attr]
+                elif request.operation is GitHubReadOperation.REVIEWS:
+                    actual = tuple(item.review_id for item in result.snapshot.reviews)  # type: ignore[union-attr]
+                else:
+                    actual = result.snapshot.reviewers  # type: ignore[union-attr]
+                self.assertEqual(actual, expected)
+                self.assertEqual(len(runner.calls), 2)
+                self.assertTrue(any("cursor=cursor-1" in argument for argument in runner.calls[1]))
+
+    def test_native_collection_reads_reject_pagination_drift_duplicates_and_limits(self) -> None:
+        import json
+
+        requested = GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46, expected_sha=SHA)
+        missing_cursor = gh_comments_page(next_cursor="cursor-1", total=2)
+        missing_cursor["data"]["repository"]["issue"]["comments"]["pageInfo"]["endCursor"] = None  # type: ignore[index]
+        review_drift = gh_reviews_page(total=2, identifier="review-47")
+        review_drift["data"]["repository"]["pullRequest"]["headRefOid"] = BASE  # type: ignore[index]
+        requested_drift = gh_requested_reviewers_page("octocat", total=2)
+        requested_drift["data"]["repository"]["owner"]["login"] = "other"  # type: ignore[index]
+        cases = (
+            ("missing-cursor", comments_request(), [missing_cursor]),
+            ("comment-cursor-loop", comments_request(), [gh_comments_page(next_cursor="loop", total=2), gh_comments_page(next_cursor="loop", total=2, identifier="comment-47")]),
+            ("review-identity-drift", reviews_request(), [gh_reviews_page(next_cursor="cursor-1", total=2), review_drift]),
+            ("requested-identity-drift", requested, [gh_requested_reviewers_page("alice", next_cursor="cursor-1", total=2), requested_drift]),
+            ("comment-duplicate", comments_request(), [gh_comments_page(next_cursor="cursor-1", total=2), gh_comments_page(total=2)]),
+            ("review-duplicate", reviews_request(), [gh_reviews_page(next_cursor="cursor-1", total=2), gh_reviews_page(total=2)]),
+            ("requested-duplicate", requested, [gh_requested_reviewers_page("octocat", next_cursor="cursor-1", total=2), gh_requested_reviewers_page("octocat", total=2)]),
+            ("item-overflow", comments_request(), [gh_comments_page(present=False, total=3201)]),
+        )
+        for name, request, pages in cases:
+            with self.subTest(name=name):
+                result = GhGitHubAdapter(
+                    Runner(*(GhCommandResult(0, json.dumps(page)) for page in pages)), health(request.operation),
+                ).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+
+        overflow_pages = [gh_comments_page(present=False, next_cursor=f"cursor-{index}", total=1) for index in range(32)]
+        overflow = GhGitHubAdapter(
+            Runner(*(GhCommandResult(0, json.dumps(page)) for page in overflow_pages)), health(GitHubReadOperation.COMMENTS),
+        ).read(comments_request())
+        self.assertFalse(overflow.ok)
+        self.assertEqual(overflow.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+
+    def test_broker_completeness_uses_native_requested_reviewer_pages(self) -> None:
+        import json
+
+        reviewers = ("alice", "octocat")
+        reviewer_digest = "sha256:" + hashlib.sha256(
+            json.dumps(("reviewers", reviewers), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+        ).hexdigest()
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.REQUEST_REVIEW, REPOSITORY, "native-reviewers-46",
+            target_number=46, expected_sha=SHA, payload=(("reviewers_digest", reviewer_digest),),
+        )
+        context = allowed_context()
+        plan = _broker_semantic_plan(intent)
+        runner = Runner(
+            GhCommandResult(0, json.dumps(gh_requested_reviewers_page("alice", next_cursor="cursor-1", total=2))),
+            GhCommandResult(0, json.dumps(gh_requested_reviewers_page("octocat", total=2))),
+        )
+        result, receipt = _complete_broker_read(
+            GhGitHubAdapter(runner, health(GitHubReadOperation.REQUESTED_REVIEWERS)),
+            plan.pre_state, context, schema_v2_authorization_bundle(context), plan, None,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.reviewers, reviewers)  # type: ignore[union-attr]
+        self.assertTrue(receipt.startswith("sha256:"))
+        self.assertEqual(len(runner.calls), 2)
+
     def test_collection_completeness_consumes_single_and_multi_page_typed_results(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "paged-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         context = allowed_context()
@@ -1284,7 +1383,7 @@ class GitHubRuntimeTests(unittest.TestCase):
 
         multi = PagedFakeGitHubAdapter({}, {
             None: comments_page(None, "cursor-1", 2, comment("comment-01")),
-            "cursor-1": comments_page("cursor-1", None, 2, comment("comment-01"), comment("comment-02", DIGEST)),
+            "cursor-1": comments_page("cursor-1", None, 2, comment("comment-02", DIGEST)),
         })
         complete, receipt = _complete_broker_read(multi, request, context, bundle, plan, None)
         self.assertTrue(complete.ok)

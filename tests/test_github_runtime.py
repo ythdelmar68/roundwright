@@ -585,6 +585,22 @@ class GitHubRuntimeTests(unittest.TestCase):
         altered = MutationJournalEntry.deserialize(serialized)
         self.assertNotEqual(altered, entry)
 
+    def test_persisted_receipt_time_drift_is_rejected(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "receipt-time-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        bundle = schema_v2_authorization_bundle(context)
+        plan = _broker_semantic_plan(intent)
+        entry = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
+        receipt = GitHubMutationBroker._semantic_receipt(intent, context, bundle, plan, DIGEST, DIGEST, DIGEST, DIGEST, "comment-46", MutationDisposition.ACCEPTED)
+        verified = replace(entry, lifecycle=JournalLifecycle.VERIFIED, receipt=receipt)
+        encoded = dict(verified.serialize())
+        encoded_receipt = dict(encoded["receipt"])
+        encoded_receipt["fresh_until"] = "2026-08-08T00:05:00+00:00"
+        encoded_receipt["time_identity"] = "sha256:" + hashlib.sha256(json.dumps((encoded_receipt["evaluated_at"], encoded_receipt["fresh_until"]), separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        encoded["receipt"] = encoded_receipt
+        with self.assertRaises(ValueError):
+            MutationJournalEntry.deserialize(encoded)
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

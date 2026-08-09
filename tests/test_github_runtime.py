@@ -643,6 +643,18 @@ class GitHubRuntimeTests(unittest.TestCase):
         result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, started, started)
         self.assertTrue(result.ok)
         self.assertNotEqual(result.receipt.affected_identity, "reconciled")  # type: ignore[union-attr]
+        for state in (JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.AMBIGUOUS):
+            adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            entry = replace(claimed, lifecycle=state)
+            result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, entry, entry)
+            self.assertTrue(result.ok)
+            self.assertNotEqual(result.receipt.affected_identity, "reconciled")  # type: ignore[union-attr]
+        empty = {**comments_payload(), "comments": []}
+        adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=empty)})
+        ambiguous = replace(claimed, lifecycle=JournalLifecycle.AMBIGUOUS)
+        result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, ambiguous, ambiguous)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.reconciliation_required)
 
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))

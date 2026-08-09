@@ -520,7 +520,7 @@ def allowed_context(
     )
     deployment = evaluate_deployment_authority(deployment_identity, deployment_receipt, deployment_verification, now=now)
     assert deployment.authorized
-    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition, snapshot, receipt, deployment_identity, deployment_receipt, deployment_verification, now)
+    return MutationBrokerContext(policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification, mutation_context, transition, snapshot, receipt, deployment_identity, deployment_receipt, deployment_verification, now, REPOSITORY)
 
 
 class GitHubRuntimeTests(unittest.TestCase):
@@ -690,7 +690,11 @@ class GitHubRuntimeTests(unittest.TestCase):
             if operation in numbered:
                 values["target_number"] = 46
             if operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
-                values.update({"base_sha": BASE, "head_sha": SHA, "marker_digest": COMMENT_DIGEST})
+                values.update({
+                    "base_sha": BASE, "head_sha": SHA, "marker_digest": COMMENT_DIGEST,
+                    "authorized_base_sha": BASE, "base_ref": "main", "head_ref": "codex/issue-46",
+                    "base_repository": REPOSITORY, "head_repository": REPOSITORY,
+                })
             elif operation is GitHubMutationOperation.COMMENT:
                 values["marker_digest"] = COMMENT_DIGEST
             request = OwnerMutationRequest(DIGEST, operation, DIGEST, DIGEST, DIGEST, REPOSITORY, **values)
@@ -1020,6 +1024,91 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertEqual(result.receipt.created_resource_identity, stored.created_resource.identity)  # type: ignore[union-attr]
             self.assertTrue(result.receipt.affected_identity.startswith("sha256:"))  # type: ignore[union-attr]
 
+    def test_create_pull_request_context_binding_rejects_base_head_and_repository_drift_before_ipc(self) -> None:
+        """Creation has no ``expected_sha``; payload commits must bind context instead."""
+
+        intent, payload = pull_request_intent()
+        context = allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR)
+        matrix = health(
+            GitHubReadOperation.REPOSITORY, GitHubReadOperation.PULL_REQUEST,
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+        )
+
+        class CountingReadChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_read(self, _: GitHubReadRequest) -> object:
+                self.calls += 1
+                raise AssertionError("denied create request reached read IPC")
+
+            def exchange_collection_page(self, _: GitHubReadRequest, __: str | None) -> object:
+                self.calls += 1
+                raise AssertionError("denied create request reached collection IPC")
+
+        class CountingMutationChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_mutation(self, _: OwnerMutationIpcMessage) -> object:
+                self.calls += 1
+                raise AssertionError("denied create request reached mutation IPC")
+
+        values = dict(intent.payload)
+        cases = (
+            ("base", replace(intent, payload=tuple(sorted({**values, "base_sha": SHA}.items())))),
+            ("head", replace(intent, payload=tuple(sorted({**values, "head_sha": BASE}.items())))),
+            ("repository", replace(intent, repository=RepositoryRef("other", "roundwright"))),
+        )
+        for name, drifted in cases:
+            with self.subTest(drift=name), tempfile.TemporaryDirectory() as directory:
+                reads, mutations = CountingReadChannel(), CountingMutationChannel()
+                broker = GitHubMutationBroker.with_owner_transport(
+                    OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                    journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW,
+                )
+                result = broker.submit(drifted, context, payload=payload)
+                self.assertFalse(result.ok)
+                self.assertEqual(reads.calls, 0)
+                self.assertEqual(mutations.calls, 0)
+
+    def test_create_pull_request_request_and_receipt_bind_the_authorized_candidate(self) -> None:
+        intent, payload = pull_request_intent()
+        context = allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR)
+        plan = _broker_semantic_plan(intent)
+        allocated_request = GitHubReadRequest(
+            GitHubReadOperation.PULL_REQUEST, REPOSITORY, number=58, expected_sha=SHA,
+        )
+        adapter = FakeGitHubAdapter({
+            plan.pre_state.identity(): FakeGitHubScenario(response=repository_payload()),
+            allocated_request.identity(): FakeGitHubScenario(response=pull_request_payload()),
+        })
+        transport = OwnerTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            result = GitHubMutationBroker(
+                adapter, journal=journal,
+                _executor=_GhBrokerExecutor(transport, health(
+                    GitHubReadOperation.REPOSITORY, GitHubReadOperation.PULL_REQUEST,
+                    GitHubMutationOperation.CREATE_PULL_REQUEST,
+                )),
+            ).submit(intent, context, payload=payload)
+            self.assertTrue(result.ok)
+            self.assertEqual(transport.requests[0].authorized_base_sha, context.base_sha)
+            self.assertEqual(transport.requests[0].head_sha, context.candidate_sha)
+            self.assertEqual(transport.requests[0].base_ref, dict(intent.payload)["base_ref"])
+            self.assertEqual(transport.requests[0].head_ref, dict(intent.payload)["head_ref"])
+            self.assertEqual(transport.requests[0].base_repository, context.repository)
+            self.assertEqual(transport.requests[0].head_repository, context.repository)
+            with self.assertRaises(ValueError):
+                replace(transport.requests[0], head_repository=RepositoryRef("fork", "roundwright"))
+            with self.assertRaises(ValueError):
+                replace(transport.requests[0], head_ref="")
+            self.assertEqual(result.receipt.candidate_sha, context.candidate_sha)  # type: ignore[union-attr]
+            self.assertEqual(result.receipt.created_resource_identity, journal.find(
+                MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), plan)
+            ).created_resource.identity)  # type: ignore[union-attr]
+
     def test_created_pull_request_locator_and_post_state_drift_fail_closed(self) -> None:
         intent, payload = pull_request_intent()
         context = allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR)
@@ -1086,6 +1175,8 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(restarted.call_count(kind="mutation"), 0)
             self.assertEqual(len(transport.requests), 1)
+            self.assertEqual(result.receipt.candidate_sha, context.candidate_sha)  # type: ignore[union-attr]
+            self.assertEqual(result.receipt.created_resource_identity, stored.created_resource.identity)  # type: ignore[union-attr]
 
     def test_allocated_comment_post_read_requires_the_exact_comment_identity(self) -> None:
         intent = GitHubMutationIntent(
@@ -1471,7 +1562,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         comment = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "override-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         complete = (
             GitHubMutationIntent(GitHubMutationOperation.CREATE_BRANCH, REPOSITORY, "create-46", expected_sha=SHA, target_ref="codex/issue-46"),
-            GitHubMutationIntent(GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY, "pr-46", target_number=46, payload=(("base_ref", "main"), ("base_sha", SHA), ("body_digest", COMMENT_DIGEST), ("head_ref", "codex/issue-46"), ("head_sha", SHA), ("title_digest", COMMENT_DIGEST))),
+            GitHubMutationIntent(GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY, "pr-46", target_number=46, payload=(("base_ref", "main"), ("base_sha", BASE), ("body_digest", COMMENT_DIGEST), ("head_ref", "codex/issue-46"), ("head_sha", SHA), ("title_digest", COMMENT_DIGEST))),
             GitHubMutationIntent(GitHubMutationOperation.DELETE_BRANCH, REPOSITORY, "delete-46", expected_sha=SHA, target_ref="codex/issue-46"),
         )
         override = _broker_semantic_plan(comment)

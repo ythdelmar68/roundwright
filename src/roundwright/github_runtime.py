@@ -213,6 +213,11 @@ class OwnerMutationRequest:
     head_sha: str | None = None
     marker_digest: str | None = None
     candidate_sha: str | None = None
+    authorized_base_sha: str | None = None
+    base_ref: str | None = None
+    head_ref: str | None = None
+    base_repository: RepositoryRef | None = None
+    head_repository: RepositoryRef | None = None
     idempotency_identity: str | None = None
     command: BrokerMutationCommand | None = None
     deployment_identity: str | None = None
@@ -269,8 +274,32 @@ class OwnerMutationRequest:
                     raise GitHubRuntimeError(f"{name} is invalid")
             if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
                 raise GitHubRuntimeError("owner mutation time seal drifted")
+            if self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+                if (
+                    type(self.authorized_base_sha) is not str
+                    or len(self.authorized_base_sha) not in {40, 64}
+                    or any(char not in "0123456789abcdef" for char in self.authorized_base_sha)
+                    or self.base_sha != self.authorized_base_sha
+                    or self.head_sha != self.candidate_sha
+                    or type(self.base_ref) is not str or not self.base_ref
+                    or type(self.head_ref) is not str or not self.head_ref
+                    or self.base_repository != self.repository
+                    or self.head_repository != self.repository
+                ):
+                    raise GitHubRuntimeError("owner pull request request is not bound to the authorized base and candidate")
+            elif any(value is not None for value in (
+                self.authorized_base_sha, self.base_ref, self.head_ref,
+                self.base_repository, self.head_repository,
+            )):
+                raise GitHubRuntimeError("owner non-pull-request request has base authorization evidence")
+        elif any(value is not None for value in (
+            self.authorized_base_sha, self.base_ref, self.head_ref,
+            self.base_repository, self.head_repository,
+        )):
+            raise GitHubRuntimeError("owner pull request base authorization seal is incomplete")
         object.__setattr__(self, "identity", _sha256(tuple(
             self.operation.value if name == "operation" else self.repository.slug if name == "repository"
+            else getattr(self, name).slug if name in {"base_repository", "head_repository"} and getattr(self, name) is not None
             else self.command.value if name == "command" and self.command is not None else getattr(self, name)
             for name in self.__dataclass_fields__ if name != "identity"
         )))
@@ -1123,6 +1152,7 @@ class MutationBrokerContext:
     deployment_receipt: DeploymentAuthorityReceipt
     deployment_verification: AuthorityReceiptVerification
     evaluated_at: datetime
+    repository: RepositoryRef
 
     def __post_init__(self) -> None:
         if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
@@ -1131,7 +1161,8 @@ class MutationBrokerContext:
                 or type(self.policy_snapshot) is not TrustedRepositoryPolicySnapshot or type(self.activation_receipt) is not RepositoryActivationReceipt
                 or type(self.deployment_identity) is not DeploymentIdentity or type(self.deployment_receipt) is not DeploymentAuthorityReceipt
                 or type(self.deployment_verification) is not AuthorityReceiptVerification
-                or type(self.evaluated_at) is not datetime or self.evaluated_at.tzinfo is not timezone.utc):
+                or type(self.evaluated_at) is not datetime or self.evaluated_at.tzinfo is not timezone.utc
+                or type(self.repository) is not RepositoryRef):
             raise GitHubRuntimeError("broker authority evidence is invalid")
         for value, name in ((self.configuration_digest, "configuration"), (self.gate_identity, "gate")):
             _digest(value, name)
@@ -1212,6 +1243,7 @@ def schema_v2_authorization_bundle(
         context.deployment_verification.receipt_binding_fingerprint,
         evaluated_at, fresh_until_text, _sha256((evaluated_at, fresh_until_text)),
         capability_health.identity,
+        context.repository.slug,
     )
 
 
@@ -1246,7 +1278,7 @@ class SchemaV2AuthorizationBundle:
     fresh_until: str
     time_identity: str
     capability_health_identity: str
-    capability_health_identity: str
+    target_repository: str
     identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1278,6 +1310,8 @@ class SchemaV2AuthorizationBundle:
         if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
             raise GitHubRuntimeError("authorization time identity drifted")
         _digest(self.capability_health_identity, "authorization capability health")
+        if type(self.target_repository) is not str or self.target_repository.count("/") != 1:
+            raise GitHubRuntimeError("authorization bundle target repository is invalid")
         if type(self.receipt_status) is not RepositoryReceiptStatus:
             raise GitHubRuntimeError("authorization bundle receipt lifecycle status is invalid")
         _digest(self.configuration_digest, "configuration")
@@ -2356,14 +2390,33 @@ class _GhBrokerExecutor:
                 raise GitHubRuntimeError("broker journal execution seal is unavailable")
             intent_payload = dict(intent.payload)
             request = OwnerMutationRequest(
-                intent.identity(), intent.operation, bundle.identity, plan.identity, journal.key,
-                intent.repository, intent.target_number,
-                intent_payload.get("base_sha"), intent_payload.get("head_sha"),
-                intent_payload.get("body_digest"),
-                bundle.candidate_sha, plan.idempotency_identity, plan.command,
-                bundle.deployment_identity, journal.pre_state_identity,
-                journal.evaluated_at, journal.fresh_until, journal.time_identity,
-                bundle.capability_health_identity,
+                intent_identity=intent.identity(), operation=intent.operation,
+                authorization_bundle_identity=bundle.identity, semantic_plan_identity=plan.identity,
+                journal_identity=journal.key, repository=intent.repository,
+                target_number=intent.target_number, base_sha=intent_payload.get("base_sha"),
+                head_sha=intent_payload.get("head_sha"), marker_digest=intent_payload.get("body_digest"),
+                candidate_sha=bundle.candidate_sha, idempotency_identity=plan.idempotency_identity,
+                command=plan.command, deployment_identity=bundle.deployment_identity,
+                pre_state_identity=journal.pre_state_identity, evaluated_at=journal.evaluated_at,
+                fresh_until=journal.fresh_until, time_identity=journal.time_identity,
+                capability_health_identity=bundle.capability_health_identity,
+                authorized_base_sha=(
+                    bundle.base_sha
+                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST
+                    else None
+                ),
+                base_ref=intent_payload.get("base_ref"),
+                head_ref=intent_payload.get("head_ref"),
+                base_repository=(
+                    intent.repository
+                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST
+                    else None
+                ),
+                head_repository=(
+                    intent.repository
+                    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST
+                    else None
+                ),
             )
             fact = self.__transport.dispatch(request)
             request_identity = request.identity
@@ -2808,6 +2861,23 @@ def _authorize(
         return GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "deployment authority denies GitHub mutation")
     if binding.candidate_sha != context.candidate_sha:
         return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation authority is not bound to the exact candidate and deployment")
+    if intent.repository != context.repository:
+        return GitHubFailure(
+            GitHubFailureKind.POLICY_DENIED,
+            intent.operation,
+            "mutation target repository is not bound to the authorized context",
+        )
+    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+        payload = dict(intent.payload)
+        if (
+            payload.get("base_sha") != context.base_sha
+            or payload.get("head_sha") != context.candidate_sha
+        ):
+            return GitHubFailure(
+                GitHubFailureKind.STALE_RESPONSE,
+                intent.operation,
+                "pull request payload is not bound to the authorized base and candidate",
+            )
     if intent.expected_sha is not None and intent.expected_sha != context.candidate_sha:
         return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation intent is not bound to the exact candidate")
     return None

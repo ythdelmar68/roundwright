@@ -721,6 +721,9 @@ class SemanticMutationReceipt:
     pre_state_digest: str
     post_state_digest: str
     affected_identity: str
+    evaluated_at: str
+    fresh_until: str
+    time_identity: str
     disposition: MutationDisposition
     receipt_digest: str = field(init=False)
 
@@ -736,8 +739,11 @@ class SemanticMutationReceipt:
             (self.public_payload_digest, "payload"), (self.configuration_digest, "configuration"),
             (self.gate_identity, "gate"), (self.pre_state_digest, "pre-state"),
             (self.post_state_digest, "post-state"),
+            (self.time_identity, "receipt time identity"),
         ):
             _digest(value, name)
+        if self.time_identity != _sha256((self.evaluated_at, self.fresh_until)):
+            raise GitHubRuntimeError("receipt time identity drifted")
         for value, name in ((self.policy_binding_digest, "policy binding"), (self.deployment_fingerprint, "deployment"), (self.task_fingerprint, "task")):
             _fingerprint(value, name)
         if type(self.affected_identity) is not str or not self.affected_identity:
@@ -837,6 +843,9 @@ class MutationJournalEntry:
             or self.receipt.candidate_sha != self.candidate_sha
             or self.receipt.configuration_digest != self.configuration_digest
             or self.receipt.gate_identity != self.gate_identity
+            or self.receipt.evaluated_at != self.evaluated_at
+            or self.receipt.fresh_until != self.fresh_until
+            or self.receipt.time_identity != self.time_identity
         ):
             raise GitHubRuntimeError("mutation journal receipt does not match durable evidence")
 
@@ -1294,7 +1303,8 @@ class GitHubMutationBroker:
             context.configuration_digest, binding.deployment_fingerprint,
             binding.task_fingerprint, context.base_sha, context.candidate_sha,
             context.gate_identity, pre_state_digest, post_state_digest,
-            affected_identity, disposition,
+            affected_identity, context.evaluated_at.isoformat(), (context.evaluated_at + timedelta(minutes=5)).isoformat(),
+            _sha256((context.evaluated_at.isoformat(), (context.evaluated_at + timedelta(minutes=5)).isoformat())), disposition,
         )
 
     def _journal_transition(

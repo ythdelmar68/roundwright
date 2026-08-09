@@ -50,7 +50,7 @@ class GitHubAdapterTests(unittest.TestCase):
     def payload(self, operation: GitHubReadOperation) -> dict[str, object]:
         repository = {"owner": "example", "name": "roundwright"}
         payloads: dict[GitHubReadOperation, dict[str, object]] = {
-            GitHubReadOperation.REPOSITORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "default_branch_sha": SHA},
+            GitHubReadOperation.REPOSITORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "default_branch_sha": SHA, "repository_evidence_identity": DIGEST, "default_branch_evidence_identity": READBACK_DIGEST},
             GitHubReadOperation.ISSUE: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": []},
             GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41]},
             GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},

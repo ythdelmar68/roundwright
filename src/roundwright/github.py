@@ -172,12 +172,17 @@ class RepositorySnapshot:
     repository: RepositoryRef
     default_branch: str
     default_branch_sha: str
+    repository_evidence_identity: str
+    default_branch_evidence_identity: str
 
     def __post_init__(self) -> None:
         _validate_token(self.repository_id, "repository id")
         if type(self.repository) is not RepositoryRef or type(self.default_branch) is not str or not _IDENTIFIER.fullmatch(self.default_branch):
             raise GitHubContractError("repository snapshot is invalid")
-        _validate_sha(self.default_branch_sha, "default branch sha")
+        if type(self.default_branch_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.default_branch_sha):
+            raise GitHubContractError("default branch sha is invalid")
+        _validate_digest(self.repository_evidence_identity, "repository evidence")
+        _validate_digest(self.default_branch_evidence_identity, "default branch evidence")
 
 
 @dataclass(frozen=True)
@@ -699,9 +704,13 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
     try:
         operation = request.operation
         if operation is GitHubReadOperation.REPOSITORY:
-            _exact_shape(response, {"repository", "id", "default_branch", "default_branch_sha"})
+            _exact_shape(response, {"repository", "id", "default_branch", "default_branch_sha", "repository_evidence_identity", "default_branch_evidence_identity"})
             repository = _repository(response)
-            return RepositorySnapshot(_string(response, "id"), repository, _string(response, "default_branch"), _string(response, "default_branch_sha"))
+            return RepositorySnapshot(
+                _string(response, "id"), repository, _string(response, "default_branch"),
+                _string(response, "default_branch_sha"), _string(response, "repository_evidence_identity"),
+                _string(response, "default_branch_evidence_identity"),
+            )
         if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
             _exact_shape(response, {"repository", "id", "number", "state", "parent_number", "sub_issue_numbers"})
             return IssueSnapshot(_repository(response), _string(response, "id"), _integer(response, "number"), IssueState(_string(response, "state")), _optional_integer(response, "parent_number"), _integer_tuple(response, "sub_issue_numbers"))

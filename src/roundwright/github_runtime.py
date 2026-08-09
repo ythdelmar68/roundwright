@@ -354,6 +354,8 @@ class GhGitHubAdapter:
         blocked = _health_failure(request.operation, self._health)
         if blocked is not None:
             return GitHubReadResult(request, failure=blocked)
+        if request.operation is GitHubReadOperation.REPOSITORY:
+            return self._read_repository(request)
         outcome = self.__runner.run(_read_command(request))
         if outcome.exit_code != 0:
             try:
@@ -372,6 +374,42 @@ class GhGitHubAdapter:
             return GitHubReadResult(request, snapshot=snapshot)
         except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "gh read response is malformed"))
+
+    def _read_repository(self, request: GitHubReadRequest) -> GitHubReadResult:
+        """Compose the default head from two provider-established REST reads."""
+
+        repository_outcome = self.__runner.run(_read_command(request))
+        if repository_outcome.exit_code != 0:
+            return GitHubReadResult(request, failure=GitHubFailure(
+                _failure_kind(repository_outcome.exit_code), request.operation,
+                "gh repository read did not return a usable response",
+            ))
+        try:
+            repository_raw = json.loads(repository_outcome.stdout)
+            metadata = _project_repository_metadata(request, repository_raw)
+            branch_command = _repository_default_branch_command(
+                request.repository, _raw_text(metadata, "default_branch"),
+            )
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh repository response is malformed",
+            ))
+        branch_outcome = self.__runner.run(branch_command)
+        if branch_outcome.exit_code != 0:
+            return GitHubReadResult(request, failure=GitHubFailure(
+                _failure_kind(branch_outcome.exit_code), request.operation,
+                "gh default branch read did not return a usable response",
+            ))
+        try:
+            branch_raw = json.loads(branch_outcome.stdout)
+            projected = _compose_repository_default_head(request, metadata, repository_raw, branch_raw)
+            return GitHubReadResult(request, snapshot=normalize_github_response(request, projected))
+        except (json.JSONDecodeError, GitHubContractError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh default branch response is malformed",
+            ))
 
     def read_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
         """Read one native GraphQL connection page, or fail closed.
@@ -1920,6 +1958,48 @@ def _post_state_digest(intent: GitHubMutationIntent, result: GitHubReadResult) -
     return result.snapshot_digest
 
 
+def _project_repository_metadata(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
+    """Project only the repository fields the first REST response establishes."""
+
+    item = _raw_mapping(raw)
+    _raw_repository_matches(item, request)
+    if _raw_text(item, "full_name") != request.repository.slug:
+        raise GitHubRuntimeError("gh repository full name does not match request")
+    return {
+        "repository": {"owner": request.repository.owner, "name": request.repository.name},
+        "id": _raw_id(item, "id"),
+        "default_branch": _raw_text(item, "default_branch"),
+    }
+
+
+def _compose_repository_default_head(
+    request: GitHubReadRequest, metadata: Mapping[str, object], repository_raw: object, branch_raw: object,
+) -> Mapping[str, object]:
+    """Bind one exact branch ref response to its preceding repository metadata."""
+
+    default_branch = _raw_text(metadata, "default_branch")
+    branch = _raw_mapping(branch_raw)
+    if _raw_text(branch, "name") != default_branch:
+        raise GitHubRuntimeError("gh default branch changed between repository reads")
+    _raw_branch_repository_matches(branch, request)
+    commit = _raw_mapping(branch.get("commit"))
+    sha = _raw_text(commit, "sha")
+    if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+        raise GitHubRuntimeError("gh default branch sha is malformed")
+    if not _raw_text(commit, "url").rstrip("/").endswith(
+        f"/repos/{request.repository.slug}/commits/{sha}",
+    ):
+        raise GitHubRuntimeError("gh default branch commit identity does not match response")
+    return {
+        "repository": _raw_mapping(metadata.get("repository")),
+        "id": _raw_id(metadata, "id"),
+        "default_branch": default_branch,
+        "default_branch_sha": sha,
+        "repository_evidence_identity": _sha256(repository_raw),
+        "default_branch_evidence_identity": _sha256(branch_raw),
+    }
+
+
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:
     """Project one REST response into the exact core schema.
 
@@ -1989,9 +2069,7 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
             ],
         }
     if operation is GitHubReadOperation.REPOSITORY:
-        item = _raw_mapping(raw)
-        _raw_repository_matches(item, request)
-        return {"repository": repository, "id": _raw_id(item, "id"), "default_branch": _raw_text(item, "default_branch"), "default_branch_sha": _raw_text(item, "default_branch_sha")}
+        raise GitHubRuntimeError("repository reads require default-head composition")
     if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
         item = _raw_mapping(raw)
         _raw_repository_matches(item, request)
@@ -2287,6 +2365,14 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     else:
         raise GitHubRuntimeError("unsupported gh read operation")
     return ("api", "--method", "GET", path)
+
+
+def _repository_default_branch_command(repository: RepositoryRef, default_branch: str) -> tuple[str, ...]:
+    """Read the ref selected by already-validated repository metadata."""
+
+    if type(repository) is not RepositoryRef or type(default_branch) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", default_branch):
+        raise GitHubRuntimeError("repository default branch command is invalid")
+    return ("api", "--method", "GET", f"repos/{repository.slug}/branches/{default_branch}")
 
 
 def _collection_read_command(request: GitHubReadRequest, cursor: str | None) -> tuple[str, ...]:

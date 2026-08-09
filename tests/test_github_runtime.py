@@ -164,7 +164,26 @@ def repository_payload() -> dict[str, object]:
     return {
         "repository": {"owner": "example", "name": "roundwright"},
         "id": "repository-1", "default_branch": "main", "default_branch_sha": BASE,
+        "repository_evidence_identity": DIGEST,
+        "default_branch_evidence_identity": "sha256:" + "d" * 64,
     }
+
+
+def gh_repository_metadata(*, default_branch: str = "main", full_name: str = "example/roundwright") -> dict[str, object]:
+    return {
+        "id": 1, "name": "roundwright", "full_name": full_name,
+        "owner": {"login": "example"}, "default_branch": default_branch,
+    }
+
+
+def gh_default_branch(*, name: str = "main", sha: str = BASE, repository: str = "example/roundwright", include_commit: bool = True, include_url: bool = True) -> dict[str, object]:
+    branch: dict[str, object] = {"name": name}
+    if include_commit:
+        commit: dict[str, object] = {"sha": sha}
+        if include_url:
+            commit["url"] = f"https://api.github.com/repos/{repository}/commits/{sha}"
+        branch["commit"] = commit
+    return branch
 
 
 def pull_request_intent() -> tuple[GitHubMutationIntent, GhMutationPayload]:
@@ -914,6 +933,48 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(runner.calls[0][:2], ("api", "graphql"))
         self.assertNotIn("curated evidence", repr(result.snapshot))
+
+    def test_native_repository_read_composes_default_head_from_two_bound_rest_responses(self) -> None:
+        import json
+
+        runner = Runner(
+            GhCommandResult(0, json.dumps(gh_repository_metadata())),
+            GhCommandResult(0, json.dumps(gh_default_branch())),
+        )
+        request = GitHubReadRequest(GitHubReadOperation.REPOSITORY, REPOSITORY)
+        result = GhGitHubAdapter(runner, health(GitHubReadOperation.REPOSITORY)).read(request)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.default_branch, "main")  # type: ignore[union-attr]
+        self.assertEqual(result.snapshot.default_branch_sha, BASE)  # type: ignore[union-attr]
+        self.assertNotEqual(result.snapshot.repository_evidence_identity, result.snapshot.default_branch_evidence_identity)  # type: ignore[union-attr]
+        self.assertEqual(runner.calls, [
+            ("api", "--method", "GET", "repos/example/roundwright"),
+            ("api", "--method", "GET", "repos/example/roundwright/branches/main"),
+        ])
+
+    def test_native_repository_read_rejects_default_head_drift_and_truncated_branch_evidence(self) -> None:
+        import json
+
+        malformed_sha = "c" * 64
+        cases = (
+            ("wrong-default-branch", gh_repository_metadata(), gh_default_branch(name="master")),
+            ("wrong-full-name", gh_repository_metadata(full_name="other/repository"), None),
+            ("wrong-branch-repository", gh_repository_metadata(), gh_default_branch(repository="other/repository")),
+            ("missing-commit", gh_repository_metadata(), gh_default_branch(include_commit=False)),
+            ("truncated-commit", gh_repository_metadata(), gh_default_branch(include_url=False)),
+            ("malformed-sha", gh_repository_metadata(), gh_default_branch(sha=malformed_sha)),
+        )
+        request = GitHubReadRequest(GitHubReadOperation.REPOSITORY, REPOSITORY)
+        for name, metadata, branch in cases:
+            with self.subTest(name=name):
+                outcomes = [GhCommandResult(0, json.dumps(metadata))]
+                if branch is not None:
+                    outcomes.append(GhCommandResult(0, json.dumps(branch)))
+                runner = Runner(*outcomes)
+                result = GhGitHubAdapter(runner, health(GitHubReadOperation.REPOSITORY)).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+                self.assertEqual(len(runner.calls), 1 if branch is None else 2)
 
     def test_native_comment_and_review_actor_queries_use_only_concrete_login_shapes(self) -> None:
         from roundwright.github_runtime import _collection_read_command

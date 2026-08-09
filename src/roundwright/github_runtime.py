@@ -537,22 +537,37 @@ class _OwnerGitHubReadHostEndpoint:
     unavailable, which is the safe construction for workers and tests.
     """
 
-    def __init__(self, runner: _FixedGhReadRunner, health: GitHubCapabilityHealth | None = None) -> None:
-        if not hasattr(runner, "run"):
+    def __init__(
+        self, runner: _FixedGhReadRunner, health: GitHubCapabilityHealth | None = None,
+        *, clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not hasattr(runner, "run") or clock is None:
             raise GitHubRuntimeError("gh runner is invalid")
         self.__runner = runner
         self._health = health or unavailable_capability_health()
+        self.__clock = clock
         self.calls: list[tuple[str, str]] = []
 
     @property
     def health(self) -> GitHubCapabilityHealth:
         return self._health
 
+    def _fresh_failure(self, operation: GitHubReadOperation) -> GitHubFailure | None:
+        """Read-host evidence is valid only at one owner-clock observation."""
+
+        try:
+            now = self.__clock()
+        except Exception:
+            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "owner read clock is unavailable")
+        if type(now) is not datetime or now.tzinfo is not timezone.utc:
+            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "owner read clock is invalid")
+        return _health_failure(operation, self._health, now=now)
+
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
         if type(request) is not GitHubReadRequest:
             raise GitHubContractError("read request is invalid")
         self.calls.append(("read", request.operation.value))
-        blocked = _health_failure(request.operation, self._health)
+        blocked = self._fresh_failure(request.operation)
         if blocked is not None:
             return GitHubReadResult(request, failure=blocked)
         if request.operation is GitHubReadOperation.REPOSITORY:
@@ -844,7 +859,7 @@ class _OwnerGitHubReadHostEndpoint:
         if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
             return None
         self.calls.append(("collection-read", request.operation.value))
-        if _health_failure(request.operation, self._health) is not None:
+        if self._fresh_failure(request.operation) is not None:
             return None
         command = (
             _requested_reviewers_collection_command(request, cursor)
@@ -1986,11 +2001,15 @@ class OwnerMutationHostEndpoint:
         self, registry: OwnerMutationSealRegistry, executor: OwnerFixedMutationHostExecutor,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if not hasattr(registry, "resolve_and_consume") or type(executor) is not OwnerFixedMutationHostExecutor:
+        if (
+            not hasattr(registry, "resolve_and_consume")
+            or type(executor) is not OwnerFixedMutationHostExecutor
+            or clock is None
+        ):
             raise GitHubRuntimeError("owner mutation host endpoint is unavailable")
         self.__registry = registry
         self.__executor = executor
-        self.__clock = _trusted_utc_now if clock is None else clock
+        self.__clock = clock
 
     def _dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         if type(request) is not OwnerMutationRequest:
@@ -2002,10 +2021,14 @@ class OwnerMutationHostEndpoint:
             return OwnerMutationFact(False, request.identity)
         try:
             now = self.__clock()
+            evaluated_at = datetime.fromisoformat(record.evaluated_at)
             fresh_until = datetime.fromisoformat(record.fresh_until)
         except (TypeError, ValueError):
             return OwnerMutationFact(False, request.identity)
-        if type(now) is not datetime or now.tzinfo is not timezone.utc or now >= fresh_until:
+        if (
+            type(now) is not datetime or now.tzinfo is not timezone.utc
+            or now < evaluated_at or now >= fresh_until
+        ):
             return OwnerMutationFact(False, request.identity)
         try:
             fact = self.__executor.execute_fixed(record)
@@ -3720,10 +3743,14 @@ def _broker_receipt(intent: GitHubMutationIntent) -> MutationReceipt:
     return MutationReceipt(intent.identity(), intent.operation, MutationDisposition.ACCEPTED, f"gh-{intent.operation.value}", _sha256(("transport", intent.identity())))
 
 
-def _health_failure(operation: GitHubOperation, health: GitHubCapabilityHealth) -> GitHubFailure | None:
+def _health_failure(
+    operation: GitHubOperation, health: GitHubCapabilityHealth, *, now: datetime | None = None,
+) -> GitHubFailure | None:
     item = health.for_operation(operation)
     if item.available:
-        return None
+        if now is None or item.fresh_at(now):
+            return None
+        return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "gh capability evidence is stale")
     kind = {
         CapabilityState.UNAVAILABLE: GitHubFailureKind.UNAVAILABLE,
         CapabilityState.PERMISSION_DENIED: GitHubFailureKind.PERMISSION_DENIED,

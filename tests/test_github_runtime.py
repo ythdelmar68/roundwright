@@ -37,7 +37,7 @@ from roundwright.github_runtime import (
     CreatedResourceLocator,
     _GhCommandResult as GhCommandResult,
     DurableMutationJournal,
-    _OwnerGitHubReadHostEndpoint as GhGitHubAdapter,
+    _OwnerGitHubReadHostEndpoint as _OwnerGitHubReadHostEndpoint,
     GhMutationPayload,
     GitHubCapabilityHealth,
     GitHubMutationBroker,
@@ -91,6 +91,14 @@ COMMENT_DIGEST = "sha256:" + hashlib.sha256(
 ).hexdigest()
 REPOSITORY = RepositoryRef("example", "roundwright")
 NOW = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+
+def GhGitHubAdapter(
+    runner: Runner, matrix: GitHubCapabilityHealth | None = None, *, clock=lambda: NOW,
+) -> _OwnerGitHubReadHostEndpoint:
+    """Construct the credentialed host only with a hermetic owner clock."""
+
+    return _OwnerGitHubReadHostEndpoint(runner, matrix, clock=clock)
 
 
 class Runner:
@@ -172,16 +180,20 @@ class ReadIpcChannel:
         return self._endpoint.read_collection_page(request, cursor)
 
 
-def owner_endpoint(transport: OwnerTransport | None = None) -> OwnerMutationIpcClient:
+def owner_endpoint(
+    transport: OwnerTransport | None = None, *, clock=lambda: NOW,
+) -> OwnerMutationIpcClient:
     host = transport or OwnerTransport()
     endpoint = OwnerMutationHostEndpoint(
-        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), clock=lambda: NOW,
+        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), clock=clock,
     )
     return OwnerMutationIpcClient(DIGEST, endpoint)
 
 
-def owner_read_endpoint(runner: Runner, matrix: GitHubCapabilityHealth) -> OwnerGitHubReadIpcClient:
-    return OwnerGitHubReadIpcClient(matrix, ReadIpcChannel(GhGitHubAdapter(runner, matrix)))
+def owner_read_endpoint(
+    runner: Runner, matrix: GitHubCapabilityHealth, *, clock=lambda: NOW,
+) -> OwnerGitHubReadIpcClient:
+    return OwnerGitHubReadIpcClient(matrix, ReadIpcChannel(GhGitHubAdapter(runner, matrix, clock=clock)))
 
 
 def sealed_owner_request(*, evaluated_at: datetime = NOW, fresh_until: datetime | None = None) -> OwnerMutationRequest:
@@ -829,11 +841,56 @@ class GitHubRuntimeTests(unittest.TestCase):
                 )
                 transport = OwnerTransport()
                 result = GitHubMutationBroker.with_owner_transport(
-                    owner_read_endpoint(runner, matrix), owner_endpoint(transport),
+                    owner_read_endpoint(runner, matrix, clock=lambda: now), owner_endpoint(transport, clock=lambda: now),
                     journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: now,
                 ).submit(intent, allowed_context(now=now), payload=payload)
                 self.assertTrue(result.ok)
                 self.assertEqual(len(transport.requests), 1)
+
+    def test_credentialed_read_host_rejects_future_and_expired_health_before_runner(self) -> None:
+        """AVAILABLE is insufficient outside the owner-clock validity interval."""
+
+        with self.assertRaises(ValueError):
+            _OwnerGitHubReadHostEndpoint(Runner(), health(GitHubReadOperation.COMMENTS))
+        observed_at = NOW
+        fresh_until = NOW + timedelta(minutes=5)
+        cases = (
+            ("future-observation", observed_at - timedelta(microseconds=1)),
+            ("expiry-boundary", fresh_until),
+        )
+        for name, now in cases:
+            with self.subTest(name=name):
+                runner = Runner(GhCommandResult(0, json.dumps(gh_comments_page())))
+                adapter = GhGitHubAdapter(
+                    runner,
+                    health(GitHubReadOperation.COMMENTS, observed_at=observed_at, fresh_until=fresh_until),
+                    clock=lambda: now,
+                )
+                result = adapter.read(comments_request())
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.STALE_RESPONSE)  # type: ignore[union-attr]
+                self.assertEqual(runner.calls, [])
+
+    def test_mutation_host_rejects_pre_evaluated_and_expired_seals_before_execution(self) -> None:
+        """Host execution is valid only in [evaluated_at, fresh_until)."""
+
+        future = sealed_owner_request(
+            evaluated_at=NOW + timedelta(minutes=1), fresh_until=NOW + timedelta(minutes=6),
+        )
+        expired = sealed_owner_request(
+            evaluated_at=NOW - timedelta(minutes=6), fresh_until=NOW,
+        )
+        for name, request in (("pre-evaluated", future), ("expired", expired)):
+            with self.subTest(name=name):
+                transport = OwnerTransport()
+                host = OwnerMutationHostEndpoint(
+                    InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
+                    OwnerFixedMutationHostExecutor(transport), clock=lambda: NOW,
+                )
+                reply = host.exchange_mutation(OwnerMutationIpcMessage(request))
+                self.assertIsInstance(reply.fact, OwnerMutationFact)
+                self.assertEqual(transport.requests, [])
+                self.assertEqual(transport.commands, [])
 
     def test_production_restart_revalidates_original_freshness_before_any_downstream_call(self) -> None:
         """Restart may read before expiry, but the exact expiry is denied before read/host dispatch."""

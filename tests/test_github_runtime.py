@@ -45,12 +45,14 @@ from roundwright.github_runtime import (
     MutationJournalEntry,
     MutationBrokerContext,
     OwnerMutationFact,
+    OwnerMutationAcceptedFact,
     OwnerMutationRequest,
     OperationHealth,
     SemanticPostcondition,
     SemanticReadback,
     _broker_semantic_plan,
     _complete_broker_read,
+    _validate_created_resource_locator,
     schema_v2_authorization_bundle,
     unavailable_capability_health,
 )
@@ -96,10 +98,24 @@ class OwnerTransport:
         self.accepted = accepted
         self.requests: list[OwnerMutationRequest] = []
 
-    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact:
+    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         self.requests.append(request)
         identity = "sha256:" + hashlib.sha256(json.dumps((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
-        return OwnerMutationFact(self.accepted, identity)
+        if not self.accepted:
+            return OwnerMutationFact(False, identity)
+        locator: CreatedResourceLocator | None = None
+        if request.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+            locator = CreatedResourceLocator(
+                request.operation, request.repository, pull_request_number=58,
+                base_sha=request.base_sha, head_sha=request.head_sha, draft=True,
+                marker_digest=request.marker_digest,
+            )
+        elif request.operation is GitHubMutationOperation.COMMENT:
+            locator = CreatedResourceLocator(
+                request.operation, request.repository, issue_number=request.target_number,
+                comment_id="comment-46", marker_digest=request.marker_digest,
+            )
+        return OwnerMutationAcceptedFact(identity, request.operation, locator)
 
 
 class PagedFakeGitHubAdapter(FakeGitHubAdapter):
@@ -234,6 +250,80 @@ class GitHubRuntimeTests(unittest.TestCase):
         ):
             with self.subTest(locator=locator), self.assertRaises(ValueError):
                 locator()
+
+    def test_owner_accepted_fact_requires_exact_locator_operation(self) -> None:
+        comment = CreatedResourceLocator(
+            GitHubMutationOperation.COMMENT, REPOSITORY, issue_number=46,
+            comment_id="comment-46", marker_digest=COMMENT_DIGEST,
+        )
+        accepted = OwnerMutationAcceptedFact(
+            DIGEST, GitHubMutationOperation.COMMENT, comment,
+        )
+        self.assertEqual(accepted.identity, OwnerMutationAcceptedFact(
+            DIGEST, GitHubMutationOperation.COMMENT, comment,
+        ).identity)
+        self.assertNotEqual(accepted.identity, OwnerMutationAcceptedFact(
+            DIGEST, GitHubMutationOperation.COMMENT, replace(comment, comment_id="comment-47"),
+        ).identity)
+        for fact in (
+            lambda: OwnerMutationFact(True, DIGEST),
+            lambda: OwnerMutationAcceptedFact(DIGEST, GitHubMutationOperation.COMMENT),
+            lambda: OwnerMutationAcceptedFact(
+                DIGEST, GitHubMutationOperation.REQUEST_REVIEW, comment,
+            ),
+        ):
+            with self.subTest(fact=fact), self.assertRaises(ValueError):
+                fact()
+
+    def test_created_resource_locator_binds_to_fixed_request_and_plan(self) -> None:
+        comment_intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "locator-comment-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        comment_request = OwnerMutationRequest(
+            DIGEST, comment_intent.operation, DIGEST, _broker_semantic_plan(comment_intent).identity,
+            DIGEST, REPOSITORY, 46, marker_digest=COMMENT_DIGEST,
+        )
+        comment_locator = CreatedResourceLocator(
+            comment_intent.operation, REPOSITORY, issue_number=46,
+            comment_id="comment-46", marker_digest=COMMENT_DIGEST,
+        )
+        comment_fact = OwnerMutationAcceptedFact(DIGEST, comment_intent.operation, comment_locator)
+        _validate_created_resource_locator(
+            comment_fact, comment_request, comment_intent, _broker_semantic_plan(comment_intent),
+        )
+        for locator in (
+            replace(comment_locator, repository=RepositoryRef("other", "repository")),
+            replace(comment_locator, issue_number=47),
+            replace(comment_locator, marker_digest=DIGEST),
+        ):
+            with self.subTest(locator=locator), self.assertRaises(ValueError):
+                _validate_created_resource_locator(
+                    OwnerMutationAcceptedFact(DIGEST, comment_intent.operation, locator),
+                    comment_request, comment_intent, _broker_semantic_plan(comment_intent),
+                )
+
+        pull_request_intent = GitHubMutationIntent(
+            GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY, "locator-pr-46",
+            target_number=46,
+            payload=(("base_ref", "main"), ("base_sha", BASE), ("body_digest", COMMENT_DIGEST),
+                     ("head_ref", "codex/issue-46"), ("head_sha", SHA), ("title_digest", COMMENT_DIGEST)),
+        )
+        pull_request_request = OwnerMutationRequest(
+            DIGEST, pull_request_intent.operation, DIGEST, _broker_semantic_plan(pull_request_intent).identity,
+            DIGEST, REPOSITORY, base_sha=BASE, head_sha=SHA, marker_digest=COMMENT_DIGEST,
+        )
+        pull_request_locator = CreatedResourceLocator(
+            pull_request_intent.operation, REPOSITORY, pull_request_number=58,
+            base_sha=BASE, head_sha=SHA, draft=True, marker_digest=COMMENT_DIGEST,
+        )
+        for locator in (pull_request_locator, replace(pull_request_locator, base_sha=SHA), replace(pull_request_locator, head_sha=BASE)):
+            fact = OwnerMutationAcceptedFact(DIGEST, pull_request_intent.operation, locator)
+            if locator is pull_request_locator:
+                _validate_created_resource_locator(fact, pull_request_request, pull_request_intent, _broker_semantic_plan(pull_request_intent))
+            else:
+                with self.subTest(locator=locator), self.assertRaises(ValueError):
+                    _validate_created_resource_locator(fact, pull_request_request, pull_request_intent, _broker_semantic_plan(pull_request_intent))
 
     def test_schema_v2_authorization_bundle_is_immutable_and_deterministic(self) -> None:
         bundle = schema_v2_authorization_bundle(allowed_context())

@@ -211,17 +211,34 @@ class OwnerMutationRequest:
     authorization_bundle_identity: str
     semantic_plan_identity: str
     journal_identity: str
+    repository: RepositoryRef
+    target_number: int | None = None
+    base_sha: str | None = None
+    head_sha: str | None = None
+    marker_digest: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.operation) is not GitHubMutationOperation:
             raise GitHubRuntimeError("owner mutation operation is invalid")
+        if type(self.repository) is not RepositoryRef:
+            raise GitHubRuntimeError("owner mutation repository is invalid")
         for value, name in ((self.intent_identity, "owner intent"), (self.authorization_bundle_identity, "owner bundle"), (self.semantic_plan_identity, "owner plan"), (self.journal_identity, "owner journal")):
             _digest(value, name)
+        if self.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+            if any(type(value) is not str or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value) for value in (self.base_sha, self.head_sha)):
+                raise GitHubRuntimeError("owner pull request request sha is invalid")
+            _digest(self.marker_digest, "owner pull request marker")
+        elif self.operation is GitHubMutationOperation.COMMENT:
+            if type(self.target_number) is not int or self.target_number <= 0 or self.base_sha is not None or self.head_sha is not None:
+                raise GitHubRuntimeError("owner comment request target is invalid")
+            _digest(self.marker_digest, "owner comment marker")
+        elif any(value is not None for value in (self.base_sha, self.head_sha, self.marker_digest)):
+            raise GitHubRuntimeError("owner non-allocating request resource evidence is invalid")
 
 
 @dataclass(frozen=True)
 class OwnerMutationFact:
-    """Curated host result; provider output and process status never cross it."""
+    """Curated denial result; accepted results use ``OwnerMutationAcceptedFact``."""
 
     accepted: bool
     request_identity: str
@@ -229,6 +246,8 @@ class OwnerMutationFact:
     def __post_init__(self) -> None:
         if type(self.accepted) is not bool:
             raise GitHubRuntimeError("owner mutation fact is invalid")
+        if self.accepted:
+            raise GitHubRuntimeError("accepted owner fact requires allocation-aware accepted fact")
         _digest(self.request_identity, "owner request")
 
 
@@ -273,10 +292,37 @@ class CreatedResourceLocator:
         }))
 
 
+@dataclass(frozen=True)
+class OwnerMutationAcceptedFact:
+    """Curated accepted result, with an allocation locator when one exists."""
+
+    request_identity: str
+    operation: GitHubMutationOperation
+    created_resource: CreatedResourceLocator | None = None
+    identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _digest(self.request_identity, "owner request")
+        if type(self.operation) is not GitHubMutationOperation:
+            raise GitHubRuntimeError("owner accepted fact operation is invalid")
+        allocates_identity = self.operation in {
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+            GitHubMutationOperation.COMMENT,
+        }
+        if allocates_identity != (type(self.created_resource) is CreatedResourceLocator):
+            raise GitHubRuntimeError("owner accepted fact resource locator is invalid")
+        if self.created_resource is not None and self.created_resource.operation is not self.operation:
+            raise GitHubRuntimeError("owner accepted fact resource locator operation is invalid")
+        object.__setattr__(self, "identity", _sha256((
+            self.request_identity, self.operation.value,
+            self.created_resource.identity if self.created_resource is not None else None,
+        )))
+
+
 class OwnerMutationTransport(Protocol):
     """Deployment-injected fixed protocol; absent transport fails closed."""
 
-    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact: ...
+    def dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact: ...
 
 
 class GhGitHubAdapter:
@@ -1227,6 +1273,41 @@ def _complete_broker_read(
     return result, receipt.identity
 
 
+def _validate_created_resource_locator(
+    fact: OwnerMutationAcceptedFact, request: OwnerMutationRequest,
+    intent: GitHubMutationIntent, plan: BrokerSemanticPlan,
+) -> None:
+    """Bind a curated allocation to the sealed request and broker plan."""
+
+    if fact.operation is not intent.operation or request.operation is not intent.operation:
+        raise GitHubRuntimeError("created resource operation drifted")
+    if plan.operation is not intent.operation or plan.intent_identity != intent.identity():
+        raise GitHubRuntimeError("created resource semantic plan drifted")
+    locator = fact.created_resource
+    if intent.operation not in {
+        GitHubMutationOperation.CREATE_PULL_REQUEST,
+        GitHubMutationOperation.COMMENT,
+    }:
+        if locator is not None:
+            raise GitHubRuntimeError("non-allocating operation returned a resource locator")
+        return
+    if type(locator) is not CreatedResourceLocator or locator.repository != request.repository or locator.repository != intent.repository:
+        raise GitHubRuntimeError("created resource repository drifted")
+    if intent.operation is GitHubMutationOperation.CREATE_PULL_REQUEST:
+        if (
+            locator.base_sha != request.base_sha
+            or locator.head_sha != request.head_sha
+            or locator.marker_digest != request.marker_digest
+            or not locator.draft
+        ):
+            raise GitHubRuntimeError("created pull request locator does not match fixed request")
+    elif (
+        locator.issue_number != request.target_number
+        or locator.marker_digest != request.marker_digest
+    ):
+        raise GitHubRuntimeError("created comment locator does not match fixed request")
+
+
 class _GhBrokerExecutor:
     """Private credential-owning seam; only broker construction creates it."""
 
@@ -1249,13 +1330,27 @@ class _GhBrokerExecutor:
             payload.require_matches(intent)
             if command is not plan.command:
                 raise GitHubRuntimeError("broker command does not match semantic plan")
-            request = OwnerMutationRequest(intent.identity(), intent.operation, bundle.identity, plan.identity, journal_identity)
+            intent_payload = dict(intent.payload)
+            request = OwnerMutationRequest(
+                intent.identity(), intent.operation, bundle.identity, plan.identity, journal_identity,
+                intent.repository, intent.target_number,
+                intent_payload.get("base_sha"), intent_payload.get("head_sha"),
+                intent_payload.get("body_digest"),
+            )
             fact = self.__transport.dispatch(request)
-            if type(fact) is not OwnerMutationFact or fact.request_identity != _sha256((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity)):
+            request_identity = _sha256((request.intent_identity, request.operation.value, request.authorization_bundle_identity, request.semantic_plan_identity, request.journal_identity))
+            if type(fact) is OwnerMutationFact:
+                if fact.request_identity != request_identity:
+                    raise GitHubRuntimeError("owner mutation fact is not bound to request")
+            elif type(fact) is OwnerMutationAcceptedFact:
+                if fact.request_identity != request_identity or fact.operation is not intent.operation:
+                    raise GitHubRuntimeError("owner accepted fact is not bound to request")
+                _validate_created_resource_locator(fact, request, intent, plan)
+            else:
                 raise GitHubRuntimeError("owner mutation fact is not bound to request")
         except GitHubRuntimeError:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "brokered gh mutation payload is invalid"))
-        if not fact.accepted:
+        if type(fact) is OwnerMutationFact and not fact.accepted:
             return GitHubMutationResult(intent, failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "owner mutation transport denied fixed request"))
         return GitHubMutationResult(intent, receipt=_broker_receipt(intent))
 

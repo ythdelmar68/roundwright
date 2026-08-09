@@ -1311,7 +1311,7 @@ class GitHubMutationBroker:
                 self._journal_transition(evidence, JournalLifecycle.AMBIGUOUS)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation requires semantic reconciliation"), reconciliation_required=True)
         assert outcome.receipt is not None
-        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, pre_completeness, post_completeness, outcome.receipt.affected_identity, outcome.receipt.disposition)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, before.snapshot_digest, after.snapshot_digest, pre_completeness, post_completeness, _affected_identity(intent, after), outcome.receipt.disposition)
         self._completed[intent.identity()] = receipt
         if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             self._completed.pop(intent.identity(), None)
@@ -1386,7 +1386,7 @@ class GitHubMutationBroker:
         receipt = self._semantic_receipt(
             intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest,
             completeness, completeness,
-            "reconciled", MutationDisposition.ALREADY_APPLIED,
+            _affected_identity(intent, observed), MutationDisposition.ALREADY_APPLIED,
         )
         if self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "reconciled receipt was not persisted"), reconciliation_required=True)
@@ -1444,7 +1444,7 @@ class GitHubMutationBroker:
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
         if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)
-        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, completeness, completeness, "reconciled", MutationDisposition.ALREADY_APPLIED)
+        receipt = self._semantic_receipt(intent, context, bundle, plan, observed.snapshot_digest, observed.snapshot_digest, completeness, completeness, _affected_identity(intent, observed), MutationDisposition.ALREADY_APPLIED)
         self._completed[intent.identity()] = receipt
         return BrokerMutationResult(receipt=receipt)
 
@@ -1526,6 +1526,16 @@ def _readback_matches(
             and result.failure.kind is GitHubFailureKind.STALE_RESPONSE
         )
     return result.ok and _matches(readback, intent, result.snapshot)
+
+
+def _affected_identity(intent: GitHubMutationIntent, result: GitHubReadResult) -> str:
+    """Bind a receipt to the exact normalized post-state, never a transport label."""
+
+    if type(intent) is not GitHubMutationIntent or type(result) is not GitHubReadResult or not result.ok or result.snapshot is None:
+        raise GitHubRuntimeError("semantic affected identity is unavailable")
+    # The typed snapshot digest commits repository, target, candidate and the
+    # operation-specific normalized fields selected by the broker read-back.
+    return _sha256(("affected", intent.operation.value, intent.repository.slug, intent.target_ref, intent.target_number, result.snapshot_digest))
 
 
 def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str, object]:

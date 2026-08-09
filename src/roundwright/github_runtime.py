@@ -776,7 +776,13 @@ class BrokerMutationResult:
 class JournalLifecycle(StrEnum):
     """Durable mutation states; uncertainty is never a success state."""
 
-    PENDING = "pending"
+    CLAIMED = "claimed"
+    # Compatibility name for persisted journals before the explicit checkpoint
+    # model.  It is deliberately the same state, never an implicit advance.
+    PENDING = "claimed"
+    PRESTATE_CAPTURED = "prestate-captured"
+    EXECUTION_STARTED = "execution-started"
+    TRANSPORT_ACCEPTED = "transport-accepted"
     APPLIED_AWAITING_VERIFICATION = "applied-awaiting-verification"
     VERIFIED = "verified"
     DENIED = "denied"
@@ -806,6 +812,9 @@ class MutationJournalEntry:
     time_identity: str
     lifecycle: JournalLifecycle
     receipt: SemanticMutationReceipt | None = None
+    pre_state_digest: str | None = None
+    pre_state_complete: bool = False
+    pre_state_identity: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.repository) is not str or "/" not in self.repository or type(self.operation) is not GitHubMutationOperation or type(self.idempotency_key) is not str:
@@ -833,6 +842,13 @@ class MutationJournalEntry:
             raise GitHubRuntimeError("mutation journal lifecycle is invalid")
         if (self.lifecycle is JournalLifecycle.VERIFIED) != (type(self.receipt) is SemanticMutationReceipt):
             raise GitHubRuntimeError("mutation journal receipt lifecycle is invalid")
+        if self.pre_state_complete:
+            _digest(self.pre_state_digest, "journal pre-state")
+            _digest(self.pre_state_identity, "journal pre-state identity")
+            if self.pre_state_identity != _sha256((self.intent_identity, self.pre_state_digest)):
+                raise GitHubRuntimeError("journal pre-state identity drifted")
+        elif self.pre_state_digest is not None or self.pre_state_identity is not None:
+            raise GitHubRuntimeError("incomplete journal pre-state evidence")
         if self.receipt is not None and (
             self.receipt.repository != self.repository or self.receipt.operation is not self.operation
             or self.receipt.idempotency_key != self.idempotency_key
@@ -890,6 +906,8 @@ class MutationJournalEntry:
             "command": self.command.value, "semantic_readback_identity": self.semantic_readback_identity,
             "evaluated_at": self.evaluated_at, "fresh_until": self.fresh_until, "time_identity": self.time_identity,
             "lifecycle": self.lifecycle.value,
+            "pre_state_digest": self.pre_state_digest, "pre_state_complete": self.pre_state_complete,
+            "pre_state_identity": self.pre_state_identity,
             "receipt": None if self.receipt is None else self.receipt._payload(),
         }
 
@@ -900,7 +918,7 @@ class MutationJournalEntry:
             "intent_identity", "authorization_bundle_identity", "candidate_sha", "configuration_digest",
             "gate_identity", "semantic_plan_identity", "command", "semantic_readback_identity",
             "evaluated_at", "fresh_until", "time_identity",
-            "lifecycle", "receipt",
+            "lifecycle", "receipt", "pre_state_digest", "pre_state_complete", "pre_state_identity",
         }
         if type(value) is not dict or set(value) != required:
             raise GitHubRuntimeError("mutation journal entry is malformed")
@@ -923,7 +941,7 @@ class MutationJournalEntry:
                 value["target_identity"], value["idempotency_identity"], value["intent_identity"],
                 value["authorization_bundle_identity"], value["candidate_sha"], value["configuration_digest"],
                 value["gate_identity"], value["semantic_plan_identity"], BrokerMutationCommand(value["command"]),
-                value["semantic_readback_identity"], value["evaluated_at"], value["fresh_until"], value["time_identity"], JournalLifecycle(value["lifecycle"]), receipt,
+                value["semantic_readback_identity"], value["evaluated_at"], value["fresh_until"], value["time_identity"], JournalLifecycle(value["lifecycle"]), receipt, value["pre_state_digest"], value["pre_state_complete"], value["pre_state_identity"],
             )
         except (TypeError, ValueError) as error:
             raise GitHubRuntimeError("mutation journal entry is malformed") from error
@@ -961,7 +979,10 @@ class DurableMutationJournal:
         if prior is None or not prior.evidence_matches(evidence):
             raise GitHubRuntimeError("mutation journal evidence is missing or conflicting")
         allowed = {
-            JournalLifecycle.PENDING: {JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.DENIED, JournalLifecycle.FAILED, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.CLAIMED: {JournalLifecycle.PRESTATE_CAPTURED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.DENIED, JournalLifecycle.FAILED, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.PRESTATE_CAPTURED: {JournalLifecycle.EXECUTION_STARTED, JournalLifecycle.DENIED, JournalLifecycle.FAILED},
+            JournalLifecycle.EXECUTION_STARTED: {JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.TRANSPORT_ACCEPTED: {JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.APPLIED_AWAITING_VERIFICATION: {JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.AMBIGUOUS: {JournalLifecycle.VERIFIED},
             JournalLifecycle.VERIFIED: set(), JournalLifecycle.DENIED: set(), JournalLifecycle.FAILED: set(),

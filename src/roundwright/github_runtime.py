@@ -892,7 +892,7 @@ class MutationJournalEntry:
     def evidence_matches(self, other: "MutationJournalEntry") -> bool:
         return type(other) is MutationJournalEntry and all(
             getattr(self, name) == getattr(other, name)
-            for name in self.__dataclass_fields__ if name not in {"lifecycle", "receipt"}
+            for name in self.__dataclass_fields__ if name not in {"lifecycle", "receipt", "pre_state_digest", "pre_state_complete", "pre_state_identity"}
         )
 
     def serialize(self) -> Mapping[str, object]:
@@ -970,7 +970,7 @@ class DurableMutationJournal:
 
     def transition(
         self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
-        receipt: SemanticMutationReceipt | None = None,
+        receipt: SemanticMutationReceipt | None = None, *, pre_state_digest: str | None = None,
     ) -> MutationJournalEntry:
         if type(evidence) is not MutationJournalEntry or type(lifecycle) is not JournalLifecycle:
             raise GitHubRuntimeError("mutation journal transition is invalid")
@@ -982,14 +982,17 @@ class DurableMutationJournal:
             JournalLifecycle.CLAIMED: {JournalLifecycle.PRESTATE_CAPTURED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.DENIED, JournalLifecycle.FAILED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.PRESTATE_CAPTURED: {JournalLifecycle.EXECUTION_STARTED, JournalLifecycle.DENIED, JournalLifecycle.FAILED},
             JournalLifecycle.EXECUTION_STARTED: {JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.AMBIGUOUS},
-            JournalLifecycle.TRANSPORT_ACCEPTED: {JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.TRANSPORT_ACCEPTED: {JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.APPLIED_AWAITING_VERIFICATION: {JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.AMBIGUOUS: {JournalLifecycle.VERIFIED},
             JournalLifecycle.VERIFIED: set(), JournalLifecycle.DENIED: set(), JournalLifecycle.FAILED: set(),
         }
         if lifecycle not in allowed[prior.lifecycle]:
             raise GitHubRuntimeError("mutation journal transition is impossible")
-        updated = replace(prior, lifecycle=lifecycle, receipt=receipt)
+        updated = replace(prior, lifecycle=lifecycle, receipt=receipt) if pre_state_digest is None else replace(
+            prior, lifecycle=lifecycle, receipt=receipt, pre_state_digest=pre_state_digest,
+            pre_state_complete=True, pre_state_identity=_sha256((prior.intent_identity, pre_state_digest)),
+        )
         records[evidence.key] = updated
         self._store(records)
         return updated
@@ -1284,13 +1287,22 @@ class GitHubMutationBroker:
             if evidence is not None and self._journal is not None:
                 self._journal_transition(evidence, JournalLifecycle.FAILED)
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-mutation semantic state is unavailable"))
+        if evidence is not None and self._journal is not None:
+            evidence = self._journal_transition(evidence, JournalLifecycle.PRESTATE_CAPTURED, pre_state_digest=before.snapshot_digest)
+            if evidence is None:
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "pre-state checkpoint was not persisted"))
+            evidence = self._journal_transition(evidence, JournalLifecycle.EXECUTION_STARTED)
+            if evidence is None:
+                return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "execution checkpoint was not persisted"))
         outcome = self._execute(intent, payload, plan, bundle, evidence, now)
         if not outcome.ok:
             if evidence is not None and self._journal is not None:
                 lifecycle = JournalLifecycle.DENIED if outcome.failure is not None and outcome.failure.kind is GitHubFailureKind.POLICY_DENIED else JournalLifecycle.FAILED
                 self._journal_transition(evidence, lifecycle)
             return BrokerMutationResult(failure=outcome.failure or GitHubFailure(GitHubFailureKind.UNAVAILABLE, intent.operation, "mutation outcome is unavailable"))
-        if evidence is not None and self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.APPLIED_AWAITING_VERIFICATION):
+        if evidence is not None and self._journal is not None:
+            evidence = self._journal_transition(evidence, JournalLifecycle.TRANSPORT_ACCEPTED)
+        if evidence is None and self._journal is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "mutation durability is uncertain"), reconciliation_required=True)
         after, post_completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, evidence)
         if not _readback_matches(plan.readback, intent, after):
@@ -1330,11 +1342,11 @@ class GitHubMutationBroker:
 
     def _journal_transition(
         self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
-        receipt: SemanticMutationReceipt | None = None,
+        receipt: SemanticMutationReceipt | None = None, *, pre_state_digest: str | None = None,
     ) -> MutationJournalEntry | None:
         assert self._journal is not None
         try:
-            updated = self._journal.transition(evidence, lifecycle, receipt)
+            updated = self._journal.transition(evidence, lifecycle, receipt, pre_state_digest=pre_state_digest)
         except (AttributeError, TypeError, ValueError):
             return None
         # Reconstruct from the serialized public-safe record before returning:

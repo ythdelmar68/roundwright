@@ -1112,7 +1112,7 @@ def _complete_broker_read(
 ) -> tuple[GitHubReadResult, str]:
     """Read every typed collection page and return its completeness receipt."""
 
-    if request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS}:
+    if request.operation not in {GitHubReadOperation.COMMENTS, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS}:
         result = adapter.read(request)
         return result, _sha256(("not-a-collection", request.identity(), plan.identity))
     read_page = getattr(adapter, "read_collection_page", None)
@@ -1157,6 +1157,8 @@ def _complete_broker_read(
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable")), ""
         for identifier, item in zip(identifiers, collection):
             prior = items.get(identifier)
+            if prior is not None and type(page.snapshot) is RequestedReviewersSnapshot:
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "requested reviewer is duplicated across pages")), ""
             if prior is not None and prior != item:
                 return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection duplicate conflicts")), ""
             if prior is None:
@@ -1168,7 +1170,10 @@ def _complete_broker_read(
     if len(ordered) != first.total_count:
         return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection is incomplete")), ""
     if type(first.snapshot) is CommentsSnapshot:
-        normalized: CommentsSnapshot | ReviewsSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, tuple(ordered))  # type: ignore[arg-type]
+        normalized: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, tuple(ordered))  # type: ignore[arg-type]
+    elif type(first.snapshot) is RequestedReviewersSnapshot:
+        reviewers = tuple(ordered)
+        normalized = RequestedReviewersSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.candidate_sha, reviewers, _sha256(("reviewers", reviewers)), True, None, _sha256(tuple(page.identity for page in pages)))  # type: ignore[arg-type]
     else:
         normalized = ReviewsSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.head_sha, tuple(ordered))  # type: ignore[arg-type]
     result = GitHubReadResult(request, snapshot=normalized)

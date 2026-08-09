@@ -671,6 +671,28 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertIs(stored.lifecycle, JournalLifecycle.PRESTATE_CAPTURED)  # type: ignore[union-attr]
             self.assertEqual(adapter.call_count(kind="mutation"), 0)
 
+    def test_execution_started_crash_recovers_without_second_comment_mutation(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "started-crash-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        evidence = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent))
+        with tempfile.TemporaryDirectory() as directory:
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            def crash(entry: MutationJournalEntry) -> None:
+                if entry.lifecycle is JournalLifecycle.EXECUTION_STARTED:
+                    raise RuntimeError("crash")
+            with self.assertRaises(RuntimeError):
+                GitHubMutationBroker(adapter, journal=journal, checkpoint_observer=crash).submit(intent, context)
+            stored = journal.find(evidence)
+            self.assertIs(stored.lifecycle, JournalLifecycle.EXECUTION_STARTED)  # type: ignore[union-attr]
+            self.assertTrue(stored.pre_state_complete)  # type: ignore[union-attr]
+            self.assertEqual(adapter.call_count(kind="mutation"), 0)
+            restart = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            result = GitHubMutationBroker(restart, journal=DurableMutationJournal(Path(directory) / "journal.json")).submit(intent, context)
+            self.assertTrue(result.ok)
+            self.assertEqual(restart.call_count(kind="mutation"), 0)
+            self.assertEqual(result.receipt.pre_state_digest, stored.pre_state_digest)  # type: ignore[union-attr]
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

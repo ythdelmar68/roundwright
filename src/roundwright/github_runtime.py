@@ -981,7 +981,7 @@ class DurableMutationJournal:
         allowed = {
             JournalLifecycle.CLAIMED: {JournalLifecycle.PRESTATE_CAPTURED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.DENIED, JournalLifecycle.FAILED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.PRESTATE_CAPTURED: {JournalLifecycle.EXECUTION_STARTED, JournalLifecycle.DENIED, JournalLifecycle.FAILED},
-            JournalLifecycle.EXECUTION_STARTED: {JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.AMBIGUOUS},
+            JournalLifecycle.EXECUTION_STARTED: {JournalLifecycle.TRANSPORT_ACCEPTED, JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.TRANSPORT_ACCEPTED: {JournalLifecycle.APPLIED_AWAITING_VERIFICATION, JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.APPLIED_AWAITING_VERIFICATION: {JournalLifecycle.VERIFIED, JournalLifecycle.AMBIGUOUS},
             JournalLifecycle.AMBIGUOUS: {JournalLifecycle.VERIFIED},

@@ -1347,7 +1347,7 @@ class GitHubMutationBroker:
             completeness, completeness,
             "reconciled", MutationDisposition.ALREADY_APPLIED,
         )
-        if not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
+        if self._journal is not None and not self._journal_transition(evidence, JournalLifecycle.VERIFIED, receipt):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "reconciled receipt was not persisted"), reconciliation_required=True)
         self._completed[intent.identity()] = receipt
         return BrokerMutationResult(receipt=receipt)

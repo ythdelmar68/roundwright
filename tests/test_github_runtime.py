@@ -601,6 +601,32 @@ class GitHubRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MutationJournalEntry.deserialize(encoded)
 
+    def test_recovery_at_fresh_until_minus_one_microsecond_reads(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "fresh-boundary-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        initial = allowed_context()
+        bundle, plan = schema_v2_authorization_bundle(initial), _broker_semantic_plan(intent)
+        entry = MutationJournalEntry.from_evidence(intent, initial, bundle, plan)
+        now = NOW + timedelta(minutes=5) - timedelta(microseconds=1)
+        context = replace(initial, evaluated_at=now)
+        adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+        broker = GitHubMutationBroker(adapter, clock=lambda: now)
+        result = broker._reconcile_journal(intent, context, bundle, plan, entry, entry)
+        self.assertTrue(result.ok)
+        self.assertEqual(adapter.call_count(kind="read"), 1)
+
+    def test_recovery_at_fresh_until_denies_without_calls(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "expired-boundary-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        initial = allowed_context()
+        bundle, plan = schema_v2_authorization_bundle(initial), _broker_semantic_plan(intent)
+        entry = MutationJournalEntry.from_evidence(intent, initial, bundle, plan)
+        now = NOW + timedelta(minutes=5)
+        context = replace(initial, evaluated_at=now)
+        adapter = FakeGitHubAdapter()
+        broker = GitHubMutationBroker(adapter, clock=lambda: now)
+        result = broker._reconcile_journal(intent, context, bundle, plan, entry, entry)
+        self.assertFalse(result.ok)
+        self.assertEqual(adapter.call_count(), 0)
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

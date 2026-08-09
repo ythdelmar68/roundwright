@@ -218,8 +218,8 @@ def health(
     )
 
 
-def comments_request() -> GitHubReadRequest:
-    return GitHubReadRequest(GitHubReadOperation.COMMENTS, REPOSITORY, number=46)
+def comments_request(number: int = 46) -> GitHubReadRequest:
+    return GitHubReadRequest(GitHubReadOperation.COMMENTS, REPOSITORY, number=number)
 
 
 def reviews_request() -> GitHubReadRequest:
@@ -230,6 +230,7 @@ def comments_payload() -> dict[str, object]:
     return {
         "repository": {"owner": "example", "name": "roundwright"},
         "issue_number": 46,
+        "target_kind": "ISSUE",
         "comments": [{"id": "comment-46", "author_id": "owner-1", "body": "curated evidence", "created_at": "2026-08-07T00:00:00Z"}],
     }
 
@@ -393,14 +394,20 @@ def pull_request_payload(
     }
 
 
-def gh_comments_page(*, present: bool = True, next_cursor: str | None = None, total: int | None = None, identifier: str = "comment-46") -> dict[str, object]:
+def gh_comments_page(
+    *, present: bool = True, next_cursor: str | None = None, total: int | None = None,
+    identifier: str = "comment-46", identifiers: tuple[str, ...] | None = None,
+    target_kind: str = "Issue", number: int = 46, repository: str = "example/roundwright",
+) -> dict[str, object]:
     count = (1 if present else 0) if total is None else total
+    owner, name = repository.split("/", 1)
+    comment_identifiers = identifiers if identifiers is not None else ((identifier,) if present else ())
     return {
         "data": {"repository": {
-            "name": "roundwright", "owner": {"login": "example"},
-            "issue": {"number": 46, "comments": {
+            "name": name, "owner": {"login": owner},
+            "issueOrPullRequest": {"__typename": target_kind, "number": number, "comments": {
                 "totalCount": count,
-                "nodes": ([] if not present else [{"id": identifier, "author": {"__typename": "User", "login": "OctoCat"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"}]),
+                "nodes": [{"id": item, "author": {"__typename": "User", "login": "OctoCat"}, "body": "curated evidence", "createdAt": "2026-08-07T00:00:00Z"} for item in comment_identifiers],
                 "pageInfo": {"hasNextPage": next_cursor is not None, "endCursor": next_cursor},
             }},
         }},
@@ -444,7 +451,7 @@ def comments_page(
     request: GitHubReadRequest | None = None,
 ) -> CollectionPage:
     actual_request = request or comments_request()
-    return CollectionPage(actual_request, cursor, next_cursor, total, CommentsSnapshot(REPOSITORY, 46, items))
+    return CollectionPage(actual_request, cursor, next_cursor, total, CommentsSnapshot(REPOSITORY, 46, "ISSUE", items))
 
 
 def allowed_context(
@@ -1766,7 +1773,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             ("Bot", "dependabot[bot]", "bot:dependabot[bot]"),
         ):
             page = gh_comments_page()
-            page["data"]["repository"]["issue"]["comments"]["nodes"][0]["author"] = {  # type: ignore[index]
+            page["data"]["repository"]["issueOrPullRequest"]["comments"]["nodes"][0]["author"] = {  # type: ignore[index]
                 "__typename": actor_type, "login": login,
             }
             with self.subTest(actor_type=actor_type):
@@ -1796,7 +1803,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         import json
 
         malformed_comment = gh_comments_page()
-        malformed_comment["data"]["repository"]["issue"]["comments"]["nodes"][0]["author"] = {"__typename": "Team", "login": "core"}  # type: ignore[index]
+        malformed_comment["data"]["repository"]["issueOrPullRequest"]["comments"]["nodes"][0]["author"] = {"__typename": "Team", "login": "core"}  # type: ignore[index]
         wrong_repository = gh_comments_page()
         wrong_repository["data"]["repository"]["owner"]["login"] = "other"  # type: ignore[index]
         malformed_review = gh_reviews_page()
@@ -1839,12 +1846,73 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(runner.calls), 2)
                 self.assertTrue(any("cursor=cursor-1" in argument for argument in runner.calls[1]))
 
+    def test_native_comments_read_pr_conversation_with_provider_ordered_opaque_ids(self) -> None:
+        """A PR conversation is an Issue-or-PullRequest target, not ``issue``."""
+
+        import json
+
+        request = comments_request(58)
+        first = gh_comments_page(
+            number=58, target_kind="PullRequest", identifiers=("opaque-z", "opaque-a"),
+            total=3, next_cursor="cursor-1",
+        )
+        terminal = gh_comments_page(
+            number=58, target_kind="PullRequest", identifiers=("opaque-m",), total=3,
+        )
+        runner = Runner(
+            GhCommandResult(0, json.dumps(first)), GhCommandResult(0, json.dumps(terminal)),
+        )
+        result = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS)).read(request)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.snapshot.target_kind, "PULL_REQUEST")  # type: ignore[union-attr]
+        self.assertEqual(
+            tuple(item.comment_id for item in result.snapshot.comments),  # type: ignore[union-attr]
+            ("opaque-z", "opaque-a", "opaque-m"),
+        )
+        query = next(value for value in runner.calls[0] if value.startswith("query="))
+        self.assertIn("issueOrPullRequest(number:$number)", query)
+        self.assertIn("... on Issue", query)
+        self.assertIn("... on PullRequest", query)
+        self.assertNotIn(" issue(number:$number)", query)
+        self.assertTrue(any("cursor=cursor-1" in argument for argument in runner.calls[1]))
+
+    def test_native_comments_reject_target_pagination_and_identity_drift(self) -> None:
+        """Provider page order is preserved; all identity/completeness defects fail closed."""
+
+        import json
+
+        request = comments_request()
+        missing_cursor = gh_comments_page(next_cursor="cursor-1", total=2)
+        missing_cursor["data"]["repository"]["issueOrPullRequest"]["comments"]["pageInfo"]["endCursor"] = None  # type: ignore[index]
+        malformed_target = gh_comments_page(target_kind="Discussion")
+        target_drift = gh_comments_page(number=47, total=2, identifier="opaque-b")
+        type_drift = gh_comments_page(target_kind="PullRequest", total=2, identifier="opaque-b")
+        repository_drift = gh_comments_page(repository="other/repository", total=2, identifier="opaque-b")
+        cases = (
+            ("duplicate-within-page", [gh_comments_page(identifiers=("opaque-a", "opaque-a"), total=2)]),
+            ("duplicate", [gh_comments_page(next_cursor="cursor-1", total=2, identifier="opaque-a"), gh_comments_page(total=2, identifier="opaque-a")]),
+            ("number-drift", [gh_comments_page(next_cursor="cursor-1", total=2, identifier="opaque-a"), target_drift]),
+            ("target-kind-drift", [gh_comments_page(next_cursor="cursor-1", total=2, identifier="opaque-a"), type_drift]),
+            ("repository-drift", [gh_comments_page(next_cursor="cursor-1", total=2, identifier="opaque-a"), repository_drift]),
+            ("cursor-cycle", [gh_comments_page(next_cursor="loop", total=2, identifier="opaque-a"), gh_comments_page(next_cursor="loop", total=2, identifier="opaque-b")]),
+            ("incomplete-total", [gh_comments_page(total=2, identifier="opaque-a")]),
+            ("truncated-continuation", [missing_cursor]),
+            ("malformed-target", [malformed_target]),
+        )
+        for name, pages in cases:
+            with self.subTest(name=name):
+                runner = Runner(*(GhCommandResult(0, json.dumps(page)) for page in pages))
+                result = GhGitHubAdapter(runner, health(GitHubReadOperation.COMMENTS)).read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]
+
     def test_native_collection_reads_reject_pagination_drift_duplicates_and_limits(self) -> None:
         import json
 
         requested = GitHubReadRequest(GitHubReadOperation.REQUESTED_REVIEWERS, REPOSITORY, number=46, expected_sha=SHA)
         missing_cursor = gh_comments_page(next_cursor="cursor-1", total=2)
-        missing_cursor["data"]["repository"]["issue"]["comments"]["pageInfo"]["endCursor"] = None  # type: ignore[index]
+        missing_cursor["data"]["repository"]["issueOrPullRequest"]["comments"]["pageInfo"]["endCursor"] = None  # type: ignore[index]
         review_drift = gh_reviews_page(total=2, identifier="review-47")
         review_drift["data"]["repository"]["pullRequest"]["headRefOid"] = BASE  # type: ignore[index]
         requested_drift = gh_requested_reviewers_page("octocat", total=2)

@@ -1925,7 +1925,7 @@ def _broker_semantic_plan(intent: GitHubMutationIntent) -> BrokerSemanticPlan:
 
 def _collection_snapshot_payload(snapshot: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot) -> tuple[object, ...]:
     if type(snapshot) is CommentsSnapshot:
-        return ("comments", snapshot.repository.slug, snapshot.issue_number, tuple((item.comment_id, item.author_id, item.body_digest, item.created_at) for item in snapshot.comments))
+        return ("comments", snapshot.repository.slug, snapshot.issue_number, snapshot.target_kind, tuple((item.comment_id, item.author_id, item.body_digest, item.created_at) for item in snapshot.comments))
     if type(snapshot) is ReviewsSnapshot:
         return ("reviews", snapshot.repository.slug, snapshot.pull_request_number, snapshot.head_sha, tuple((item.review_id, item.reviewer_id, item.state.value, item.commit_sha) for item in snapshot.reviews))
     if type(snapshot) is RequestedReviewersSnapshot:
@@ -1943,32 +1943,45 @@ def _normalize_complete_collection_pages(
     first = pages[0]
     items: dict[str, object] = {}
     ordered: list[object] = []
-    last_unique_identifier: str | None = None
     for page in pages:
         if type(page.snapshot) is RequestedReviewersSnapshot:
             if page.snapshot.repository != first.snapshot.repository or page.snapshot.pull_request_number != first.snapshot.pull_request_number or page.snapshot.candidate_sha != first.snapshot.candidate_sha:
                 return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "requested reviewer page identity drifted"))
             collection = page.snapshot.reviewers
             identifiers = list(collection)
+        elif type(page.snapshot) is CommentsSnapshot:
+            if (
+                type(first.snapshot) is not CommentsSnapshot
+                or page.snapshot.repository != first.snapshot.repository
+                or page.snapshot.issue_number != first.snapshot.issue_number
+                or page.snapshot.target_kind != first.snapshot.target_kind
+            ):
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "comment page identity drifted"))
+            collection = page.snapshot.comments
+            identifiers = [item.comment_id for item in collection]
         else:
+            if (
+                type(first.snapshot) is not ReviewsSnapshot
+                or page.snapshot.repository != first.snapshot.repository
+                or page.snapshot.pull_request_number != first.snapshot.pull_request_number
+                or page.snapshot.head_sha != first.snapshot.head_sha
+            ):
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "review page identity drifted"))
             collection = page.snapshot.comments if type(page.snapshot) is CommentsSnapshot else page.snapshot.reviews
             identifiers = [item.comment_id if type(page.snapshot) is CommentsSnapshot else item.review_id for item in collection]
-        if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
-            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable"))
+        if len(identifiers) != len(set(identifiers)):
+            return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection identifier is duplicated"))
         for identifier, item in zip(identifiers, collection):
             prior = items.get(identifier)
             if prior is not None:
                 return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection identifier is duplicated"))
             if prior is None:
-                if last_unique_identifier is not None and identifier <= last_unique_identifier:
-                    return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable"))
                 items[identifier] = item
                 ordered.append(item)
-                last_unique_identifier = identifier
     if len(ordered) != first.total_count:
         return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection is incomplete"))
     if type(first.snapshot) is CommentsSnapshot:
-        normalized: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, tuple(ordered))  # type: ignore[arg-type]
+        normalized: CommentsSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot = CommentsSnapshot(first.snapshot.repository, first.snapshot.issue_number, first.snapshot.target_kind, tuple(ordered))  # type: ignore[arg-type]
     elif type(first.snapshot) is RequestedReviewersSnapshot:
         reviewers = tuple(ordered)
         normalized = RequestedReviewersSnapshot(first.snapshot.repository, first.snapshot.pull_request_number, first.snapshot.candidate_sha, reviewers, _sha256(("reviewers", reviewers)), True, None, _sha256(tuple(page.identity for page in pages)))  # type: ignore[arg-type]
@@ -3152,12 +3165,12 @@ def _project_gh_response(request: GitHubReadRequest, raw: object) -> Mapping[str
     if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
         raise GitHubRuntimeError("issue reads require native relationship composition")
     if operation is GitHubReadOperation.COMMENTS:
-        if type(raw) is dict and "data" in raw:
-            projected, next_cursor, _ = _project_gh_collection_page(request, raw)
-            if next_cursor is not None:
-                raise GitHubRuntimeError("gh comment response is not terminal")
-            return projected
-        return {"repository": repository, "issue_number": request.number, "comments": [{"id": _raw_id(item, "id"), "author_id": _raw_id(_raw_mapping(item.get("user")), "id"), "body": _raw_text(item, "body"), "created_at": _raw_text(item, "created_at")} for item in _raw_collection(raw, "comments")]}
+        if type(raw) is not dict or "data" not in raw:
+            raise GitHubRuntimeError("gh comment response must use the native target connection")
+        projected, next_cursor, _ = _project_gh_collection_page(request, raw)
+        if next_cursor is not None:
+            raise GitHubRuntimeError("gh comment response is not terminal")
+        return projected
     if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
         item = _raw_mapping(raw)
         name = _raw_text(item, "name")
@@ -3250,7 +3263,7 @@ def _project_gh_collection_page(
         or _raw_text(graph_repository, "name") != request.repository.name
     ):
         raise GitHubRuntimeError("gh collection repository does not match request")
-    target_key = "issue" if request.operation is GitHubReadOperation.COMMENTS else "pullRequest"
+    target_key = "issueOrPullRequest" if request.operation is GitHubReadOperation.COMMENTS else "pullRequest"
     target = _raw_mapping(graph_repository.get(target_key))
     if _raw_integer(target, "number") != request.number:
         raise GitHubRuntimeError("gh collection target does not match request")
@@ -3276,10 +3289,17 @@ def _project_gh_collection_page(
     nodes = connection.get("nodes")
     if type(nodes) is not list:
         raise GitHubRuntimeError("gh collection nodes are malformed")
-    repository = {"owner": request.repository.owner, "name": request.repository.name}
+    repository = {"owner": _raw_text(owner, "login"), "name": _raw_text(graph_repository, "name")}
     if request.operation is GitHubReadOperation.COMMENTS:
+        target_kind = _raw_text(target, "__typename")
+        if target_kind == "Issue":
+            normalized_target_kind = "ISSUE"
+        elif target_kind == "PullRequest":
+            normalized_target_kind = "PULL_REQUEST"
+        else:
+            raise GitHubRuntimeError("gh comment target kind is malformed")
         projected = {
-            "repository": repository, "issue_number": request.number,
+            "repository": repository, "issue_number": _raw_integer(target, "number"), "target_kind": normalized_target_kind,
             output_name: [
                 {"id": _raw_id(_raw_mapping(node), "id"),
                  "author_id": _raw_actor_identity(_raw_mapping(node).get("author")),
@@ -3488,7 +3508,7 @@ def _collection_read_command(request: GitHubReadRequest, cursor: str | None) -> 
     """
 
     if request.operation is GitHubReadOperation.COMMENTS:
-        target = "issue(number:$number){number comments(first:100,after:$cursor){totalCount nodes{id author{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login}} body createdAt} pageInfo{hasNextPage endCursor}}}"
+        target = "issueOrPullRequest(number:$number){__typename ... on Issue{number comments(first:100,after:$cursor){totalCount nodes{id author{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login}} body createdAt} pageInfo{hasNextPage endCursor}}} ... on PullRequest{number comments(first:100,after:$cursor){totalCount nodes{id author{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login}} body createdAt} pageInfo{hasNextPage endCursor}}}}"
     elif request.operation is GitHubReadOperation.REVIEWS:
         target = "pullRequest(number:$number){number headRefOid reviews(first:100,after:$cursor){totalCount nodes{id author{__typename ... on User{login} ... on Bot{login} ... on Organization{login} ... on Mannequin{login}} state commit{oid}} pageInfo{hasNextPage endCursor}}}"
     else:

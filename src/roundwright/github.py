@@ -229,12 +229,15 @@ class CommentSnapshot:
 class CommentsSnapshot:
     repository: RepositoryRef
     issue_number: int
+    target_kind: str
     comments: tuple[CommentSnapshot, ...]
 
     def __post_init__(self) -> None:
         if type(self.repository) is not RepositoryRef:
             raise GitHubContractError("comments repository is invalid")
         _validate_number(self.issue_number, "issue number")
+        if type(self.target_kind) is not str or self.target_kind not in {"ISSUE", "PULL_REQUEST"}:
+            raise GitHubContractError("comments target kind is invalid")
         if type(self.comments) is not tuple or any(type(item) is not CommentSnapshot for item in self.comments):
             raise GitHubContractError("comments snapshot is invalid")
         _unique((item.comment_id for item in self.comments), "comment identities")
@@ -739,8 +742,8 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
                 _integer_tuple(response, "sub_issue_numbers"),
             )
         if operation is GitHubReadOperation.COMMENTS:
-            _exact_shape(response, {"repository", "issue_number", "comments"})
-            return CommentsSnapshot(_repository(response), _integer(response, "issue_number"), tuple(CommentSnapshot(_string(item, "id"), _string(item, "author_id"), _digest_text(_string(item, "body")), _string(item, "created_at")) for item in _mappings(response, "comments", {"id", "author_id", "body", "created_at"})))
+            _exact_shape(response, {"repository", "issue_number", "target_kind", "comments"})
+            return CommentsSnapshot(_repository(response), _integer(response, "issue_number"), _string(response, "target_kind"), tuple(CommentSnapshot(_string(item, "id"), _string(item, "author_id"), _digest_text(_string(item, "body")), _string(item, "created_at")) for item in _mappings(response, "comments", {"id", "author_id", "body", "created_at"})))
         if operation is GitHubReadOperation.BRANCH:
             _exact_shape(response, {"repository", "ref", "sha"})
             return BranchSnapshot(_repository(response), _string(response, "ref"), _string(response, "sha"))

@@ -58,7 +58,7 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.REPOSITORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "default_branch_sha": SHA, "repository_evidence_identity": DIGEST, "default_branch_evidence_identity": READBACK_DIGEST},
             GitHubReadOperation.ISSUE: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
             GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
-            GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
+            GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "target_kind": "ISSUE", "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
             GitHubReadOperation.BRANCH: {"repository": repository, "ref": "main", "sha": SHA},
             GitHubReadOperation.PULL_REQUEST: {"repository": repository, "base_repository": repository, "head_repository": repository, "id": "pr-40", "number": 40, "state": "OPEN", "base_ref": "main", "base_sha": SHA, "head_ref": "codex/issue-40", "head_sha": SHA, "draft": True, "merge_commit_sha": None},
             GitHubReadOperation.REVIEWS: {"repository": repository, "pull_request_number": 40, "head_sha": SHA, "reviews": [{"id": "review-1", "reviewer_id": "reviewer-1", "state": "APPROVED", "commit_sha": SHA}]},
@@ -98,7 +98,7 @@ class GitHubAdapterTests(unittest.TestCase):
 
     def test_response_shapes_fail_closed_without_preserving_comment_bodies(self) -> None:
         request = self.request(GitHubReadOperation.COMMENTS)
-        fake = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response={"repository": {"owner": "example", "name": "roundwright"}, "issue_number": 40, "comments": [{"id": "comment-1"}]})})
+        fake = FakeGitHubAdapter({request.identity(): FakeGitHubScenario(response={"repository": {"owner": "example", "name": "roundwright"}, "issue_number": 40, "target_kind": "ISSUE", "comments": [{"id": "comment-1"}]})})
         result = fake.read(request)
         self.assertFalse(result.ok)
         self.assertEqual(result.failure.kind, GitHubFailureKind.MALFORMED_RESPONSE)  # type: ignore[union-attr]

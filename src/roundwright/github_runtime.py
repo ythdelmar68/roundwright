@@ -1145,8 +1145,14 @@ def _complete_broker_read(
     ordered: list[object] = []
     last_unique_identifier: str | None = None
     for page in pages:
-        collection = page.snapshot.comments if type(page.snapshot) is CommentsSnapshot else page.snapshot.reviews
-        identifiers = [item.comment_id if type(page.snapshot) is CommentsSnapshot else item.review_id for item in collection]
+        if type(page.snapshot) is RequestedReviewersSnapshot:
+            if page.snapshot.repository != first.snapshot.repository or page.snapshot.pull_request_number != first.snapshot.pull_request_number or page.snapshot.candidate_sha != first.snapshot.candidate_sha:
+                return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "requested reviewer page identity drifted")), ""
+            collection = page.snapshot.reviewers
+            identifiers = list(collection)
+        else:
+            collection = page.snapshot.comments if type(page.snapshot) is CommentsSnapshot else page.snapshot.reviews
+            identifiers = [item.comment_id if type(page.snapshot) is CommentsSnapshot else item.review_id for item in collection]
         if identifiers != sorted(identifiers) or len(identifiers) != len(set(identifiers)):
             return GitHubReadResult(request, failure=GitHubFailure(GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "collection ordering is unstable")), ""
         for identifier, item in zip(identifiers, collection):

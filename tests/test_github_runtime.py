@@ -628,6 +628,22 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(adapter.call_count(), 0)
 
+    def test_comment_recovery_blocks_unstarted_and_reads_started_provenance(self) -> None:
+        intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "comment-state-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
+        context = allowed_context()
+        bundle, plan = schema_v2_authorization_bundle(context), _broker_semantic_plan(intent)
+        claimed = MutationJournalEntry.from_evidence(intent, context, bundle, plan)
+        for state in (JournalLifecycle.CLAIMED, JournalLifecycle.PRESTATE_CAPTURED):
+            adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+            result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, claimed, replace(claimed, lifecycle=state))
+            self.assertFalse(result.ok)
+            self.assertEqual(adapter.call_count(), 0)
+        started = replace(claimed, lifecycle=JournalLifecycle.EXECUTION_STARTED)
+        adapter = FakeGitHubAdapter({comments_request().identity(): FakeGitHubScenario(response=comments_payload())})
+        result = GitHubMutationBroker(adapter)._reconcile_journal(intent, context, bundle, plan, started, started)
+        self.assertTrue(result.ok)
+        self.assertNotEqual(result.receipt.affected_identity, "reconciled")  # type: ignore[union-attr]
+
     def test_journal_verified_receipt_is_reused_across_restart_without_adapter_calls(self) -> None:
         intent = GitHubMutationIntent(GitHubMutationOperation.COMMENT, REPOSITORY, "journal-reuse-46", target_number=46, payload=(("body_digest", COMMENT_DIGEST),))
         request = comments_request()

@@ -1331,13 +1331,18 @@ class GitHubMutationBroker:
     def _journal_transition(
         self, evidence: MutationJournalEntry, lifecycle: JournalLifecycle,
         receipt: SemanticMutationReceipt | None = None,
-    ) -> bool:
+    ) -> MutationJournalEntry | None:
         assert self._journal is not None
         try:
-            self._journal.transition(evidence, lifecycle, receipt)
+            updated = self._journal.transition(evidence, lifecycle, receipt)
         except (AttributeError, TypeError, ValueError):
-            return False
-        return True
+            return None
+        # Reconstruct from the serialized public-safe record before returning:
+        # callers never retain an in-memory value that was not durably stored.
+        try:
+            return MutationJournalEntry.deserialize(updated.serialize())
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def _reconcile_journal(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext,

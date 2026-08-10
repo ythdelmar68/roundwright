@@ -35,15 +35,24 @@ class ValidationToolchainTests(unittest.TestCase):
             shutil.copy2(CI / name, ci / name)
         return ci / "validation-toolchain.lock.toml"
 
-    def fake_receipt(self, cache: Path) -> tuple[Path, dict[str, object]]:
+    def fake_receipt(
+        self,
+        cache: Path,
+        *,
+        validation_python_symlink: bool = False,
+    ) -> tuple[Path, dict[str, object]]:
         root = toolchain.toolchain_root(cache, self.lock, self.identity)
         uv = root / "uv" / ("uv.exe" if sys.platform == "win32" else "uv")
         managed = root / "python" / ("python.exe" if sys.platform == "win32" else "python")
         python = root / "build-env" / ("python.exe" if sys.platform == "win32" else "python")
         pipx = root / "uv-tools" / "pipx" / ("pipx.exe" if sys.platform == "win32" else "pipx")
-        for index, path in enumerate((uv, managed, python, pipx), 1):
+        tools = (uv, managed, pipx) if validation_python_symlink else (uv, managed, python, pipx)
+        for index, path in enumerate(tools, 1):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"tool-{index}".encode("ascii"))
+        if validation_python_symlink:
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.symlink_to(Path("..") / "python" / managed.name)
         document = toolchain.create_receipt(
             root,
             self.lock,
@@ -68,7 +77,7 @@ class ValidationToolchainTests(unittest.TestCase):
         receipt.write_text(json.dumps(document, sort_keys=True), encoding="ascii")
 
     def test_tracked_lock_pins_every_supported_platform_and_hashed_input(self) -> None:
-        self.assertEqual(self.lock.resolver_revision, 2)
+        self.assertEqual(self.lock.resolver_revision, 3)
         self.assertEqual(self.lock.uv_version, "0.12.3")
         self.assertEqual(self.lock.python_version, "3.12.13")
         self.assertEqual(self.lock.pip_version, "26.1.2")
@@ -168,6 +177,37 @@ class ValidationToolchainTests(unittest.TestCase):
             self.rewrite_receipt(receipt, changed)
             with self.assertRaisesRegex(toolchain.ToolchainError, "path is invalid"):
                 toolchain.verify_receipt(receipt, self.lock, self.identity, read_back=False)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows venv launchers are not symlinks")
+    def test_receipt_preserves_in_root_tool_symlink_and_rejects_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            receipt, document = self.fake_receipt(
+                parent / "cache",
+                validation_python_symlink=True,
+            )
+            resolved = toolchain.verify_receipt(receipt, self.lock, self.identity, read_back=False)
+            expected = receipt.parent / Path(document["tools"]["python"]["path"])
+            self.assertEqual(resolved.python, expected)
+            self.assertTrue(resolved.python.is_symlink())
+            self.assertNotEqual(resolved.python, resolved.python.resolve())
+
+            outside = parent / "outside-python"
+            outside.write_bytes(b"outside")
+            escaping = receipt.parent / "escaping-python"
+            escaping.symlink_to(outside)
+            value = {
+                "path": escaping.name,
+                "version": self.lock.python_version,
+                "sha256": toolchain.file_sha256(outside),
+            }
+            with self.assertRaisesRegex(toolchain.ToolchainError, "is unavailable"):
+                toolchain._receipt_tool(
+                    receipt.parent,
+                    value,
+                    self.lock.python_version,
+                    "escaping Python",
+                )
 
     def test_read_back_requires_every_locked_version(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

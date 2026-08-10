@@ -389,12 +389,13 @@ def _receipt_tool(root: Path, value: object, expected_version: str, label: str) 
     relative = PurePosixPath(_string(item["path"], f"{label} path"))
     if relative.is_absolute() or ".." in relative.parts or "." in relative.parts:
         _fail(f"{label} path is invalid")
+    command = root / Path(*relative.parts)
     try:
-        command = (root / Path(*relative.parts)).resolve(strict=True)
-        command.relative_to(root.resolve(strict=True))
+        target = command.resolve(strict=True)
+        target.relative_to(root.resolve(strict=True))
     except (FileNotFoundError, ValueError) as error:
         raise ToolchainError(f"{label} is unavailable") from error
-    if not command.is_file() or file_sha256(command) != _sha256(item["sha256"], f"{label} digest"):
+    if not command.is_file() or file_sha256(target) != _sha256(item["sha256"], f"{label} digest"):
         _fail(f"{label} digest does not match")
     return command
 

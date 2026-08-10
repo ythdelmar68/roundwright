@@ -68,7 +68,7 @@ class ValidationToolchainTests(unittest.TestCase):
         receipt.write_text(json.dumps(document, sort_keys=True), encoding="ascii")
 
     def test_tracked_lock_pins_every_supported_platform_and_hashed_input(self) -> None:
-        self.assertEqual(self.lock.resolver_revision, 1)
+        self.assertEqual(self.lock.resolver_revision, 2)
         self.assertEqual(self.lock.uv_version, "0.12.3")
         self.assertEqual(self.lock.python_version, "3.12.13")
         self.assertEqual(self.lock.pip_version, "26.1.2")
@@ -76,6 +76,19 @@ class ValidationToolchainTests(unittest.TestCase):
         self.assertEqual(self.lock.pipx_version, "1.16.6")
         self.assertEqual(set(self.lock.uv_artifacts), set(toolchain.SUPPORTED_PLATFORMS))
         self.assertTrue(self.lock.digest.startswith("sha256:"))
+
+    def test_tracked_validation_inputs_are_canonical_lf(self) -> None:
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+        self.assertIn("ci/validation-* text eol=lf", attributes)
+        for path in (
+            self.lock.path,
+            self.lock.build_requirements,
+            self.lock.pipx_requirements,
+            CI / "validation-build.in",
+            CI / "validation-toolchain.in",
+        ):
+            with self.subTest(path=path.name):
+                self.assertNotIn(b"\r\n", path.read_bytes())
 
     def test_lock_rejects_missing_extra_and_drifted_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -166,8 +179,20 @@ class ValidationToolchainTests(unittest.TestCase):
                 self.lock.pipx_version,
                 f"{self.lock.pip_version} {self.lock.setuptools_version}",
             ]
-            with mock.patch.object(toolchain, "_read_back", side_effect=expected):
+            with mock.patch.object(toolchain, "_read_back", side_effect=expected) as read_back:
                 toolchain.verify_receipt(receipt, self.lock, self.identity)
+            self.assertEqual(
+                read_back.call_args_list[-1].args[0],
+                [
+                    str(receipt.parent / "build-env" / ("python.exe" if sys.platform == "win32" else "python")),
+                    "-I",
+                    "-c",
+                    toolchain.BUILD_TOOL_VERSION_PROBE,
+                ],
+            )
+            self.assertIn("importlib.metadata", toolchain.BUILD_TOOL_VERSION_PROBE)
+            self.assertNotIn("import pip", toolchain.BUILD_TOOL_VERSION_PROBE)
+            self.assertNotIn("import setuptools", toolchain.BUILD_TOOL_VERSION_PROBE)
             stale = list(expected)
             stale[3] = "0.0.0"
             with mock.patch.object(toolchain, "_read_back", side_effect=stale):

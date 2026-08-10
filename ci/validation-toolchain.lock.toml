@@ -1,7 +1,7 @@
 schema = "roundwright-validation-toolchain-lock/v1"
 
 [contract]
-resolver_revision = 1
+resolver_revision = 2
 receipt_schema = "roundwright-validation-toolchain-receipt/v1"
 
 [python]

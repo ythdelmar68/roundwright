@@ -16,6 +16,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from validation_toolchain import (
+    BUILD_TOOL_VERSION_PROBE,
     ToolchainError,
     ValidationToolchainLock,
     create_receipt,
@@ -204,9 +205,12 @@ def _provision(root: Path, lock: ValidationToolchainLock) -> Path:
     for command in (managed_python, python):
         if _run([str(command), "-I", "-c", python_probe], environment=environment, cwd=root) != expected_python:
             raise ToolchainError("provisioned Python version does not match")
-    build_probe = "import pip, setuptools; print(pip.__version__, setuptools.__version__)"
     expected_build = f"{lock.pip_version} {lock.setuptools_version}"
-    if _run([str(python), "-I", "-c", build_probe], environment=environment, cwd=root) != expected_build:
+    if _run(
+        [str(python), "-I", "-c", BUILD_TOOL_VERSION_PROBE],
+        environment=environment,
+        cwd=root,
+    ) != expected_build:
         raise ToolchainError("provisioned build tool versions do not match")
     if _run([str(pipx), "--version"], environment=environment, cwd=root) != lock.pipx_version:
         raise ToolchainError("provisioned pipx version does not match")

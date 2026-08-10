@@ -16,6 +16,10 @@ from typing import NoReturn
 
 LOCK_SCHEMA = "roundwright-validation-toolchain-lock/v1"
 RECEIPT_SCHEMA = "roundwright-validation-toolchain-receipt/v1"
+BUILD_TOOL_VERSION_PROBE = (
+    "from importlib.metadata import version; "
+    "print(version('pip'), version('setuptools'))"
+)
 SUPPORTED_PLATFORMS = frozenset(
     {
         "windows-x86_64",
@@ -491,8 +495,10 @@ def verify_receipt(
                 _fail(f"{label} read-back version is stale")
         if _read_back([str(pipx), "--version"], "pipx") != lock.pipx_version:
             _fail("pipx read-back version is stale")
-        build_probe = "import pip, setuptools; print(pip.__version__, setuptools.__version__)"
-        if _read_back([str(python), "-I", "-c", build_probe], "build tools") != f"{lock.pip_version} {lock.setuptools_version}":
+        if _read_back(
+            [str(python), "-I", "-c", BUILD_TOOL_VERSION_PROBE],
+            "build tools",
+        ) != f"{lock.pip_version} {lock.setuptools_version}":
             _fail("build tool read-back version is stale")
 
     return ResolvedToolchain(

@@ -1,0 +1,59 @@
+schema = "roundwright-validation-toolchain-lock/v1"
+
+[contract]
+resolver_revision = 1
+receipt_schema = "roundwright-validation-toolchain-receipt/v1"
+
+[python]
+implementation = "cpython"
+version = "3.12.13"
+
+[build]
+pip_version = "26.1.2"
+setuptools_version = "83.0.0"
+requirements = "ci/validation-build.requirements.txt"
+requirements_sha256 = "8a5ccef6470afbef1c6a0b8f1f883c77cd45df905511dd08a816f0cf5a861b33"
+
+[pipx]
+version = "1.16.6"
+requirements = "ci/validation-toolchain.requirements.txt"
+requirements_sha256 = "0d6a6a98638070570be7401bcfb821c41556bb478d86d53347a213ecacd412d6"
+
+[uv]
+version = "0.12.3"
+
+[uv.artifacts.windows-x86_64]
+filename = "uv-x86_64-pc-windows-msvc.zip"
+format = "zip"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip"
+sha256 = "b23350c79e8ad0192b8124af13a0f17e8d4e4549524785e1aef389ae5a06990e"
+
+[uv.artifacts.windows-aarch64]
+filename = "uv-aarch64-pc-windows-msvc.zip"
+format = "zip"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-pc-windows-msvc.zip"
+sha256 = "4343217d668727b8a8eb5cad92389a1d2eeead93c89940d1b955ba1bb15462eb"
+
+[uv.artifacts.macos-x86_64]
+filename = "uv-x86_64-apple-darwin.tar.gz"
+format = "tar.gz"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-apple-darwin.tar.gz"
+sha256 = "4c9f52262a14da336e4a42ed24992d12d0c956acde87619e4611d321dffa602b"
+
+[uv.artifacts.macos-aarch64]
+filename = "uv-aarch64-apple-darwin.tar.gz"
+format = "tar.gz"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-apple-darwin.tar.gz"
+sha256 = "546f7f8a6c70ff13a3a9d2bc958db3427298cebf3e0cb756f9177133b7068843"
+
+[uv.artifacts.linux-x86_64]
+filename = "uv-x86_64-unknown-linux-gnu.tar.gz"
+format = "tar.gz"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-unknown-linux-gnu.tar.gz"
+sha256 = "600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"
+
+[uv.artifacts.linux-aarch64]
+filename = "uv-aarch64-unknown-linux-gnu.tar.gz"
+format = "tar.gz"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-unknown-linux-gnu.tar.gz"
+sha256 = "bb66cb52e7b1823aed1183630d8d8e5c958840d584a4c55ec10a4cfc168dcca2"

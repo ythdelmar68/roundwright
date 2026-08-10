@@ -457,7 +457,9 @@ def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot
     """Resolve the fixture configuration without invoking repository discovery commands."""
 
     return resolve_dispatch_configuration(
-        cwd=Path(os.__file__).resolve().parent,
+        # A repo-local Python makes os.__file__ a descendant of the checkout.
+        # The filesystem root is stable across interpreter installation layouts.
+        cwd=Path(repository.root.anchor),
         environment={},
         home=repository.root,
         trusted_policy_snapshot=trusted_policy_snapshot,

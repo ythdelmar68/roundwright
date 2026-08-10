@@ -39,7 +39,14 @@ class PackageArtifactTests(unittest.TestCase):
                 ROOT,
                 source,
                 ignore=shutil.ignore_patterns(
-                    ".git", "build", "dist", ".venv", "__pycache__", "*.egg-info"
+                    ".git",
+                    ".pytest_cache",
+                    ".roundlet",
+                    "build",
+                    "dist",
+                    ".venv",
+                    "__pycache__",
+                    "*.egg-info",
                 ),
             )
             wheels = workspace / "wheels"

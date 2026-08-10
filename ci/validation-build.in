@@ -1,0 +1,3 @@
+# Build and install-test tooling executed by the receipt-bound Python.
+pip==26.1.2
+setuptools==83.0.0

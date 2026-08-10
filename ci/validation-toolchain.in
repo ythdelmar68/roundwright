@@ -1,0 +1,2 @@
+# Regenerate validation-toolchain.requirements.txt with the locked uv release.
+pipx==1.16.6

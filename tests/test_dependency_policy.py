@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 import unittest
+
+# Keep this contract test independently runnable from the repository root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.dependency_policy import (
     ComponentPolicy,
@@ -32,19 +37,19 @@ class DependencyPolicyTests(unittest.TestCase):
         return DependencyPolicy(
             digest(revision), 30,
             (
-                ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("b")),
-                ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange(provider_minimum, "2.0.0"), "registry/codex-sdk", digest("c")),
-                ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("d")),
-                ComponentPolicy(DependencyComponent.BUILD_BACKEND, "setuptools", VersionRange("69.0.0", "70.0.0"), "pypi/setuptools", digest("e")),
-                ComponentPolicy(DependencyComponent.OPTIONAL_ADAPTER, "jira-adapter", VersionRange("1.0.0", "2.0.0"), "pypi/jira-adapter", digest("f")),
+                ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("b"), digest("1")),
+                ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange(provider_minimum, "2.0.0"), "registry/codex-sdk", digest("c"), digest("2")),
+                ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("d"), digest("3")),
+                ComponentPolicy(DependencyComponent.BUILD_BACKEND, "setuptools", VersionRange("69.0.0", "70.0.0"), "pypi/setuptools", digest("e"), digest("4")),
+                ComponentPolicy(DependencyComponent.OPTIONAL_ADAPTER, "jira-adapter", VersionRange("1.0.0", "2.0.0"), "pypi/jira-adapter", digest("f"), digest("5")),
             ),
             transition or PolicyTransition(PolicyTransitionKind.INITIAL, None, None),
         )
 
-    def observation(self, policy: DependencyPolicy, component: DependencyComponent, *, version: str | None = None, observed_at: int = 100, policy_digest: str | None = None, artifact: str | None = None) -> ObservedDependency:
+    def observation(self, policy: DependencyPolicy, component: DependencyComponent, *, version: str | None = None, observed_at: int = 100, policy_digest: str | None = None, artifact: str | None = None, executable: str | None = None) -> ObservedDependency:
         expected = policy.component(component)
         assert expected is not None
-        return ObservedDependency(component, expected.identifier, version or expected.versions.minimum, expected.source_identity, artifact or expected.artifact_digest, digest("9"), observed_at, policy_digest or policy.policy_digest)
+        return ObservedDependency(component, expected.identifier, version or expected.versions.minimum, expected.source_identity, artifact or expected.artifact_digest, executable or expected.executable_digest, observed_at, policy_digest or policy.policy_digest)
 
     def requirement(self, *components: DependencyComponent, stage: DependencyStage = DependencyStage.DISPATCH) -> StageRequirement:
         return StageRequirement(stage, components)
@@ -77,6 +82,12 @@ class DependencyPolicyTests(unittest.TestCase):
         policy = self.policy(); required = self.requirement(DependencyComponent.PROVIDER_RUNTIME)
         decision = evaluate_dependency_preflight(policy, (self.observation(policy, DependencyComponent.PROVIDER_RUNTIME, version="2.0.0"),), required, now=100)
         self.assertEqual((decision.outcome, decision.reason), (DependencyDecisionOutcome.BLOCKED, "dependency version is unsupported"))
+
+    def test_changed_executable_digest_blocks_even_when_all_other_identity_is_current(self) -> None:
+        policy = self.policy(); required = self.requirement(DependencyComponent.GITHUB_CLI)
+        changed = self.observation(policy, DependencyComponent.GITHUB_CLI, executable=digest("0"))
+        decision = evaluate_dependency_preflight(policy, (changed,), required, now=100)
+        self.assertEqual((decision.outcome, decision.reason), (DependencyDecisionOutcome.BLOCKED, "dependency executable identity does not match policy"))
 
     def test_duplicate_component_records_fail_closed(self) -> None:
         policy = self.policy(); required = self.requirement(DependencyComponent.PACKAGE)
@@ -112,7 +123,7 @@ class DependencyPolicyTests(unittest.TestCase):
 
     def test_copilot_is_neither_a_policy_component_nor_runtime_probe(self) -> None:
         with self.assertRaises(DependencyPolicyError):
-            ComponentPolicy(DependencyComponent.OPTIONAL_ADAPTER, "copilot-sdk", VersionRange("1.0.0", "2.0.0"), "registry/copilot", digest("a"))
+            ComponentPolicy(DependencyComponent.OPTIONAL_ADAPTER, "copilot-sdk", VersionRange("1.0.0", "2.0.0"), "registry/copilot", digest("a"), digest("b"))
 
     def test_reviewed_upgrade_and_rollback_are_independent(self) -> None:
         previous = self.policy(revision="a", provider_minimum="1.2.0")

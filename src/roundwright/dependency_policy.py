@@ -77,13 +77,14 @@ class ComponentPolicy:
     versions: VersionRange
     source_identity: str
     artifact_digest: str
+    executable_digest: str
 
     def __post_init__(self) -> None:
         if type(self.component) is not DependencyComponent or not _safe_identifier(self.identifier):
             raise DependencyPolicyError("dependency component policy is invalid")
         if "copilot" in self.identifier or type(self.versions) is not VersionRange:
             raise DependencyPolicyError("dependency component policy is invalid")
-        if not _safe_identifier(self.source_identity) or not _is_digest(self.artifact_digest):
+        if not _safe_identifier(self.source_identity) or not _is_digest(self.artifact_digest) or not _is_digest(self.executable_digest):
             raise DependencyPolicyError("dependency component policy is invalid")
 
 
@@ -293,6 +294,8 @@ def _validate_observation(policy: DependencyPolicy, expected: ComponentPolicy, o
         return "dependency provenance time is invalid"
     if (observed.identifier, observed.source_identity, observed.artifact_digest) != (expected.identifier, expected.source_identity, expected.artifact_digest):
         return "dependency identity does not match policy"
+    if observed.executable_digest != expected.executable_digest:
+        return "dependency executable identity does not match policy"
     if not expected.versions.contains(observed.version):
         return "dependency version is unsupported"
     return None

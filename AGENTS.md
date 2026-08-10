@@ -7,6 +7,12 @@
 - Read and use [Conventional Branch](https://conventional-branch.github.io/) to create descriptive branch names.
 - Update `.gitignore` for new build artifacts or dependencies.
 
+## Roundwright issue planning
+
+Before creating, splitting, or materially rescoping an actionable Roundwright
+leaf or standalone issue, read and use
+[`$create-roundwright-leaf`](.agents/skills/create-roundwright-leaf/SKILL.md).
+
 ## External validation routing
 
 Before a task or gate that may require external credentials, cross-environment

@@ -115,7 +115,10 @@ change the toolchain receipt, grant runtime authority, or permit a remote gate.
 `.roundlet/validation-tools/` is a host-owned reusable repository cache, not
 run-owned state. Normal Roundlet stop, reconcile, cleanup, or worktree removal
 must not delete it. CI may cache the same directory using a key derived from the
-tracked lock and requirements.
+tracked lock and requirements. Windows CI provisions a fresh cache for each job
+because uv's managed-Python compatibility junction is not portable through
+`actions/cache`; restoring that junction can make an otherwise valid receipt
+tree unreadable. Linux and macOS CI may restore the keyed cache.
 
 A missing cache may be provisioned. A directory without `receipt.json` is an
 incomplete cache and fails closed. `provision --rebuild` may remove and recreate

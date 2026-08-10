@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Roundwright Leaf"
+  short_description: "Create and schedule canonical Roundwright leaves"
+  default_prompt: "Use $create-roundwright-leaf to create or reschedule a Roundwright leaf and reconcile its umbrella."

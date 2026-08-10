@@ -63,6 +63,22 @@ gate must produce and bind its own exact fresh evidence.
 
 ## Routing decision
 
+Issue planning uses Roundwright's repository vocabulary while generic Roundlet
+core uses phase-neutral route names. Translate them without changing their
+authority:
+
+| Roundwright leaf | Generic Roundlet route | Target use |
+| --- | --- | --- |
+| `none` | `none` | No external toolbox or target. |
+| `harness` | `toolbox` | Use the exact selected execution toolbox only. |
+| `harness+forward-test` | `toolbox+disposable-target` | Use the exact selected toolbox and approved disposable target. |
+
+The repository-owned leaf skill chooses and records this route. Roundlet may
+mechanically fill selection-time identities from current reviewed policy, but
+must not infer missing authority. A route declaration does not select a
+credential, authorize a live call or mutation, or make a future candidate SHA
+knowable during issue creation.
+
 | Gate or work class | External validation | Required immutable selection | Evidence and authority boundary |
 | --- | --- | --- | --- |
 | Hermetic Roundwright tests | `none` | Roundwright candidate only | Local deterministic test evidence; no external credential, toolbox, or target. |

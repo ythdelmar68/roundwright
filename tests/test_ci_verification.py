@@ -69,6 +69,14 @@ class CiVerificationTests(unittest.TestCase):
         self.assertLess(workflow.index(provision), workflow.index(build))
         self.assertNotIn('setuptools>=69" pipx uv', workflow)
 
+    def test_workflow_does_not_restore_nonportable_windows_junctions(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        cache_step = """- name: Restore portable validation toolchain cache
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4"""
+        self.assertIn(cache_step, workflow)
+        self.assertIn("path: .roundlet/validation-tools", workflow)
+
     def test_pipx_route_forces_pip_and_uses_one_offline_no_dependency_pair(self) -> None:
         verifier = load_install_verifier()
         environment = verifier.pipx_environment({"PIP_NO_INDEX": "1", "PIP_NO_DEPS": "1"})

@@ -55,9 +55,11 @@ change the Phase 2 boundaries or authority matrix below.
 | 6+ — release/publication | A separate owner decision authorizes release preparation. | Release-specific checks and public artifacts. | Criteria defined by that separate decision. | This roadmap grants none. | Authorize each release/publication action separately. |
 
 The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
-then #40, #41, #42, #59, #46, and #47. Issue #59 completes the canonical
-schema v2 mutation vocabulary and authority-block isolation before the live
-broker can continue. The Phase 3 qualification result may produce
+then #40, #41, #42, #59, #46, planning correction #65, and #47. Issue #59
+completes the canonical schema v2 mutation vocabulary and authority-block
+isolation before the live broker can continue. Issue #65 installs the
+repository-owned leaf-planning transaction and migrates the remaining open
+leaves before dispatch resumes. The Phase 3 qualification result may produce
 `PROMOTION_READY` only; it cannot start a canary.
 
 Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for

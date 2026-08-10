@@ -1,52 +1,44 @@
-# Leaf issue planning template
+# Leaf issue planning contract
 
-Use this template for every new actionable leaf. It supplements the applicable
-umbrella's dependency order; it does not make an umbrella a dependency or grant
-authority. Consult the [qualification test infrastructure](qualification-test-infrastructure.md)
+The selectable GitHub body scaffold is
+[`.github/ISSUE_TEMPLATE/roundwright-leaf.md`](../../.github/ISSUE_TEMPLATE/roundwright-leaf.md).
+Agents must use the repository-scoped
+[`$create-roundwright-leaf`](../../.agents/skills/create-roundwright-leaf/SKILL.md)
+workflow when creating, splitting, materially rescoping, or migrating an
+actionable issue. The template supplies fields; the skill owns the live GitHub
+transaction, scheduling reconciliation, and read-back behavior.
+
+The template does not make an umbrella a dependency or grant authority. Read
+the live owning umbrella's canonical scheduling note and the
+[qualification test infrastructure](qualification-test-infrastructure.md)
 before selecting external validation.
 
-```markdown
-Parent: #<umbrella-or-none>
+## Common priority-leaf rule
 
-## Purpose
+P0, P1, and P2 leaves follow the same rule. Each transaction updates the owning
+umbrella's exact required implementation order, dependency-matrix row,
+cross-prerequisites, and downstream gate impact, plus any other umbrella whose
+queue or gate changes. Priority determines placement and impact, not whether
+reconciliation is required.
 
-<bounded product purpose>
+A correction leaf attaches to the umbrella whose contract it repairs and
+updates every affected queue or gate. A truly standalone issue has no parent
+and never lists an umbrella as a dependency; it still updates affected
+umbrellas if it blocks or reorders their leaves.
 
-## Dependencies
+## Planning and execution identities
 
-- <exact leaf or standalone issue numbers only>
+Issue planning records the minimum validation route and the rules for selecting
+exact identities. It must not guess a future candidate SHA. At execution time,
+Roundlet binds the exact current base, candidate, harness, forward-test target,
+environment, case, and contract identities required by reviewed policy. A
+floating ref is never evidence.
 
-## External validation declaration
-
-- External validation: `none` | `harness` | `harness+forward-test`
-- Gate/evidence class: <hermetic, live read-only provider, hosted read-only,
-  remote lifecycle/mutation, or cross-environment/canary>
-- Owner input/login required: `no` | `yes, only in the approved harness`
-- Exact candidate/target identity: Roundwright base/candidate `<40-hex>`;
-  harness `<40-hex>` when selected; forward-test `<40-hex>` when selected;
-  declared environment and approved mutation scope when applicable. Never use
-  a floating ref.
-- Public-safe evidence boundary: <allowed commit/case/digest/result/read-back
-  fields>; no credentials, tokens, raw payloads/prose/logs, or private paths.
-
-## Shadow impact
-
-- Shadow cycle: <required / N/A with reason>
-- Canonical references: <exact documents/issues>
-- Exact evidence and comparison identity: <candidate, case, digest, result>
-
-## Acceptance criteria
-
-- [ ] <typed, bounded, candidate-bound conditions>
-
-## Boundaries and non-goals
-
-- <authority, phase, mutation, and deferred-work limits>
-```
-
-The declaration is a routing and evidence record. It never authorizes a live
-provider call, remote mutation, promotion, or a change to the disabled
-Roundwright authority surface.
+The external-validation declaration is a routing and evidence record. It never
+authorizes a live provider call, remote mutation, promotion, or a change to the
+disabled Roundwright authority surface. A new or materially changed issue stays
+`BLOCKED_SCHEDULING` until formal hierarchy, umbrella state, leaf body, and all
+affected downstream gates are written and read back consistently.
 
 If a leaf adds a `GitHubMutationOperation`, that same reviewed change must add
 exactly one canonical `RepositoryMutationOperation`, exactly one strict

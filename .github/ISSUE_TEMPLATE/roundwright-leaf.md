@@ -24,6 +24,8 @@ Planning transaction state: `BLOCKED_SCHEDULING`
 
 - External validation: `none` | `harness` | `harness+forward-test`
 - Generic Roundlet route: `none` | `toolbox` | `toolbox+disposable-target`
+- External validation execution skill: `$run-roundwright-external-validation`
+- Historical replay time: immutable bundle `ready_at` | `not applicable`
 - Gate/evidence class: <hermetic, live read-only provider, hosted read-only,
   remote lifecycle/read-only, remote lifecycle/mutation, or cross-environment/canary>
 - Mutation mode: <no mutation, read-only observation, or exact policy-bounded

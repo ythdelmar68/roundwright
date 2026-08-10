@@ -124,5 +124,7 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertEqual(value["receipt_digests"], [item["receipt_digest"] for item in value["receipts"]])
         self.assertEqual(len(set(value["receipt_digests"])), len(value["receipt_digests"]))
         replayed = rehydrate_live_provider_health_evidence(value)
-        self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=100).outcome, ComparisonOutcome.MATCH)
+        capture_time = value["ready_at"]
+        self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=capture_time).outcome, ComparisonOutcome.MATCH)
+        self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=capture_time + 10_000).outcome, ComparisonOutcome.INVALID)
         self.assertFalse(any(marker in lines[0].lower() for marker in ("secret-token", "c:/private", "payload", "_backend", "0x")))

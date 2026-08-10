@@ -11,7 +11,10 @@ transaction, scheduling reconciliation, and read-back behavior.
 The template does not make an umbrella a dependency or grant authority. Read
 the live owning umbrella's canonical scheduling note and the
 [qualification test infrastructure](qualification-test-infrastructure.md)
-before selecting external validation.
+before selecting external validation. The planning skill records the minimum
+route; the repository-owned
+[`$run-roundwright-external-validation`](../../.agents/skills/run-roundwright-external-validation/SKILL.md)
+skill owns execution, recovery, and historical replay.
 
 ## Common priority-leaf rule
 
@@ -34,11 +37,18 @@ Roundlet binds the exact current base, candidate, harness, forward-test target,
 environment, case, and contract identities required by reviewed policy. A
 floating ref is never evidence.
 
-The external-validation declaration is a routing and evidence record. It never
-authorizes a live provider call, remote mutation, promotion, or a change to the
-disabled Roundwright authority surface. A new or materially changed issue stays
-`BLOCKED_SCHEDULING` until formal hierarchy, umbrella state, leaf body, and all
-affected downstream gates are written and read back consistently.
+Every declaration names `$run-roundwright-external-validation` and records
+whether historical replay uses immutable bundle `ready_at` or is not
+applicable. A current wall-clock timestamp is never a substitute for captured
+evidence time.
+
+The external-validation declaration is a routing and evidence record. The
+standing Booleans in authoritative root policy remove repetitive approval only
+for a mechanically conforming selected route; the declaration alone never
+authorizes a credential, provider call, target mutation, promotion, or change
+to the disabled Roundwright authority surface. A new or materially changed
+issue stays `BLOCKED_SCHEDULING` until formal hierarchy, umbrella state, leaf
+body, and all affected downstream gates are written and read back consistently.
 
 If a leaf adds a `GitHubMutationOperation`, that same reviewed change must add
 exactly one canonical `RepositoryMutationOperation`, exactly one strict

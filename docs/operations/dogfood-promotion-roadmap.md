@@ -25,7 +25,7 @@ clean itself.
 | Mode | Meaning | Repository mutation | Exit only when |
 | --- | --- | --- | --- |
 | `SHADOW_ONLY` | Replay production-shaped, immutable inputs and compare results. | None; Shadow is always read-only. | The required read-only evidence is retained and a qualification issue records its assessment. |
-| `FORWARD_TEST_CANARY` | A bounded, owner-authorized experiment in the controlled forward-test repository. | Only the exact actions separately enabled for that repository. Never Roundwright production authority. | The bounded experiment is reconciled, read back, and rolled back or explicitly advanced by the owner. |
+| `FORWARD_TEST_CANARY` | A bounded experiment selected by an exact Phase 4-or-later leaf under reviewed standing authority. | Only the leaf/target-policy intersection in the controlled forward-test repository. Never Roundwright production authority. | The bounded experiment is reconciled, read back, and rolled back or advanced through the next reviewed phase gate. |
 | `CROSS_ENV_CANARY` | The controlled experiment is repeated across declared environments. | Only the same bounded forward-test authority. | Cross-environment evidence is complete, comparable, and owner-reviewed. |
 | `PROMOTION_READY` | Evidence is sufficient to request a promotion decision. | No new authority; this mode does not activate anything. | An allowlisted owner records a candidate-bound activation or rejection decision. |
 | `ACTIVE` | A later external, owner-approved transition has made one declared runtime authoritative. | Only explicit, externally verified, current authority. | A superseding owner decision moves the runtime to recovery or replacement. |
@@ -38,29 +38,34 @@ this Phase 3 document does not establish it.
 ## External qualification routing
 
 The [qualification test infrastructure](qualification-test-infrastructure.md)
-is the single source for selecting the external execution toolbox and, when a
-remote mutation is separately approved, the disposable target. Every gate
-pins an exact candidate and exact infrastructure commits; a floating branch or
-`main` reference is never evidence. The document is routing-only and does not
-change the Phase 2 boundaries or authority matrix below.
+is the single source for selecting the external execution toolbox and public
+disposable target. Root `AGENTS.md` owns independent standing read-only and
+disposable-target mutation Booleans; the repository execution skill applies
+them only to an exact conforming leaf. Every gate pins an exact candidate and
+exact infrastructure commits; a floating branch or `main` reference is never
+evidence. These contracts do not activate Roundwright or widen the phase and
+repository boundaries below.
 
 ## Phase plan
 
 | Phase | Entry criteria | Work and required evidence | Exit criteria | Authority and rollback | Owner decision |
 | --- | --- | --- | --- | --- | --- |
 | 2 — substrate | Hermetic single-task baseline is defined. | Isolated-package, local-Git, restart, and adversarial-path evidence. | #26 and #27 are closed; no external-runtime claim. | No Roundwright mutation authority; return to blocked local diagnosis on failure. | None; Phase 2 does not promote. |
-| 3 — contracts | Phase 2 evidence is complete. | Roadmap, immutable Shadow protocol, typed contracts, fail-closed Boolean policy, provider health, receipts, provenance, and qualification evidence. | Every Phase 3 P0 leaf and qualification issue pass on the exact candidate; Shadow remains read-only. | Roundlet remains authoritative for Roundwright. Rollback means stop the candidate, preserve evidence, and resume `SHADOW_ONLY` or `DORMANT_RECOVERY`. | Decide only whether a bounded Phase 4 forward-test canary may be attempted. |
-| 4 — controlled canary | An owner explicitly authorizes a bounded controlled forward-test scope after Phase 3 qualification. | Forward-test and cross-environment canary evidence, read-back, semantic receipts, and rollback rehearsal. | Every stated environment has matching evidence or a recorded owner rejection. | Roundlet remains the Roundwright authority. The forward-test repository is limited to its approved scope. Disable its switches and reconcile on failure. | Approve, reject, or constrain a Phase 5 promotion evaluation. |
+| 3 — contracts | Phase 2 evidence is complete. | Roadmap, immutable Shadow protocol, typed contracts, fail-closed Boolean policy, provider health, receipts, provenance, and qualification evidence. | Every Phase 3 P0 leaf and qualification issue pass on the exact candidate; Shadow and any forward-target observation remain read-only. | Roundlet remains authoritative for Roundwright. Rollback means stop the candidate, preserve evidence, and resume `SHADOW_ONLY` or `DORMANT_RECOVERY`. | No fresh per-attempt approval for conforming read-only routes; Phase 3 never performs Canary mutation. |
+| 4 — controlled canary | Phase 3 qualification is complete and an exact leaf-scoped forward-test route matches standing and target authority. | Forward-test and cross-environment canary evidence, read-back, semantic receipts, and rollback rehearsal. | Every stated environment has matching evidence or a recorded blocked/rejected disposition. | Roundlet remains the Roundwright authority. The public forward-test repository is limited to the exact leaf/target-policy intersection. Disable the affected route and reconcile on failure. | Approve, reject, or constrain a Phase 5 promotion evaluation. |
 | 5 — promotion evaluation | Controlled-canary evidence is complete and comparable. | Legacy parity, retention, maintenance, cleanup eligibility, final promotion evidence, and Roundlet stop/reconciliation plan. | An owner has a complete, candidate-bound evidence bundle; no automatic transition occurs. | No dual dispatch: any replacement requires stopping and reconciling Roundlet before a successor can dispatch. Roll back to `DORMANT_RECOVERY` on uncertainty. | Make the external self-hosting/activation decision, or reject it. |
 | 6+ — release/publication | A separate owner decision authorizes release preparation. | Release-specific checks and public artifacts. | Criteria defined by that separate decision. | This roadmap grants none. | Authorize each release/publication action separately. |
 
 The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
-then #40, #41, #42, #59, #46, planning correction #65, and #47. Issue #59
+then #40, #41, #42, #59, #46, planning correction #65, external-validation
+correction #67, and #47. Issue #59
 completes the canonical schema v2 mutation vocabulary and authority-block
 isolation before the live broker can continue. Issue #65 installs the
 repository-owned leaf-planning transaction and migrates the remaining open
-leaves before dispatch resumes. The Phase 3 qualification result may produce
-`PROMOTION_READY` only; it cannot start a canary.
+leaves before dispatch resumes. Issue #67 adopts reviewed generic Roundlet
+routing, standing repository authority, repo-owned execution mechanics, and
+capture-time replay. The Phase 3 qualification result may produce
+`PROMOTION_READY` only; it cannot start a Canary by itself.
 
 Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for
 canary and cross-environment work; Phase 5 for operations, migration, and
@@ -91,9 +96,9 @@ of authority.
 | Stage | Roundwright repository | Controlled forward-test repository | Shadow | Decision record |
 | --- | --- | --- | --- | --- |
 | Phase 2 | Roundlet is sole mutation-capable Orchestrator; Roundwright is non-authoritative. | Not authorized. | N/A for execution. | Closed Phase 2 leaves. |
-| Phase 3 | Roundlet remains sole mutation-capable Orchestrator. The Roundwright Boolean block is disabled. | Not authorized; no canary. | Permanent read-only replay and comparison. | Exact-candidate qualification evidence. |
-| Phase 4 | Roundlet remains sole authority for Roundwright. | May perform only an allowlisted, owner-approved, bounded canary. | Read-only regression check; no dispatch. | Owner's canary authorization and each read-back receipt. |
-| Phase 5 | Roundlet remains sole authority until it is stopped and reconciled by a later owner-approved transition. | May remain bounded only while its explicit authorization is current. | Read-only regression check and retained comparison history. | Candidate-bound promotion or rejection decision. |
+| Phase 3 | Roundlet remains sole mutation-capable Orchestrator. The Roundwright Boolean block is disabled. | Read-only observation only; no Canary mutation. | Permanent read-only replay and comparison. | Exact-candidate qualification evidence. |
+| Phase 4 | Roundlet remains sole authority for Roundwright. | May perform only an exact leaf-scoped, standing-policy and target-policy allowlisted bounded Canary. | Read-only regression check; no Roundwright dispatch. | Standing authority identity, exact leaf contract, and each semantic read-back receipt. |
+| Phase 5 | Roundlet remains sole authority until it is stopped and reconciled by a later owner-approved transition. | May remain bounded only while the standing policy and exact selected route remain current. | Read-only regression check and retained comparison history. | Candidate-bound promotion or rejection decision. |
 | After a transition | Exactly one declared authoritative dispatcher; Roundlet is dormant or recovery-only if replaced. | Disabled unless separately re-authorized. | Permanent read-only regression layer. | External owner-reviewed authority transition. |
 
 Two repositories must never have two dispatchers for the same authority. The
@@ -118,5 +123,7 @@ candidate-authored evidence denies the next mutation and returns to
 curated reports, disables the relevant authority switches, stops the affected
 dispatcher, and requires reconciliation before any new owner decision.
 
-No mode authorizes a Canary by default. No document in this repository is an
-activation receipt, and no candidate can issue its own receipt.
+No mode or route starts a Canary by default. Standing authority becomes usable
+only through an exact eligible leaf and target-policy intersection. No document
+in this repository is a Roundwright activation receipt, and no candidate can
+issue its own receipt.

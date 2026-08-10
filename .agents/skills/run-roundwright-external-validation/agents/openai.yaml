@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Roundwright External Validation"
+  short_description: "Execute pinned Roundwright external validation safely"
+  default_prompt: "Use $run-roundwright-external-validation to execute a declared Roundwright external gate with exact bindings and read-back."

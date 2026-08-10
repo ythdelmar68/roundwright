@@ -13,13 +13,11 @@ Before creating, splitting, or materially rescoping an actionable Roundwright
 leaf or standalone issue, read and use
 [`$create-roundwright-leaf`](.agents/skills/create-roundwright-leaf/SKILL.md).
 
-## External validation routing
+## Roundwright external validation
 
-Before a task or gate that may require external credentials, cross-environment
-execution, or remote GitHub lifecycle testing, read
-[`docs/operations/qualification-test-infrastructure.md`](docs/operations/qualification-test-infrastructure.md).
-That document is routing and evidence guidance only: it does not grant
-Roundwright authority or activate its disabled runtime surface.
+Before executing, replaying, recovering, or reconstructing a Roundwright gate
+whose leaf declares external validation, read and use
+[`$run-roundwright-external-validation`](.agents/skills/run-roundwright-external-validation/SKILL.md).
 
 Before building or running the packaging preflight, read and use
 [`docs/operations/validation-toolchain.md`](docs/operations/validation-toolchain.md).
@@ -54,6 +52,8 @@ Roundlet runtime state remains local-only under `.roundlet/` in the authoritativ
 # roundlet:repository-authority
 roundlet:
   enabled: true
+  allow_external_validation_read_only: true
+  allow_external_validation_disposable_target_mutation: true
   allow_mark_pr_ready: true
   allow_merge_pr: true
   allow_close_leaf_issue: true

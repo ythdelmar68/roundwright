@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -22,7 +23,43 @@ def load_install_verifier() -> object:
     return module
 
 
+def load_validation_resolver() -> object:
+    location = ROOT / "ci" / "resolve_validation_toolchain.py"
+    specification = importlib.util.spec_from_file_location("resolve_validation_toolchain", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("validation toolchain resolver is unavailable")
+    module = importlib.util.module_from_spec(specification)
+    with mock.patch.object(sys, "path", [str(location.parent), *sys.path]):
+        specification.loader.exec_module(module)
+    return module
+
+
 class CiVerificationTests(unittest.TestCase):
+    def test_candidate_route_uses_candidate_lock_and_explicit_shared_cache(self) -> None:
+        resolver = load_validation_resolver()
+        candidate_lock = Path("candidate") / "ci" / "validation-toolchain.lock.toml"
+        authoritative_cache = Path("authoritative") / ".roundlet" / "validation-tools"
+        arguments = [
+            "resolve_validation_toolchain.py",
+            "--lock",
+            str(candidate_lock),
+            "--cache-root",
+            str(authoritative_cache),
+            "verify",
+        ]
+        with mock.patch.object(sys, "argv", arguments):
+            parsed = resolver.parse_arguments()
+        self.assertEqual(parsed.lock, candidate_lock)
+        self.assertEqual(parsed.cache_root, authoritative_cache)
+        self.assertEqual(parsed.operation, "verify")
+
+        guide = (ROOT / "docs" / "operations" / "validation-toolchain.md").read_text(encoding="utf-8")
+        self.assertIn("run the candidate's resolver and candidate lock", guide)
+        self.assertIn("--cache-root <authoritative-checkout>/.roundlet/validation-tools", guide)
+        instructions = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("isolated candidate Worker must execute the resolver and lock", instructions)
+        self.assertIn("never validation evidence", instructions)
+
     def test_workflow_provisions_locked_toolchain_before_no_isolation_build(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         provision = "python ci/resolve_validation_toolchain.py provision"

@@ -20,6 +20,13 @@ Before building or running the packaging preflight, read and use
 CI and local validation must consume the same tracked lock and exact repo-local
 receipt. A bootstrap interpreter is not packaging evidence, and missing or
 invalid toolchain evidence must never fall back to user or system tools.
+Canonical-checkout and CI commands may use the resolver's default cache. An
+isolated candidate Worker must execute the resolver and lock from that exact
+candidate SHA while passing the authoritative checkout's
+`.roundlet/validation-tools/` through the explicit global `--cache-root`
+argument. The bootstrap Python may be discovered from the host when it satisfies
+the documented bootstrap constraint; it remains a resolver-only bootstrap and
+never validation evidence.
 
 <!-- roundlet-bootstrap-policy:start -->
 ## ACTIVE Roundlet Authority

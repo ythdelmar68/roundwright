@@ -37,14 +37,33 @@ Roundlet runtime state or validation caches to repository-wide ignore rules.
 
 ## Provision and use
 
-From the canonical checkout, use an available Python 3.12 interpreter only as
-the bootstrap command:
+For canonical-checkout and CI validation, use any host-discovered Python 3.12
+interpreter only as the bootstrap command. The resolver's default lock and
+cache root are anchored to that checkout:
 
 ```text
 <bootstrap-python> ci/resolve_validation_toolchain.py provision
 <bootstrap-python> ci/resolve_validation_toolchain.py verify
 <bootstrap-python> ci/resolve_validation_toolchain.py exec-python -- -m unittest discover -s tests -v
 ```
+
+For an isolated candidate worktree, first verify the exact candidate SHA, then
+run the candidate's resolver and candidate lock while naming the authoritative
+checkout's shared cache explicitly. Global resolver arguments precede the
+operation:
+
+```text
+<bootstrap-python> ci/resolve_validation_toolchain.py --lock ci/validation-toolchain.lock.toml --cache-root <authoritative-checkout>/.roundlet/validation-tools provision
+<bootstrap-python> ci/resolve_validation_toolchain.py --lock ci/validation-toolchain.lock.toml --cache-root <authoritative-checkout>/.roundlet/validation-tools verify
+<bootstrap-python> ci/resolve_validation_toolchain.py --lock ci/validation-toolchain.lock.toml --cache-root <authoritative-checkout>/.roundlet/validation-tools exec-python -- -m unittest discover -s tests -v
+```
+
+Run those commands with the candidate worktree as the current directory. Do not
+copy the resolver or lock into the authoritative checkout and do not create a
+candidate-local validation cache. Record the exact candidate SHA with the
+public-safe lock digest, platform cache key, receipt status, and command results.
+The receipt remains lock/platform-bound; the surrounding Worker handoff binds
+that verified receipt and result to the candidate SHA.
 
 `provision` is the only networked transition. It downloads the lock-selected uv
 archive, verifies its SHA-256 before execution, installs only the exact managed

@@ -9,6 +9,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+CI_DIRECTORY = Path(__file__).resolve().parent
+if str(CI_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(CI_DIRECTORY))
+
+from validation_toolchain import current_platform, load_lock, verify_receipt
+
+ROOT = CI_DIRECTORY.parent
+DEFAULT_LOCK = ROOT / "ci" / "validation-toolchain.lock.toml"
+
 
 def run(command: list[str], *, cwd: Path, environment: dict[str, str], allowed: tuple[int, ...] = (0,)) -> None:
     result = subprocess.run(command, cwd=cwd, env=environment, text=True, capture_output=True, check=False)
@@ -65,7 +74,7 @@ def pipx_default_paths(profile: Path) -> tuple[Path, Path]:
     """Return the fresh profile paths pipx uses when its two overrides are absent."""
 
     if os.name == "nt":
-        home = profile / ".local" / "pipx"
+        home = profile / "AppData" / "Local" / "pipx" / "pipx"
     elif sys.platform == "darwin":
         home = profile / "Library" / "Application Support" / "pipx"
     else:
@@ -79,10 +88,14 @@ def pipx_default_environment(environment: dict[str, str], profile: Path) -> dict
     configured = pipx_environment(environment)
     configured.pop("PIPX_HOME", None)
     configured.pop("PIPX_BIN_DIR", None)
+    configured.pop("XDG_BIN_HOME", None)
+    configured.pop("XDG_CACHE_HOME", None)
+    configured.pop("XDG_DATA_HOME", None)
     configured["HOME"] = str(profile)
     if os.name == "nt":
         configured["USERPROFILE"] = str(profile)
         configured["LOCALAPPDATA"] = str(profile / "AppData" / "Local")
+        configured["APPDATA"] = str(profile / "AppData" / "Roaming")
     return configured
 
 
@@ -113,19 +126,46 @@ def pipx_environment(environment: dict[str, str]) -> dict[str, str]:
     configured = environment.copy()
     configured.pop("PIP_NO_INDEX", None)
     configured.pop("PIP_NO_DEPS", None)
+    configured["PIPX_DISABLE_SHARED_LIBS_AUTO_UPGRADE"] = "1"
+    configured["PIPX_FETCH_MISSING_PYTHON"] = "0"
     return configured
 
 
-def pipx_install_command(wheel: Path) -> list[str]:
+def pipx_install_command(pipx: Path, python: Path, wheel: Path) -> list[str]:
     """Install only the local wheel with pip's offline, no-dependency flags."""
 
-    return ["pipx", "install", "--backend", "pip", "--force", "--pip-args=--no-index --no-deps", str(wheel)]
+    return [
+        str(pipx),
+        "install",
+        "--backend",
+        "pip",
+        "--python",
+        str(python),
+        "--force",
+        "--skip-maintenance",
+        "--pip-args=--no-index --no-deps",
+        str(wheel),
+    ]
 
 
-def uv_tool_install_command(wheel: Path) -> list[str]:
-    """Use the active Python 3.12 interpreter without an offline download."""
+def uv_tool_install_command(uv: Path, python: Path, wheel: Path) -> list[str]:
+    """Use the receipt-bound Python without discovery or an offline download."""
 
-    return ["uv", "tool", "install", "--python", sys.executable, "--offline", "--no-cache", "--force", "--from", str(wheel), "roundwright"]
+    return [
+        str(uv),
+        "tool",
+        "install",
+        "--python",
+        str(python),
+        "--no-python-downloads",
+        "--offline",
+        "--no-cache",
+        "--force",
+        "--no-config",
+        "--from",
+        str(wheel),
+        "roundwright",
+    ]
 
 
 def select_wheel(dist: Path) -> Path:
@@ -146,7 +186,16 @@ def select_wheel(dist: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dist", type=Path)
+    parser.add_argument(
+        "--toolchain-receipt",
+        type=Path,
+        default=os.environ.get("ROUNDWRIGHT_VALIDATION_TOOLCHAIN_RECEIPT"),
+        required=os.environ.get("ROUNDWRIGHT_VALIDATION_TOOLCHAIN_RECEIPT") is None,
+    )
+    parser.add_argument("--toolchain-lock", type=Path, default=DEFAULT_LOCK)
     arguments = parser.parse_args()
+    lock = load_lock(arguments.toolchain_lock)
+    toolchain = verify_receipt(arguments.toolchain_receipt, lock, current_platform(lock))
     wheel = select_wheel(arguments.dist)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -157,7 +206,7 @@ def main() -> int:
         environment["PIP_NO_DEPS"] = "1"
 
         venv = root / "pip"
-        run([sys.executable, "-m", "venv", str(venv)], cwd=root, environment=environment)
+        run([str(toolchain.managed_python), "-m", "venv", str(venv)], cwd=root, environment=environment)
         scripts = venv / ("Scripts" if os.name == "nt" else "bin")
         pip_environment_variables = command_environment(environment, scripts)
         run([str(executable(scripts, "python")), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=root, environment=pip_environment_variables)
@@ -167,8 +216,13 @@ def main() -> int:
         pipx_bin_directory = root / "pipx-bin"
         environment["PIPX_HOME"] = str(pipx_home)
         environment["PIPX_BIN_DIR"] = str(pipx_bin_directory)
+        environment["PIPX_DEFAULT_PYTHON"] = str(toolchain.managed_python)
         pipx_environment_variables = command_environment(pipx_environment(environment), pipx_bin_directory)
-        run(pipx_install_command(wheel), cwd=root, environment=pipx_environment_variables)
+        run(
+            pipx_install_command(toolchain.pipx, toolchain.managed_python, wheel),
+            cwd=root,
+            environment=pipx_environment_variables,
+        )
         pipx_exposed_command, _pipx_managed_command = pipx_commands(pipx_home, pipx_bin_directory)
         pipx_smoke(pipx_exposed_command, cwd=root, environment=pipx_environment_variables)
 
@@ -177,7 +231,11 @@ def main() -> int:
         pipx_default_home.mkdir(parents=True)
         pipx_default_environment_variables = pipx_default_environment(environment, pipx_default_profile)
         pipx_default_environment_variables = command_environment(pipx_default_environment_variables, pipx_default_bin_directory)
-        run(pipx_install_command(wheel), cwd=root, environment=pipx_default_environment_variables)
+        run(
+            pipx_install_command(toolchain.pipx, toolchain.managed_python, wheel),
+            cwd=root,
+            environment=pipx_default_environment_variables,
+        )
         pipx_default_exposed_command, _pipx_default_managed_command = pipx_commands(
             pipx_default_home, pipx_default_bin_directory
         )
@@ -185,8 +243,13 @@ def main() -> int:
 
         environment["UV_TOOL_DIR"] = str(root / "uv-tools")
         environment["UV_TOOL_BIN_DIR"] = str(root / "uv-bin")
+        environment["UV_CACHE_DIR"] = str(root / "uv-cache")
         uv_environment_variables = command_environment(environment, Path(environment["UV_TOOL_BIN_DIR"]))
-        run(uv_tool_install_command(wheel), cwd=root, environment=uv_environment_variables)
+        run(
+            uv_tool_install_command(toolchain.uv, toolchain.managed_python, wheel),
+            cwd=root,
+            environment=uv_environment_variables,
+        )
         smoke(executable(Path(environment["UV_TOOL_BIN_DIR"]), "roundwright"), cwd=root, environment=uv_environment_variables)
     return 0
 

@@ -120,8 +120,13 @@ toolbox and target commits and remains non-authoritative.
 
 ## Development check
 
-Use Python 3.12:
+The packaging gate uses the tracked, receipt-bound toolchain described in
+[Packaging validation toolchain](docs/operations/validation-toolchain.md). An
+available Python 3.12 interpreter is only a standard-library bootstrap; all
+builds and tests execute with the repo-local locked Python:
 
 ```text
-python -m unittest discover -s tests -v
+<bootstrap-python> ci/resolve_validation_toolchain.py provision
+<bootstrap-python> ci/resolve_validation_toolchain.py exec-python -- -m unittest discover -s tests -v
+<bootstrap-python> ci/resolve_validation_toolchain.py exec-python -- ci/verify_installs.py dist
 ```

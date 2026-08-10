@@ -23,29 +23,34 @@ def load_install_verifier() -> object:
 
 
 class CiVerificationTests(unittest.TestCase):
-    def test_workflow_installs_declared_backend_before_no_isolation_build(self) -> None:
+    def test_workflow_provisions_locked_toolchain_before_no_isolation_build(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        backend = 'python -m pip install --disable-pip-version-check "setuptools>=69" pipx uv'
-        build = "python -m pip wheel --no-build-isolation --no-deps --wheel-dir dist ."
-        self.assertIn(backend, workflow)
+        provision = "python ci/resolve_validation_toolchain.py provision"
+        build = "python ci/resolve_validation_toolchain.py exec-python -- -m pip wheel --no-build-isolation"
+        self.assertIn(provision, workflow)
         self.assertIn(build, workflow)
-        self.assertLess(workflow.index(backend), workflow.index(build))
+        self.assertLess(workflow.index(provision), workflow.index(build))
+        self.assertNotIn('setuptools>=69" pipx uv', workflow)
 
     def test_pipx_route_forces_pip_and_uses_one_offline_no_dependency_pair(self) -> None:
         verifier = load_install_verifier()
         environment = verifier.pipx_environment({"PIP_NO_INDEX": "1", "PIP_NO_DEPS": "1"})
-        command = verifier.pipx_install_command(Path("candidate.whl"))
+        command = verifier.pipx_install_command(Path("tools/pipx"), Path("python"), Path("candidate.whl"))
         self.assertNotIn("PIPX_USE_UV", environment)
         self.assertNotIn("PIP_NO_INDEX", environment)
         self.assertNotIn("PIP_NO_DEPS", environment)
         self.assertEqual(command[2:4], ["--backend", "pip"])
+        self.assertEqual(command[4:6], ["--python", str(Path("python"))])
+        self.assertIn("--skip-maintenance", command)
         self.assertEqual(command.count("--pip-args=--no-index --no-deps"), 1)
         self.assertEqual(command[-1], "candidate.whl")
 
-    def test_uv_route_uses_the_active_python_without_an_offline_download(self) -> None:
+    def test_uv_route_uses_receipt_bound_tools_without_discovery_or_download(self) -> None:
         verifier = load_install_verifier()
-        command = verifier.uv_tool_install_command(Path("candidate.whl"))
-        self.assertEqual(command[:5], ["uv", "tool", "install", "--python", verifier.sys.executable])
+        command = verifier.uv_tool_install_command(Path("tools/uv"), Path("python"), Path("candidate.whl"))
+        self.assertEqual(command[:5], [str(Path("tools/uv")), "tool", "install", "--python", str(Path("python"))])
+        self.assertIn("--no-python-downloads", command)
+        self.assertIn("--no-config", command)
         self.assertIn("--offline", command)
         self.assertEqual(command[-2:], ["candidate.whl", "roundwright"])
 
@@ -89,14 +94,22 @@ class CiVerificationTests(unittest.TestCase):
         verifier = load_install_verifier()
         profile = Path("temporary-profile")
         environment = verifier.pipx_default_environment(
-            {"PIPX_HOME": "override-home", "PIPX_BIN_DIR": "override-bin"}, profile
+            {
+                "PIPX_HOME": "override-home",
+                "PIPX_BIN_DIR": "override-bin",
+                "XDG_BIN_HOME": "override-xdg-bin",
+                "XDG_CACHE_HOME": "override-xdg-cache",
+                "XDG_DATA_HOME": "override-xdg-data",
+            },
+            profile,
         )
         home, bin_directory = verifier.pipx_default_paths(profile)
         self.assertNotIn("PIPX_HOME", environment)
         self.assertNotIn("PIPX_BIN_DIR", environment)
+        self.assertFalse({"XDG_BIN_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"} & set(environment))
         self.assertEqual(environment["HOME"], str(profile))
         if verifier.os.name == "nt":
-            self.assertEqual(home, profile / ".local" / "pipx")
+            self.assertEqual(home, profile / "AppData" / "Local" / "pipx" / "pipx")
         self.assertEqual(bin_directory, profile / ".local" / "bin")
         self.assertNotEqual(home, Path("override-home"))
 

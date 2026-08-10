@@ -15,6 +15,12 @@ execution, or remote GitHub lifecycle testing, read
 That document is routing and evidence guidance only: it does not grant
 Roundwright authority or activate its disabled runtime surface.
 
+Before building or running the packaging preflight, read and use
+[`docs/operations/validation-toolchain.md`](docs/operations/validation-toolchain.md).
+CI and local validation must consume the same tracked lock and exact repo-local
+receipt. A bootstrap interpreter is not packaging evidence, and missing or
+invalid toolchain evidence must never fall back to user or system tools.
+
 <!-- roundlet-bootstrap-policy:start -->
 ## ACTIVE Roundlet Authority
 

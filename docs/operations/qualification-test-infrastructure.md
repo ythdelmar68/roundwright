@@ -2,132 +2,163 @@
 
 ## Purpose and ownership
 
-This is the single routing source for external validation used by Roundwright
-gates. It selects a phase-neutral execution toolbox and, only when separately
-approved, a disposable remote mutation target. It does not activate
-Roundwright, change the disabled authority surface, grant credentials, or
-authorize a repository mutation. Roundwright product code owns its typed
-contracts and gates; the owner-approved external repositories only supply a
-bounded environment or a disposable test target.
+This is Roundwright's single source for external-validation repositories,
+reviewed identities, route translation, action boundaries, and public-safe
+evidence. The repository-owned
+[`$run-roundwright-external-validation`](../../.agents/skills/run-roundwright-external-validation/SKILL.md)
+skill executes this contract after a leaf selects a route.
 
-## Approved infrastructure and immutable bindings
+The active Roundlet block in root `AGENTS.md` is the authority source. This
+document and the skill cannot activate Roundwright, grant credentials, promote
+a candidate, or widen either repository's policy. A candidate policy edit is
+inert until reviewed, merged to authoritative `origin/main`, and acknowledged
+by the allowlisted owner.
 
-| Role | Public repository | Approved identity | Use | Never use it as |
+## Approved infrastructure and immutable identities
+
+| Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | Reviewed pending content: `e5ec738c67130b17a8e723b89a4b567e1873838d`; canonical main merge: `42830db90acbba499989cd434cdc46b4627042e2`; historical prior selection: `52b1ad81ca2e13b40f4244f431fad9c231ab4c28`; historical non-qualifying pin: `681c7e9359a3767892a615ffa032d42b51e7be15` | A future exact candidate-bound selection may use the repaired content only after fresh authenticated owner approval | A Roundwright authority source, a credential store, a floating `main` ref, or an invocation without fresh selection |
-| Remote mutation target | `ythdelmar68/roundlet-forward-test` | Canonical main: `4f39ef0e4e616eb896950d3756c433b624771a97` | A public, disposable target for explicitly approved remote lifecycle/mutation tests | Production, a unique-work target, or authority over Roundwright |
-
-Historical pins are never silently replaced by harness main. The original
-`681c7e9359a3767892a615ffa032d42b51e7be15` pin remains non-qualifying and must
-not be invoked. The prior content
-`52b1ad81ca2e13b40f4244f431fad9c231ab4c28`, its merge
-`2d412311d8ddbeb1db538111126a6e5dd62297b1`, and factory
-`roundwright_harness.native:native_factory` are historical previously-selected
-evidence for candidate `b1279ff00547c84980bd413076c0b0f9fbbde432`, not current
-invocation authority.
+| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `42830db90acbba499989cd434cdc46b4627042e2`; tree `4107953c2d9a97c0446a5a9789bd823493cf4839` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
+| Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
 
 Harness PR #3 repaired content
-`e5ec738c67130b17a8e723b89a4b567e1873838d`; its canonical main merge is
-`42830db90acbba499989cd434cdc46b4627042e2`, with parents
-`2d412311d8ddbeb1db538111126a6e5dd62297b1` and the repaired content. Both
-resolve to tree `4107953c2d9a97c0446a5a9789bd823493cf4839`. Exact-head CI run
-`31115923833` succeeded and independent COMPLETE review reported VALID/PASS
-without findings, as curated in Roundwright PR #57 comment `5207059725`.
-Those facts record reviewed repair content only. The repaired harness and its
-factory remain pending a fresh authenticated owner selection bound to the new
-resulting Roundwright candidate; all superseded PR #2 heads remain unselected. A
-branch name, tag, or `main` is never an authorization or evidence identity.
+`e5ec738c67130b17a8e723b89a4b567e1873838d`; canonical merge
+`42830db90acbba499989cd434cdc46b4627042e2` has parents
+`2d412311d8ddbeb1db538111126a6e5dd62297b1` and that repaired content. Both
+resolve to tree `4107953c2d9a97c0446a5a9789bd823493cf4839`.
+Exact-head CI run `31115923833` passed, and independent COMPLETE review
+reported VALID/PASS without findings, as curated in Roundwright PR #57 comment
+`5207059725`.
 
-Any selected factory consumes already-resolved native channels; it does not
-discover credentials, load tokens, or automate login. `uv` may be global or
-per-user; Python environments and all packages remain inside the harness
-repository's repo-local `.venv`, with no global Python package installation.
+The original harness pin
+`681c7e9359a3767892a615ffa032d42b51e7be15` remains non-qualifying. Prior
+content `52b1ad81ca2e13b40f4244f431fad9c231ab4c28`, merge
+`2d412311d8ddbeb1db538111126a6e5dd62297b1`, and its evidence remain
+historical only. Never replace a recorded pin because a branch, tag, or
+`main` moved.
+
+The reviewed toolbox uses a repo-local `.venv`, committed `uv.lock`, and
+factory `roundwright_harness.native:native_factory`. `uv` may be installed
+globally or per-user, but Python and packages remain repository-local. A
+Roundwright candidate is an explicit temporary overlay, never a lockfile
+dependency or global installation. The factory consumes already-resolved
+native channels; it does not discover credentials, load tokens, or automate
+login.
+
+## Standing authority
+
+The authoritative Roundlet block contains two independent strict Booleans:
+
+- `allow_external_validation_read_only`: a selected conforming route may run
+  read-only without a new per-attempt owner approval;
+- `allow_external_validation_disposable_target_mutation`: a later selected
+  route may perform only its exact allowlisted operations in the exact public
+  disposable target, with rollback and semantic read-back.
+
+A `true` value is standing repository-scoped owner authorization, not a waiver.
+It applies only after the selected leaf, exact candidate, reviewed toolbox,
+target when applicable, operation, evidence time, rollback, and read-back all
+agree with authoritative source. Missing, malformed, stale, conflicting, or
+unverifiable input blocks the action. A read-only leaf remains zero-mutation
+even when the independent mutation Boolean is `true`.
+
+Phase 3 never mutates the forward-test target. Phase 4-or-later mutation also
+requires the exact leaf to declare mutation and the target repository's own
+authoritative instructions to permit every requested operation. The effective
+allowlist is their intersection: one exact target issue, isolated `codex/`
+branch, changes only under `fixtures/`, reviewed pull request, and only the
+ready, merge-commit, exact-leaf close, branch, worktree, and cleanup operations
+whose target Booleans are true. Force push, reset, rebase, protection bypass,
+tag, release, publication, visibility changes, other paths/repositories, and
+destruction of unrelated or unique work are prohibited.
 
 ## Windows execution boundary
 
 The approved Windows host is an ordinary low-privilege user. `uv` is global or
-per-user only; the repository-local `.venv` owns Python and packages. When an
-agent filesystem sandbox denies child execution, the separately authorized live
-host process may permit Python to launch hermetic Git and the pinned Codex
-runtime outside that filesystem sandbox. This is neither administrator
-elevation nor global Python/package installation. The SDK remains deny-all,
-read-only, and ephemeral; this boundary neither selects nor invokes a live
-gate.
-
-## Pre-selection diagnostic evidence
-
-The pre-review/pre-selection READY 5/5 observations, receipts, and manifest
-are non-qualifying diagnostic evidence only. They cannot be carried forward as
-the formal provider-health gate for the resulting candidate. A later selected
-gate must produce and bind its own exact fresh evidence.
+per-user only; the toolbox's `.venv` owns Python and packages. When an agent
+filesystem sandbox denies child execution, the exact selected live command may
+run as the same low-privilege user outside that filesystem sandbox so Python
+can launch hermetic Git and the pinned Codex runtime. This is not administrator
+elevation, a global package install, credential authority, or permission for a
+different command.
 
 ## Routing decision
 
-Issue planning uses Roundwright's repository vocabulary while generic Roundlet
-core uses phase-neutral route names. Translate them without changing their
-authority:
+Issue planning uses Roundwright vocabulary; generic Roundlet uses phase-neutral
+routes:
 
-| Roundwright leaf | Generic Roundlet route | Target use |
+| Roundwright declaration | Generic Roundlet route | Target use |
 | --- | --- | --- |
 | `none` | `none` | No external toolbox or target. |
-| `harness` | `toolbox` | Use the exact selected execution toolbox only. |
-| `harness+forward-test` | `toolbox+disposable-target` | Use the exact selected toolbox and approved disposable target. |
+| `harness` | `toolbox` | Exact selected execution toolbox only. |
+| `harness+forward-test` | `toolbox+disposable-target` | Exact selected toolbox and approved public disposable target. |
 
-The repository-owned leaf skill chooses and records this route. Roundlet may
-mechanically fill selection-time identities from current reviewed policy, but
-must not infer missing authority. A route declaration does not select a
-credential, authorize a live call or mutation, or make a future candidate SHA
-knowable during issue creation.
+The planning skill records the route; the execution skill resolves it. A route
+does not itself grant credentials or mutation. Roundlet mechanically fills only
+values that authoritative policy makes exact. It never invents a future
+candidate SHA, floating ref, missing action, or absent authority.
 
-| Gate or work class | External validation | Required immutable selection | Evidence and authority boundary |
+| Gate or work class | Declaration | Required selection | Evidence and authority boundary |
 | --- | --- | --- | --- |
-| Hermetic Roundwright tests | `none` | Roundwright candidate only | Local deterministic test evidence; no external credential, toolbox, or target. |
-| Live read-only SDK/provider qualification | `harness` | Candidate plus exact harness commit | At most the separately defined content-free read-only probe; owner-safe receipt and typed Shadow input only. No task dispatch or remote mutation. |
-| GitHub lifecycle or mutation test | `harness+forward-test` | Candidate, exact harness commit, exact forward-test commit, and separately approved target scope | Semantic read-back and curated receipts only. The forward-test target is disposable; all mutation authority remains separately checked. |
-| Cross-environment or canary | `harness` plus only an explicitly owner-approved disposable target | Candidate, exact toolbox commit, exact target commit, declared environment, scope, and rollback identity | Comparable public-safe evidence; missing environment evidence is a blocker, never a waiver. |
+| Hermetic Roundwright validation | `none` | Roundwright candidate | Local deterministic evidence; no external credential, toolbox, or target. |
+| Live SDK/provider or host qualification | `harness` | Candidate plus reviewed harness commit | Content-free typed read-only probe; no task dispatch or remote mutation. |
+| Hosted or forward-target observation | `harness` or `harness+forward-test` | Candidate, harness, and target when used | Read-only observation plus independently verified zero mutation. |
+| Disposable lifecycle/Canary | `harness+forward-test` | Candidate, harness, target baseline, exact action/budget/rollback/read-back contract | Phase 4-or-later only; Orchestrator is sole mutator and target policy must allow every action. |
+| Cross-environment validation | route selected by the leaf | Candidate, harness, target when needed, environment, case, and contract | Comparable public-safe evidence; a missing environment blocks instead of waiving the gate. |
 
-## Candidate, target, and evidence discipline
+## Selection, replay, and evidence discipline
 
-Before invocation, a leaf records the exact Roundwright base/candidate SHA,
-contract/configuration identity, selected harness commit, selected target commit
-when applicable, declared gate/evidence class, and reference/Shadow case
-identity. A later run must reconcile those durable bindings; it may not replace
-an old pin with a current branch head. Candidate movement, target movement,
-missing read-back, or any unsupported identity invalidates the evidence.
+Before invocation, persist the exact Roundwright base/candidate SHA, selected
+leaf, route, policy and skill blobs, contract/configuration, harness commit,
+target baseline when applicable, environment, observation window or action,
+Shadow case, rollback, and semantic read-back. Reconcile those durable bindings
+on every retry or recovery. Movement invalidates the selection; it does not
+authorize substitution.
 
-Public-safe evidence may include exact public commit identities, repository
-names, declared environment, case IDs, curated receipt or manifest digests,
-typed comparison result, gate result, and semantic read-back. It must exclude
-credentials, tokens, provider prose or raw payloads, private paths, raw logs,
-owner-private reasoning, and secret-bearing configuration. A public-safe
-projection is evidence, not an authority receipt.
+Historical external replay uses the immutable bundle's capture time. For live
+provider evidence, the required field is the top-level integer `ready_at`.
+Pass that exact value to the Roundwright comparator. Never substitute replay
+execution time, host wall clock, file time, or a fresh timestamp. Missing or
+conflicting capture time makes the replay invalid.
 
-## Owner interaction and non-authority semantics
+Public-safe evidence may contain exact public repositories/commits, declared
+environment, case/task/attempt identifiers, curated receipt or manifest
+digests, capture time, typed comparison/gate result, and semantic read-back.
+It excludes credentials, tokens, raw provider/GitHub payloads or prose, raw
+logs, private paths, secret-bearing configuration, and internal owner
+reasoning. A public-safe projection is evidence, not an authority receipt.
 
-The owner supplies interactive login or other sensitive input only in the
-approved toolbox when a typed gate requires it. Code, tasks, and fixtures must
-not discover, print, persist, relay, or automate that input. Missing or expired
-authentication stops the gate for owner input with resources retained; it does
-not cause provider substitution or an inferred policy explanation.
+## Owner interaction and recovery
+
+Do not request repetitive owner approval when the route and both required
+standing/target policies match. Request owner input only for an actual
+credential/login failure, repository or commit conflict, out-of-allowlist
+action, unavailable required target authority, or partial/ambiguous mutation
+read-back. Preserve resources on those failures; never substitute provider,
+target, action, evidence time, or policy explanation.
+
+Pause, resume, recovery, or standing-route refresh preserves the same review
+epoch and round when the immutable leaf, scope, candidate review basis, and
+external binding reconcile unchanged. A fresh Roundlet activation never
+recovers an old bundle.
 
 Roundlet remains the sole mutation-capable Orchestrator for Roundwright until a
 separate owner-reviewed transition changes the root authority policy. The
-toolbox and forward-test repository do not make Roundwright active, do not
-waive native provider health, typed Shadow, exact-candidate checks, CI, or
-merge gates, and do not permit a candidate to self-promote.
+toolbox and forward-test target never make Roundwright active and never waive
+native provider health, typed Shadow, exact-candidate checks, CI, or merge
+gates.
 
 ## Reuse by phase
 
-- **Phase 3:** route native Codex and typed Shadow qualification through the
-  harness when live evidence is separately required.
-- **Phase 4:** route canary and cross-environment work through the harness and
-  only the explicitly approved disposable target.
-- **Phase 5:** route operations, migration, promotion evaluation, and retained
-  evidence through exact infrastructure pins when external validation is
-  required.
-- **Phase 6:** route release-readiness validation through the same selection
-  discipline; a release decision remains separately owner-authorized.
+- **Phase 3:** read-only native Codex, hosted, forward-target, and typed Shadow
+  qualification; zero target mutation.
+- **Phase 4:** bounded cross-environment and disposable-target Canary under the
+  standing mutation Boolean plus exact leaf/target action contract.
+- **Phase 5:** operations, migration, promotion evaluation, and retained
+  evidence using exact infrastructure identities.
+- **Phase 6:** release-readiness validation using the same selection discipline;
+  release/publication remains separately prohibited unless later authorized.
 
-See the [dogfood promotion roadmap](dogfood-promotion-roadmap.md) for phase
-entry/exit boundaries and the [leaf issue template](leaf-issue-template.md) for
-the declaration every new leaf must make.
+See the [dogfood promotion roadmap](dogfood-promotion-roadmap.md) for phase and
+activation boundaries, and the [leaf issue planning contract](leaf-issue-template.md)
+for declarations created before execution.

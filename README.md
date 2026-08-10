@@ -114,9 +114,12 @@ the permanent read-only comparison layer; neither document grants runtime or
 repository mutation authority.
 
 The [qualification test infrastructure](docs/operations/qualification-test-infrastructure.md)
-is the single routing source for separately approved external credentials,
-cross-environment execution, and disposable remote lifecycle tests. It pins
-toolbox and target commits and remains non-authoritative.
+is the single routing source for external credentials, cross-environment
+execution, and disposable remote lifecycle tests. The repository-owned
+[`$run-roundwright-external-validation`](.agents/skills/run-roundwright-external-validation/SKILL.md)
+skill applies its exact toolbox/target pins and standing Roundlet Booleans to a
+selected leaf. Neither the route nor the skill activates Roundwright or grants
+authority outside the reviewed root policy.
 
 ## Development check
 

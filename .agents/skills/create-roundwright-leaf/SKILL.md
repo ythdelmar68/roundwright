@@ -33,6 +33,7 @@ Before drafting or writing, read all of the following from current state:
 2. `.github/ISSUE_TEMPLATE/roundwright-leaf.md` and
    `docs/operations/leaf-issue-template.md`.
 3. `docs/operations/qualification-test-infrastructure.md`,
+   `.agents/skills/run-roundwright-external-validation/SKILL.md`,
    `docs/operations/dogfood-promotion-roadmap.md`, and
    `docs/operations/validation-toolchain.md`.
 4. The live owning umbrella body, including its canonical scheduling note,
@@ -85,20 +86,26 @@ the qualification infrastructure document:
 
 State separately whether `harness+forward-test` is read-only observation or a
 mutation Canary. A route name never grants a mutation. Mutation remains subject
-to the effective repository policy, phase boundary, exact allowlist, budget,
-rollback, semantic read-back, and any required external owner decision.
+to the effective standing repository policy, Phase 4-or-later boundary, exact
+leaf and target allowlist, call budget, rollback, kill switch, and semantic
+read-back.
 
 At planning time, record the route, gate/evidence class, expected owner
-interaction, public-safe evidence boundary, and selection rule. Do not invent a
-future candidate SHA or silently use a floating ref. At execution selection,
-Roundlet must bind the exact base, candidate, toolbox, target, environment,
-case, and contract identities required by current reviewed policy. Any movement
-invalidates prior evidence.
+interaction, the `$run-roundwright-external-validation` execution skill,
+public-safe evidence boundary, historical evidence-time rule, and selection
+rule. Do not invent a future candidate SHA or silently use a floating ref. At
+execution selection, Roundlet must bind the exact base, candidate, toolbox,
+target, environment, case, and contract identities required by current
+reviewed policy. Any movement invalidates prior evidence.
 
 Mark expected owner interaction as none when standing policy and healthy
 credentials cover the declared route. Reserve owner input for a real credential
 failure, identity conflict, out-of-policy target or action, or ambiguous partial
 mutation; do not ask again for mechanically derivable fields.
+
+For historical replay, require the immutable evidence bundle's capture time.
+Live provider evidence uses the top-level integer `ready_at`; current wall-clock
+time is never an allowed substitute.
 
 ## Compose the issue body
 
@@ -108,8 +115,8 @@ Start from the tracked GitHub template and fill every applicable field:
 - formal/prose parent and phase ownership;
 - bounded purpose and exact numbered leaf or standalone dependencies;
 - external-validation declaration, generic route, evidence class, mutation
-  mode, owner-input expectation, selection-time bindings, and public-safe
-  evidence boundary;
+  mode, execution-skill reference, historical evidence-time rule, owner-input
+  expectation, selection-time bindings, and public-safe evidence boundary;
 - Shadow cycle, canonical references, evidence/comparison identity, or a
   concrete N/A reason;
 - typed and bounded acceptance criteria;

@@ -24,6 +24,11 @@ Before a replay, the validator records an immutable input manifest containing:
 - the capture time and retention class without private paths, credentials, raw
   prompts, or confidential source content.
 
+When the input is a live provider evidence bundle, its top-level integer
+`ready_at` is the capture-time value. Historical replay passes that exact value
+to the comparator. Replay execution time, host wall clock, file modification
+time, and a newly generated timestamp are invalid substitutes.
+
 The replay consumes only the frozen manifest and its referenced immutable
 contents. It must reject an absent manifest, duplicate or malformed identifier,
 digest mismatch, changed source, undeclared dependency, unverifiable reference,
@@ -56,6 +61,12 @@ toolbox, target (if any), candidate, and commit pins are selected through the
 [qualification test infrastructure](../operations/qualification-test-infrastructure.md).
 That routing record is immutable replay input; it is neither authority nor an
 invocation permission.
+
+Roundlet records the selected repository contract field and captured value as
+`historical_evidence_time`. A missing, non-integer, conflicting, or unbound
+value blocks replay. Evidence that is valid at its frozen `ready_at` is assessed
+at that historical point; it is never refreshed merely because it would be
+stale at the later replay wall clock.
 
 ## Deterministic comparison
 

@@ -248,15 +248,13 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     record_artifact(repository, identity, artifact_kind="plan", artifact_fingerprint=persisted_plan.content_digest, lease=lease)
     submit_plan_for_review(repository, identity, plan_attempt_id=persisted_plan.plan_attempt_id, evidence_fingerprint=_fingerprint("submit-plan", identity.task_id), lease=lease)
 
-    plan_review = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
-        lambda: dispatch_plan_review(
-            repository, identity, _health_context(context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch),
-            review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
-            supervisor_session_identity="local-plan-supervisor-session", external_turn_identity="local-plan-review-turn",
-            plan_attempt_id=persisted_plan.plan_attempt_id, process_lease_id="local-plan-review-lease",
-            process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], lease=lease, now=epoch,
-        ), epoch,
+    plan_review = dispatch_plan_review(
+        repository, identity, _health_context(context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch),
+        review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
+        supervisor_session_identity="local-plan-supervisor-session", external_turn_identity="local-plan-review-turn",
+        plan_attempt_id=persisted_plan.plan_attempt_id, process_lease_id="local-plan-review-lease",
+        process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0],
+        binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
     record_plan_review(
         repository, identity, context, review_attempt_id=plan_review.review_attempt_id,

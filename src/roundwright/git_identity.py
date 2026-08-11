@@ -241,27 +241,7 @@ def provision_worktree(
         or control.binding.candidate_sha != identity.base_sha
     ):
         raise GitIdentityError("git entrypoint control does not match task identity")
-    return _provision_worktree_compatibility(
-        repository, identity, default_branch=default_branch, worktree=worktree, control=control, lease=lease
-    )
-
-
-def _provision_worktree_compatibility(
-    repository: RepositoryIdentity,
-    identity: TaskIdentity,
-    *,
-    default_branch: str,
-    worktree: Path,
-    control: GitEntrypointControl | None = None,
-    lease: TransitionLease | None = None,
-) -> WorktreeBinding:
-    """Private temporary compatibility path pending local-slice entrypoint migration."""
-
-    base_sha = (
-        _resolve_canonical_base_unchecked(repository, default_branch)
-        if control is None
-        else resolve_canonical_base(repository, default_branch, control=control)
-    )
+    base_sha = resolve_canonical_base(repository, default_branch, control=control)
     if base_sha != identity.base_sha:
         raise GitIdentityError("task base does not match the canonical default branch")
     _require_branch(identity.branch)

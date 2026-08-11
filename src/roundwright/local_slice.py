@@ -44,7 +44,7 @@ from .gates import (
     task_identity_fingerprint,
     transition_ready_for_owner,
 )
-from .git_identity import CandidateSeal, _provision_worktree_compatibility, _resolve_canonical_base_unchecked, transition_lease
+from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, provision_worktree, resolve_canonical_base, transition_lease
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
@@ -94,6 +94,7 @@ def run_once_local_slice(
     repository: RepositoryIdentity,
     fixture: LocalSliceFixture,
     *,
+    git_entrypoint_control: GitEntrypointControl,
     trusted_policy_snapshot: TrustedPolicySnapshot | None = None,
     trusted_review_floor: ReviewPolicy | None = None,
     candidate_dependency_evidence: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
@@ -109,14 +110,32 @@ def run_once_local_slice(
     APIs.  A second call is intentionally a read-only completion replay.
     """
 
-    if type(fixture) is not LocalSliceFixture or not isinstance(fixture.worktree, Path):
+    if type(repository) is not RepositoryIdentity or type(fixture) is not LocalSliceFixture or not isinstance(fixture.worktree, Path):
         raise LocalSliceError("local slice fixture is invalid")
     if not isinstance(fixture.source_contents, str) or not fixture.source_contents:
         raise LocalSliceError("local slice source is invalid")
-
-    # Temporary private compatibility route; the next slice threads a sealed
-    # GitEntrypointControl through this fixture before exposing Git execution.
-    base_sha = _resolve_canonical_base_unchecked(repository, "main")
+    if type(git_entrypoint_control) is not GitEntrypointControl:
+        raise LocalSliceError("local slice Git entrypoint control is invalid")
+    if (
+        git_entrypoint_control.binding.repository != fixture.repository_id
+        or git_entrypoint_control.binding.task_id != fixture.task_id
+    ):
+        raise LocalSliceError("local slice Git entrypoint control does not match fixture identity")
+    instant = datetime.now(timezone.utc) if now is None else now
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise LocalSliceError("local slice clock must be timezone-aware")
+    epoch = int(instant.timestamp())
+    if git_entrypoint_control.now != epoch:
+        raise LocalSliceError("local slice clock does not match Git entrypoint control")
+    try:
+        git_entrypoint_control.dependency_control.require(
+            git_entrypoint_control.binding, DependencyStage.GIT_ENTRYPOINT, now=git_entrypoint_control.now
+        )
+        base_sha = resolve_canonical_base(repository, "main", control=git_entrypoint_control)
+    except (DependencyPolicyError, GitIdentityError) as error:
+        raise LocalSliceError("local slice Git entrypoint preflight blocked execution") from error
+    if base_sha != git_entrypoint_control.binding.candidate_sha:
+        raise LocalSliceError("local slice canonical base does not match Git entrypoint control")
     identity = TaskIdentity(
         fixture.task_id,
         fixture.source_id,
@@ -127,10 +146,6 @@ def run_once_local_slice(
     )
     configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
     runtime_binding = configuration.pin().runtime_binding()
-    instant = datetime.now(timezone.utc) if now is None else now
-    if instant.tzinfo is None or instant.utcoffset() is None:
-        raise LocalSliceError("local slice clock must be timezone-aware")
-    epoch = int(instant.timestamp())
     _execute_candidate_helper_from_factory(
         candidate_dependency_evidence, trusted_dependency_admission,
         CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha),
@@ -154,7 +169,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -179,7 +194,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -265,7 +280,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     binding = _execute_candidate_helper_from_factory(
         candidate_dependency_evidence, trusted_dependency_admission,
         base_dependency_binding, DependencyStage.GITHUB_MUTATION,
-        lambda: _provision_worktree_compatibility(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease),
+        lambda: provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, control=git_entrypoint_control, lease=lease),
         epoch,
     )
     implementation = _execute_candidate_helper_from_factory(

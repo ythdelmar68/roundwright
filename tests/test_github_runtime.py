@@ -703,6 +703,84 @@ class GitHubRuntimeTests(unittest.TestCase):
             self.assertEqual(transport.requests, [])
             self.assertFalse(journal_path.exists())
 
+    def test_invalid_context_dependency_precedes_broker_clock_and_owner_control_callbacks(self) -> None:
+        """Submit and reconcile reject context evidence before every broker callback."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "context-ordering-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        base = allowed_context()
+        assert base.dependency_control is not None
+        control = base.dependency_control
+        stale_observations = tuple(replace(item, observed_at=int(NOW.timestamp()) - 3_601) for item in control.observations)
+        missing_stage = DependencyExecutionControl(control.policy, control.observations[:2], control.admission)
+        replaced = replace(base)
+        object.__setattr__(replaced, "dependency_control", object())
+        contexts = (
+            replace(base, dependency_control=None),
+            replaced,
+            replace(base, dependency_control=DependencyExecutionControl(control.policy, stale_observations, control.admission)),
+            replace(base, dependency_control=missing_stage),
+            replace(base, candidate_sha="f" * 40),
+            replace(base, repository=RepositoryRef("other", "repository")),
+            replace(base, mutation_context=replace(base.mutation_context, task_fingerprint="e" * 64)),
+        )
+
+        class CountingClock:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self) -> datetime:
+                self.calls += 1
+                raise AssertionError("invalid context reached broker clock")
+
+        class CountingControls:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def resolve(self, _: GitHubMutationIntent) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached owner control resolver")
+
+        class CountingReadChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_read(self, _: GitHubReadRequest) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached read IPC")
+
+            def exchange_collection_page(self, _: GitHubReadRequest, __: str | None) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached paginated read IPC")
+
+        class CountingMutationChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_mutation(self, _: OwnerMutationIpcMessage) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached mutation IPC")
+
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        for context in contexts:
+            for route in ("submit", "reconcile"):
+                with self.subTest(route=route, context_type=type(context.dependency_control).__name__), tempfile.TemporaryDirectory() as directory:
+                    clock, controls = CountingClock(), CountingControls()
+                    reads, mutations = CountingReadChannel(), CountingMutationChannel()
+                    journal_path = Path(directory) / "journal.json"
+                    broker = GitHubMutationBroker.with_owner_transport(
+                        OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                        journal=DurableMutationJournal(journal_path), binding=owner_broker_binding(),
+                        controls=controls, clock=clock,
+                    )
+                    result = getattr(broker, route)(intent, context)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                    self.assertEqual((clock.calls, controls.calls, reads.calls, mutations.calls), (0, 0, 0, 0))
+                    self.assertFalse(journal_path.exists())
+
     def test_owner_broker_control_denials_precede_journal_readback_and_transport(self) -> None:
         """Broker submit consumes only the exact owner control before every action."""
 

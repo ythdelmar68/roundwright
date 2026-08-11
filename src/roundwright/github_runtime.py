@@ -2868,7 +2868,9 @@ class GitHubMutationBroker:
         if pre_state is not None or readback is not None or semantic_plan is not None or command is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
+            self._require_context_dependency_control(intent, context)
             now = self._now(context)
+            self._require_context_dependency_control(intent, context, now=now)
             owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
         except (AttributeError, KeyError, TypeError, ValueError, GitHubRuntimeError):
             return BrokerMutationResult(failure=GitHubFailure(
@@ -2885,20 +2887,6 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
-        try:
-            control = context.dependency_control
-            if type(control) is not DependencyExecutionControl:
-                raise DependencyPolicyError("dependency execution control is unavailable")
-            control.require(
-                CandidateBinding(intent.repository.slug, context.mutation_context.task_fingerprint, context.candidate_sha),
-                DependencyStage.GITHUB_MUTATION,
-                now=int(now.timestamp()),
-            )
-        except (DependencyPolicyError, ValueError):
-            return BrokerMutationResult(failure=GitHubFailure(
-                GitHubFailureKind.POLICY_DENIED, intent.operation,
-                "candidate dependency preflight blocked mutation execution",
-            ))
         # A caller carrying outbound payload proves it is attempting the
         # owner-host mutation route.  Do not even open a semantic read when
         # that capability was not injected; reads must not become a fallback
@@ -3092,6 +3080,28 @@ class GitHubMutationBroker:
             return None
         return self.__executor.require_dependency(intent, context, now=now)
 
+    @staticmethod
+    def _require_context_dependency_control(
+        intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime | None = None,
+    ) -> None:
+        """Reject invalid dependency evidence without invoking broker callbacks."""
+
+        if type(intent) is not GitHubMutationIntent or type(context) is not MutationBrokerContext:
+            raise GitHubRuntimeError("broker dependency context is invalid")
+        attested_now = context.evaluated_at if now is None else now
+        if type(attested_now) is not datetime or attested_now.tzinfo is not timezone.utc:
+            raise GitHubRuntimeError("broker dependency control time is invalid")
+        if intent.repository != context.repository or context.mutation_context.candidate_sha != context.candidate_sha:
+            raise GitHubRuntimeError("broker dependency control does not match active context")
+        control = context.dependency_control
+        if type(control) is not DependencyExecutionControl:
+            raise GitHubRuntimeError("broker dependency execution control is unavailable")
+        binding = CandidateBinding(intent.repository.slug, context.mutation_context.task_fingerprint, context.candidate_sha)
+        try:
+            control.require(binding, DependencyStage.GITHUB_MUTATION, now=int(attested_now.timestamp()))
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("broker dependency preflight blocked execution") from error
+
     def _reconcile_journal(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext,
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
@@ -3101,7 +3111,9 @@ class GitHubMutationBroker:
         """Resolve a durable uncertain state only from broker-owned read-back."""
 
         try:
+            self._require_context_dependency_control(intent, context)
             now = self._now(context)
+            self._require_context_dependency_control(intent, context, now=now)
             if self.__executor is not None and self.__executor.requires_owner_dependency_control:
                 if type(owner_authorization) is not _OwnerBrokerMutationAuthorization:
                     owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
@@ -3195,7 +3207,9 @@ class GitHubMutationBroker:
         if readback is not None or semantic_plan is not None or command is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
+            self._require_context_dependency_control(intent, context)
             now = self._now(context)
+            self._require_context_dependency_control(intent, context, now=now)
             owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
             plan = _broker_semantic_plan(intent)
             self._require_capabilities(intent, plan, now)
@@ -3206,19 +3220,6 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
-        try:
-            control = context.dependency_control
-            if type(control) is not DependencyExecutionControl:
-                raise DependencyPolicyError("dependency execution control is unavailable")
-            control.require(
-                CandidateBinding(intent.repository.slug, context.mutation_context.task_fingerprint, context.candidate_sha),
-                DependencyStage.GITHUB_MUTATION, now=int(now.timestamp()),
-            )
-        except (DependencyPolicyError, ValueError):
-            return BrokerMutationResult(failure=GitHubFailure(
-                GitHubFailureKind.POLICY_DENIED, intent.operation,
-                "candidate dependency preflight blocked reconciliation",
-            ))
         if intent.operation in {
             GitHubMutationOperation.CREATE_PULL_REQUEST,
             GitHubMutationOperation.COMMENT,

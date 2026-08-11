@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .configuration import RepositoryIdentity
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .state import StateError, TaskIdentity, _open_writable_connection
 
 
@@ -60,6 +61,23 @@ class CandidateSeal:
     base_sha: str
     candidate_sha: str
     state_identity: str
+
+
+@dataclass(frozen=True)
+class GitEntrypointControl:
+    """Pre-materialized exact evidence required before a Git entrypoint runs."""
+
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not CandidateBinding or type(self.dependency_control) is not DependencyExecutionControl or type(self.now) is not int or self.now < 0:
+            raise GitIdentityError("git entrypoint control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GIT_ENTRYPOINT, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitIdentityError("git entrypoint preflight blocked execution") from error
 
 
 def acquire_transition_lease(
@@ -176,9 +194,24 @@ def transition_lease(
         release_transition_lease(repository, lease, now=now)
 
 
-def resolve_canonical_base(repository: RepositoryIdentity, default_branch: str) -> str:
+def resolve_canonical_base(repository: RepositoryIdentity, default_branch: str, *, control: GitEntrypointControl | None = None) -> str:
     """Resolve a full base commit from ``origin/<default_branch>``, never local HEAD."""
 
+    if control is None:
+        return _resolve_canonical_base_unchecked(repository, default_branch)
+    if type(control) is not GitEntrypointControl:
+        raise GitIdentityError("git entrypoint control is invalid")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise GitIdentityError("git entrypoint preflight blocked execution") from error
+    base = _resolve_canonical_base_unchecked(repository, default_branch)
+    if base != control.binding.candidate_sha:
+        raise GitIdentityError("git entrypoint base does not match sealed candidate")
+    return base
+
+
+def _resolve_canonical_base_unchecked(repository: RepositoryIdentity, default_branch: str) -> str:
     _require_branch(default_branch)
     return _git_commit(repository.root, "rev-parse", "--verify", f"refs/remotes/origin/{default_branch}^{{commit}}")
 
@@ -197,7 +230,7 @@ def provision_worktree(
     paths are revalidated rather than repaired.
     """
 
-    base_sha = resolve_canonical_base(repository, default_branch)
+    base_sha = _resolve_canonical_base_unchecked(repository, default_branch)
     if base_sha != identity.base_sha:
         raise GitIdentityError("task base does not match the canonical default branch")
     _require_branch(identity.branch)

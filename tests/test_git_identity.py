@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright.git_identity import (
+    GitEntrypointControl,
     GitIdentityError,
     TransitionLease,
     WorktreeBinding,
@@ -29,11 +30,25 @@ from roundwright.git_identity import (
     resolve_canonical_base,
     seal_candidate,
 )
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, initialize
 from roundwright.state import database_path
 
 
 class GitIdentityTests(unittest.TestCase):
+    def control(self, repository: RepositoryIdentity) -> GitEntrypointControl:
+        base = self.run_git(repository.root, "rev-parse", "refs/remotes/origin/main")
+        digest = lambda value: "sha256:" + value * 64
+        binding = CandidateBinding("ythdelmar68/roundwright", "issue-20", base)
+        components = (
+            ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-scm/git", digest("3"), digest("4")),
+        )
+        policy = DependencyPolicy(binding, digest("5"), 100, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("6"), authority_digest=digest("7"))
+        policy = __import__("dataclasses").replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 100, policy.policy_digest) for item in components)
+        return GitEntrypointControl(binding, DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7"))), 100)
     def run_git(self, directory: Path, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True)
         return result.stdout.strip()
@@ -98,12 +113,12 @@ class GitIdentityTests(unittest.TestCase):
     def test_base_comes_from_origin_default_branch_not_current_checkout_head(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary) / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             self.run_git(repository.root, "checkout", "-b", "local-only")
             (repository.root / "README.md").write_text("local-only\n", encoding="utf-8")
             self.run_git(repository.root, "commit", "-am", "test: diverge local checkout")
             self.assertNotEqual(self.run_git(repository.root, "rev-parse", "HEAD"), base)
-            self.assertEqual(resolve_canonical_base(repository, "main"), base)
+            self.assertEqual(resolve_canonical_base(repository, "main", control=self.control(repository)), base)
 
     def test_provision_revalidates_exact_registered_worktree_and_rejects_detached_or_dirty_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

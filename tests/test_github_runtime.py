@@ -40,6 +40,7 @@ from roundwright.github_runtime import (
     DurableMutationJournal,
     _OwnerGitHubReadHostEndpoint as _OwnerGitHubReadHostEndpoint,
     _OwnerGitHubReadControl as _OwnerGitHubReadControl,
+    _OwnerGitHubMutationControl as _OwnerGitHubMutationControl,
     GhMutationPayload,
     GitHubCapabilityHealth,
     GitHubMutationBroker,
@@ -57,6 +58,7 @@ from roundwright.github_runtime import (
     OwnerGitHubReadIpcClient,
     OwnerFixedMutationCommand,
     OwnerFixedMutationHostExecutor,
+    InMemoryOwnerMutationControlRegistry,
     InMemoryOwnerMutationSealRegistry,
     OperationHealth,
     SemanticPostcondition,
@@ -182,6 +184,42 @@ class OwnerTransport:
         return result
 
 
+def owner_mutation_control(
+    request: OwnerMutationRequest, *, now: datetime = NOW,
+    binding: CandidateBinding | None = None, operation: GitHubMutationOperation | None = None,
+) -> _OwnerGitHubMutationControl:
+    """Build test-only sealed fixed-host evidence; no role client receives it."""
+
+    digest = lambda value: "sha256:" + value * 64
+    candidate_binding = binding or CandidateBinding(request.repository.slug, "github-mutation-host", request.candidate_sha)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
+    )
+    policy = DependencyPolicy(candidate_binding, digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b"))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(
+        ObservedDependency(candidate_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), policy.policy_digest)
+        for item in components
+    )
+    return _OwnerGitHubMutationControl(
+        request.identity, candidate_binding, operation or request.operation,
+        DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(candidate_binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))),
+        int(now.timestamp()),
+    )
+
+
+class FixtureOwnerMutationControlRegistry:
+    """Test-only control source; production hosts receive a fixed registry."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def resolve(self, request: OwnerMutationRequest) -> _OwnerGitHubMutationControl:
+        return owner_mutation_control(request, now=self.now)
+
+
 class FixtureOwnerSealRegistry:
     """Hermetic endpoint registry; production registry records are pre-provisioned."""
 
@@ -217,8 +255,13 @@ def owner_endpoint(
     transport: OwnerTransport | None = None, *, clock=lambda: NOW,
 ) -> OwnerMutationIpcClient:
     host = transport or OwnerTransport()
+    try:
+        observed_at = clock()
+    except Exception:
+        observed_at = NOW
+    control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
     endpoint = OwnerMutationHostEndpoint(
-        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), clock=clock,
+        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), FixtureOwnerMutationControlRegistry(control_now), clock=clock,
     )
     return OwnerMutationIpcClient(DIGEST, endpoint)
 
@@ -698,6 +741,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         transport = OwnerTransport()
         endpoint = OwnerMutationHostEndpoint(
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport),
+            InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)),
             clock=lambda: NOW,
         )
         self.assertFalse(hasattr(endpoint, "dispatch"))
@@ -740,11 +784,54 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(record=record is None):
                 denied_transport = OwnerTransport()
                 denied = OwnerMutationHostEndpoint(
-                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), clock=lambda: NOW,
+                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), FixtureOwnerMutationControlRegistry(NOW), clock=lambda: NOW,
                 ).exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(denied, OwnerMutationFact)
                 self.assertEqual(denied_transport.requests, [])
                 self.assertEqual(denied_transport.commands, [])
+
+    def test_owner_mutation_dependency_controls_block_before_seal_consumption_or_transport(self) -> None:
+        """The fixed host rejects every untrusted control before any mutable seam."""
+
+        request = sealed_owner_request()
+
+        class CountingSealRegistry:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def resolve_and_consume(self, _: OwnerMutationRequest) -> OwnerMutationSealRecord:
+                self.calls += 1
+                return sealed_owner_record(request)
+
+        class StaticControls:
+            def __init__(self, control: object | None) -> None:
+                self.control = control
+                self.calls = 0
+
+            def resolve(self, _: OwnerMutationRequest) -> object | None:
+                self.calls += 1
+                return self.control
+
+        controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_mutation_control(request, binding=CandidateBinding("other/repository", "github-mutation-host", SHA)),
+            owner_mutation_control(request, binding=CandidateBinding(REPOSITORY.slug, "github-mutation-host", "f" * 40)),
+            owner_mutation_control(request, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_mutation_control(request, now=NOW - timedelta(seconds=1)),
+        )
+        for control in controls:
+            with self.subTest(control_type=type(control).__name__):
+                transport, seals, registry = OwnerTransport(), CountingSealRegistry(), StaticControls(control)
+                endpoint = OwnerMutationHostEndpoint(
+                    seals, OwnerFixedMutationHostExecutor(transport), registry, clock=lambda: NOW,
+                )
+                fact = endpoint.exchange_mutation(OwnerMutationIpcMessage(request)).fact
+                self.assertIsInstance(fact, OwnerMutationFact)
+                self.assertEqual(registry.calls, 1)
+                self.assertEqual(seals.calls, 0)
+                self.assertEqual(transport.requests, [])
+                self.assertEqual(transport.commands, [])
 
     def test_owner_fixed_executor_has_total_sealed_operation_mapping_without_process_access(self) -> None:
         """Every operation reaches the host only as a sealed fixed command shape."""
@@ -801,7 +888,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls, [])
 
         with self.assertRaises(ValueError):
-            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport())  # type: ignore[arg-type]
+            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport(), object())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
 
@@ -854,7 +941,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         transport = OwnerTransport()
         host = OwnerMutationHostEndpoint(
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-            OwnerFixedMutationHostExecutor(transport), clock=lambda: NOW,
+            OwnerFixedMutationHostExecutor(transport), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
         )
         client = OwnerMutationIpcClient(DIGEST, host)
         with self.assertRaises(ValueError):
@@ -992,7 +1079,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 transport = OwnerTransport()
                 host = OwnerMutationHostEndpoint(
                     InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-                    OwnerFixedMutationHostExecutor(transport), clock=lambda: NOW,
+                    OwnerFixedMutationHostExecutor(transport), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
                 )
                 reply = host.exchange_mutation(OwnerMutationIpcMessage(request))
                 self.assertIsInstance(reply.fact, OwnerMutationFact)

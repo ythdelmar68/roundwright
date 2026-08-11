@@ -2082,6 +2082,71 @@ class _OwnerFixedMutationCommandHandler(Protocol):
     ) -> OwnerMutationAcceptedFact: ...
 
 
+@dataclass(frozen=True)
+class _OwnerGitHubMutationControl:
+    """Pre-provisioned owner-only authority for one fixed mutation request."""
+
+    request_identity: str
+    binding: CandidateBinding
+    operation: GitHubMutationOperation
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.operation) is not GitHubMutationOperation
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise GitHubRuntimeError("owner mutation dependency control is invalid")
+        _digest(self.request_identity, "owner mutation dependency request")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner mutation dependency control is invalid") from error
+
+    def require(self, request: OwnerMutationRequest, *, now: datetime) -> None:
+        if (
+            type(self) is not _OwnerGitHubMutationControl
+            or type(request) is not OwnerMutationRequest
+            or type(now) is not datetime
+            or now.tzinfo is not timezone.utc
+            or self.now != int(now.timestamp())
+            or self.request_identity != request.identity
+            or self.binding.repository != request.repository.slug
+            or self.binding.candidate_sha != request.candidate_sha
+            or self.operation is not request.operation
+        ):
+            raise GitHubRuntimeError("owner mutation dependency control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner mutation dependency control is stale") from error
+
+
+class _OwnerMutationControlRegistry(Protocol):
+    """Owner-only source for exact pre-materialized mutation controls."""
+
+    def resolve(self, request: OwnerMutationRequest) -> _OwnerGitHubMutationControl | None: ...
+
+
+class InMemoryOwnerMutationControlRegistry:
+    """Hermetic immutable control registry for owner-host tests and wiring."""
+
+    def __init__(self, controls: tuple[_OwnerGitHubMutationControl, ...]) -> None:
+        if type(controls) is not tuple or any(type(control) is not _OwnerGitHubMutationControl for control in controls):
+            raise GitHubRuntimeError("owner mutation dependency controls are invalid")
+        if len({control.request_identity for control in controls}) != len(controls):
+            raise GitHubRuntimeError("owner mutation dependency controls are duplicated")
+        self.__controls = {control.request_identity: control for control in controls}
+
+    def resolve(self, request: OwnerMutationRequest) -> _OwnerGitHubMutationControl | None:
+        if type(request) is not OwnerMutationRequest:
+            raise GitHubRuntimeError("owner mutation dependency request is invalid")
+        return self.__controls.get(request.identity)
+
+
 class OwnerFixedMutationHostExecutor:
     """Concrete disabled owner-host executor for sealed fixed command shapes.
 
@@ -2130,35 +2195,49 @@ class OwnerMutationHostEndpoint:
 
     def __init__(
         self, registry: OwnerMutationSealRegistry, executor: OwnerFixedMutationHostExecutor,
+        controls: _OwnerMutationControlRegistry,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
             not hasattr(registry, "resolve_and_consume")
             or type(executor) is not OwnerFixedMutationHostExecutor
+            or not hasattr(controls, "resolve")
             or clock is None
         ):
             raise GitHubRuntimeError("owner mutation host endpoint is unavailable")
         self.__registry = registry
         self.__executor = executor
+        self.__controls = controls
         self.__clock = clock
 
     def _dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         if type(request) is not OwnerMutationRequest:
             raise GitHubRuntimeError("owner mutation host request is invalid")
+        try:
+            now = self.__clock()
+        except (TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
+        if type(now) is not datetime or now.tzinfo is not timezone.utc:
+            return OwnerMutationFact(False, request.identity)
+        try:
+            control = self.__controls.resolve(request)
+            if type(control) is not _OwnerGitHubMutationControl:
+                return OwnerMutationFact(False, request.identity)
+            control.require(request, now=now)
+        except (AttributeError, DependencyPolicyError, TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
         record = self.__registry.resolve_and_consume(request)
         if type(record) is not OwnerMutationSealRecord or not record.matches(request):
             return OwnerMutationFact(False, request.identity)
         if request.command is not _MUTATION_COMMAND_BY_OPERATION[request.operation]:
             return OwnerMutationFact(False, request.identity)
         try:
-            now = self.__clock()
             evaluated_at = datetime.fromisoformat(record.evaluated_at)
             fresh_until = datetime.fromisoformat(record.fresh_until)
         except (TypeError, ValueError):
             return OwnerMutationFact(False, request.identity)
         if (
-            type(now) is not datetime or now.tzinfo is not timezone.utc
-            or now < evaluated_at or now >= fresh_until
+            now < evaluated_at or now >= fresh_until
         ):
             return OwnerMutationFact(False, request.identity)
         try:

@@ -169,6 +169,49 @@ class ProviderHealthTests(unittest.TestCase):
         self.assertEqual((self.store.store_reads, self.store.isolation_reads, self.store.roles), (0, 0, []))
         self.assertEqual((self.channel.identity_reads, self.channel.audit_calls, self.channel.requests), (0, 0, []))
 
+    def test_direct_credential_and_audit_callbacks_require_exact_control_before_effects(self):
+        class SentinelCache:
+            def get(self, *args, **kwargs):
+                raise AssertionError("cache read attempted")
+
+            def put(self, *args, **kwargs):
+                raise AssertionError("cache write attempted")
+
+        service = self.service(cache=SentinelCache())
+        binding, valid = self.control(now=100)
+
+        def forged(candidate_binding, dependency_control, now=100):
+            value = object.__new__(ProviderQualificationControl)
+            object.__setattr__(value, "binding", candidate_binding)
+            object.__setattr__(value, "dependency_control", dependency_control)
+            object.__setattr__(value, "now", now)
+            return value
+
+        stale_observations = tuple(replace(item, observed_at=39) for item in valid.dependency_control.observations)
+        missing_stage = DependencyExecutionControl(
+            valid.dependency_control.policy, valid.dependency_control.observations[:1], valid.dependency_control.admission,
+        )
+        invalid = (
+            object(),
+            forged(binding, DependencyExecutionControl(valid.dependency_control.policy, stale_observations, valid.dependency_control.admission)),
+            forged(CandidateBinding("other/repository", binding.task_id, binding.candidate_sha), valid.dependency_control),
+            forged(CandidateBinding(binding.repository, "other-task", binding.candidate_sha), valid.dependency_control),
+            forged(CandidateBinding(binding.repository, binding.task_id, "f" * 40), valid.dependency_control),
+            forged(binding, missing_stage),
+        )
+        with self.assertRaises(TypeError):
+            service.credential_isolation(ProviderRole.WORKER, binding=binding, now=100)  # type: ignore[call-arg]
+        with self.assertRaises(TypeError):
+            service.audit_runtime(ProviderRole.WORKER, binding=binding, now=100)  # type: ignore[call-arg]
+        for control in invalid:
+            with self.subTest(control=type(control).__name__):
+                with self.assertRaises(ProviderHealthError):
+                    service.credential_isolation(ProviderRole.WORKER, binding=binding, control=control, now=100)
+                with self.assertRaises(ProviderHealthError):
+                    service.audit_runtime(ProviderRole.WORKER, binding=binding, control=control, now=100)
+        self.assertEqual((self.store.store_reads, self.store.isolation_reads, self.store.roles), (0, 0, []))
+        self.assertEqual((self.channel.identity_reads, self.channel.audit_calls, self.channel.requests), (0, 0, []))
+
     def test_version_and_model_mismatch_block_only_the_qualified_profile(self):
         incompatible = self.qualify(self.service(audit=CodexRuntimeAudit("1.2.4", "4.5.6", self.audit.capabilities)), ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         self.assertEqual(incompatible.failure, CodexFailure.SDK_INCOMPATIBLE)
@@ -300,7 +343,8 @@ class ProviderHealthTests(unittest.TestCase):
 
     def test_role_credential_projection_has_no_secret_access_and_diagnostics_are_redacted(self):
         service = self.service((ProbeOutcome(False, CodexFailure.AUTH_EXPIRED),))
-        isolation = service.credential_isolation(ProviderRole.WORKER)
+        binding, control = self.control(now=100)
+        isolation = service.credential_isolation(ProviderRole.WORKER, binding=binding, control=control, now=100)
         self.assertTrue(all(value is False for name, value in vars(isolation).items() if name not in {"role", "credential_identity"}))
         result = self.qualify(service, ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         diagnostic = render_health_diagnostic(result)
@@ -312,8 +356,9 @@ class ProviderHealthTests(unittest.TestCase):
         blocked = self.qualify(self.service(isolation=RuntimeError("secret path unavailable")), ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         self.assertEqual(blocked.failure, CodexFailure.MALFORMED_RESPONSE)
         self.assertEqual(self.store.roles, [])
+        binding, control = self.control(now=100)
         with self.assertRaises(ProviderHealthError):
-            self.service(isolation=CredentialIsolationEvidence(ProviderRole.SUPERVISOR, RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.SUPERVISOR, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.SUPERVISOR)))).credential_isolation(ProviderRole.WORKER)
+            self.service(isolation=CredentialIsolationEvidence(ProviderRole.SUPERVISOR, RoleBoundCredentialIdentity("sha256:" + "a" * 64, ProviderRole.SUPERVISOR, "sha256:" + "b" * 64, tuple(item for item in ProviderRole if item is not ProviderRole.SUPERVISOR)))).credential_isolation(ProviderRole.WORKER, binding=binding, control=control, now=100)
 
     def test_rejects_invalid_inputs_and_typed_adapter_failures_stay_classified(self):
         with self.assertRaises(ProviderHealthError):

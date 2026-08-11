@@ -612,7 +612,7 @@ class CodexProviderHealth:
         profile_identity = profile_fingerprint(profile)
         contract_identity = self._contract.fingerprint
         try:
-            isolation = self.credential_isolation(role)
+            isolation = self.credential_isolation(role, binding=binding, control=control, now=now)
         except CodexAdapterError as error:
             return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), error.failure, observed_at, freshness_seconds, 1)
         except ProviderHealthError:
@@ -623,9 +623,12 @@ class CodexProviderHealth:
                 return cached
         return self._refresh(role, profile, profile_identity, contract_identity, isolation, observed_at, freshness_seconds, max_attempts, binding, control)
 
-    def credential_isolation(self, role: ProviderRole) -> CredentialIsolationEvidence:
+    def credential_isolation(
+        self, role: ProviderRole, *, binding: CandidateBinding, control: ProviderQualificationControl, now: int,
+    ) -> CredentialIsolationEvidence:
         """Require the native store's explicit no-secret projection for this role."""
 
+        _authorize_qualification_control(binding, control, now)
         try:
             store_identity = self._credentials.store_identity()
             evidence = self._credentials.credential_isolation(role)
@@ -640,6 +643,30 @@ class CodexProviderHealth:
         except Exception as error:
             raise ProviderHealthError("provider credential isolation is not proven") from error
         return evidence
+
+    def audit_runtime(
+        self, role: ProviderRole, *, binding: CandidateBinding, control: ProviderQualificationControl, now: int,
+    ) -> CodexRuntimeAudit:
+        """Read one runtime audit only under exact qualification authority."""
+
+        _authorize_qualification_control(binding, control, now)
+        isolation = self.credential_isolation(role, binding=binding, control=control, now=now)
+        try:
+            channel = self._credentials.open_role_channel(role)
+            channel_identity = channel.credential_identity()
+            if type(channel_identity) is not RoleBoundCredentialIdentity:
+                raise ProviderHealthError("provider credential channel is invalid")
+            channel_identity.authorize_channel(role, isolation.credential_identity.store_identity, channel_identity.channel_identity)
+            if channel_identity != isolation.credential_identity:
+                raise ProviderHealthError("provider credential channel is invalid")
+            audit = _audit_runtime_under_control(channel, binding, control, now)
+        except CodexAdapterError:
+            raise
+        except Exception as error:
+            raise ProviderHealthError("provider runtime audit is not proven") from error
+        if type(audit) is not CodexRuntimeAudit:
+            raise ProviderHealthError("provider runtime audit is not proven")
+        return audit
 
     def qualify_configuration(
         self,
@@ -690,7 +717,7 @@ class CodexProviderHealth:
         except Exception:
             return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.MALFORMED_RESPONSE, now, freshness_seconds, 1)
         try:
-            audit = channel.audit_runtime()
+            audit = _audit_runtime_under_control(channel, binding, control, now)
         except CodexAdapterError as error:
             return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), error.failure, now, freshness_seconds, 1)
         except Exception:
@@ -738,6 +765,15 @@ def _authorize_qualification_control(binding: CandidateBinding, control: Provide
         control.dependency_control.require(binding, DependencyStage.PROVIDER_QUALIFICATION, now=now)
     except DependencyPolicyError as error:
         raise ProviderHealthError("provider qualification preflight blocked execution") from error
+
+
+def _audit_runtime_under_control(
+    channel: CodexRoleChannel, binding: CandidateBinding, control: ProviderQualificationControl, now: int,
+) -> CodexRuntimeAudit:
+    """Ensure every direct runtime-audit callback is preceded by the sealed gate."""
+
+    _authorize_qualification_control(binding, control, now)
+    return channel.audit_runtime()
 
 
 def profile_fingerprint(profile: ProviderProfile) -> str:

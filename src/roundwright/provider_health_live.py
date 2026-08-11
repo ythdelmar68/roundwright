@@ -71,7 +71,8 @@ def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStor
     if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(qualification_control) is not ProviderQualificationControl or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit:
         raise ProviderHealthError("live provider health fixture is disabled or invalid")
     try:
-        report = CodexProviderHealth(store, contract).qualify_configuration(configuration, binding=qualification_control.binding, control=qualification_control, freshness_seconds=freshness_seconds, max_attempts=1, force_refresh=True, now=now)
+        health = CodexProviderHealth(store, contract)
+        report = health.qualify_configuration(configuration, binding=qualification_control.binding, control=qualification_control, freshness_seconds=freshness_seconds, max_attempts=1, force_refresh=True, now=now)
         if type(report) is not ProviderQualificationReport: raise ValueError
         profiles = (configuration.worker.value, configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
         if tuple(selection for selection in report.selections) != required_provider_selections(report.configuration): raise ValueError
@@ -79,7 +80,7 @@ def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStor
         for ordinal, ((_, role, profile_identity), observation, profile) in enumerate(zip(report.selections, report.observations, profiles, strict=True)):
             if observation.state is not HealthState.READY or not observation.is_fresh_at(now):
                 continue
-            audit = store.open_role_channel(role).audit_runtime()
+            audit = health.audit_runtime(role, binding=qualification_control.binding, control=qualification_control, now=now)
             if type(audit) is not CodexRuntimeAudit: raise ValueError
             audit_identity = ProviderHealthAuditIdentity(audit, profile)
             if audit_identity.runtime_fingerprint != observation.runtime_fingerprint: raise ValueError

@@ -30,7 +30,7 @@ from .candidate_review import (
     record_implementation_candidate,
 )
 from .configuration import RepositoryIdentity, ReviewPolicy, resolve_dispatch_configuration
-from .dependency_policy import CandidateBinding, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAuthority, execute_after_dependency_preflight
+from .dependency_policy import CandidateBinding, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAdmission, execute_after_dependency_preflight
 from .gates import (
     EvidenceOutcome,
     GATE_REGISTRY,
@@ -96,7 +96,8 @@ def run_once_local_slice(
     *,
     trusted_policy_snapshot: TrustedPolicySnapshot | None = None,
     trusted_review_floor: ReviewPolicy | None = None,
-    candidate_dependency_evidence: Callable[[CandidateBinding, TrustedDependencyAuthority], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
+    candidate_dependency_evidence: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
+    trusted_dependency_admission: Callable[[CandidateBinding], TrustedDependencyAdmission] | None = None,
     now: datetime | None = None,
 ) -> LocalSliceResult:
     """Drive one local task to ready-for-owner, or return its exact completed replay.
@@ -145,7 +146,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, trusted_policy_snapshot, candidate_dependency_evidence)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -170,7 +171,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, trusted_policy_snapshot, candidate_dependency_evidence):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -205,7 +206,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         (),
     )
     plan_dispatch = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_policy_snapshot, base_dependency_binding, DependencyStage.DISPATCH,
+        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
         lambda: dispatch_plan(
             repository, identity, _health_context(context, identity, ProviderRole.PLANNING, configuration.worker.value, epoch), planning_input,
             plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
@@ -227,7 +228,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     submit_plan_for_review(repository, identity, plan_attempt_id=persisted_plan.plan_attempt_id, evidence_fingerprint=_fingerprint("submit-plan", identity.task_id), lease=lease)
 
     plan_review = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_policy_snapshot, base_dependency_binding, DependencyStage.DISPATCH,
+        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
         lambda: dispatch_plan_review(
             repository, identity, _health_context(context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch),
             review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
@@ -255,7 +256,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
 
     binding = provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease)
     implementation = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_policy_snapshot, base_dependency_binding, DependencyStage.DISPATCH,
+        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
         lambda: begin_implementation(
             repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
             implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
@@ -265,7 +266,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         ), epoch,
     )
     _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_policy_snapshot, base_dependency_binding, DependencyStage.GITHUB_MUTATION,
+        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.GITHUB_MUTATION,
         lambda: _commit_local_implementation(binding.worktree, source_contents), epoch,
     )
     seal = record_implementation_candidate(
@@ -274,7 +275,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     )
     for verification_id, kind in (("local-targeted-tests", VerificationKind.TEST), ("local-build", VerificationKind.BUILD)):
         _execute_candidate_helper_from_factory(
-            candidate_dependency_evidence, trusted_policy_snapshot, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha), DependencyStage.PACKAGE_BUILD,
+            candidate_dependency_evidence, trusted_dependency_admission, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha), DependencyStage.PACKAGE_BUILD,
             lambda verification_id=verification_id, kind=kind: record_candidate_verification(
                 repository, identity, binding, seal,
                 CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha)),
@@ -289,7 +290,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     )
     candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
     diff_review = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_policy_snapshot, candidate_binding, DependencyStage.DISPATCH,
+        candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, DependencyStage.DISPATCH,
         lambda: dispatch_diff_review(
             repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
             diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
@@ -529,8 +530,8 @@ def _execute_candidate_diff_helper(
 
 
 def _execute_candidate_helper_from_factory(
-    factory: Callable[[CandidateBinding, TrustedDependencyAuthority], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None,
-    trusted_policy_snapshot: TrustedPolicySnapshot | None,
+    factory: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None,
+    admission_factory: Callable[[CandidateBinding], TrustedDependencyAdmission] | None,
     binding: CandidateBinding,
     stage: DependencyStage,
     action: Callable[[], object],
@@ -538,32 +539,21 @@ def _execute_candidate_helper_from_factory(
 ) -> object:
     """Require trusted evidence before every local-slice helper execution."""
 
-    if not callable(factory):
+    if not callable(factory) or not callable(admission_factory):
         raise LocalSliceError("candidate dependency evidence is unavailable")
     try:
-        trusted_authority = _trusted_dependency_authority(trusted_policy_snapshot, binding)
-        policy, observations = factory(binding, trusted_authority)
+        trusted_admission = admission_factory(binding)
+        policy, observations = factory(binding)
     except (DependencyPolicyError, TypeError, ValueError) as error:
         raise LocalSliceError("candidate dependency evidence is unavailable") from error
     try:
         return execute_after_dependency_preflight(
             binding, policy, observations, stage, now=now, action=action,
-            trusted_authority=trusted_authority,
+            previous_policy=trusted_admission.previous_policy,
+            trusted_admission=trusted_admission,
         )
     except DependencyPolicyError as error:
         raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
-
-
-def _trusted_dependency_authority(snapshot: TrustedPolicySnapshot | None, binding: CandidateBinding) -> TrustedDependencyAuthority:
-    """Project expected receipt identities from the pinned control-plane snapshot."""
-
-    if type(snapshot) is not TrustedPolicySnapshot or type(snapshot.source) is not TrustedControlSource:
-        raise LocalSliceError("trusted dependency authority is unavailable")
-    return TrustedDependencyAuthority(
-        binding,
-        "sha256:" + _fingerprint("dependency-reviewer", snapshot.source.source_fingerprint, snapshot.source.revision_fingerprint),
-        "sha256:" + _fingerprint("dependency-authority", snapshot.policy_digest, snapshot.source.revision_fingerprint),
-    )
 
 
 def _git(directory: Path, *arguments: str) -> str:

@@ -230,19 +230,6 @@ class BootstrapPolicyReceipt:
 
 
 @dataclass(frozen=True)
-class TrustedDependencyAuthority:
-    """Expected receipt identities projected by the trusted control boundary."""
-
-    binding: CandidateBinding
-    reviewer_identity: str
-    authority_digest: str
-
-    def __post_init__(self) -> None:
-        if type(self.binding) is not CandidateBinding or not _is_digest(self.reviewer_identity) or not _is_digest(self.authority_digest):
-            raise DependencyPolicyError("trusted dependency authority is invalid")
-
-
-@dataclass(frozen=True)
 class PolicyTransition:
     kind: PolicyTransitionKind
     review: PolicyTransitionReview | BootstrapPolicyReceipt | None = None
@@ -283,6 +270,31 @@ class DependencyPolicy:
 
     def component(self, kind: DependencyComponent) -> ComponentPolicy | None:
         return next((item for item in self.components if item.component is kind), None)
+
+
+@dataclass(frozen=True)
+class TrustedDependencyAdmission:
+    """Control-plane sealed receipt and predecessor for one exact policy."""
+
+    binding: CandidateBinding
+    policy_fingerprint: str
+    receipt_digest: str
+    reviewer_identity: str
+    authority_digest: str
+    previous_policy: DependencyPolicy | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not CandidateBinding or not all(
+            _is_digest(item) for item in (
+                self.policy_fingerprint, self.receipt_digest,
+                self.reviewer_identity, self.authority_digest,
+            )
+        ):
+            raise DependencyPolicyError("trusted dependency admission is invalid")
+        if self.previous_policy is not None and type(self.previous_policy) is not DependencyPolicy:
+            raise DependencyPolicyError("trusted dependency admission is invalid")
+        if self.previous_policy is not None and self.previous_policy.binding != self.binding:
+            raise DependencyPolicyError("trusted dependency admission is invalid")
 
 
 @dataclass(frozen=True)
@@ -341,7 +353,7 @@ def canonical_stage_requirements(stage: DependencyStage) -> tuple[DependencyComp
     return _CANONICAL_STAGE_REQUIREMENTS[stage]
 
 
-def evaluate_dependency_preflight(binding: CandidateBinding, policy: DependencyPolicy | None, observations: Iterable[ObservedDependency] | None, stage: DependencyStage, *, now: int, previous_policy: DependencyPolicy | None = None, trusted_authority: TrustedDependencyAuthority | None = None) -> DependencyDecision:
+def evaluate_dependency_preflight(binding: CandidateBinding, policy: DependencyPolicy | None, observations: Iterable[ObservedDependency] | None, stage: DependencyStage, *, now: int, previous_policy: DependencyPolicy | None = None, trusted_admission: TrustedDependencyAdmission | None = None) -> DependencyDecision:
     """Authorize exactly one canonical helper stage without discovering tools."""
 
     if type(binding) is not CandidateBinding or type(stage) is not DependencyStage or type(now) is not int or now < 0:
@@ -352,7 +364,7 @@ def evaluate_dependency_preflight(binding: CandidateBinding, policy: DependencyP
         return _blocked(binding, stage, DependencyDecisionCode.CANDIDATE_MISMATCH, now)
     if now - policy.issued_at > policy.freshness_seconds or policy.issued_at > now:
         return _blocked(binding, stage, DependencyDecisionCode.POLICY_STALE, now)
-    if not verify_policy_admission(policy, previous_policy, trusted_authority):
+    if not verify_policy_admission(policy, previous_policy, trusted_admission):
         return _blocked(binding, stage, DependencyDecisionCode.POLICY_TRANSITION_INVALID, now)
     if observations is None:
         return _blocked(binding, stage, DependencyDecisionCode.PROVENANCE_UNAVAILABLE, now)
@@ -407,25 +419,46 @@ def verify_policy_transition(previous: DependencyPolicy, current: DependencyPoli
     return all(value <= 0 for value in minimum_direction | maximum_direction) and any(value < 0 for value in minimum_direction | maximum_direction)
 
 
-def verify_policy_admission(policy: DependencyPolicy, previous_policy: DependencyPolicy | None, trusted_authority: TrustedDependencyAuthority | None = None) -> bool:
+def verify_policy_admission(policy: DependencyPolicy, previous_policy: DependencyPolicy | None, trusted_admission: TrustedDependencyAdmission | None = None) -> bool:
     """Admit only an authority-receipted bootstrap or reviewed policy change."""
 
-    if type(policy) is not DependencyPolicy or type(trusted_authority) is not TrustedDependencyAuthority or trusted_authority.binding != policy.binding:
+    if (
+        type(policy) is not DependencyPolicy
+        or type(trusted_admission) is not TrustedDependencyAdmission
+        or trusted_admission.binding != policy.binding
+        or trusted_admission.policy_fingerprint != policy.core_fingerprint
+    ):
         return False
     transition = policy.transition
     if transition.kind is PolicyTransitionKind.BOOTSTRAP and type(transition.review) is BootstrapPolicyReceipt:
         receipt = transition.review
-        return receipt.binding == policy.binding and receipt.policy_fingerprint == policy.core_fingerprint and (receipt.reviewer_identity, receipt.authority_digest) == (trusted_authority.reviewer_identity, trusted_authority.authority_digest)
-    if type(previous_policy) is not DependencyPolicy or not verify_policy_transition(previous_policy, policy):
+        return (
+            trusted_admission.previous_policy is None
+            and receipt.binding == policy.binding
+            and receipt.policy_fingerprint == policy.core_fingerprint
+            and (receipt.receipt_digest, receipt.reviewer_identity, receipt.authority_digest)
+            == (trusted_admission.receipt_digest, trusted_admission.reviewer_identity, trusted_admission.authority_digest)
+        )
+    if (
+        type(previous_policy) is not DependencyPolicy
+        or previous_policy != trusted_admission.previous_policy
+        or not verify_policy_transition(previous_policy, policy)
+    ):
         return False
     review = policy.transition.review
-    return type(review) is PolicyTransitionReview and (review.reviewer_identity, review.authority_digest) == (trusted_authority.reviewer_identity, trusted_authority.authority_digest)
+    return type(review) is PolicyTransitionReview and (
+        review.review_digest, review.reviewer_identity, review.authority_digest
+    ) == (
+        trusted_admission.receipt_digest,
+        trusted_admission.reviewer_identity,
+        trusted_admission.authority_digest,
+    )
 
 
-def execute_after_dependency_preflight(binding: CandidateBinding, policy: DependencyPolicy | None, observations: Iterable[ObservedDependency] | None, stage: DependencyStage, *, now: int, action: Callable[[], object], previous_policy: DependencyPolicy | None = None, trusted_authority: TrustedDependencyAuthority | None = None) -> object:
+def execute_after_dependency_preflight(binding: CandidateBinding, policy: DependencyPolicy | None, observations: Iterable[ObservedDependency] | None, stage: DependencyStage, *, now: int, action: Callable[[], object], previous_policy: DependencyPolicy | None = None, trusted_admission: TrustedDependencyAdmission | None = None) -> object:
     """Run an action only after its non-optional canonical checks pass."""
 
-    decision = evaluate_dependency_preflight(binding, policy, observations, stage, now=now, previous_policy=previous_policy, trusted_authority=trusted_authority)
+    decision = evaluate_dependency_preflight(binding, policy, observations, stage, now=now, previous_policy=previous_policy, trusted_admission=trusted_admission)
     if decision.outcome is not DependencyDecisionOutcome.PASS:
         raise DependencyPolicyError(decision.code.value)
     return action()

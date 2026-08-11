@@ -50,6 +50,7 @@ def dispatch_plan(repository, identity, context, *args, **kwargs):
 
 
 def dispatch_plan_review(repository, identity, context, *args, **kwargs):
+    binding, control = _dispatch_control(identity, context, kwargs["now"]); kwargs.update(binding=binding, control=control)
     return _native_dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), *args, **kwargs)
 
 

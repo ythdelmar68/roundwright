@@ -1,9 +1,4 @@
-"""Hermetic trust gates for dependencies and executable runtime components.
-
-This module deliberately accepts observations from a caller instead of finding
-or starting tools itself.  That makes the authorization decision independent
-of PATH, private filesystem locations, command output, and network state.
-"""
+"""Candidate-bound, hermetic trust gates for dependency helper execution."""
 
 from __future__ import annotations
 
@@ -16,12 +11,15 @@ from typing import Callable, Iterable
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
+_TASK = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 
 
 class DependencyPolicyError(ValueError):
-    """Raised when policy or provenance evidence is not safe to evaluate."""
+    """Raised when untrusted policy or execution evidence is supplied."""
 
 
 class DependencyComponent(StrEnum):
@@ -51,18 +49,79 @@ class DependencyDecisionOutcome(StrEnum):
     BLOCKED = "BLOCKED"
 
 
+class DependencyDecisionCode(StrEnum):
+    AUTHORIZED = "authorized"
+    INVALID_CONTEXT = "invalid-context"
+    POLICY_UNAVAILABLE = "policy-unavailable"
+    POLICY_STALE = "policy-stale"
+    CANDIDATE_MISMATCH = "candidate-mismatch"
+    PROVENANCE_UNAVAILABLE = "provenance-unavailable"
+    PROVENANCE_INVALID = "provenance-invalid"
+    DUPLICATE_PROVENANCE = "duplicate-provenance"
+    POLICY_COVERAGE_MISSING = "policy-coverage-missing"
+    PROVENANCE_MISSING = "provenance-missing"
+    PROVENANCE_STALE = "provenance-stale"
+    IDENTITY_MISMATCH = "identity-mismatch"
+    EXECUTABLE_MISMATCH = "executable-mismatch"
+    VERSION_UNSUPPORTED = "version-unsupported"
+
+
+_CANONICAL_STAGE_REQUIREMENTS: dict[DependencyStage, tuple[DependencyComponent, ...]] = {
+    DependencyStage.DISPATCH: (
+        DependencyComponent.PACKAGE,
+        DependencyComponent.PROVIDER_RUNTIME,
+        DependencyComponent.GITHUB_CLI,
+        DependencyComponent.BUILD_BACKEND,
+    ),
+    DependencyStage.GITHUB_MUTATION: (DependencyComponent.PACKAGE, DependencyComponent.GITHUB_CLI),
+    DependencyStage.PACKAGE_BUILD: (DependencyComponent.PACKAGE, DependencyComponent.BUILD_BACKEND),
+    DependencyStage.PROVIDER_QUALIFICATION: (DependencyComponent.PACKAGE, DependencyComponent.PROVIDER_RUNTIME),
+    DependencyStage.OPTIONAL_ADAPTER: (DependencyComponent.PACKAGE, DependencyComponent.OPTIONAL_ADAPTER),
+}
+
+_DIAGNOSTICS = {
+    DependencyDecisionCode.AUTHORIZED: "all mandatory dependency identities are current",
+    DependencyDecisionCode.INVALID_CONTEXT: "candidate dependency preflight context is invalid",
+    DependencyDecisionCode.POLICY_UNAVAILABLE: "trusted dependency policy is unavailable",
+    DependencyDecisionCode.POLICY_STALE: "trusted dependency policy is stale",
+    DependencyDecisionCode.CANDIDATE_MISMATCH: "dependency evidence does not match the active candidate",
+    DependencyDecisionCode.PROVENANCE_UNAVAILABLE: "dependency provenance is unavailable",
+    DependencyDecisionCode.PROVENANCE_INVALID: "dependency provenance is invalid",
+    DependencyDecisionCode.DUPLICATE_PROVENANCE: "duplicate dependency provenance was supplied",
+    DependencyDecisionCode.POLICY_COVERAGE_MISSING: "required dependency is not covered by policy",
+    DependencyDecisionCode.PROVENANCE_MISSING: "required dependency provenance is missing",
+    DependencyDecisionCode.PROVENANCE_STALE: "dependency provenance is stale",
+    DependencyDecisionCode.IDENTITY_MISMATCH: "dependency identity does not match policy",
+    DependencyDecisionCode.EXECUTABLE_MISMATCH: "dependency executable identity does not match policy",
+    DependencyDecisionCode.VERSION_UNSUPPORTED: "dependency version is unsupported",
+}
+
+
+@dataclass(frozen=True)
+class CandidateBinding:
+    """Exact public repository, task, and candidate identity for all evidence."""
+
+    repository: str
+    task_id: str
+    candidate_sha: str
+
+    def __post_init__(self) -> None:
+        if not _REPOSITORY.fullmatch(self.repository) or not _TASK.fullmatch(self.task_id) or not _COMMIT.fullmatch(self.candidate_sha):
+            raise DependencyPolicyError("candidate dependency binding is invalid")
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint({"repository": self.repository, "task_id": self.task_id, "candidate_sha": self.candidate_sha})
+
+
 @dataclass(frozen=True)
 class VersionRange:
-    """A supported, finite semantic-version range."""
-
     minimum: str
     maximum_exclusive: str
 
     def __post_init__(self) -> None:
-        if not _is_version(self.minimum) or not _is_version(self.maximum_exclusive):
+        if not _is_version(self.minimum) or not _is_version(self.maximum_exclusive) or _version_key(self.minimum) >= _version_key(self.maximum_exclusive):
             raise DependencyPolicyError("supported version range is invalid")
-        if _version_key(self.minimum) >= _version_key(self.maximum_exclusive):
-            raise DependencyPolicyError("supported version range is empty")
 
     def contains(self, version: str) -> bool:
         return _is_version(version) and _version_key(self.minimum) <= _version_key(version) < _version_key(self.maximum_exclusive)
@@ -70,8 +129,6 @@ class VersionRange:
 
 @dataclass(frozen=True)
 class ComponentPolicy:
-    """Trusted immutable expectation for one independently usable component."""
-
     component: DependencyComponent
     identifier: str
     versions: VersionRange
@@ -80,48 +137,108 @@ class ComponentPolicy:
     executable_digest: str
 
     def __post_init__(self) -> None:
-        if type(self.component) is not DependencyComponent or not _safe_identifier(self.identifier):
+        if type(self.component) is not DependencyComponent or type(self.versions) is not VersionRange:
             raise DependencyPolicyError("dependency component policy is invalid")
-        if "copilot" in self.identifier or type(self.versions) is not VersionRange:
+        if not _safe_identifier(self.identifier) or "copilot" in self.identifier or not _safe_identifier(self.source_identity):
             raise DependencyPolicyError("dependency component policy is invalid")
-        if not _safe_identifier(self.source_identity) or not _is_digest(self.artifact_digest) or not _is_digest(self.executable_digest):
+        if not _is_digest(self.artifact_digest) or not _is_digest(self.executable_digest):
             raise DependencyPolicyError("dependency component policy is invalid")
+
+    def evidence(self) -> dict[str, str]:
+        return {
+            "component": self.component.value,
+            "identifier": self.identifier,
+            "minimum": self.versions.minimum,
+            "maximum_exclusive": self.versions.maximum_exclusive,
+            "source_identity": self.source_identity,
+            "artifact_digest": self.artifact_digest,
+            "executable_digest": self.executable_digest,
+        }
+
+
+@dataclass(frozen=True)
+class PolicyTransitionReview:
+    """Canonical authority receipt for one complete policy delta."""
+
+    binding: CandidateBinding
+    reviewer_identity: str
+    authority_digest: str
+    previous_policy_fingerprint: str
+    current_policy_fingerprint: str
+    delta_digest: str
+    review_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not CandidateBinding or not all(_is_digest(item) for item in (self.reviewer_identity, self.authority_digest, self.previous_policy_fingerprint, self.current_policy_fingerprint, self.delta_digest, self.review_digest)):
+            raise DependencyPolicyError("policy transition review is invalid")
+        if self.review_digest != _fingerprint(self._evidence_without_digest()):
+            raise DependencyPolicyError("policy transition review is invalid")
+
+    @classmethod
+    def create(cls, previous: "DependencyPolicy", current: "DependencyPolicy", *, reviewer_identity: str, authority_digest: str) -> "PolicyTransitionReview":
+        if type(previous) is not DependencyPolicy or type(current) is not DependencyPolicy or previous.binding != current.binding:
+            raise DependencyPolicyError("policy transition review is invalid")
+        evidence = {
+            "binding": previous.binding.fingerprint,
+            "reviewer_identity": reviewer_identity,
+            "authority_digest": authority_digest,
+            "previous_policy_fingerprint": previous.core_fingerprint,
+            "current_policy_fingerprint": current.core_fingerprint,
+            "delta_digest": _policy_delta_digest(previous, current),
+        }
+        return cls(previous.binding, reviewer_identity, authority_digest, previous.core_fingerprint, current.core_fingerprint, evidence["delta_digest"], _fingerprint(evidence))
+
+    def _evidence_without_digest(self) -> dict[str, str]:
+        return {
+            "binding": self.binding.fingerprint,
+            "reviewer_identity": self.reviewer_identity,
+            "authority_digest": self.authority_digest,
+            "previous_policy_fingerprint": self.previous_policy_fingerprint,
+            "current_policy_fingerprint": self.current_policy_fingerprint,
+            "delta_digest": self.delta_digest,
+        }
 
 
 @dataclass(frozen=True)
 class PolicyTransition:
-    """Owner-reviewed evidence for a policy upgrade or rollback."""
-
     kind: PolicyTransitionKind
-    previous_policy_digest: str | None
-    review_digest: str | None
+    review: PolicyTransitionReview | None = None
 
     def __post_init__(self) -> None:
         if type(self.kind) is not PolicyTransitionKind:
             raise DependencyPolicyError("dependency policy transition is invalid")
-        if self.kind is PolicyTransitionKind.INITIAL:
-            if self.previous_policy_digest is not None or self.review_digest is not None:
-                raise DependencyPolicyError("initial policy transition is invalid")
-        elif not _is_digest(self.previous_policy_digest) or not _is_digest(self.review_digest):
-            raise DependencyPolicyError("reviewed policy transition is invalid")
+        if (self.kind is PolicyTransitionKind.INITIAL) != (self.review is None):
+            raise DependencyPolicyError("dependency policy transition is invalid")
+        if self.review is not None and type(self.review) is not PolicyTransitionReview:
+            raise DependencyPolicyError("dependency policy transition is invalid")
 
 
 @dataclass(frozen=True)
 class DependencyPolicy:
-    """A path-free dependency policy obtained from an already trusted source."""
-
+    binding: CandidateBinding
     policy_digest: str
+    issued_at: int
     freshness_seconds: int
     components: tuple[ComponentPolicy, ...]
     transition: PolicyTransition
 
     def __post_init__(self) -> None:
-        if not _is_digest(self.policy_digest) or type(self.freshness_seconds) is not int or self.freshness_seconds < 1:
+        if type(self.binding) is not CandidateBinding or not _is_digest(self.policy_digest) or type(self.issued_at) is not int or self.issued_at < 0 or type(self.freshness_seconds) is not int or self.freshness_seconds < 1:
             raise DependencyPolicyError("dependency policy is invalid")
-        if type(self.components) is not tuple or not self.components or any(type(item) is not ComponentPolicy for item in self.components):
+        if type(self.components) is not tuple or not self.components or any(type(item) is not ComponentPolicy for item in self.components) or len({item.component for item in self.components}) != len(self.components):
             raise DependencyPolicyError("dependency policy is invalid")
-        if len({item.component for item in self.components}) != len(self.components) or type(self.transition) is not PolicyTransition:
+        if type(self.transition) is not PolicyTransition:
             raise DependencyPolicyError("dependency policy is invalid")
+
+    @property
+    def core_fingerprint(self) -> str:
+        return _fingerprint({
+            "binding": self.binding.fingerprint,
+            "policy_digest": self.policy_digest,
+            "issued_at": self.issued_at,
+            "freshness_seconds": self.freshness_seconds,
+            "components": tuple(item.evidence() for item in self.components),
+        })
 
     def component(self, kind: DependencyComponent) -> ComponentPolicy | None:
         return next((item for item in self.components if item.component is kind), None)
@@ -129,8 +246,7 @@ class DependencyPolicy:
 
 @dataclass(frozen=True)
 class ObservedDependency:
-    """A caller-supplied, exact identity; it never contains an executable path."""
-
+    binding: CandidateBinding
     component: DependencyComponent
     identifier: str
     version: str
@@ -141,119 +257,105 @@ class ObservedDependency:
     policy_digest: str
 
     def __post_init__(self) -> None:
-        if type(self.component) is not DependencyComponent or not _safe_identifier(self.identifier) or not _is_version(self.version):
+        if type(self.binding) is not CandidateBinding or type(self.component) is not DependencyComponent or not _safe_identifier(self.identifier) or not _is_version(self.version) or not _safe_identifier(self.source_identity) or "copilot" in self.identifier:
             raise DependencyPolicyError("dependency observation is invalid")
-        if "copilot" in self.identifier or not _safe_identifier(self.source_identity):
-            raise DependencyPolicyError("dependency observation is invalid")
-        if not all(_is_digest(value) for value in (self.artifact_digest, self.executable_digest, self.policy_digest)):
-            raise DependencyPolicyError("dependency observation is invalid")
-        if type(self.observed_at) is not int or self.observed_at < 0:
+        if not all(_is_digest(item) for item in (self.artifact_digest, self.executable_digest, self.policy_digest)) or type(self.observed_at) is not int or self.observed_at < 0:
             raise DependencyPolicyError("dependency observation is invalid")
 
     @property
     def fingerprint(self) -> str:
-        """Return a content-addressed, path-independent observation identity."""
-
-        encoded = json.dumps(
-            {
-                "component": self.component.value,
-                "identifier": self.identifier,
-                "version": self.version,
-                "source_identity": self.source_identity,
-                "artifact_digest": self.artifact_digest,
-                "executable_digest": self.executable_digest,
-                "observed_at": self.observed_at,
-                "policy_digest": self.policy_digest,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return "sha256:" + hashlib.sha256(encoded).hexdigest()
-
-
-@dataclass(frozen=True)
-class StageRequirement:
-    """Components required for exactly one stage, keeping optional adapters isolated."""
-
-    stage: DependencyStage
-    components: tuple[DependencyComponent, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.stage) is not DependencyStage or type(self.components) is not tuple or not self.components:
-            raise DependencyPolicyError("dependency stage requirement is invalid")
-        if any(type(item) is not DependencyComponent for item in self.components) or len(set(self.components)) != len(self.components):
-            raise DependencyPolicyError("dependency stage requirement is invalid")
+        return _fingerprint({
+            "binding": self.binding.fingerprint,
+            "component": self.component.value,
+            "identifier": self.identifier,
+            "version": self.version,
+            "source_identity": self.source_identity,
+            "artifact_digest": self.artifact_digest,
+            "executable_digest": self.executable_digest,
+            "observed_at": self.observed_at,
+            "policy_digest": self.policy_digest,
+        })
 
 
 @dataclass(frozen=True)
 class DependencyDecision:
     outcome: DependencyDecisionOutcome
-    stage: DependencyStage
-    reason: str
-    observation_fingerprints: tuple[str, ...] = ()
+    code: DependencyDecisionCode
+    stage: DependencyStage | None
+    binding_fingerprint: str | None
+    policy_fingerprint: str | None
+    observation_fingerprints: tuple[str, ...]
+    evaluated_at: int
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not DependencyDecisionOutcome or type(self.code) is not DependencyDecisionCode or type(self.observation_fingerprints) is not tuple or any(not _is_digest(item) for item in self.observation_fingerprints) or type(self.evaluated_at) is not int or self.evaluated_at < 0:
+            raise DependencyPolicyError("dependency decision is invalid")
 
 
-def evaluate_dependency_preflight(
-    policy: DependencyPolicy | None,
-    observations: Iterable[ObservedDependency] | None,
-    requirement: StageRequirement,
-    *,
-    now: int,
-) -> DependencyDecision:
-    """Fail closed before dispatch, mutation, build, or adapter use.
+def canonical_stage_requirements(stage: DependencyStage) -> tuple[DependencyComponent, ...]:
+    """Return the closed requirement map used by every helper boundary."""
 
-    The function is pure: it cannot inspect PATH, launch a helper, read a
-    filesystem path, or contact a registry.  Callers must first supply one
-    policy-bound observation for every component needed by this exact stage.
-    """
+    if type(stage) is not DependencyStage:
+        raise DependencyPolicyError("dependency stage is invalid")
+    return _CANONICAL_STAGE_REQUIREMENTS[stage]
 
-    if type(requirement) is not StageRequirement or type(now) is not int or now < 0:
-        return _blocked(requirement, "invalid preflight context")
+
+def evaluate_dependency_preflight(binding: CandidateBinding, policy: DependencyPolicy | None, observations: Iterable[ObservedDependency] | None, stage: DependencyStage, *, now: int) -> DependencyDecision:
+    """Authorize exactly one canonical helper stage without discovering tools."""
+
+    if type(binding) is not CandidateBinding or type(stage) is not DependencyStage or type(now) is not int or now < 0:
+        return _blocked(binding, stage, DependencyDecisionCode.INVALID_CONTEXT, now)
     if type(policy) is not DependencyPolicy:
-        return _blocked(requirement, "trusted dependency policy is unavailable")
+        return _blocked(binding, stage, DependencyDecisionCode.POLICY_UNAVAILABLE, now)
+    if policy.binding != binding:
+        return _blocked(binding, stage, DependencyDecisionCode.CANDIDATE_MISMATCH, now)
+    if now - policy.issued_at > policy.freshness_seconds or policy.issued_at > now:
+        return _blocked(binding, stage, DependencyDecisionCode.POLICY_STALE, now)
     if observations is None:
-        return _blocked(requirement, "dependency provenance is unavailable")
+        return _blocked(binding, stage, DependencyDecisionCode.PROVENANCE_UNAVAILABLE, now)
     try:
         records = tuple(observations)
     except TypeError:
-        return _blocked(requirement, "dependency provenance is invalid")
+        return _blocked(binding, stage, DependencyDecisionCode.PROVENANCE_INVALID, now)
     if any(type(item) is not ObservedDependency for item in records):
-        return _blocked(requirement, "dependency provenance is invalid")
+        return _blocked(binding, stage, DependencyDecisionCode.PROVENANCE_INVALID, now)
+    if any(item.binding != binding for item in records):
+        return _blocked(binding, stage, DependencyDecisionCode.CANDIDATE_MISMATCH, now)
     if len({item.component for item in records}) != len(records):
-        return _blocked(requirement, "duplicate dependency provenance was supplied")
+        return _blocked(binding, stage, DependencyDecisionCode.DUPLICATE_PROVENANCE, now)
 
     selected: list[str] = []
-    by_component = {item.component: item for item in records}
-    for component in requirement.components:
+    records_by_component = {item.component: item for item in records}
+    for component in canonical_stage_requirements(stage):
         expected = policy.component(component)
-        observed = by_component.get(component)
+        observed = records_by_component.get(component)
         if expected is None:
-            return _blocked(requirement, "required dependency is not covered by policy")
+            return _blocked(binding, stage, DependencyDecisionCode.POLICY_COVERAGE_MISSING, now)
         if observed is None:
-            return _blocked(requirement, "required dependency provenance is missing")
-        reason = _validate_observation(policy, expected, observed, now)
-        if reason is not None:
-            return _blocked(requirement, reason)
+            return _blocked(binding, stage, DependencyDecisionCode.PROVENANCE_MISSING, now)
+        code = _validate_observation(policy, expected, observed, now)
+        if code is not None:
+            return _blocked(binding, stage, code, now)
         selected.append(observed.fingerprint)
-    return DependencyDecision(DependencyDecisionOutcome.PASS, requirement.stage, "all required dependency identities are current", tuple(selected))
+    return DependencyDecision(DependencyDecisionOutcome.PASS, DependencyDecisionCode.AUTHORIZED, stage, binding.fingerprint, policy.core_fingerprint, tuple(selected), now)
 
 
 def verify_policy_transition(previous: DependencyPolicy, current: DependencyPolicy) -> bool:
-    """Validate an explicitly reviewed upgrade or rollback without applying it."""
+    """Require a canonical authority receipt over the complete policy delta."""
 
-    if type(previous) is not DependencyPolicy or type(current) is not DependencyPolicy:
+    if type(previous) is not DependencyPolicy or type(current) is not DependencyPolicy or previous.binding != current.binding:
         return False
     transition = current.transition
-    if transition.kind is PolicyTransitionKind.INITIAL or transition.previous_policy_digest != previous.policy_digest:
+    if transition.kind is PolicyTransitionKind.INITIAL or type(transition.review) is not PolicyTransitionReview:
         return False
-    if not _is_digest(transition.review_digest):
+    review = transition.review
+    if review.binding != current.binding or review.previous_policy_fingerprint != previous.core_fingerprint or review.current_policy_fingerprint != current.core_fingerprint or review.delta_digest != _policy_delta_digest(previous, current):
         return False
-    earlier = {item.component: item for item in previous.components}
-    later = {item.component: item for item in current.components}
-    if earlier.keys() != later.keys():
+    before = {item.component: item for item in previous.components}
+    after = {item.component: item for item in current.components}
+    if before.keys() != after.keys():
         return False
-    # Determine policy direction independently for every component.
-    direction = {_compare_version(later[key].versions.minimum, earlier[key].versions.minimum) for key in earlier}
+    direction = {_compare_version(after[key].versions.minimum, before[key].versions.minimum) for key in before}
     if direction == {0}:
         return False
     if transition.kind is PolicyTransitionKind.UPGRADE:
@@ -261,49 +363,49 @@ def verify_policy_transition(previous: DependencyPolicy, current: DependencyPoli
     return all(value <= 0 for value in direction) and any(value < 0 for value in direction)
 
 
-def execute_after_dependency_preflight(
-    policy: DependencyPolicy | None,
-    observations: Iterable[ObservedDependency] | None,
-    requirement: StageRequirement,
-    *,
-    now: int,
-    action: Callable[[], object],
-) -> object:
-    """Run a supplied action only after the pure trust decision passes."""
+def execute_after_dependency_preflight(binding: CandidateBinding, policy: DependencyPolicy | None, observations: Iterable[ObservedDependency] | None, stage: DependencyStage, *, now: int, action: Callable[[], object]) -> object:
+    """Run an action only after its non-optional canonical checks pass."""
 
-    decision = evaluate_dependency_preflight(policy, observations, requirement, now=now)
+    decision = evaluate_dependency_preflight(binding, policy, observations, stage, now=now)
     if decision.outcome is not DependencyDecisionOutcome.PASS:
-        raise DependencyPolicyError(decision.reason)
+        raise DependencyPolicyError(decision.code.value)
     return action()
 
 
 def render_dependency_decision(decision: DependencyDecision) -> str:
-    """Render only stable public identifiers; no paths or raw command evidence."""
+    """Render only fixed public-safe diagnostic text."""
 
     if type(decision) is not DependencyDecision:
-        return "dependency-gate=BLOCKED stage=unknown reason=invalid decision"
-    return f"dependency-gate={decision.outcome.value} stage={decision.stage.value} reason={decision.reason}"
+        return "dependency-gate=BLOCKED stage=unknown code=invalid-context reason=candidate dependency preflight context is invalid"
+    stage = decision.stage.value if type(decision.stage) is DependencyStage else "unknown"
+    return f"dependency-gate={decision.outcome.value} stage={stage} code={decision.code.value} reason={_DIAGNOSTICS[decision.code]}"
 
 
-def _validate_observation(policy: DependencyPolicy, expected: ComponentPolicy, observed: ObservedDependency, now: int) -> str | None:
+def _validate_observation(policy: DependencyPolicy, expected: ComponentPolicy, observed: ObservedDependency, now: int) -> DependencyDecisionCode | None:
     if observed.policy_digest != policy.policy_digest:
-        return "dependency provenance is bound to a different policy"
-    if now - observed.observed_at > policy.freshness_seconds:
-        return "dependency provenance is stale"
-    if observed.observed_at > now:
-        return "dependency provenance time is invalid"
+        return DependencyDecisionCode.CANDIDATE_MISMATCH
+    if now - observed.observed_at > policy.freshness_seconds or observed.observed_at > now:
+        return DependencyDecisionCode.PROVENANCE_STALE
     if (observed.identifier, observed.source_identity, observed.artifact_digest) != (expected.identifier, expected.source_identity, expected.artifact_digest):
-        return "dependency identity does not match policy"
+        return DependencyDecisionCode.IDENTITY_MISMATCH
     if observed.executable_digest != expected.executable_digest:
-        return "dependency executable identity does not match policy"
+        return DependencyDecisionCode.EXECUTABLE_MISMATCH
     if not expected.versions.contains(observed.version):
-        return "dependency version is unsupported"
+        return DependencyDecisionCode.VERSION_UNSUPPORTED
     return None
 
 
-def _blocked(requirement: object, reason: str) -> DependencyDecision:
-    stage = requirement.stage if type(requirement) is StageRequirement else DependencyStage.DISPATCH
-    return DependencyDecision(DependencyDecisionOutcome.BLOCKED, stage, reason)
+def _blocked(binding: object, stage: object, code: DependencyDecisionCode, now: object) -> DependencyDecision:
+    valid_binding = binding if type(binding) is CandidateBinding else None
+    return DependencyDecision(DependencyDecisionOutcome.BLOCKED, code, stage if type(stage) is DependencyStage else None, valid_binding.fingerprint if valid_binding else None, None, (), now if type(now) is int and now >= 0 else 0)
+
+
+def _policy_delta_digest(previous: DependencyPolicy, current: DependencyPolicy) -> str:
+    return _fingerprint({"previous": tuple(item.evidence() for item in previous.components), "current": tuple(item.evidence() for item in current.components)})
+
+
+def _fingerprint(value: object) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _is_digest(value: object) -> bool:
@@ -319,9 +421,9 @@ def _is_version(value: object) -> bool:
 
 
 def _version_key(value: str) -> tuple[int, int, int]:
-    matched = _VERSION.fullmatch(value)
-    assert matched is not None
-    return tuple(int(item) for item in matched.groups())  # type: ignore[return-value]
+    match = _VERSION.fullmatch(value)
+    assert match is not None
+    return tuple(int(item) for item in match.groups())  # type: ignore[return-value]
 
 
 def _compare_version(left: str, right: str) -> int:

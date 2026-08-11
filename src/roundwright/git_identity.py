@@ -194,11 +194,9 @@ def transition_lease(
         release_transition_lease(repository, lease, now=now)
 
 
-def resolve_canonical_base(repository: RepositoryIdentity, default_branch: str, *, control: GitEntrypointControl | None = None) -> str:
+def resolve_canonical_base(repository: RepositoryIdentity, default_branch: str, *, control: GitEntrypointControl) -> str:
     """Resolve a full base commit from ``origin/<default_branch>``, never local HEAD."""
 
-    if control is None:
-        return _resolve_canonical_base_unchecked(repository, default_branch)
     if type(control) is not GitEntrypointControl:
         raise GitIdentityError("git entrypoint control is invalid")
     try:
@@ -222,6 +220,7 @@ def provision_worktree(
     *,
     default_branch: str,
     worktree: Path,
+    control: GitEntrypointControl,
     lease: TransitionLease | None = None,
 ) -> WorktreeBinding:
     """Create or revalidate one task-owned branch/worktree at the canonical base.
@@ -230,7 +229,39 @@ def provision_worktree(
     paths are revalidated rather than repaired.
     """
 
-    base_sha = _resolve_canonical_base_unchecked(repository, default_branch)
+    if type(control) is not GitEntrypointControl:
+        raise GitIdentityError("git entrypoint control is invalid")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise GitIdentityError("git entrypoint preflight blocked execution") from error
+    if (
+        control.binding.repository != identity.repository_id
+        or control.binding.task_id != identity.task_id
+        or control.binding.candidate_sha != identity.base_sha
+    ):
+        raise GitIdentityError("git entrypoint control does not match task identity")
+    return _provision_worktree_compatibility(
+        repository, identity, default_branch=default_branch, worktree=worktree, control=control, lease=lease
+    )
+
+
+def _provision_worktree_compatibility(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    *,
+    default_branch: str,
+    worktree: Path,
+    control: GitEntrypointControl | None = None,
+    lease: TransitionLease | None = None,
+) -> WorktreeBinding:
+    """Private temporary compatibility path pending local-slice entrypoint migration."""
+
+    base_sha = (
+        _resolve_canonical_base_unchecked(repository, default_branch)
+        if control is None
+        else resolve_canonical_base(repository, default_branch, control=control)
+    )
     if base_sha != identity.base_sha:
         raise GitIdentityError("task base does not match the canonical default branch")
     _require_branch(identity.branch)

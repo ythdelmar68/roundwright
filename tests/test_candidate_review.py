@@ -28,7 +28,8 @@ import roundwright.candidate_review as candidate_review
 from roundwright.configuration import RepositoryIdentity
 from roundwright.gates import _valid_review_limit_finalization
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
+from roundwright.git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review as _native_dispatch_plan_review, record_plan_review
 from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, prepare_attempt, read_attempt, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
@@ -104,6 +105,23 @@ class CandidateReviewTests(unittest.TestCase):
     def git(self, directory: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True).stdout.strip()
 
+    def git_control(self, identity: TaskIdentity, *, now: int) -> GitEntrypointControl:
+        digest = lambda value: "sha256:" + value * 64
+        binding = CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha)
+        components = (
+            ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-scm/git", digest("3"), digest("4")),
+        )
+        policy = DependencyPolicy(binding, digest("5"), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("6"), authority_digest=digest("7"))
+        policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        observations = tuple(
+            ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest)
+            for item in components
+        )
+        admission = TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7"))
+        return GitEntrypointControl(binding, DependencyExecutionControl(policy, observations, admission), now)
+
     def repository(self, root: Path) -> RepositoryIdentity:
         remote = root.parent / "remote.git"
         subprocess.run(["git", "init", "--bare", str(remote)], check=True, text=True, capture_output=True)
@@ -136,7 +154,7 @@ class CandidateReviewTests(unittest.TestCase):
         review = dispatch_plan_review(repository, identity, context, review_attempt_id="plan-review-25", provider_attempt_id="plan-supervisor", supervisor_session_identity="plan-session-25", external_turn_identity="plan-review-turn", plan_attempt_id="plan-25", process_lease_id="review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
         record_plan_review(repository, identity, context, review_attempt_id=review.review_attempt_id, output=PlanReviewOutput(review.review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity, review.external_turn_identity, review.plan_attempt_id, review.source_digest, review.plan_digest, PlanReviewVerdict.PASS, (), (), (), ()), completion_evidence_fingerprint="1" * 64, lease=lease, now=now)
         accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-25", receipt=PlanReviewReceipt("plan-review-25", persisted.content_digest, True), evidence_fingerprint="2" * 64, lease=lease)
-        binding = provision_worktree(repository, identity, default_branch="main", worktree=worktree, lease=lease)
+        binding = provision_worktree(repository, identity, default_branch="main", worktree=worktree, control=self.git_control(identity, now=now), lease=lease)
         if commit:
             (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
             self.git(worktree, "add", "candidate.txt")

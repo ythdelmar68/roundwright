@@ -44,7 +44,7 @@ from .gates import (
     task_identity_fingerprint,
     transition_ready_for_owner,
 )
-from .git_identity import CandidateSeal, provision_worktree, resolve_canonical_base, transition_lease
+from .git_identity import CandidateSeal, _provision_worktree_compatibility, _resolve_canonical_base_unchecked, transition_lease
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
@@ -114,7 +114,9 @@ def run_once_local_slice(
     if not isinstance(fixture.source_contents, str) or not fixture.source_contents:
         raise LocalSliceError("local slice source is invalid")
 
-    base_sha = resolve_canonical_base(repository, "main")
+    # Temporary private compatibility route; the next slice threads a sealed
+    # GitEntrypointControl through this fixture before exposing Git execution.
+    base_sha = _resolve_canonical_base_unchecked(repository, "main")
     identity = TaskIdentity(
         fixture.task_id,
         fixture.source_id,
@@ -263,7 +265,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     binding = _execute_candidate_helper_from_factory(
         candidate_dependency_evidence, trusted_dependency_admission,
         base_dependency_binding, DependencyStage.GITHUB_MUTATION,
-        lambda: provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease),
+        lambda: _provision_worktree_compatibility(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease),
         epoch,
     )
     implementation = _execute_candidate_helper_from_factory(

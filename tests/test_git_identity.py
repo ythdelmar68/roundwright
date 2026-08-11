@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -124,18 +125,18 @@ class GitIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             location = parent / "isolated" / "task-20"
             identity = self.identity(base, worktree=location)
             self.admit(repository, identity)
             lease = self.lease(repository)
             with self.assertRaises(GitIdentityError):
-                provision_worktree(repository, identity, default_branch="main", worktree=location)
-            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
+                provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository))
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=lease)
             wrong_owner = TransitionLease(lease.repository_id, lease.state_identity, "orchestrator-b", lease.generation, lease.expires_at)
             with self.assertRaises(GitIdentityError):
                 seal_candidate(repository, binding, lease=wrong_owner)
-            self.assertEqual(provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease), binding)
+            self.assertEqual(provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=lease), binding)
             self.run_git(location, "checkout", "--detach")
             with self.assertRaises(GitIdentityError):
                 seal_candidate(repository, binding, lease=lease)
@@ -144,19 +145,78 @@ class GitIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             location = parent / "isolated" / "任務"
             identity = self.identity(base, branch="codex/unicode-worktree", worktree=location)
             self.admit(repository, identity)
-            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=self.lease(repository))
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=self.lease(repository))
             self.assertTrue(location.is_dir())
             self.assertEqual(revalidate_worktree(repository, binding), binding)
+
+    def test_provision_rejects_unsealed_or_mismatched_control_before_git_or_state_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repository = self.repository(parent / "repository")
+            base = self.run_git(repository.root, "rev-parse", "refs/remotes/origin/main")
+            location = parent / "isolated" / "task-20"
+            identity = self.identity(base, worktree=location)
+            self.admit(repository, identity)
+            lease = self.lease(repository)
+            state_before = database_path(repository).read_bytes()
+            valid = self.control(repository)
+
+            def forged(binding, now):
+                value = object.__new__(GitEntrypointControl)
+                object.__setattr__(value, "binding", binding)
+                object.__setattr__(value, "dependency_control", valid.dependency_control)
+                object.__setattr__(value, "now", now)
+                return value
+
+            invalid = (
+                None,
+                object(),
+                forged(valid.binding, 1_000),
+                forged(CandidateBinding("other/repository", identity.task_id, base), valid.now),
+                forged(CandidateBinding(identity.repository_id, "other-task", base), valid.now),
+                valid,
+            )
+            identities = (*((identity,) * 5), self.identity("f" * 40, worktree=parent / "isolated" / "wrong-candidate"))
+            with patch("roundwright.git_identity._resolve_canonical_base_unchecked") as resolve:
+                for control, attempted_identity in zip(invalid, identities, strict=True):
+                    with self.subTest(control=type(control).__name__, task=attempted_identity.task_id):
+                        with self.assertRaises((GitIdentityError, TypeError)):
+                            provision_worktree(
+                                repository, attempted_identity, default_branch="main", worktree=Path(attempted_identity.worktree), control=control, lease=lease
+                            )
+            resolve.assert_not_called()
+            self.assertFalse(location.exists())
+            self.assertFalse((parent / "isolated" / "wrong-candidate").exists())
+            self.assertEqual(database_path(repository).read_bytes(), state_before)
+
+    def test_provision_rejects_base_drift_before_worktree_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            repository = self.repository(parent / "repository")
+            base = self.run_git(repository.root, "rev-parse", "refs/remotes/origin/main")
+            location = parent / "isolated" / "task-20"
+            identity = self.identity(base, worktree=location)
+            self.admit(repository, identity)
+            lease = self.lease(repository)
+            state_before = database_path(repository).read_bytes()
+            with patch("roundwright.git_identity._resolve_canonical_base_unchecked", return_value="f" * 40) as resolve:
+                with self.assertRaises(GitIdentityError):
+                    provision_worktree(
+                        repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=lease
+                    )
+            resolve.assert_called_once()
+            self.assertFalse(location.exists())
+            self.assertEqual(database_path(repository).read_bytes(), state_before)
 
     def test_repository_bound_lease_and_metadata_descendant_paths_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             initialize(repository)
             normal = parent / "isolated" / "wrong-repository"
             normal_identity = self.identity(base, branch="codex/wrong-repository", worktree=normal)
@@ -164,7 +224,7 @@ class GitIdentityTests(unittest.TestCase):
             current = self.lease(repository)
             wrong_lease = TransitionLease("other/repository", current.state_identity, current.owner, current.generation, current.expires_at)
             with self.assertRaises(GitIdentityError):
-                provision_worktree(repository, normal_identity, default_branch="main", worktree=normal, lease=wrong_lease)
+                provision_worktree(repository, normal_identity, default_branch="main", worktree=normal, control=self.control(repository), lease=wrong_lease)
             for name in (".git/nested-worktree", ".roundwright/nested-worktree"):
                 location = repository.root / name
                 identity = TaskIdentity(
@@ -177,13 +237,13 @@ class GitIdentityTests(unittest.TestCase):
                 )
                 self.admit(repository, identity)
                 with self.subTest(path=name), self.assertRaises(GitIdentityError):
-                    provision_worktree(repository, identity, default_branch="main", worktree=location, lease=wrong_lease)
+                    provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=wrong_lease)
 
     def test_revalidate_rejects_registered_path_prefix_collisions_and_copied_gitfiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             requested = parent / "isolated" / "task"
             registered = parent / "isolated" / "task-copy"
             identity = self.identity(base, worktree=requested)
@@ -205,12 +265,12 @@ class GitIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             location = parent / "isolated" / "task-20"
             identity = self.identity(base, worktree=location)
             self.admit(repository, identity)
             lease = self.lease(repository)
-            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=lease)
             seal = seal_candidate(repository, binding, lease=lease)
             bind_candidate_evidence(repository, binding, seal, evidence_fingerprint="b" * 64, lease=lease)
             connection = sqlite3.connect(database_path(repository))
@@ -280,12 +340,12 @@ class GitIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             location = parent / "isolated" / "task-20"
             identity = self.identity(base, worktree=location)
             self.admit(repository, identity)
             lease = self.lease(repository)
-            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, lease=lease)
+            binding = provision_worktree(repository, identity, default_branch="main", worktree=location, control=self.control(repository), lease=lease)
             seal = seal_candidate(repository, binding, lease=lease)
             bind_candidate_evidence(repository, binding, seal, evidence_fingerprint="b" * 64, lease=lease)
             self.run_git(location, "checkout", "--detach", base)
@@ -302,16 +362,16 @@ class GitIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             repository = self.repository(parent / "repository")
-            base = resolve_canonical_base(repository, "main")
+            base = resolve_canonical_base(repository, "main", control=self.control(repository))
             collision = parent / "isolated" / "collision"
             identity = self.identity(base, worktree=collision)
             self.admit(repository, identity)
             lease = self.lease(repository)
             with self.assertRaises(GitIdentityError):
-                provision_worktree(repository, self.identity("f" * 40, worktree=parent / "isolated" / "wrong-base"), default_branch="main", worktree=parent / "isolated" / "wrong-base", lease=lease)
+                provision_worktree(repository, self.identity("f" * 40, worktree=parent / "isolated" / "wrong-base"), default_branch="main", worktree=parent / "isolated" / "wrong-base", control=self.control(repository), lease=lease)
             collision.mkdir(parents=True)
             with self.assertRaises(GitIdentityError):
-                provision_worktree(repository, identity, default_branch="main", worktree=collision, lease=lease)
+                provision_worktree(repository, identity, default_branch="main", worktree=collision, control=self.control(repository), lease=lease)
             foreign = self.repository(parent / "foreign")
             binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, foreign.root, base, lease.state_identity)
             with self.assertRaises(GitIdentityError):

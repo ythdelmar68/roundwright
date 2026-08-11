@@ -21,10 +21,12 @@ from pathlib import Path
 from typing import Iterable
 
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
+from .dependency_policy import CandidateBinding, DependencyPolicyError, DependencyStage
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
+from .worker_planning import ProviderDispatchControl
 
 
 class CandidateReviewError(StateError):
@@ -283,6 +285,8 @@ def begin_implementation(
     identity: TaskIdentity,
     context: RecoveryContext,
     *,
+    binding: CandidateBinding,
+    control: ProviderDispatchControl,
     implementation_attempt_id: str,
     provider_attempt_id: str,
     plan_attempt_id: str,
@@ -294,10 +298,16 @@ def begin_implementation(
     process_lease_id: str,
     process_lease_expires_at: int,
     lease: TransitionLease | None,
-    now: int | None = None,
+    now: int,
 ) -> ImplementationDispatch:
     """Resume exactly the Worker accepted by plan review for an implementation turn."""
 
+    if type(binding) is not CandidateBinding or type(control) is not ProviderDispatchControl or control.binding != binding or control.now != now or binding.repository != identity.repository_id or binding.task_id != identity.task_id or binding.candidate_sha != (repair_candidate_sha or context.candidate_sha or identity.base_sha):
+        raise CandidateReviewError("implementation dispatch control is invalid")
+    try:
+        control.dependency_control.require(binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("implementation dispatch preflight blocked execution") from error
     for value, name in (
         (implementation_attempt_id, "implementation attempt identity"), (provider_attempt_id, "provider attempt identity"),
         (plan_attempt_id, "plan attempt identity"), (worker_thread_identity, "Worker thread identity"),

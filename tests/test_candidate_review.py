@@ -34,14 +34,18 @@ from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatc
 from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, prepare_attempt, read_attempt, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
-    PlanReviewReceipt, PlanningInput, WorkerPlan, WorkerPlanOutput,
+    PlanReviewReceipt, PlanningInput, ProviderDispatchControl, WorkerPlan, WorkerPlanOutput,
     accept_plan_review_and_begin_implementation, begin_planning, dispatch_plan as _native_dispatch_plan,
     record_plan, submit_plan_for_review,
 )
 from tests.provider_health_fixture import provider_context, runtime_binding as health_runtime_binding
 
 
+def _dispatch_control(identity, context, now, candidate=None):
+    digest=lambda value: "sha256:" + value * 64; binding=CandidateBinding(identity.repository_id, identity.task_id, candidate or context.candidate_sha or identity.base_sha); components=(ComponentPolicy(DependencyComponent.PACKAGE,"roundwright",VersionRange("0.0.0","3.0.0"),"pypi/roundwright",digest("1"),digest("2")),ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME,"codex-sdk",VersionRange("1.0.0","2.0.0"),"registry/codex-sdk",digest("3"),digest("4")),ComponentPolicy(DependencyComponent.GITHUB_CLI,"gh",VersionRange("2.0.0","3.0.0"),"github/gh",digest("5"),digest("6")),ComponentPolicy(DependencyComponent.BUILD_BACKEND,"setuptools",VersionRange("69.0.0","70.0.0"),"pypi/setuptools",digest("7"),digest("8"))); policy=DependencyPolicy(binding,digest("9"),now,60,components,PolicyTransition(PolicyTransitionKind.BOOTSTRAP)); receipt=BootstrapPolicyReceipt.create(policy,reviewer_identity=digest("a"),authority_digest=digest("b")); policy=replace(policy,transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP,receipt)); observations=tuple(ObservedDependency(binding,item.component,item.identifier,item.versions.minimum,item.source_identity,item.artifact_digest,item.executable_digest,now,policy.policy_digest) for item in components); return binding,ProviderDispatchControl(binding,DependencyExecutionControl(policy,observations,TrustedDependencyAdmission(binding,policy.core_fingerprint,receipt.receipt_digest,digest("a"),digest("b"))),now)
+
 def dispatch_plan(repository, identity, context, *args, **kwargs):
+    binding, control = _dispatch_control(identity, context, kwargs["now"]); kwargs.update(binding=binding, control=control)
     return _native_dispatch_plan(repository, identity, provider_context(context, identity, ProviderRole.PLANNING), *args, **kwargs)
 
 
@@ -50,6 +54,7 @@ def dispatch_plan_review(repository, identity, context, *args, **kwargs):
 
 
 def begin_implementation(repository, identity, context, *args, **kwargs):
+    binding, control = _dispatch_control(identity, context, kwargs["now"], kwargs.get("repair_candidate_sha")); kwargs.update(binding=binding, control=control)
     return _begin_implementation(repository, identity, provider_context(context, identity, ProviderRole.WORKER), *args, **kwargs)
 
 

@@ -279,15 +279,12 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         lambda: provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, control=git_entrypoint_control, lease=lease),
         epoch,
     )
-    implementation = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
-        lambda: begin_implementation(
-            repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
-            implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
-            plan_attempt_id=persisted_plan.plan_attempt_id, worker_thread_identity=plan_dispatch.worker_thread_identity,
-            external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
-            process_lease_expires_at=epoch + 60, lease=lease, now=epoch,
-        ), epoch,
+    implementation = begin_implementation(
+        repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
+        implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
+        plan_attempt_id=persisted_plan.plan_attempt_id, worker_thread_identity=plan_dispatch.worker_thread_identity,
+        external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
+        process_lease_expires_at=epoch + 60, binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
     _execute_candidate_helper_from_factory(
         candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.GITHUB_MUTATION,

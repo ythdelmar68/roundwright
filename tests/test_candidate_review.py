@@ -78,6 +78,25 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
+    def test_native_implementation_control_denials_have_zero_internal_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, _, now = self.ready_task(Path(temporary) / "repository", commit=False)
+            binding, control = _dispatch_control(identity, context, now)
+            arguments = dict(
+                implementation_attempt_id="implementation-gate", provider_attempt_id="worker-gate", plan_attempt_id="plan-25",
+                worker_thread_identity="worker-thread-25", external_turn_identity="implementation-gate-turn",
+                process_lease_id="implementation-gate-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            with self.assertRaises(TypeError):
+                _begin_implementation(repository, identity, context, binding=binding, **arguments)
+            for supplied_binding, supplied_control in (
+                (binding, _dispatch_control(identity, context, now, "f" * 40)[1]),
+                (binding, _dispatch_control(identity, context, now - 61)[1]),
+            ):
+                with self.subTest(control_now=supplied_control.now), patch.object(candidate_review, "_accepted_plan", side_effect=AssertionError("plan read")) as accepted, patch.object(candidate_review, "prepare_attempt", side_effect=AssertionError("provider")) as prepared, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(CandidateReviewError):
+                        _begin_implementation(repository, identity, context, binding=supplied_binding, control=supplied_control, **arguments)
+                    accepted.assert_not_called(); prepared.assert_not_called(); database.assert_not_called()
     def runtime_binding(self, supervisor_count: int = 3, *, include_policy: bool = True) -> RuntimeBinding:
         values = "cdefgh"
         policy_digest = candidate_review._digest({"complete_rounds": 3, "max_rounds": 10, "max_supervisor_attempts_per_round": supervisor_count, "on_final_findings": "worker-final-repair-then-merge"})

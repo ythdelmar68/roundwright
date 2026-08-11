@@ -137,6 +137,11 @@ def run_once_local_slice(
         raise LocalSliceError("local slice Git entrypoint preflight blocked execution") from error
     if base_sha != git_entrypoint_control.binding.candidate_sha:
         raise LocalSliceError("local slice canonical base does not match Git entrypoint control")
+    base_dependency_binding = CandidateBinding(fixture.repository_id, fixture.task_id, base_sha)
+    try:
+        git_entrypoint_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice dispatch preflight blocked execution") from error
     identity = TaskIdentity(
         fixture.task_id,
         fixture.source_id,
@@ -147,16 +152,6 @@ def run_once_local_slice(
     )
     configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
     runtime_binding = configuration.pin().runtime_binding()
-    _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission,
-        CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha),
-        DependencyStage.DISPATCH, lambda: None, epoch,
-    )
-    base_dependency_binding = CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha)
-    try:
-        git_entrypoint_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
-    except DependencyPolicyError as error:
-        raise LocalSliceError("local slice dispatch preflight blocked execution") from error
     dispatch_control = _materialize_dispatch_control(candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, epoch)
     database = check_database(repository)
     if database.state == "healthy":
@@ -234,15 +229,12 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         planning_input.recovery_notes,
         (),
     )
-    plan_dispatch = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
-        lambda: dispatch_plan(
-            repository, identity, _health_context(context, identity, ProviderRole.PLANNING, configuration.worker.value, epoch), planning_input,
-            plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
-            worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
-            process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
-            binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
-        ), epoch,
+    plan_dispatch = dispatch_plan(
+        repository, identity, _health_context(context, identity, ProviderRole.PLANNING, configuration.worker.value, epoch), planning_input,
+        plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
+        worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
+        process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
+        binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
     persisted_plan = record_plan(
         repository, identity, context, plan_attempt_id=plan_dispatch.plan_attempt_id,

@@ -298,6 +298,31 @@ class TrustedDependencyAdmission:
 
 
 @dataclass(frozen=True)
+class DependencyExecutionControl:
+    """Selection-time sealed evidence consumed at an execution boundary."""
+
+    policy: DependencyPolicy
+    observations: tuple[ObservedDependency, ...]
+    admission: TrustedDependencyAdmission
+
+    def __post_init__(self) -> None:
+        if type(self.policy) is not DependencyPolicy or type(self.observations) is not tuple or any(type(item) is not ObservedDependency for item in self.observations) or type(self.admission) is not TrustedDependencyAdmission:
+            raise DependencyPolicyError("dependency execution control is invalid")
+        if self.admission.binding != self.policy.binding:
+            raise DependencyPolicyError("dependency execution control is invalid")
+
+    def require(self, binding: CandidateBinding, stage: DependencyStage, *, now: int) -> None:
+        """Fail closed before a provider, transport, subprocess, or mutation starts."""
+
+        decision = evaluate_dependency_preflight(
+            binding, self.policy, self.observations, stage, now=now,
+            previous_policy=self.admission.previous_policy, trusted_admission=self.admission,
+        )
+        if decision.outcome is not DependencyDecisionOutcome.PASS:
+            raise DependencyPolicyError(decision.code.value)
+
+
+@dataclass(frozen=True)
 class ObservedDependency:
     binding: CandidateBinding
     component: DependencyComponent

@@ -16,6 +16,7 @@ from roundwright.deployment import (
     DeploymentAuthorityReceipt, DeploymentIdentity, DeploymentMode,
     _receipt_binding_fingerprint, evaluate_deployment_authority,
 )
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.github import (
     CommentSnapshot,
     CommentsSnapshot,
@@ -531,15 +532,46 @@ def allowed_context(
     )
     deployment = evaluate_deployment_authority(deployment_identity, deployment_receipt, deployment_verification, now=now)
     assert deployment.authorized
+    dependency_digest = lambda value: "sha256:" + value * 64
+    dependency_binding = CandidateBinding(REPOSITORY.slug, mutation_context.task_fingerprint, SHA)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", dependency_digest("1"), dependency_digest("2")),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange("1.0.0", "2.0.0"), "registry/codex-sdk", dependency_digest("3"), dependency_digest("4")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", dependency_digest("5"), dependency_digest("6")),
+        ComponentPolicy(DependencyComponent.BUILD_BACKEND, "setuptools", VersionRange("69.0.0", "70.0.0"), "pypi/setuptools", dependency_digest("7"), dependency_digest("8")),
+    )
+    dependency_policy = DependencyPolicy(dependency_binding, dependency_digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    dependency_receipt = BootstrapPolicyReceipt.create(dependency_policy, reviewer_identity=dependency_digest("a"), authority_digest=dependency_digest("b"))
+    dependency_policy = replace(dependency_policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, dependency_receipt))
+    dependency_control = DependencyExecutionControl(dependency_policy, tuple(ObservedDependency(dependency_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), dependency_policy.policy_digest) for item in components), TrustedDependencyAdmission(dependency_binding, dependency_policy.core_fingerprint, dependency_receipt.receipt_digest, dependency_digest("a"), dependency_digest("b")))
     return MutationBrokerContext(
         policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification,
         mutation_context, transition, snapshot, receipt, deployment_identity,
         deployment_receipt, deployment_verification, now, REPOSITORY,
-        REPOSITORY, REPOSITORY, "main", "codex/issue-46",
+        REPOSITORY, REPOSITORY, "main", "codex/issue-46", dependency_control,
     )
 
 
 class GitHubRuntimeTests(unittest.TestCase):
+    def test_missing_dependency_control_blocks_before_reads_journal_or_transport(self) -> None:
+        intent, payload = pull_request_intent()
+        context = replace(allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR), dependency_control=None)
+        matrix = health(
+            GitHubReadOperation.BRANCH, GitHubReadOperation.PULL_REQUEST,
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path = Path(directory) / "journal.json"
+            adapter, transport = FakeGitHubAdapter({}), OwnerTransport()
+            result = GitHubMutationBroker(
+                adapter, journal=DurableMutationJournal(journal_path),
+                _executor=_GhBrokerExecutor(transport, matrix),
+            ).submit(intent, context, payload=payload)
+            self.assertFalse(result.ok)
+            self.assertEqual(adapter.call_count(kind="read"), 0)
+            self.assertEqual(transport.requests, [])
+            self.assertFalse(journal_path.exists())
+
     def test_created_resource_locator_is_total_and_canonical(self) -> None:
         pull_request = CreatedResourceLocator(
             GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,

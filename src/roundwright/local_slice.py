@@ -254,7 +254,12 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         evidence_fingerprint=_fingerprint("begin-implementation", identity.task_id), lease=lease,
     )
 
-    binding = provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease)
+    binding = _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, trusted_dependency_admission,
+        base_dependency_binding, DependencyStage.GITHUB_MUTATION,
+        lambda: provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease),
+        epoch,
+    )
     implementation = _execute_candidate_helper_from_factory(
         candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.DISPATCH,
         lambda: begin_implementation(

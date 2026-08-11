@@ -32,6 +32,7 @@ from .deployment import (
     DeploymentAuthorityReceipt, DeploymentIdentity, DeploymentMode,
     evaluate_deployment_authority,
 )
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .github import (
     BranchSnapshot,
     CommentsSnapshot,
@@ -1175,6 +1176,7 @@ class MutationBrokerContext:
     head_repository: RepositoryRef
     base_ref: str
     head_ref: str
+    dependency_control: DependencyExecutionControl | None = None
 
     def __post_init__(self) -> None:
         if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
@@ -1198,6 +1200,8 @@ class MutationBrokerContext:
             GitHubReadRequest(GitHubReadOperation.BRANCH, self.head_repository, ref=self.head_ref, expected_sha=self.candidate_sha)
         except (TypeError, ValueError) as error:
             raise GitHubRuntimeError("broker pull request reference evidence is invalid") from error
+        if self.dependency_control is not None and type(self.dependency_control) is not DependencyExecutionControl:
+            raise GitHubRuntimeError("broker dependency execution control is invalid")
 
 
 def schema_v2_authorization_bundle(
@@ -2624,6 +2628,20 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
+        try:
+            control = context.dependency_control
+            if type(control) is not DependencyExecutionControl:
+                raise DependencyPolicyError("dependency execution control is unavailable")
+            control.require(
+                CandidateBinding(intent.repository.slug, context.mutation_context.task_fingerprint, context.candidate_sha),
+                DependencyStage.GITHUB_MUTATION,
+                now=int(now.timestamp()),
+            )
+        except (DependencyPolicyError, ValueError):
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "candidate dependency preflight blocked mutation execution",
+            ))
         # A caller carrying outbound payload proves it is attempting the
         # owner-host mutation route.  Do not even open a semantic read when
         # that capability was not injected; reads must not become a fallback

@@ -2932,6 +2932,19 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
+        try:
+            control = context.dependency_control
+            if type(control) is not DependencyExecutionControl:
+                raise DependencyPolicyError("dependency execution control is unavailable")
+            control.require(
+                CandidateBinding(intent.repository.slug, context.mutation_context.task_fingerprint, context.candidate_sha),
+                DependencyStage.GITHUB_MUTATION, now=int(now.timestamp()),
+            )
+        except (DependencyPolicyError, ValueError):
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "candidate dependency preflight blocked reconciliation",
+            ))
         if intent.operation in {
             GitHubMutationOperation.CREATE_PULL_REQUEST,
             GitHubMutationOperation.COMMENT,

@@ -158,6 +158,9 @@ def git_entrypoint_control(value):
     binding = CandidateBinding(value.repository_id, value.task_id, sealed_base)
     components = (
         ComponentPolicy(DependencyComponent.PACKAGE, 'roundwright', VersionRange('0.0.0', '1.0.0'), 'pypi/roundwright', dependency_digest('c'), dependency_digest('d')),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, 'codex-sdk', VersionRange('1.0.0', '2.0.0'), 'registry/codex-sdk', dependency_digest('1'), dependency_digest('2')),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, 'gh', VersionRange('2.0.0', '3.0.0'), 'github/gh', dependency_digest('3'), dependency_digest('4')),
+        ComponentPolicy(DependencyComponent.BUILD_BACKEND, 'setuptools', VersionRange('69.0.0', '70.0.0'), 'pypi/setuptools', dependency_digest('5'), dependency_digest('6')),
         ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, 'git', VersionRange('2.0.0', '3.0.0'), 'git-scm/git', dependency_digest('e'), dependency_digest('f')),
     )
     policy = DependencyPolicy(binding, dependency_digest('0'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))

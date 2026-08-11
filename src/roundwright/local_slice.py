@@ -30,7 +30,7 @@ from .candidate_review import (
     record_implementation_candidate,
 )
 from .configuration import RepositoryIdentity, ReviewPolicy, resolve_dispatch_configuration
-from .dependency_policy import CandidateBinding, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAdmission, execute_after_dependency_preflight
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAdmission, execute_after_dependency_preflight
 from .gates import (
     EvidenceOutcome,
     GATE_REGISTRY,
@@ -55,6 +55,7 @@ from .worker_planning import (
     PlanningInput,
     WorkerPlan,
     WorkerPlanOutput,
+    ProviderDispatchControl,
     accept_plan_review_and_begin_implementation,
     begin_planning,
     dispatch_plan,
@@ -151,6 +152,12 @@ def run_once_local_slice(
         CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha),
         DependencyStage.DISPATCH, lambda: None, epoch,
     )
+    base_dependency_binding = CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha)
+    try:
+        git_entrypoint_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice dispatch preflight blocked execution") from error
+    dispatch_control = _materialize_dispatch_control(candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, epoch)
     database = check_database(repository)
     if database.state == "healthy":
         completed = _completed_result(repository, identity, fixture, runtime_binding)
@@ -169,7 +176,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, base_dependency_binding, dispatch_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -194,7 +201,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, base_dependency_binding, dispatch_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -208,7 +215,6 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         deployment_fingerprint=_fingerprint("deployment", identity.task_id),
         runtime_binding=runtime_binding,
     )
-    base_dependency_binding = CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha)
     planning_input = PlanningInput(
         "Implement one isolated local task",
         ("No network", "No credential", "No external provider"),
@@ -235,7 +241,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
             plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
             worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
             process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
-            lease=lease, now=epoch,
+            binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
         ), epoch,
     )
     persisted_plan = record_plan(
@@ -578,6 +584,21 @@ def _execute_candidate_helper_from_factory(
             binding, policy, observations, stage, now=now, action=action,
             previous_policy=trusted_admission.previous_policy,
             trusted_admission=trusted_admission,
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _materialize_dispatch_control(factory, admission_factory, binding, now):
+    if not callable(factory) or not callable(admission_factory):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        trusted_admission = admission_factory(binding)
+        policy, observations = factory(binding)
+        return execute_after_dependency_preflight(
+            binding, policy, observations, DependencyStage.DISPATCH, now=now,
+            previous_policy=trusted_admission.previous_policy, trusted_admission=trusted_admission,
+            action=lambda: ProviderDispatchControl(binding, DependencyExecutionControl(policy, tuple(observations), trusted_admission), now),
         )
     except DependencyPolicyError as error:
         raise LocalSliceError("candidate dependency preflight blocked helper execution") from error

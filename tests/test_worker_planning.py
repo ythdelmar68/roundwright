@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.runtime_binding import RuntimeBinding
 import roundwright.worker_planning as worker_planning
 from roundwright.git_identity import acquire_transition_lease
@@ -22,6 +23,7 @@ from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatc
 from roundwright.worker_planning import (
     PlanReviewReceipt,
     PlanningInput,
+    ProviderDispatchControl,
     WorkerPlan,
     WorkerPlanOutput,
     WorkerPlanningError,
@@ -69,10 +71,17 @@ class WorkerPlanningTests(unittest.TestCase):
         return repository, identity, lease, context, now
 
     def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None, planning_input: PlanningInput | None = None):
+        binding = CandidateBinding(identity.repository_id, identity.task_id, context.candidate_sha or identity.base_sha)
+        digest = lambda value: "sha256:" + value * 64
+        components = tuple(ComponentPolicy(component, identifier, VersionRange("0.0.0", "3.0.0"), source, digest(str(index)), digest(str(index + 1))) for index, (component, identifier, source) in enumerate(((DependencyComponent.PACKAGE, "roundwright", "pypi/roundwright"), (DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", "registry/codex-sdk"), (DependencyComponent.GITHUB_CLI, "gh", "github/gh"), (DependencyComponent.BUILD_BACKEND, "setuptools", "pypi/setuptools"))))
+        policy = DependencyPolicy(binding, digest("9"), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b")); policy = __import__("dataclasses").replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
+        control = ProviderDispatchControl(binding, DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))), now)
         return dispatch_plan(
             repository, identity, provider_context(context, identity, ProviderRole.PLANNING), self.input() if planning_input is None else planning_input, plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
             worker_thread_identity=thread, external_turn_identity=f"turn-{provider_attempt}", process_lease_id=f"lease-{provider_attempt}",
-            process_lease_expires_at=now + 60, parent_plan_attempt_id=parent, lease=lease, now=now,
+            process_lease_expires_at=now + 60, parent_plan_attempt_id=parent, binding=binding, control=control, lease=lease, now=now,
         )
 
     def accept_review(self, repository, identity, lease, context, now, persisted, *, review_attempt: str = "review-one", provider_attempt: str = "supervisor-one", session: str = "supervisor-session-one"):
@@ -224,11 +233,7 @@ class WorkerPlanningTests(unittest.TestCase):
             finally:
                 connection.close()
             with self.assertRaises(WorkerPlanningError):
-                dispatch_plan(
-                    repository, identity, context, self.input(), plan_attempt_id="plan-one", provider_attempt_id="provider-one",
-                    worker_thread_identity="worker-thread-23", external_turn_identity="turn-two", process_lease_id="lease-provider-one",
-                    process_lease_expires_at=now + 60, lease=lease, now=now,
-                )
+                self.dispatch(repository, identity, lease, context, now, provider_attempt="provider-two")
 
     def test_dispatch_resumes_a_bound_session_checkpoint_before_external_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

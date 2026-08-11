@@ -2584,18 +2584,91 @@ def _created_comment_locator_matches_intent(
     )
 
 
+@dataclass(frozen=True)
+class _OwnerGitHubBrokerMutationControl:
+    """Owner-side sealed authority for one broker submit operation."""
+
+    intent_identity: str
+    binding: CandidateBinding
+    operation: GitHubMutationOperation
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.operation) is not GitHubMutationOperation
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise GitHubRuntimeError("owner broker dependency control is invalid")
+        _digest(self.intent_identity, "owner broker dependency intent")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner broker dependency control is invalid") from error
+
+    def require(self, intent: GitHubMutationIntent, context: MutationBrokerContext, binding: CandidateBinding, *, now: datetime) -> None:
+        if (
+            type(self) is not _OwnerGitHubBrokerMutationControl
+            or type(intent) is not GitHubMutationIntent
+            or type(context) is not MutationBrokerContext
+            or type(binding) is not CandidateBinding
+            or type(now) is not datetime
+            or now.tzinfo is not timezone.utc
+            or self.now != int(now.timestamp())
+            or self.intent_identity != intent.identity()
+            or self.binding != binding
+            or self.operation is not intent.operation
+            or binding.repository != intent.repository.slug
+            or binding.repository != context.repository.slug
+            or binding.task_id != context.mutation_context.task_fingerprint
+            or binding.candidate_sha != context.candidate_sha
+        ):
+            raise GitHubRuntimeError("owner broker dependency control is invalid")
+        try:
+            self.dependency_control.require(binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner broker dependency control is stale") from error
+
+
+class _OwnerBrokerMutationControlRegistry(Protocol):
+    """Private owner-side source for exact broker-submit controls."""
+
+    def resolve(self, intent: GitHubMutationIntent) -> _OwnerGitHubBrokerMutationControl | None: ...
+
+
 class _GhBrokerExecutor:
     """Private credential-owning seam; only broker construction creates it."""
 
-    def __init__(self, transport: OwnerMutationTransport, health: GitHubCapabilityHealth) -> None:
-        if not hasattr(transport, "dispatch"):
+    def __init__(self, transport: OwnerMutationTransport, health: GitHubCapabilityHealth, binding: CandidateBinding | None = None, controls: _OwnerBrokerMutationControlRegistry | None = None) -> None:
+        if (
+            not hasattr(transport, "dispatch")
+            or (binding is None) != (controls is None)
+            or (binding is not None and type(binding) is not CandidateBinding)
+            or (controls is not None and not hasattr(controls, "resolve"))
+        ):
             raise GitHubRuntimeError("owner mutation transport is invalid")
         self.__transport = transport
         self.__health = health
+        self.__binding = binding
+        self.__controls = controls
 
     @property
     def health(self) -> GitHubCapabilityHealth:
         return self.__health
+
+    @property
+    def requires_owner_dependency_control(self) -> bool:
+        return self.__controls is not None
+
+    def require_dependency(self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime) -> None:
+        if self.__controls is None or self.__binding is None:
+            raise GitHubRuntimeError("owner broker dependency control is unavailable")
+        control = self.__controls.resolve(intent)
+        if type(control) is not _OwnerGitHubBrokerMutationControl:
+            raise GitHubRuntimeError("owner broker dependency control is unavailable")
+        control.require(intent, context, self.__binding, now=now)
 
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
@@ -2725,7 +2798,7 @@ class GitHubMutationBroker:
 
     @classmethod
     def with_owner_transport(
-        cls, read_endpoint: OwnerGitHubReadIpcClient, transport: OwnerMutationIpcClient, *, journal: DurableMutationJournal, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
+        cls, read_endpoint: OwnerGitHubReadIpcClient, transport: OwnerMutationIpcClient, *, journal: DurableMutationJournal, binding: CandidateBinding, controls: _OwnerBrokerMutationControlRegistry, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
         """Create the only production path from owner-host typed endpoints."""
 
@@ -2735,9 +2808,11 @@ class GitHubMutationBroker:
             raise GitHubRuntimeError("live broker requires an owner mutation IPC client")
         if type(read_endpoint) is not OwnerGitHubReadIpcClient:
             raise GitHubRuntimeError("live broker requires an owner github read IPC client")
+        if type(binding) is not CandidateBinding or not hasattr(controls, "resolve"):
+            raise GitHubRuntimeError("live broker requires owner dependency controls")
         if clock is None:
             raise GitHubRuntimeError("live broker requires an injected trusted clock")
-        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health), clock=clock, checkpoint_observer=checkpoint_observer)
+        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health, binding, controls), clock=clock, checkpoint_observer=checkpoint_observer)
 
     def submit(
         self,
@@ -2756,6 +2831,14 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
             now = self._now(context)
+            if self.__executor is not None and self.__executor.requires_owner_dependency_control:
+                self.__executor.require_dependency(intent, context, now=now)
+        except (AttributeError, KeyError, TypeError, ValueError, GitHubRuntimeError):
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "owner dependency preflight blocked mutation execution",
+            ))
+        try:
             plan = _broker_semantic_plan(intent)
             self._require_capabilities(intent, plan, now)
             bound_health = self.__health if not self.__clock_is_default else None

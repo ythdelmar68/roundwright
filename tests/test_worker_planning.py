@@ -70,7 +70,7 @@ class WorkerPlanningTests(unittest.TestCase):
         context = RecoveryContext.for_task(identity, candidate_sha=None, policy_fingerprint="d" * 64, deployment_fingerprint="e" * 64, runtime_binding=self.runtime_binding())
         return repository, identity, lease, context, now
 
-    def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None, planning_input: PlanningInput | None = None):
+    def dispatch_control(self, identity, context, now):
         binding = CandidateBinding(identity.repository_id, identity.task_id, context.candidate_sha or identity.base_sha)
         digest = lambda value: "sha256:" + value * 64
         components = tuple(ComponentPolicy(component, identifier, VersionRange("0.0.0", "3.0.0"), source, digest(str(index)), digest(str(index + 1))) for index, (component, identifier, source) in enumerate(((DependencyComponent.PACKAGE, "roundwright", "pypi/roundwright"), (DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", "registry/codex-sdk"), (DependencyComponent.GITHUB_CLI, "gh", "github/gh"), (DependencyComponent.BUILD_BACKEND, "setuptools", "pypi/setuptools"))))
@@ -78,6 +78,10 @@ class WorkerPlanningTests(unittest.TestCase):
         receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b")); policy = __import__("dataclasses").replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
         observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
         control = ProviderDispatchControl(binding, DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))), now)
+        return binding, control
+
+    def dispatch(self, repository, identity, lease, context, now, *, plan_attempt: str = "plan-one", provider_attempt: str = "provider-one", thread: str = "worker-thread-23", parent: str | None = None, planning_input: PlanningInput | None = None):
+        binding, control = self.dispatch_control(identity, context, now)
         return dispatch_plan(
             repository, identity, provider_context(context, identity, ProviderRole.PLANNING), self.input() if planning_input is None else planning_input, plan_attempt_id=plan_attempt, provider_attempt_id=provider_attempt,
             worker_thread_identity=thread, external_turn_identity=f"turn-{provider_attempt}", process_lease_id=f"lease-{provider_attempt}",
@@ -85,11 +89,12 @@ class WorkerPlanningTests(unittest.TestCase):
         )
 
     def accept_review(self, repository, identity, lease, context, now, persisted, *, review_attempt: str = "review-one", provider_attempt: str = "supervisor-one", session: str = "supervisor-session-one"):
+        binding, control = self.dispatch_control(identity, context, now)
         dispatch_plan_review(
             repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), review_attempt_id=review_attempt, provider_attempt_id=provider_attempt,
             supervisor_session_identity=session, external_turn_identity=f"turn-{provider_attempt}",
             plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider_attempt}",
-            process_lease_expires_at=now + 60, lease=lease, now=now,
+            process_lease_expires_at=now + 60, binding=binding, control=control, lease=lease, now=now,
         )
         record_plan_review(
             repository, identity, context, review_attempt_id=review_attempt,

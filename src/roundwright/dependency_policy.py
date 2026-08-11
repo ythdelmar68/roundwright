@@ -27,6 +27,7 @@ class DependencyComponent(StrEnum):
     PROVIDER_RUNTIME = "provider-runtime"
     GITHUB_CLI = "github-cli"
     BUILD_BACKEND = "build-backend"
+    GIT_EXECUTABLE = "git-executable"
     OPTIONAL_ADAPTER = "optional-adapter"
 
 
@@ -36,6 +37,7 @@ class DependencyStage(StrEnum):
     PACKAGE_BUILD = "package-build"
     PROVIDER_QUALIFICATION = "provider-qualification"
     OPTIONAL_ADAPTER = "optional-adapter"
+    GIT_ENTRYPOINT = "git-entrypoint"
 
 
 class PolicyTransitionKind(StrEnum):
@@ -79,6 +81,7 @@ _CANONICAL_STAGE_REQUIREMENTS: dict[DependencyStage, tuple[DependencyComponent, 
     DependencyStage.PACKAGE_BUILD: (DependencyComponent.PACKAGE, DependencyComponent.BUILD_BACKEND),
     DependencyStage.PROVIDER_QUALIFICATION: (DependencyComponent.PACKAGE, DependencyComponent.PROVIDER_RUNTIME),
     DependencyStage.OPTIONAL_ADAPTER: (DependencyComponent.PACKAGE, DependencyComponent.OPTIONAL_ADAPTER),
+    DependencyStage.GIT_ENTRYPOINT: (DependencyComponent.PACKAGE, DependencyComponent.GIT_EXECUTABLE),
 }
 
 _DIAGNOSTICS = {

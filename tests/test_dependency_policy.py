@@ -50,6 +50,7 @@ class DependencyPolicyTests(unittest.TestCase):
                 ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange(provider_minimum, "2.0.0"), "registry/codex-sdk", digest("c"), digest("2")),
                 ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("d"), digest("3")),
                 ComponentPolicy(DependencyComponent.BUILD_BACKEND, "setuptools", VersionRange("69.0.0", "70.0.0"), "pypi/setuptools", digest("e"), digest("4")),
+                ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-scm/git", digest("0"), digest("6")),
                 ComponentPolicy(DependencyComponent.OPTIONAL_ADAPTER, "jira-adapter", VersionRange("1.0.0", "2.0.0"), "pypi/jira-adapter", digest("f"), digest("5")),
             ),
             transition or PolicyTransition(PolicyTransitionKind.BOOTSTRAP),
@@ -89,8 +90,18 @@ class DependencyPolicyTests(unittest.TestCase):
             DependencyStage.PACKAGE_BUILD: (DependencyComponent.PACKAGE, DependencyComponent.BUILD_BACKEND),
             DependencyStage.PROVIDER_QUALIFICATION: (DependencyComponent.PACKAGE, DependencyComponent.PROVIDER_RUNTIME),
             DependencyStage.OPTIONAL_ADAPTER: (DependencyComponent.PACKAGE, DependencyComponent.OPTIONAL_ADAPTER),
+            DependencyStage.GIT_ENTRYPOINT: (DependencyComponent.PACKAGE, DependencyComponent.GIT_EXECUTABLE),
         }
         self.assertEqual({stage: canonical_stage_requirements(stage) for stage in expected}, expected)
+
+    def test_git_entrypoint_requires_exact_current_and_admitted_evidence(self) -> None:
+        policy = self.policy(); stage = DependencyStage.GIT_ENTRYPOINT
+        records = self.records_for(policy, stage)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, records, stage, now=100, trusted_admission=self.admission(policy)).code, DependencyDecisionCode.AUTHORIZED)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, (records[0],), stage, now=100, trusted_admission=self.admission(policy)).code, DependencyDecisionCode.PROVENANCE_MISSING)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, (records[0], replace(records[1], observed_at=69)), stage, now=100, trusted_admission=self.admission(policy)).code, DependencyDecisionCode.PROVENANCE_STALE)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, (records[0], replace(records[1], executable_digest=digest("7"))), stage, now=100, trusted_admission=self.admission(policy)).code, DependencyDecisionCode.EXECUTABLE_MISMATCH)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, records, stage, now=100, trusted_admission=replace(self.admission(policy), receipt_digest=digest("7"))).code, DependencyDecisionCode.POLICY_TRANSITION_INVALID)
 
     def test_policy_observation_and_decision_are_candidate_bound(self) -> None:
         policy = self.policy(); other = self.binding("b")

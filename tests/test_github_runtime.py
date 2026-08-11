@@ -98,6 +98,14 @@ REPOSITORY = RepositoryRef("example", "roundwright")
 NOW = datetime(2026, 8, 7, tzinfo=timezone.utc)
 
 
+def owner_read_binding() -> CandidateBinding:
+    return CandidateBinding(REPOSITORY.slug, "github-read-host", SHA)
+
+
+def owner_mutation_binding(candidate_sha: str = SHA) -> CandidateBinding:
+    return CandidateBinding(REPOSITORY.slug, "github-mutation-host", candidate_sha)
+
+
 def GhGitHubAdapter(
     runner: Runner, matrix: GitHubCapabilityHealth | None = None, *, clock=lambda: NOW,
 ) -> _OwnerGitHubReadHostEndpoint:
@@ -108,7 +116,8 @@ def GhGitHubAdapter(
     except Exception:
         observed_at = NOW
     control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
-    return _OwnerGitHubReadHostEndpoint(runner, owner_read_control(now=control_now), matrix, clock=clock)
+    binding = owner_read_binding()
+    return _OwnerGitHubReadHostEndpoint(runner, binding, owner_read_control(binding=binding, now=control_now), matrix, clock=clock)
 
 
 class Runner:
@@ -127,7 +136,7 @@ def owner_read_control(
     """Build only test-owned sealed read evidence; role clients never receive it."""
 
     digest = lambda value: "sha256:" + value * 64
-    candidate_binding = binding or CandidateBinding(REPOSITORY.slug, "github-read-host", SHA)
+    candidate_binding = binding or owner_read_binding()
     components = (
         ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
         ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
@@ -191,7 +200,7 @@ def owner_mutation_control(
     """Build test-only sealed fixed-host evidence; no role client receives it."""
 
     digest = lambda value: "sha256:" + value * 64
-    candidate_binding = binding or CandidateBinding(request.repository.slug, "github-mutation-host", request.candidate_sha)
+    candidate_binding = binding or owner_mutation_binding(request.candidate_sha)
     components = (
         ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
         ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
@@ -261,7 +270,7 @@ def owner_endpoint(
         observed_at = NOW
     control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
     endpoint = OwnerMutationHostEndpoint(
-        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), FixtureOwnerMutationControlRegistry(control_now), clock=clock,
+        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), owner_mutation_binding(), FixtureOwnerMutationControlRegistry(control_now), clock=clock,
     )
     return OwnerMutationIpcClient(DIGEST, endpoint)
 
@@ -741,7 +750,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         transport = OwnerTransport()
         endpoint = OwnerMutationHostEndpoint(
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport),
-            InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)),
+            owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)),
             clock=lambda: NOW,
         )
         self.assertFalse(hasattr(endpoint, "dispatch"))
@@ -784,7 +793,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(record=record is None):
                 denied_transport = OwnerTransport()
                 denied = OwnerMutationHostEndpoint(
-                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), FixtureOwnerMutationControlRegistry(NOW), clock=lambda: NOW,
+                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), owner_mutation_binding(request.candidate_sha), FixtureOwnerMutationControlRegistry(NOW), clock=lambda: NOW,
                 ).exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(denied, OwnerMutationFact)
                 self.assertEqual(denied_transport.requests, [])
@@ -816,6 +825,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             None,
             object(),
             owner_mutation_control(request, binding=CandidateBinding("other/repository", "github-mutation-host", SHA)),
+            owner_mutation_control(request, binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
             owner_mutation_control(request, binding=CandidateBinding(REPOSITORY.slug, "github-mutation-host", "f" * 40)),
             owner_mutation_control(request, operation=GitHubMutationOperation.CLOSE_ISSUE),
             owner_mutation_control(request, now=NOW - timedelta(seconds=1)),
@@ -824,7 +834,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(control_type=type(control).__name__):
                 transport, seals, registry = OwnerTransport(), CountingSealRegistry(), StaticControls(control)
                 endpoint = OwnerMutationHostEndpoint(
-                    seals, OwnerFixedMutationHostExecutor(transport), registry, clock=lambda: NOW,
+                    seals, OwnerFixedMutationHostExecutor(transport), owner_mutation_binding(request.candidate_sha), registry, clock=lambda: NOW,
                 )
                 fact = endpoint.exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(fact, OwnerMutationFact)
@@ -888,7 +898,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls, [])
 
         with self.assertRaises(ValueError):
-            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport(), object())  # type: ignore[arg-type]
+            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport(), object(), object())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
 
@@ -941,7 +951,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         transport = OwnerTransport()
         host = OwnerMutationHostEndpoint(
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-            OwnerFixedMutationHostExecutor(transport), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
+            OwnerFixedMutationHostExecutor(transport), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
         )
         client = OwnerMutationIpcClient(DIGEST, host)
         with self.assertRaises(ValueError):
@@ -1021,7 +1031,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         """AVAILABLE is insufficient outside the owner-clock validity interval."""
 
         with self.assertRaises(ValueError):
-            _OwnerGitHubReadHostEndpoint(Runner(), health(GitHubReadOperation.COMMENTS))
+            _OwnerGitHubReadHostEndpoint(Runner(), owner_read_binding(), health(GitHubReadOperation.COMMENTS))
         observed_at = NOW
         fresh_until = NOW + timedelta(minutes=5)
         cases = (
@@ -1048,17 +1058,18 @@ class GitHubRuntimeTests(unittest.TestCase):
         request = reviews_request()
         runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
         with self.assertRaises(ValueError):
-            _OwnerGitHubReadHostEndpoint(runner, None, matrix, clock=lambda: NOW)  # type: ignore[arg-type]
+            _OwnerGitHubReadHostEndpoint(runner, owner_read_binding(), None, matrix, clock=lambda: NOW)  # type: ignore[arg-type]
         self.assertEqual(runner.calls, [])
         controls = (
             owner_read_control(binding=CandidateBinding("other/repository", "github-read-host", SHA)),
+            owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
             owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "github-read-host", "f" * 40)),
             owner_read_control(now=NOW - timedelta(seconds=1)),
         )
         for control in controls:
             with self.subTest(binding=control.binding, control_now=control.now):
                 runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
-                endpoint = _OwnerGitHubReadHostEndpoint(runner, control, matrix, clock=lambda: NOW)
+                endpoint = _OwnerGitHubReadHostEndpoint(runner, owner_read_binding(), control, matrix, clock=lambda: NOW)
                 result = endpoint.read(request)
                 self.assertFalse(result.ok)
                 self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
@@ -1079,7 +1090,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 transport = OwnerTransport()
                 host = OwnerMutationHostEndpoint(
                     InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-                    OwnerFixedMutationHostExecutor(transport), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
+                    OwnerFixedMutationHostExecutor(transport), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
                 )
                 reply = host.exchange_mutation(OwnerMutationIpcMessage(request))
                 self.assertIsInstance(reply.fact, OwnerMutationFact)

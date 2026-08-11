@@ -576,13 +576,15 @@ class _OwnerGitHubReadControl:
         except DependencyPolicyError as error:
             raise GitHubRuntimeError("owner read dependency control is invalid") from error
 
-    def require(self, request: GitHubReadRequest, *, now: datetime) -> None:
+    def require(self, request: GitHubReadRequest, binding: CandidateBinding, *, now: datetime) -> None:
         if (
             type(self) is not _OwnerGitHubReadControl
             or type(request) is not GitHubReadRequest
+            or type(binding) is not CandidateBinding
             or type(now) is not datetime
             or now.tzinfo is not timezone.utc
             or self.now != int(now.timestamp())
+            or self.binding != binding
             or self.binding.repository != request.repository.slug
         ):
             raise GitHubRuntimeError("owner read dependency control is invalid")
@@ -610,13 +612,14 @@ class _OwnerGitHubReadHostEndpoint:
     """
 
     def __init__(
-        self, runner: _FixedGhReadRunner, control: _OwnerGitHubReadControl,
+        self, runner: _FixedGhReadRunner, binding: CandidateBinding, control: _OwnerGitHubReadControl,
         health: GitHubCapabilityHealth | None = None,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if not hasattr(runner, "run") or type(control) is not _OwnerGitHubReadControl or clock is None:
+        if not hasattr(runner, "run") or type(binding) is not CandidateBinding or type(control) is not _OwnerGitHubReadControl or clock is None:
             raise GitHubRuntimeError("gh runner is invalid")
         self.__runner = runner
+        self.__binding = binding
         self.__control = control
         self._health = health or unavailable_capability_health()
         self.__clock = clock
@@ -639,7 +642,7 @@ class _OwnerGitHubReadHostEndpoint:
         if health_failure is not None:
             return health_failure
         try:
-            self.__control.require(request, now=now)
+            self.__control.require(request, self.__binding, now=now)
         except (DependencyPolicyError, GitHubRuntimeError, ValueError):
             return GitHubFailure(GitHubFailureKind.POLICY_DENIED, request.operation, "owner read dependency preflight blocked execution")
         return None
@@ -2106,14 +2109,16 @@ class _OwnerGitHubMutationControl:
         except DependencyPolicyError as error:
             raise GitHubRuntimeError("owner mutation dependency control is invalid") from error
 
-    def require(self, request: OwnerMutationRequest, *, now: datetime) -> None:
+    def require(self, request: OwnerMutationRequest, binding: CandidateBinding, *, now: datetime) -> None:
         if (
             type(self) is not _OwnerGitHubMutationControl
             or type(request) is not OwnerMutationRequest
+            or type(binding) is not CandidateBinding
             or type(now) is not datetime
             or now.tzinfo is not timezone.utc
             or self.now != int(now.timestamp())
             or self.request_identity != request.identity
+            or self.binding != binding
             or self.binding.repository != request.repository.slug
             or self.binding.candidate_sha != request.candidate_sha
             or self.operation is not request.operation
@@ -2195,18 +2200,20 @@ class OwnerMutationHostEndpoint:
 
     def __init__(
         self, registry: OwnerMutationSealRegistry, executor: OwnerFixedMutationHostExecutor,
-        controls: _OwnerMutationControlRegistry,
+        binding: CandidateBinding, controls: _OwnerMutationControlRegistry,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
             not hasattr(registry, "resolve_and_consume")
             or type(executor) is not OwnerFixedMutationHostExecutor
+            or type(binding) is not CandidateBinding
             or not hasattr(controls, "resolve")
             or clock is None
         ):
             raise GitHubRuntimeError("owner mutation host endpoint is unavailable")
         self.__registry = registry
         self.__executor = executor
+        self.__binding = binding
         self.__controls = controls
         self.__clock = clock
 
@@ -2223,7 +2230,7 @@ class OwnerMutationHostEndpoint:
             control = self.__controls.resolve(request)
             if type(control) is not _OwnerGitHubMutationControl:
                 return OwnerMutationFact(False, request.identity)
-            control.require(request, now=now)
+            control.require(request, self.__binding, now=now)
         except (AttributeError, DependencyPolicyError, TypeError, ValueError):
             return OwnerMutationFact(False, request.identity)
         record = self.__registry.resolve_and_consume(request)

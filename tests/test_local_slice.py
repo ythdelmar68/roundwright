@@ -61,7 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')
 from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
-from roundwright.dependency_policy import BootstrapPolicyReceipt, ComponentPolicy, DependencyComponent, DependencyPolicy, DependencyStage, ObservedDependency, PolicyTransition, PolicyTransitionKind, VersionRange
+from roundwright.dependency_policy import BootstrapPolicyReceipt, ComponentPolicy, DependencyComponent, DependencyPolicy, DependencyStage, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAuthority, VersionRange
 from roundwright.local_slice import LocalSliceFixture, render_local_slice_status, run_once_local_slice
 from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.state import database_path
@@ -78,7 +78,7 @@ trusted_review_floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_R
 drifted_review_floor = ReviewPolicy(2, 9, 2, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
 def dependency_digest(value):
     return 'sha256:' + value * 64
-def candidate_dependency_evidence(binding):
+def candidate_dependency_evidence(binding, trusted_authority):
     components = (
         ComponentPolicy(DependencyComponent.PACKAGE, 'roundwright', VersionRange('0.0.0', '1.0.0'), 'pypi/roundwright', dependency_digest('1'), dependency_digest('2')),
         ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, 'codex-sdk', VersionRange('1.0.0', '2.0.0'), 'registry/codex-sdk', dependency_digest('3'), dependency_digest('4')),
@@ -86,7 +86,7 @@ def candidate_dependency_evidence(binding):
         ComponentPolicy(DependencyComponent.BUILD_BACKEND, 'setuptools', VersionRange('69.0.0', '70.0.0'), 'pypi/setuptools', dependency_digest('7'), dependency_digest('8')),
     )
     policy = DependencyPolicy(binding, dependency_digest('9'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
-    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, BootstrapPolicyReceipt.create(policy, reviewer_identity=dependency_digest('a'), authority_digest=dependency_digest('b'))))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, BootstrapPolicyReceipt.create(policy, reviewer_identity=trusted_authority.reviewer_identity, authority_digest=trusted_authority.authority_digest)))
     observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 1893456000, policy.policy_digest) for item in components)
     return policy, observations
 def run_slice(value):
@@ -141,11 +141,12 @@ def no_credential(name, *args, **kwargs):
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
 from roundwright.dependency_policy import CandidateBinding
-blocked_policy, _ = candidate_dependency_evidence(CandidateBinding('local/repository', 'blocked-task', 'c' * 40))
+blocked_binding = CandidateBinding('local/repository', 'blocked-task', 'c' * 40)
+blocked_policy, blocked_observations = candidate_dependency_evidence(blocked_binding, TrustedDependencyAuthority(blocked_binding, dependency_digest('a'), dependency_digest('b')))
 blocked_action = []
 for stage in DependencyStage:
     try:
-        local_slice._execute_candidate_helper_from_factory(lambda binding: (blocked_policy, ()), blocked_policy.binding, stage, lambda stage=stage: blocked_action.append(stage.value), 1893456000)
+        local_slice._execute_candidate_helper_from_factory(lambda binding, authority: (blocked_policy, blocked_observations), trusted_policy_snapshot, blocked_policy.binding, stage, lambda stage=stage: blocked_action.append(stage.value), 1893456000)
     except Exception:
         pass
 blocked_candidate_helper = not blocked_action

@@ -23,11 +23,13 @@ from roundwright.dependency_policy import (
     PolicyTransition,
     PolicyTransitionKind,
     PolicyTransitionReview,
+    TrustedDependencyAuthority,
     VersionRange,
     canonical_stage_requirements,
     evaluate_dependency_preflight,
     execute_after_dependency_preflight,
     render_dependency_decision,
+    verify_policy_admission,
     verify_policy_transition,
 )
 
@@ -63,16 +65,19 @@ class DependencyPolicyTests(unittest.TestCase):
     def records_for(self, policy: DependencyPolicy, stage: DependencyStage) -> tuple[ObservedDependency, ...]:
         return tuple(self.observation(policy, component) for component in canonical_stage_requirements(stage))
 
+    def authority(self, policy: DependencyPolicy, *, reviewer: str = "a", authority: str = "b") -> TrustedDependencyAuthority:
+        return TrustedDependencyAuthority(policy.binding, digest(reviewer), digest(authority))
+
     def test_dispatch_uses_all_four_non_optional_components(self) -> None:
         self.assertEqual(canonical_stage_requirements(DependencyStage.DISPATCH), (DependencyComponent.PACKAGE, DependencyComponent.PROVIDER_RUNTIME, DependencyComponent.GITHUB_CLI, DependencyComponent.BUILD_BACKEND))
         policy = self.policy()
-        decision = evaluate_dependency_preflight(policy.binding, policy, self.records_for(policy, DependencyStage.DISPATCH), DependencyStage.DISPATCH, now=120)
+        decision = evaluate_dependency_preflight(policy.binding, policy, self.records_for(policy, DependencyStage.DISPATCH), DependencyStage.DISPATCH, now=120, trusted_authority=self.authority(policy))
         self.assertEqual((decision.outcome, decision.code, len(decision.observation_fingerprints)), (DependencyDecisionOutcome.PASS, DependencyDecisionCode.AUTHORIZED, 4))
 
     def test_canonical_helper_cannot_omit_required_checks(self) -> None:
         policy = self.policy(); calls: list[bool] = []
         with self.assertRaises(DependencyPolicyError):
-            execute_after_dependency_preflight(policy.binding, policy, (self.observation(policy, DependencyComponent.GITHUB_CLI),), DependencyStage.DISPATCH, now=100, action=lambda: calls.append(True))
+            execute_after_dependency_preflight(policy.binding, policy, (self.observation(policy, DependencyComponent.GITHUB_CLI),), DependencyStage.DISPATCH, now=100, action=lambda: calls.append(True), trusted_authority=self.authority(policy))
         self.assertEqual(calls, [])
 
     def test_each_helper_stage_has_closed_relevant_requirements(self) -> None:
@@ -86,18 +91,18 @@ class DependencyPolicyTests(unittest.TestCase):
 
     def test_policy_observation_and_decision_are_candidate_bound(self) -> None:
         policy = self.policy(); other = self.binding("b")
-        decision = evaluate_dependency_preflight(other, policy, self.records_for(policy, DependencyStage.PACKAGE_BUILD), DependencyStage.PACKAGE_BUILD, now=100)
+        decision = evaluate_dependency_preflight(other, policy, self.records_for(policy, DependencyStage.PACKAGE_BUILD), DependencyStage.PACKAGE_BUILD, now=100, trusted_authority=self.authority(policy))
         self.assertEqual((decision.outcome, decision.code), (DependencyDecisionOutcome.BLOCKED, DependencyDecisionCode.CANDIDATE_MISMATCH))
         wrong_observation = self.observation(policy, DependencyComponent.PACKAGE, binding=other)
-        decision = evaluate_dependency_preflight(policy.binding, policy, (wrong_observation, self.observation(policy, DependencyComponent.BUILD_BACKEND)), DependencyStage.PACKAGE_BUILD, now=100)
+        decision = evaluate_dependency_preflight(policy.binding, policy, (wrong_observation, self.observation(policy, DependencyComponent.BUILD_BACKEND)), DependencyStage.PACKAGE_BUILD, now=100, trusted_authority=self.authority(policy))
         self.assertEqual(decision.code, DependencyDecisionCode.CANDIDATE_MISMATCH)
 
     def test_policy_and_observation_freshness_fail_closed(self) -> None:
         policy = self.policy(); stage = DependencyStage.PACKAGE_BUILD
         stale_policy = replace(policy, issued_at=69)
-        self.assertEqual(evaluate_dependency_preflight(policy.binding, stale_policy, self.records_for(stale_policy, stage), stage, now=100).code, DependencyDecisionCode.POLICY_STALE)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, stale_policy, self.records_for(stale_policy, stage), stage, now=100, trusted_authority=self.authority(stale_policy)).code, DependencyDecisionCode.POLICY_STALE)
         records = (self.observation(policy, DependencyComponent.PACKAGE, observed_at=69), self.observation(policy, DependencyComponent.BUILD_BACKEND))
-        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, records, stage, now=100).code, DependencyDecisionCode.PROVENANCE_STALE)
+        self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, records, stage, now=100, trusted_authority=self.authority(policy)).code, DependencyDecisionCode.PROVENANCE_STALE)
 
     def test_identity_version_and_executable_drift_have_closed_codes(self) -> None:
         policy = self.policy(); stage = DependencyStage.GITHUB_MUTATION
@@ -110,7 +115,7 @@ class DependencyPolicyTests(unittest.TestCase):
             records = [self.observation(policy, item) for item in canonical_stage_requirements(stage)]
             records[[item.component for item in records].index(changed.component)] = changed
             with self.subTest(code=code):
-                self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, tuple(records), stage, now=100).code, code)
+                self.assertEqual(evaluate_dependency_preflight(policy.binding, policy, tuple(records), stage, now=100, trusted_authority=self.authority(policy)).code, code)
 
     def test_transition_review_binds_complete_delta_and_authority(self) -> None:
         previous = self.policy(revision="a", provider_minimum="1.2.0")
@@ -131,8 +136,36 @@ class DependencyPolicyTests(unittest.TestCase):
         with self.assertRaises(DependencyPolicyError):
             PolicyTransition(PolicyTransitionKind.UPGRADE)
 
+    def test_trusted_authority_identity_is_required_for_bootstrap_and_every_stage(self) -> None:
+        policy = self.policy()
+        calls: list[bool] = []
+        self.assertFalse(verify_policy_admission(policy, None))
+        self.assertFalse(verify_policy_admission(policy, None, self.authority(policy, reviewer="0")))
+        for stage in DependencyStage:
+            with self.subTest(stage=stage):
+                decision = evaluate_dependency_preflight(policy.binding, policy, self.records_for(policy, stage), stage, now=100, trusted_authority=self.authority(policy, reviewer="0"))
+                self.assertEqual(decision.code, DependencyDecisionCode.POLICY_TRANSITION_INVALID)
+                with self.assertRaises(DependencyPolicyError):
+                    execute_after_dependency_preflight(policy.binding, policy, self.records_for(policy, stage), stage, now=100, action=lambda: calls.append(True), trusted_authority=self.authority(policy, authority="0"))
+        self.assertEqual(calls, [])
+
+    def test_trusted_authority_identity_is_required_for_policy_changes(self) -> None:
+        previous = self.policy(revision="a", provider_minimum="1.2.0")
+        draft = self.policy(revision="b", provider_minimum="1.3.0")
+        review = PolicyTransitionReview.create(previous, draft, reviewer_identity=digest("6"), authority_digest=digest("7"))
+        upgraded = replace(draft, transition=PolicyTransition(PolicyTransitionKind.UPGRADE, review))
+        records = self.records_for(upgraded, DependencyStage.PACKAGE_BUILD)
+        self.assertEqual(
+            evaluate_dependency_preflight(upgraded.binding, upgraded, records, DependencyStage.PACKAGE_BUILD, now=100, previous_policy=previous, trusted_authority=self.authority(upgraded, reviewer="6", authority="7")).code,
+            DependencyDecisionCode.AUTHORIZED,
+        )
+        self.assertEqual(
+            evaluate_dependency_preflight(upgraded.binding, upgraded, records, DependencyStage.PACKAGE_BUILD, now=100, previous_policy=previous, trusted_authority=self.authority(upgraded, reviewer="6", authority="0")).code,
+            DependencyDecisionCode.POLICY_TRANSITION_INVALID,
+        )
+
     def test_diagnostics_cannot_render_attacker_supplied_reason_text(self) -> None:
-        policy = self.policy(); decision = evaluate_dependency_preflight(policy.binding, policy, (), DependencyStage.GITHUB_MUTATION, now=100)
+        policy = self.policy(); decision = evaluate_dependency_preflight(policy.binding, policy, (), DependencyStage.GITHUB_MUTATION, now=100, trusted_authority=self.authority(policy))
         rendered = render_dependency_decision(decision)
         self.assertEqual(decision.code, DependencyDecisionCode.PROVENANCE_MISSING)
         self.assertNotIn("C:\\private", rendered)

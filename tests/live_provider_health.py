@@ -7,7 +7,7 @@ import re
 import sys
 import time
 from roundwright.configuration import Configuration
-from roundwright.provider_health import CodexHealthContract, RoleBoundCodexCredentialStore
+from roundwright.provider_health import CodexHealthContract, ProviderQualificationControl, RoleBoundCodexCredentialStore
 from roundwright.provider_health_live import run_bounded_live_provider_health_fixture
 
 _SCHEMA = "roundwright-live-provider-health/v1"
@@ -22,7 +22,7 @@ def main() -> int:
         candidate = os.environ.get("ROUNDWRIGHT_CANDIDATE_SHA") or None
         if not _FACTORY.fullmatch(factory_name) or not _COMMIT.fullmatch(commit) or not _CASE.fullmatch(case) or (candidate is not None and not _COMMIT.fullmatch(candidate)): raise ValueError
         module, name = factory_name.split(":"); factory = getattr(importlib.import_module(module), name); value = factory()
-        if type(value) is not tuple or len(value) != 3 or type(value[0]) is not RoleBoundCodexCredentialStore or type(value[1]) is not CodexHealthContract or type(value[2]) is not Configuration or value[1].contract_commit != commit: raise ValueError
+        if type(value) is not tuple or len(value) != 4 or type(value[0]) is not RoleBoundCodexCredentialStore or type(value[1]) is not CodexHealthContract or type(value[2]) is not Configuration or type(value[3]) is not ProviderQualificationControl or value[1].contract_commit != commit: raise ValueError
         result = run_bounded_live_provider_health_fixture(*value, enabled=True, contract_commit=commit, candidate_sha=candidate, case_id=case, now=int(time.time()), freshness_seconds=60)
         evidence = result.owner_safe_evidence()
         sys.stdout.write(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"); return 0 if evidence["status"] == "ready" else 1

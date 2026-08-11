@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,7 +60,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')
 from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
-from roundwright.dependency_policy import ComponentPolicy, DependencyComponent, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, VersionRange
+from roundwright.dependency_policy import BootstrapPolicyReceipt, ComponentPolicy, DependencyComponent, DependencyPolicy, DependencyStage, ObservedDependency, PolicyTransition, PolicyTransitionKind, VersionRange
 from roundwright.local_slice import LocalSliceFixture, render_local_slice_status, run_once_local_slice
 from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.state import database_path
@@ -83,7 +84,8 @@ def candidate_dependency_evidence(binding):
         ComponentPolicy(DependencyComponent.GITHUB_CLI, 'gh', VersionRange('2.0.0', '3.0.0'), 'github/gh', dependency_digest('5'), dependency_digest('6')),
         ComponentPolicy(DependencyComponent.BUILD_BACKEND, 'setuptools', VersionRange('69.0.0', '70.0.0'), 'pypi/setuptools', dependency_digest('7'), dependency_digest('8')),
     )
-    policy = DependencyPolicy(binding, dependency_digest('9'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.INITIAL))
+    policy = DependencyPolicy(binding, dependency_digest('9'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, BootstrapPolicyReceipt.create(policy, reviewer_identity=dependency_digest('a'), authority_digest=dependency_digest('b'))))
     observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 1893456000, policy.policy_digest) for item in components)
     return policy, observations
 def run_slice(value):
@@ -140,12 +142,12 @@ repository = RepositoryIdentity.from_root(root)
 from roundwright.dependency_policy import CandidateBinding
 blocked_policy, _ = candidate_dependency_evidence(CandidateBinding('local/repository', 'blocked-task', 'c' * 40))
 blocked_action = []
-try:
-    local_slice._execute_candidate_diff_helper(blocked_policy.binding, blocked_policy, (), lambda: blocked_action.append(True), 1893456000)
-except Exception:
-    blocked_candidate_helper = not blocked_action
-else:
-    blocked_candidate_helper = False
+for stage in DependencyStage:
+    try:
+        local_slice._execute_candidate_helper_from_factory(lambda binding: (blocked_policy, ()), blocked_policy.binding, stage, lambda stage=stage: blocked_action.append(stage.value), 1893456000)
+    except Exception:
+        pass
+blocked_candidate_helper = not blocked_action
 try:
     run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
 except Exception:

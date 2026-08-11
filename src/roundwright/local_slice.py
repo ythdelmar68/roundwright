@@ -184,6 +184,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         deployment_fingerprint=_fingerprint("deployment", identity.task_id),
         runtime_binding=runtime_binding,
     )
+    base_dependency_binding = CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha)
     planning_input = PlanningInput(
         "Implement one isolated local task",
         ("No network", "No credential", "No external provider"),
@@ -203,12 +204,15 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         planning_input.recovery_notes,
         (),
     )
-    plan_dispatch = dispatch_plan(
-        repository, identity, _health_context(context, identity, ProviderRole.PLANNING, configuration.worker.value, epoch), planning_input,
-        plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
-        worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
-        process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
-        lease=lease, now=epoch,
+    plan_dispatch = _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, base_dependency_binding, DependencyStage.DISPATCH,
+        lambda: dispatch_plan(
+            repository, identity, _health_context(context, identity, ProviderRole.PLANNING, configuration.worker.value, epoch), planning_input,
+            plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
+            worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
+            process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
+            lease=lease, now=epoch,
+        ), epoch,
     )
     persisted_plan = record_plan(
         repository, identity, context, plan_attempt_id=plan_dispatch.plan_attempt_id,
@@ -222,12 +226,15 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     record_artifact(repository, identity, artifact_kind="plan", artifact_fingerprint=persisted_plan.content_digest, lease=lease)
     submit_plan_for_review(repository, identity, plan_attempt_id=persisted_plan.plan_attempt_id, evidence_fingerprint=_fingerprint("submit-plan", identity.task_id), lease=lease)
 
-    plan_review = dispatch_plan_review(
-        repository, identity, _health_context(context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch),
-        review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
-        supervisor_session_identity="local-plan-supervisor-session", external_turn_identity="local-plan-review-turn",
-        plan_attempt_id=persisted_plan.plan_attempt_id, process_lease_id="local-plan-review-lease",
-        process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], lease=lease, now=epoch,
+    plan_review = _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, base_dependency_binding, DependencyStage.DISPATCH,
+        lambda: dispatch_plan_review(
+            repository, identity, _health_context(context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch),
+            review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
+            supervisor_session_identity="local-plan-supervisor-session", external_turn_identity="local-plan-review-turn",
+            plan_attempt_id=persisted_plan.plan_attempt_id, process_lease_id="local-plan-review-lease",
+            process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], lease=lease, now=epoch,
+        ), epoch,
     )
     record_plan_review(
         repository, identity, context, review_attempt_id=plan_review.review_attempt_id,
@@ -247,23 +254,32 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     )
 
     binding = provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease)
-    implementation = begin_implementation(
-        repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
-        implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
-        plan_attempt_id=persisted_plan.plan_attempt_id, worker_thread_identity=plan_dispatch.worker_thread_identity,
-        external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
-        process_lease_expires_at=epoch + 60, lease=lease, now=epoch,
+    implementation = _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, base_dependency_binding, DependencyStage.DISPATCH,
+        lambda: begin_implementation(
+            repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
+            implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
+            plan_attempt_id=persisted_plan.plan_attempt_id, worker_thread_identity=plan_dispatch.worker_thread_identity,
+            external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
+            process_lease_expires_at=epoch + 60, lease=lease, now=epoch,
+        ), epoch,
     )
-    _commit_local_implementation(binding.worktree, source_contents)
+    _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, base_dependency_binding, DependencyStage.GITHUB_MUTATION,
+        lambda: _commit_local_implementation(binding.worktree, source_contents), epoch,
+    )
     seal = record_implementation_candidate(
         repository, identity, context, binding, implementation_attempt_id=implementation.implementation_attempt_id,
         completion_evidence_fingerprint=_fingerprint("implementation", identity.task_id), lease=lease, now=epoch,
     )
     for verification_id, kind in (("local-targeted-tests", VerificationKind.TEST), ("local-build", VerificationKind.BUILD)):
-        record_candidate_verification(
-            repository, identity, binding, seal,
-            CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha)),
-            lease=lease,
+        _execute_candidate_helper_from_factory(
+            candidate_dependency_evidence, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha), DependencyStage.PACKAGE_BUILD,
+            lambda verification_id=verification_id, kind=kind: record_candidate_verification(
+                repository, identity, binding, seal,
+                CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha)),
+                lease=lease,
+            ), epoch,
         )
 
     candidate_context = RecoveryContext.for_task(
@@ -272,14 +288,8 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         runtime_binding=runtime_binding,
     )
     candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
-    if not callable(candidate_dependency_evidence):
-        raise LocalSliceError("candidate dependency evidence is unavailable")
-    try:
-        dependency_policy, dependency_observations = candidate_dependency_evidence(candidate_binding)
-    except (DependencyPolicyError, TypeError, ValueError) as error:
-        raise LocalSliceError("candidate dependency evidence is unavailable") from error
-    diff_review = _execute_candidate_diff_helper(
-        candidate_binding, dependency_policy, dependency_observations,
+    diff_review = _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, candidate_binding, DependencyStage.DISPATCH,
         lambda: dispatch_diff_review(
             repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
             diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
@@ -514,6 +524,27 @@ def _execute_candidate_diff_helper(
         return execute_after_dependency_preflight(
             binding, policy, observations, DependencyStage.DISPATCH, now=now, action=action,
         )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _execute_candidate_helper_from_factory(
+    factory: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None,
+    binding: CandidateBinding,
+    stage: DependencyStage,
+    action: Callable[[], object],
+    now: int,
+) -> object:
+    """Require trusted evidence before every local-slice helper execution."""
+
+    if not callable(factory):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        policy, observations = factory(binding)
+    except (DependencyPolicyError, TypeError, ValueError) as error:
+        raise LocalSliceError("candidate dependency evidence is unavailable") from error
+    try:
+        return execute_after_dependency_preflight(binding, policy, observations, stage, now=now, action=action)
     except DependencyPolicyError as error:
         raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
 

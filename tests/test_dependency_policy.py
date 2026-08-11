@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.dependency_policy import (
     CandidateBinding,
+    BootstrapPolicyReceipt,
     ComponentPolicy,
     DependencyComponent,
     DependencyDecisionCode,
@@ -40,7 +41,7 @@ class DependencyPolicyTests(unittest.TestCase):
         return CandidateBinding("ythdelmar68/roundwright", "issue-47", candidate * 40)
 
     def policy(self, *, binding: CandidateBinding | None = None, revision: str = "a", provider_minimum: str = "1.2.0", transition: PolicyTransition | None = None) -> DependencyPolicy:
-        return DependencyPolicy(
+        policy = DependencyPolicy(
             binding or self.binding(), digest(revision), 100, 30,
             (
                 ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("b"), digest("1")),
@@ -49,8 +50,11 @@ class DependencyPolicyTests(unittest.TestCase):
                 ComponentPolicy(DependencyComponent.BUILD_BACKEND, "setuptools", VersionRange("69.0.0", "70.0.0"), "pypi/setuptools", digest("e"), digest("4")),
                 ComponentPolicy(DependencyComponent.OPTIONAL_ADAPTER, "jira-adapter", VersionRange("1.0.0", "2.0.0"), "pypi/jira-adapter", digest("f"), digest("5")),
             ),
-            transition or PolicyTransition(PolicyTransitionKind.INITIAL),
+            transition or PolicyTransition(PolicyTransitionKind.BOOTSTRAP),
         )
+        if transition is not None:
+            return policy
+        return replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b"))))
 
     def observation(self, policy: DependencyPolicy, component: DependencyComponent, *, binding: CandidateBinding | None = None, version: str | None = None, observed_at: int = 100, policy_digest: str | None = None, artifact: str | None = None, executable: str | None = None) -> ObservedDependency:
         expected = policy.component(component); assert expected is not None

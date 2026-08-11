@@ -2160,12 +2160,23 @@ class OwnerFixedMutationHostExecutor:
     denial before any credential or process access.
     """
 
-    def __init__(self, handler: _OwnerFixedMutationCommandHandler) -> None:
-        if not hasattr(handler, "execute_fixed_command"):
+    def __init__(self, handler: _OwnerFixedMutationCommandHandler, binding: CandidateBinding) -> None:
+        if not hasattr(handler, "execute_fixed_command") or type(binding) is not CandidateBinding:
             raise GitHubRuntimeError("owner fixed mutation handler is unavailable")
         self.__handler = handler
+        self.__binding = binding
 
-    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact:
+    def _matches_binding(self, binding: CandidateBinding) -> bool:
+        return type(binding) is CandidateBinding and self.__binding == binding
+
+    def execute_fixed(
+        self, record: OwnerMutationSealRecord, *, control: _OwnerGitHubMutationControl, now: datetime,
+    ) -> OwnerMutationAcceptedFact:
+        """Execute only after exact host-owned mutation authority is re-proved."""
+
+        if type(record) is not OwnerMutationSealRecord or type(control) is not _OwnerGitHubMutationControl:
+            raise GitHubRuntimeError("owner fixed mutation dependency control is invalid")
+        control.require(record.request, self.__binding, now=now)
         command = _owner_fixed_mutation_command(record)
         fact = self.__handler.execute_fixed_command(command, record)
         if (
@@ -2207,6 +2218,7 @@ class OwnerMutationHostEndpoint:
             not hasattr(registry, "resolve_and_consume")
             or type(executor) is not OwnerFixedMutationHostExecutor
             or type(binding) is not CandidateBinding
+            or not executor._matches_binding(binding)
             or not hasattr(controls, "resolve")
             or clock is None
         ):
@@ -2248,7 +2260,7 @@ class OwnerMutationHostEndpoint:
         ):
             return OwnerMutationFact(False, request.identity)
         try:
-            fact = self.__executor.execute_fixed(record)
+            fact = self.__executor.execute_fixed(record, control=control, now=now)
         except (AttributeError, TypeError, ValueError):
             return OwnerMutationFact(False, request.identity)
         if type(fact) is not OwnerMutationAcceptedFact or fact.request_identity != request.identity or fact.operation is not request.operation:

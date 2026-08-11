@@ -316,8 +316,9 @@ def owner_endpoint(
     except Exception:
         observed_at = NOW
     control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
+    binding = owner_mutation_binding()
     endpoint = OwnerMutationHostEndpoint(
-        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), owner_mutation_binding(), FixtureOwnerMutationControlRegistry(control_now), clock=clock,
+        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host, binding), binding, FixtureOwnerMutationControlRegistry(control_now), clock=clock,
     )
     return OwnerMutationIpcClient(DIGEST, endpoint)
 
@@ -943,7 +944,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         request = sealed_owner_request()
         transport = OwnerTransport()
         endpoint = OwnerMutationHostEndpoint(
-            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport),
+            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)),
             owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)),
             clock=lambda: NOW,
         )
@@ -987,7 +988,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(record=record is None):
                 denied_transport = OwnerTransport()
                 denied = OwnerMutationHostEndpoint(
-                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), owner_mutation_binding(request.candidate_sha), FixtureOwnerMutationControlRegistry(NOW), clock=lambda: NOW,
+                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), FixtureOwnerMutationControlRegistry(NOW), clock=lambda: NOW,
                 ).exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(denied, OwnerMutationFact)
                 self.assertEqual(denied_transport.requests, [])
@@ -1028,7 +1029,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(control_type=type(control).__name__):
                 transport, seals, registry = OwnerTransport(), CountingSealRegistry(), StaticControls(control)
                 endpoint = OwnerMutationHostEndpoint(
-                    seals, OwnerFixedMutationHostExecutor(transport), owner_mutation_binding(request.candidate_sha), registry, clock=lambda: NOW,
+                    seals, OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), registry, clock=lambda: NOW,
                 )
                 fact = endpoint.exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(fact, OwnerMutationFact)
@@ -1036,6 +1037,41 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertEqual(seals.calls, 0)
                 self.assertEqual(transport.requests, [])
                 self.assertEqual(transport.commands, [])
+
+    def test_fixed_executor_requires_exact_mutation_control_before_handler(self) -> None:
+        """The direct fixed-executor seam cannot bypass endpoint preflight."""
+
+        request = sealed_owner_request()
+        record = sealed_owner_record(request)
+        binding = owner_mutation_binding(request.candidate_sha)
+        valid = owner_mutation_control(request, binding=binding)
+        forged_wrong_stage = object.__new__(_OwnerGitHubMutationControl)
+        object.__setattr__(forged_wrong_stage, "request_identity", valid.request_identity)
+        object.__setattr__(forged_wrong_stage, "binding", valid.binding)
+        object.__setattr__(forged_wrong_stage, "operation", valid.operation)
+        object.__setattr__(
+            forged_wrong_stage, "dependency_control",
+            DependencyExecutionControl(valid.dependency_control.policy, valid.dependency_control.observations[:1], valid.dependency_control.admission),
+        )
+        object.__setattr__(forged_wrong_stage, "now", valid.now)
+        controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_mutation_control(request, binding=CandidateBinding("other/repository", binding.task_id, request.candidate_sha)),
+            owner_mutation_control(request, binding=CandidateBinding(binding.repository, "other-task", request.candidate_sha)),
+            owner_mutation_control(request, binding=CandidateBinding(binding.repository, binding.task_id, "f" * 40)),
+            owner_mutation_control(request, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_mutation_control(request, now=NOW - timedelta(seconds=1)),
+            forged_wrong_stage,
+        )
+        for control in controls:
+            with self.subTest(control_type=type(control).__name__):
+                transport = OwnerTransport()
+                executor = OwnerFixedMutationHostExecutor(transport, binding)
+                with self.assertRaises(ValueError):
+                    executor.execute_fixed(record, control=control, now=NOW)  # type: ignore[arg-type]
+                self.assertEqual(transport.commands, [])
+                self.assertEqual(transport.requests, [])
 
     def test_owner_fixed_executor_has_total_sealed_operation_mapping_without_process_access(self) -> None:
         """Every operation reaches the host only as a sealed fixed command shape."""
@@ -1069,7 +1105,10 @@ class GitHubRuntimeTests(unittest.TestCase):
                 values["marker_digest"] = COMMENT_DIGEST
             request = OwnerMutationRequest(DIGEST, operation, DIGEST, DIGEST, DIGEST, REPOSITORY, **values)
             transport = OwnerTransport()
-            fact = OwnerFixedMutationHostExecutor(transport).execute_fixed(sealed_owner_record(request))
+            binding = owner_mutation_binding(request.candidate_sha)
+            fact = OwnerFixedMutationHostExecutor(transport, binding).execute_fixed(
+                sealed_owner_record(request), control=owner_mutation_control(request, binding=binding), now=NOW,
+            )
             with self.subTest(operation=operation):
                 self.assertIsInstance(fact, OwnerMutationAcceptedFact)
                 self.assertEqual(transport.commands[0].command, command)
@@ -1095,7 +1134,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport(), object(), object())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
-            OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
+            OwnerFixedMutationHostExecutor(object(), object())  # type: ignore[arg-type]
 
     def test_production_ipc_clients_have_no_reachable_process_or_credential_capability(self) -> None:
         """The broker graph retains only absent-by-default typed IPC clients."""
@@ -1147,7 +1186,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         transport = OwnerTransport()
         host = OwnerMutationHostEndpoint(
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-            OwnerFixedMutationHostExecutor(transport), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
+            OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
         )
         client = OwnerMutationIpcClient(DIGEST, host)
         with self.assertRaises(ValueError):
@@ -1288,7 +1327,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 transport = OwnerTransport()
                 host = OwnerMutationHostEndpoint(
                     InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-                    OwnerFixedMutationHostExecutor(transport), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
+                    OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
                 )
                 reply = host.exchange_mutation(OwnerMutationIpcMessage(request))
                 self.assertIsInstance(reply.fact, OwnerMutationFact)

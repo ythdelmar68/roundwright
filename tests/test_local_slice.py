@@ -96,6 +96,8 @@ def trusted_dependency_admission(binding):
     policy = trusted_dependency_policy(binding)
     receipt = policy.transition.review
     return TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, dependency_digest('a'), dependency_digest('b'))
+def candidate_validation(binding, kind):
+    return dependency_digest(kind.value[0])
 def run_slice(value):
     return run_once_local_slice(
         repository, value,
@@ -103,6 +105,7 @@ def run_slice(value):
         trusted_review_floor=trusted_review_floor,
         candidate_dependency_evidence=candidate_dependency_evidence,
         trusted_dependency_admission=trusted_dependency_admission,
+        candidate_validation=candidate_validation,
         now=datetime(2030, 1, 1, tzinfo=timezone.utc),
     )
 commands = []
@@ -148,6 +151,7 @@ def no_credential(name, *args, **kwargs):
     return original_getenv(name, *args, **kwargs)
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
+database_before_missing_admission = database_path(repository).exists()
 from roundwright.dependency_policy import CandidateBinding
 blocked_binding = CandidateBinding('local/repository', 'blocked-task', 'c' * 40)
 blocked_policy, blocked_observations = candidate_dependency_evidence(blocked_binding)
@@ -164,6 +168,7 @@ except Exception:
     missing_trusted_floor_rejected = True
 else:
     missing_trusted_floor_rejected = False
+database_after_missing_admission = database_path(repository).exists()
 before_first = len(commands)
 first = run_slice(fixture)
 first_pass_commands = len(commands) - before_first
@@ -276,6 +281,7 @@ print(json.dumps({
     'artifacts': [item.kind for item in first.task.artifacts],
     'blockers': first.task.blockers,
     'missing_trusted_floor_rejected': missing_trusted_floor_rejected,
+    'missing_admission_has_no_domain_state': not database_before_missing_admission and not database_after_missing_admission,
     'drifted_trusted_floor_rejected': drifted_trusted_floor_rejected,
     'changed_source_rejected': changed_source_rejected,
     'transitions': transitions,
@@ -317,6 +323,7 @@ print(json.dumps({
             self.assertEqual(result["artifacts"], ["diff", "plan", "review", "status"])
             self.assertEqual(result["blockers"], [])
             self.assertTrue(result["missing_trusted_floor_rejected"])
+            self.assertTrue(result["missing_admission_has_no_domain_state"])
             self.assertTrue(result["drifted_trusted_floor_rejected"])
             self.assertTrue(result["changed_source_rejected"])
             self.assertEqual(result["transitions"], [

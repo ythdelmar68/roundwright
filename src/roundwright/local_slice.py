@@ -98,6 +98,7 @@ def run_once_local_slice(
     trusted_review_floor: ReviewPolicy | None = None,
     candidate_dependency_evidence: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
     trusted_dependency_admission: Callable[[CandidateBinding], TrustedDependencyAdmission] | None = None,
+    candidate_validation: Callable[[CandidateBinding, VerificationKind], str] | None = None,
     now: datetime | None = None,
 ) -> LocalSliceResult:
     """Drive one local task to ready-for-owner, or return its exact completed replay.
@@ -124,6 +125,15 @@ def run_once_local_slice(
     )
     configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
     runtime_binding = configuration.pin().runtime_binding()
+    instant = datetime.now(timezone.utc) if now is None else now
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise LocalSliceError("local slice clock must be timezone-aware")
+    epoch = int(instant.timestamp())
+    _execute_candidate_helper_from_factory(
+        candidate_dependency_evidence, trusted_dependency_admission,
+        CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha),
+        DependencyStage.DISPATCH, lambda: None, epoch,
+    )
     database = check_database(repository)
     if database.state == "healthy":
         completed = _completed_result(repository, identity, fixture, runtime_binding)
@@ -134,10 +144,6 @@ def run_once_local_slice(
     else:
         raise LocalSliceError("local slice database is unavailable")
 
-    instant = datetime.now(timezone.utc) if now is None else now
-    if instant.tzinfo is None or instant.utcoffset() is None:
-        raise LocalSliceError("local slice clock must be timezone-aware")
-    epoch = int(instant.timestamp())
     try:
         with transition_lease(
             repository,
@@ -146,7 +152,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -171,7 +177,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -281,10 +287,9 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     for verification_id, kind in (("local-targeted-tests", VerificationKind.TEST), ("local-build", VerificationKind.BUILD)):
         _execute_candidate_helper_from_factory(
             candidate_dependency_evidence, trusted_dependency_admission, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha), DependencyStage.PACKAGE_BUILD,
-            lambda verification_id=verification_id, kind=kind: record_candidate_verification(
-                repository, identity, binding, seal,
-                CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha)),
-                lease=lease,
+            lambda verification_id=verification_id, kind=kind: _run_and_record_candidate_validation(
+                candidate_validation, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha),
+                repository, identity, binding, seal, verification_id, kind, lease,
             ), epoch,
         )
 
@@ -559,6 +564,21 @@ def _execute_candidate_helper_from_factory(
         )
     except DependencyPolicyError as error:
         raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _run_and_record_candidate_validation(validation, candidate_binding, repository, identity, worktree_binding, seal, verification_id, kind, lease):
+    """Run the actual validation callback before durable PASS evidence exists."""
+
+    if not callable(validation):
+        raise LocalSliceError("candidate validation is unavailable")
+    evidence = validation(candidate_binding, kind)
+    if not isinstance(evidence, str) or not evidence:
+        raise LocalSliceError("candidate validation is invalid")
+    return record_candidate_verification(
+        repository, identity, worktree_binding, seal,
+        CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha, evidence)),
+        lease=lease,
+    )
 
 
 def _git(directory: Path, *arguments: str) -> str:

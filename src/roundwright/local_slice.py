@@ -310,7 +310,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     )
     candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
     try:
-        git_entrypoint_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
+        dispatch_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
     except DependencyPolicyError as error:
         raise LocalSliceError("local slice candidate dispatch preflight blocked evidence collection") from error
     candidate_dispatch_control = _materialize_dispatch_control(

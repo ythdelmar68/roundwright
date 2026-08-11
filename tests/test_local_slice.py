@@ -79,6 +79,7 @@ trusted_review_floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_R
 drifted_review_floor = ReviewPolicy(2, 9, 2, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
 def dependency_digest(value):
     return 'sha256:' + value * 64
+dependency_callbacks = []
 def trusted_dependency_policy(binding):
     components = (
         ComponentPolicy(DependencyComponent.PACKAGE, 'roundwright', VersionRange('0.0.0', '1.0.0'), 'pypi/roundwright', dependency_digest('1'), dependency_digest('2')),
@@ -90,10 +91,12 @@ def trusted_dependency_policy(binding):
     policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, BootstrapPolicyReceipt.create(policy, reviewer_identity=dependency_digest('a'), authority_digest=dependency_digest('b'))))
     return policy
 def candidate_dependency_evidence(binding):
+    dependency_callbacks.append(('evidence', binding.candidate_sha))
     policy = trusted_dependency_policy(binding)
     observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 1893456000, policy.policy_digest) for item in policy.components)
     return policy, observations
 def trusted_dependency_admission(binding):
+    dependency_callbacks.append(('admission', binding.candidate_sha))
     policy = trusted_dependency_policy(binding)
     receipt = policy.transition.review
     return TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, dependency_digest('a'), dependency_digest('b'))
@@ -225,8 +228,13 @@ else:
     missing_trusted_floor_rejected = False
 database_after_missing_admission = database_path(repository).exists()
 before_first = len(commands)
+callbacks_before_first = len(dependency_callbacks)
 first = run_slice(fixture)
 first_pass_commands = len(commands) - before_first
+first_candidate_callback_counts = [
+    sum(1 for kind, candidate_sha in dependency_callbacks[callbacks_before_first:] if kind == expected_kind and candidate_sha == first.candidate.candidate_sha)
+    for expected_kind in ('admission', 'evidence')
+]
 connection = sqlite3.connect(database_path(repository))
 try:
     leases_after_first = connection.execute("SELECT COUNT(*) FROM transition_leases").fetchone()[0]
@@ -363,6 +371,7 @@ print(json.dumps({
     'failure_released_lease': failure_released_lease,
     'blocked_candidate_helper': blocked_candidate_helper,
     'invalid_entrypoints_leave_no_action': invalid_entrypoints_leave_no_action,
+    'first_candidate_callback_counts': first_candidate_callback_counts,
 }))
 """ % (str(installed), str(fixture))
             environment = {"PATH": os.environ["PATH"]}
@@ -417,6 +426,7 @@ print(json.dumps({
             self.assertTrue(result["failure_released_lease"])
             self.assertTrue(result["blocked_candidate_helper"])
             self.assertTrue(result["invalid_entrypoints_leave_no_action"])
+            self.assertEqual(result["first_candidate_callback_counts"], [3, 3])
             expected_na = {"dependency-graph", "github-trace", "public-identifier", "live-proof", "external-ci"}
             self.assertEqual({row[0] for row in result["gates"]}, {
                 "plan-review", "candidate-seal", "supervisor-diff-review", "targeted-tests", "full-tests", "build",

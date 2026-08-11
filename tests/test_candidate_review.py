@@ -63,6 +63,8 @@ def _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs
     selected = kwargs.get("selected_profile_identity")
     if selected not in context.runtime_binding.supervisor_profile_identities:
         selected = None
+    dependency_binding, control = _dispatch_control(identity, context, kwargs["now"], seal.candidate_sha)
+    kwargs.update(dependency_binding=dependency_binding, control=control)
     return _native_dispatch_diff_review(
         repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR, selected_profile_identity=selected), binding, seal, **kwargs
     )
@@ -78,6 +80,40 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
+    def test_native_diff_review_control_denials_have_zero_internal_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, worktree_binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            dependency_binding, control = _dispatch_control(identity, review_context, now, seal.candidate_sha)
+            arguments = dict(
+                diff_review_attempt_id="diff-gate", implementation_attempt_id=implementation.implementation_attempt_id,
+                provider_attempt_id="diff-gate-supervisor", supervisor_session_identity="diff-gate-session",
+                external_turn_identity="diff-gate-turn", message_identity="diff-gate-message",
+                process_lease_id="diff-gate-lease", process_lease_expires_at=now + 60,
+                selected_profile_identity=review_context.runtime_binding.supervisor_profile_identities[0],
+                within_round_attempt=1, review_round=4, lease=lease, now=now,
+            )
+            with self.assertRaises(TypeError):
+                _native_dispatch_diff_review(
+                    repository, identity, provider_context(review_context, identity, ProviderRole.SUPERVISOR),
+                    worktree_binding, seal, dependency_binding=dependency_binding, **arguments,
+                )
+            invalid_binding = CandidateBinding(identity.repository_id, identity.task_id, "f" * 40)
+            for supplied_binding, supplied_control in (
+                (invalid_binding, _dispatch_control(identity, review_context, now, invalid_binding.candidate_sha)[1]),
+                (dependency_binding, _dispatch_control(identity, review_context, now, "e" * 40)[1]),
+                (dependency_binding, _dispatch_control(identity, review_context, now - 61, seal.candidate_sha)[1]),
+            ):
+                with self.subTest(control_now=supplied_control.now), patch.object(candidate_review, "candidate_evidence", side_effect=AssertionError("candidate evidence")) as evidence, patch.object(candidate_review, "prepare_attempt", side_effect=AssertionError("provider")) as prepared, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(CandidateReviewError):
+                        _native_dispatch_diff_review(
+                            repository, identity, provider_context(review_context, identity, ProviderRole.SUPERVISOR),
+                            worktree_binding, seal, dependency_binding=supplied_binding, control=supplied_control, **arguments,
+                        )
+                    evidence.assert_not_called(); prepared.assert_not_called(); database.assert_not_called()
+
     def test_native_implementation_control_denials_have_zero_internal_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease, context, _, now = self.ready_task(Path(temporary) / "repository", commit=False)

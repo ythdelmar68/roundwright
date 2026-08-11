@@ -309,16 +309,21 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         runtime_binding=runtime_binding,
     )
     candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
-    diff_review = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, DependencyStage.DISPATCH,
-        lambda: dispatch_diff_review(
-            repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
-            diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
-            provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
-            external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
-            process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1,
-            review_round=1, lease=lease, now=epoch,
-        ), epoch,
+    try:
+        git_entrypoint_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice candidate dispatch preflight blocked evidence collection") from error
+    candidate_dispatch_control = _materialize_dispatch_control(
+        candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, epoch,
+    )
+    diff_review = dispatch_diff_review(
+        repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
+        dependency_binding=candidate_binding, control=candidate_dispatch_control,
+        diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
+        provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
+        external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
+        process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1,
+        review_round=1, lease=lease, now=epoch,
     )
     record_diff_review(
         repository, identity, candidate_context, binding, seal, diff_review_attempt_id=diff_review.diff_review_attempt_id,

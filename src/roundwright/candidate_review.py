@@ -500,6 +500,8 @@ def dispatch_diff_review(
     binding: WorktreeBinding,
     seal: CandidateSeal,
     *,
+    dependency_binding: CandidateBinding,
+    control: ProviderDispatchControl,
     diff_review_attempt_id: str,
     implementation_attempt_id: str,
     provider_attempt_id: str,
@@ -516,6 +518,20 @@ def dispatch_diff_review(
 ) -> DiffReviewDispatch:
     """Dispatch one fresh read-only review of exactly ``base...candidate``."""
 
+    if (
+        type(dependency_binding) is not CandidateBinding
+        or type(control) is not ProviderDispatchControl
+        or control.binding != dependency_binding
+        or control.now != now
+        or dependency_binding.repository != identity.repository_id
+        or dependency_binding.task_id != identity.task_id
+        or dependency_binding.candidate_sha != seal.candidate_sha
+    ):
+        raise CandidateReviewError("diff review dispatch control is invalid")
+    try:
+        control.dependency_control.require(dependency_binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("diff review dispatch preflight blocked execution") from error
     for value, name in (
         (diff_review_attempt_id, "diff review identity"), (implementation_attempt_id, "implementation attempt identity"),
         (provider_attempt_id, "provider attempt identity"), (supervisor_session_identity, "Supervisor session identity"),

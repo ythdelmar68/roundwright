@@ -19,9 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.candidate_review import (
-    CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
+    CandidateReviewError, CandidateValidationControl, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
     VerificationKind, VerificationOutcome, begin_implementation as _begin_implementation, dispatch_diff_review as _native_dispatch_diff_review,
-    finalize_review_limit_repair, read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
+    finalize_review_limit_repair, read_diff_review, record_candidate_verification as _native_record_candidate_verification, record_diff_review, record_implementation_candidate,
     recover_diff_review,
 )
 import roundwright.candidate_review as candidate_review
@@ -59,6 +59,18 @@ def begin_implementation(repository, identity, context, *args, **kwargs):
     return _begin_implementation(repository, identity, provider_context(context, identity, ProviderRole.WORKER), *args, **kwargs)
 
 
+def _validation_control(identity, seal, now):
+    binding, dispatch_control = _dispatch_control(identity, None, now, seal.candidate_sha)
+    return binding, CandidateValidationControl(binding, dispatch_control.dependency_control, now)
+
+
+def record_candidate_verification(repository, identity, binding, seal, verification, **kwargs):
+    now = kwargs.setdefault("now", int(time.time()))
+    dependency_binding, control = _validation_control(identity, seal, now)
+    kwargs.update(dependency_binding=dependency_binding, control=control)
+    return _native_record_candidate_verification(repository, identity, binding, seal, verification, **kwargs)
+
+
 def _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs):
     selected = kwargs.get("selected_profile_identity")
     if selected not in context.runtime_binding.supervisor_profile_identities:
@@ -80,6 +92,32 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
+    def test_native_candidate_verification_control_denials_have_zero_internal_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, _, worktree_binding, now = values
+            _, seal = self.implement(values)
+            dependency_binding, control = _validation_control(identity, seal, now)
+            verification = CandidateVerification("verification-gate", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64)
+            with self.assertRaises(TypeError):
+                _native_record_candidate_verification(
+                    repository, identity, worktree_binding, seal, verification,
+                    dependency_binding=dependency_binding, lease=lease, now=now,
+                )
+            invalid_binding = CandidateBinding(identity.repository_id, identity.task_id, "f" * 40)
+            for supplied_binding, supplied_control in (
+                (invalid_binding, CandidateValidationControl(invalid_binding, _dispatch_control(identity, None, now, invalid_binding.candidate_sha)[1].dependency_control, now)),
+                (dependency_binding, CandidateValidationControl(CandidateBinding(identity.repository_id, identity.task_id, "e" * 40), _dispatch_control(identity, None, now, "e" * 40)[1].dependency_control, now)),
+                (dependency_binding, _validation_control(identity, seal, now - 61)[1]),
+            ):
+                with self.subTest(control_now=supplied_control.now), patch.object(candidate_review, "candidate_evidence", side_effect=AssertionError("candidate evidence")) as evidence, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(CandidateReviewError):
+                        _native_record_candidate_verification(
+                            repository, identity, worktree_binding, seal, verification,
+                            dependency_binding=supplied_binding, control=supplied_control, lease=lease, now=now,
+                        )
+                    evidence.assert_not_called(); database.assert_not_called()
+
     def test_native_diff_review_control_denials_have_zero_internal_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

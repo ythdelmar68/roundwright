@@ -426,7 +426,7 @@ print(json.dumps({
             self.assertTrue(result["failure_released_lease"])
             self.assertTrue(result["blocked_candidate_helper"])
             self.assertTrue(result["invalid_entrypoints_leave_no_action"])
-            self.assertEqual(result["first_candidate_callback_counts"], [3, 3])
+            self.assertEqual(result["first_candidate_callback_counts"], [2, 2])
             expected_na = {"dependency-graph", "github-trace", "public-identifier", "live-proof", "external-ci"}
             self.assertEqual({row[0] for row in result["gates"]}, {
                 "plan-review", "candidate-seal", "supervisor-diff-review", "targeted-tests", "full-tests", "build",

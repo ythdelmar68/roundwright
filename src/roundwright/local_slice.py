@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .candidate_review import (
+    CandidateValidationControl,
     CandidateVerification,
     DiffReviewOutput,
     DiffReviewVerdict,
@@ -294,13 +295,18 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         repository, identity, context, binding, implementation_attempt_id=implementation.implementation_attempt_id,
         completion_evidence_fingerprint=_fingerprint("implementation", identity.task_id), lease=lease, now=epoch,
     )
+    candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
+    try:
+        dispatch_control.dependency_control.require(base_dependency_binding, DependencyStage.PACKAGE_BUILD, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice candidate build preflight blocked evidence collection") from error
+    candidate_validation_control = _materialize_validation_control(
+        candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, epoch,
+    )
     for verification_id, kind in (("local-targeted-tests", VerificationKind.TEST), ("local-build", VerificationKind.BUILD)):
-        _execute_candidate_helper_from_factory(
-            candidate_dependency_evidence, trusted_dependency_admission, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha), DependencyStage.PACKAGE_BUILD,
-            lambda verification_id=verification_id, kind=kind: _run_and_record_candidate_validation(
-                candidate_validation, CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha),
-                repository, identity, binding, seal, verification_id, kind, lease,
-            ), epoch,
+        _run_and_record_candidate_validation(
+            candidate_validation, candidate_binding, candidate_validation_control,
+            repository, identity, binding, seal, verification_id, kind, lease, epoch,
         )
 
     candidate_context = RecoveryContext.for_task(
@@ -596,18 +602,41 @@ def _materialize_dispatch_control(factory, admission_factory, binding, now):
         raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
 
 
-def _run_and_record_candidate_validation(validation, candidate_binding, repository, identity, worktree_binding, seal, verification_id, kind, lease):
+def _materialize_validation_control(factory, admission_factory, binding, now):
+    if not callable(factory) or not callable(admission_factory):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        trusted_admission = admission_factory(binding)
+        policy, observations = factory(binding)
+        return execute_after_dependency_preflight(
+            binding, policy, observations, DependencyStage.PACKAGE_BUILD, now=now,
+            previous_policy=trusted_admission.previous_policy, trusted_admission=trusted_admission,
+            action=lambda: CandidateValidationControl(
+                binding, DependencyExecutionControl(policy, tuple(observations), trusted_admission), now,
+            ),
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _run_and_record_candidate_validation(validation, candidate_binding, control, repository, identity, worktree_binding, seal, verification_id, kind, lease, now):
     """Run the actual validation callback before durable PASS evidence exists."""
 
-    if not callable(validation):
+    if not callable(validation) or type(control) is not CandidateValidationControl:
         raise LocalSliceError("candidate validation is unavailable")
+    try:
+        control.dependency_control.require(candidate_binding, DependencyStage.PACKAGE_BUILD, now=now)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate validation preflight blocked execution") from error
     evidence = validation(candidate_binding, kind)
     if not isinstance(evidence, str) or not evidence:
         raise LocalSliceError("candidate validation is invalid")
     return record_candidate_verification(
         repository, identity, worktree_binding, seal,
         CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha, evidence)),
+        dependency_binding=candidate_binding, control=control,
         lease=lease,
+        now=now,
     )
 
 

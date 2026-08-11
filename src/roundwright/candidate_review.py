@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
-from .dependency_policy import CandidateBinding, DependencyPolicyError, DependencyStage
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
@@ -31,6 +31,27 @@ from .worker_planning import ProviderDispatchControl
 
 class CandidateReviewError(StateError):
     """Raised when candidate-bound implementation or diff review is unsafe."""
+
+
+@dataclass(frozen=True)
+class CandidateValidationControl:
+    """Pre-materialized candidate-bound authority for package validation."""
+
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise CandidateReviewError("candidate validation control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.PACKAGE_BUILD, now=self.now)
+        except DependencyPolicyError as error:
+            raise CandidateReviewError("candidate validation preflight blocked execution") from error
 
 
 @dataclass(frozen=True)
@@ -445,10 +466,27 @@ def record_candidate_verification(
     seal: CandidateSeal,
     verification: CandidateVerification,
     *,
+    dependency_binding: CandidateBinding,
+    control: CandidateValidationControl,
     lease: TransitionLease | None,
+    now: int,
 ) -> None:
     """Persist a structured test/build result only for the currently clean candidate."""
 
+    if (
+        type(dependency_binding) is not CandidateBinding
+        or type(control) is not CandidateValidationControl
+        or control.binding != dependency_binding
+        or control.now != now
+        or dependency_binding.repository != identity.repository_id
+        or dependency_binding.task_id != identity.task_id
+        or dependency_binding.candidate_sha != seal.candidate_sha
+    ):
+        raise CandidateReviewError("candidate verification control is invalid")
+    try:
+        control.dependency_control.require(dependency_binding, DependencyStage.PACKAGE_BUILD, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("candidate verification preflight blocked execution") from error
     value = verification.normalized()
     _require_candidate_binding(identity, binding, seal)
     candidate_evidence(repository, binding, seal, lease=lease)
@@ -456,7 +494,7 @@ def record_candidate_verification(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_lease(connection, lease, identity, None)
+        _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "diff-review")
         existing = connection.execute(
             "SELECT verification_kind, outcome, evidence_fingerprint, justification FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? AND verification_id = ?",

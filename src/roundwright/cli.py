@@ -88,6 +88,8 @@ def _initialize(output: object) -> int:
         require_safe_entrypoint_identity(sys.argv[0])
         configuration = load_configuration(cwd=Path.cwd())
         preflight(configuration, PreflightMode.READ_ONLY)
+        if configuration.repository is not None and configuration.repository_configuration_root is None:
+            raise ConfigurationError("repository initialization requires sealed Git entrypoint control")
         repository = (
             RepositoryIdentity.from_root(configuration.repository_configuration_root)
             if configuration.repository_configuration_root is not None

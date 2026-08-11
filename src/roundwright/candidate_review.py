@@ -22,7 +22,7 @@ from typing import Iterable
 
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
-from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
+from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
@@ -418,6 +418,7 @@ def record_implementation_candidate(
     context: RecoveryContext,
     binding: WorktreeBinding,
     *,
+    git_entrypoint_control: GitEntrypointControl,
     implementation_attempt_id: str,
     completion_evidence_fingerprint: str,
     lease: TransitionLease | None,
@@ -430,7 +431,7 @@ def record_implementation_candidate(
     if dispatch is None:
         raise CandidateReviewError("implementation dispatch is unavailable")
     _require_candidate_binding(identity, binding, None)
-    seal = seal_candidate(repository, binding, lease=lease)
+    seal = seal_candidate(repository, binding, control=git_entrypoint_control, lease=lease)
     _require_candidate_binding(identity, binding, seal)
     if seal.candidate_sha == identity.base_sha:
         raise CandidateReviewError("implementation candidate requires a new local commit")

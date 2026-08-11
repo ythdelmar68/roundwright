@@ -287,7 +287,7 @@ class CandidateReviewTests(unittest.TestCase):
     def implement(self, values):
         repository, identity, lease, context, binding, now = values
         dispatch = begin_implementation(repository, identity, context, implementation_attempt_id="implementation-25", provider_attempt_id="worker-implementation", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="implementation-turn", process_lease_id="implementation-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
-        seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="3" * 64, lease=lease, now=now)
+        seal = record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="3" * 64, lease=lease, now=now)
         return dispatch, seal
 
     def review_context(self, identity, initial_context, seal):
@@ -348,6 +348,7 @@ class CandidateReviewTests(unittest.TestCase):
         )
         repair_seal = record_implementation_candidate(
             repository, identity, context, binding, implementation_attempt_id=repair.implementation_attempt_id,
+            git_entrypoint_control=self.git_control(identity, now=now),
             completion_evidence_fingerprint="d" * 64, lease=lease, now=now,
         )
         return repository, identity, lease, context, binding, now, routed.content_digest, repair_seal
@@ -900,7 +901,7 @@ class CandidateReviewTests(unittest.TestCase):
             (Path(identity.worktree) / "candidate.txt").write_text("repaired candidate\n", encoding="utf-8")
             self.git(Path(identity.worktree), "add", "candidate.txt")
             self.git(Path(identity.worktree), "commit", "-m", "fix(candidate): repair routed finding")
-            repaired_seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=repair.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
+            repaired_seal = record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=repair.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
             self.assertNotEqual(repaired_seal.candidate_sha, seal.candidate_sha)
             repaired_context = self.review_context(identity, context, repaired_seal)
             for verification in (
@@ -921,7 +922,7 @@ class CandidateReviewTests(unittest.TestCase):
             candidate.write_text("second repaired candidate\n", encoding="utf-8")
             self.git(Path(identity.worktree), "add", "candidate.txt")
             self.git(Path(identity.worktree), "commit", "-m", "fix(candidate): repair latest routed finding")
-            final_seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=repair_two.implementation_attempt_id, completion_evidence_fingerprint="e" * 64, lease=lease, now=now)
+            final_seal = record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=repair_two.implementation_attempt_id, completion_evidence_fingerprint="e" * 64, lease=lease, now=now)
             final_context = self.review_context(identity, context, final_seal)
             for verification in (
                 CandidateVerification("final-repair-tests", VerificationKind.TEST, VerificationOutcome.PASS, "f" * 64),
@@ -1126,7 +1127,7 @@ class CandidateReviewTests(unittest.TestCase):
             repository, identity, lease, context, binding, now = values
             dispatch = begin_implementation(repository, identity, context, implementation_attempt_id="implementation-base", provider_attempt_id="worker-base", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="base-turn", process_lease_id="base-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             with self.assertRaisesRegex(CandidateReviewError, "new local commit"):
-                record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
+                record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
             self.assertEqual(task_projection(repository, identity).state, "implementing")
 
     def test_second_clean_task_at_the_same_sha_cannot_alias_candidate_authority(self):

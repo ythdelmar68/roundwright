@@ -275,11 +275,9 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         evidence_fingerprint=_fingerprint("begin-implementation", identity.task_id), lease=lease,
     )
 
-    binding = _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission,
-        base_dependency_binding, DependencyStage.GITHUB_MUTATION,
-        lambda: provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, control=git_entrypoint_control, lease=lease),
-        epoch,
+    binding = provision_worktree(
+        repository, identity, default_branch="main", worktree=fixture.worktree,
+        control=git_entrypoint_control, lease=lease,
     )
     implementation = begin_implementation(
         repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
@@ -288,12 +286,10 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
         process_lease_expires_at=epoch + 60, binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
-    _execute_candidate_helper_from_factory(
-        candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, DependencyStage.GITHUB_MUTATION,
-        lambda: _commit_local_implementation(binding.worktree, source_contents), epoch,
-    )
+    _commit_local_implementation(binding.worktree, source_contents, control=git_entrypoint_control)
     seal = record_implementation_candidate(
         repository, identity, context, binding, implementation_attempt_id=implementation.implementation_attempt_id,
+        git_entrypoint_control=git_entrypoint_control,
         completion_evidence_fingerprint=_fingerprint("implementation", identity.task_id), lease=lease, now=epoch,
     )
     candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
@@ -537,7 +533,15 @@ def _gate_evidence(identity, seal, instant, runtime_binding):
     return context, TrustedGatePolicyEvidence(snapshot, receipt, StandingAuthority(frozenset(PolicyAction)), instant, ReceiptStatus.FRESH)
 
 
-def _commit_local_implementation(worktree: Path, source_contents: str) -> None:
+def _commit_local_implementation(
+    worktree: Path, source_contents: str, *, control: GitEntrypointControl,
+) -> None:
+    if type(control) is not GitEntrypointControl:
+        raise LocalSliceError("local implementation Git entrypoint control is invalid")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local implementation Git entrypoint preflight blocked execution") from error
     target = worktree / "implementation.txt"
     target.write_text(source_contents, encoding="utf-8")
     _git(worktree, "add", target.name)

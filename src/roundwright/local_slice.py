@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .candidate_review import (
+    CandidateReviewError,
     CandidateValidationControl,
     CandidateVerification,
     DiffReviewOutput,
@@ -622,11 +623,11 @@ def _materialize_validation_control(factory, admission_factory, binding, now):
 def _run_and_record_candidate_validation(validation, candidate_binding, control, repository, identity, worktree_binding, seal, verification_id, kind, lease, now):
     """Run the actual validation callback before durable PASS evidence exists."""
 
-    if not callable(validation) or type(control) is not CandidateValidationControl:
+    if not callable(validation):
         raise LocalSliceError("candidate validation is unavailable")
     try:
-        control.dependency_control.require(candidate_binding, DependencyStage.PACKAGE_BUILD, now=now)
-    except DependencyPolicyError as error:
+        control.require(candidate_binding, now=now)
+    except (CandidateReviewError, DependencyPolicyError) as error:
         raise LocalSliceError("candidate validation preflight blocked execution") from error
     evidence = validation(candidate_binding, kind)
     if not isinstance(evidence, str) or not evidence:

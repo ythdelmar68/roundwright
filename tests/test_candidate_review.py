@@ -25,6 +25,7 @@ from roundwright.candidate_review import (
     recover_diff_review,
 )
 import roundwright.candidate_review as candidate_review
+import roundwright.local_slice as local_slice
 from roundwright.configuration import RepositoryIdentity
 from roundwright.gates import _valid_review_limit_finalization
 from roundwright.runtime_binding import RuntimeBinding
@@ -92,6 +93,29 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
+    def test_local_validation_runner_rejects_replaced_controls_before_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, _, worktree_binding, now = values
+            _, seal = self.implement(values)
+            dependency_binding, _ = _validation_control(identity, seal, now)
+            wrong_binding = CandidateBinding(identity.repository_id, identity.task_id, "f" * 40)
+            wrong_control = CandidateValidationControl(
+                wrong_binding, _dispatch_control(identity, None, now, wrong_binding.candidate_sha)[1].dependency_control, now,
+            )
+            stale_control = _validation_control(identity, seal, now - 1)[1]
+            for supplied_control in (wrong_control, stale_control):
+                callbacks = []
+                with self.subTest(control_now=supplied_control.now), patch.object(local_slice, "record_candidate_verification", side_effect=AssertionError("record")) as record, patch.object(candidate_review, "candidate_evidence", side_effect=AssertionError("candidate evidence")) as evidence, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(local_slice.LocalSliceError):
+                        local_slice._run_and_record_candidate_validation(
+                            lambda binding, kind: callbacks.append((binding, kind)) or "evidence",
+                            dependency_binding, supplied_control, repository, identity, worktree_binding, seal,
+                            "validation-runner-gate", VerificationKind.TEST, lease, now,
+                        )
+                    self.assertEqual(callbacks, [])
+                    record.assert_not_called(); evidence.assert_not_called(); database.assert_not_called()
+
     def test_native_candidate_verification_control_denials_have_zero_internal_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

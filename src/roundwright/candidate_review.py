@@ -42,10 +42,17 @@ class CandidateValidationControl:
     now: int
 
     def __post_init__(self) -> None:
+        self.require(self.binding, now=self.now)
+
+    def require(self, binding: CandidateBinding, *, now: int) -> None:
         if (
-            type(self.binding) is not CandidateBinding
+            type(self) is not CandidateValidationControl
+            or type(self.binding) is not CandidateBinding
             or type(self.dependency_control) is not DependencyExecutionControl
             or type(self.now) is not int
+            or type(binding) is not CandidateBinding
+            or self.binding != binding
+            or self.now != now
         ):
             raise CandidateReviewError("candidate validation control is invalid")
         try:
@@ -475,17 +482,14 @@ def record_candidate_verification(
 
     if (
         type(dependency_binding) is not CandidateBinding
-        or type(control) is not CandidateValidationControl
-        or control.binding != dependency_binding
-        or control.now != now
         or dependency_binding.repository != identity.repository_id
         or dependency_binding.task_id != identity.task_id
         or dependency_binding.candidate_sha != seal.candidate_sha
     ):
         raise CandidateReviewError("candidate verification control is invalid")
     try:
-        control.dependency_control.require(dependency_binding, DependencyStage.PACKAGE_BUILD, now=now)
-    except DependencyPolicyError as error:
+        control.require(dependency_binding, now=now)
+    except (CandidateReviewError, DependencyPolicyError) as error:
         raise CandidateReviewError("candidate verification preflight blocked execution") from error
     value = verification.normalized()
     _require_candidate_binding(identity, binding, seal)

@@ -56,6 +56,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')

@@ -337,10 +337,10 @@ def evaluate_dependency_preflight(binding: CandidateBinding, policy: DependencyP
         return _blocked(binding, stage, DependencyDecisionCode.POLICY_UNAVAILABLE, now)
     if policy.binding != binding:
         return _blocked(binding, stage, DependencyDecisionCode.CANDIDATE_MISMATCH, now)
-    if not verify_policy_admission(policy, previous_policy):
-        return _blocked(binding, stage, DependencyDecisionCode.POLICY_TRANSITION_INVALID, now)
     if now - policy.issued_at > policy.freshness_seconds or policy.issued_at > now:
         return _blocked(binding, stage, DependencyDecisionCode.POLICY_STALE, now)
+    if not verify_policy_admission(policy, previous_policy):
+        return _blocked(binding, stage, DependencyDecisionCode.POLICY_TRANSITION_INVALID, now)
     if observations is None:
         return _blocked(binding, stage, DependencyDecisionCode.PROVENANCE_UNAVAILABLE, now)
     try:

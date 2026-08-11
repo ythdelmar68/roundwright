@@ -59,6 +59,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')
 from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
+from roundwright.dependency_policy import ComponentPolicy, DependencyComponent, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, VersionRange
 from roundwright.local_slice import LocalSliceFixture, render_local_slice_status, run_once_local_slice
 from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.state import database_path
@@ -73,11 +74,24 @@ trusted_policy_snapshot = TrustedPolicySnapshot(
 )
 trusted_review_floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
 drifted_review_floor = ReviewPolicy(2, 9, 2, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+def dependency_digest(value):
+    return 'sha256:' + value * 64
+def candidate_dependency_evidence(binding):
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, 'roundwright', VersionRange('0.0.0', '1.0.0'), 'pypi/roundwright', dependency_digest('1'), dependency_digest('2')),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, 'codex-sdk', VersionRange('1.0.0', '2.0.0'), 'registry/codex-sdk', dependency_digest('3'), dependency_digest('4')),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, 'gh', VersionRange('2.0.0', '3.0.0'), 'github/gh', dependency_digest('5'), dependency_digest('6')),
+        ComponentPolicy(DependencyComponent.BUILD_BACKEND, 'setuptools', VersionRange('69.0.0', '70.0.0'), 'pypi/setuptools', dependency_digest('7'), dependency_digest('8')),
+    )
+    policy = DependencyPolicy(binding, dependency_digest('9'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.INITIAL))
+    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 1893456000, policy.policy_digest) for item in components)
+    return policy, observations
 def run_slice(value):
     return run_once_local_slice(
         repository, value,
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=trusted_review_floor,
+        candidate_dependency_evidence=candidate_dependency_evidence,
         now=datetime(2030, 1, 1, tzinfo=timezone.utc),
     )
 commands = []
@@ -123,6 +137,15 @@ def no_credential(name, *args, **kwargs):
     return original_getenv(name, *args, **kwargs)
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
+from roundwright.dependency_policy import CandidateBinding
+blocked_policy, _ = candidate_dependency_evidence(CandidateBinding('local/repository', 'blocked-task', 'c' * 40))
+blocked_action = []
+try:
+    local_slice._execute_candidate_diff_helper(blocked_policy.binding, blocked_policy, (), lambda: blocked_action.append(True), 1893456000)
+except Exception:
+    blocked_candidate_helper = not blocked_action
+else:
+    blocked_candidate_helper = False
 try:
     run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
 except Exception:
@@ -264,6 +287,7 @@ print(json.dumps({
     'platform_normalization_matches': platform_normalization_matches,
     'leases': [leases_after_first, leases_after_replay_and_failure],
     'failure_released_lease': failure_released_lease,
+    'blocked_candidate_helper': blocked_candidate_helper,
 }))
 """ % (str(installed), str(fixture))
             environment = {"PATH": os.environ["PATH"]}
@@ -315,6 +339,7 @@ print(json.dumps({
             self.assertTrue(result["platform_normalization_matches"])
             self.assertEqual(result["leases"], [0, 0])
             self.assertTrue(result["failure_released_lease"])
+            self.assertTrue(result["blocked_candidate_helper"])
             expected_na = {"dependency-graph", "github-trace", "public-identifier", "live-proof", "external-ci"}
             self.assertEqual({row[0] for row in result["gates"]}, {
                 "plan-review", "candidate-seal", "supervisor-diff-review", "targeted-tests", "full-tests", "build",

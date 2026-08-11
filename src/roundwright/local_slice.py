@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable, Iterable
 
 from .candidate_review import (
     CandidateVerification,
@@ -29,6 +30,7 @@ from .candidate_review import (
     record_implementation_candidate,
 )
 from .configuration import RepositoryIdentity, ReviewPolicy, resolve_dispatch_configuration
+from .dependency_policy import CandidateBinding, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, execute_after_dependency_preflight
 from .gates import (
     EvidenceOutcome,
     GATE_REGISTRY,
@@ -94,6 +96,7 @@ def run_once_local_slice(
     *,
     trusted_policy_snapshot: TrustedPolicySnapshot | None = None,
     trusted_review_floor: ReviewPolicy | None = None,
+    candidate_dependency_evidence: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
     now: datetime | None = None,
 ) -> LocalSliceResult:
     """Drive one local task to ready-for-owner, or return its exact completed replay.
@@ -142,7 +145,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -167,7 +170,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, candidate_dependency_evidence):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -268,13 +271,23 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         policy_fingerprint=context.policy_fingerprint, deployment_fingerprint=context.deployment_fingerprint,
         runtime_binding=runtime_binding,
     )
-    diff_review = dispatch_diff_review(
-        repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
-        diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
-        provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
-        external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
-        process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1,
-        review_round=1, lease=lease, now=epoch,
+    candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
+    if not callable(candidate_dependency_evidence):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        dependency_policy, dependency_observations = candidate_dependency_evidence(candidate_binding)
+    except (DependencyPolicyError, TypeError, ValueError) as error:
+        raise LocalSliceError("candidate dependency evidence is unavailable") from error
+    diff_review = _execute_candidate_diff_helper(
+        candidate_binding, dependency_policy, dependency_observations,
+        lambda: dispatch_diff_review(
+            repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
+            diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
+            provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
+            external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
+            process_lease_id="local-diff-review-lease", process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], within_round_attempt=1,
+            review_round=1, lease=lease, now=epoch,
+        ), epoch,
     )
     record_diff_review(
         repository, identity, candidate_context, binding, seal, diff_review_attempt_id=diff_review.diff_review_attempt_id,
@@ -486,6 +499,23 @@ def _commit_local_implementation(worktree: Path, source_contents: str) -> None:
     target.write_text(source_contents, encoding="utf-8")
     _git(worktree, "add", target.name)
     _git(worktree, "commit", "-m", "feat(local-slice): record hermetic implementation")
+
+
+def _execute_candidate_diff_helper(
+    binding: CandidateBinding,
+    policy: DependencyPolicy | None,
+    observations: Iterable[ObservedDependency] | None,
+    action: Callable[[], object],
+    now: int,
+) -> object:
+    """Canonical candidate-bound provider helper boundary for the local slice."""
+
+    try:
+        return execute_after_dependency_preflight(
+            binding, policy, observations, DependencyStage.DISPATCH, now=now, action=action,
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
 
 
 def _git(directory: Path, *arguments: str) -> str:

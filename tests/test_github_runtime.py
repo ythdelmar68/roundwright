@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from uuid import UUID
 
 from roundwright.deployment import (
@@ -764,6 +765,89 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertEqual(reads.calls, 0)
                 self.assertEqual(mutations.calls, 0)
                 self.assertFalse(journal_path.exists())
+
+    def test_owner_broker_control_precedes_direct_and_existing_journal_reconciliation(self) -> None:
+        """Reconcile needs the same owner control without re-resolving it on submit."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "broker-reconcile-control-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+
+        class CountingReadChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_read(self, _: GitHubReadRequest) -> object:
+                self.calls += 1
+                raise AssertionError("denied reconciliation reached readback IPC")
+
+            def exchange_collection_page(self, _: GitHubReadRequest, __: str | None) -> object:
+                self.calls += 1
+                raise AssertionError("denied reconciliation reached paginated readback IPC")
+
+        class CountingMutationChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_mutation(self, _: OwnerMutationIpcMessage) -> object:
+                self.calls += 1
+                raise AssertionError("denied reconciliation reached mutation IPC")
+
+        class StaticControls:
+            def __init__(self, control: object | None) -> None:
+                self.control = control
+                self.calls = 0
+
+            def resolve(self, _: GitHubMutationIntent) -> object | None:
+                self.calls += 1
+                return self.control
+
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        denied_controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_broker_control(intent, binding=CandidateBinding("other/repository", "7" * 64, SHA)),
+            owner_broker_control(intent, binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
+            owner_broker_control(intent, binding=CandidateBinding(REPOSITORY.slug, "7" * 64, "f" * 40)),
+            owner_broker_control(replace(intent, idempotency_key="other-intent-46")),
+            owner_broker_control(intent, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_broker_control(intent, now=NOW - timedelta(seconds=1)),
+        )
+        for control in denied_controls:
+            with self.subTest(route="direct", control_type=type(control).__name__), tempfile.TemporaryDirectory() as directory:
+                reads, mutations, controls = CountingReadChannel(), CountingMutationChannel(), StaticControls(control)
+                journal = DurableMutationJournal(Path(directory) / "journal.json")
+                broker = GitHubMutationBroker.with_owner_transport(
+                    OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                    journal=journal, binding=owner_broker_binding(), controls=controls, clock=lambda: NOW,
+                )
+                with mock.patch.object(DurableMutationJournal, "find_recovery", side_effect=AssertionError("denied reconciliation loaded journal")):
+                    result = broker.reconcile(intent, allowed_context())
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(controls.calls, 1)
+                self.assertEqual(reads.calls, 0)
+                self.assertEqual(mutations.calls, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = allowed_context()
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            entry = MutationJournalEntry.from_evidence(
+                intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
+            )
+            journal.claim(entry)
+            reads, mutations = CountingReadChannel(), CountingMutationChannel()
+            controls = StaticControls(owner_broker_control(intent))
+            broker = GitHubMutationBroker.with_owner_transport(
+                OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                journal=journal, binding=owner_broker_binding(), controls=controls, clock=lambda: NOW,
+            )
+            result = broker.submit(intent, context)
+            self.assertFalse(result.ok)
+            self.assertEqual(controls.calls, 1)
+            self.assertEqual(reads.calls, 0)
+            self.assertEqual(mutations.calls, 0)
 
     def test_created_resource_locator_is_total_and_canonical(self) -> None:
         pull_request = CreatedResourceLocator(

@@ -2638,6 +2638,29 @@ class _OwnerBrokerMutationControlRegistry(Protocol):
     def resolve(self, intent: GitHubMutationIntent) -> _OwnerGitHubBrokerMutationControl | None: ...
 
 
+@dataclass(frozen=True)
+class _OwnerBrokerMutationAuthorization:
+    """Private proof that the owner control was resolved once for this route."""
+
+    intent_identity: str
+    binding: CandidateBinding
+    now: int
+
+    def matches(self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime) -> bool:
+        return (
+            type(self) is _OwnerBrokerMutationAuthorization
+            and type(intent) is GitHubMutationIntent
+            and type(context) is MutationBrokerContext
+            and type(now) is datetime
+            and now.tzinfo is timezone.utc
+            and self.now == int(now.timestamp())
+            and self.intent_identity == intent.identity()
+            and self.binding.repository == intent.repository.slug == context.repository.slug
+            and self.binding.task_id == context.mutation_context.task_fingerprint
+            and self.binding.candidate_sha == context.candidate_sha
+        )
+
+
 class _GhBrokerExecutor:
     """Private credential-owning seam; only broker construction creates it."""
 
@@ -2662,13 +2685,16 @@ class _GhBrokerExecutor:
     def requires_owner_dependency_control(self) -> bool:
         return self.__controls is not None
 
-    def require_dependency(self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime) -> None:
+    def require_dependency(
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime,
+    ) -> _OwnerBrokerMutationAuthorization:
         if self.__controls is None or self.__binding is None:
             raise GitHubRuntimeError("owner broker dependency control is unavailable")
         control = self.__controls.resolve(intent)
         if type(control) is not _OwnerGitHubBrokerMutationControl:
             raise GitHubRuntimeError("owner broker dependency control is unavailable")
         control.require(intent, context, self.__binding, now=now)
+        return _OwnerBrokerMutationAuthorization(intent.identity(), self.__binding, int(now.timestamp()))
 
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
@@ -2831,8 +2857,7 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
             now = self._now(context)
-            if self.__executor is not None and self.__executor.requires_owner_dependency_control:
-                self.__executor.require_dependency(intent, context, now=now)
+            owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
         except (AttributeError, KeyError, TypeError, ValueError, GitHubRuntimeError):
             return BrokerMutationResult(failure=GitHubFailure(
                 GitHubFailureKind.POLICY_DENIED, intent.operation,
@@ -2882,7 +2907,10 @@ class GitHubMutationBroker:
             except (AttributeError, TypeError, ValueError):
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if not created:
-                return self._reconcile_journal(intent, context, bundle, plan, evidence, journal_entry)
+                return self._reconcile_journal(
+                    intent, context, bundle, plan, evidence, journal_entry,
+                    owner_authorization=owner_authorization,
+                )
         if intent.operation in {
             GitHubMutationOperation.CREATE_PULL_REQUEST,
             GitHubMutationOperation.COMMENT,
@@ -3045,15 +3073,28 @@ class GitHubMutationBroker:
             self.__checkpoint_observer(persisted)
         return persisted
 
+    def _owner_dependency_preflight(
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime,
+    ) -> _OwnerBrokerMutationAuthorization | None:
+        if self.__executor is None or not self.__executor.requires_owner_dependency_control:
+            return None
+        return self.__executor.require_dependency(intent, context, now=now)
+
     def _reconcile_journal(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext,
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
         evidence: MutationJournalEntry, entry: MutationJournalEntry,
+        *, owner_authorization: _OwnerBrokerMutationAuthorization | None = None,
     ) -> BrokerMutationResult:
         """Resolve a durable uncertain state only from broker-owned read-back."""
 
         try:
             now = self._now(context)
+            if self.__executor is not None and self.__executor.requires_owner_dependency_control:
+                if type(owner_authorization) is not _OwnerBrokerMutationAuthorization:
+                    owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
+                if not owner_authorization.matches(intent, context, now=now):
+                    raise GitHubRuntimeError("owner broker dependency authorization is invalid")
             evaluated_at = datetime.fromisoformat(entry.evaluated_at)
             fresh_until = datetime.fromisoformat(entry.fresh_until)
         except (TypeError, ValueError, GitHubRuntimeError):
@@ -3143,12 +3184,13 @@ class GitHubMutationBroker:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
             now = self._now(context)
+            owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
             plan = _broker_semantic_plan(intent)
             self._require_capabilities(intent, plan, now)
             bound_health = self.__health if not self.__clock_is_default else None
             bundle = schema_v2_authorization_bundle(context, now=now, health=bound_health)
             failure = _authorize(intent, context, now=now, health=bound_health)
-        except (AttributeError, KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError, GitHubRuntimeError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
@@ -3180,7 +3222,10 @@ class GitHubMutationBroker:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if entry is None:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is missing"))
-            return self._reconcile_journal(intent, context, bundle, plan, entry, entry)
+            return self._reconcile_journal(
+                intent, context, bundle, plan, entry, entry,
+                owner_authorization=owner_authorization,
+            )
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
         if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)

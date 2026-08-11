@@ -39,6 +39,7 @@ from roundwright.github_runtime import (
     _GhCommandResult as GhCommandResult,
     DurableMutationJournal,
     _OwnerGitHubReadHostEndpoint as _OwnerGitHubReadHostEndpoint,
+    _OwnerGitHubReadControl as _OwnerGitHubReadControl,
     GhMutationPayload,
     GitHubCapabilityHealth,
     GitHubMutationBroker,
@@ -100,7 +101,12 @@ def GhGitHubAdapter(
 ) -> _OwnerGitHubReadHostEndpoint:
     """Construct the credentialed host only with a hermetic owner clock."""
 
-    return _OwnerGitHubReadHostEndpoint(runner, matrix, clock=clock)
+    try:
+        observed_at = clock()
+    except Exception:
+        observed_at = NOW
+    control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
+    return _OwnerGitHubReadHostEndpoint(runner, owner_read_control(now=control_now), matrix, clock=clock)
 
 
 class Runner:
@@ -111,6 +117,31 @@ class Runner:
     def run(self, arguments: tuple[str, ...]) -> GhCommandResult:
         self.calls.append(arguments)
         return self.results.pop(0)
+
+
+def owner_read_control(
+    *, binding: CandidateBinding | None = None, now: datetime = NOW,
+) -> _OwnerGitHubReadControl:
+    """Build only test-owned sealed read evidence; role clients never receive it."""
+
+    digest = lambda value: "sha256:" + value * 64
+    candidate_binding = binding or CandidateBinding(REPOSITORY.slug, "github-read-host", SHA)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
+    )
+    policy = DependencyPolicy(candidate_binding, digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b"))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(
+        ObservedDependency(candidate_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), policy.policy_digest)
+        for item in components
+    )
+    return _OwnerGitHubReadControl(
+        candidate_binding,
+        DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(candidate_binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))),
+        int(now.timestamp()),
+    )
 
 
 class OwnerTransport:
@@ -922,6 +953,30 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertEqual(result.failure.kind, GitHubFailureKind.STALE_RESPONSE)  # type: ignore[union-attr]
                 self.assertEqual(runner.calls, [])
+
+    def test_credentialed_read_host_control_denials_precede_runner_and_host_actions(self) -> None:
+        """Missing, replaced, and stale sealed controls cannot start a host read."""
+
+        matrix = health(GitHubReadOperation.REVIEWS)
+        request = reviews_request()
+        runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
+        with self.assertRaises(ValueError):
+            _OwnerGitHubReadHostEndpoint(runner, None, matrix, clock=lambda: NOW)  # type: ignore[arg-type]
+        self.assertEqual(runner.calls, [])
+        controls = (
+            owner_read_control(binding=CandidateBinding("other/repository", "github-read-host", SHA)),
+            owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "github-read-host", "f" * 40)),
+            owner_read_control(now=NOW - timedelta(seconds=1)),
+        )
+        for control in controls:
+            with self.subTest(binding=control.binding, control_now=control.now):
+                runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
+                endpoint = _OwnerGitHubReadHostEndpoint(runner, control, matrix, clock=lambda: NOW)
+                result = endpoint.read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(endpoint.calls, [])
 
     def test_mutation_host_rejects_pre_evaluated_and_expired_seals_before_execution(self) -> None:
         """Host execution is valid only in [evaluated_at, fresh_until)."""

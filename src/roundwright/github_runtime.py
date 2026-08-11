@@ -556,6 +556,48 @@ class OwnerGitHubReadIpcClient:
         ))
 
 
+@dataclass(frozen=True)
+class _OwnerGitHubReadControl:
+    """Owner-host-only sealed dependency authority for credentialed reads."""
+
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise GitHubRuntimeError("owner read dependency control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_READ, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner read dependency control is invalid") from error
+
+    def require(self, request: GitHubReadRequest, *, now: datetime) -> None:
+        if (
+            type(self) is not _OwnerGitHubReadControl
+            or type(request) is not GitHubReadRequest
+            or type(now) is not datetime
+            or now.tzinfo is not timezone.utc
+            or self.now != int(now.timestamp())
+            or self.binding.repository != request.repository.slug
+        ):
+            raise GitHubRuntimeError("owner read dependency control is invalid")
+        if (
+            request.expected_sha is not None
+            and request.operation not in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
+            and request.expected_sha != self.binding.candidate_sha
+        ):
+            raise GitHubRuntimeError("owner read dependency control does not match the requested candidate")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_READ, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner read dependency control is stale") from error
+
+
 class _OwnerGitHubReadHostEndpoint:
     """``gh api`` adapter with explicit health gating and no mutation fallback.
 
@@ -568,12 +610,14 @@ class _OwnerGitHubReadHostEndpoint:
     """
 
     def __init__(
-        self, runner: _FixedGhReadRunner, health: GitHubCapabilityHealth | None = None,
+        self, runner: _FixedGhReadRunner, control: _OwnerGitHubReadControl,
+        health: GitHubCapabilityHealth | None = None,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if not hasattr(runner, "run") or clock is None:
+        if not hasattr(runner, "run") or type(control) is not _OwnerGitHubReadControl or clock is None:
             raise GitHubRuntimeError("gh runner is invalid")
         self.__runner = runner
+        self.__control = control
         self._health = health or unavailable_capability_health()
         self.__clock = clock
         self.calls: list[tuple[str, str]] = []
@@ -582,24 +626,31 @@ class _OwnerGitHubReadHostEndpoint:
     def health(self) -> GitHubCapabilityHealth:
         return self._health
 
-    def _fresh_failure(self, operation: GitHubReadOperation) -> GitHubFailure | None:
+    def _fresh_failure(self, request: GitHubReadRequest) -> GitHubFailure | None:
         """Read-host evidence is valid only at one owner-clock observation."""
 
         try:
             now = self.__clock()
         except Exception:
-            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "owner read clock is unavailable")
+            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, request.operation, "owner read clock is unavailable")
         if type(now) is not datetime or now.tzinfo is not timezone.utc:
-            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "owner read clock is invalid")
-        return _health_failure(operation, self._health, now=now)
+            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, request.operation, "owner read clock is invalid")
+        health_failure = _health_failure(request.operation, self._health, now=now)
+        if health_failure is not None:
+            return health_failure
+        try:
+            self.__control.require(request, now=now)
+        except (DependencyPolicyError, GitHubRuntimeError, ValueError):
+            return GitHubFailure(GitHubFailureKind.POLICY_DENIED, request.operation, "owner read dependency preflight blocked execution")
+        return None
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
         if type(request) is not GitHubReadRequest:
             raise GitHubContractError("read request is invalid")
-        self.calls.append(("read", request.operation.value))
-        blocked = self._fresh_failure(request.operation)
+        blocked = self._fresh_failure(request)
         if blocked is not None:
             return GitHubReadResult(request, failure=blocked)
+        self.calls.append(("read", request.operation.value))
         if request.operation is GitHubReadOperation.REPOSITORY:
             return self._read_repository(request)
         if request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
@@ -888,9 +939,9 @@ class _OwnerGitHubReadHostEndpoint:
             return None
         if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
             return None
-        self.calls.append(("collection-read", request.operation.value))
-        if self._fresh_failure(request.operation) is not None:
+        if self._fresh_failure(request) is not None:
             return None
+        self.calls.append(("collection-read", request.operation.value))
         command = (
             _requested_reviewers_collection_command(request, cursor)
             if request.operation is GitHubReadOperation.REQUESTED_REVIEWERS

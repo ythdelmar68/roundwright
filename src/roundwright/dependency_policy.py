@@ -33,6 +33,7 @@ class DependencyComponent(StrEnum):
 
 class DependencyStage(StrEnum):
     DISPATCH = "dispatch"
+    GITHUB_READ = "github-read"
     GITHUB_MUTATION = "github-mutation"
     PACKAGE_BUILD = "package-build"
     PROVIDER_QUALIFICATION = "provider-qualification"
@@ -77,6 +78,7 @@ _CANONICAL_STAGE_REQUIREMENTS: dict[DependencyStage, tuple[DependencyComponent, 
         DependencyComponent.GITHUB_CLI,
         DependencyComponent.BUILD_BACKEND,
     ),
+    DependencyStage.GITHUB_READ: (DependencyComponent.PACKAGE, DependencyComponent.GITHUB_CLI),
     DependencyStage.GITHUB_MUTATION: (DependencyComponent.PACKAGE, DependencyComponent.GITHUB_CLI),
     DependencyStage.PACKAGE_BUILD: (DependencyComponent.PACKAGE, DependencyComponent.BUILD_BACKEND),
     DependencyStage.PROVIDER_QUALIFICATION: (DependencyComponent.PACKAGE, DependencyComponent.PROVIDER_RUNTIME),

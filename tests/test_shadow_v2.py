@@ -58,6 +58,7 @@ from roundwright.shadow import (
     VerifiedProvenanceSelection,
     VerifiedDurableProvenanceRecord,
     VerifiedProvenanceRecordStore,
+    VerifiedCaptureReadinessReceipt,
     VerifiedValidationToolchainProjection,
     NamedContentIdentity,
     AcceptedResultReference,
@@ -67,9 +68,12 @@ from roundwright.shadow import (
     verify_selection_for_durable_record,
     materialize_verified_provenance_record,
     _materialize_provenance_record,
+    _export_legacy_provenance_decision,
     replay_shadow_case,
     replay_shadow_v2_case,
     require_capture_readiness,
+    _require_legacy_capture_readiness,
+    require_verified_provenance_capture_readiness,
     shadow_evidence_profile,
     shadow_evidence_profiles,
 )
@@ -81,6 +85,13 @@ def digest(value: str) -> str:
 
 class ShadowV2Tests(unittest.TestCase):
     def external_control_bytes(self):
+        recorder_digest = digest("6")
+        store_identity = "sha256:" + hashlib.sha256(json.dumps({
+            "run_id": "ab8aea71a95647bdbe1e00e9d915d557", "contract_id": "contract-47",
+            "candidate_sha": "b" * 40,
+            "profile": "roundwright-shadow-profile/provenance-decision/v1",
+            "recorder_binding_digest": recorder_digest,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         payload = {
             "schema": "roundwright-provenance-selection-control/v1", "control_mode": "REHEARSAL", "capture_ready": False,
             "roundlet": {"run_id": "ab8aea71a95647bdbe1e00e9d915d557", "contract_id": "contract-47", "orchestrator_task": "orchestrator-47"},
@@ -90,7 +101,7 @@ class ShadowV2Tests(unittest.TestCase):
         content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         receipt = {"schema": "roundwright-provenance-selection-control-receipt/v1", "append_only": True, "capture_ready": False, "contract_sha256": digest("1"), "control_mode": "REHEARSAL", "payload_bytes": len(content), "payload_sha256": "sha256:" + hashlib.sha256(content).hexdigest(), "read_back": "VERIFIED", "retention_identity": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/rehearsal-" + "b" * 40}
         receipt_bytes = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
-        expected = ExternalSelectionControlExpectation("ab8aea71a95647bdbe1e00e9d915d557", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")), (3, "node-3", digest("5"))))
+        expected = ExternalSelectionControlExpectation("ab8aea71a95647bdbe1e00e9d915d557", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")), (3, "node-3", digest("5"))), store_identity, "append-only-content-addressed-readback", recorder_digest)
         return content, receipt_bytes, expected
 
     def test_external_rehearsal_control_is_bound_but_never_terminal_ready(self) -> None:
@@ -243,9 +254,13 @@ class ShadowV2Tests(unittest.TestCase):
         value["validation_toolchain"] = validation.public_payload()
         value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "normalized_version": git.normalized_version, "reported_version": git.reported_version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}}
         value["dependency_control"] = {"binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency.policy.core_fingerprint, "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in sorted(dependency.observations, key=lambda item: item.component.value)], "admission": {"policy_fingerprint": dependency.admission.policy_fingerprint, "receipt_digest": dependency.admission.receipt_digest, "reviewer_identity": dependency.admission.reviewer_identity, "authority_digest": dependency.admission.authority_digest}}
-        value["public_safe_projection"] = {"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot", "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint, "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git.observation_fingerprint}
+        recorder_digest = "sha256:" + hashlib.sha256(json.dumps({"harness_merge": "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "recorder_content": "87094a4e780c692a00135421840c0e6713af5d35", "harness_tree": "0c594caa275262164fce1942ebd2142abe0e77bb"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        store_identity = "sha256:" + hashlib.sha256(json.dumps({"run_id": "ab8aea71a95647bdbe1e00e9d915d557", "contract_id": "contract-47", "candidate_sha": binding.candidate_sha, "profile": "roundwright-shadow-profile/provenance-decision/v1", "recorder_binding_digest": recorder_digest}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        value["recorder_store"] = {"profile": "roundwright-shadow-profile/provenance-decision/v1", "candidate_sha": binding.candidate_sha, "recorder_binding_digest": recorder_digest, "store_identity": store_identity, "retention_contract": "append-only-content-addressed-readback"}
+        value["public_safe_projection"] = {"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot", "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint, "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git.observation_fingerprint, "recorder_store_fingerprint": "sha256:" + hashlib.sha256(json.dumps(value["recorder_store"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
         if mutate is not None:
             mutate(value)
+            value["public_safe_projection"]["recorder_store_fingerprint"] = "sha256:" + hashlib.sha256(json.dumps(value["recorder_store"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         value["authority"]["live_leaf"]["number"] = leaf
         payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         receipt_value = json.loads(receipt)
@@ -253,7 +268,7 @@ class ShadowV2Tests(unittest.TestCase):
         if receipt_mutate is not None:
             receipt_mutate(receipt_value)
         receipt = json.dumps(receipt_value, sort_keys=True, separators=(",", ":")).encode()
-        expected = replace(expected, leaf=leaf, candidate_sha=candidate, live_leaf=(1, "node-47", leaf, "now", digest("3")), payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
+        expected = replace(expected, leaf=leaf, candidate_sha=candidate, live_leaf=(1, "node-47", leaf, "now", digest("3")), recorder_store_identity=store_identity, recorder_binding_digest=recorder_digest, payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
         return ExternalSelectionControl.load(payload, receipt, expected), validation, artifacts, git_control, git, dependency
 
     def test_final_reconciliation_derives_all_fingerprints_from_verified_inputs(self) -> None:
@@ -264,6 +279,7 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(selection.contract_digest, control.contract_digest)
         self.assertEqual(selection.validation_fingerprint, validation.projection_fingerprint)
         self.assertEqual(selection.git_fingerprint, git.observation_fingerprint)
+        self.assertEqual(selection.recorder_store_fingerprint, "sha256:" + hashlib.sha256(json.dumps(json.loads(control.payload)["recorder_store"], sort_keys=True, separators=(",", ":")).encode()).hexdigest())
         selection.verify_reconciliation()
         verify_selection_for_durable_record(control, selection)
         with self.assertRaises(TypeError):
@@ -281,6 +297,11 @@ class ShadowV2Tests(unittest.TestCase):
             ExternalSelectionControl()
         with self.assertRaises(ProvenanceRecordError):
             reconcile_final_provenance_selection(object.__new__(ExternalSelectionControl), **arguments)
+        with self.assertRaises(ProvenanceRecordError):
+            ExternalSelectionControl.load(
+                control.payload, control.receipt,
+                replace(control.expected, recorder_store_identity="not-a-content-digest"),
+            )
         for invalid in (
             lambda: (self.final_reconciliation_fixture(lambda value: value.update(control_contract_digest=digest("9")))[0], arguments),
             lambda: (control, {**arguments, "git_observation": replace(git, executable_digest=digest("9"), observation_fingerprint="")}),
@@ -289,6 +310,9 @@ class ShadowV2Tests(unittest.TestCase):
             lambda: (control, {**arguments, "git_observation": replace(git, reported_version="2.53.0.windows.4", observation_fingerprint="")}),
             lambda: (control, {**arguments, "artifacts": replace(artifacts, package_digest=digest("9"), projection_fingerprint="")}),
             lambda: (self.final_reconciliation_fixture(lambda value: value["selection"].update(gate="another-gate"))[0], arguments),
+            lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(store_identity=digest("9")))[0], arguments),
+            lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(retention_contract="other-contract"))[0], arguments),
+            lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(recorder_binding_digest=digest("a")))[0], arguments),
         ):
             invalid_control, invalid_arguments = invalid()
             with self.subTest(invalid=invalid):
@@ -781,6 +805,83 @@ class ShadowV2Tests(unittest.TestCase):
             with self.assertRaises(ProvenanceRecordError):
                 store.read_back(record.candidate_sha, record.record_digest)
 
+    def verified_readback_fixture(self):
+        record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
+        authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        temporary = TemporaryDirectory()
+        store = VerifiedProvenanceRecordStore(Path(temporary.name), record.retention_identity)
+        store.append(record, **authority)
+        return temporary, store, store.read_back(record.candidate_sha, record.record_digest), record, authority
+
+    @staticmethod
+    def export_authority(authority):
+        return {name: value for name, value in authority.items() if name != "now"}
+
+    def test_verified_terminal_export_and_readiness_require_readback_authority(self) -> None:
+        temporary, store, read_back, record, authority = self.verified_readback_fixture()
+        self.addCleanup(temporary.cleanup)
+        export_authority = self.export_authority(authority)
+        decision = export_provenance_decision(store, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
+        self.assertEqual((decision.candidate_sha, decision.ready_at), ("b" * 40, 101))
+        self.assertEqual(tuple(item.kind for item in decision.artifacts), (
+            "candidate-source", "candidate-package", "installed-roundwright-entrypoint",
+            "reviewed-git-artifact", "reviewed-git-executable",
+        ))
+        readiness = require_verified_provenance_capture_readiness(
+            shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
+            RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+            candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=101, **export_authority,
+        )
+        self.assertIs(type(readiness), VerifiedCaptureReadinessReceipt)
+        self.assertEqual(readiness.durable_record_digest, record.record_digest)
+        self.assertEqual(readiness.ready_at, 101)
+        self.assertEqual(readiness.evidence_store_identity, authority["loaded_control"].expected.recorder_store_identity)
+        readiness.verify()
+        readiness.verify_against(
+            store, recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+            **export_authority,
+        )
+        with self.assertRaises(TypeError):
+            VerifiedCaptureReadinessReceipt()
+        with self.assertRaises(ShadowV2Error):
+            require_capture_readiness(
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), self.record(),
+                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                AppendOnlyEvidenceStore("fixture-store"), candidate_sha=record.candidate_sha, ready_at=101,
+            )
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(record, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(read_back, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
+        with self.assertRaises(ProvenanceRecordError):
+            require_verified_provenance_capture_readiness(
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
+                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=102, **export_authority,
+            )
+        with self.assertRaises(ShadowV2Error):
+            require_verified_provenance_capture_readiness(
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
+                RecorderBinding("0" * 40, "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=101, **export_authority,
+            )
+
+    def test_verified_terminal_export_denies_legacy_moved_and_tampered_inputs(self) -> None:
+        temporary, store, read_back, record, authority = self.verified_readback_fixture()
+        self.addCleanup(temporary.cleanup)
+        export_authority = self.export_authority(authority)
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(self.record(), candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
+        moved_control, moved_validation, moved_artifacts, moved_git_control, moved_git, moved_dependency = self.final_reconciliation_fixture(candidate="c" * 40)
+        moved_selection = reconcile_final_provenance_selection(moved_control, validation=moved_validation, artifacts=moved_artifacts, git_control=moved_git_control, git_observation=moved_git, dependency_control=moved_dependency, now=101)
+        moved_authority = {"loaded_control": moved_control, "selection": moved_selection, "validation": moved_validation, "artifacts": moved_artifacts, "git_control": moved_git_control, "git_observation": moved_git, "dependency_control": moved_dependency}
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(store, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **moved_authority)
+        self.assertEqual(export_provenance_decision(store, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority).ready_at, 101)
+        object.__setattr__(read_back, "payload", b"{}")
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(read_back, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
+
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)
         return _materialize_provenance_record(
@@ -795,11 +896,11 @@ class ShadowV2Tests(unittest.TestCase):
         )
 
     def decision(self, *, candidate: str = "b" * 40, ready_at: int = 101):
-        return export_provenance_decision(self.record(candidate=candidate, ready_at=ready_at))
+        return _export_legacy_provenance_decision(self.record(candidate=candidate, ready_at=ready_at))
 
     def case(self, *, candidate: str = "b" * 40, ready_at: int = 101) -> ShadowV2Case:
         decision = self.decision(candidate=candidate, ready_at=ready_at)
-        readiness = require_capture_readiness(
+        readiness = _require_legacy_capture_readiness(
             shadow_evidence_profile(PROVENANCE_DECISION_PROFILE),
             self.record(candidate=candidate, ready_at=ready_at),
             RecorderBinding(
@@ -854,7 +955,7 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(compare_provenance_decision(decision, decision, ready_at=101), ComparisonOutcome.MATCH)
         self.assertEqual(compare_provenance_decision(decision, decision, ready_at=102), ComparisonOutcome.INVALID)
         with self.assertRaises(ShadowV2Error):
-            require_capture_readiness(
+            _require_legacy_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), self.record(),
                 RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
                 AppendOnlyEvidenceStore("roundlet-provenance-retention"),
@@ -864,7 +965,7 @@ class ShadowV2Tests(unittest.TestCase):
     def test_terminal_export_requires_durable_record_and_store_readback_rejects_tampering(self) -> None:
         record = self.record()
         with self.assertRaises(ProvenanceRecordError):
-            export_provenance_decision(record.decision)
+            _export_legacy_provenance_decision(record.decision)
         with TemporaryDirectory() as temporary:
             store = ProvenanceRecordStore(Path(temporary), "roundlet-provenance-records")
             digest = store.append(record)
@@ -937,7 +1038,7 @@ class ShadowV2Tests(unittest.TestCase):
     def lifecycle_case(self, graph: ShadowV2EventGraph | None = None, *, profile: ShadowEvidenceProfile | None = None) -> ShadowV2Case:
         decision = self.decision()
         profile = self.lifecycle_profile() if profile is None else profile
-        readiness = require_capture_readiness(
+        readiness = _require_legacy_capture_readiness(
             profile, decision,
             RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
             AppendOnlyEvidenceStore("roundlet-provenance-retention"), candidate_sha="b" * 40, ready_at=101,

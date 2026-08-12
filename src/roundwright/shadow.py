@@ -1153,6 +1153,9 @@ class ExternalSelectionControlExpectation:
     authority_block_digest: str
     live_leaf: tuple[object, ...]
     owner_instructions: tuple[tuple[object, ...], ...]
+    recorder_store_identity: str
+    recorder_store_contract: str
+    recorder_binding_digest: str
 
 
 @dataclass(frozen=True, init=False)
@@ -1202,6 +1205,12 @@ class ExternalSelectionControl:
     def load(cls, payload_bytes: bytes, receipt_bytes: bytes, expected: ExternalSelectionControlExpectation) -> "ExternalSelectionControl":
         if type(payload_bytes) is not bytes or type(receipt_bytes) is not bytes or type(expected) is not ExternalSelectionControlExpectation:
             raise ProvenanceRecordError("external selection control is invalid")
+        if (
+            not _is_v2_digest(expected.recorder_store_identity)
+            or expected.recorder_store_contract != "append-only-content-addressed-readback"
+            or not _is_v2_digest(expected.recorder_binding_digest)
+        ):
+            raise ProvenanceRecordError("external recorder store expectation is invalid")
         payload = _strict_json_object(payload_bytes, "external selection control")
         receipt = _strict_json_object(receipt_bytes, "external selection control receipt")
         digest = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
@@ -1467,6 +1476,7 @@ class VerifiedProvenanceSelection:
     validation_fingerprint: str
     git_fingerprint: str
     control_fingerprint: str
+    recorder_store_fingerprint: str
     selection_fingerprint: str
     external_load_fingerprint: str
     _loaded_control: ExternalSelectionControl
@@ -1481,6 +1491,7 @@ class VerifiedProvenanceSelection:
         cls, *, payload_digest: str, receipt_digest: str, contract_digest: str,
         retention_identity: str, selection_at: int, candidate_fingerprint: str,
         validation_fingerprint: str, git_fingerprint: str, control_fingerprint: str,
+        recorder_store_fingerprint: str,
         loaded_control: ExternalSelectionControl,
     ) -> "VerifiedProvenanceSelection":
         value = object.__new__(cls)
@@ -1494,6 +1505,7 @@ class VerifiedProvenanceSelection:
             "validation_fingerprint": validation_fingerprint,
             "git_fingerprint": git_fingerprint,
             "control_fingerprint": control_fingerprint,
+            "recorder_store_fingerprint": recorder_store_fingerprint,
         }.items():
             object.__setattr__(value, name, item)
         value._validate()
@@ -1513,6 +1525,7 @@ class VerifiedProvenanceSelection:
                 self.payload_digest, self.receipt_digest, self.contract_digest,
                 self.candidate_fingerprint, self.validation_fingerprint,
                 self.git_fingerprint, self.control_fingerprint,
+                self.recorder_store_fingerprint,
             ))
             or not _safe_roundlet_retention_identity(self.retention_identity)
             or type(self.selection_at) is not int
@@ -1547,6 +1560,7 @@ class VerifiedProvenanceSelection:
             "validation_fingerprint": self.validation_fingerprint,
             "git_fingerprint": self.git_fingerprint,
             "control_fingerprint": self.control_fingerprint,
+            "recorder_store_fingerprint": self.recorder_store_fingerprint,
         }
 
 
@@ -1647,7 +1661,7 @@ def reconcile_final_provenance_selection(
     if set(payload) != {
         "schema", "control_mode", "capture_ready", "roundlet", "selection", "authority",
         "control_contract_digest", "freshness", "validation_toolchain", "artifacts",
-        "dependency_control", "public_safe_projection",
+        "dependency_control", "recorder_store", "public_safe_projection",
     }:
         raise ProvenanceRecordError("final provenance selection is incomplete")
     repository = selection["repository"]
@@ -1745,6 +1759,15 @@ def reconcile_final_provenance_selection(
     }
     if payload.get("dependency_control") != expected_dependency:
         raise ProvenanceRecordError("dependency projection does not match")
+    recorder_store = payload.get("recorder_store")
+    expected_recorder_store = {
+        "profile": PROVENANCE_DECISION_PROFILE, "candidate_sha": candidate_sha,
+        "recorder_binding_digest": control.expected.recorder_binding_digest,
+        "store_identity": control.expected.recorder_store_identity,
+        "retention_contract": control.expected.recorder_store_contract,
+    }
+    if recorder_store != expected_recorder_store:
+        raise ProvenanceRecordError("recorder store selection does not match")
     candidate_fingerprint = _v2_digest({
         "repository": repository, "task_id": task_id, "base_sha": base_sha,
         "candidate_sha": candidate_sha, "candidate_tree": candidate_tree,
@@ -1758,6 +1781,7 @@ def reconcile_final_provenance_selection(
         "gate": selection["gate"], "blocker": selection["blocker"], "next_action": selection["next_action"],
         "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint,
         "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git_observation.observation_fingerprint,
+        "recorder_store_fingerprint": _v2_digest(recorder_store),
     }
     if payload.get("public_safe_projection") != expected_public:
         raise ProvenanceRecordError("public-safe selection projection does not match")
@@ -1773,6 +1797,7 @@ def reconcile_final_provenance_selection(
         validation_fingerprint=validation.projection_fingerprint,
         git_fingerprint=git_observation.observation_fingerprint,
         control_fingerprint=_v2_digest({"dependency": dependency_fingerprint, "git_control": git_control_fingerprint, "observations": observation_fingerprints}),
+        recorder_store_fingerprint=_v2_digest(recorder_store),
         loaded_control=control,
     )
 
@@ -1831,7 +1856,7 @@ def _verified_record_document(payload: bytes) -> dict[str, object]:
     value = _strict_json_object(payload, "verified provenance record")
     required = {
         "schema", "record_digest", "external", "selection", "fingerprints",
-        "validation", "artifacts", "dependency",
+        "validation", "artifacts", "dependency", "recorder_store",
     }
     if set(value) != required or value.get("schema") != VERIFIED_PROVENANCE_RECORD_SCHEMA:
         raise ProvenanceRecordError("verified provenance record is invalid")
@@ -1846,9 +1871,10 @@ def _verified_record_document(payload: bytes) -> dict[str, object]:
     validation = value["validation"]
     artifacts = value["artifacts"]
     dependency = value["dependency"]
-    if not all(type(item) is dict for item in (external, selection, fingerprints, validation, artifacts, dependency)):
+    recorder_store = value["recorder_store"]
+    if not all(type(item) is dict for item in (external, selection, fingerprints, validation, artifacts, dependency, recorder_store)):
         raise ProvenanceRecordError("verified provenance record is invalid")
-    if set(external) != {"payload_digest", "receipt_digest", "contract_digest", "retention_identity", "run_id", "contract_id", "orchestrator_task", "mode"} or set(selection) != {"repository", "task_id", "base_sha", "candidate_sha", "candidate_tree", "leaf", "route", "case_schema", "profile", "selection_at", "gate", "blocker", "next_action"} or set(fingerprints) != {"candidate", "validation", "artifacts", "dependency", "git", "control", "selection"}:
+    if set(external) != {"payload_digest", "receipt_digest", "contract_digest", "retention_identity", "run_id", "contract_id", "orchestrator_task", "mode"} or set(selection) != {"repository", "task_id", "base_sha", "candidate_sha", "candidate_tree", "leaf", "route", "case_schema", "profile", "selection_at", "gate", "blocker", "next_action"} or set(fingerprints) != {"candidate", "validation", "artifacts", "dependency", "git", "control", "selection", "recorder_store"}:
         raise ProvenanceRecordError("verified provenance record is incomplete")
     retention = _parse_roundlet_retention_identity(external.get("retention_identity"))
     if (
@@ -1875,6 +1901,8 @@ def _verified_record_document(payload: bytes) -> dict[str, object]:
         or selection["selection_at"] < 0
     ):
         raise ProvenanceRecordError("verified provenance record is invalid")
+    if set(recorder_store) != {"profile", "candidate_sha", "recorder_binding_digest", "store_identity", "retention_contract"} or recorder_store.get("profile") != PROVENANCE_DECISION_PROFILE or recorder_store.get("candidate_sha") != selection["candidate_sha"] or not _is_v2_digest(recorder_store.get("recorder_binding_digest")) or not _is_v2_digest(recorder_store.get("store_identity")) or recorder_store.get("retention_contract") != "append-only-content-addressed-readback":
+        raise ProvenanceRecordError("verified provenance recorder store is invalid")
     if (
         set(validation) != {"lock_digest", "cache_key", "receipt_digest", "requirements", "environments", "tools"}
         or type(validation.get("requirements")) is not dict
@@ -1940,14 +1968,15 @@ def _verified_record_document(payload: bytes) -> dict[str, object]:
     package = next((item for item in observations if item.component.value == "package"), None)
     git_dependency = next((item for item in observations if item.component.value == "git-executable"), None)
     candidate_fingerprint = _v2_digest({"repository": selection["repository"], "task_id": selection["task_id"], "base_sha": selection["base_sha"], "candidate_sha": selection["candidate_sha"], "candidate_tree": selection["candidate_tree"], "artifacts": verified_artifacts.projection_fingerprint})
-    selection_fingerprint = _v2_digest({"payload_digest": external["payload_digest"], "receipt_digest": external["receipt_digest"], "contract_digest": external["contract_digest"], "retention_identity": external["retention_identity"], "selection_at": selection["selection_at"], "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": verified_validation.projection_fingerprint, "git_fingerprint": verified_git.observation_fingerprint, "control_fingerprint": _v2_digest({"dependency": dependency_fingerprint, "git_control": git_control_fingerprint, "observations": tuple(item.fingerprint for item in canonical_observations)})})
+    recorder_store_fingerprint = _v2_digest(recorder_store)
+    selection_fingerprint = _v2_digest({"payload_digest": external["payload_digest"], "receipt_digest": external["receipt_digest"], "contract_digest": external["contract_digest"], "retention_identity": external["retention_identity"], "selection_at": selection["selection_at"], "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": verified_validation.projection_fingerprint, "git_fingerprint": verified_git.observation_fingerprint, "control_fingerprint": _v2_digest({"dependency": dependency_fingerprint, "git_control": git_control_fingerprint, "observations": tuple(item.fingerprint for item in canonical_observations)}), "recorder_store_fingerprint": recorder_store_fingerprint})
     if (
         package is None or git_dependency is None
         or artifacts["candidate_source"] != {"source_identity": package.source_identity, "digest": verified_artifacts.source_digest}
         or artifacts["candidate_package"] != package.artifact_digest
         or artifacts["installed_roundwright_entrypoint"] != package.executable_digest
         or (verified_git.repository, verified_git.task_id, verified_git.candidate_sha, verified_git.binding_fingerprint, verified_git.identifier, verified_git.source_identity, verified_git.normalized_version, verified_git.artifact_digest, verified_git.executable_digest, verified_git.control_fingerprint) != (selection["repository"], selection["task_id"], selection["candidate_sha"], binding.fingerprint, git_dependency.identifier, git_dependency.source_identity, git_dependency.version, git_dependency.artifact_digest, git_dependency.executable_digest, git_control_fingerprint)
-        or fingerprints != {"candidate": candidate_fingerprint, "validation": verified_validation.projection_fingerprint, "artifacts": verified_artifacts.projection_fingerprint, "dependency": dependency_fingerprint, "git": verified_git.observation_fingerprint, "control": _v2_digest({"dependency": dependency_fingerprint, "git_control": git_control_fingerprint, "observations": tuple(item.fingerprint for item in canonical_observations)}), "selection": selection_fingerprint}
+        or fingerprints != {"candidate": candidate_fingerprint, "validation": verified_validation.projection_fingerprint, "artifacts": verified_artifacts.projection_fingerprint, "dependency": dependency_fingerprint, "git": verified_git.observation_fingerprint, "control": _v2_digest({"dependency": dependency_fingerprint, "git_control": git_control_fingerprint, "observations": tuple(item.fingerprint for item in canonical_observations)}), "selection": selection_fingerprint, "recorder_store": recorder_store_fingerprint}
     ):
         raise ProvenanceRecordError("verified provenance record projections are inconsistent")
     return value
@@ -2056,7 +2085,7 @@ def materialize_verified_provenance_record(
             "validation": validation.projection_fingerprint, "artifacts": artifacts.projection_fingerprint,
             "dependency": _control_fingerprint(dependency_control, now=now)[0],
             "git": git_observation.observation_fingerprint, "control": selection.control_fingerprint,
-            "selection": selection.selection_fingerprint,
+            "selection": selection.selection_fingerprint, "recorder_store": _v2_digest(payload["recorder_store"]),
         },
         "validation": validation.public_payload(),
         "artifacts": {
@@ -2071,6 +2100,7 @@ def materialize_verified_provenance_record(
             "observations": [{"component": item.component.value, "identifier": item.identifier, "version": item.version, "source_identity": item.source_identity, "artifact_digest": item.artifact_digest, "executable_digest": item.executable_digest, "observed_at": item.observed_at, "policy_digest": item.policy_digest, "fingerprint": item.fingerprint} for item in sorted(dependency_control.observations, key=lambda item: item.component.value)],
             "admission": {"policy_fingerprint": dependency_control.admission.policy_fingerprint, "receipt_digest": dependency_control.admission.receipt_digest, "reviewer_identity": dependency_control.admission.reviewer_identity, "authority_digest": dependency_control.admission.authority_digest},
         },
+        "recorder_store": payload["recorder_store"],
     }
     document["record_digest"] = _v2_digest(document)
     encoded = _canonical_json_bytes(document)
@@ -2299,12 +2329,256 @@ def _materialize_provenance_record(
     )
 
 
-def export_provenance_decision(record: object) -> ProvenanceDecision:
-    """Export only a verified durable record; callers cannot supply raw fields."""
+def _export_legacy_provenance_decision(record: object) -> ProvenanceDecision:
+    """Private fixture-only export; never the verified terminal export path."""
 
     if type(record) is not DurableProvenanceRecord:
         raise ProvenanceRecordError("durable provenance record is required for export")
     return record.decision
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedCaptureReadinessReceipt:
+    """Verified-only terminal preflight; this does not create capture evidence."""
+
+    profile_id: str
+    candidate_sha: str
+    ready_at: int
+    decision_digest: str
+    durable_record_digest: str
+    payload_digest: str
+    receipt_digest: str
+    contract_digest: str
+    roundlet_retention_identity: str
+    run_id: str
+    contract_id: str
+    orchestrator_task: str
+    evidence_store_identity: str
+    evidence_store_contract: str
+    recorder_binding_digest: str
+    readiness_digest: str = ""
+    _readiness_seal: object
+
+    def __init__(self, *arguments: object, **keywords: object) -> None:
+        raise TypeError("verified capture readiness is produced by verified preflight only")
+
+    def verify(self) -> None:
+        if (
+            type(self) is not VerifiedCaptureReadinessReceipt
+            or getattr(self, "_readiness_seal", None) is not _VERIFIED_PROVENANCE_RECORD_SEAL
+            or self.profile_id != PROVENANCE_DECISION_PROFILE
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or not all(_is_v2_digest(value) for value in (
+                self.decision_digest, self.durable_record_digest, self.payload_digest,
+                self.receipt_digest, self.contract_digest, self.recorder_binding_digest,
+            ))
+            or _parse_roundlet_retention_identity(self.roundlet_retention_identity) is None
+            or _parse_roundlet_retention_identity(self.roundlet_retention_identity) != (self.run_id, "final", self.candidate_sha)
+            or not re.fullmatch(r"[0-9a-f]{32}", self.run_id)
+            or not _safe_v2_token(self.contract_id)
+            or not _safe_v2_token(self.orchestrator_task)
+            or not _is_v2_digest(self.evidence_store_identity)
+            or self.evidence_store_contract != "append-only-content-addressed-readback"
+        ):
+            raise ProvenanceRecordError("verified capture readiness receipt is invalid")
+        digest = _v2_digest({
+            "profile_id": self.profile_id, "candidate_sha": self.candidate_sha,
+            "ready_at": self.ready_at, "decision_digest": self.decision_digest,
+            "durable_record_digest": self.durable_record_digest,
+            "payload_digest": self.payload_digest, "receipt_digest": self.receipt_digest,
+            "contract_digest": self.contract_digest,
+            "roundlet_retention_identity": self.roundlet_retention_identity,
+            "run_id": self.run_id, "contract_id": self.contract_id,
+            "orchestrator_task": self.orchestrator_task,
+            "evidence_store_identity": self.evidence_store_identity,
+            "evidence_store_contract": self.evidence_store_contract,
+            "recorder_binding_digest": self.recorder_binding_digest,
+        })
+        if self.readiness_digest and self.readiness_digest != digest:
+            raise ProvenanceRecordError("verified capture readiness receipt digest is invalid")
+        if self.readiness_digest != digest:
+            raise ProvenanceRecordError("verified capture readiness receipt is unsealed")
+
+    def verify_against(
+        self, store: object, *, loaded_control: object, selection: object,
+        validation: object, artifacts: object, git_control: object,
+        git_observation: object, dependency_control: object, recorder: object,
+    ) -> None:
+        """Recheck this passive receipt against the original store-bound authority."""
+
+        self.verify()
+        if type(recorder) is not RecorderBinding:
+            raise ProvenanceRecordError("verified capture readiness recorder is invalid")
+        decision = export_provenance_decision(
+            store, candidate_sha=self.candidate_sha, record_digest=self.durable_record_digest,
+            loaded_control=loaded_control, selection=selection, validation=validation,
+            artifacts=artifacts, git_control=git_control, git_observation=git_observation,
+            dependency_control=dependency_control,
+        )
+        recorder_digest = _v2_digest({
+            "harness_merge": recorder.harness_merge, "recorder_content": recorder.recorder_content,
+            "harness_tree": recorder.harness_tree,
+        })
+        if (
+            self.ready_at != decision.ready_at
+            or self.decision_digest != decision.decision_digest
+            or self.recorder_binding_digest != recorder_digest
+            or type(loaded_control) is not ExternalSelectionControl
+            or type(selection) is not VerifiedProvenanceSelection
+            or (self.run_id, self.contract_id, self.orchestrator_task,
+                self.payload_digest, self.receipt_digest, self.contract_digest,
+                self.roundlet_retention_identity, self.evidence_store_identity,
+                self.evidence_store_contract) != (
+                loaded_control.expected.run_id, loaded_control.expected.contract_id,
+                loaded_control.expected.orchestrator_task, loaded_control.payload_digest,
+                loaded_control.receipt_digest, loaded_control.contract_digest,
+                loaded_control.retention_identity,
+                loaded_control.expected.recorder_store_identity,
+                loaded_control.expected.recorder_store_contract,
+            )
+        ):
+            raise ProvenanceRecordError("verified capture readiness receipt binding is invalid")
+
+
+def _verified_terminal_export(
+    read_back: object, *, loaded_control: object, selection: object, validation: object,
+    artifacts: object, git_control: object, git_observation: object,
+    dependency_control: object,
+) -> tuple[ProvenanceDecision, VerifiedDurableProvenanceRecord]:
+    """Promote a parsed record only by exact re-materialization and byte comparison."""
+
+    if type(read_back) is not ReadBackVerifiedProvenanceRecord:
+        raise ProvenanceRecordError("verified provenance read-back is required for export")
+    if type(selection) is not VerifiedProvenanceSelection:
+        raise ProvenanceRecordError("verified provenance selection is required for export")
+    # Revalidation is pinned to the immutable FINAL selection time.  Replay or
+    # capture wall-clock time must neither mint nor stale this authority.
+    record = read_back.verify_against(
+        loaded_control, selection, validation=validation, artifacts=artifacts,
+        git_control=git_control, git_observation=git_observation,
+        dependency_control=dependency_control, now=selection.selection_at,
+    )
+    projection = record.public_projection()
+    source = projection["artifacts"]["candidate_source"]
+    reviewed_git = projection["artifacts"]["reviewed_git_entrypoint"]
+    try:
+        artifact_references = (
+            PublicArtifactReference("candidate-source", source["digest"]),
+            PublicArtifactReference("candidate-package", projection["artifacts"]["candidate_package"]),
+            PublicArtifactReference("installed-roundwright-entrypoint", projection["artifacts"]["installed_roundwright_entrypoint"]),
+            PublicArtifactReference("reviewed-git-artifact", reviewed_git["artifact_digest"]),
+            PublicArtifactReference("reviewed-git-executable", reviewed_git["executable_digest"]),
+        )
+        decision = ProvenanceDecision(
+            projection["selection"]["repository"], projection["selection"]["task_id"],
+            projection["selection"]["base_sha"], projection["selection"]["candidate_sha"],
+            projection["dependency"]["policy_fingerprint"], projection["fingerprints"]["dependency"],
+            _v2_digest({"installed": projection["artifacts"]["installed_roundwright_entrypoint"], "reviewed_git": projection["fingerprints"]["git"]}),
+            artifact_references, projection["selection"]["gate"], projection["selection"]["blocker"],
+            projection["selection"]["next_action"], projection["selection"]["selection_at"],
+        )
+    except (AttributeError, KeyError, TypeError, ShadowV2Error) as error:
+        raise ProvenanceRecordError("verified provenance export projection is invalid") from error
+    return decision, record
+
+
+def export_provenance_decision(
+    store: object, *, candidate_sha: str, record_digest: str, loaded_control: object, selection: object, validation: object,
+    artifacts: object, git_control: object, git_observation: object,
+    dependency_control: object,
+) -> ProvenanceDecision:
+    """Export terminal provenance from exact store-bound read-back evidence only."""
+
+    if type(store) is not VerifiedProvenanceRecordStore:
+        raise ProvenanceRecordError("verified provenance store is required for export")
+    read_back = store.read_back(candidate_sha, record_digest)
+    return _verified_terminal_export(
+        read_back, loaded_control=loaded_control, selection=selection, validation=validation,
+        artifacts=artifacts, git_control=git_control, git_observation=git_observation,
+        dependency_control=dependency_control,
+    )[0]
+
+
+def require_verified_provenance_capture_readiness(
+    profile: object, store: object, decision: object, recorder: object,
+    *, candidate_sha: str, record_digest: str, ready_at: int, loaded_control: object, selection: object,
+    validation: object, artifacts: object, git_control: object, git_observation: object,
+    dependency_control: object,
+) -> VerifiedCaptureReadinessReceipt:
+    """Check verified terminal readiness without calling Recorder or appending evidence."""
+
+    if type(profile) is not ShadowEvidenceProfile or profile.profile_id != PROVENANCE_DECISION_PROFILE or type(recorder) is not RecorderBinding or type(decision) is not ProvenanceDecision or type(selection) is not VerifiedProvenanceSelection:
+        raise ProvenanceRecordError("verified capture readiness preflight is incomplete")
+    derived = export_provenance_decision(
+        store, candidate_sha=candidate_sha, record_digest=record_digest,
+        loaded_control=loaded_control, selection=selection, validation=validation,
+        artifacts=artifacts, git_control=git_control, git_observation=git_observation,
+        dependency_control=dependency_control,
+    )
+    read_back = store.read_back(candidate_sha, record_digest)
+    record = read_back.verify_against(
+        loaded_control, selection, validation=validation, artifacts=artifacts,
+        git_control=git_control, git_observation=git_observation,
+        dependency_control=dependency_control, now=selection.selection_at,
+    )
+    if (
+        decision != derived or decision.decision_digest != derived.decision_digest
+        or candidate_sha != derived.candidate_sha or ready_at != derived.ready_at
+    ):
+        raise ProvenanceRecordError("verified capture readiness binding is invalid")
+    recorder_digest = _v2_digest({
+        "harness_merge": recorder.harness_merge, "recorder_content": recorder.recorder_content,
+        "harness_tree": recorder.harness_tree,
+    })
+    projection = record.public_projection()
+    selected_store = projection["recorder_store"]
+    expected_store = {
+        "profile": profile.profile_id, "candidate_sha": candidate_sha,
+        "recorder_binding_digest": recorder_digest,
+        "store_identity": loaded_control.expected.recorder_store_identity,
+        "retention_contract": loaded_control.expected.recorder_store_contract,
+    }
+    if selected_store != expected_store:
+        raise ProvenanceRecordError("verified capture readiness recorder store is invalid")
+    external = projection["external"]
+    parsed_retention = _parse_roundlet_retention_identity(external["retention_identity"])
+    if (
+        parsed_retention != (loaded_control.expected.run_id, "final", candidate_sha)
+        or (external["run_id"], external["contract_id"], external["orchestrator_task"], external["mode"]) != (
+            loaded_control.expected.run_id, loaded_control.expected.contract_id,
+            loaded_control.expected.orchestrator_task, "final",
+        )
+    ):
+        raise ProvenanceRecordError("verified capture readiness external binding is invalid")
+    # Allocation remains lexical to this exact store-bound, selection-time
+    # revalidation boundary.  The receipt is a passive public-safe projection,
+    # and its verifier does not itself grant capture authority.
+    value = object.__new__(VerifiedCaptureReadinessReceipt)
+    values = {
+        "profile_id": profile.profile_id, "candidate_sha": candidate_sha, "ready_at": ready_at,
+        "decision_digest": derived.decision_digest, "durable_record_digest": record.record_digest,
+        "payload_digest": external["payload_digest"], "receipt_digest": external["receipt_digest"],
+        "contract_digest": external["contract_digest"],
+        "roundlet_retention_identity": external["retention_identity"],
+        "run_id": external["run_id"], "contract_id": external["contract_id"],
+        "orchestrator_task": external["orchestrator_task"],
+        "evidence_store_identity": selected_store["store_identity"],
+        "evidence_store_contract": selected_store["retention_contract"],
+        "recorder_binding_digest": recorder_digest,
+    }
+    for name, item in values.items():
+        object.__setattr__(value, name, item)
+    digest = _v2_digest(values)
+    object.__setattr__(value, "readiness_digest", digest)
+    object.__setattr__(value, "_readiness_seal", _VERIFIED_PROVENANCE_RECORD_SEAL)
+    value.verify()
+    value.verify_against(
+        store, loaded_control=loaded_control, selection=selection, validation=validation,
+        artifacts=artifacts, git_control=git_control, git_observation=git_observation,
+        dependency_control=dependency_control, recorder=recorder,
+    )
+    return value
 
 
 @dataclass(frozen=True)
@@ -2340,7 +2614,12 @@ class RetentionReceipt:
 
 
 class AppendOnlyEvidenceStore:
-    """In-memory Recorder store contract: content addressed, append-only, readable."""
+    """Legacy generic fixture-only evidence store, never provenance readiness authority.
+
+    Production provenance readiness carries only the immutable externally selected
+    Recorder-store identity from the verified durable record.  It does not accept
+    this caller-created in-memory store as evidence of a future capture.
+    """
 
     def __init__(self, retention_identity: str) -> None:
         if not _safe_v2_token(retention_identity):
@@ -2401,7 +2680,7 @@ class CaptureReadinessReceipt:
         object.__setattr__(self, "readiness_digest", digest)
 
 
-def require_capture_readiness(
+def _require_legacy_capture_readiness(
     profile: ShadowEvidenceProfile,
     decision: ProvenanceDecision | DurableProvenanceRecord,
     recorder: RecorderBinding,
@@ -2410,7 +2689,7 @@ def require_capture_readiness(
     candidate_sha: str,
     ready_at: int,
 ) -> CaptureReadinessReceipt:
-    """Preflight every terminal-snapshot prerequisite before Recorder use."""
+    """Private fixture-only generic readiness preflight."""
 
     durable = decision if type(decision) is DurableProvenanceRecord else None
     effective_decision = durable.decision if durable is not None else decision
@@ -2432,6 +2711,22 @@ def require_capture_readiness(
         "harness_tree": recorder.harness_tree,
     })
     return CaptureReadinessReceipt(profile.profile_id, candidate_sha, ready_at, recorder_digest, store.retention_identity)
+
+
+def require_capture_readiness(
+    profile: ShadowEvidenceProfile,
+    decision: ProvenanceDecision | DurableProvenanceRecord,
+    recorder: RecorderBinding,
+    store: AppendOnlyEvidenceStore,
+    *, candidate_sha: str, ready_at: int,
+) -> CaptureReadinessReceipt:
+    """Generic-profile readiness only; provenance uses verified-store readiness."""
+
+    if type(profile) is not ShadowEvidenceProfile or profile.profile_id == PROVENANCE_DECISION_PROFILE:
+        raise ShadowV2Error("provenance capture readiness requires verified durable evidence")
+    return _require_legacy_capture_readiness(
+        profile, decision, recorder, store, candidate_sha=candidate_sha, ready_at=ready_at,
+    )
 
 
 @dataclass(frozen=True)

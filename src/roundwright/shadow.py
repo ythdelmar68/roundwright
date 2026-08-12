@@ -881,6 +881,12 @@ def _safe_v2_token(value: object) -> bool:
     return not any(term in lowered for term in ("token", "secret", "credential", "password", "ghp_")) and not lowered.startswith("sk-")
 
 
+def _safe_profile_id(value: object) -> bool:
+    if type(value) is not str or not re.fullmatch(r"roundwright-shadow-profile/[a-z0-9][a-z0-9._-]{0,127}/v[1-9][0-9]*", value):
+        return False
+    return _safe_v2_token(value.replace("/", "-"))
+
+
 def _safe_repository(value: object) -> bool:
     return type(value) is str and _V2_REPOSITORY.fullmatch(value) is not None
 
@@ -899,10 +905,12 @@ class ShadowV2Error(ShadowError):
 
 class CaptureMode(StrEnum):
     TERMINAL_SNAPSHOT = "terminal-snapshot"
+    LIFECYCLE_GRAPH = "lifecycle-graph"
 
 
 class ShadowProducer(StrEnum):
     DURABLE_PROVENANCE = "durable-provenance"
+    PROFILE_DEFINED = "profile-defined"
 
 
 @dataclass(frozen=True)
@@ -917,10 +925,13 @@ class ShadowEvidenceProfile:
     retention_readback_contract: str
     missing_history_recapture: str
     event_kinds: tuple[str, ...]
+    minimum_commits: int = 0
+    maximum_commits: int = 0
+    requires_accepted_result: bool = False
 
     def __post_init__(self) -> None:
         if (
-            self.profile_id != PROVENANCE_DECISION_PROFILE
+            not _safe_profile_id(self.profile_id)
             or type(self.capture_mode) is not CaptureMode
             or type(self.producer) is not ShadowProducer
             or any(not _safe_v2_token(value) for value in (
@@ -930,9 +941,25 @@ class ShadowEvidenceProfile:
                 self.missing_history_recapture,
             ))
             or type(self.event_kinds) is not tuple
-            or self.event_kinds != ("provenance-decision",)
+            or not self.event_kinds
+            or any(not _safe_v2_token(value) for value in self.event_kinds)
+            or len(set(self.event_kinds)) != len(self.event_kinds)
+            or type(self.minimum_commits) is not int
+            or type(self.maximum_commits) is not int
+            or self.minimum_commits < 0
+            or self.maximum_commits < self.minimum_commits
+            or type(self.requires_accepted_result) is not bool
         ):
             raise ShadowV2Error("shadow evidence profile is invalid")
+        if self.profile_id == PROVENANCE_DECISION_PROFILE and (
+            self.capture_mode is not CaptureMode.TERMINAL_SNAPSHOT
+            or self.producer is not ShadowProducer.DURABLE_PROVENANCE
+            or self.event_kinds != ("provenance-decision",)
+            or self.minimum_commits != 0
+            or self.maximum_commits != 0
+            or self.requires_accepted_result
+        ):
+            raise ShadowV2Error("provenance evidence profile is invalid")
 
 
 _PROVENANCE_PROFILE = ShadowEvidenceProfile(
@@ -1175,7 +1202,7 @@ class CaptureReadinessReceipt:
 
     def __post_init__(self) -> None:
         if (
-            self.profile_id != PROVENANCE_DECISION_PROFILE
+            not _safe_profile_id(self.profile_id)
             or not _SHA1.fullmatch(self.candidate_sha)
             or type(self.ready_at) is not int
             or self.ready_at < 0
@@ -1208,7 +1235,6 @@ def require_capture_readiness(
 
     if (
         type(profile) is not ShadowEvidenceProfile
-        or profile != _PROVENANCE_PROFILE
         or type(decision) is not ProvenanceDecision
         or type(recorder) is not RecorderBinding
         or type(store) is not AppendOnlyEvidenceStore
@@ -1275,6 +1301,228 @@ class ShadowV2Observation:
         }
 
 
+class LifecycleAttemptKind(StrEnum):
+    WORKER = "worker"
+    SUPERVISOR = "supervisor"
+    RETRY = "retry"
+    FAILOVER = "failover"
+    REPAIR = "repair"
+
+
+@dataclass(frozen=True)
+class LifecycleAttempt:
+    """One durable lifecycle attempt, independent from its provider calls."""
+
+    attempt_id: str
+    ordinal: int
+    kind: LifecycleAttemptKind
+    role: EvidenceRole
+    parent_attempt_id: str | None = None
+    review_round_id: str | None = None
+    commit_sha: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_v2_token(self.attempt_id)
+            or type(self.ordinal) is not int
+            or self.ordinal < 1
+            or type(self.kind) is not LifecycleAttemptKind
+            or type(self.role) is not EvidenceRole
+            or (self.parent_attempt_id is not None and not _safe_v2_token(self.parent_attempt_id))
+            or (self.review_round_id is not None and not _safe_v2_token(self.review_round_id))
+            or (self.commit_sha is not None and not _SHA1.fullmatch(self.commit_sha))
+        ):
+            raise ShadowV2Error("lifecycle attempt is invalid")
+
+
+@dataclass(frozen=True)
+class ProviderAttemptManifest:
+    """One provider call attempt, never a lifecycle correlation surrogate."""
+
+    provider_attempt_id: str
+    lifecycle_attempt_id: str
+    ordinal: int
+    provider_identity: str
+    outcome: str
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_v2_token(self.provider_attempt_id)
+            or not _safe_v2_token(self.lifecycle_attempt_id)
+            or type(self.ordinal) is not int
+            or self.ordinal < 1
+            or not _safe_v2_token(self.provider_identity)
+            or not _safe_v2_token(self.outcome)
+        ):
+            raise ShadowV2Error("provider attempt manifest is invalid")
+
+
+@dataclass(frozen=True)
+class FormalReviewRoundReference:
+    review_round_id: str
+    ordinal: int
+    candidate_sha: str
+    accepted_result_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_v2_token(self.review_round_id)
+            or type(self.ordinal) is not int
+            or self.ordinal < 1
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or (self.accepted_result_id is not None and not _safe_v2_token(self.accepted_result_id))
+        ):
+            raise ShadowV2Error("review round reference is invalid")
+
+
+@dataclass(frozen=True)
+class CandidateCommitReference:
+    commit_sha: str
+    commit_identity: str
+
+    def __post_init__(self) -> None:
+        if not _SHA1.fullmatch(self.commit_sha) or not _safe_v2_token(self.commit_identity):
+            raise ShadowV2Error("candidate commit reference is invalid")
+
+
+@dataclass(frozen=True)
+class AcceptedResultReference:
+    result_id: str
+    review_round_id: str
+    event_id: str
+    candidate_sha: str
+
+    def __post_init__(self) -> None:
+        if not all(_safe_v2_token(value) for value in (self.result_id, self.review_round_id, self.event_id)) or not _SHA1.fullmatch(self.candidate_sha):
+            raise ShadowV2Error("accepted result reference is invalid")
+
+
+@dataclass(frozen=True)
+class ShadowV2Event:
+    """A profile-defined immutable event with explicit graph references."""
+
+    event_id: str
+    ordinal: int
+    lifecycle_attempt_id: str
+    event_kind: str
+    provider_attempt_id: str | None
+    provider_call_made: bool
+    review_round_id: str | None = None
+    commit_sha: str | None = None
+    accepted_result_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not all(_safe_v2_token(value) for value in (self.event_id, self.lifecycle_attempt_id, self.event_kind))
+            or type(self.ordinal) is not int
+            or self.ordinal < 1
+            or type(self.provider_call_made) is not bool
+            or (self.provider_attempt_id is not None and not _safe_v2_token(self.provider_attempt_id))
+            or (self.review_round_id is not None and not _safe_v2_token(self.review_round_id))
+            or (self.commit_sha is not None and not _SHA1.fullmatch(self.commit_sha))
+            or (self.accepted_result_id is not None and not _safe_v2_token(self.accepted_result_id))
+            or (self.provider_call_made != (self.provider_attempt_id is not None))
+        ):
+            raise ShadowV2Error("profile-defined event is invalid")
+
+
+@dataclass(frozen=True)
+class ShadowV2EventGraph:
+    """Reusable profile event graph; only profiles, not the core, choose events."""
+
+    attempts: tuple[LifecycleAttempt, ...]
+    provider_attempts: tuple[ProviderAttemptManifest, ...]
+    review_rounds: tuple[FormalReviewRoundReference, ...]
+    commits: tuple[CandidateCommitReference, ...]
+    accepted_results: tuple[AcceptedResultReference, ...]
+    events: tuple[ShadowV2Event, ...]
+
+    def validate(self, profile: ShadowEvidenceProfile, candidate_sha: str) -> None:
+        if (
+            type(profile) is not ShadowEvidenceProfile
+            or not _SHA1.fullmatch(candidate_sha)
+            or any(type(item) is not LifecycleAttempt for item in self.attempts)
+            or any(type(item) is not ProviderAttemptManifest for item in self.provider_attempts)
+            or any(type(item) is not FormalReviewRoundReference for item in self.review_rounds)
+            or any(type(item) is not CandidateCommitReference for item in self.commits)
+            or any(type(item) is not AcceptedResultReference for item in self.accepted_results)
+            or any(type(item) is not ShadowV2Event for item in self.events)
+            or not self.attempts
+            or not self.events
+        ):
+            raise ShadowV2Error("Shadow v2 event graph is invalid")
+        _require_ordered_unique(self.attempts, "attempt_id", "ordinal", "lifecycle attempts")
+        _require_ordered_unique(self.provider_attempts, "provider_attempt_id", "ordinal", "provider attempts")
+        _require_ordered_unique(self.review_rounds, "review_round_id", "ordinal", "review rounds")
+        _require_ordered_unique(self.events, "event_id", "ordinal", "profile events")
+        if len({item.commit_sha for item in self.commits}) != len(self.commits):
+            raise ShadowV2Error("candidate commits are duplicate")
+        if not profile.minimum_commits <= len(self.commits) <= profile.maximum_commits:
+            raise ShadowV2Error("candidate commit cardinality is invalid")
+        attempts = {item.attempt_id: item for item in self.attempts}
+        providers = {item.provider_attempt_id: item for item in self.provider_attempts}
+        rounds = {item.review_round_id: item for item in self.review_rounds}
+        commits = {item.commit_sha for item in self.commits}
+        results = {item.result_id: item for item in self.accepted_results}
+        if len(results) != len(self.accepted_results):
+            raise ShadowV2Error("accepted results are duplicate")
+        for attempt in self.attempts:
+            if attempt.parent_attempt_id is not None and attempt.parent_attempt_id not in attempts:
+                raise ShadowV2Error("lifecycle attempt parent is unavailable")
+            if attempt.review_round_id is not None and attempt.review_round_id not in rounds:
+                raise ShadowV2Error("lifecycle attempt review round is unavailable")
+            if attempt.commit_sha is not None and attempt.commit_sha not in commits:
+                raise ShadowV2Error("lifecycle attempt commit is unavailable")
+        for provider in self.provider_attempts:
+            if provider.lifecycle_attempt_id not in attempts:
+                raise ShadowV2Error("provider attempt lifecycle reference is unavailable")
+        for review in self.review_rounds:
+            if review.candidate_sha != candidate_sha:
+                raise ShadowV2Error("review round candidate is stale")
+            if review.accepted_result_id is not None and review.accepted_result_id not in results:
+                raise ShadowV2Error("accepted review result is unavailable")
+        event_ids = {item.event_id for item in self.events}
+        for result in self.accepted_results:
+            if result.review_round_id not in rounds or result.event_id not in event_ids or result.candidate_sha != candidate_sha:
+                raise ShadowV2Error("accepted result reference is invalid")
+        for review in self.review_rounds:
+            if review.accepted_result_id is not None:
+                result = results[review.accepted_result_id]
+                if result.review_round_id != review.review_round_id:
+                    raise ShadowV2Error("accepted review result does not match round")
+        for event in self.events:
+            if event.lifecycle_attempt_id not in attempts or event.event_kind not in profile.event_kinds:
+                raise ShadowV2Error("profile event reference is invalid")
+            if event.provider_attempt_id is not None:
+                provider = providers.get(event.provider_attempt_id)
+                if provider is None or provider.lifecycle_attempt_id != event.lifecycle_attempt_id:
+                    raise ShadowV2Error("provider event reference is invalid")
+            if event.review_round_id is not None and event.review_round_id not in rounds:
+                raise ShadowV2Error("event review round is unavailable")
+            if event.commit_sha is not None and event.commit_sha not in commits:
+                raise ShadowV2Error("event commit is unavailable")
+            if event.accepted_result_id is not None:
+                result = results.get(event.accepted_result_id)
+                if result is None or result.event_id != event.event_id:
+                    raise ShadowV2Error("event accepted result is invalid")
+        event_provider_ids = tuple(item.provider_attempt_id for item in self.events if item.provider_attempt_id is not None)
+        if set(event_provider_ids) != set(providers) or len(event_provider_ids) != len(providers):
+            raise ShadowV2Error("provider attempt references are missing or duplicate")
+        for commit in commits:
+            if sum(attempt.commit_sha == commit for attempt in self.attempts) != 1:
+                raise ShadowV2Error("candidate commit must have exactly one lifecycle attempt")
+        if profile.requires_accepted_result:
+            if len(self.accepted_results) != 1 or not self.review_rounds or self.review_rounds[-1].accepted_result_id is None:
+                raise ShadowV2Error("profile requires one final accepted result")
+
+
+def _require_ordered_unique(records: tuple[object, ...], identity: str, ordinal: str, label: str) -> None:
+    values = tuple(getattr(item, ordinal) for item in records)
+    identities = tuple(getattr(item, identity) for item in records)
+    if values != tuple(range(1, len(records) + 1)) or len(set(identities)) != len(identities):
+        raise ShadowV2Error(f"{label} are missing, duplicate, or out of order")
+
+
 @dataclass(frozen=True)
 class ShadowV2Case:
     case_id: str
@@ -1288,6 +1536,7 @@ class ShadowV2Case:
     retention_reference: str
     schema: str = SHADOW_CASE_SCHEMA_V2
     case_digest: str = ""
+    event_graph: ShadowV2EventGraph | None = None
 
     def __post_init__(self) -> None:
         _validate_v2_case(self, verify_digest=False)
@@ -1308,6 +1557,7 @@ class ShadowV2Case:
             "observations": tuple(item.evidence_digest for item in self.observations),
             "retention_class": self.retention_class,
             "retention_reference": self.retention_reference,
+            "event_graph": None if self.event_graph is None else _v2_graph_payload(self.event_graph),
         }
 
     def retention_payload(self) -> bytes:
@@ -1390,29 +1640,54 @@ def _validate_v2_case(case: object, *, verify_digest: bool) -> None:
         or not _safe_v2_token(case.case_id)
         or not _safe_v2_token(case.lifecycle_correlation_id)
         or type(case.profile) is not ShadowEvidenceProfile
-        or case.profile != _PROVENANCE_PROFILE
         or type(case.decision) is not ProvenanceDecision
         or type(case.reference_decision) is not ProvenanceDecision
         or type(case.readiness) is not CaptureReadinessReceipt
         or type(case.observations) is not tuple
-        or len(case.observations) != 1
         or any(type(item) is not ShadowV2Observation for item in case.observations)
         or not _safe_v2_token(case.retention_class)
         or not _safe_v2_token(case.retention_reference)
     ):
         raise ShadowV2Error("Shadow v2 case is invalid")
-    observation = case.observations[0]
+    if case.profile.profile_id == PROVENANCE_DECISION_PROFILE:
+        if len(case.observations) != 1 or any(type(item) is not ShadowV2Observation for item in case.observations):
+            raise ShadowV2Error("provenance profile observation is invalid")
+        observation = case.observations[0]
+    elif case.observations:
+        raise ShadowV2Error("generic profile observations must use event graph")
+    else:
+        observation = None
     if (
         case.decision.candidate_sha != case.readiness.candidate_sha
         or case.decision.ready_at != case.readiness.ready_at
         or case.reference_decision.candidate_sha != case.decision.candidate_sha
         or case.reference_decision.base_sha != case.decision.base_sha
-        or observation.lifecycle_correlation_id != case.lifecycle_correlation_id
+    ):
+        raise ShadowV2Error("Shadow v2 evidence is stale or mixed")
+    if observation is not None and (
+        observation.lifecycle_correlation_id != case.lifecycle_correlation_id
         or observation.candidate_sha != case.decision.candidate_sha
         or observation.decision_digest != case.decision.decision_digest
         or observation.profile_id != case.profile.profile_id
         or observation.event_kind not in case.profile.event_kinds
     ):
-        raise ShadowV2Error("Shadow v2 evidence is stale or mixed")
+        raise ShadowV2Error("provenance terminal observation is stale or mixed")
+    if case.event_graph is not None:
+        if type(case.event_graph) is not ShadowV2EventGraph:
+            raise ShadowV2Error("Shadow v2 event graph is invalid")
+        case.event_graph.validate(case.profile, case.decision.candidate_sha)
+    elif case.profile.capture_mode is CaptureMode.LIFECYCLE_GRAPH:
+        raise ShadowV2Error("profile event graph is missing")
     if verify_digest and case.case_digest != _v2_digest(case._payload()):
         raise ShadowV2Error("Shadow v2 case digest is invalid")
+
+
+def _v2_graph_payload(graph: ShadowV2EventGraph) -> dict[str, object]:
+    return {
+        "attempts": tuple((item.attempt_id, item.ordinal, item.kind.value, item.role.value, item.parent_attempt_id, item.review_round_id, item.commit_sha) for item in graph.attempts),
+        "provider_attempts": tuple((item.provider_attempt_id, item.lifecycle_attempt_id, item.ordinal, item.provider_identity, item.outcome) for item in graph.provider_attempts),
+        "review_rounds": tuple((item.review_round_id, item.ordinal, item.candidate_sha, item.accepted_result_id) for item in graph.review_rounds),
+        "commits": tuple((item.commit_sha, item.commit_identity) for item in graph.commits),
+        "accepted_results": tuple((item.result_id, item.review_round_id, item.event_id, item.candidate_sha) for item in graph.accepted_results),
+        "events": tuple((item.event_id, item.ordinal, item.lifecycle_attempt_id, item.event_kind, item.provider_attempt_id, item.provider_call_made, item.review_round_id, item.commit_sha, item.accepted_result_id) for item in graph.events),
+    }

@@ -1108,6 +1108,13 @@ class ExternalSelectionControlExpectation:
     authority_agents_blob: str
     skill_blob: str
     qualification_blob: str
+    payload_digest: str
+    receipt_digest: str
+    contract_digest: str
+    origin_tree: str
+    authority_block_digest: str
+    live_leaf: tuple[object, ...]
+    owner_instructions: tuple[tuple[object, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -1135,9 +1142,12 @@ class ExternalSelectionControl:
         except (UnicodeError, json.JSONDecodeError) as error:
             raise ProvenanceRecordError("external selection control is invalid") from error
         digest = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+        receipt_digest = "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
+        if digest != expected.payload_digest or receipt_digest != expected.receipt_digest:
+            raise ProvenanceRecordError("external selection control bytes are not pinned")
         if type(payload) is not dict or type(receipt) is not dict or set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
             raise ProvenanceRecordError("external selection control receipt is invalid")
-        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True:
+        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True:
             raise ProvenanceRecordError("external selection control receipt is invalid")
         selection = payload.get("selection")
         authority = payload.get("authority")
@@ -1149,15 +1159,19 @@ class ExternalSelectionControl:
         active = authority.get("active_roundlet_block")
         if type(origin) is not dict or type(external) is not dict or type(active) is not dict:
             raise ProvenanceRecordError("external selection control authority is invalid")
+        leaf = authority.get("live_leaf")
+        instructions = authority.get("owner_instructions")
         checks = (
             roundlet.get("run_id") == expected.run_id, roundlet.get("contract_id") == expected.contract_id,
             selection.get("repository") == expected.repository, selection.get("worker_task") == expected.task_id,
             selection.get("base_sha") == expected.base_sha, selection.get("candidate_sha") == expected.candidate_sha,
             selection.get("candidate_tree") == expected.candidate_tree, selection.get("active_leaf") == expected.leaf,
             selection.get("route") == expected.route, selection.get("case_schema") == expected.schema,
-            selection.get("evidence_profile") == expected.profile, origin.get("commit") == expected.base_sha,
-            active.get("agents_blob") == expected.authority_agents_blob,
+            selection.get("evidence_profile") == expected.profile, origin.get("commit") == expected.base_sha, origin.get("tree") == expected.origin_tree,
+            active.get("agents_blob") == expected.authority_agents_blob, active.get("block_sha256") == expected.authority_block_digest,
             external.get("skill_blob") == expected.skill_blob, external.get("qualification_blob") == expected.qualification_blob,
+            type(leaf) is dict and tuple(leaf.get(key) for key in ("issue_database_id", "issue_node_id", "number", "updated_at", "body_sha256")) == expected.live_leaf,
+            type(instructions) is list and tuple(tuple(item.get(key) for key in ("comment_id", "comment_node_id", "body_sha256")) for item in instructions if type(item) is dict) == expected.owner_instructions,
         )
         if not all(checks):
             raise ProvenanceRecordError("external selection control binding is invalid")

@@ -6,20 +6,36 @@ import tempfile
 from unittest import mock
 from pathlib import Path
 from roundwright.configuration import load_configuration
-from roundwright.provider_health import CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, ProbeOutcome, ProviderHealthError, ProviderHealthReceipt, RoleBoundCodexCredentialStore
+from dataclasses import replace
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
+from roundwright.provider_health import CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, ProbeOutcome, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationControl, RoleBoundCodexCredentialStore
 from roundwright.provider_health_live import run_bounded_live_provider_health_fixture
 from roundwright.provider_recovery import ProviderRole
 from tests import live_provider_health as live_harness
 from roundwright.shadow import compare_provider_health_receipt, ComparisonOutcome, rehydrate_live_provider_health_evidence
 
+def qualification_control(now=100):
+    digest = lambda value: "sha256:" + value * 64
+    binding = CandidateBinding("ythdelmar68/roundwright", "live-provider-health", "c" * 40)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange("1.0.0", "2.0.0"), "registry/codex-sdk", digest("3"), digest("4")),
+    )
+    policy = DependencyPolicy(binding, digest("5"), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("6"), authority_digest=digest("7"))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
+    admission = TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7"))
+    return ProviderQualificationControl(binding, DependencyExecutionControl(policy, observations, admission), now)
+
 def live_provider_factory():
     test = LiveFixtureTests(); store, configuration, _ = test.fixture()
-    return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration
+    return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration, qualification_control()
 
 def blocked_live_provider_factory():
     test = LiveFixtureTests(); store, configuration, channels = test.fixture()
     channels[ProviderRole.WORKER][1].outcome = ProbeOutcome(False, CodexFailure.AUTH_EXPIRED)
-    return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration
+    return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration, qualification_control()
 
 class Channel:
     def __init__(self, audit, outcome=ProbeOutcome(True)): self.audit, self.outcome, self.audits, self.requests = audit, outcome, 0, []
@@ -42,7 +58,7 @@ class LiveFixtureTests(unittest.TestCase):
         store, config, channels = self.fixture(); contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
         for values in ({"enabled": False}, {"contract_commit": "bad"}, {"candidate_sha": "bad"}, {"case_id": "bad space"}, {"freshness_seconds": 0}):
             args = dict(enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30); args.update(values)
-            with self.assertRaises(ProviderHealthError): run_bounded_live_provider_health_fixture(store, contract, config, **args)
+            with self.assertRaises(ProviderHealthError): run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), **args)
         self.assertTrue(all(not channel.audits and not channel.requests for _, channel in channels.values()))
     def test_enabled_fixture_returns_ordered_canonical_redacted_receipts(self):
         with tempfile.TemporaryDirectory(prefix="roundwright live ") as temporary:
@@ -52,7 +68,7 @@ class LiveFixtureTests(unittest.TestCase):
             with mock.patch.dict("os.environ", {"HOME": "ignored"}, clear=True), mock.patch("os.getcwd", return_value="ignored"):
                 store, config, channels = self.fixture_at(workspace)
         contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
-        result = run_bounded_live_provider_health_fixture(store, contract, config, enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
+        result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
         self.assertEqual(len(result.receipts), 2 + len(config.supervisor_attempt_profiles.value))
         self.assertTrue(all(ProviderHealthReceipt.from_evidence(item.evidence()) == item for item in result.receipts))
         self.assertEqual(sum(len(channel.requests) for _, channel in channels.values()), len(result.receipts))
@@ -60,7 +76,7 @@ class LiveFixtureTests(unittest.TestCase):
         store, config, channels = self.fixture()
         channels[ProviderRole.WORKER][1].outcome = ProbeOutcome(False, CodexFailure.AUTH_EXPIRED)
         contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
-        result = run_bounded_live_provider_health_fixture(store, contract, config, enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
+        result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
         self.assertFalse(result.report.ready_at(100))
         self.assertEqual(len(result.receipts), len(result.report.observations) - 1)
         self.assertEqual(result.report.observations[1].failure, CodexFailure.AUTH_EXPIRED)
@@ -76,7 +92,7 @@ class LiveFixtureTests(unittest.TestCase):
         for failure in CodexFailure:
             with self.subTest(failure=failure):
                 store, config, _ = self.fixture(ProbeOutcome(False, failure))
-                result = run_bounded_live_provider_health_fixture(store, contract, config, enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
+                result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
                 evidence = result.owner_safe_evidence()
                 self.assertEqual((evidence["status"], evidence["ready"], result.receipts), ("blocked", False, ()))
                 self.assertEqual({item.failure for item in result.report.observations}, {failure})
@@ -88,7 +104,7 @@ class LiveFixtureTests(unittest.TestCase):
         store, config, _ = self.fixture(); contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
         with mock.patch("roundwright.provider_health_live.CodexProviderHealth.qualify_configuration", side_effect=RuntimeError("secret-token C:/private/path")):
             with self.assertRaisesRegex(ProviderHealthError, "^live provider health fixture is blocked$") as error:
-                run_bounded_live_provider_health_fixture(store, contract, config, enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
+                run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
         self.assertNotIn("secret-token", str(error.exception).lower())
 
     def test_harness_disabled_blocked_and_success_contract(self):

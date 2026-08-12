@@ -298,7 +298,7 @@ def discover_repository(start: Path | None = None) -> RepositoryIdentity | None:
     return None
 
 
-def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, trusted_review_floor: ReviewPolicy | None = None, platform: str | None = None, home: Path | None = None) -> Configuration:
+def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, trusted_review_floor: ReviewPolicy | None = None, platform: str | None = None, home: Path | None = None, git_binding: object | None = None, git_entrypoint_control: object | None = None) -> Configuration:
     """Resolve defaults < user < authoritative repository < env < CLI.
 
     Repository configuration is read only from the discovered/validated root;
@@ -319,11 +319,17 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     if paths["repository_root"].value is not None:
         repository = RepositoryIdentity.from_root(paths["repository_root"].value)
     repository_config_root: Path | None = None
-    if authoritative_repository_root is None and repository is not None:
-        authoritative_repository_root = discover_authoritative_repository(repository)
+    if authoritative_repository_root is None and repository is not None and git_binding is not None and git_entrypoint_control is not None:
+        authoritative_repository_root = discover_authoritative_repository(
+            repository, binding=git_binding, control=git_entrypoint_control,
+        )
     if authoritative_repository_root is not None:
-        authoritative_root = _validated_authoritative_repository(authoritative_repository_root)
-        repository_values = _read_authoritative_runtime_toml(authoritative_root)
+        authoritative_root = _validated_authoritative_repository(
+            authoritative_repository_root, binding=git_binding, control=git_entrypoint_control,
+        )
+        repository_values = _read_authoritative_runtime_toml(
+            authoritative_root, binding=git_binding, control=git_entrypoint_control,
+        )
         _apply_paths(paths, repository_values.get("paths", {}), ConfigurationSource.REPOSITORY, required_repository_root=authoritative_root)
         # The validated authoritative repository remains the mutation target
         # even when it intentionally has no optional runtime TOML.
@@ -354,7 +360,7 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     )
 
 
-def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_review_floor: object, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, platform: str | None = None, home: Path | None = None) -> Configuration:
+def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_review_floor: object, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, platform: str | None = None, home: Path | None = None, git_binding: object | None = None, git_entrypoint_control: object | None = None) -> Configuration:
     """Resolve dispatch-capable configuration only under typed trusted control evidence."""
 
     if not _is_trusted_review_floor_evidence(trusted_policy_snapshot, trusted_review_floor):
@@ -372,6 +378,8 @@ def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_r
         trusted_review_floor=trusted_review_floor,
         platform=platform,
         home=home,
+        git_binding=git_binding,
+        git_entrypoint_control=git_entrypoint_control,
     )
 
 
@@ -437,8 +445,9 @@ def _read_runtime_toml(path: Path, *, required: bool) -> dict[str, Any]:
     return document
 
 
-def _validated_authoritative_repository(root: Path) -> Path:
+def _validated_authoritative_repository(root: Path, *, binding: object, control: object) -> Path:
     """Accept persistent repository settings only from checked-out origin/main."""
+    _require_configuration_git_control(binding, control)
     repository = RepositoryIdentity.from_root(root)
     try:
         branch = subprocess.run(["git", "-C", os.fspath(repository.root), "symbolic-ref", "--quiet", "--short", "HEAD"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
@@ -462,22 +471,26 @@ def _validated_authoritative_repository(root: Path) -> Path:
     visible_flags = not index_entries and not flag_entries
     if len(index_entries) == 1:
         visible_flags = flag_entries == [f"H {_REPOSITORY_CONFIG}"]
-    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or index.returncode or unmerged.returncode or flags.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or not _origin_matches(origin.stdout.strip()) or status.stdout.strip() or unmerged.stdout.strip() or not ordinary_index or not visible_flags:
+    if branch.returncode or head.returncode or remote.returncode or origin.returncode or status.returncode or index.returncode or unmerged.returncode or flags.returncode or branch.stdout.strip() != "main" or head.stdout.strip() != remote.stdout.strip() or remote.stdout.strip() != binding.candidate_sha or not _origin_matches(origin.stdout.strip()) or status.stdout.strip() or unmerged.stdout.strip() or not ordinary_index or not visible_flags:
         raise ConfigurationError("repository configuration is not from authoritative main")
     return repository.root
 
 
-def _read_authoritative_runtime_toml(root: Path) -> dict[str, Any]:
+def _read_authoritative_runtime_toml(root: Path, *, binding: object, control: object) -> dict[str, Any]:
     """Read configuration only from the exact origin/main Git blob, never checkout bytes."""
 
+    _require_configuration_git_control(binding, control)
     repository = RepositoryIdentity.from_root(root)
     try:
         remote = subprocess.run(["git", "-C", os.fspath(repository.root), "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ConfigurationError("authoritative repository configuration is unavailable") from error
+    if remote.returncode or remote.stdout.strip() != binding.candidate_sha:
+        raise ConfigurationError("authoritative repository configuration is unavailable")
+    try:
         blob = subprocess.run(["git", "-C", os.fspath(repository.root), "show", f"{remote.stdout.strip()}:{_REPOSITORY_CONFIG}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigurationError("authoritative repository configuration is unavailable") from error
-    if remote.returncode:
-        raise ConfigurationError("authoritative repository configuration is unavailable")
     if blob.returncode == 128:
         return {}
     if blob.returncode:
@@ -490,8 +503,9 @@ def _read_authoritative_runtime_toml(root: Path) -> dict[str, Any]:
     return document
 
 
-def discover_authoritative_repository(repository: RepositoryIdentity) -> Path | None:
+def discover_authoritative_repository(repository: RepositoryIdentity, *, binding: object, control: object) -> Path | None:
     """Locate the sole clean local worktree checked out at trusted origin/main."""
+    _require_configuration_git_control(binding, control)
     try:
         listed = subprocess.run(["git", "-C", os.fspath(repository.root), "worktree", "list", "--porcelain"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
     except (OSError, subprocess.TimeoutExpired):
@@ -502,7 +516,7 @@ def discover_authoritative_repository(repository: RepositoryIdentity) -> Path | 
     candidates: list[Path] = []
     for root in roots:
         try:
-            candidates.append(_validated_authoritative_repository(root))
+            candidates.append(_validated_authoritative_repository(root, binding=binding, control=control))
         except ConfigurationError:
             continue
     if len(candidates) > 1:
@@ -742,7 +756,7 @@ def _is_git_worktree_marker(root: Path, marker: Path) -> bool:
         if _has_repository_selecting_git_environment() or _is_reparse_point(marker):
             return False
         if marker.is_dir():
-            return _is_complete_git_directory(marker) and _git_confirms_worktree(root)
+            return _is_complete_git_directory(marker)
         if not marker.is_file():
             return False
         pointer = marker.read_text(encoding="utf-8").strip()
@@ -752,17 +766,29 @@ def _is_git_worktree_marker(root: Path, marker: Path) -> bool:
         if not target.is_absolute():
             target = marker.parent / target
         normalized_target = target.resolve(strict=True)
-        return _is_bound_linked_worktree(root, marker, normalized_target) and _git_confirms_worktree(root)
+        return _is_bound_linked_worktree(root, marker, normalized_target)
     except (OSError, ValueError):
         return False
 
 
-def _git_confirms_worktree(root: Path) -> bool:
+def _require_configuration_git_control(binding: object, control: object) -> None:
+    """Authorize an authoritative configuration Git read before any Git helper.
+
+    This lazy import avoids a configuration/git-identity import cycle while
+    keeping the control's exact runtime type private to the execution seam.
+    """
+
+    from .dependency_policy import CandidateBinding, DependencyStage
+    from .git_identity import GitEntrypointControl, GitIdentityError
+
+    if type(binding) is not CandidateBinding or type(control) is not GitEntrypointControl:
+        raise ConfigurationError("authoritative repository Git control is unavailable")
+    if control.binding != binding or binding.repository != _EXPECTED_REPOSITORY:
+        raise ConfigurationError("authoritative repository Git control does not match the active task")
     try:
-        result = subprocess.run(["git", "-C", os.fspath(root), "rev-parse", "--is-inside-work-tree"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5, env=_hermetic_git_environment())
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0 and result.stdout.strip().casefold() == "true"
+        control.dependency_control.require(binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except (GitIdentityError, ValueError, TypeError):
+        raise ConfigurationError("authoritative repository Git preflight blocked execution") from None
 
 
 def _has_repository_selecting_git_environment() -> bool:

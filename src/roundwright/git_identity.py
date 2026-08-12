@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .configuration import RepositoryIdentity
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .state import StateError, TaskIdentity, _open_writable_connection
 
 
@@ -50,6 +51,7 @@ class WorktreeBinding:
     worktree: Path
     base_sha: str
     state_identity: str
+    git_entrypoint_control: GitEntrypointControl | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,23 @@ class CandidateSeal:
     base_sha: str
     candidate_sha: str
     state_identity: str
+
+
+@dataclass(frozen=True)
+class GitEntrypointControl:
+    """Pre-materialized exact evidence required before a Git entrypoint runs."""
+
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not CandidateBinding or type(self.dependency_control) is not DependencyExecutionControl or type(self.now) is not int or self.now < 0:
+            raise GitIdentityError("git entrypoint control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GIT_ENTRYPOINT, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitIdentityError("git entrypoint preflight blocked execution") from error
 
 
 def acquire_transition_lease(
@@ -176,9 +195,22 @@ def transition_lease(
         release_transition_lease(repository, lease, now=now)
 
 
-def resolve_canonical_base(repository: RepositoryIdentity, default_branch: str) -> str:
+def resolve_canonical_base(repository: RepositoryIdentity, default_branch: str, *, control: GitEntrypointControl) -> str:
     """Resolve a full base commit from ``origin/<default_branch>``, never local HEAD."""
 
+    if type(control) is not GitEntrypointControl:
+        raise GitIdentityError("git entrypoint control is invalid")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise GitIdentityError("git entrypoint preflight blocked execution") from error
+    base = _resolve_canonical_base_unchecked(repository, default_branch)
+    if base != control.binding.candidate_sha:
+        raise GitIdentityError("git entrypoint base does not match sealed candidate")
+    return base
+
+
+def _resolve_canonical_base_unchecked(repository: RepositoryIdentity, default_branch: str) -> str:
     _require_branch(default_branch)
     return _git_commit(repository.root, "rev-parse", "--verify", f"refs/remotes/origin/{default_branch}^{{commit}}")
 
@@ -189,6 +221,7 @@ def provision_worktree(
     *,
     default_branch: str,
     worktree: Path,
+    control: GitEntrypointControl,
     lease: TransitionLease | None = None,
 ) -> WorktreeBinding:
     """Create or revalidate one task-owned branch/worktree at the canonical base.
@@ -197,7 +230,19 @@ def provision_worktree(
     paths are revalidated rather than repaired.
     """
 
-    base_sha = resolve_canonical_base(repository, default_branch)
+    if type(control) is not GitEntrypointControl:
+        raise GitIdentityError("git entrypoint control is invalid")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise GitIdentityError("git entrypoint preflight blocked execution") from error
+    if (
+        control.binding.repository != identity.repository_id
+        or control.binding.task_id != identity.task_id
+        or control.binding.candidate_sha != identity.base_sha
+    ):
+        raise GitIdentityError("git entrypoint control does not match task identity")
+    base_sha = resolve_canonical_base(repository, default_branch, control=control)
     if base_sha != identity.base_sha:
         raise GitIdentityError("task base does not match the canonical default branch")
     _require_branch(identity.branch)
@@ -205,16 +250,22 @@ def provision_worktree(
     if Path(identity.worktree).resolve(strict=False) != requested:
         raise GitIdentityError("task worktree path does not match committed task identity")
     _verify_lease(repository, lease, identity.repository_id)
-    binding = WorktreeBinding(identity.task_id, identity.repository_id, identity.branch, requested, identity.base_sha, _read_state_identity(repository))
+    binding = WorktreeBinding(
+        identity.task_id, identity.repository_id, identity.branch, requested, identity.base_sha,
+        _read_state_identity(repository), control,
+    )
     if requested.exists():
-        return revalidate_worktree(repository, binding)
+        return revalidate_worktree(repository, binding, control=control)
     _git(repository.root, "worktree", "add", "-b", identity.branch, os.fspath(requested), base_sha)
-    return revalidate_worktree(repository, binding)
+    return revalidate_worktree(repository, binding, control=control)
 
 
-def revalidate_worktree(repository: RepositoryIdentity, binding: WorktreeBinding) -> WorktreeBinding:
+def revalidate_worktree(
+    repository: RepositoryIdentity, binding: WorktreeBinding, *, control: GitEntrypointControl,
+) -> WorktreeBinding:
     """Prove one existing linked worktree belongs to its exact task identity."""
 
+    _require_git_entrypoint_control(control, binding.repository_id, binding.task_id, binding.base_sha)
     root = repository.root.resolve(strict=True)
     worktree = _validated_worktree_path(root, binding.worktree)
     _require_task_binding(repository, binding, worktree)
@@ -233,13 +284,20 @@ def revalidate_worktree(repository: RepositoryIdentity, binding: WorktreeBinding
     if _local_path_key(worktree) not in _registered_worktree_paths(root):
         raise GitIdentityError("task worktree is not an active registered worktree")
     _require_worktree_backlink(worktree)
-    return WorktreeBinding(binding.task_id, binding.repository_id, binding.branch, worktree, binding.base_sha, binding.state_identity)
+    return WorktreeBinding(
+        binding.task_id, binding.repository_id, binding.branch, worktree, binding.base_sha,
+        binding.state_identity, binding.git_entrypoint_control,
+    )
 
 
-def seal_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, *, lease: TransitionLease | None = None) -> CandidateSeal:
+def seal_candidate(
+    repository: RepositoryIdentity, binding: WorktreeBinding, *, control: GitEntrypointControl,
+    lease: TransitionLease | None = None,
+) -> CandidateSeal:
     """Seal a clean full commit HEAD and invalidate evidence for a moved candidate."""
 
-    verified = _revalidate_live_candidate_binding(repository, binding, lease)
+    _require_git_entrypoint_control(control, binding.repository_id, binding.task_id, binding.base_sha)
+    verified = _revalidate_live_candidate_binding(repository, binding, lease, control=control)
     if _git(verified.worktree, "status", "--porcelain=v1", "--untracked-files=all"):
         _invalidate_candidate(repository, verified, lease)
         raise GitIdentityError("candidate worktree is dirty")
@@ -360,7 +418,8 @@ def _require_live_candidate(
 
 
 def _revalidate_live_candidate_binding(
-    repository: RepositoryIdentity, binding: WorktreeBinding, lease: TransitionLease | None
+    repository: RepositoryIdentity, binding: WorktreeBinding, lease: TransitionLease | None,
+    *, control: GitEntrypointControl | None = None,
 ) -> WorktreeBinding:
     """Invalidate candidate state after leased, exact task worktree drift."""
 
@@ -370,11 +429,30 @@ def _revalidate_live_candidate_binding(
     _require_task_binding(repository, binding, worktree)
     if not isinstance(lease, TransitionLease) or binding.state_identity != lease.state_identity:
         raise GitIdentityError("candidate state identity has drifted")
+    active_control = control if control is not None else binding.git_entrypoint_control
+    if type(active_control) is not GitEntrypointControl:
+        raise GitIdentityError("candidate worktree Git entrypoint control is unavailable")
     try:
-        return revalidate_worktree(repository, binding)
+        return revalidate_worktree(repository, binding, control=active_control)
     except GitIdentityError:
         _invalidate_candidate(repository, binding, lease)
         raise
+
+
+def _require_git_entrypoint_control(
+    control: GitEntrypointControl, repository_id: str, task_id: str, candidate_sha: str,
+) -> None:
+    if (
+        type(control) is not GitEntrypointControl
+        or control.binding.repository != repository_id
+        or control.binding.task_id != task_id
+        or control.binding.candidate_sha != candidate_sha
+    ):
+        raise GitIdentityError("git entrypoint control does not match task identity")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise GitIdentityError("git entrypoint preflight blocked execution") from error
 
 
 def _invalidate_candidate(repository: RepositoryIdentity, binding: WorktreeBinding, lease: TransitionLease | None) -> None:

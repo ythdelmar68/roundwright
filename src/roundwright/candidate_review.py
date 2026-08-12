@@ -21,14 +21,44 @@ from pathlib import Path
 from typing import Iterable
 
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
-from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
+from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
+from .worker_planning import ProviderDispatchControl
 
 
 class CandidateReviewError(StateError):
     """Raised when candidate-bound implementation or diff review is unsafe."""
+
+
+@dataclass(frozen=True)
+class CandidateValidationControl:
+    """Pre-materialized candidate-bound authority for package validation."""
+
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        self.require(self.binding, now=self.now)
+
+    def require(self, binding: CandidateBinding, *, now: int) -> None:
+        if (
+            type(self) is not CandidateValidationControl
+            or type(self.binding) is not CandidateBinding
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+            or type(binding) is not CandidateBinding
+            or self.binding != binding
+            or self.now != now
+        ):
+            raise CandidateReviewError("candidate validation control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.PACKAGE_BUILD, now=self.now)
+        except DependencyPolicyError as error:
+            raise CandidateReviewError("candidate validation preflight blocked execution") from error
 
 
 @dataclass(frozen=True)
@@ -283,6 +313,8 @@ def begin_implementation(
     identity: TaskIdentity,
     context: RecoveryContext,
     *,
+    binding: CandidateBinding,
+    control: ProviderDispatchControl,
     implementation_attempt_id: str,
     provider_attempt_id: str,
     plan_attempt_id: str,
@@ -294,10 +326,16 @@ def begin_implementation(
     process_lease_id: str,
     process_lease_expires_at: int,
     lease: TransitionLease | None,
-    now: int | None = None,
+    now: int,
 ) -> ImplementationDispatch:
     """Resume exactly the Worker accepted by plan review for an implementation turn."""
 
+    if type(binding) is not CandidateBinding or type(control) is not ProviderDispatchControl or control.binding != binding or control.now != now or binding.repository != identity.repository_id or binding.task_id != identity.task_id or binding.candidate_sha != (repair_candidate_sha or context.candidate_sha or identity.base_sha):
+        raise CandidateReviewError("implementation dispatch control is invalid")
+    try:
+        control.dependency_control.require(binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("implementation dispatch preflight blocked execution") from error
     for value, name in (
         (implementation_attempt_id, "implementation attempt identity"), (provider_attempt_id, "provider attempt identity"),
         (plan_attempt_id, "plan attempt identity"), (worker_thread_identity, "Worker thread identity"),
@@ -380,6 +418,7 @@ def record_implementation_candidate(
     context: RecoveryContext,
     binding: WorktreeBinding,
     *,
+    git_entrypoint_control: GitEntrypointControl,
     implementation_attempt_id: str,
     completion_evidence_fingerprint: str,
     lease: TransitionLease | None,
@@ -392,7 +431,7 @@ def record_implementation_candidate(
     if dispatch is None:
         raise CandidateReviewError("implementation dispatch is unavailable")
     _require_candidate_binding(identity, binding, None)
-    seal = seal_candidate(repository, binding, lease=lease)
+    seal = seal_candidate(repository, binding, control=git_entrypoint_control, lease=lease)
     _require_candidate_binding(identity, binding, seal)
     if seal.candidate_sha == identity.base_sha:
         raise CandidateReviewError("implementation candidate requires a new local commit")
@@ -435,10 +474,24 @@ def record_candidate_verification(
     seal: CandidateSeal,
     verification: CandidateVerification,
     *,
+    dependency_binding: CandidateBinding,
+    control: CandidateValidationControl,
     lease: TransitionLease | None,
+    now: int,
 ) -> None:
     """Persist a structured test/build result only for the currently clean candidate."""
 
+    if (
+        type(dependency_binding) is not CandidateBinding
+        or dependency_binding.repository != identity.repository_id
+        or dependency_binding.task_id != identity.task_id
+        or dependency_binding.candidate_sha != seal.candidate_sha
+    ):
+        raise CandidateReviewError("candidate verification control is invalid")
+    try:
+        control.require(dependency_binding, now=now)
+    except (CandidateReviewError, DependencyPolicyError) as error:
+        raise CandidateReviewError("candidate verification preflight blocked execution") from error
     value = verification.normalized()
     _require_candidate_binding(identity, binding, seal)
     candidate_evidence(repository, binding, seal, lease=lease)
@@ -446,7 +499,7 @@ def record_candidate_verification(
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _require_lease(connection, lease, identity, None)
+        _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "diff-review")
         existing = connection.execute(
             "SELECT verification_kind, outcome, evidence_fingerprint, justification FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? AND verification_id = ?",
@@ -490,6 +543,8 @@ def dispatch_diff_review(
     binding: WorktreeBinding,
     seal: CandidateSeal,
     *,
+    dependency_binding: CandidateBinding,
+    control: ProviderDispatchControl,
     diff_review_attempt_id: str,
     implementation_attempt_id: str,
     provider_attempt_id: str,
@@ -506,6 +561,20 @@ def dispatch_diff_review(
 ) -> DiffReviewDispatch:
     """Dispatch one fresh read-only review of exactly ``base...candidate``."""
 
+    if (
+        type(dependency_binding) is not CandidateBinding
+        or type(control) is not ProviderDispatchControl
+        or control.binding != dependency_binding
+        or control.now != now
+        or dependency_binding.repository != identity.repository_id
+        or dependency_binding.task_id != identity.task_id
+        or dependency_binding.candidate_sha != seal.candidate_sha
+    ):
+        raise CandidateReviewError("diff review dispatch control is invalid")
+    try:
+        control.dependency_control.require(dependency_binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("diff review dispatch preflight blocked execution") from error
     for value, name in (
         (diff_review_attempt_id, "diff review identity"), (implementation_attempt_id, "implementation attempt identity"),
         (provider_attempt_id, "provider attempt identity"), (supervisor_session_identity, "Supervisor session identity"),

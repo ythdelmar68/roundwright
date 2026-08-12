@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 
 from .configuration import Configuration
-from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationReport, RoleBoundCodexCredentialStore, required_provider_selections
+from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationControl, ProviderQualificationReport, RoleBoundCodexCredentialStore, required_provider_selections
 from .provider_recovery import ProviderRole
 
 
@@ -63,15 +63,16 @@ class LiveProviderHealthFixtureResult:
         return {**payload, "manifest": {**manifest, "bundle_digest": _digest({"payload": payload, "manifest": manifest})}}
 
 
-def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:
+def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, qualification_control: ProviderQualificationControl, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:
     """Run one forced content-free qualification pass only when explicitly enabled."""
     valid_commit = type(contract_commit) is str and re.fullmatch(r"[0-9a-f]{40}", contract_commit)
     valid_candidate = candidate_sha is None or (type(candidate_sha) is str and re.fullmatch(r"[0-9a-f]{40}", candidate_sha))
     valid_case = type(case_id) is str and 0 < len(case_id) <= 128 and all(item.isalnum() or item in "._-" for item in case_id)
-    if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit:
+    if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(qualification_control) is not ProviderQualificationControl or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit:
         raise ProviderHealthError("live provider health fixture is disabled or invalid")
     try:
-        report = CodexProviderHealth(store, contract).qualify_configuration(configuration, freshness_seconds=freshness_seconds, max_attempts=1, force_refresh=True, now=now)
+        health = CodexProviderHealth(store, contract)
+        report = health.qualify_configuration(configuration, binding=qualification_control.binding, control=qualification_control, freshness_seconds=freshness_seconds, max_attempts=1, force_refresh=True, now=now)
         if type(report) is not ProviderQualificationReport: raise ValueError
         profiles = (configuration.worker.value, configuration.worker.value, *configuration.supervisor_attempt_profiles.value)
         if tuple(selection for selection in report.selections) != required_provider_selections(report.configuration): raise ValueError
@@ -79,7 +80,7 @@ def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStor
         for ordinal, ((_, role, profile_identity), observation, profile) in enumerate(zip(report.selections, report.observations, profiles, strict=True)):
             if observation.state is not HealthState.READY or not observation.is_fresh_at(now):
                 continue
-            audit = store.open_role_channel(role).audit_runtime()
+            audit = health.audit_runtime(role, binding=qualification_control.binding, control=qualification_control, now=now)
             if type(audit) is not CodexRuntimeAudit: raise ValueError
             audit_identity = ProviderHealthAuditIdentity(audit, profile)
             if audit_identity.runtime_fingerprint != observation.runtime_fingerprint: raise ValueError

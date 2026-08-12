@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,10 +56,13 @@ import socket
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')
 from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, DependencyStage, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
+from roundwright.git_identity import GitEntrypointControl
 from roundwright.local_slice import LocalSliceFixture, render_local_slice_status, run_once_local_slice
 from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.state import database_path
@@ -73,11 +77,40 @@ trusted_policy_snapshot = TrustedPolicySnapshot(
 )
 trusted_review_floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
 drifted_review_floor = ReviewPolicy(2, 9, 2, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+def dependency_digest(value):
+    return 'sha256:' + value * 64
+dependency_callbacks = []
+def trusted_dependency_policy(binding):
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, 'roundwright', VersionRange('0.0.0', '1.0.0'), 'pypi/roundwright', dependency_digest('1'), dependency_digest('2')),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, 'codex-sdk', VersionRange('1.0.0', '2.0.0'), 'registry/codex-sdk', dependency_digest('3'), dependency_digest('4')),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, 'gh', VersionRange('2.0.0', '3.0.0'), 'github/gh', dependency_digest('5'), dependency_digest('6')),
+        ComponentPolicy(DependencyComponent.BUILD_BACKEND, 'setuptools', VersionRange('69.0.0', '70.0.0'), 'pypi/setuptools', dependency_digest('7'), dependency_digest('8')),
+    )
+    policy = DependencyPolicy(binding, dependency_digest('9'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, BootstrapPolicyReceipt.create(policy, reviewer_identity=dependency_digest('a'), authority_digest=dependency_digest('b'))))
+    return policy
+def candidate_dependency_evidence(binding):
+    dependency_callbacks.append(('evidence', binding.candidate_sha))
+    policy = trusted_dependency_policy(binding)
+    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 1893456000, policy.policy_digest) for item in policy.components)
+    return policy, observations
+def trusted_dependency_admission(binding):
+    dependency_callbacks.append(('admission', binding.candidate_sha))
+    policy = trusted_dependency_policy(binding)
+    receipt = policy.transition.review
+    return TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, dependency_digest('a'), dependency_digest('b'))
+def candidate_validation(binding, kind):
+    return dependency_digest(kind.value[0])
 def run_slice(value):
     return run_once_local_slice(
         repository, value,
+        git_entrypoint_control=git_entrypoint_control(value),
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=trusted_review_floor,
+        candidate_dependency_evidence=candidate_dependency_evidence,
+        trusted_dependency_admission=trusted_dependency_admission,
+        candidate_validation=candidate_validation,
         now=datetime(2030, 1, 1, tzinfo=timezone.utc),
     )
 commands = []
@@ -123,15 +156,85 @@ def no_credential(name, *args, **kwargs):
     return original_getenv(name, *args, **kwargs)
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
+sealed_base = original_run(['git', '-C', str(root), 'rev-parse', 'refs/remotes/origin/main'], check=True, text=True, capture_output=True).stdout.strip()
+def git_entrypoint_control(value):
+    binding = CandidateBinding(value.repository_id, value.task_id, sealed_base)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, 'roundwright', VersionRange('0.0.0', '1.0.0'), 'pypi/roundwright', dependency_digest('c'), dependency_digest('d')),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, 'codex-sdk', VersionRange('1.0.0', '2.0.0'), 'registry/codex-sdk', dependency_digest('1'), dependency_digest('2')),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, 'gh', VersionRange('2.0.0', '3.0.0'), 'github/gh', dependency_digest('3'), dependency_digest('4')),
+        ComponentPolicy(DependencyComponent.BUILD_BACKEND, 'setuptools', VersionRange('69.0.0', '70.0.0'), 'pypi/setuptools', dependency_digest('5'), dependency_digest('6')),
+        ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, 'git', VersionRange('2.0.0', '3.0.0'), 'git-scm/git', dependency_digest('e'), dependency_digest('f')),
+    )
+    policy = DependencyPolicy(binding, dependency_digest('0'), 1893456000, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=dependency_digest('a'), authority_digest=dependency_digest('b'))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 1893456000, policy.policy_digest) for item in components)
+    admission = TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, dependency_digest('a'), dependency_digest('b'))
+    return GitEntrypointControl(binding, DependencyExecutionControl(policy, observations, admission), 1893456000)
+database_before_missing_admission = database_path(repository).exists()
+entrypoint_callbacks = []
+valid_entrypoint_control = git_entrypoint_control(fixture)
+def forged_entrypoint_control(binding, dependency_control):
+    value = object.__new__(GitEntrypointControl)
+    object.__setattr__(value, 'binding', binding)
+    object.__setattr__(value, 'dependency_control', dependency_control)
+    object.__setattr__(value, 'now', 1893456000)
+    return value
+stale_observations = tuple(replace(item, observed_at=1893455939) for item in valid_entrypoint_control.dependency_control.observations)
+stale_entrypoint_control = forged_entrypoint_control(valid_entrypoint_control.binding, DependencyExecutionControl(valid_entrypoint_control.dependency_control.policy, stale_observations, valid_entrypoint_control.dependency_control.admission))
+invalid_entrypoint_controls = (
+    None,
+    object(),
+    stale_entrypoint_control,
+    forged_entrypoint_control(CandidateBinding('other/repository', fixture.task_id, sealed_base), valid_entrypoint_control.dependency_control),
+    forged_entrypoint_control(CandidateBinding(fixture.repository_id, 'other-task', sealed_base), valid_entrypoint_control.dependency_control),
+    forged_entrypoint_control(CandidateBinding(fixture.repository_id, fixture.task_id, 'f' * 40), valid_entrypoint_control.dependency_control),
+)
+before_invalid_entrypoints = len(commands)
+for invalid_control in invalid_entrypoint_controls:
+    try:
+        kwargs = dict(
+            trusted_policy_snapshot=trusted_policy_snapshot,
+            trusted_review_floor=trusted_review_floor,
+            candidate_dependency_evidence=lambda binding: entrypoint_callbacks.append(('evidence', binding)) or candidate_dependency_evidence(binding),
+            trusted_dependency_admission=lambda binding: entrypoint_callbacks.append(('admission', binding)) or trusted_dependency_admission(binding),
+            candidate_validation=candidate_validation,
+            now=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
+        if invalid_control is None:
+            run_once_local_slice(repository, fixture, **kwargs)
+        else:
+            run_once_local_slice(repository, fixture, git_entrypoint_control=invalid_control, **kwargs)
+    except Exception:
+        pass
+    else:
+        raise AssertionError('invalid Git entrypoint control was accepted')
+invalid_entrypoints_leave_no_action = not entrypoint_callbacks and len(commands) == before_invalid_entrypoints and not database_path(repository).exists()
+blocked_binding = CandidateBinding('local/repository', 'blocked-task', 'c' * 40)
+blocked_policy, blocked_observations = candidate_dependency_evidence(blocked_binding)
+blocked_action = []
+for stage in DependencyStage:
+    try:
+        local_slice._execute_candidate_helper_from_factory(lambda binding: (blocked_policy, blocked_observations), lambda binding: TrustedDependencyAdmission(binding, blocked_policy.core_fingerprint, dependency_digest('0'), dependency_digest('a'), dependency_digest('b')), blocked_policy.binding, stage, lambda stage=stage: blocked_action.append(stage.value), 1893456000)
+    except Exception:
+        pass
+blocked_candidate_helper = not blocked_action
 try:
-    run_once_local_slice(repository, fixture, now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+    run_once_local_slice(repository, fixture, git_entrypoint_control=git_entrypoint_control(fixture), now=datetime(2030, 1, 1, tzinfo=timezone.utc))
 except Exception:
     missing_trusted_floor_rejected = True
 else:
     missing_trusted_floor_rejected = False
+database_after_missing_admission = database_path(repository).exists()
 before_first = len(commands)
+callbacks_before_first = len(dependency_callbacks)
 first = run_slice(fixture)
 first_pass_commands = len(commands) - before_first
+first_candidate_callback_counts = [
+    sum(1 for kind, candidate_sha in dependency_callbacks[callbacks_before_first:] if kind == expected_kind and candidate_sha == first.candidate.candidate_sha)
+    for expected_kind in ('admission', 'evidence')
+]
 connection = sqlite3.connect(database_path(repository))
 try:
     leases_after_first = connection.execute("SELECT COUNT(*) FROM transition_leases").fetchone()[0]
@@ -158,6 +261,7 @@ state_module._open_writable_connection = original_writable_connection
 try:
     run_once_local_slice(
         repository, fixture,
+        git_entrypoint_control=git_entrypoint_control(fixture),
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=drifted_review_floor,
         now=datetime(2030, 1, 1, tzinfo=timezone.utc),
@@ -241,6 +345,7 @@ print(json.dumps({
     'artifacts': [item.kind for item in first.task.artifacts],
     'blockers': first.task.blockers,
     'missing_trusted_floor_rejected': missing_trusted_floor_rejected,
+    'missing_admission_has_no_domain_state': not database_before_missing_admission and not database_after_missing_admission,
     'drifted_trusted_floor_rejected': drifted_trusted_floor_rejected,
     'changed_source_rejected': changed_source_rejected,
     'transitions': transitions,
@@ -264,6 +369,9 @@ print(json.dumps({
     'platform_normalization_matches': platform_normalization_matches,
     'leases': [leases_after_first, leases_after_replay_and_failure],
     'failure_released_lease': failure_released_lease,
+    'blocked_candidate_helper': blocked_candidate_helper,
+    'invalid_entrypoints_leave_no_action': invalid_entrypoints_leave_no_action,
+    'first_candidate_callback_counts': first_candidate_callback_counts,
 }))
 """ % (str(installed), str(fixture))
             environment = {"PATH": os.environ["PATH"]}
@@ -281,6 +389,7 @@ print(json.dumps({
             self.assertEqual(result["artifacts"], ["diff", "plan", "review", "status"])
             self.assertEqual(result["blockers"], [])
             self.assertTrue(result["missing_trusted_floor_rejected"])
+            self.assertTrue(result["missing_admission_has_no_domain_state"])
             self.assertTrue(result["drifted_trusted_floor_rejected"])
             self.assertTrue(result["changed_source_rejected"])
             self.assertEqual(result["transitions"], [
@@ -315,6 +424,9 @@ print(json.dumps({
             self.assertTrue(result["platform_normalization_matches"])
             self.assertEqual(result["leases"], [0, 0])
             self.assertTrue(result["failure_released_lease"])
+            self.assertTrue(result["blocked_candidate_helper"])
+            self.assertTrue(result["invalid_entrypoints_leave_no_action"])
+            self.assertEqual(result["first_candidate_callback_counts"], [2, 2])
             expected_na = {"dependency-graph", "github-trace", "public-identifier", "live-proof", "external-ci"}
             self.assertEqual({row[0] for row in result["gates"]}, {
                 "plan-review", "candidate-seal", "supervisor-diff-review", "targeted-tests", "full-tests", "build",

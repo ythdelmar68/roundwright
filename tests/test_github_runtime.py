@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from uuid import UUID
 
 from roundwright.deployment import (
@@ -16,6 +17,7 @@ from roundwright.deployment import (
     DeploymentAuthorityReceipt, DeploymentIdentity, DeploymentMode,
     _receipt_binding_fingerprint, evaluate_deployment_authority,
 )
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.github import (
     CommentSnapshot,
     CommentsSnapshot,
@@ -38,6 +40,9 @@ from roundwright.github_runtime import (
     _GhCommandResult as GhCommandResult,
     DurableMutationJournal,
     _OwnerGitHubReadHostEndpoint as _OwnerGitHubReadHostEndpoint,
+    _OwnerGitHubReadControl as _OwnerGitHubReadControl,
+    _OwnerGitHubMutationControl as _OwnerGitHubMutationControl,
+    _OwnerGitHubBrokerMutationControl as _OwnerGitHubBrokerMutationControl,
     GhMutationPayload,
     GitHubCapabilityHealth,
     GitHubMutationBroker,
@@ -55,6 +60,7 @@ from roundwright.github_runtime import (
     OwnerGitHubReadIpcClient,
     OwnerFixedMutationCommand,
     OwnerFixedMutationHostExecutor,
+    InMemoryOwnerMutationControlRegistry,
     InMemoryOwnerMutationSealRegistry,
     OperationHealth,
     SemanticPostcondition,
@@ -94,12 +100,30 @@ REPOSITORY = RepositoryRef("example", "roundwright")
 NOW = datetime(2026, 8, 7, tzinfo=timezone.utc)
 
 
+def owner_read_binding() -> CandidateBinding:
+    return CandidateBinding(REPOSITORY.slug, "github-read-host", SHA)
+
+
+def owner_mutation_binding(candidate_sha: str = SHA) -> CandidateBinding:
+    return CandidateBinding(REPOSITORY.slug, "github-mutation-host", candidate_sha)
+
+
+def owner_broker_binding(candidate_sha: str = SHA) -> CandidateBinding:
+    return CandidateBinding(REPOSITORY.slug, "7" * 64, candidate_sha)
+
+
 def GhGitHubAdapter(
     runner: Runner, matrix: GitHubCapabilityHealth | None = None, *, clock=lambda: NOW,
 ) -> _OwnerGitHubReadHostEndpoint:
     """Construct the credentialed host only with a hermetic owner clock."""
 
-    return _OwnerGitHubReadHostEndpoint(runner, matrix, clock=clock)
+    try:
+        observed_at = clock()
+    except Exception:
+        observed_at = NOW
+    control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
+    binding = owner_read_binding()
+    return _OwnerGitHubReadHostEndpoint(runner, binding, owner_read_control(binding=binding, now=control_now), matrix, clock=clock)
 
 
 class Runner:
@@ -110,6 +134,31 @@ class Runner:
     def run(self, arguments: tuple[str, ...]) -> GhCommandResult:
         self.calls.append(arguments)
         return self.results.pop(0)
+
+
+def owner_read_control(
+    *, binding: CandidateBinding | None = None, now: datetime = NOW,
+) -> _OwnerGitHubReadControl:
+    """Build only test-owned sealed read evidence; role clients never receive it."""
+
+    digest = lambda value: "sha256:" + value * 64
+    candidate_binding = binding or owner_read_binding()
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
+    )
+    policy = DependencyPolicy(candidate_binding, digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b"))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(
+        ObservedDependency(candidate_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), policy.policy_digest)
+        for item in components
+    )
+    return _OwnerGitHubReadControl(
+        candidate_binding,
+        DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(candidate_binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))),
+        int(now.timestamp()),
+    )
 
 
 class OwnerTransport:
@@ -150,6 +199,83 @@ class OwnerTransport:
         return result
 
 
+def owner_mutation_control(
+    request: OwnerMutationRequest, *, now: datetime = NOW,
+    binding: CandidateBinding | None = None, operation: GitHubMutationOperation | None = None,
+) -> _OwnerGitHubMutationControl:
+    """Build test-only sealed fixed-host evidence; no role client receives it."""
+
+    digest = lambda value: "sha256:" + value * 64
+    candidate_binding = binding or owner_mutation_binding(request.candidate_sha)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
+    )
+    policy = DependencyPolicy(candidate_binding, digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b"))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(
+        ObservedDependency(candidate_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), policy.policy_digest)
+        for item in components
+    )
+    return _OwnerGitHubMutationControl(
+        request.identity, candidate_binding, operation or request.operation,
+        DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(candidate_binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))),
+        int(now.timestamp()),
+    )
+
+
+class FixtureOwnerMutationControlRegistry:
+    """Test-only control source; production hosts receive a fixed registry."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def resolve(self, request: OwnerMutationRequest) -> _OwnerGitHubMutationControl:
+        return owner_mutation_control(request, now=self.now)
+
+
+def owner_broker_control(
+    intent: GitHubMutationIntent, *, now: datetime = NOW,
+    binding: CandidateBinding | None = None, operation: GitHubMutationOperation | None = None,
+) -> _OwnerGitHubBrokerMutationControl:
+    """Build test-only sealed broker evidence; role callers cannot receive it."""
+
+    digest = lambda value: "sha256:" + value * 64
+    candidate_binding = binding or owner_broker_binding()
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", digest("5"), digest("6")),
+    )
+    policy = DependencyPolicy(candidate_binding, digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("a"), authority_digest=digest("b"))
+    policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(
+        ObservedDependency(candidate_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), policy.policy_digest)
+        for item in components
+    )
+    return _OwnerGitHubBrokerMutationControl(
+        intent.identity(), candidate_binding, operation or intent.operation,
+        DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(candidate_binding, policy.core_fingerprint, receipt.receipt_digest, digest("a"), digest("b"))),
+        int(now.timestamp()),
+    )
+
+
+class FixtureOwnerBrokerMutationControlRegistry:
+    """Test-only pre-provisioned source; the production constructor requires it."""
+
+    def __init__(self, binding: CandidateBinding, clock=lambda: NOW) -> None:
+        self.binding = binding
+        self.clock = clock
+
+    def resolve(self, intent: GitHubMutationIntent) -> _OwnerGitHubBrokerMutationControl:
+        return owner_broker_control(intent, binding=self.binding, now=self.clock())
+
+
+def owner_broker_controls(*, binding: CandidateBinding | None = None, clock=lambda: NOW) -> FixtureOwnerBrokerMutationControlRegistry:
+    return FixtureOwnerBrokerMutationControlRegistry(binding or owner_broker_binding(), clock)
+
+
 class FixtureOwnerSealRegistry:
     """Hermetic endpoint registry; production registry records are pre-provisioned."""
 
@@ -185,8 +311,14 @@ def owner_endpoint(
     transport: OwnerTransport | None = None, *, clock=lambda: NOW,
 ) -> OwnerMutationIpcClient:
     host = transport or OwnerTransport()
+    try:
+        observed_at = clock()
+    except Exception:
+        observed_at = NOW
+    control_now = observed_at if type(observed_at) is datetime and observed_at.tzinfo is timezone.utc else NOW
+    binding = owner_mutation_binding()
     endpoint = OwnerMutationHostEndpoint(
-        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host), clock=clock,
+        FixtureOwnerSealRegistry(), OwnerFixedMutationHostExecutor(host, binding), binding, FixtureOwnerMutationControlRegistry(control_now), clock=clock,
     )
     return OwnerMutationIpcClient(DIGEST, endpoint)
 
@@ -531,15 +663,271 @@ def allowed_context(
     )
     deployment = evaluate_deployment_authority(deployment_identity, deployment_receipt, deployment_verification, now=now)
     assert deployment.authorized
+    dependency_digest = lambda value: "sha256:" + value * 64
+    dependency_binding = CandidateBinding(REPOSITORY.slug, mutation_context.task_fingerprint, SHA)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", dependency_digest("1"), dependency_digest("2")),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange("1.0.0", "2.0.0"), "registry/codex-sdk", dependency_digest("3"), dependency_digest("4")),
+        ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github/gh", dependency_digest("5"), dependency_digest("6")),
+        ComponentPolicy(DependencyComponent.BUILD_BACKEND, "setuptools", VersionRange("69.0.0", "70.0.0"), "pypi/setuptools", dependency_digest("7"), dependency_digest("8")),
+    )
+    dependency_policy = DependencyPolicy(dependency_binding, dependency_digest("9"), int(now.timestamp()), 3600, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    dependency_receipt = BootstrapPolicyReceipt.create(dependency_policy, reviewer_identity=dependency_digest("a"), authority_digest=dependency_digest("b"))
+    dependency_policy = replace(dependency_policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, dependency_receipt))
+    dependency_control = DependencyExecutionControl(dependency_policy, tuple(ObservedDependency(dependency_binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, int(now.timestamp()), dependency_policy.policy_digest) for item in components), TrustedDependencyAdmission(dependency_binding, dependency_policy.core_fingerprint, dependency_receipt.receipt_digest, dependency_digest("a"), dependency_digest("b")))
     return MutationBrokerContext(
         policy, deployment, DIGEST, BASE, SHA, DIGEST, standing, verification,
         mutation_context, transition, snapshot, receipt, deployment_identity,
         deployment_receipt, deployment_verification, now, REPOSITORY,
-        REPOSITORY, REPOSITORY, "main", "codex/issue-46",
+        REPOSITORY, REPOSITORY, "main", "codex/issue-46", dependency_control,
     )
 
 
 class GitHubRuntimeTests(unittest.TestCase):
+    def test_missing_dependency_control_blocks_before_reads_journal_or_transport(self) -> None:
+        intent, payload = pull_request_intent()
+        context = replace(allowed_context(RepositoryMutationOperation.CREATE_DRAFT_PR), dependency_control=None)
+        matrix = health(
+            GitHubReadOperation.BRANCH, GitHubReadOperation.PULL_REQUEST,
+            GitHubMutationOperation.CREATE_PULL_REQUEST,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path = Path(directory) / "journal.json"
+            adapter, transport = FakeGitHubAdapter({}), OwnerTransport()
+            result = GitHubMutationBroker(
+                adapter, journal=DurableMutationJournal(journal_path),
+                _executor=_GhBrokerExecutor(transport, matrix),
+            ).submit(intent, context, payload=payload)
+            self.assertFalse(result.ok)
+            self.assertEqual(adapter.call_count(kind="read"), 0)
+            self.assertEqual(transport.requests, [])
+            self.assertFalse(journal_path.exists())
+
+    def test_invalid_context_dependency_precedes_broker_clock_and_owner_control_callbacks(self) -> None:
+        """Submit and reconcile reject context evidence before every broker callback."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "context-ordering-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+        base = allowed_context()
+        assert base.dependency_control is not None
+        control = base.dependency_control
+        stale_observations = tuple(replace(item, observed_at=int(NOW.timestamp()) - 3_601) for item in control.observations)
+        missing_stage = DependencyExecutionControl(control.policy, control.observations[:2], control.admission)
+        replaced = replace(base)
+        object.__setattr__(replaced, "dependency_control", object())
+        contexts = (
+            replace(base, dependency_control=None),
+            replaced,
+            replace(base, dependency_control=DependencyExecutionControl(control.policy, stale_observations, control.admission)),
+            replace(base, dependency_control=missing_stage),
+            replace(base, candidate_sha="f" * 40),
+            replace(base, repository=RepositoryRef("other", "repository")),
+            replace(base, mutation_context=replace(base.mutation_context, task_fingerprint="e" * 64)),
+        )
+
+        class CountingClock:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self) -> datetime:
+                self.calls += 1
+                raise AssertionError("invalid context reached broker clock")
+
+        class CountingControls:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def resolve(self, _: GitHubMutationIntent) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached owner control resolver")
+
+        class CountingReadChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_read(self, _: GitHubReadRequest) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached read IPC")
+
+            def exchange_collection_page(self, _: GitHubReadRequest, __: str | None) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached paginated read IPC")
+
+        class CountingMutationChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_mutation(self, _: OwnerMutationIpcMessage) -> object:
+                self.calls += 1
+                raise AssertionError("invalid context reached mutation IPC")
+
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        for context in contexts:
+            for route in ("submit", "reconcile"):
+                with self.subTest(route=route, context_type=type(context.dependency_control).__name__), tempfile.TemporaryDirectory() as directory:
+                    clock, controls = CountingClock(), CountingControls()
+                    reads, mutations = CountingReadChannel(), CountingMutationChannel()
+                    journal_path = Path(directory) / "journal.json"
+                    broker = GitHubMutationBroker.with_owner_transport(
+                        OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                        journal=DurableMutationJournal(journal_path), binding=owner_broker_binding(),
+                        controls=controls, clock=clock,
+                    )
+                    result = getattr(broker, route)(intent, context)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                    self.assertEqual((clock.calls, controls.calls, reads.calls, mutations.calls), (0, 0, 0, 0))
+                    self.assertFalse(journal_path.exists())
+
+    def test_owner_broker_control_denials_precede_journal_readback_and_transport(self) -> None:
+        """Broker submit consumes only the exact owner control before every action."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "broker-control-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+
+        class CountingReadChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_read(self, _: GitHubReadRequest) -> object:
+                self.calls += 1
+                raise AssertionError("denied broker submit reached readback IPC")
+
+            def exchange_collection_page(self, _: GitHubReadRequest, __: str | None) -> object:
+                self.calls += 1
+                raise AssertionError("denied broker submit reached paginated readback IPC")
+
+        class CountingMutationChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_mutation(self, _: OwnerMutationIpcMessage) -> object:
+                self.calls += 1
+                raise AssertionError("denied broker submit reached mutation IPC")
+
+        class StaticControls:
+            def __init__(self, control: object | None) -> None:
+                self.control = control
+                self.calls = 0
+
+            def resolve(self, _: GitHubMutationIntent) -> object | None:
+                self.calls += 1
+                return self.control
+
+        controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_broker_control(intent, binding=CandidateBinding("other/repository", "7" * 64, SHA)),
+            owner_broker_control(intent, binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
+            owner_broker_control(intent, binding=CandidateBinding(REPOSITORY.slug, "7" * 64, "f" * 40)),
+            owner_broker_control(intent, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_broker_control(intent, now=NOW - timedelta(seconds=1)),
+        )
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        for control in controls:
+            with self.subTest(control_type=type(control).__name__), tempfile.TemporaryDirectory() as directory:
+                reads, mutations, registry = CountingReadChannel(), CountingMutationChannel(), StaticControls(control)
+                journal_path = Path(directory) / "journal.json"
+                broker = GitHubMutationBroker.with_owner_transport(
+                    OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                    journal=DurableMutationJournal(journal_path), binding=owner_broker_binding(),
+                    controls=registry, clock=lambda: NOW,
+                )
+                result = broker.submit(intent, allowed_context())
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(registry.calls, 1)
+                self.assertEqual(reads.calls, 0)
+                self.assertEqual(mutations.calls, 0)
+                self.assertFalse(journal_path.exists())
+
+    def test_owner_broker_control_precedes_direct_and_existing_journal_reconciliation(self) -> None:
+        """Reconcile needs the same owner control without re-resolving it on submit."""
+
+        intent = GitHubMutationIntent(
+            GitHubMutationOperation.COMMENT, REPOSITORY, "broker-reconcile-control-46",
+            target_number=46, payload=(("body_digest", COMMENT_DIGEST),),
+        )
+
+        class CountingReadChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_read(self, _: GitHubReadRequest) -> object:
+                self.calls += 1
+                raise AssertionError("denied reconciliation reached readback IPC")
+
+            def exchange_collection_page(self, _: GitHubReadRequest, __: str | None) -> object:
+                self.calls += 1
+                raise AssertionError("denied reconciliation reached paginated readback IPC")
+
+        class CountingMutationChannel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def exchange_mutation(self, _: OwnerMutationIpcMessage) -> object:
+                self.calls += 1
+                raise AssertionError("denied reconciliation reached mutation IPC")
+
+        class StaticControls:
+            def __init__(self, control: object | None) -> None:
+                self.control = control
+                self.calls = 0
+
+            def resolve(self, _: GitHubMutationIntent) -> object | None:
+                self.calls += 1
+                return self.control
+
+        matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
+        denied_controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_broker_control(intent, binding=CandidateBinding("other/repository", "7" * 64, SHA)),
+            owner_broker_control(intent, binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
+            owner_broker_control(intent, binding=CandidateBinding(REPOSITORY.slug, "7" * 64, "f" * 40)),
+            owner_broker_control(replace(intent, idempotency_key="other-intent-46")),
+            owner_broker_control(intent, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_broker_control(intent, now=NOW - timedelta(seconds=1)),
+        )
+        for control in denied_controls:
+            with self.subTest(route="direct", control_type=type(control).__name__), tempfile.TemporaryDirectory() as directory:
+                reads, mutations, controls = CountingReadChannel(), CountingMutationChannel(), StaticControls(control)
+                journal = DurableMutationJournal(Path(directory) / "journal.json")
+                broker = GitHubMutationBroker.with_owner_transport(
+                    OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                    journal=journal, binding=owner_broker_binding(), controls=controls, clock=lambda: NOW,
+                )
+                with mock.patch.object(DurableMutationJournal, "find_recovery", side_effect=AssertionError("denied reconciliation loaded journal")):
+                    result = broker.reconcile(intent, allowed_context())
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(controls.calls, 1)
+                self.assertEqual(reads.calls, 0)
+                self.assertEqual(mutations.calls, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = allowed_context()
+            journal = DurableMutationJournal(Path(directory) / "journal.json")
+            entry = MutationJournalEntry.from_evidence(
+                intent, context, schema_v2_authorization_bundle(context), _broker_semantic_plan(intent),
+            )
+            journal.claim(entry)
+            reads, mutations = CountingReadChannel(), CountingMutationChannel()
+            controls = StaticControls(owner_broker_control(intent))
+            broker = GitHubMutationBroker.with_owner_transport(
+                OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
+                journal=journal, binding=owner_broker_binding(), controls=controls, clock=lambda: NOW,
+            )
+            result = broker.submit(intent, context)
+            self.assertFalse(result.ok)
+            self.assertEqual(controls.calls, 1)
+            self.assertEqual(reads.calls, 0)
+            self.assertEqual(mutations.calls, 0)
+
     def test_created_resource_locator_is_total_and_canonical(self) -> None:
         pull_request = CreatedResourceLocator(
             GitHubMutationOperation.CREATE_PULL_REQUEST, REPOSITORY,
@@ -634,7 +1022,8 @@ class GitHubRuntimeTests(unittest.TestCase):
         request = sealed_owner_request()
         transport = OwnerTransport()
         endpoint = OwnerMutationHostEndpoint(
-            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport),
+            InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)), OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)),
+            owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)),
             clock=lambda: NOW,
         )
         self.assertFalse(hasattr(endpoint, "dispatch"))
@@ -677,11 +1066,90 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.subTest(record=record is None):
                 denied_transport = OwnerTransport()
                 denied = OwnerMutationHostEndpoint(
-                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport), clock=lambda: NOW,
+                    StaticRegistry(record), OwnerFixedMutationHostExecutor(denied_transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), FixtureOwnerMutationControlRegistry(NOW), clock=lambda: NOW,
                 ).exchange_mutation(OwnerMutationIpcMessage(request)).fact
                 self.assertIsInstance(denied, OwnerMutationFact)
                 self.assertEqual(denied_transport.requests, [])
                 self.assertEqual(denied_transport.commands, [])
+
+    def test_owner_mutation_dependency_controls_block_before_seal_consumption_or_transport(self) -> None:
+        """The fixed host rejects every untrusted control before any mutable seam."""
+
+        request = sealed_owner_request()
+
+        class CountingSealRegistry:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def resolve_and_consume(self, _: OwnerMutationRequest) -> OwnerMutationSealRecord:
+                self.calls += 1
+                return sealed_owner_record(request)
+
+        class StaticControls:
+            def __init__(self, control: object | None) -> None:
+                self.control = control
+                self.calls = 0
+
+            def resolve(self, _: OwnerMutationRequest) -> object | None:
+                self.calls += 1
+                return self.control
+
+        controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_mutation_control(request, binding=CandidateBinding("other/repository", "github-mutation-host", SHA)),
+            owner_mutation_control(request, binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
+            owner_mutation_control(request, binding=CandidateBinding(REPOSITORY.slug, "github-mutation-host", "f" * 40)),
+            owner_mutation_control(request, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_mutation_control(request, now=NOW - timedelta(seconds=1)),
+        )
+        for control in controls:
+            with self.subTest(control_type=type(control).__name__):
+                transport, seals, registry = OwnerTransport(), CountingSealRegistry(), StaticControls(control)
+                endpoint = OwnerMutationHostEndpoint(
+                    seals, OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), registry, clock=lambda: NOW,
+                )
+                fact = endpoint.exchange_mutation(OwnerMutationIpcMessage(request)).fact
+                self.assertIsInstance(fact, OwnerMutationFact)
+                self.assertEqual(registry.calls, 1)
+                self.assertEqual(seals.calls, 0)
+                self.assertEqual(transport.requests, [])
+                self.assertEqual(transport.commands, [])
+
+    def test_fixed_executor_requires_exact_mutation_control_before_handler(self) -> None:
+        """The direct fixed-executor seam cannot bypass endpoint preflight."""
+
+        request = sealed_owner_request()
+        record = sealed_owner_record(request)
+        binding = owner_mutation_binding(request.candidate_sha)
+        valid = owner_mutation_control(request, binding=binding)
+        forged_wrong_stage = object.__new__(_OwnerGitHubMutationControl)
+        object.__setattr__(forged_wrong_stage, "request_identity", valid.request_identity)
+        object.__setattr__(forged_wrong_stage, "binding", valid.binding)
+        object.__setattr__(forged_wrong_stage, "operation", valid.operation)
+        object.__setattr__(
+            forged_wrong_stage, "dependency_control",
+            DependencyExecutionControl(valid.dependency_control.policy, valid.dependency_control.observations[:1], valid.dependency_control.admission),
+        )
+        object.__setattr__(forged_wrong_stage, "now", valid.now)
+        controls: tuple[object | None, ...] = (
+            None,
+            object(),
+            owner_mutation_control(request, binding=CandidateBinding("other/repository", binding.task_id, request.candidate_sha)),
+            owner_mutation_control(request, binding=CandidateBinding(binding.repository, "other-task", request.candidate_sha)),
+            owner_mutation_control(request, binding=CandidateBinding(binding.repository, binding.task_id, "f" * 40)),
+            owner_mutation_control(request, operation=GitHubMutationOperation.CLOSE_ISSUE),
+            owner_mutation_control(request, now=NOW - timedelta(seconds=1)),
+            forged_wrong_stage,
+        )
+        for control in controls:
+            with self.subTest(control_type=type(control).__name__):
+                transport = OwnerTransport()
+                executor = OwnerFixedMutationHostExecutor(transport, binding)
+                with self.assertRaises(ValueError):
+                    executor.execute_fixed(record, control=control, now=NOW)  # type: ignore[arg-type]
+                self.assertEqual(transport.commands, [])
+                self.assertEqual(transport.requests, [])
 
     def test_owner_fixed_executor_has_total_sealed_operation_mapping_without_process_access(self) -> None:
         """Every operation reaches the host only as a sealed fixed command shape."""
@@ -715,7 +1183,10 @@ class GitHubRuntimeTests(unittest.TestCase):
                 values["marker_digest"] = COMMENT_DIGEST
             request = OwnerMutationRequest(DIGEST, operation, DIGEST, DIGEST, DIGEST, REPOSITORY, **values)
             transport = OwnerTransport()
-            fact = OwnerFixedMutationHostExecutor(transport).execute_fixed(sealed_owner_record(request))
+            binding = owner_mutation_binding(request.candidate_sha)
+            fact = OwnerFixedMutationHostExecutor(transport, binding).execute_fixed(
+                sealed_owner_record(request), control=owner_mutation_control(request, binding=binding), now=NOW,
+            )
             with self.subTest(operation=operation):
                 self.assertIsInstance(fact, OwnerMutationAcceptedFact)
                 self.assertEqual(transport.commands[0].command, command)
@@ -734,13 +1205,14 @@ class GitHubRuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 GitHubMutationBroker.with_owner_transport(
                     runner, owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                    binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW,
                 )
         self.assertEqual(runner.calls, [])
 
         with self.assertRaises(ValueError):
-            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport())  # type: ignore[arg-type]
+            OwnerMutationHostEndpoint(FixtureOwnerSealRegistry(), OwnerTransport(), object(), object())  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
-            OwnerFixedMutationHostExecutor(object())  # type: ignore[arg-type]
+            OwnerFixedMutationHostExecutor(object(), object())  # type: ignore[arg-type]
 
     def test_production_ipc_clients_have_no_reachable_process_or_credential_capability(self) -> None:
         """The broker graph retains only absent-by-default typed IPC clients."""
@@ -755,7 +1227,8 @@ class GitHubRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             broker = GitHubMutationBroker.with_owner_transport(
                 read_client, mutation_client,
-                journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW,
+                journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW,
             )
 
             seen: set[int] = set()
@@ -791,7 +1264,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         transport = OwnerTransport()
         host = OwnerMutationHostEndpoint(
             InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-            OwnerFixedMutationHostExecutor(transport), clock=lambda: NOW,
+            OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
         )
         client = OwnerMutationIpcClient(DIGEST, host)
         with self.assertRaises(ValueError):
@@ -833,7 +1306,8 @@ class GitHubRuntimeTests(unittest.TestCase):
                 runner, transport = Runner(), OwnerTransport()
                 broker = GitHubMutationBroker.with_owner_transport(
                     owner_read_endpoint(runner, matrix), owner_endpoint(transport),
-                    journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: clock_now,
+                    journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                    binding=owner_broker_binding(), controls=owner_broker_controls(clock=lambda: clock_now), clock=lambda: clock_now,
                 )
                 result = broker.submit(intent, replace(context, evaluated_at=context_now), payload=payload)
                 self.assertFalse(result.ok)
@@ -862,7 +1336,8 @@ class GitHubRuntimeTests(unittest.TestCase):
                 transport = OwnerTransport()
                 result = GitHubMutationBroker.with_owner_transport(
                     owner_read_endpoint(runner, matrix, clock=lambda: now), owner_endpoint(transport, clock=lambda: now),
-                    journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: now,
+                    journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                    binding=owner_broker_binding(), controls=owner_broker_controls(clock=lambda: now), clock=lambda: now,
                 ).submit(intent, allowed_context(now=now), payload=payload)
                 self.assertTrue(result.ok)
                 self.assertEqual(len(transport.requests), 1)
@@ -871,7 +1346,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         """AVAILABLE is insufficient outside the owner-clock validity interval."""
 
         with self.assertRaises(ValueError):
-            _OwnerGitHubReadHostEndpoint(Runner(), health(GitHubReadOperation.COMMENTS))
+            _OwnerGitHubReadHostEndpoint(Runner(), owner_read_binding(), health(GitHubReadOperation.COMMENTS))
         observed_at = NOW
         fresh_until = NOW + timedelta(minutes=5)
         cases = (
@@ -891,6 +1366,31 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertEqual(result.failure.kind, GitHubFailureKind.STALE_RESPONSE)  # type: ignore[union-attr]
                 self.assertEqual(runner.calls, [])
 
+    def test_credentialed_read_host_control_denials_precede_runner_and_host_actions(self) -> None:
+        """Missing, replaced, and stale sealed controls cannot start a host read."""
+
+        matrix = health(GitHubReadOperation.REVIEWS)
+        request = reviews_request()
+        runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
+        with self.assertRaises(ValueError):
+            _OwnerGitHubReadHostEndpoint(runner, owner_read_binding(), None, matrix, clock=lambda: NOW)  # type: ignore[arg-type]
+        self.assertEqual(runner.calls, [])
+        controls = (
+            owner_read_control(binding=CandidateBinding("other/repository", "github-read-host", SHA)),
+            owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
+            owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "github-read-host", "f" * 40)),
+            owner_read_control(now=NOW - timedelta(seconds=1)),
+        )
+        for control in controls:
+            with self.subTest(binding=control.binding, control_now=control.now):
+                runner = Runner(GhCommandResult(0, json.dumps(gh_reviews_page())))
+                endpoint = _OwnerGitHubReadHostEndpoint(runner, owner_read_binding(), control, matrix, clock=lambda: NOW)
+                result = endpoint.read(request)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.kind, GitHubFailureKind.POLICY_DENIED)  # type: ignore[union-attr]
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(endpoint.calls, [])
+
     def test_mutation_host_rejects_pre_evaluated_and_expired_seals_before_execution(self) -> None:
         """Host execution is valid only in [evaluated_at, fresh_until)."""
 
@@ -905,7 +1405,7 @@ class GitHubRuntimeTests(unittest.TestCase):
                 transport = OwnerTransport()
                 host = OwnerMutationHostEndpoint(
                     InMemoryOwnerMutationSealRegistry((sealed_owner_record(request),)),
-                    OwnerFixedMutationHostExecutor(transport), clock=lambda: NOW,
+                    OwnerFixedMutationHostExecutor(transport, owner_mutation_binding(request.candidate_sha)), owner_mutation_binding(request.candidate_sha), InMemoryOwnerMutationControlRegistry((owner_mutation_control(request),)), clock=lambda: NOW,
                 )
                 reply = host.exchange_mutation(OwnerMutationIpcMessage(request))
                 self.assertIsInstance(reply.fact, OwnerMutationFact)
@@ -933,14 +1433,15 @@ class GitHubRuntimeTests(unittest.TestCase):
                 GitHubMutationBroker.with_owner_transport(
                     owner_read_endpoint(Runner(GhCommandResult(0, json.dumps(gh_comments_page()))), matrix),
                     owner_endpoint(OwnerTransport()), journal=DurableMutationJournal(path),
-                    clock=lambda: NOW, checkpoint_observer=crash,
+                    binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW, checkpoint_observer=crash,
                 ).submit(intent, allowed_context(), payload=payload)
 
             before_expiry = fresh_until - timedelta(microseconds=1)
             restart_runner, restart_transport = Runner(GhCommandResult(0, json.dumps(gh_comments_page()))), OwnerTransport()
             recovered = GitHubMutationBroker.with_owner_transport(
                 owner_read_endpoint(restart_runner, matrix), owner_endpoint(restart_transport),
-                journal=DurableMutationJournal(path), clock=lambda: before_expiry,
+                journal=DurableMutationJournal(path), binding=owner_broker_binding(),
+                controls=owner_broker_controls(clock=lambda: before_expiry), clock=lambda: before_expiry,
             ).reconcile(intent, allowed_context(now=before_expiry))
             self.assertFalse(recovered.ok)
             self.assertEqual(restart_runner.calls, [])
@@ -949,7 +1450,8 @@ class GitHubRuntimeTests(unittest.TestCase):
             expired_runner, expired_transport = Runner(), OwnerTransport()
             expired = GitHubMutationBroker.with_owner_transport(
                 owner_read_endpoint(expired_runner, matrix), owner_endpoint(expired_transport),
-                journal=DurableMutationJournal(path), clock=lambda: fresh_until,
+                journal=DurableMutationJournal(path), binding=owner_broker_binding(),
+                controls=owner_broker_controls(clock=lambda: fresh_until), clock=lambda: fresh_until,
             ).reconcile(intent, allowed_context(now=fresh_until))
             self.assertFalse(expired.ok)
             self.assertEqual(expired_runner.calls, [])
@@ -1087,7 +1589,8 @@ class GitHubRuntimeTests(unittest.TestCase):
                 reads, mutations = CountingReadChannel(), CountingMutationChannel()
                 broker = GitHubMutationBroker.with_owner_transport(
                     OwnerGitHubReadIpcClient(matrix, reads), OwnerMutationIpcClient(DIGEST, mutations),
-                    journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW,
+                    journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                    binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW,
                 )
                 result = broker.submit(drifted, drifted_context, payload=payload)
                 self.assertFalse(result.ok)
@@ -2699,7 +3202,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             def crash(entry: MutationJournalEntry) -> None:
                 if entry.lifecycle is JournalLifecycle.TRANSPORT_ACCEPTED:
                     raise RuntimeError("crash")
-            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=journal, clock=lambda: NOW, checkpoint_observer=crash)
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=journal, binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW, checkpoint_observer=crash)
             with self.assertRaises(RuntimeError):
                 broker.submit(intent, context, payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),)))
             entry = MutationJournalEntry.from_evidence(intent, context, schema_v2_authorization_bundle(context, health=matrix), _broker_semantic_plan(intent))
@@ -2710,7 +3213,8 @@ class GitHubRuntimeTests(unittest.TestCase):
             restart_transport = OwnerTransport()
             result = GitHubMutationBroker.with_owner_transport(
                 owner_read_endpoint(restart_runner, matrix), owner_endpoint(restart_transport),
-                journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW,
+                journal=DurableMutationJournal(Path(directory) / "journal.json"),
+                binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW,
             ).submit(intent, context)
             self.assertTrue(result.ok)
             self.assertEqual(restart_transport.requests, [])
@@ -2931,7 +3435,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
             transport = OwnerTransport()
-            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW)
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(transport), journal=DurableMutationJournal(Path(directory) / "journal.json"), binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW)
             result = broker.submit(intent, allowed_context(), payload=GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", body),)))
             self.assertTrue(result.ok)
             self.assertEqual(len(runner.calls), 2)
@@ -2955,7 +3459,7 @@ class GitHubRuntimeTests(unittest.TestCase):
         )
         matrix = health(GitHubReadOperation.COMMENTS, GitHubMutationOperation.COMMENT)
         with tempfile.TemporaryDirectory() as directory:
-            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"), clock=lambda: NOW)
+            broker = GitHubMutationBroker.with_owner_transport(owner_read_endpoint(runner, matrix), owner_endpoint(), journal=DurableMutationJournal(Path(directory) / "journal.json"), binding=owner_broker_binding(), controls=owner_broker_controls(), clock=lambda: NOW)
             payload = GhMutationPayload(GitHubMutationOperation.COMMENT, (("body", "curated evidence"),))
             first = broker.submit(intent, allowed_context(), payload=payload)
             self.assertFalse(first.ok)

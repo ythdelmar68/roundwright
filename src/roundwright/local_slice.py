@@ -15,8 +15,11 @@ import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable, Iterable
 
 from .candidate_review import (
+    CandidateReviewError,
+    CandidateValidationControl,
     CandidateVerification,
     DiffReviewOutput,
     DiffReviewVerdict,
@@ -29,6 +32,7 @@ from .candidate_review import (
     record_implementation_candidate,
 )
 from .configuration import RepositoryIdentity, ReviewPolicy, resolve_dispatch_configuration
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAdmission, execute_after_dependency_preflight
 from .gates import (
     EvidenceOutcome,
     GATE_REGISTRY,
@@ -42,7 +46,7 @@ from .gates import (
     task_identity_fingerprint,
     transition_ready_for_owner,
 )
-from .git_identity import CandidateSeal, provision_worktree, resolve_canonical_base, transition_lease
+from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, provision_worktree, resolve_canonical_base, transition_lease
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
@@ -53,6 +57,7 @@ from .worker_planning import (
     PlanningInput,
     WorkerPlan,
     WorkerPlanOutput,
+    ProviderDispatchControl,
     accept_plan_review_and_begin_implementation,
     begin_planning,
     dispatch_plan,
@@ -92,8 +97,12 @@ def run_once_local_slice(
     repository: RepositoryIdentity,
     fixture: LocalSliceFixture,
     *,
+    git_entrypoint_control: GitEntrypointControl,
     trusted_policy_snapshot: TrustedPolicySnapshot | None = None,
     trusted_review_floor: ReviewPolicy | None = None,
+    candidate_dependency_evidence: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
+    trusted_dependency_admission: Callable[[CandidateBinding], TrustedDependencyAdmission] | None = None,
+    candidate_validation: Callable[[CandidateBinding, VerificationKind], str] | None = None,
     now: datetime | None = None,
 ) -> LocalSliceResult:
     """Drive one local task to ready-for-owner, or return its exact completed replay.
@@ -104,12 +113,37 @@ def run_once_local_slice(
     APIs.  A second call is intentionally a read-only completion replay.
     """
 
-    if type(fixture) is not LocalSliceFixture or not isinstance(fixture.worktree, Path):
+    if type(repository) is not RepositoryIdentity or type(fixture) is not LocalSliceFixture or not isinstance(fixture.worktree, Path):
         raise LocalSliceError("local slice fixture is invalid")
     if not isinstance(fixture.source_contents, str) or not fixture.source_contents:
         raise LocalSliceError("local slice source is invalid")
-
-    base_sha = resolve_canonical_base(repository, "main")
+    if type(git_entrypoint_control) is not GitEntrypointControl:
+        raise LocalSliceError("local slice Git entrypoint control is invalid")
+    if (
+        git_entrypoint_control.binding.repository != fixture.repository_id
+        or git_entrypoint_control.binding.task_id != fixture.task_id
+    ):
+        raise LocalSliceError("local slice Git entrypoint control does not match fixture identity")
+    instant = datetime.now(timezone.utc) if now is None else now
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise LocalSliceError("local slice clock must be timezone-aware")
+    epoch = int(instant.timestamp())
+    if git_entrypoint_control.now != epoch:
+        raise LocalSliceError("local slice clock does not match Git entrypoint control")
+    try:
+        git_entrypoint_control.dependency_control.require(
+            git_entrypoint_control.binding, DependencyStage.GIT_ENTRYPOINT, now=git_entrypoint_control.now
+        )
+        base_sha = resolve_canonical_base(repository, "main", control=git_entrypoint_control)
+    except (DependencyPolicyError, GitIdentityError) as error:
+        raise LocalSliceError("local slice Git entrypoint preflight blocked execution") from error
+    if base_sha != git_entrypoint_control.binding.candidate_sha:
+        raise LocalSliceError("local slice canonical base does not match Git entrypoint control")
+    base_dependency_binding = CandidateBinding(fixture.repository_id, fixture.task_id, base_sha)
+    try:
+        git_entrypoint_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice dispatch preflight blocked execution") from error
     identity = TaskIdentity(
         fixture.task_id,
         fixture.source_id,
@@ -120,6 +154,7 @@ def run_once_local_slice(
     )
     configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
     runtime_binding = configuration.pin().runtime_binding()
+    dispatch_control = _materialize_dispatch_control(candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, epoch)
     database = check_database(repository)
     if database.state == "healthy":
         completed = _completed_result(repository, identity, fixture, runtime_binding)
@@ -130,10 +165,6 @@ def run_once_local_slice(
     else:
         raise LocalSliceError("local slice database is unavailable")
 
-    instant = datetime.now(timezone.utc) if now is None else now
-    if instant.tzinfo is None or instant.utcoffset() is None:
-        raise LocalSliceError("local slice clock must be timezone-aware")
-    epoch = int(instant.timestamp())
     try:
         with transition_lease(
             repository,
@@ -142,7 +173,7 @@ def run_once_local_slice(
             ttl_seconds=120,
             now=epoch,
         ) as lease:
-            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding)
+            return _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, base_dependency_binding, dispatch_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation)
     except StateError as error:
         raise LocalSliceError(str(error)) from error
 
@@ -167,7 +198,7 @@ def render_local_slice_status(result: LocalSliceResult) -> str:
     )
 
 
-def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding):
+def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configuration, runtime_binding, git_entrypoint_control, base_dependency_binding, dispatch_control, candidate_dependency_evidence, trusted_dependency_admission, candidate_validation):
     source_contents = _normalized_source_contents(fixture.source_contents)
     source = SourceSnapshot(identity.source_id, identity.repository_id, _fingerprint("source", source_contents))
     admit_task(repository, identity, (source,), lease=lease)
@@ -205,7 +236,7 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         plan_attempt_id="local-plan", provider_attempt_id="local-worker-plan",
         worker_thread_identity="local-worker-thread", external_turn_identity="local-plan-turn",
         process_lease_id="local-plan-lease", process_lease_expires_at=epoch + 60,
-        lease=lease, now=epoch,
+        binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
     persisted_plan = record_plan(
         repository, identity, context, plan_attempt_id=plan_dispatch.plan_attempt_id,
@@ -224,7 +255,8 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         review_attempt_id="local-plan-review", provider_attempt_id="local-plan-supervisor",
         supervisor_session_identity="local-plan-supervisor-session", external_turn_identity="local-plan-review-turn",
         plan_attempt_id=persisted_plan.plan_attempt_id, process_lease_id="local-plan-review-lease",
-        process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0], lease=lease, now=epoch,
+        process_lease_expires_at=epoch + 60, selected_profile_identity=runtime_binding.supervisor_profile_identities[0],
+        binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
     record_plan_review(
         repository, identity, context, review_attempt_id=plan_review.review_attempt_id,
@@ -243,24 +275,35 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         evidence_fingerprint=_fingerprint("begin-implementation", identity.task_id), lease=lease,
     )
 
-    binding = provision_worktree(repository, identity, default_branch="main", worktree=fixture.worktree, lease=lease)
+    binding = provision_worktree(
+        repository, identity, default_branch="main", worktree=fixture.worktree,
+        control=git_entrypoint_control, lease=lease,
+    )
     implementation = begin_implementation(
         repository, identity, _health_context(context, identity, ProviderRole.WORKER, configuration.worker.value, epoch),
         implementation_attempt_id="local-implementation", provider_attempt_id="local-worker-implementation",
         plan_attempt_id=persisted_plan.plan_attempt_id, worker_thread_identity=plan_dispatch.worker_thread_identity,
         external_turn_identity="local-implementation-turn", process_lease_id="local-implementation-lease",
-        process_lease_expires_at=epoch + 60, lease=lease, now=epoch,
+        process_lease_expires_at=epoch + 60, binding=base_dependency_binding, control=dispatch_control, lease=lease, now=epoch,
     )
-    _commit_local_implementation(binding.worktree, source_contents)
+    _commit_local_implementation(binding.worktree, source_contents, control=git_entrypoint_control)
     seal = record_implementation_candidate(
         repository, identity, context, binding, implementation_attempt_id=implementation.implementation_attempt_id,
+        git_entrypoint_control=git_entrypoint_control,
         completion_evidence_fingerprint=_fingerprint("implementation", identity.task_id), lease=lease, now=epoch,
     )
+    candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
+    try:
+        dispatch_control.dependency_control.require(base_dependency_binding, DependencyStage.PACKAGE_BUILD, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice candidate build preflight blocked evidence collection") from error
+    candidate_validation_control = _materialize_validation_control(
+        candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, epoch,
+    )
     for verification_id, kind in (("local-targeted-tests", VerificationKind.TEST), ("local-build", VerificationKind.BUILD)):
-        record_candidate_verification(
-            repository, identity, binding, seal,
-            CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha)),
-            lease=lease,
+        _run_and_record_candidate_validation(
+            candidate_validation, candidate_binding, candidate_validation_control,
+            repository, identity, binding, seal, verification_id, kind, lease, epoch,
         )
 
     candidate_context = RecoveryContext.for_task(
@@ -268,8 +311,17 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
         policy_fingerprint=context.policy_fingerprint, deployment_fingerprint=context.deployment_fingerprint,
         runtime_binding=runtime_binding,
     )
+    candidate_binding = CandidateBinding(identity.repository_id, identity.task_id, seal.candidate_sha)
+    try:
+        dispatch_control.dependency_control.require(base_dependency_binding, DependencyStage.DISPATCH, now=epoch)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local slice candidate dispatch preflight blocked evidence collection") from error
+    candidate_dispatch_control = _materialize_dispatch_control(
+        candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, epoch,
+    )
     diff_review = dispatch_diff_review(
         repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
+        dependency_binding=candidate_binding, control=candidate_dispatch_control,
         diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
         provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",
         external_turn_identity="local-diff-review-turn", message_identity="local-diff-review-message",
@@ -481,11 +533,116 @@ def _gate_evidence(identity, seal, instant, runtime_binding):
     return context, TrustedGatePolicyEvidence(snapshot, receipt, StandingAuthority(frozenset(PolicyAction)), instant, ReceiptStatus.FRESH)
 
 
-def _commit_local_implementation(worktree: Path, source_contents: str) -> None:
+def _commit_local_implementation(
+    worktree: Path, source_contents: str, *, control: GitEntrypointControl,
+) -> None:
+    if type(control) is not GitEntrypointControl:
+        raise LocalSliceError("local implementation Git entrypoint control is invalid")
+    try:
+        control.dependency_control.require(control.binding, DependencyStage.GIT_ENTRYPOINT, now=control.now)
+    except DependencyPolicyError as error:
+        raise LocalSliceError("local implementation Git entrypoint preflight blocked execution") from error
     target = worktree / "implementation.txt"
     target.write_text(source_contents, encoding="utf-8")
     _git(worktree, "add", target.name)
     _git(worktree, "commit", "-m", "feat(local-slice): record hermetic implementation")
+
+
+def _execute_candidate_diff_helper(
+    binding: CandidateBinding,
+    policy: DependencyPolicy | None,
+    observations: Iterable[ObservedDependency] | None,
+    action: Callable[[], object],
+    now: int,
+) -> object:
+    """Canonical candidate-bound provider helper boundary for the local slice."""
+
+    try:
+        return execute_after_dependency_preflight(
+            binding, policy, observations, DependencyStage.DISPATCH, now=now, action=action,
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _execute_candidate_helper_from_factory(
+    factory: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None,
+    admission_factory: Callable[[CandidateBinding], TrustedDependencyAdmission] | None,
+    binding: CandidateBinding,
+    stage: DependencyStage,
+    action: Callable[[], object],
+    now: int,
+) -> object:
+    """Require trusted evidence before every local-slice helper execution."""
+
+    if not callable(factory) or not callable(admission_factory):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        trusted_admission = admission_factory(binding)
+        policy, observations = factory(binding)
+    except (DependencyPolicyError, TypeError, ValueError) as error:
+        raise LocalSliceError("candidate dependency evidence is unavailable") from error
+    try:
+        return execute_after_dependency_preflight(
+            binding, policy, observations, stage, now=now, action=action,
+            previous_policy=trusted_admission.previous_policy,
+            trusted_admission=trusted_admission,
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _materialize_dispatch_control(factory, admission_factory, binding, now):
+    if not callable(factory) or not callable(admission_factory):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        trusted_admission = admission_factory(binding)
+        policy, observations = factory(binding)
+        return execute_after_dependency_preflight(
+            binding, policy, observations, DependencyStage.DISPATCH, now=now,
+            previous_policy=trusted_admission.previous_policy, trusted_admission=trusted_admission,
+            action=lambda: ProviderDispatchControl(binding, DependencyExecutionControl(policy, tuple(observations), trusted_admission), now),
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _materialize_validation_control(factory, admission_factory, binding, now):
+    if not callable(factory) or not callable(admission_factory):
+        raise LocalSliceError("candidate dependency evidence is unavailable")
+    try:
+        trusted_admission = admission_factory(binding)
+        policy, observations = factory(binding)
+        return execute_after_dependency_preflight(
+            binding, policy, observations, DependencyStage.PACKAGE_BUILD, now=now,
+            previous_policy=trusted_admission.previous_policy, trusted_admission=trusted_admission,
+            action=lambda: CandidateValidationControl(
+                binding, DependencyExecutionControl(policy, tuple(observations), trusted_admission), now,
+            ),
+        )
+    except DependencyPolicyError as error:
+        raise LocalSliceError("candidate dependency preflight blocked helper execution") from error
+
+
+def _run_and_record_candidate_validation(validation, candidate_binding, control, repository, identity, worktree_binding, seal, verification_id, kind, lease, now):
+    """Run the actual validation callback before durable PASS evidence exists."""
+
+    if not callable(validation):
+        raise LocalSliceError("candidate validation is unavailable")
+    try:
+        control.require(candidate_binding, now=now)
+    except (CandidateReviewError, DependencyPolicyError) as error:
+        raise LocalSliceError("candidate validation preflight blocked execution") from error
+    evidence = validation(candidate_binding, kind)
+    if not isinstance(evidence, str) or not evidence:
+        raise LocalSliceError("candidate validation is invalid")
+    return record_candidate_verification(
+        repository, identity, worktree_binding, seal,
+        CandidateVerification(verification_id, kind, VerificationOutcome.PASS, _fingerprint(verification_id, seal.candidate_sha, evidence)),
+        dependency_binding=candidate_binding, control=control,
+        lease=lease,
+        now=now,
+    )
 
 
 def _git(directory: Path, *arguments: str) -> str:

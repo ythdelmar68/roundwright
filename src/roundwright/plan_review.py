@@ -16,6 +16,7 @@ from enum import StrEnum
 from typing import Iterable
 
 from .configuration import RepositoryIdentity
+from .dependency_policy import CandidateBinding, DependencyPolicyError, DependencyStage
 from .git_identity import TransitionLease, _require_current_lease
 from .provider_recovery import (
     AttemptState,
@@ -33,6 +34,7 @@ from .provider_recovery import (
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task
 from .worker_planning import (
     PlanAttemptState,
+    ProviderDispatchControl,
     WorkerPlanningError,
     _items as _canonical_plan_findings,
     read_plan,
@@ -161,6 +163,8 @@ def dispatch_plan_review(
     identity: TaskIdentity,
     context: RecoveryContext,
     *,
+    binding: CandidateBinding,
+    control: ProviderDispatchControl,
     review_attempt_id: str,
     provider_attempt_id: str,
     supervisor_session_identity: str,
@@ -170,10 +174,16 @@ def dispatch_plan_review(
     process_lease_expires_at: int,
     selected_profile_identity: str | None = None,
     lease: TransitionLease | None,
-    now: int | None = None,
+    now: int,
 ) -> PlanReviewDispatch:
     """Persist a new, non-reusable Supervisor session before review output exists."""
 
+    if type(binding) is not CandidateBinding or type(control) is not ProviderDispatchControl or control.binding != binding or control.now != now or binding.repository != identity.repository_id or binding.task_id != identity.task_id or binding.candidate_sha != (context.candidate_sha or identity.base_sha):
+        raise PlanReviewError("plan review dispatch control is invalid")
+    try:
+        control.dependency_control.require(binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise PlanReviewError("plan review dispatch preflight blocked execution") from error
     for value, name in (
         (review_attempt_id, "review attempt identity"),
         (provider_attempt_id, "provider attempt identity"),

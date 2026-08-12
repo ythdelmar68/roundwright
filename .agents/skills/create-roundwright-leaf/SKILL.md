@@ -107,6 +107,17 @@ For historical replay, require the immutable evidence bundle's capture time.
 Live provider evidence uses the top-level integer `ready_at`; current wall-clock
 time is never an allowed substitute.
 
+## Capture-readiness preflight
+
+When a leaf declares a Shadow capture, its profile declaration must name capture
+mode, producer, readiness point, arm-before boundary, retention/read-back
+contract, and missing-history/recapture behavior. Before an ephemeral
+observation window can open, planning must bind the exact base/candidate,
+profile/schema, typed exporter/comparator, reviewed Recorder, append-only
+content-addressed store, and immutable capture time. The selected profile's
+readiness preflight must pass before its arm-before boundary. Candidate movement
+requires recapture; planning must never reconstruct missing historical evidence.
+
 ## Compose the issue body
 
 Start from the tracked GitHub template and fill every applicable field:

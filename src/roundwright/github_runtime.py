@@ -32,6 +32,7 @@ from .deployment import (
     DeploymentAuthorityReceipt, DeploymentIdentity, DeploymentMode,
     evaluate_deployment_authority,
 )
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .github import (
     BranchSnapshot,
     CommentsSnapshot,
@@ -555,6 +556,50 @@ class OwnerGitHubReadIpcClient:
         ))
 
 
+@dataclass(frozen=True)
+class _OwnerGitHubReadControl:
+    """Owner-host-only sealed dependency authority for credentialed reads."""
+
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise GitHubRuntimeError("owner read dependency control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_READ, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner read dependency control is invalid") from error
+
+    def require(self, request: GitHubReadRequest, binding: CandidateBinding, *, now: datetime) -> None:
+        if (
+            type(self) is not _OwnerGitHubReadControl
+            or type(request) is not GitHubReadRequest
+            or type(binding) is not CandidateBinding
+            or type(now) is not datetime
+            or now.tzinfo is not timezone.utc
+            or self.now != int(now.timestamp())
+            or self.binding != binding
+            or self.binding.repository != request.repository.slug
+        ):
+            raise GitHubRuntimeError("owner read dependency control is invalid")
+        if (
+            request.expected_sha is not None
+            and request.operation not in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
+            and request.expected_sha != self.binding.candidate_sha
+        ):
+            raise GitHubRuntimeError("owner read dependency control does not match the requested candidate")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_READ, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner read dependency control is stale") from error
+
+
 class _OwnerGitHubReadHostEndpoint:
     """``gh api`` adapter with explicit health gating and no mutation fallback.
 
@@ -567,12 +612,15 @@ class _OwnerGitHubReadHostEndpoint:
     """
 
     def __init__(
-        self, runner: _FixedGhReadRunner, health: GitHubCapabilityHealth | None = None,
+        self, runner: _FixedGhReadRunner, binding: CandidateBinding, control: _OwnerGitHubReadControl,
+        health: GitHubCapabilityHealth | None = None,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if not hasattr(runner, "run") or clock is None:
+        if not hasattr(runner, "run") or type(binding) is not CandidateBinding or type(control) is not _OwnerGitHubReadControl or clock is None:
             raise GitHubRuntimeError("gh runner is invalid")
         self.__runner = runner
+        self.__binding = binding
+        self.__control = control
         self._health = health or unavailable_capability_health()
         self.__clock = clock
         self.calls: list[tuple[str, str]] = []
@@ -581,24 +629,31 @@ class _OwnerGitHubReadHostEndpoint:
     def health(self) -> GitHubCapabilityHealth:
         return self._health
 
-    def _fresh_failure(self, operation: GitHubReadOperation) -> GitHubFailure | None:
+    def _fresh_failure(self, request: GitHubReadRequest) -> GitHubFailure | None:
         """Read-host evidence is valid only at one owner-clock observation."""
 
         try:
             now = self.__clock()
         except Exception:
-            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "owner read clock is unavailable")
+            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, request.operation, "owner read clock is unavailable")
         if type(now) is not datetime or now.tzinfo is not timezone.utc:
-            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, operation, "owner read clock is invalid")
-        return _health_failure(operation, self._health, now=now)
+            return GitHubFailure(GitHubFailureKind.STALE_RESPONSE, request.operation, "owner read clock is invalid")
+        health_failure = _health_failure(request.operation, self._health, now=now)
+        if health_failure is not None:
+            return health_failure
+        try:
+            self.__control.require(request, self.__binding, now=now)
+        except (DependencyPolicyError, GitHubRuntimeError, ValueError):
+            return GitHubFailure(GitHubFailureKind.POLICY_DENIED, request.operation, "owner read dependency preflight blocked execution")
+        return None
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
         if type(request) is not GitHubReadRequest:
             raise GitHubContractError("read request is invalid")
-        self.calls.append(("read", request.operation.value))
-        blocked = self._fresh_failure(request.operation)
+        blocked = self._fresh_failure(request)
         if blocked is not None:
             return GitHubReadResult(request, failure=blocked)
+        self.calls.append(("read", request.operation.value))
         if request.operation is GitHubReadOperation.REPOSITORY:
             return self._read_repository(request)
         if request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
@@ -887,9 +942,9 @@ class _OwnerGitHubReadHostEndpoint:
             return None
         if cursor is not None and (type(cursor) is not str or not _CURSOR.fullmatch(cursor)):
             return None
-        self.calls.append(("collection-read", request.operation.value))
-        if self._fresh_failure(request.operation) is not None:
+        if self._fresh_failure(request) is not None:
             return None
+        self.calls.append(("collection-read", request.operation.value))
         command = (
             _requested_reviewers_collection_command(request, cursor)
             if request.operation is GitHubReadOperation.REQUESTED_REVIEWERS
@@ -1175,6 +1230,7 @@ class MutationBrokerContext:
     head_repository: RepositoryRef
     base_ref: str
     head_ref: str
+    dependency_control: DependencyExecutionControl | None = None
 
     def __post_init__(self) -> None:
         if (type(self.policy) is not RepositoryMutationDecision or type(self.deployment) is not DeploymentAuthorityDecision
@@ -1198,6 +1254,8 @@ class MutationBrokerContext:
             GitHubReadRequest(GitHubReadOperation.BRANCH, self.head_repository, ref=self.head_ref, expected_sha=self.candidate_sha)
         except (TypeError, ValueError) as error:
             raise GitHubRuntimeError("broker pull request reference evidence is invalid") from error
+        if self.dependency_control is not None and type(self.dependency_control) is not DependencyExecutionControl:
+            raise GitHubRuntimeError("broker dependency execution control is invalid")
 
 
 def schema_v2_authorization_bundle(
@@ -2027,6 +2085,73 @@ class _OwnerFixedMutationCommandHandler(Protocol):
     ) -> OwnerMutationAcceptedFact: ...
 
 
+@dataclass(frozen=True)
+class _OwnerGitHubMutationControl:
+    """Pre-provisioned owner-only authority for one fixed mutation request."""
+
+    request_identity: str
+    binding: CandidateBinding
+    operation: GitHubMutationOperation
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.operation) is not GitHubMutationOperation
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise GitHubRuntimeError("owner mutation dependency control is invalid")
+        _digest(self.request_identity, "owner mutation dependency request")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner mutation dependency control is invalid") from error
+
+    def require(self, request: OwnerMutationRequest, binding: CandidateBinding, *, now: datetime) -> None:
+        if (
+            type(self) is not _OwnerGitHubMutationControl
+            or type(request) is not OwnerMutationRequest
+            or type(binding) is not CandidateBinding
+            or type(now) is not datetime
+            or now.tzinfo is not timezone.utc
+            or self.now != int(now.timestamp())
+            or self.request_identity != request.identity
+            or self.binding != binding
+            or self.binding.repository != request.repository.slug
+            or self.binding.candidate_sha != request.candidate_sha
+            or self.operation is not request.operation
+        ):
+            raise GitHubRuntimeError("owner mutation dependency control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner mutation dependency control is stale") from error
+
+
+class _OwnerMutationControlRegistry(Protocol):
+    """Owner-only source for exact pre-materialized mutation controls."""
+
+    def resolve(self, request: OwnerMutationRequest) -> _OwnerGitHubMutationControl | None: ...
+
+
+class InMemoryOwnerMutationControlRegistry:
+    """Hermetic immutable control registry for owner-host tests and wiring."""
+
+    def __init__(self, controls: tuple[_OwnerGitHubMutationControl, ...]) -> None:
+        if type(controls) is not tuple or any(type(control) is not _OwnerGitHubMutationControl for control in controls):
+            raise GitHubRuntimeError("owner mutation dependency controls are invalid")
+        if len({control.request_identity for control in controls}) != len(controls):
+            raise GitHubRuntimeError("owner mutation dependency controls are duplicated")
+        self.__controls = {control.request_identity: control for control in controls}
+
+    def resolve(self, request: OwnerMutationRequest) -> _OwnerGitHubMutationControl | None:
+        if type(request) is not OwnerMutationRequest:
+            raise GitHubRuntimeError("owner mutation dependency request is invalid")
+        return self.__controls.get(request.identity)
+
+
 class OwnerFixedMutationHostExecutor:
     """Concrete disabled owner-host executor for sealed fixed command shapes.
 
@@ -2035,12 +2160,23 @@ class OwnerFixedMutationHostExecutor:
     denial before any credential or process access.
     """
 
-    def __init__(self, handler: _OwnerFixedMutationCommandHandler) -> None:
-        if not hasattr(handler, "execute_fixed_command"):
+    def __init__(self, handler: _OwnerFixedMutationCommandHandler, binding: CandidateBinding) -> None:
+        if not hasattr(handler, "execute_fixed_command") or type(binding) is not CandidateBinding:
             raise GitHubRuntimeError("owner fixed mutation handler is unavailable")
         self.__handler = handler
+        self.__binding = binding
 
-    def execute_fixed(self, record: OwnerMutationSealRecord) -> OwnerMutationAcceptedFact:
+    def _matches_binding(self, binding: CandidateBinding) -> bool:
+        return type(binding) is CandidateBinding and self.__binding == binding
+
+    def execute_fixed(
+        self, record: OwnerMutationSealRecord, *, control: _OwnerGitHubMutationControl, now: datetime,
+    ) -> OwnerMutationAcceptedFact:
+        """Execute only after exact host-owned mutation authority is re-proved."""
+
+        if type(record) is not OwnerMutationSealRecord or type(control) is not _OwnerGitHubMutationControl:
+            raise GitHubRuntimeError("owner fixed mutation dependency control is invalid")
+        control.require(record.request, self.__binding, now=now)
         command = _owner_fixed_mutation_command(record)
         fact = self.__handler.execute_fixed_command(command, record)
         if (
@@ -2075,39 +2211,56 @@ class OwnerMutationHostEndpoint:
 
     def __init__(
         self, registry: OwnerMutationSealRegistry, executor: OwnerFixedMutationHostExecutor,
+        binding: CandidateBinding, controls: _OwnerMutationControlRegistry,
         *, clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
             not hasattr(registry, "resolve_and_consume")
             or type(executor) is not OwnerFixedMutationHostExecutor
+            or type(binding) is not CandidateBinding
+            or not executor._matches_binding(binding)
+            or not hasattr(controls, "resolve")
             or clock is None
         ):
             raise GitHubRuntimeError("owner mutation host endpoint is unavailable")
         self.__registry = registry
         self.__executor = executor
+        self.__binding = binding
+        self.__controls = controls
         self.__clock = clock
 
     def _dispatch(self, request: OwnerMutationRequest) -> OwnerMutationFact | OwnerMutationAcceptedFact:
         if type(request) is not OwnerMutationRequest:
             raise GitHubRuntimeError("owner mutation host request is invalid")
+        try:
+            now = self.__clock()
+        except (TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
+        if type(now) is not datetime or now.tzinfo is not timezone.utc:
+            return OwnerMutationFact(False, request.identity)
+        try:
+            control = self.__controls.resolve(request)
+            if type(control) is not _OwnerGitHubMutationControl:
+                return OwnerMutationFact(False, request.identity)
+            control.require(request, self.__binding, now=now)
+        except (AttributeError, DependencyPolicyError, TypeError, ValueError):
+            return OwnerMutationFact(False, request.identity)
         record = self.__registry.resolve_and_consume(request)
         if type(record) is not OwnerMutationSealRecord or not record.matches(request):
             return OwnerMutationFact(False, request.identity)
         if request.command is not _MUTATION_COMMAND_BY_OPERATION[request.operation]:
             return OwnerMutationFact(False, request.identity)
         try:
-            now = self.__clock()
             evaluated_at = datetime.fromisoformat(record.evaluated_at)
             fresh_until = datetime.fromisoformat(record.fresh_until)
         except (TypeError, ValueError):
             return OwnerMutationFact(False, request.identity)
         if (
-            type(now) is not datetime or now.tzinfo is not timezone.utc
-            or now < evaluated_at or now >= fresh_until
+            now < evaluated_at or now >= fresh_until
         ):
             return OwnerMutationFact(False, request.identity)
         try:
-            fact = self.__executor.execute_fixed(record)
+            fact = self.__executor.execute_fixed(record, control=control, now=now)
         except (AttributeError, TypeError, ValueError):
             return OwnerMutationFact(False, request.identity)
         if type(fact) is not OwnerMutationAcceptedFact or fact.request_identity != request.identity or fact.operation is not request.operation:
@@ -2443,18 +2596,117 @@ def _created_comment_locator_matches_intent(
     )
 
 
+@dataclass(frozen=True)
+class _OwnerGitHubBrokerMutationControl:
+    """Owner-side sealed authority for one broker submit operation."""
+
+    intent_identity: str
+    binding: CandidateBinding
+    operation: GitHubMutationOperation
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CandidateBinding
+            or type(self.operation) is not GitHubMutationOperation
+            or type(self.dependency_control) is not DependencyExecutionControl
+            or type(self.now) is not int
+        ):
+            raise GitHubRuntimeError("owner broker dependency control is invalid")
+        _digest(self.intent_identity, "owner broker dependency intent")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner broker dependency control is invalid") from error
+
+    def require(self, intent: GitHubMutationIntent, context: MutationBrokerContext, binding: CandidateBinding, *, now: datetime) -> None:
+        if (
+            type(self) is not _OwnerGitHubBrokerMutationControl
+            or type(intent) is not GitHubMutationIntent
+            or type(context) is not MutationBrokerContext
+            or type(binding) is not CandidateBinding
+            or type(now) is not datetime
+            or now.tzinfo is not timezone.utc
+            or self.now != int(now.timestamp())
+            or self.intent_identity != intent.identity()
+            or self.binding != binding
+            or self.operation is not intent.operation
+            or binding.repository != intent.repository.slug
+            or binding.repository != context.repository.slug
+            or binding.task_id != context.mutation_context.task_fingerprint
+            or binding.candidate_sha != context.candidate_sha
+        ):
+            raise GitHubRuntimeError("owner broker dependency control is invalid")
+        try:
+            self.dependency_control.require(binding, DependencyStage.GITHUB_MUTATION, now=self.now)
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("owner broker dependency control is stale") from error
+
+
+class _OwnerBrokerMutationControlRegistry(Protocol):
+    """Private owner-side source for exact broker-submit controls."""
+
+    def resolve(self, intent: GitHubMutationIntent) -> _OwnerGitHubBrokerMutationControl | None: ...
+
+
+@dataclass(frozen=True)
+class _OwnerBrokerMutationAuthorization:
+    """Private proof that the owner control was resolved once for this route."""
+
+    intent_identity: str
+    binding: CandidateBinding
+    now: int
+
+    def matches(self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime) -> bool:
+        return (
+            type(self) is _OwnerBrokerMutationAuthorization
+            and type(intent) is GitHubMutationIntent
+            and type(context) is MutationBrokerContext
+            and type(now) is datetime
+            and now.tzinfo is timezone.utc
+            and self.now == int(now.timestamp())
+            and self.intent_identity == intent.identity()
+            and self.binding.repository == intent.repository.slug == context.repository.slug
+            and self.binding.task_id == context.mutation_context.task_fingerprint
+            and self.binding.candidate_sha == context.candidate_sha
+        )
+
+
 class _GhBrokerExecutor:
     """Private credential-owning seam; only broker construction creates it."""
 
-    def __init__(self, transport: OwnerMutationTransport, health: GitHubCapabilityHealth) -> None:
-        if not hasattr(transport, "dispatch"):
+    def __init__(self, transport: OwnerMutationTransport, health: GitHubCapabilityHealth, binding: CandidateBinding | None = None, controls: _OwnerBrokerMutationControlRegistry | None = None) -> None:
+        if (
+            not hasattr(transport, "dispatch")
+            or (binding is None) != (controls is None)
+            or (binding is not None and type(binding) is not CandidateBinding)
+            or (controls is not None and not hasattr(controls, "resolve"))
+        ):
             raise GitHubRuntimeError("owner mutation transport is invalid")
         self.__transport = transport
         self.__health = health
+        self.__binding = binding
+        self.__controls = controls
 
     @property
     def health(self) -> GitHubCapabilityHealth:
         return self.__health
+
+    @property
+    def requires_owner_dependency_control(self) -> bool:
+        return self.__controls is not None
+
+    def require_dependency(
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime,
+    ) -> _OwnerBrokerMutationAuthorization:
+        if self.__controls is None or self.__binding is None:
+            raise GitHubRuntimeError("owner broker dependency control is unavailable")
+        control = self.__controls.resolve(intent)
+        if type(control) is not _OwnerGitHubBrokerMutationControl:
+            raise GitHubRuntimeError("owner broker dependency control is unavailable")
+        control.require(intent, context, self.__binding, now=now)
+        return _OwnerBrokerMutationAuthorization(intent.identity(), self.__binding, int(now.timestamp()))
 
     def execute(
         self, intent: GitHubMutationIntent, payload: GhMutationPayload, command: BrokerMutationCommand,
@@ -2584,7 +2836,7 @@ class GitHubMutationBroker:
 
     @classmethod
     def with_owner_transport(
-        cls, read_endpoint: OwnerGitHubReadIpcClient, transport: OwnerMutationIpcClient, *, journal: DurableMutationJournal, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
+        cls, read_endpoint: OwnerGitHubReadIpcClient, transport: OwnerMutationIpcClient, *, journal: DurableMutationJournal, binding: CandidateBinding, controls: _OwnerBrokerMutationControlRegistry, clock: Callable[[], datetime] | None = None, checkpoint_observer: Callable[[MutationJournalEntry], None] | None = None,
     ) -> "GitHubMutationBroker":
         """Create the only production path from owner-host typed endpoints."""
 
@@ -2594,9 +2846,11 @@ class GitHubMutationBroker:
             raise GitHubRuntimeError("live broker requires an owner mutation IPC client")
         if type(read_endpoint) is not OwnerGitHubReadIpcClient:
             raise GitHubRuntimeError("live broker requires an owner github read IPC client")
+        if type(binding) is not CandidateBinding or not hasattr(controls, "resolve"):
+            raise GitHubRuntimeError("live broker requires owner dependency controls")
         if clock is None:
             raise GitHubRuntimeError("live broker requires an injected trusted clock")
-        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health), clock=clock, checkpoint_observer=checkpoint_observer)
+        return cls(read_endpoint, journal=journal, _executor=_GhBrokerExecutor(transport, read_endpoint.health, binding, controls), clock=clock, checkpoint_observer=checkpoint_observer)
 
     def submit(
         self,
@@ -2614,7 +2868,16 @@ class GitHubMutationBroker:
         if pre_state is not None or readback is not None or semantic_plan is not None or command is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
+            self._require_context_dependency_control(intent, context)
             now = self._now(context)
+            self._require_context_dependency_control(intent, context, now=now)
+            owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
+        except (AttributeError, KeyError, TypeError, ValueError, GitHubRuntimeError):
+            return BrokerMutationResult(failure=GitHubFailure(
+                GitHubFailureKind.POLICY_DENIED, intent.operation,
+                "owner dependency preflight blocked mutation execution",
+            ))
+        try:
             plan = _broker_semantic_plan(intent)
             self._require_capabilities(intent, plan, now)
             bound_health = self.__health if not self.__clock_is_default else None
@@ -2644,7 +2907,10 @@ class GitHubMutationBroker:
             except (AttributeError, TypeError, ValueError):
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if not created:
-                return self._reconcile_journal(intent, context, bundle, plan, evidence, journal_entry)
+                return self._reconcile_journal(
+                    intent, context, bundle, plan, evidence, journal_entry,
+                    owner_authorization=owner_authorization,
+                )
         if intent.operation in {
             GitHubMutationOperation.CREATE_PULL_REQUEST,
             GitHubMutationOperation.COMMENT,
@@ -2807,15 +3073,52 @@ class GitHubMutationBroker:
             self.__checkpoint_observer(persisted)
         return persisted
 
+    def _owner_dependency_preflight(
+        self, intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime,
+    ) -> _OwnerBrokerMutationAuthorization | None:
+        if self.__executor is None or not self.__executor.requires_owner_dependency_control:
+            return None
+        return self.__executor.require_dependency(intent, context, now=now)
+
+    @staticmethod
+    def _require_context_dependency_control(
+        intent: GitHubMutationIntent, context: MutationBrokerContext, *, now: datetime | None = None,
+    ) -> None:
+        """Reject invalid dependency evidence without invoking broker callbacks."""
+
+        if type(intent) is not GitHubMutationIntent or type(context) is not MutationBrokerContext:
+            raise GitHubRuntimeError("broker dependency context is invalid")
+        attested_now = context.evaluated_at if now is None else now
+        if type(attested_now) is not datetime or attested_now.tzinfo is not timezone.utc:
+            raise GitHubRuntimeError("broker dependency control time is invalid")
+        if intent.repository != context.repository or context.mutation_context.candidate_sha != context.candidate_sha:
+            raise GitHubRuntimeError("broker dependency control does not match active context")
+        control = context.dependency_control
+        if type(control) is not DependencyExecutionControl:
+            raise GitHubRuntimeError("broker dependency execution control is unavailable")
+        binding = CandidateBinding(intent.repository.slug, context.mutation_context.task_fingerprint, context.candidate_sha)
+        try:
+            control.require(binding, DependencyStage.GITHUB_MUTATION, now=int(attested_now.timestamp()))
+        except DependencyPolicyError as error:
+            raise GitHubRuntimeError("broker dependency preflight blocked execution") from error
+
     def _reconcile_journal(
         self, intent: GitHubMutationIntent, context: MutationBrokerContext,
         bundle: SchemaV2AuthorizationBundle, plan: BrokerSemanticPlan,
         evidence: MutationJournalEntry, entry: MutationJournalEntry,
+        *, owner_authorization: _OwnerBrokerMutationAuthorization | None = None,
     ) -> BrokerMutationResult:
         """Resolve a durable uncertain state only from broker-owned read-back."""
 
         try:
+            self._require_context_dependency_control(intent, context)
             now = self._now(context)
+            self._require_context_dependency_control(intent, context, now=now)
+            if self.__executor is not None and self.__executor.requires_owner_dependency_control:
+                if type(owner_authorization) is not _OwnerBrokerMutationAuthorization:
+                    owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
+                if not owner_authorization.matches(intent, context, now=now):
+                    raise GitHubRuntimeError("owner broker dependency authorization is invalid")
             evaluated_at = datetime.fromisoformat(entry.evaluated_at)
             fresh_until = datetime.fromisoformat(entry.fresh_until)
         except (TypeError, ValueError, GitHubRuntimeError):
@@ -2904,13 +3207,16 @@ class GitHubMutationBroker:
         if readback is not None or semantic_plan is not None or command is not None:
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "caller-supplied mutation semantics are forbidden"))
         try:
+            self._require_context_dependency_control(intent, context)
             now = self._now(context)
+            self._require_context_dependency_control(intent, context, now=now)
+            owner_authorization = self._owner_dependency_preflight(intent, context, now=now)
             plan = _broker_semantic_plan(intent)
             self._require_capabilities(intent, plan, now)
             bound_health = self.__health if not self.__clock_is_default else None
             bundle = schema_v2_authorization_bundle(context, now=now, health=bound_health)
             failure = _authorize(intent, context, now=now, health=bound_health)
-        except (AttributeError, KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError, GitHubRuntimeError):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "broker semantic plan is unavailable or incomplete"))
         if failure is not None:
             return BrokerMutationResult(failure=failure)
@@ -2929,7 +3235,10 @@ class GitHubMutationBroker:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is unavailable or conflicting"))
             if entry is None:
                 return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.POLICY_DENIED, intent.operation, "durable mutation evidence is missing"))
-            return self._reconcile_journal(intent, context, bundle, plan, entry, entry)
+            return self._reconcile_journal(
+                intent, context, bundle, plan, entry, entry,
+                owner_authorization=owner_authorization,
+            )
         observed, completeness = _complete_broker_read(self._adapter, plan.readback.request, context, bundle, plan, None)
         if not _readback_matches(plan.readback, intent, observed):
             return BrokerMutationResult(failure=GitHubFailure(GitHubFailureKind.STALE_RESPONSE, intent.operation, "interrupted mutation is not semantically reconciled"), reconciliation_required=True)

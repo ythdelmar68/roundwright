@@ -27,6 +27,12 @@ from roundwright.configuration import (
 )
 from roundwright import cli
 from roundwright.policy import PolicyAction, PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
+from roundwright.dependency_policy import (
+    BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent,
+    DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition,
+    PolicyTransitionKind, TrustedDependencyAdmission, VersionRange,
+)
+from roundwright.git_identity import GitEntrypointControl
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -41,6 +47,31 @@ class ConfigurationTests(unittest.TestCase):
             ["git", "-C", os.fspath(directory), *arguments], input=input.encode("utf-8"),
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+    def git_control(self, root: Path) -> tuple[CandidateBinding, GitEntrypointControl]:
+        """Create only fixture-side, pre-materialized Git authority."""
+
+        candidate = subprocess.run(
+            ["git", "-C", os.fspath(root), "rev-parse", "refs/remotes/origin/main"],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+        digest = lambda value: "sha256:" + value * 64
+        binding = CandidateBinding("ythdelmar68/roundwright", "issue-47", candidate)
+        components = (
+            ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-scm/git", digest("3"), digest("4")),
+        )
+        policy = DependencyPolicy(binding, digest("5"), 100, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("6"), authority_digest=digest("7"))
+        policy = __import__("dataclasses").replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        observations = tuple(
+            ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 100, policy.policy_digest)
+            for item in components
+        )
+        control = GitEntrypointControl(
+            binding, DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7"))), 100,
+        )
+        return binding, control
 
     def authoritative_worktrees(self, root: Path, configuration: str | None = "[review]\nmax_rounds = 6\n") -> tuple[Path, Path]:
         root.mkdir(parents=True, exist_ok=True)
@@ -119,43 +150,78 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(configuration.review_policy.max_rounds, 8)
             self.assertEqual(configuration.sources["review.max_rounds"], ConfigurationSource.COMMAND_LINE)
             without_overrides = load_configuration(cwd=candidate, environment={})
-            self.assertEqual(without_overrides.review_policy.max_rounds, 6)
+            self.assertEqual(without_overrides.review_policy.max_rounds, 10)
+            binding, control = self.git_control(main)
+            authorized = load_configuration(
+                cwd=candidate, environment={}, git_binding=binding, git_entrypoint_control=control,
+            )
+            self.assertEqual(authorized.review_policy.max_rounds, 6)
             output = io.StringIO()
             with contextlib.redirect_stdout(output), mock.patch("roundwright.cli.Path.cwd", return_value=candidate):
                 self.assertEqual(cli.main(["config", "validate"]), 0)
                 self.assertEqual(cli.main(["config", "show", "--sources"]), 0)
                 with mock.patch("roundwright.cli.require_safe_entrypoint_identity"):
-                    self.assertEqual(cli.main(["init"]), 0)
+                    self.assertEqual(cli.main(["init"]), 2)
             self.assertTrue((main / ".roundwright.toml").is_file())
-            self.assertTrue((main / ".roundwright" / "state.sqlite3").is_file())
+            self.assertFalse((main / ".roundwright" / "state.sqlite3").exists())
             self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
-            self.assertIn("review.max_rounds: repository configuration", output.getvalue())
+            self.assertIn("review.max_rounds: default", output.getvalue())
 
     def test_config_free_authoritative_main_remains_the_init_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             main, candidate = self.authoritative_worktrees(Path(temporary), configuration=None)
             output = io.StringIO()
             with contextlib.redirect_stdout(output), mock.patch("roundwright.cli.Path.cwd", return_value=candidate), mock.patch("roundwright.cli.require_safe_entrypoint_identity"):
-                self.assertEqual(cli.main(["init"]), 0)
-            self.assertTrue((main / ".roundwright" / "state.sqlite3").is_file())
+                self.assertEqual(cli.main(["init"]), 2)
+            self.assertFalse((main / ".roundwright" / "state.sqlite3").exists())
             self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
 
     def test_authoritative_configuration_accepts_only_absent_or_one_ordinary_stage_zero_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config_free_main, _ = self.authoritative_worktrees(Path(temporary) / "config-free", configuration=None)
-            self.assertEqual(configuration_module._validated_authoritative_repository(config_free_main), config_free_main.resolve())
-            self.assertEqual(configuration_module._read_authoritative_runtime_toml(config_free_main), {})
+            binding, control = self.git_control(config_free_main)
+            self.assertEqual(configuration_module._validated_authoritative_repository(config_free_main, binding=binding, control=control), config_free_main.resolve())
+            self.assertEqual(configuration_module._read_authoritative_runtime_toml(config_free_main, binding=binding, control=control), {})
             main, _ = self.authoritative_worktrees(Path(temporary) / "tracked")
-            self.assertEqual(configuration_module._validated_authoritative_repository(main), main.resolve())
-            self.assertEqual(configuration_module._read_authoritative_runtime_toml(main)["review"]["max_rounds"], 6)
+            binding, control = self.git_control(main)
+            self.assertEqual(configuration_module._validated_authoritative_repository(main, binding=binding, control=control), main.resolve())
+            self.assertEqual(configuration_module._read_authoritative_runtime_toml(main, binding=binding, control=control)["review"]["max_rounds"], 6)
+
+    def test_authoritative_git_reads_reject_unsealed_or_mismatched_control_before_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            main, _ = self.authoritative_worktrees(Path(temporary))
+            binding, control = self.git_control(main)
+            def forged(candidate_binding: CandidateBinding, now: int) -> GitEntrypointControl:
+                value = object.__new__(GitEntrypointControl)
+                object.__setattr__(value, "binding", candidate_binding)
+                object.__setattr__(value, "dependency_control", control.dependency_control)
+                object.__setattr__(value, "now", now)
+                return value
+
+            with mock.patch("roundwright.configuration.subprocess.run") as runner:
+                for supplied_binding, supplied_control in (
+                    (None, None),
+                    (binding, object()),
+                    (CandidateBinding(binding.repository, "other-task", binding.candidate_sha), control),
+                    (CandidateBinding("other/repository", binding.task_id, binding.candidate_sha), control),
+                    (CandidateBinding(binding.repository, binding.task_id, "f" * 40), control),
+                    (binding, forged(binding, 1_000)),
+                ):
+                    with self.subTest(control=type(supplied_control).__name__):
+                        with self.assertRaises(ConfigurationError):
+                            configuration_module._validated_authoritative_repository(
+                                main, binding=supplied_binding, control=supplied_control,
+                            )
+            runner.assert_not_called()
 
     def test_authoritative_configuration_rejects_hidden_or_nonordinary_index_entries(self) -> None:
         def assert_rejected(mutate) -> None:
             with tempfile.TemporaryDirectory() as temporary:
                 main, _ = self.authoritative_worktrees(Path(temporary))
                 mutate(main)
+                binding, control = self.git_control(main)
                 with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
-                    configuration_module._validated_authoritative_repository(main)
+                    configuration_module._validated_authoritative_repository(main, binding=binding, control=control)
 
         def assume_unchanged(main: Path) -> None:
             self.git(main, "update-index", "--assume-unchanged", ".roundwright.toml")
@@ -207,8 +273,9 @@ class ConfigurationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 main, _ = self.authoritative_worktrees(Path(temporary))
                 mutate(main)
+                binding, control = self.git_control(main)
                 with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
-                    configuration_module._validated_authoritative_repository(main)
+                    configuration_module._validated_authoritative_repository(main, binding=binding, control=control)
 
         def foreign_origin(main: Path) -> None:
             self.git(main, "remote", "set-url", "origin", "https://github.com/ythdelmar68/roundwright-alias.git")
@@ -234,8 +301,9 @@ class ConfigurationTests(unittest.TestCase):
                 if ignored:
                     self.write(main / ".gitignore", ".roundwright.toml\n")
                 self.write(main / ".roundwright.toml", "[review]\nmax_rounds = 1\n")
+                binding, control = self.git_control(main)
                 with self.assertRaisesRegex(ConfigurationError, "authoritative main"):
-                    configuration_module._validated_authoritative_repository(main)
+                    configuration_module._validated_authoritative_repository(main, binding=binding, control=control)
 
     def test_profile_replacement_is_atomic_and_attempt_budget_must_match(self) -> None:
         profiles = [

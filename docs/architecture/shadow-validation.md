@@ -56,6 +56,48 @@ only safe identities, a retention reference, explicit read-only proof, and a
 protocol mismatch disposition; private/path-shaped identifiers are replaced by
 one-way public-safe digests.
 
+## Phase 3 provenance profile and v2 cases
+
+`roundwright-shadow-case/v1` remains isolated for compatible historical and
+synthetic single-attempt Phase 2 fixtures. It retains its fixed six-state trace
+and cannot be silently mixed with v2 observations.
+
+`roundwright-shadow-case/v2` carries a lifecycle-correlation identity distinct
+from provider attempts, review rounds, events, and commits. Its events are
+defined by the selected profile rather than a universal lifecycle trace. Phase
+3 currently registers only
+`roundwright-shadow-profile/provenance-decision/v1`: a terminal-snapshot from
+the durable typed provenance/policy state. Its sole event explicitly makes no
+provider call.
+
+Before terminal export, the production provenance materializer must require a
+candidate-bound admitted dependency execution control, validate the canonical
+Git-entrypoint stage, and seal the resulting public-safe policy, observation,
+admission, candidate-tree, entrypoint, and gate projection in append-only
+content-addressed local retention. Terminal export and capture readiness accept
+that verified durable projection, never caller-authored policy or exporter
+fields; moved, stale, partial, duplicate, tampered, or overwritten records
+fail closed.
+
+The reusable v2 core retains ordered lifecycle attempts, provider-attempt
+manifests, formal review rounds, candidate commits, accepted-result references,
+typed lifecycle-attempt-to-commit relation edges, and profile-defined events as
+separate identities. The relation is explicitly many-to-many: an attempt may
+have no commits or several commits, and a commit may compose several attempts.
+It rejects missing, duplicate, out-of-order, orphaned, or cross-linked
+references; provider calls are separate from no-provider lifecycle events.
+Profiles retain responsibility for their total commit-cardinality constraints.
+Later leaves may define profiles over this graph, but do not register or
+implement those adapters here.
+
+Every registered profile declares capture mode, producer, readiness point,
+arm-before boundary, retention/read-back contract, and
+missing-history/recapture behavior. The complete capture-readiness preflight
+must bind the exact base/candidate, profile/schema, typed exporter/comparator,
+reviewed Recorder, append-only content-addressed store, and immutable capture
+time before its arm-before boundary. A moved candidate requires a fresh
+terminal snapshot; missing v1 history is never fabricated or reconstructed.
+
 When a Shadow case consumes a separately run external qualification bundle, its
 toolbox, target (if any), candidate, and commit pins are selected through the
 [qualification test infrastructure](../operations/qualification-test-infrastructure.md).

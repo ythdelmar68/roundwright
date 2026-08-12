@@ -19,43 +19,65 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.candidate_review import (
-    CandidateReviewError, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
+    CandidateReviewError, CandidateValidationControl, CandidateVerification, DiffReviewOutput, DiffReviewVerdict, ImplementationDispatch,
     VerificationKind, VerificationOutcome, begin_implementation as _begin_implementation, dispatch_diff_review as _native_dispatch_diff_review,
-    finalize_review_limit_repair, read_diff_review, record_candidate_verification, record_diff_review, record_implementation_candidate,
+    finalize_review_limit_repair, read_diff_review, record_candidate_verification as _native_record_candidate_verification, record_diff_review, record_implementation_candidate,
     recover_diff_review,
 )
 import roundwright.candidate_review as candidate_review
+import roundwright.local_slice as local_slice
 from roundwright.configuration import RepositoryIdentity
 from roundwright.gates import _valid_review_limit_finalization
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.git_identity import CandidateSeal, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
+from roundwright.git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review as _native_dispatch_plan_review, record_plan_review
 from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, prepare_attempt, read_attempt, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
-    PlanReviewReceipt, PlanningInput, WorkerPlan, WorkerPlanOutput,
+    PlanReviewReceipt, PlanningInput, ProviderDispatchControl, WorkerPlan, WorkerPlanOutput,
     accept_plan_review_and_begin_implementation, begin_planning, dispatch_plan as _native_dispatch_plan,
     record_plan, submit_plan_for_review,
 )
 from tests.provider_health_fixture import provider_context, runtime_binding as health_runtime_binding
 
 
+def _dispatch_control(identity, context, now, candidate=None):
+    digest=lambda value: "sha256:" + value * 64; binding=CandidateBinding(identity.repository_id, identity.task_id, candidate or context.candidate_sha or identity.base_sha); components=(ComponentPolicy(DependencyComponent.PACKAGE,"roundwright",VersionRange("0.0.0","3.0.0"),"pypi/roundwright",digest("1"),digest("2")),ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME,"codex-sdk",VersionRange("1.0.0","2.0.0"),"registry/codex-sdk",digest("3"),digest("4")),ComponentPolicy(DependencyComponent.GITHUB_CLI,"gh",VersionRange("2.0.0","3.0.0"),"github/gh",digest("5"),digest("6")),ComponentPolicy(DependencyComponent.BUILD_BACKEND,"setuptools",VersionRange("69.0.0","70.0.0"),"pypi/setuptools",digest("7"),digest("8"))); policy=DependencyPolicy(binding,digest("9"),now,60,components,PolicyTransition(PolicyTransitionKind.BOOTSTRAP)); receipt=BootstrapPolicyReceipt.create(policy,reviewer_identity=digest("a"),authority_digest=digest("b")); policy=replace(policy,transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP,receipt)); observations=tuple(ObservedDependency(binding,item.component,item.identifier,item.versions.minimum,item.source_identity,item.artifact_digest,item.executable_digest,now,policy.policy_digest) for item in components); return binding,ProviderDispatchControl(binding,DependencyExecutionControl(policy,observations,TrustedDependencyAdmission(binding,policy.core_fingerprint,receipt.receipt_digest,digest("a"),digest("b"))),now)
+
 def dispatch_plan(repository, identity, context, *args, **kwargs):
+    binding, control = _dispatch_control(identity, context, kwargs["now"]); kwargs.update(binding=binding, control=control)
     return _native_dispatch_plan(repository, identity, provider_context(context, identity, ProviderRole.PLANNING), *args, **kwargs)
 
 
 def dispatch_plan_review(repository, identity, context, *args, **kwargs):
+    binding, control = _dispatch_control(identity, context, kwargs["now"]); kwargs.update(binding=binding, control=control)
     return _native_dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), *args, **kwargs)
 
 
 def begin_implementation(repository, identity, context, *args, **kwargs):
+    binding, control = _dispatch_control(identity, context, kwargs["now"], kwargs.get("repair_candidate_sha")); kwargs.update(binding=binding, control=control)
     return _begin_implementation(repository, identity, provider_context(context, identity, ProviderRole.WORKER), *args, **kwargs)
+
+
+def _validation_control(identity, seal, now):
+    binding, dispatch_control = _dispatch_control(identity, None, now, seal.candidate_sha)
+    return binding, CandidateValidationControl(binding, dispatch_control.dependency_control, now)
+
+
+def record_candidate_verification(repository, identity, binding, seal, verification, **kwargs):
+    now = kwargs.setdefault("now", int(time.time()))
+    dependency_binding, control = _validation_control(identity, seal, now)
+    kwargs.update(dependency_binding=dependency_binding, control=control)
+    return _native_record_candidate_verification(repository, identity, binding, seal, verification, **kwargs)
 
 
 def _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs):
     selected = kwargs.get("selected_profile_identity")
     if selected not in context.runtime_binding.supervisor_profile_identities:
         selected = None
+    dependency_binding, control = _dispatch_control(identity, context, kwargs["now"], seal.candidate_sha)
+    kwargs.update(dependency_binding=dependency_binding, control=control)
     return _native_dispatch_diff_review(
         repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR, selected_profile_identity=selected), binding, seal, **kwargs
     )
@@ -71,6 +93,108 @@ def dispatch_diff_review(repository, identity, context, binding, seal, **kwargs)
 
 
 class CandidateReviewTests(unittest.TestCase):
+    def test_local_validation_runner_rejects_replaced_controls_before_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, _, worktree_binding, now = values
+            _, seal = self.implement(values)
+            dependency_binding, _ = _validation_control(identity, seal, now)
+            wrong_binding = CandidateBinding(identity.repository_id, identity.task_id, "f" * 40)
+            wrong_control = CandidateValidationControl(
+                wrong_binding, _dispatch_control(identity, None, now, wrong_binding.candidate_sha)[1].dependency_control, now,
+            )
+            stale_control = _validation_control(identity, seal, now - 1)[1]
+            for supplied_control in (wrong_control, stale_control):
+                callbacks = []
+                with self.subTest(control_now=supplied_control.now), patch.object(local_slice, "record_candidate_verification", side_effect=AssertionError("record")) as record, patch.object(candidate_review, "candidate_evidence", side_effect=AssertionError("candidate evidence")) as evidence, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(local_slice.LocalSliceError):
+                        local_slice._run_and_record_candidate_validation(
+                            lambda binding, kind: callbacks.append((binding, kind)) or "evidence",
+                            dependency_binding, supplied_control, repository, identity, worktree_binding, seal,
+                            "validation-runner-gate", VerificationKind.TEST, lease, now,
+                        )
+                    self.assertEqual(callbacks, [])
+                    record.assert_not_called(); evidence.assert_not_called(); database.assert_not_called()
+
+    def test_native_candidate_verification_control_denials_have_zero_internal_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, _, worktree_binding, now = values
+            _, seal = self.implement(values)
+            dependency_binding, control = _validation_control(identity, seal, now)
+            verification = CandidateVerification("verification-gate", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64)
+            with self.assertRaises(TypeError):
+                _native_record_candidate_verification(
+                    repository, identity, worktree_binding, seal, verification,
+                    dependency_binding=dependency_binding, lease=lease, now=now,
+                )
+            invalid_binding = CandidateBinding(identity.repository_id, identity.task_id, "f" * 40)
+            for supplied_binding, supplied_control in (
+                (invalid_binding, CandidateValidationControl(invalid_binding, _dispatch_control(identity, None, now, invalid_binding.candidate_sha)[1].dependency_control, now)),
+                (dependency_binding, CandidateValidationControl(CandidateBinding(identity.repository_id, identity.task_id, "e" * 40), _dispatch_control(identity, None, now, "e" * 40)[1].dependency_control, now)),
+                (dependency_binding, _validation_control(identity, seal, now - 61)[1]),
+            ):
+                with self.subTest(control_now=supplied_control.now), patch.object(candidate_review, "candidate_evidence", side_effect=AssertionError("candidate evidence")) as evidence, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(CandidateReviewError):
+                        _native_record_candidate_verification(
+                            repository, identity, worktree_binding, seal, verification,
+                            dependency_binding=supplied_binding, control=supplied_control, lease=lease, now=now,
+                        )
+                    evidence.assert_not_called(); database.assert_not_called()
+
+    def test_native_diff_review_control_denials_have_zero_internal_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, worktree_binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            dependency_binding, control = _dispatch_control(identity, review_context, now, seal.candidate_sha)
+            arguments = dict(
+                diff_review_attempt_id="diff-gate", implementation_attempt_id=implementation.implementation_attempt_id,
+                provider_attempt_id="diff-gate-supervisor", supervisor_session_identity="diff-gate-session",
+                external_turn_identity="diff-gate-turn", message_identity="diff-gate-message",
+                process_lease_id="diff-gate-lease", process_lease_expires_at=now + 60,
+                selected_profile_identity=review_context.runtime_binding.supervisor_profile_identities[0],
+                within_round_attempt=1, review_round=4, lease=lease, now=now,
+            )
+            with self.assertRaises(TypeError):
+                _native_dispatch_diff_review(
+                    repository, identity, provider_context(review_context, identity, ProviderRole.SUPERVISOR),
+                    worktree_binding, seal, dependency_binding=dependency_binding, **arguments,
+                )
+            invalid_binding = CandidateBinding(identity.repository_id, identity.task_id, "f" * 40)
+            for supplied_binding, supplied_control in (
+                (invalid_binding, _dispatch_control(identity, review_context, now, invalid_binding.candidate_sha)[1]),
+                (dependency_binding, _dispatch_control(identity, review_context, now, "e" * 40)[1]),
+                (dependency_binding, _dispatch_control(identity, review_context, now - 61, seal.candidate_sha)[1]),
+            ):
+                with self.subTest(control_now=supplied_control.now), patch.object(candidate_review, "candidate_evidence", side_effect=AssertionError("candidate evidence")) as evidence, patch.object(candidate_review, "prepare_attempt", side_effect=AssertionError("provider")) as prepared, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(CandidateReviewError):
+                        _native_dispatch_diff_review(
+                            repository, identity, provider_context(review_context, identity, ProviderRole.SUPERVISOR),
+                            worktree_binding, seal, dependency_binding=supplied_binding, control=supplied_control, **arguments,
+                        )
+                    evidence.assert_not_called(); prepared.assert_not_called(); database.assert_not_called()
+
+    def test_native_implementation_control_denials_have_zero_internal_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, _, now = self.ready_task(Path(temporary) / "repository", commit=False)
+            binding, control = _dispatch_control(identity, context, now)
+            arguments = dict(
+                implementation_attempt_id="implementation-gate", provider_attempt_id="worker-gate", plan_attempt_id="plan-25",
+                worker_thread_identity="worker-thread-25", external_turn_identity="implementation-gate-turn",
+                process_lease_id="implementation-gate-lease", process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            with self.assertRaises(TypeError):
+                _begin_implementation(repository, identity, context, binding=binding, **arguments)
+            for supplied_binding, supplied_control in (
+                (binding, _dispatch_control(identity, context, now, "f" * 40)[1]),
+                (binding, _dispatch_control(identity, context, now - 61)[1]),
+            ):
+                with self.subTest(control_now=supplied_control.now), patch.object(candidate_review, "_accepted_plan", side_effect=AssertionError("plan read")) as accepted, patch.object(candidate_review, "prepare_attempt", side_effect=AssertionError("provider")) as prepared, patch.object(candidate_review, "_open_writable_connection", side_effect=AssertionError("database")) as database:
+                    with self.assertRaises(CandidateReviewError):
+                        _begin_implementation(repository, identity, context, binding=supplied_binding, control=supplied_control, **arguments)
+                    accepted.assert_not_called(); prepared.assert_not_called(); database.assert_not_called()
     def runtime_binding(self, supervisor_count: int = 3, *, include_policy: bool = True) -> RuntimeBinding:
         values = "cdefgh"
         policy_digest = candidate_review._digest({"complete_rounds": 3, "max_rounds": 10, "max_supervisor_attempts_per_round": supervisor_count, "on_final_findings": "worker-final-repair-then-merge"})
@@ -104,6 +228,23 @@ class CandidateReviewTests(unittest.TestCase):
     def git(self, directory: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True, capture_output=True).stdout.strip()
 
+    def git_control(self, identity: TaskIdentity, *, now: int) -> GitEntrypointControl:
+        digest = lambda value: "sha256:" + value * 64
+        binding = CandidateBinding(identity.repository_id, identity.task_id, identity.base_sha)
+        components = (
+            ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi/roundwright", digest("1"), digest("2")),
+            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-scm/git", digest("3"), digest("4")),
+        )
+        policy = DependencyPolicy(binding, digest("5"), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("6"), authority_digest=digest("7"))
+        policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        observations = tuple(
+            ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest)
+            for item in components
+        )
+        admission = TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7"))
+        return GitEntrypointControl(binding, DependencyExecutionControl(policy, observations, admission), now)
+
     def repository(self, root: Path) -> RepositoryIdentity:
         remote = root.parent / "remote.git"
         subprocess.run(["git", "init", "--bare", str(remote)], check=True, text=True, capture_output=True)
@@ -136,7 +277,7 @@ class CandidateReviewTests(unittest.TestCase):
         review = dispatch_plan_review(repository, identity, context, review_attempt_id="plan-review-25", provider_attempt_id="plan-supervisor", supervisor_session_identity="plan-session-25", external_turn_identity="plan-review-turn", plan_attempt_id="plan-25", process_lease_id="review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
         record_plan_review(repository, identity, context, review_attempt_id=review.review_attempt_id, output=PlanReviewOutput(review.review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity, review.external_turn_identity, review.plan_attempt_id, review.source_digest, review.plan_digest, PlanReviewVerdict.PASS, (), (), (), ()), completion_evidence_fingerprint="1" * 64, lease=lease, now=now)
         accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-25", receipt=PlanReviewReceipt("plan-review-25", persisted.content_digest, True), evidence_fingerprint="2" * 64, lease=lease)
-        binding = provision_worktree(repository, identity, default_branch="main", worktree=worktree, lease=lease)
+        binding = provision_worktree(repository, identity, default_branch="main", worktree=worktree, control=self.git_control(identity, now=now), lease=lease)
         if commit:
             (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
             self.git(worktree, "add", "candidate.txt")
@@ -146,7 +287,7 @@ class CandidateReviewTests(unittest.TestCase):
     def implement(self, values):
         repository, identity, lease, context, binding, now = values
         dispatch = begin_implementation(repository, identity, context, implementation_attempt_id="implementation-25", provider_attempt_id="worker-implementation", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="implementation-turn", process_lease_id="implementation-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
-        seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="3" * 64, lease=lease, now=now)
+        seal = record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="3" * 64, lease=lease, now=now)
         return dispatch, seal
 
     def review_context(self, identity, initial_context, seal):
@@ -207,6 +348,7 @@ class CandidateReviewTests(unittest.TestCase):
         )
         repair_seal = record_implementation_candidate(
             repository, identity, context, binding, implementation_attempt_id=repair.implementation_attempt_id,
+            git_entrypoint_control=self.git_control(identity, now=now),
             completion_evidence_fingerprint="d" * 64, lease=lease, now=now,
         )
         return repository, identity, lease, context, binding, now, routed.content_digest, repair_seal
@@ -759,7 +901,7 @@ class CandidateReviewTests(unittest.TestCase):
             (Path(identity.worktree) / "candidate.txt").write_text("repaired candidate\n", encoding="utf-8")
             self.git(Path(identity.worktree), "add", "candidate.txt")
             self.git(Path(identity.worktree), "commit", "-m", "fix(candidate): repair routed finding")
-            repaired_seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=repair.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
+            repaired_seal = record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=repair.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
             self.assertNotEqual(repaired_seal.candidate_sha, seal.candidate_sha)
             repaired_context = self.review_context(identity, context, repaired_seal)
             for verification in (
@@ -780,7 +922,7 @@ class CandidateReviewTests(unittest.TestCase):
             candidate.write_text("second repaired candidate\n", encoding="utf-8")
             self.git(Path(identity.worktree), "add", "candidate.txt")
             self.git(Path(identity.worktree), "commit", "-m", "fix(candidate): repair latest routed finding")
-            final_seal = record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=repair_two.implementation_attempt_id, completion_evidence_fingerprint="e" * 64, lease=lease, now=now)
+            final_seal = record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=repair_two.implementation_attempt_id, completion_evidence_fingerprint="e" * 64, lease=lease, now=now)
             final_context = self.review_context(identity, context, final_seal)
             for verification in (
                 CandidateVerification("final-repair-tests", VerificationKind.TEST, VerificationOutcome.PASS, "f" * 64),
@@ -985,7 +1127,7 @@ class CandidateReviewTests(unittest.TestCase):
             repository, identity, lease, context, binding, now = values
             dispatch = begin_implementation(repository, identity, context, implementation_attempt_id="implementation-base", provider_attempt_id="worker-base", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="base-turn", process_lease_id="base-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
             with self.assertRaisesRegex(CandidateReviewError, "new local commit"):
-                record_implementation_candidate(repository, identity, context, binding, implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
+                record_implementation_candidate(repository, identity, context, binding, git_entrypoint_control=self.git_control(identity, now=now), implementation_attempt_id=dispatch.implementation_attempt_id, completion_evidence_fingerprint="a" * 64, lease=lease, now=now)
             self.assertEqual(task_projection(repository, identity).state, "implementing")
 
     def test_second_clean_task_at_the_same_sha_cannot_alias_candidate_authority(self):

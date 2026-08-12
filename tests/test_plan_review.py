@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import roundwright.plan_review as plan_review
 from roundwright.configuration import RepositoryIdentity
+from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.plan_review import (
@@ -33,6 +34,7 @@ from roundwright.worker_planning import (
     PlanningInput,
     WorkerPlan,
     WorkerPlanOutput,
+    ProviderDispatchControl,
     accept_plan_review_and_begin_implementation,
     begin_planning,
     dispatch_plan,
@@ -43,6 +45,11 @@ from tests.provider_health_fixture import provider_context, runtime_binding
 
 
 class PlanReviewTests(unittest.TestCase):
+    def control(self, identity, context, now):
+        d=lambda x:"sha256:"+x*64; b=CandidateBinding(identity.repository_id, identity.task_id, context.candidate_sha or identity.base_sha)
+        c=tuple(ComponentPolicy(k,n,VersionRange("0.0.0","3.0.0"),s,d(str(i)),d(str(i+1))) for i,(k,n,s) in enumerate(((DependencyComponent.PACKAGE,"roundwright","pypi/roundwright"),(DependencyComponent.PROVIDER_RUNTIME,"codex-sdk","registry/codex-sdk"),(DependencyComponent.GITHUB_CLI,"gh","github/gh"),(DependencyComponent.BUILD_BACKEND,"setuptools","pypi/setuptools"))))
+        p=DependencyPolicy(b,d("9"),now,60,c,PolicyTransition(PolicyTransitionKind.BOOTSTRAP)); r=BootstrapPolicyReceipt.create(p,reviewer_identity=d("a"),authority_digest=d("b")); p=replace(p,transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP,r)); o=tuple(ObservedDependency(b,x.component,x.identifier,x.versions.minimum,x.source_identity,x.artifact_digest,x.executable_digest,now,p.policy_digest) for x in c)
+        return b,ProviderDispatchControl(b,DependencyExecutionControl(p,o,TrustedDependencyAdmission(b,p.core_fingerprint,r.receipt_digest,d("a"),d("b"))),now)
     def runtime_binding(self) -> RuntimeBinding:
         return runtime_binding(
             complete_rounds=1, max_rounds=2,
@@ -65,13 +72,15 @@ class PlanReviewTests(unittest.TestCase):
         now = int(time.time())
         input_value = PlanningInput("Review plan", (), ("Persist review",), (), ("Run tests",), (), ())
         plan = WorkerPlan("Review plan", (), (), ("Persist review",), ("Run tests",), (), (), ())
-        dispatch_plan(repository, identity, provider_context(context, identity, ProviderRole.PLANNING), input_value, plan_attempt_id="plan-one", provider_attempt_id="worker-one", worker_thread_identity="worker-thread-24", external_turn_identity="worker-turn-one", process_lease_id="worker-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+        binding, control = self.control(identity, context, now)
+        dispatch_plan(repository, identity, provider_context(context, identity, ProviderRole.PLANNING), input_value, plan_attempt_id="plan-one", provider_attempt_id="worker-one", worker_thread_identity="worker-thread-24", external_turn_identity="worker-turn-one", process_lease_id="worker-lease", process_lease_expires_at=now + 60, binding=binding, control=control, lease=lease, now=now)
         persisted = record_plan(repository, identity, context, plan_attempt_id="plan-one", output=WorkerPlanOutput("plan-one", "worker-one", "worker-thread-24", "worker-turn-one", input_value.digest, "b" * 64, plan), completion_evidence_fingerprint="f" * 64, lease=lease, now=now)
         submit_plan_for_review(repository, identity, plan_attempt_id="plan-one", evidence_fingerprint="1" * 64, lease=lease)
         return repository, identity, lease, context, now, persisted
 
     def dispatch(self, repository, identity, lease, context, now, persisted, *, review="review-one", provider="supervisor-one", session="supervisor-session-one"):
-        return dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), review_attempt_id=review, provider_attempt_id=provider, supervisor_session_identity=session, external_turn_identity=f"turn-{provider}", plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider}", process_lease_expires_at=now + 60, lease=lease, now=now)
+        binding, control = self.control(identity, context, now)
+        return dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), review_attempt_id=review, provider_attempt_id=provider, supervisor_session_identity=session, external_turn_identity=f"turn-{provider}", plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider}", process_lease_expires_at=now + 60, binding=binding, control=control, lease=lease, now=now)
 
     def output(self, dispatch, *, verdict=PlanReviewVerdict.PASS, plan_digest=None, findings=(), missing=(), ambiguous=(), risks=()):
         return PlanReviewOutput(dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity, dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, plan_digest or dispatch.plan_digest, verdict, findings, missing, ambiguous, risks)

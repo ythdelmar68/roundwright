@@ -17,6 +17,7 @@ from enum import StrEnum
 from typing import Iterable
 
 from .configuration import RepositoryIdentity
+from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .git_identity import TransitionLease, _require_current_lease
 from .provider_recovery import (
     AttemptState,
@@ -35,6 +36,21 @@ from .state import StateError, TaskIdentity, _open_writable_connection, _require
 
 class WorkerPlanningError(StateError):
     """Raised when a planning input, plan, or review receipt is unsafe."""
+
+
+@dataclass(frozen=True)
+class ProviderDispatchControl:
+    binding: CandidateBinding
+    dependency_control: DependencyExecutionControl
+    now: int
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not CandidateBinding or type(self.dependency_control) is not DependencyExecutionControl or type(self.now) is not int:
+            raise WorkerPlanningError("provider dispatch control is invalid")
+        try:
+            self.dependency_control.require(self.binding, DependencyStage.DISPATCH, now=self.now)
+        except DependencyPolicyError as error:
+            raise WorkerPlanningError("provider dispatch preflight blocked execution") from error
 
 
 class PlanAttemptKind(StrEnum):
@@ -216,6 +232,8 @@ def dispatch_plan(
     context: RecoveryContext,
     planning_input: PlanningInput,
     *,
+    binding: CandidateBinding,
+    control: ProviderDispatchControl,
     plan_attempt_id: str,
     provider_attempt_id: str,
     worker_thread_identity: str,
@@ -224,7 +242,7 @@ def dispatch_plan(
     process_lease_expires_at: int,
     parent_plan_attempt_id: str | None = None,
     lease: TransitionLease | None,
-    now: int | None = None,
+    now: int,
 ) -> PlanningDispatch:
     """Persist a normalized input and one stable Worker thread before dispatch.
 
@@ -232,6 +250,12 @@ def dispatch_plan(
     IDs and pending placeholders from being treated as a Worker thread.
     """
 
+    if type(binding) is not CandidateBinding or type(control) is not ProviderDispatchControl or control.binding != binding or control.now != now or binding.repository != identity.repository_id or binding.task_id != identity.task_id or binding.candidate_sha != (context.candidate_sha or identity.base_sha):
+        raise WorkerPlanningError("provider dispatch control is invalid")
+    try:
+        control.dependency_control.require(binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise WorkerPlanningError("provider dispatch preflight blocked execution") from error
     _require_token(plan_attempt_id, "plan attempt identity")
     _require_token(provider_attempt_id, "provider attempt identity")
     _require_worker_thread(worker_thread_identity)

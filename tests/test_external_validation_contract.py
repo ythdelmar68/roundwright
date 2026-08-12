@@ -103,6 +103,32 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("0c594caa275262164fce1942ebd2142abe0e77bb", contract)
         self.assertNotIn("fresh authenticated owner approval", contract)
 
+    def test_capture_readiness_contract_is_synchronized_and_root_only_routes(self) -> None:
+        paths = (
+            ROOT / ".agents" / "skills" / SKILL_NAME / "SKILL.md",
+            ROOT / "docs" / "operations" / "qualification-test-infrastructure.md",
+            ROOT / ".agents" / "skills" / "create-roundwright-leaf" / "SKILL.md",
+            ROOT / "docs" / "operations" / "leaf-issue-template.md",
+            ROOT / ".github" / "ISSUE_TEMPLATE" / "roundwright-leaf.md",
+        )
+        required = (
+            "capture mode",
+            "producer",
+            "readiness point",
+            "arm-before boundary",
+            "retention/read-back contract",
+            "missing-history/recapture behavior",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                value = " ".join(path.read_text(encoding="utf-8").lower().split())
+                self.assertIn("capture-readiness", value)
+                for field in required:
+                    self.assertIn(field, value)
+        root = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertNotIn("Capture-readiness preflight", root)
+        self.assertNotIn("terminal-snapshot", root)
+
 
 if __name__ == "__main__":
     unittest.main()

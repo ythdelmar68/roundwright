@@ -1319,7 +1319,6 @@ class LifecycleAttempt:
     role: EvidenceRole
     parent_attempt_id: str | None = None
     review_round_id: str | None = None
-    commit_sha: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -1330,7 +1329,6 @@ class LifecycleAttempt:
             or type(self.role) is not EvidenceRole
             or (self.parent_attempt_id is not None and not _safe_v2_token(self.parent_attempt_id))
             or (self.review_round_id is not None and not _safe_v2_token(self.review_round_id))
-            or (self.commit_sha is not None and not _SHA1.fullmatch(self.commit_sha))
         ):
             raise ShadowV2Error("lifecycle attempt is invalid")
 
@@ -1386,6 +1384,18 @@ class CandidateCommitReference:
 
 
 @dataclass(frozen=True)
+class AttemptCommitReference:
+    """A typed many-to-many edge from a lifecycle attempt to a candidate commit."""
+
+    lifecycle_attempt_id: str
+    commit_sha: str
+
+    def __post_init__(self) -> None:
+        if not _safe_v2_token(self.lifecycle_attempt_id) or not _SHA1.fullmatch(self.commit_sha):
+            raise ShadowV2Error("lifecycle attempt commit reference is invalid")
+
+
+@dataclass(frozen=True)
 class AcceptedResultReference:
     result_id: str
     review_round_id: str
@@ -1436,6 +1446,7 @@ class ShadowV2EventGraph:
     commits: tuple[CandidateCommitReference, ...]
     accepted_results: tuple[AcceptedResultReference, ...]
     events: tuple[ShadowV2Event, ...]
+    attempt_commit_references: tuple[AttemptCommitReference, ...] = ()
 
     def validate(self, profile: ShadowEvidenceProfile, candidate_sha: str) -> None:
         if (
@@ -1447,6 +1458,7 @@ class ShadowV2EventGraph:
             or any(type(item) is not CandidateCommitReference for item in self.commits)
             or any(type(item) is not AcceptedResultReference for item in self.accepted_results)
             or any(type(item) is not ShadowV2Event for item in self.events)
+            or any(type(item) is not AttemptCommitReference for item in self.attempt_commit_references)
             or not self.attempts
             or not self.events
         ):
@@ -1466,13 +1478,19 @@ class ShadowV2EventGraph:
         results = {item.result_id: item for item in self.accepted_results}
         if len(results) != len(self.accepted_results):
             raise ShadowV2Error("accepted results are duplicate")
+        edge_pairs = tuple((item.lifecycle_attempt_id, item.commit_sha) for item in self.attempt_commit_references)
+        if len(set(edge_pairs)) != len(edge_pairs):
+            raise ShadowV2Error("lifecycle attempt commit references are duplicate")
+        for lifecycle_attempt_id, commit_sha in edge_pairs:
+            if lifecycle_attempt_id not in attempts or commit_sha not in commits:
+                raise ShadowV2Error("lifecycle attempt commit reference is unavailable")
+        if any(commit not in {commit_sha for _, commit_sha in edge_pairs} for commit in commits):
+            raise ShadowV2Error("candidate commit is orphaned from lifecycle attempts")
         for attempt in self.attempts:
             if attempt.parent_attempt_id is not None and attempt.parent_attempt_id not in attempts:
                 raise ShadowV2Error("lifecycle attempt parent is unavailable")
             if attempt.review_round_id is not None and attempt.review_round_id not in rounds:
                 raise ShadowV2Error("lifecycle attempt review round is unavailable")
-            if attempt.commit_sha is not None and attempt.commit_sha not in commits:
-                raise ShadowV2Error("lifecycle attempt commit is unavailable")
         for provider in self.provider_attempts:
             if provider.lifecycle_attempt_id not in attempts:
                 raise ShadowV2Error("provider attempt lifecycle reference is unavailable")
@@ -1499,7 +1517,7 @@ class ShadowV2EventGraph:
                     raise ShadowV2Error("provider event reference is invalid")
             if event.review_round_id is not None and event.review_round_id not in rounds:
                 raise ShadowV2Error("event review round is unavailable")
-            if event.commit_sha is not None and event.commit_sha not in commits:
+            if event.commit_sha is not None and (event.commit_sha not in commits or (event.lifecycle_attempt_id, event.commit_sha) not in edge_pairs):
                 raise ShadowV2Error("event commit is unavailable")
             if event.accepted_result_id is not None:
                 result = results.get(event.accepted_result_id)
@@ -1508,9 +1526,6 @@ class ShadowV2EventGraph:
         event_provider_ids = tuple(item.provider_attempt_id for item in self.events if item.provider_attempt_id is not None)
         if set(event_provider_ids) != set(providers) or len(event_provider_ids) != len(providers):
             raise ShadowV2Error("provider attempt references are missing or duplicate")
-        for commit in commits:
-            if sum(attempt.commit_sha == commit for attempt in self.attempts) != 1:
-                raise ShadowV2Error("candidate commit must have exactly one lifecycle attempt")
         if profile.requires_accepted_result:
             if len(self.accepted_results) != 1 or not self.review_rounds or self.review_rounds[-1].accepted_result_id is None:
                 raise ShadowV2Error("profile requires one final accepted result")
@@ -1684,10 +1699,11 @@ def _validate_v2_case(case: object, *, verify_digest: bool) -> None:
 
 def _v2_graph_payload(graph: ShadowV2EventGraph) -> dict[str, object]:
     return {
-        "attempts": tuple((item.attempt_id, item.ordinal, item.kind.value, item.role.value, item.parent_attempt_id, item.review_round_id, item.commit_sha) for item in graph.attempts),
+        "attempts": tuple((item.attempt_id, item.ordinal, item.kind.value, item.role.value, item.parent_attempt_id, item.review_round_id) for item in graph.attempts),
         "provider_attempts": tuple((item.provider_attempt_id, item.lifecycle_attempt_id, item.ordinal, item.provider_identity, item.outcome) for item in graph.provider_attempts),
         "review_rounds": tuple((item.review_round_id, item.ordinal, item.candidate_sha, item.accepted_result_id) for item in graph.review_rounds),
         "commits": tuple((item.commit_sha, item.commit_identity) for item in graph.commits),
+        "attempt_commit_references": tuple((item.lifecycle_attempt_id, item.commit_sha) for item in graph.attempt_commit_references),
         "accepted_results": tuple((item.result_id, item.review_round_id, item.event_id, item.candidate_sha) for item in graph.accepted_results),
         "events": tuple((item.event_id, item.ordinal, item.lifecycle_attempt_id, item.event_kind, item.provider_attempt_id, item.provider_call_made, item.review_round_id, item.commit_sha, item.accepted_result_id) for item in graph.events),
     }

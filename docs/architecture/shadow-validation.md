@@ -72,11 +72,14 @@ provider call.
 
 The reusable v2 core retains ordered lifecycle attempts, provider-attempt
 manifests, formal review rounds, candidate commits, accepted-result references,
-and profile-defined events as separate identities. It rejects missing,
-duplicate, out-of-order, or cross-linked attempt references; provider calls are
-separate from no-provider lifecycle events; and each declared candidate commit
-has exactly one lifecycle-attempt reference. Later leaves may define profiles
-over this graph, but do not register or implement those adapters here.
+typed lifecycle-attempt-to-commit relation edges, and profile-defined events as
+separate identities. The relation is explicitly many-to-many: an attempt may
+have no commits or several commits, and a commit may compose several attempts.
+It rejects missing, duplicate, out-of-order, orphaned, or cross-linked
+references; provider calls are separate from no-provider lifecycle events.
+Profiles retain responsibility for their total commit-cardinality constraints.
+Later leaves may define profiles over this graph, but do not register or
+implement those adapters here.
 
 Every registered profile declares capture mode, producer, readiness point,
 arm-before boundary, retention/read-back contract, and

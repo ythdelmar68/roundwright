@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-import unittest
 from dataclasses import replace
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.dependency_policy import (
     CandidateBinding,
@@ -17,6 +21,7 @@ from roundwright.dependency_policy import (
 )
 from roundwright.shadow import (
     AppendOnlyEvidenceStore,
+    AttemptCommitReference,
     CaptureMode,
     CandidateCommitReference,
     ComparisonOutcome,
@@ -192,7 +197,7 @@ class ShadowV2Tests(unittest.TestCase):
             (
                 LifecycleAttempt("worker-1", 1, LifecycleAttemptKind.WORKER, EvidenceRole.WORKER),
                 LifecycleAttempt("supervisor-1", 2, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, "worker-1", "round-1"),
-                LifecycleAttempt("worker-repair-2", 3, LifecycleAttemptKind.REPAIR, EvidenceRole.WORKER, "supervisor-1", None, candidate),
+                LifecycleAttempt("worker-repair-2", 3, LifecycleAttemptKind.REPAIR, EvidenceRole.WORKER, "supervisor-1"),
                 LifecycleAttempt("supervisor-2", 4, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, "worker-repair-2", "round-2"),
             ),
             (
@@ -213,11 +218,12 @@ class ShadowV2Tests(unittest.TestCase):
                 ShadowV2Event("event-5", 5, "supervisor-2", "accepted-result", None, False, "round-2", None, "accepted-2"),
                 ShadowV2Event("event-6", 6, "supervisor-2", "lifecycle-note", None, False),
             ),
+            (AttemptCommitReference("worker-repair-2", candidate),),
         )
 
-    def lifecycle_case(self, graph: ShadowV2EventGraph | None = None) -> ShadowV2Case:
+    def lifecycle_case(self, graph: ShadowV2EventGraph | None = None, *, profile: ShadowEvidenceProfile | None = None) -> ShadowV2Case:
         decision = self.decision()
-        profile = self.lifecycle_profile()
+        profile = self.lifecycle_profile() if profile is None else profile
         readiness = require_capture_readiness(
             profile, decision,
             RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
@@ -250,12 +256,40 @@ class ShadowV2Tests(unittest.TestCase):
                 with self.assertRaises(ShadowV2Error):
                     self.lifecycle_case(invalid)
 
-    def test_graph_enforces_commit_cardinality_and_one_attempt_per_commit(self) -> None:
+    def test_graph_core_supports_many_to_many_attempt_commit_cardinality(self) -> None:
         graph = self.lifecycle_graph()
-        no_commit = replace(graph, commits=())
-        many_commits = replace(graph, commits=(*graph.commits, CandidateCommitReference("c" * 40, "extra-commit")))
-        multiple_attempts = replace(graph, attempts=(replace(graph.attempts[0], commit_sha="b" * 40), *graph.attempts[1:]))
-        for invalid in (no_commit, many_commits, multiple_attempts):
+        flexible = replace(self.lifecycle_profile(), minimum_commits=0, maximum_commits=3)
+        no_commit_events = (*graph.events[:3], replace(graph.events[3], commit_sha=None), *graph.events[4:])
+        no_commit = replace(graph, commits=(), events=no_commit_events, attempt_commit_references=())
+        self.assertEqual(replay_shadow_v2_case(self.lifecycle_case(no_commit, profile=flexible)).outcome, ComparisonOutcome.MATCH)
+
+        second_commit = CandidateCommitReference("c" * 40, "follow-up-commit")
+        one_attempt_many_commits = replace(
+            graph,
+            commits=(*graph.commits, second_commit),
+            attempt_commit_references=(*graph.attempt_commit_references, AttemptCommitReference("worker-repair-2", second_commit.commit_sha)),
+        )
+        self.assertEqual(replay_shadow_v2_case(self.lifecycle_case(one_attempt_many_commits, profile=flexible)).outcome, ComparisonOutcome.MATCH)
+
+        many_attempts_one_commit = replace(
+            graph,
+            attempt_commit_references=(
+                AttemptCommitReference("worker-1", "b" * 40),
+                AttemptCommitReference("worker-repair-2", "b" * 40),
+            ),
+        )
+        self.assertEqual(replay_shadow_v2_case(self.lifecycle_case(many_attempts_one_commit)).outcome, ComparisonOutcome.MATCH)
+
+    def test_graph_rejects_invalid_attempt_commit_relation_edges(self) -> None:
+        graph = self.lifecycle_graph()
+        edge = graph.attempt_commit_references[0]
+        extra = CandidateCommitReference("c" * 40, "orphaned-commit")
+        wrong_attempt = replace(graph, attempt_commit_references=(AttemptCommitReference("missing-attempt", edge.commit_sha),))
+        missing_commit = replace(graph, attempt_commit_references=(AttemptCommitReference(edge.lifecycle_attempt_id, "c" * 40),))
+        duplicate_edge = replace(graph, attempt_commit_references=(edge, edge))
+        orphaned_commit = replace(graph, commits=(*graph.commits, extra))
+        wrong_event_edge = replace(graph, events=(*graph.events[:3], replace(graph.events[3], commit_sha="c" * 40), *graph.events[4:]))
+        for invalid in (wrong_attempt, missing_commit, duplicate_edge, orphaned_commit, wrong_event_edge):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ShadowV2Error):
                     self.lifecycle_case(invalid)

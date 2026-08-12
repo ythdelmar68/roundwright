@@ -170,6 +170,7 @@ class ShadowV2Tests(unittest.TestCase):
         for invalid in (
             lambda: replace(toolchain, cache_key="secret-cache"),
             lambda: VerifiedValidationToolchainProjection(digest("1"), "cache", digest("2"), (), toolchain.environments, toolchain.tools),
+            lambda: VerifiedValidationToolchainProjection(digest("1"), "cache", digest("2"), (*toolchain.requirements, NamedContentIdentity("extra", digest("f"))), toolchain.environments, toolchain.tools),
             lambda: VerifiedValidationToolchainProjection(digest("1"), "cache", digest("2"), (NamedContentIdentity("pipx", digest("3")), NamedContentIdentity("build", digest("4"))), toolchain.environments, toolchain.tools),
             lambda: replace(artifacts, task_id="private-token"),
             lambda: replace(artifacts, candidate_tree="not-a-tree"),
@@ -214,7 +215,7 @@ class ShadowV2Tests(unittest.TestCase):
             (NamedContentIdentity("uv", digest("8"), "0.12.3"), NamedContentIdentity("managed_python", digest("9"), "3.12.13"), NamedContentIdentity("python", digest("a"), "3.12.13"), NamedContentIdentity("pipx", digest("b"), "1.16.6")),
         )
         artifacts = CandidateArtifactProjection(binding.repository, binding.task_id, binding.candidate_sha, "c" * 40, "roundwright-source", digest("3"), digest("a"), digest("c"))
-        observations = tuple(item.fingerprint for item in dependency.observations)
+        observations = tuple(item.fingerprint for item in sorted(dependency.observations, key=lambda item: item.component.value))
         dependency_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"binding": binding.fingerprint, "policy": dependency.policy.core_fingerprint, "observations": observations, "admission": (dependency.admission.policy_fingerprint, dependency.admission.receipt_digest, dependency.admission.reviewer_identity, dependency.admission.authority_digest)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         git_control_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"binding": binding.fingerprint, "dependency": dependency_fingerprint, "now": 101}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         git = ReviewedGitObservation(binding.repository, binding.task_id, binding.candidate_sha, binding.fingerprint, "git", "git-source", source_class, "2.53.0", reported_version, digest("e"), digest("f"), git_control_fingerprint)
@@ -228,7 +229,7 @@ class ShadowV2Tests(unittest.TestCase):
         value["freshness"] = {"selection_at": 101, "valid_until": 120, "candidate_movement_invalidates": True}
         value["validation_toolchain"] = validation.public_payload()
         value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "normalized_version": git.normalized_version, "reported_version": git.reported_version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}}
-        value["dependency_control"] = {"binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency.policy.core_fingerprint, "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in dependency.observations], "admission": {"policy_fingerprint": dependency.admission.policy_fingerprint, "receipt_digest": dependency.admission.receipt_digest, "reviewer_identity": dependency.admission.reviewer_identity, "authority_digest": dependency.admission.authority_digest}}
+        value["dependency_control"] = {"binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency.policy.core_fingerprint, "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in sorted(dependency.observations, key=lambda item: item.component.value)], "admission": {"policy_fingerprint": dependency.admission.policy_fingerprint, "receipt_digest": dependency.admission.receipt_digest, "reviewer_identity": dependency.admission.reviewer_identity, "authority_digest": dependency.admission.authority_digest}}
         value["public_safe_projection"] = {"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot", "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint, "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git.observation_fingerprint}
         if mutate is not None:
             mutate(value)
@@ -295,6 +296,65 @@ class ShadowV2Tests(unittest.TestCase):
             with self.subTest(field=field):
                 with self.assertRaises(ProvenanceRecordError):
                     changed.verify_loaded()
+
+    def test_final_reconciliation_denies_mode_freshness_and_final_shape(self) -> None:
+        rehearsal, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        payload, receipt, expected = self.external_control_bytes()
+        with self.assertRaises(ProvenanceRecordError):
+            reconcile_final_provenance_selection(ExternalSelectionControl.load(payload, receipt, expected), **arguments)
+        for mutate, now in (
+            (lambda value: value["freshness"].update(selection_at=102), 101),
+            (lambda value: value["freshness"].update(valid_until=100), 101),
+            (lambda value: value["freshness"].update(candidate_movement_invalidates=False), 101),
+            (lambda value: value.update(extra="forbidden"), 101),
+            (lambda value: value["public_safe_projection"].update(extra="private-path"), 101),
+            (lambda value: value["public_safe_projection"].update(gate="wrong-gate"), 101),
+        ):
+            control, *_ = self.final_reconciliation_fixture(mutate)
+            with self.subTest(mutate=mutate):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(control, **{**arguments, "now": now})
+        for now in (100, 121):
+            with self.subTest(now=now):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(rehearsal, **{**arguments, "now": now})
+        not_ready, *_ = self.final_reconciliation_fixture()
+        object.__setattr__(not_ready, "capture_ready", False)
+        with self.assertRaises(ProvenanceRecordError):
+            reconcile_final_provenance_selection(not_ready, **arguments)
+
+    def test_final_reconciliation_denies_projection_and_dependency_drift(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        mutations = (
+            lambda value: value["validation_toolchain"].update(lock_digest=digest("9")),
+            lambda value: value["validation_toolchain"]["requirements"].update(build=digest("9")),
+            lambda value: value["validation_toolchain"]["environments"].update(python=digest("9")),
+            lambda value: value["validation_toolchain"]["tools"]["uv"].update(version="9.9.9"),
+            lambda value: value["dependency_control"].update(policy_fingerprint=digest("9")),
+            lambda value: value["dependency_control"]["observations"].pop(),
+            lambda value: value["dependency_control"]["admission"].update(authority_digest=digest("9")),
+            lambda value: value["artifacts"].update(candidate_package=digest("9")),
+            lambda value: value["artifacts"]["reviewed_git_entrypoint"].update(reported_version="2.53.0.other"),
+        )
+        for mutate in mutations:
+            changed, *_ = self.final_reconciliation_fixture(mutate)
+            with self.subTest(mutate=mutate):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(changed, **arguments)
+        other, *_ = self.final_reconciliation_fixture()
+        selection = reconcile_final_provenance_selection(control, **arguments)
+        with self.assertRaises(ProvenanceRecordError):
+            verify_selection_for_durable_record(other, selection)
+
+    def test_external_control_rejects_duplicate_and_nonfinite_json(self) -> None:
+        payload, receipt, expected = self.external_control_bytes()
+        duplicate = payload.removesuffix(b"}") + b',"schema":"shadow"}'
+        for invalid_payload, invalid_receipt in ((duplicate, receipt), (b'{"value":NaN}', receipt), (payload, b'{"value":Infinity}')):
+            with self.subTest():
+                with self.assertRaises(ProvenanceRecordError):
+                    ExternalSelectionControl.load(invalid_payload, invalid_receipt, expected)
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)

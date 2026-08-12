@@ -906,6 +906,28 @@ def _v2_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
+def _strict_json_object(value: bytes, label: str) -> dict[str, object]:
+    """Decode one external object without duplicate keys or non-finite constants."""
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError
+            result[key] = item
+        return result
+    try:
+        decoded = json.loads(
+            value.decode("utf-8"), object_pairs_hook=pairs,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ProvenanceRecordError(f"{label} is invalid") from error
+    if type(decoded) is not dict:
+        raise ProvenanceRecordError(f"{label} is invalid")
+    return decoded
+
+
 class ShadowV2Error(ShadowError):
     """Raised when profile-defined terminal evidence is incomplete or mixed."""
 
@@ -1170,16 +1192,13 @@ class ExternalSelectionControl:
     def load(cls, payload_bytes: bytes, receipt_bytes: bytes, expected: ExternalSelectionControlExpectation) -> "ExternalSelectionControl":
         if type(payload_bytes) is not bytes or type(receipt_bytes) is not bytes or type(expected) is not ExternalSelectionControlExpectation:
             raise ProvenanceRecordError("external selection control is invalid")
-        try:
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            receipt = json.loads(receipt_bytes.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise ProvenanceRecordError("external selection control is invalid") from error
+        payload = _strict_json_object(payload_bytes, "external selection control")
+        receipt = _strict_json_object(receipt_bytes, "external selection control receipt")
         digest = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
         receipt_digest = "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
         if digest != expected.payload_digest or receipt_digest != expected.receipt_digest:
             raise ProvenanceRecordError("external selection control bytes are not pinned")
-        if type(payload) is not dict or type(receipt) is not dict or set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
+        if set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
             raise ProvenanceRecordError("external selection control receipt is invalid")
         if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True or not _safe_roundlet_retention_identity(receipt.get("retention_identity")):
             raise ProvenanceRecordError("external selection control receipt is invalid")
@@ -1431,6 +1450,7 @@ class VerifiedProvenanceSelection:
     control_fingerprint: str
     selection_fingerprint: str
     external_load_fingerprint: str
+    _loaded_control: ExternalSelectionControl
     _reconciliation_fingerprint: str
     _reconciliation_seal: object
 
@@ -1460,6 +1480,7 @@ class VerifiedProvenanceSelection:
         value._validate()
         object.__setattr__(value, "selection_fingerprint", _v2_digest(value._payload()))
         object.__setattr__(value, "external_load_fingerprint", loaded_control._load_fingerprint)
+        object.__setattr__(value, "_loaded_control", loaded_control)
         object.__setattr__(value, "_reconciliation_fingerprint", _v2_digest({
             "selection": value.selection_fingerprint,
             "loaded_control": value.external_load_fingerprint,
@@ -1520,7 +1541,8 @@ def verify_selection_for_durable_record(
     loaded_control.verify_loaded()
     selection.verify_reconciliation()
     if (
-        selection.external_load_fingerprint != loaded_control._load_fingerprint
+        selection._loaded_control is not loaded_control
+        or selection.external_load_fingerprint != loaded_control._load_fingerprint
         or (selection.payload_digest, selection.receipt_digest, selection.contract_digest, selection.retention_identity) != (
             loaded_control.payload_digest, loaded_control.receipt_digest,
             loaded_control.contract_digest, loaded_control.retention_identity,
@@ -1530,13 +1552,7 @@ def verify_selection_for_durable_record(
 
 
 def _selection_payload(control: ExternalSelectionControl) -> dict[str, object]:
-    try:
-        payload = json.loads(control.payload.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ProvenanceRecordError("external selection control is unavailable") from error
-    if type(payload) is not dict:
-        raise ProvenanceRecordError("external selection control is unavailable")
-    return payload
+    return _strict_json_object(control.payload, "external selection control")
 
 
 def _control_fingerprint(control: object, *, now: int) -> tuple[str, tuple[str, ...]]:
@@ -1558,7 +1574,8 @@ def _control_fingerprint(control: object, *, now: int) -> tuple[str, tuple[str, 
         control.require(binding, DependencyStage.GIT_ENTRYPOINT, now=now)
     except Exception as error:
         raise ProvenanceRecordError("dependency control is not admitted") from error
-    observation_fingerprints = tuple(item.fingerprint for item in observations)
+    canonical_observations = tuple(sorted(observations, key=lambda item: item.component.value))
+    observation_fingerprints = tuple(item.fingerprint for item in canonical_observations)
     admission = control.admission
     fingerprint = _v2_digest({
         "binding": binding.fingerprint,
@@ -1607,6 +1624,12 @@ def reconcile_final_provenance_selection(
         "route", "case_schema", "evidence_profile", "capture_mode", "gate", "blocker", "next_action",
     }
     if set(selection) != expected_selection or set(freshness) != {"selection_at", "valid_until", "candidate_movement_invalidates"}:
+        raise ProvenanceRecordError("final provenance selection is incomplete")
+    if set(payload) != {
+        "schema", "control_mode", "capture_ready", "roundlet", "selection", "authority",
+        "control_contract_digest", "freshness", "validation_toolchain", "artifacts",
+        "dependency_control", "public_safe_projection",
+    }:
         raise ProvenanceRecordError("final provenance selection is incomplete")
     repository = selection["repository"]
     task_id = selection["worker_task"]
@@ -1693,7 +1716,7 @@ def reconcile_final_provenance_selection(
     expected_dependency = {
         "binding_fingerprint": binding.fingerprint,
         "policy_fingerprint": dependency_control.policy.core_fingerprint,
-        "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in dependency_control.observations],
+        "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in sorted(dependency_control.observations, key=lambda item: item.component.value)],
         "admission": {
             "policy_fingerprint": admission.policy_fingerprint,
             "receipt_digest": admission.receipt_digest,

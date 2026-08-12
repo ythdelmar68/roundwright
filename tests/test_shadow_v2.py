@@ -39,8 +39,6 @@ from roundwright.shadow import (
     ExternalSelectionControlExpectation,
     ProvenanceRecordError,
     ProvenanceRecordStore,
-    ProvenanceDecision,
-    PublicArtifactReference,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -915,28 +913,54 @@ class ShadowV2Tests(unittest.TestCase):
                 store, candidate_sha=record.candidate_sha, record_digest=record.record_digest,
                 **export_authority,
             )
-        decision = ProvenanceDecision(
-            "ythdelmar68/roundwright", "task-47", "a" * 40, record.candidate_sha,
-            digest("d"), digest("e"), digest("f"), (PublicArtifactReference("fixture", digest("1")),),
-            "recorder-capture-readiness", None, "record-terminal-snapshot", 101,
+
+    def test_verified_readiness_denies_forged_decision_and_receipt_against_valid_store(self) -> None:
+        temporary, store, _, record, authority = self.verified_readback_fixture()
+        self.addCleanup(temporary.cleanup)
+        export_authority = self.export_authority(authority)
+        recorder = RecorderBinding(
+            "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52",
+            "87094a4e780c692a00135421840c0e6713af5d35",
+            "0c594caa275262164fce1942ebd2142abe0e77bb",
         )
+        decision = export_provenance_decision(
+            store, candidate_sha=record.candidate_sha, record_digest=record.record_digest,
+            **export_authority,
+        )
+        forged_decision = replace(decision, next_action="another-action", decision_digest="")
         with self.assertRaises(ProvenanceRecordError):
             require_verified_provenance_capture_readiness(
-                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
-                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, forged_decision, recorder,
                 candidate_sha=record.candidate_sha, record_digest=record.record_digest, ready_at=101,
                 **export_authority,
             )
         with self.assertRaises(ProvenanceRecordError):
             require_verified_provenance_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
-                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                recorder,
                 candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=102, **export_authority,
             )
-        with self.assertRaises(ShadowV2Error):
+        valid = require_verified_provenance_capture_readiness(
+            shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision, recorder,
+            candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=101,
+            **export_authority,
+        )
+        with self.assertRaises(ProvenanceRecordError):
+            object.__new__(VerifiedCaptureReadinessReceipt).verify()
+        forged = object.__new__(VerifiedCaptureReadinessReceipt)
+        for name in valid.__dataclass_fields__:
+            object.__setattr__(forged, name, getattr(valid, name))
+        forged.verify()
+        wrong_recorder = object.__new__(RecorderBinding)
+        object.__setattr__(wrong_recorder, "harness_merge", "0" * 40)
+        object.__setattr__(wrong_recorder, "recorder_content", recorder.recorder_content)
+        object.__setattr__(wrong_recorder, "harness_tree", recorder.harness_tree)
+        with self.assertRaises(ProvenanceRecordError):
+            forged.verify_against(store, recorder=wrong_recorder, **export_authority)
+        with self.assertRaises(ProvenanceRecordError):
             require_verified_provenance_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
-                RecorderBinding("0" * 40, "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                wrong_recorder,
                 candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=101, **export_authority,
             )
 

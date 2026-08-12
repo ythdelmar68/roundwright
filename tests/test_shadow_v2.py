@@ -55,6 +55,8 @@ from roundwright.shadow import (
     ShadowV2EventGraph,
     ShadowV2Observation,
     VerifiedProvenanceSelection,
+    VerifiedDurableProvenanceRecord,
+    VerifiedProvenanceRecordStore,
     VerifiedValidationToolchainProjection,
     NamedContentIdentity,
     AcceptedResultReference,
@@ -62,6 +64,7 @@ from roundwright.shadow import (
     export_provenance_decision,
     reconcile_final_provenance_selection,
     verify_selection_for_durable_record,
+    materialize_verified_provenance_record,
     _materialize_provenance_record,
     replay_shadow_case,
     replay_shadow_v2_case,
@@ -583,6 +586,100 @@ class ShadowV2Tests(unittest.TestCase):
             reconcile_final_provenance_selection(control, validation=other_validation, artifacts=other_artifacts, git_control=other_git, git_observation=other_observation, dependency_control=other_dependency, now=101)
         with self.assertRaises(ProvenanceRecordError):
             reconcile_final_provenance_selection(control, **{**arguments, "git_control": other_git})
+
+    def verified_record_fixture(self):
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        selection = reconcile_final_provenance_selection(
+            control, validation=validation, artifacts=artifacts, git_control=git_control,
+            git_observation=git, dependency_control=dependency, now=101,
+        )
+        record = materialize_verified_provenance_record(
+            control, selection, validation=validation, artifacts=artifacts, git_control=git_control,
+            git_observation=git, dependency_control=dependency, now=101,
+        )
+        return record, control, selection, validation, artifacts, git_control, git, dependency
+
+    def test_verified_durable_record_materializes_only_from_reconciled_inputs(self) -> None:
+        record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
+        record.verify()
+        projection = record.public_projection()
+        self.assertEqual(projection["schema"], "roundwright-verified-provenance-record/v1")
+        self.assertEqual(projection["external"]["retention_identity"], control.retention_identity)
+        self.assertEqual(projection["selection"]["candidate_sha"], dependency.policy.binding.candidate_sha)
+        self.assertNotIn("payload", projection)
+        self.assertNotIn("receipt", projection)
+        with self.assertRaises(TypeError):
+            VerifiedDurableProvenanceRecord()
+        self.assertFalse(hasattr(VerifiedDurableProvenanceRecord, "_from_document"))
+        with self.assertRaises(ProvenanceRecordError):
+            materialize_verified_provenance_record(
+                control, object.__new__(VerifiedProvenanceSelection), validation=validation, artifacts=artifacts,
+                git_control=git_control, git_observation=git, dependency_control=dependency, now=101,
+            )
+        other, *_ = self.final_reconciliation_fixture()
+        with self.assertRaises(ProvenanceRecordError):
+            materialize_verified_provenance_record(
+                other, selection, validation=validation, artifacts=artifacts, git_control=git_control,
+                git_observation=git, dependency_control=dependency, now=101,
+            )
+        with self.assertRaises(ProvenanceRecordError):
+            materialize_verified_provenance_record(
+                control, selection, validation=validation, artifacts=replace(artifacts, package_digest=digest("9"), projection_fingerprint=""),
+                git_control=git_control, git_observation=git, dependency_control=dependency, now=101,
+            )
+
+    def test_verified_durable_record_store_is_append_only_and_read_back_verified(self) -> None:
+        record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
+        authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = VerifiedProvenanceRecordStore(root, record.retention_identity)
+            self.assertEqual(store.append(record, **authority), record.record_digest)
+            read_back = store.read_back(record.candidate_sha, record.record_digest)
+            self.assertEqual(read_back.public_projection(), record.public_projection())
+            self.assertEqual(read_back.verify_against(**authority).payload, record.payload)
+            self.assertEqual(store.append(record, **authority), record.record_digest)
+            with self.assertRaises(TypeError):
+                store.append(record)
+            wrong_control, *_ = self.final_reconciliation_fixture(candidate="c" * 40)
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(record, **{**authority, "loaded_control": wrong_control})
+            with self.assertRaises(ProvenanceRecordError):
+                VerifiedProvenanceRecordStore(root, "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/final-" + "c" * 40).append(record, **authority)
+            path = root / record.candidate_sha / f"{record.record_digest.removeprefix('sha256:')}.json"
+            path.write_bytes(b"{}")
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back(record.candidate_sha, record.record_digest)
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(record, **authority)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = VerifiedProvenanceRecordStore(root, record.retention_identity)
+            value = record.public_projection()
+            value["validation"]["lock_digest"] = digest("9")
+            value.pop("record_digest")
+            value["record_digest"] = "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+            payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+            path = root / record.candidate_sha / f"{value['record_digest'].removeprefix('sha256:')}.json"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(payload)
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back(record.candidate_sha, value["record_digest"])
+            for family, replacement in (
+                ("requirements", {"build": digest("3")} ),
+                ("environments", {"python": digest("5"), "build": digest("6"), "pipx": digest("7"), "extra": digest("8")} ),
+                ("tools", {"uv": {"version": "0.12.3", "digest": digest("8")}}),
+            ):
+                malformed = record.public_projection()
+                malformed["validation"][family] = replacement
+                malformed.pop("record_digest")
+                malformed["record_digest"] = "sha256:" + hashlib.sha256(json.dumps(malformed, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+                malformed_bytes = json.dumps(malformed, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+                malformed_path = root / record.candidate_sha / f"{malformed['record_digest'].removeprefix('sha256:')}.json"
+                malformed_path.write_bytes(malformed_bytes)
+                with self.subTest(family=family):
+                    with self.assertRaises(ProvenanceRecordError):
+                        store.read_back(record.candidate_sha, malformed["record_digest"])
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)

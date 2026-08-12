@@ -84,6 +84,12 @@ def digest(value: str) -> str:
 
 
 class ShadowV2Tests(unittest.TestCase):
+    @staticmethod
+    def canonical_test_store_root(temporary: str, *parts: str) -> Path:
+        """Use the physical ordinary temp root, not a platform lexical alias."""
+
+        return Path(temporary).resolve(strict=True).joinpath(*parts)
+
     def external_control_bytes(self):
         recorder_digest = digest("6")
         store_identity = "sha256:" + hashlib.sha256(json.dumps({
@@ -658,7 +664,7 @@ class ShadowV2Tests(unittest.TestCase):
         record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
         authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = self.canonical_test_store_root(temporary)
             store = VerifiedProvenanceRecordStore(root, record.retention_identity)
             self.assertEqual(store.append(record, **authority), record.record_digest)
             read_back = store.read_back(record.candidate_sha, record.record_digest)
@@ -681,7 +687,7 @@ class ShadowV2Tests(unittest.TestCase):
             with self.assertRaises(ProvenanceRecordError):
                 store.append(record, **authority)
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = self.canonical_test_store_root(temporary)
             store = VerifiedProvenanceRecordStore(root, record.retention_identity)
             value = record.public_projection()
             value["validation"]["lock_digest"] = digest("9")
@@ -713,7 +719,7 @@ class ShadowV2Tests(unittest.TestCase):
         record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
         authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = self.canonical_test_store_root(temporary)
             store = VerifiedProvenanceRecordStore(root, record.retention_identity)
             def write(digest_value, payload):
                 path = root / record.candidate_sha / f"{digest_value.removeprefix('sha256:')}.json"
@@ -762,7 +768,7 @@ class ShadowV2Tests(unittest.TestCase):
             with self.assertRaises(ProvenanceRecordError):
                 store.append(parsed, **authority)
         with TemporaryDirectory() as temporary:
-            root = Path(temporary) / "verified-store"
+            root = self.canonical_test_store_root(temporary, "verified-store")
             store = VerifiedProvenanceRecordStore(root, record.retention_identity)
             with self.assertRaises(ProvenanceRecordError):
                 store.append(record, **{**authority, "now": 121})
@@ -773,9 +779,9 @@ class ShadowV2Tests(unittest.TestCase):
                     store.append(record, **authority)
             self.assertFalse((root / record.candidate_sha).exists())
         with TemporaryDirectory() as first, TemporaryDirectory() as second:
-            store = VerifiedProvenanceRecordStore(Path(first), record.retention_identity)
+            store = VerifiedProvenanceRecordStore(self.canonical_test_store_root(first), record.retention_identity)
             store.append(record, **authority)
-            wrong_store = VerifiedProvenanceRecordStore(Path(second), record.retention_identity)
+            wrong_store = VerifiedProvenanceRecordStore(self.canonical_test_store_root(second), record.retention_identity)
             with self.assertRaises(ProvenanceRecordError):
                 wrong_store.read_back(record.candidate_sha, record.record_digest)
 
@@ -783,7 +789,7 @@ class ShadowV2Tests(unittest.TestCase):
         record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
         authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
         with TemporaryDirectory() as temporary, TemporaryDirectory() as target:
-            root = Path(temporary) / "store-link"
+            root = self.canonical_test_store_root(temporary, "store-link")
             try:
                 root.symlink_to(Path(target), target_is_directory=True)
             except (NotImplementedError, OSError):
@@ -794,7 +800,7 @@ class ShadowV2Tests(unittest.TestCase):
             with self.assertRaises(ProvenanceRecordError):
                 store.read_back(record.candidate_sha, record.record_digest)
         with TemporaryDirectory() as temporary, TemporaryDirectory() as target:
-            base = Path(temporary)
+            base = self.canonical_test_store_root(temporary)
             link = base / "linked-parent"
             try:
                 link.symlink_to(Path(target), target_is_directory=True)
@@ -806,11 +812,20 @@ class ShadowV2Tests(unittest.TestCase):
             with self.assertRaises(ProvenanceRecordError):
                 store.read_back(record.candidate_sha, record.record_digest)
 
+    def test_verified_store_accepts_canonical_ordinary_temp_root(self) -> None:
+        record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
+        authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        with TemporaryDirectory() as temporary:
+            root = self.canonical_test_store_root(temporary)
+            store = VerifiedProvenanceRecordStore(root, record.retention_identity)
+            self.assertEqual(store.append(record, **authority), record.record_digest)
+            self.assertEqual(store.read_back(record.candidate_sha, record.record_digest).record_digest, record.record_digest)
+
     def verified_readback_fixture(self):
         record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
         authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
         temporary = TemporaryDirectory()
-        store = VerifiedProvenanceRecordStore(Path(temporary.name), record.retention_identity)
+        store = VerifiedProvenanceRecordStore(self.canonical_test_store_root(temporary.name), record.retention_identity)
         store.append(record, **authority)
         return temporary, store, store.read_back(record.candidate_sha, record.record_digest), record, authority
 

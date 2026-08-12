@@ -60,6 +60,7 @@ from roundwright.shadow import (
     compare_provenance_decision,
     export_provenance_decision,
     reconcile_final_provenance_selection,
+    verify_selection_for_durable_record,
     _materialize_provenance_record,
     replay_shadow_case,
     replay_shadow_v2_case,
@@ -195,7 +196,7 @@ class ShadowV2Tests(unittest.TestCase):
         )
         return DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, receipt.reviewer_identity, receipt.authority_digest))
 
-    def final_reconciliation_fixture(self, mutate=None):
+    def final_reconciliation_fixture(self, mutate=None, *, leaf=47):
         dependency = self.dependency_control()
         binding = dependency.policy.binding
         git_control = GitEntrypointControl(binding, dependency, 101)
@@ -216,7 +217,7 @@ class ShadowV2Tests(unittest.TestCase):
         value["control_mode"] = "FINAL"
         value["capture_ready"] = True
         value["control_contract_digest"] = expected.contract_digest
-        value["selection"] = {"repository": binding.repository, "worker_task": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "active_leaf": 47, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot"}
+        value["selection"] = {"repository": binding.repository, "worker_task": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "active_leaf": leaf, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot"}
         value["freshness"] = {"selection_at": 101, "valid_until": 120, "candidate_movement_invalidates": True}
         value["validation_toolchain"] = validation.public_payload()
         value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "version": git.version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}}
@@ -224,11 +225,12 @@ class ShadowV2Tests(unittest.TestCase):
         value["public_safe_projection"] = {"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot", "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint, "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git.observation_fingerprint}
         if mutate is not None:
             mutate(value)
+        value["authority"]["live_leaf"]["number"] = leaf
         payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         receipt_value = json.loads(receipt)
         receipt_value.update({"control_mode": "FINAL", "capture_ready": True, "payload_bytes": len(payload), "payload_sha256": "sha256:" + hashlib.sha256(payload).hexdigest()})
         receipt = json.dumps(receipt_value, sort_keys=True, separators=(",", ":")).encode()
-        expected = replace(expected, payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
+        expected = replace(expected, leaf=leaf, live_leaf=(1, "node-47", leaf, "now", digest("3")), payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
         return ExternalSelectionControl.load(payload, receipt, expected), validation, artifacts, git_control, git, dependency
 
     def test_final_reconciliation_derives_all_fingerprints_from_verified_inputs(self) -> None:
@@ -240,6 +242,7 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(selection.validation_fingerprint, validation.projection_fingerprint)
         self.assertEqual(selection.git_fingerprint, git.observation_fingerprint)
         selection.verify_reconciliation()
+        verify_selection_for_durable_record(control, selection)
         with self.assertRaises(TypeError):
             VerifiedProvenanceSelection()
 
@@ -253,6 +256,7 @@ class ShadowV2Tests(unittest.TestCase):
         for invalid in (
             lambda: (self.final_reconciliation_fixture(lambda value: value.update(control_contract_digest=digest("9")))[0], arguments),
             lambda: (control, {**arguments, "git_observation": replace(git, executable_digest=digest("9"), observation_fingerprint="")}),
+            lambda: (control, {**arguments, "git_observation": replace(git, source_class="other-git", observation_fingerprint="")}),
             lambda: (control, {**arguments, "artifacts": replace(artifacts, package_digest=digest("9"), projection_fingerprint="")}),
             lambda: (self.final_reconciliation_fixture(lambda value: value["selection"].update(gate="another-gate"))[0], arguments),
         ):
@@ -264,6 +268,19 @@ class ShadowV2Tests(unittest.TestCase):
         with self.assertRaises(ProvenanceRecordError):
             object.__new__(VerifiedProvenanceSelection).verify_reconciliation()
         selection.verify_reconciliation()
+
+    def test_final_boundary_reuses_retained_leaf_and_rechecks_loaded_bytes(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture(leaf=99)
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        selection = reconcile_final_provenance_selection(control, **arguments)
+        verify_selection_for_durable_record(control, selection)
+        self.assertFalse(hasattr(ExternalSelectionControl, "_from_load"))
+        for field, value in (("receipt", b"{}"), ("mode", "REHEARSAL"), ("retention_identity", "other-retention")):
+            changed, *_ = self.final_reconciliation_fixture(leaf=99)
+            object.__setattr__(changed, field, value)
+            with self.subTest(field=field):
+                with self.assertRaises(ProvenanceRecordError):
+                    changed.verify_loaded()
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)

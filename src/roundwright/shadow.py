@@ -871,6 +871,7 @@ def _public_identifier(value: str) -> str:
 # that older shape.
 SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
+_PROVENANCE_GIT_SOURCE_CLASS = "reviewed-git"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1120,7 +1121,7 @@ class ExternalSelectionControlExpectation:
 
 @dataclass(frozen=True, init=False)
 class ExternalSelectionControl:
-    """Opaque Roundlet-produced selection control; REHEARSAL is never terminal-ready."""
+    """Loaded pinned control; seals prevent accidental API misuse, not process compromise."""
 
     payload_digest: str
     receipt_digest: str
@@ -1130,6 +1131,7 @@ class ExternalSelectionControl:
     capture_ready: bool
     payload: bytes
     receipt: bytes
+    expected: ExternalSelectionControlExpectation
     _load_fingerprint: str
     _load_seal: object
 
@@ -1140,50 +1142,24 @@ class ExternalSelectionControl:
     def terminal_ready(self) -> bool:
         return getattr(self, "mode", None) == "FINAL" and getattr(self, "capture_ready", None) is True
 
-    @classmethod
-    def _from_load(
-        cls, *, payload_digest: str, receipt_digest: str, contract_digest: str,
-        retention_identity: str, mode: str, capture_ready: bool, payload: bytes,
-        receipt: bytes,
-    ) -> "ExternalSelectionControl":
-        value = object.__new__(cls)
-        for name, item in {
-            "payload_digest": payload_digest, "receipt_digest": receipt_digest,
-            "contract_digest": contract_digest, "retention_identity": retention_identity,
-            "mode": mode, "capture_ready": capture_ready, "payload": payload,
-            "receipt": receipt,
-        }.items():
-            object.__setattr__(value, name, item)
-        object.__setattr__(value, "_load_fingerprint", _v2_digest({
-            "payload_digest": payload_digest, "receipt_digest": receipt_digest,
-            "contract_digest": contract_digest, "retention_identity": retention_identity,
-            "mode": mode, "capture_ready": capture_ready,
-        }))
-        object.__setattr__(value, "_load_seal", _EXTERNAL_SELECTION_CONTROL_SEAL)
-        return value
-
     def verify_loaded(self) -> None:
         """Revalidate the load seal before a FINAL consumer can act."""
 
         if type(self) is not ExternalSelectionControl or getattr(self, "_load_seal", None) is not _EXTERNAL_SELECTION_CONTROL_SEAL:
             raise ProvenanceRecordError("external selection control was not loaded")
-        if (
-            type(self.payload) is not bytes or type(self.receipt) is not bytes
-            or self.payload_digest != "sha256:" + hashlib.sha256(self.payload).hexdigest()
-            or self.receipt_digest != "sha256:" + hashlib.sha256(self.receipt).hexdigest()
-            or not _is_v2_digest(self.contract_digest)
-            or self._load_fingerprint != _v2_digest({
-                "payload_digest": self.payload_digest, "receipt_digest": self.receipt_digest,
-                "contract_digest": self.contract_digest, "retention_identity": self.retention_identity,
-                "mode": self.mode, "capture_ready": self.capture_ready,
-            })
-        ):
+        if type(self.expected) is not ExternalSelectionControlExpectation:
             raise ProvenanceRecordError("external selection control seal is invalid")
         try:
-            receipt = json.loads(self.receipt.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
+            reloaded = ExternalSelectionControl.load(self.payload, self.receipt, self.expected)
+        except (ProvenanceRecordError, TypeError) as error:
             raise ProvenanceRecordError("external selection control seal is invalid") from error
-        if type(receipt) is not dict or receipt.get("contract_sha256") != self.contract_digest:
+        if (
+            (self.payload_digest, self.receipt_digest, self.contract_digest, self.retention_identity,
+             self.mode, self.capture_ready, self.expected) !=
+            (reloaded.payload_digest, reloaded.receipt_digest, reloaded.contract_digest, reloaded.retention_identity,
+             reloaded.mode, reloaded.capture_ready, reloaded.expected)
+            or self._load_fingerprint != reloaded._load_fingerprint
+        ):
             raise ProvenanceRecordError("external selection control seal is invalid")
 
     @classmethod
@@ -1201,7 +1177,7 @@ class ExternalSelectionControl:
             raise ProvenanceRecordError("external selection control bytes are not pinned")
         if type(payload) is not dict or type(receipt) is not dict or set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
             raise ProvenanceRecordError("external selection control receipt is invalid")
-        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True:
+        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True or not _safe_v2_token(receipt.get("retention_identity")):
             raise ProvenanceRecordError("external selection control receipt is invalid")
         selection = payload.get("selection")
         authority = payload.get("authority")
@@ -1233,12 +1209,21 @@ class ExternalSelectionControl:
         ready = payload.get("capture_ready")
         if mode not in {"REHEARSAL", "FINAL"} or type(ready) is not bool or receipt.get("control_mode") != mode or receipt.get("capture_ready") is not ready:
             raise ProvenanceRecordError("external selection control mode is invalid")
-        return cls._from_load(
-            payload_digest=digest, receipt_digest=receipt_digest,
-            contract_digest=expected.contract_digest,
-            retention_identity=receipt["retention_identity"], mode=mode,
-            capture_ready=ready, payload=bytes(payload_bytes), receipt=bytes(receipt_bytes),
-        )
+        value = object.__new__(cls)
+        for name, item in {
+            "payload_digest": digest, "receipt_digest": receipt_digest,
+            "contract_digest": expected.contract_digest, "retention_identity": receipt["retention_identity"],
+            "mode": mode, "capture_ready": ready, "payload": bytes(payload_bytes),
+            "receipt": bytes(receipt_bytes), "expected": expected,
+        }.items():
+            object.__setattr__(value, name, item)
+        object.__setattr__(value, "_load_fingerprint", _v2_digest({
+            "payload_digest": digest, "receipt_digest": receipt_digest,
+            "contract_digest": expected.contract_digest, "retention_identity": receipt["retention_identity"],
+            "mode": mode, "capture_ready": ready, "expected": expected.__dict__,
+        }))
+        object.__setattr__(value, "_load_seal", _EXTERNAL_SELECTION_CONTROL_SEAL)
+        return value
 
 
 @dataclass(frozen=True)
@@ -1518,6 +1503,25 @@ class VerifiedProvenanceSelection:
         }
 
 
+def verify_selection_for_durable_record(
+    loaded_control: object, selection: object,
+) -> None:
+    """Future durable storage must retain the original loaded external control."""
+
+    if type(loaded_control) is not ExternalSelectionControl or type(selection) is not VerifiedProvenanceSelection:
+        raise ProvenanceRecordError("durable provenance selection inputs are invalid")
+    loaded_control.verify_loaded()
+    selection.verify_reconciliation()
+    if (
+        selection.external_load_fingerprint != loaded_control._load_fingerprint
+        or (selection.payload_digest, selection.receipt_digest, selection.contract_digest, selection.retention_identity) != (
+            loaded_control.payload_digest, loaded_control.receipt_digest,
+            loaded_control.contract_digest, loaded_control.retention_identity,
+        )
+    ):
+        raise ProvenanceRecordError("durable provenance selection binding is invalid")
+
+
 def _selection_payload(control: ExternalSelectionControl) -> dict[str, object]:
     try:
         payload = json.loads(control.payload.decode("utf-8"))
@@ -1607,8 +1611,13 @@ def reconcile_final_provenance_selection(
     if (
         not _safe_repository(repository) or not _safe_v2_token(task_id)
         or not all(_SHA1.fullmatch(value) for value in (base_sha, candidate_sha, candidate_tree))
-        or selection["active_leaf"] != 47 or selection["route"] != "toolbox"
-        or selection["case_schema"] != SHADOW_CASE_SCHEMA_V2 or selection["evidence_profile"] != PROVENANCE_DECISION_PROFILE
+        or (selection["repository"], selection["worker_task"], selection["base_sha"], selection["candidate_sha"],
+            selection["candidate_tree"], selection["active_leaf"], selection["route"], selection["case_schema"],
+            selection["evidence_profile"]) != (
+            control.expected.repository, control.expected.task_id, control.expected.base_sha,
+            control.expected.candidate_sha, control.expected.candidate_tree, control.expected.leaf,
+            control.expected.route, control.expected.schema, control.expected.profile,
+        )
         or selection["capture_mode"] != CaptureMode.TERMINAL_SNAPSHOT.value
         or selection["gate"] != "recorder-capture-readiness" or selection["blocker"] is not None
         or selection["next_action"] != "record-terminal-snapshot"
@@ -1646,6 +1655,7 @@ def reconcile_final_provenance_selection(
         or artifacts.source_identity != package_observation.source_identity
         or artifacts.package_digest != package_observation.artifact_digest
         or artifacts.installed_entrypoint_digest != package_observation.executable_digest
+        or git_observation.source_class != _PROVENANCE_GIT_SOURCE_CLASS
         or (git_observation.identifier, git_observation.source_identity, git_observation.version, git_observation.artifact_digest, git_observation.executable_digest) != (
             git_dependency_observation.identifier, git_dependency_observation.source_identity,
             git_dependency_observation.version, git_dependency_observation.artifact_digest,

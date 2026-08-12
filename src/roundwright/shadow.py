@@ -2124,7 +2124,10 @@ class VerifiedProvenanceRecordStore:
             git_control=git_control, git_observation=git_observation,
             dependency_control=dependency_control, now=now,
         )
-        record.verify()
+        try:
+            record.verify()
+        except (AttributeError, ProvenanceRecordError) as error:
+            raise ProvenanceRecordError("verified provenance record is unsealed") from error
         if record.payload != rebuilt.payload:
             raise ProvenanceRecordError("verified provenance record authority does not match")
         self._require_safe_path(self._root)

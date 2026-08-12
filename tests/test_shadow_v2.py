@@ -641,6 +641,8 @@ class ShadowV2Tests(unittest.TestCase):
             self.assertEqual(store.append(record, **authority), record.record_digest)
             with self.assertRaises(TypeError):
                 store.append(record)
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(object.__new__(VerifiedDurableProvenanceRecord), **authority)
             wrong_control, *_ = self.final_reconciliation_fixture(candidate="c" * 40)
             with self.assertRaises(ProvenanceRecordError):
                 store.append(record, **{**authority, "loaded_control": wrong_control})

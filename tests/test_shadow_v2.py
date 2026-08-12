@@ -83,7 +83,7 @@ class ShadowV2Tests(unittest.TestCase):
             "authority": {"origin_main": {"commit": "a" * 40, "tree": "1" * 40}, "active_roundlet_block": {"agents_blob": "d" * 40, "block_sha256": digest("2")}, "external_validation_contract": {"skill_blob": "e" * 40, "qualification_blob": "f" * 40}, "live_leaf": {"issue_database_id": 1, "issue_node_id": "node-47", "number": 47, "updated_at": "now", "body_sha256": digest("3")}, "owner_instructions": [{"comment_id": 2, "comment_node_id": "node-2", "body_sha256": digest("4")}, {"comment_id": 3, "comment_node_id": "node-3", "body_sha256": digest("5")}]},
         }
         content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        receipt = {"schema": "roundwright-provenance-selection-control-receipt/v1", "append_only": True, "capture_ready": False, "contract_sha256": digest("1"), "control_mode": "REHEARSAL", "payload_bytes": len(content), "payload_sha256": "sha256:" + hashlib.sha256(content).hexdigest(), "read_back": "VERIFIED", "retention_identity": "roundlet-control-47"}
+        receipt = {"schema": "roundwright-provenance-selection-control-receipt/v1", "append_only": True, "capture_ready": False, "contract_sha256": digest("1"), "control_mode": "REHEARSAL", "payload_bytes": len(content), "payload_sha256": "sha256:" + hashlib.sha256(content).hexdigest(), "read_back": "VERIFIED", "retention_identity": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/rehearsal-" + "b" * 40}
         receipt_bytes = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
         expected = ExternalSelectionControlExpectation("run-47", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")), (3, "node-3", digest("5"))))
         return content, receipt_bytes, expected
@@ -93,6 +93,7 @@ class ShadowV2Tests(unittest.TestCase):
         control = ExternalSelectionControl.load(payload, receipt, expected)
         self.assertEqual(control.mode, "REHEARSAL")
         self.assertFalse(control.terminal_ready)
+        self.assertEqual(control.retention_identity, "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/rehearsal-" + "b" * 40)
         for bad_payload, bad_receipt, bad_expected in ((payload + b" ", receipt, expected), (payload, b"{}", expected), (payload, receipt, replace(expected, candidate_sha="d" * 40))):
             with self.subTest():
                 with self.assertRaises(ProvenanceRecordError):
@@ -142,6 +143,10 @@ class ShadowV2Tests(unittest.TestCase):
         retained = ExternalSelectionControl.load(payload, receipt, expected)
         self.assertIs(type(retained.payload), bytes)
         self.assertEqual(retained.payload, payload)
+        for retention in ("C:/private/control", "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/../final-" + "b" * 40, "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/final-token"):
+            with self.subTest(retention=retention):
+                with self.assertRaises(ProvenanceRecordError):
+                    ExternalSelectionControl.load(*rebased(payload_value, {"retention_identity": retention}))
 
     def test_reconciliation_projection_types_are_exact_and_public_safe(self) -> None:
         toolchain = VerifiedValidationToolchainProjection(
@@ -156,7 +161,7 @@ class ShadowV2Tests(unittest.TestCase):
         )
         git = ReviewedGitObservation(
             "ythdelmar68/roundwright", "task-47", "b" * 40, digest("f"), "git", "git-source",
-            "reviewed-git", "2.53.0", digest("0"), digest("1"), digest("2"),
+            "bundled-native-git", "2.53.0", "2.53.0.windows.3", digest("0"), digest("1"), digest("2"),
         )
         self.assertTrue(all(value.startswith("sha256:") for value in (
             toolchain.projection_fingerprint, artifacts.projection_fingerprint,
@@ -183,7 +188,7 @@ class ShadowV2Tests(unittest.TestCase):
         binding = CandidateBinding("ythdelmar68/roundwright", "task-47", candidate)
         components = (
             ComponentPolicy(DependencyComponent.PACKAGE, "roundwright-package", VersionRange("1.0.0", "2.0.0"), "roundwright-source", digest("a"), digest("c")),
-            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-source", digest("e"), digest("f")),
+            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.53.0", "3.0.0"), "git-source", digest("e"), digest("f")),
         )
         policy = DependencyPolicy(
             binding, digest("d"), 100, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP),
@@ -210,7 +215,7 @@ class ShadowV2Tests(unittest.TestCase):
         observations = tuple(item.fingerprint for item in dependency.observations)
         dependency_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"binding": binding.fingerprint, "policy": dependency.policy.core_fingerprint, "observations": observations, "admission": (dependency.admission.policy_fingerprint, dependency.admission.receipt_digest, dependency.admission.reviewer_identity, dependency.admission.authority_digest)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         git_control_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"binding": binding.fingerprint, "dependency": dependency_fingerprint, "now": 101}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
-        git = ReviewedGitObservation(binding.repository, binding.task_id, binding.candidate_sha, binding.fingerprint, "git", "git-source", "reviewed-git", "2.0.0", digest("e"), digest("f"), git_control_fingerprint)
+        git = ReviewedGitObservation(binding.repository, binding.task_id, binding.candidate_sha, binding.fingerprint, "git", "git-source", "bundled-native-git", "2.53.0", "2.53.0.windows.3", digest("e"), digest("f"), git_control_fingerprint)
         candidate_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "artifacts": artifacts.projection_fingerprint}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         payload, receipt, expected = self.external_control_bytes()
         value = json.loads(payload)
@@ -220,7 +225,7 @@ class ShadowV2Tests(unittest.TestCase):
         value["selection"] = {"repository": binding.repository, "worker_task": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "active_leaf": leaf, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot"}
         value["freshness"] = {"selection_at": 101, "valid_until": 120, "candidate_movement_invalidates": True}
         value["validation_toolchain"] = validation.public_payload()
-        value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "version": git.version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}}
+        value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "normalized_version": git.normalized_version, "reported_version": git.reported_version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}}
         value["dependency_control"] = {"binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency.policy.core_fingerprint, "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in dependency.observations], "admission": {"policy_fingerprint": dependency.admission.policy_fingerprint, "receipt_digest": dependency.admission.receipt_digest, "reviewer_identity": dependency.admission.reviewer_identity, "authority_digest": dependency.admission.authority_digest}}
         value["public_safe_projection"] = {"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot", "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint, "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git.observation_fingerprint}
         if mutate is not None:
@@ -228,7 +233,7 @@ class ShadowV2Tests(unittest.TestCase):
         value["authority"]["live_leaf"]["number"] = leaf
         payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         receipt_value = json.loads(receipt)
-        receipt_value.update({"control_mode": "FINAL", "capture_ready": True, "payload_bytes": len(payload), "payload_sha256": "sha256:" + hashlib.sha256(payload).hexdigest()})
+        receipt_value.update({"control_mode": "FINAL", "capture_ready": True, "retention_identity": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/final-" + binding.candidate_sha, "payload_bytes": len(payload), "payload_sha256": "sha256:" + hashlib.sha256(payload).hexdigest()})
         receipt = json.dumps(receipt_value, sort_keys=True, separators=(",", ":")).encode()
         expected = replace(expected, leaf=leaf, live_leaf=(1, "node-47", leaf, "now", digest("3")), payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
         return ExternalSelectionControl.load(payload, receipt, expected), validation, artifacts, git_control, git, dependency
@@ -257,6 +262,8 @@ class ShadowV2Tests(unittest.TestCase):
             lambda: (self.final_reconciliation_fixture(lambda value: value.update(control_contract_digest=digest("9")))[0], arguments),
             lambda: (control, {**arguments, "git_observation": replace(git, executable_digest=digest("9"), observation_fingerprint="")}),
             lambda: (control, {**arguments, "git_observation": replace(git, source_class="other-git", observation_fingerprint="")}),
+            lambda: (control, {**arguments, "git_observation": replace(git, normalized_version="2.53.1", observation_fingerprint="")}),
+            lambda: (control, {**arguments, "git_observation": replace(git, reported_version="2.53.0.windows.4", observation_fingerprint="")}),
             lambda: (control, {**arguments, "artifacts": replace(artifacts, package_digest=digest("9"), projection_fingerprint="")}),
             lambda: (self.final_reconciliation_fixture(lambda value: value["selection"].update(gate="another-gate"))[0], arguments),
         ):

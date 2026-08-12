@@ -871,10 +871,12 @@ def _public_identifier(value: str) -> str:
 # that older shape.
 SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
-_PROVENANCE_GIT_SOURCE_CLASS = "reviewed-git"
+_PROVENANCE_GIT_SOURCE_CLASS = "bundled-native-git"
+_PROVENANCE_GIT_REPORTED_VERSION = "2.53.0.windows.3"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
+_ROUNDLET_RETENTION_ID = re.compile(r"roundlet-local:[0-9a-f]{32}/(?:rehearsal|final)-[0-9a-f]{40}\Z")
 
 
 def _safe_v2_token(value: object) -> bool:
@@ -892,6 +894,10 @@ def _safe_profile_id(value: object) -> bool:
 
 def _safe_repository(value: object) -> bool:
     return type(value) is str and _V2_REPOSITORY.fullmatch(value) is not None
+
+
+def _safe_roundlet_retention_identity(value: object) -> bool:
+    return type(value) is str and _ROUNDLET_RETENTION_ID.fullmatch(value) is not None
 
 
 def _is_v2_digest(value: object) -> bool:
@@ -1177,7 +1183,7 @@ class ExternalSelectionControl:
             raise ProvenanceRecordError("external selection control bytes are not pinned")
         if type(payload) is not dict or type(receipt) is not dict or set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
             raise ProvenanceRecordError("external selection control receipt is invalid")
-        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True or not _safe_v2_token(receipt.get("retention_identity")):
+        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True or not _safe_roundlet_retention_identity(receipt.get("retention_identity")):
             raise ProvenanceRecordError("external selection control receipt is invalid")
         selection = payload.get("selection")
         authority = payload.get("authority")
@@ -1367,7 +1373,8 @@ class ReviewedGitObservation:
     identifier: str
     source_identity: str
     source_class: str
-    version: str
+    normalized_version: str
+    reported_version: str
     artifact_digest: str
     executable_digest: str
     control_fingerprint: str
@@ -1385,7 +1392,8 @@ class ReviewedGitObservation:
             or not _safe_v2_token(self.identifier)
             or not _safe_v2_token(self.source_identity)
             or not _safe_v2_token(self.source_class)
-            or not _safe_v2_token(self.version)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", self.normalized_version)
+            or not _safe_v2_token(self.reported_version)
         ):
             raise ProvenanceRecordError("reviewed Git observation is invalid")
         fingerprint = _v2_digest(self._payload())
@@ -1402,7 +1410,8 @@ class ReviewedGitObservation:
             "identifier": self.identifier,
             "source_identity": self.source_identity,
             "source_class": self.source_class,
-            "version": self.version,
+            "normalized_version": self.normalized_version,
+            "reported_version": self.reported_version,
             "artifact_digest": self.artifact_digest,
             "executable_digest": self.executable_digest,
             "control_fingerprint": self.control_fingerprint,
@@ -1467,7 +1476,7 @@ class VerifiedProvenanceSelection:
                 self.candidate_fingerprint, self.validation_fingerprint,
                 self.git_fingerprint, self.control_fingerprint,
             ))
-            or not _safe_v2_token(self.retention_identity)
+            or not _safe_roundlet_retention_identity(self.retention_identity)
             or type(self.selection_at) is not int
             or self.selection_at < 0
         ):
@@ -1656,7 +1665,8 @@ def reconcile_final_provenance_selection(
         or artifacts.package_digest != package_observation.artifact_digest
         or artifacts.installed_entrypoint_digest != package_observation.executable_digest
         or git_observation.source_class != _PROVENANCE_GIT_SOURCE_CLASS
-        or (git_observation.identifier, git_observation.source_identity, git_observation.version, git_observation.artifact_digest, git_observation.executable_digest) != (
+        or git_observation.reported_version != _PROVENANCE_GIT_REPORTED_VERSION
+        or (git_observation.identifier, git_observation.source_identity, git_observation.normalized_version, git_observation.artifact_digest, git_observation.executable_digest) != (
             git_dependency_observation.identifier, git_dependency_observation.source_identity,
             git_dependency_observation.version, git_dependency_observation.artifact_digest,
             git_dependency_observation.executable_digest,
@@ -1674,7 +1684,8 @@ def reconcile_final_provenance_selection(
             "identifier": git_observation.identifier,
             "source_identity": git_observation.source_identity,
             "source_class": git_observation.source_class,
-            "version": git_observation.version,
+            "normalized_version": git_observation.normalized_version,
+            "reported_version": git_observation.reported_version,
             "artifact_digest": git_observation.artifact_digest,
             "executable_digest": git_observation.executable_digest,
             "control_fingerprint": git_observation.control_fingerprint,

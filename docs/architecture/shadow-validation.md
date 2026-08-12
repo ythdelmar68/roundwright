@@ -70,6 +70,15 @@ defined by the selected profile rather than a universal lifecycle trace. Phase
 the durable typed provenance/policy state. Its sole event explicitly makes no
 provider call.
 
+Before terminal export, the production provenance materializer must require a
+candidate-bound admitted dependency execution control, validate the canonical
+Git-entrypoint stage, and seal the resulting public-safe policy, observation,
+admission, candidate-tree, entrypoint, and gate projection in append-only
+content-addressed local retention. Terminal export and capture readiness accept
+that verified durable projection, never caller-authored policy or exporter
+fields; moved, stale, partial, duplicate, tampered, or overwritten records
+fail closed.
+
 The reusable v2 core retains ordered lifecycle attempts, provider-attempt
 manifests, formal review rounds, candidate commits, accepted-result references,
 typed lifecycle-attempt-to-commit relation edges, and profile-defined events as

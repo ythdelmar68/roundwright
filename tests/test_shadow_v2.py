@@ -6,17 +6,21 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.dependency_policy import (
+    BootstrapPolicyReceipt,
     CandidateBinding,
     ComponentPolicy,
     DependencyComponent,
+    DependencyExecutionControl,
     DependencyPolicy,
     ObservedDependency,
     PolicyTransition,
     PolicyTransitionKind,
+    TrustedDependencyAdmission,
     VersionRange,
 )
 from roundwright.shadow import (
@@ -25,6 +29,8 @@ from roundwright.shadow import (
     CaptureMode,
     CandidateCommitReference,
     ComparisonOutcome,
+    ProvenanceRecordError,
+    ProvenanceRecordStore,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -43,6 +49,7 @@ from roundwright.shadow import (
     AcceptedResultReference,
     compare_provenance_decision,
     export_provenance_decision,
+    materialize_provenance_record,
     replay_shadow_case,
     replay_shadow_v2_case,
     require_capture_readiness,
@@ -56,52 +63,46 @@ def digest(value: str) -> str:
 
 
 class ShadowV2Tests(unittest.TestCase):
-    def decision(self, *, candidate: str = "b" * 40, ready_at: int = 101):
+    def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         binding = CandidateBinding("ythdelmar68/roundwright", "task-47", candidate)
-        component = ComponentPolicy(
-            DependencyComponent.PACKAGE,
-            "roundwright-package",
-            VersionRange("1.0.0", "2.0.0"),
-            "roundwright-source",
-            digest("a"),
-            digest("c"),
+        components = (
+            ComponentPolicy(DependencyComponent.PACKAGE, "roundwright-package", VersionRange("1.0.0", "2.0.0"), "roundwright-source", digest("a"), digest("c")),
+            ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "git-source", digest("e"), digest("f")),
         )
         policy = DependencyPolicy(
             binding,
             digest("d"),
             100,
             60,
-            (component,),
+            components,
             PolicyTransition(PolicyTransitionKind.BOOTSTRAP),
         )
-        observation = ObservedDependency(
-            binding,
-            DependencyComponent.PACKAGE,
-            "roundwright-package",
-            "1.0.0",
-            "roundwright-source",
-            digest("a"),
-            digest("c"),
-            101,
-            digest("d"),
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("1"), authority_digest=digest("2"))
+        policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        observations = tuple(
+            ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, 101, policy.policy_digest)
+            for item in components
         )
-        return export_provenance_decision(
-            binding,
-            policy,
-            (observation,),
+        control = DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, receipt.reviewer_identity, receipt.authority_digest))
+        return materialize_provenance_record(
+            control,
             base_sha="a" * 40,
+            candidate_tree="d" * 40,
             entrypoint_fingerprint=digest("e"),
             gate_identity="provenance-gate-pass",
             blocker=None,
             next_action="record-terminal-snapshot",
-            ready_at=ready_at,
+            now=ready_at,
         )
+
+    def decision(self, *, candidate: str = "b" * 40, ready_at: int = 101):
+        return export_provenance_decision(self.record(candidate=candidate, ready_at=ready_at))
 
     def case(self, *, candidate: str = "b" * 40, ready_at: int = 101) -> ShadowV2Case:
         decision = self.decision(candidate=candidate, ready_at=ready_at)
         readiness = require_capture_readiness(
             shadow_evidence_profile(PROVENANCE_DECISION_PROFILE),
-            decision,
+            self.record(candidate=candidate, ready_at=ready_at),
             RecorderBinding(
                 "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52",
                 "87094a4e780c692a00135421840c0e6713af5d35",
@@ -155,11 +156,24 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(compare_provenance_decision(decision, decision, ready_at=102), ComparisonOutcome.INVALID)
         with self.assertRaises(ShadowV2Error):
             require_capture_readiness(
-                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), decision,
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), self.record(),
                 RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
                 AppendOnlyEvidenceStore("roundlet-provenance-retention"),
                 candidate_sha="c" * 40, ready_at=101,
             )
+
+    def test_terminal_export_requires_durable_record_and_store_readback_rejects_tampering(self) -> None:
+        record = self.record()
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(record.decision)
+        with TemporaryDirectory() as temporary:
+            store = ProvenanceRecordStore(Path(temporary), "roundlet-provenance-records")
+            digest = store.append(record)
+            self.assertEqual(store.read_back(digest), record)
+            self.assertEqual(store.append(record), digest)
+            (Path(temporary) / f"{digest.removeprefix('sha256:')}.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back(digest)
 
     def test_v2_rejects_provider_attempt_and_wrong_profile_event(self) -> None:
         case = self.case()

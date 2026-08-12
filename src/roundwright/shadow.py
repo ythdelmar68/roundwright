@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Callable, Iterable, Never
 
 
@@ -1077,22 +1079,147 @@ class ProvenanceDecision:
         }
 
 
-def export_provenance_decision(
-    binding: object,
-    policy: object,
-    observations: object,
+PROVENANCE_RECORD_SCHEMA = "roundwright-provenance-record/v1"
+
+
+class ProvenanceRecordError(ShadowV2Error):
+    """Raised when production provenance cannot be sealed or read back."""
+
+
+@dataclass(frozen=True)
+class DurableProvenanceRecord:
+    """A candidate-bound projection produced only after a sealed control passes."""
+
+    decision: ProvenanceDecision
+    candidate_tree: str
+    policy_fingerprint: str
+    observation_fingerprints: tuple[str, ...]
+    admission_digest: str
+    record_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.decision) is not ProvenanceDecision
+            or not _SHA1.fullmatch(self.candidate_tree)
+            or not _is_v2_digest(self.policy_fingerprint)
+            or type(self.observation_fingerprints) is not tuple
+            or not self.observation_fingerprints
+            or any(not _is_v2_digest(value) for value in self.observation_fingerprints)
+            or len(set(self.observation_fingerprints)) != len(self.observation_fingerprints)
+            or not _is_v2_digest(self.admission_digest)
+        ):
+            raise ProvenanceRecordError("durable provenance record is invalid")
+        digest = _v2_digest(self.payload())
+        if self.record_digest and self.record_digest != digest:
+            raise ProvenanceRecordError("durable provenance record digest is invalid")
+        object.__setattr__(self, "record_digest", digest)
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": PROVENANCE_RECORD_SCHEMA,
+            "decision": self.decision._payload(),
+            "decision_digest": self.decision.decision_digest,
+            "candidate_tree": self.candidate_tree,
+            "policy_fingerprint": self.policy_fingerprint,
+            "observation_fingerprints": self.observation_fingerprints,
+            "admission_digest": self.admission_digest,
+        }
+
+
+class ProvenanceRecordStore:
+    """Append-only, content-addressed local retention for terminal provenance."""
+
+    def __init__(self, root: Path, retention_identity: str) -> None:
+        if not isinstance(root, Path) or not _safe_v2_token(retention_identity):
+            raise ProvenanceRecordError("provenance record store is invalid")
+        self._root = root
+        self._retention_identity = retention_identity
+
+    @property
+    def retention_identity(self) -> str:
+        return self._retention_identity
+
+    def append(self, record: DurableProvenanceRecord) -> str:
+        if type(record) is not DurableProvenanceRecord:
+            raise ProvenanceRecordError("durable provenance record is invalid")
+        if self._root.is_symlink():
+            raise ProvenanceRecordError("provenance record store must not be a symlink")
+        self._root.mkdir(parents=True, exist_ok=True)
+        value = json.dumps(record.payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        path = self._root / f"{record.record_digest.removeprefix('sha256:')}.json"
+        if path.is_symlink():
+            raise ProvenanceRecordError("provenance record target must not be a symlink")
+        try:
+            with path.open("xb") as output:
+                output.write(value)
+                output.flush()
+                os.fsync(output.fileno())
+        except FileExistsError:
+            if path.read_bytes() != value:
+                raise ProvenanceRecordError("durable provenance record overwrite is forbidden") from None
+        return record.record_digest
+
+    def read_back(self, digest: str) -> DurableProvenanceRecord:
+        if not _is_v2_digest(digest) or self._root.is_symlink():
+            raise ProvenanceRecordError("durable provenance read-back is invalid")
+        path = self._root / f"{digest.removeprefix('sha256:')}.json"
+        if path.is_symlink():
+            raise ProvenanceRecordError("provenance record target must not be a symlink")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ProvenanceRecordError("durable provenance read-back is unavailable") from error
+        if type(value) is not dict or value.get("schema") != PROVENANCE_RECORD_SCHEMA:
+            raise ProvenanceRecordError("durable provenance read-back is invalid")
+        decision_value = value.get("decision")
+        if type(decision_value) is not dict:
+            raise ProvenanceRecordError("durable provenance read-back is invalid")
+        try:
+            artifacts = tuple(PublicArtifactReference(kind, artifact_digest) for kind, artifact_digest in decision_value["artifacts"])
+            decision = ProvenanceDecision(
+                decision_value["repository"], decision_value["task_id"], decision_value["base_sha"], decision_value["candidate_sha"],
+                decision_value["policy_fingerprint"], decision_value["dependency_fingerprint"], decision_value["entrypoint_fingerprint"],
+                artifacts, decision_value["gate_identity"], decision_value["blocker"], decision_value["next_action"], decision_value["ready_at"], value["decision_digest"],
+            )
+            record = DurableProvenanceRecord(
+                decision, value["candidate_tree"], value["policy_fingerprint"], tuple(value["observation_fingerprints"]), value["admission_digest"], digest,
+            )
+        except (KeyError, TypeError, ShadowV2Error) as error:
+            raise ProvenanceRecordError("durable provenance read-back is invalid") from error
+        if json.dumps(record.payload(), sort_keys=True, separators=(",", ":")).encode("utf-8") != path.read_bytes():
+            raise ProvenanceRecordError("durable provenance record is non-canonical")
+        return record
+
+
+def materialize_provenance_record(
+    control: object,
     *,
     base_sha: str,
+    candidate_tree: str,
     entrypoint_fingerprint: str,
     gate_identity: str,
     blocker: str | None,
     next_action: str,
-    ready_at: int,
-) -> ProvenanceDecision:
-    """Export only typed policy/observation identities; never provider prose."""
+    now: int,
+) -> DurableProvenanceRecord:
+    """Materialize from the candidate's sealed execution control, never raw inputs."""
 
     from .dependency_policy import CandidateBinding, DependencyPolicy, ObservedDependency
 
+    if (
+        not _SHA1.fullmatch(base_sha)
+        or not _SHA1.fullmatch(candidate_tree)
+        or not _is_v2_digest(entrypoint_fingerprint)
+        or type(now) is not int
+        or now < 0
+    ):
+        raise ProvenanceRecordError("production provenance materialization is invalid")
+    from .dependency_policy import DependencyExecutionControl, DependencyStage
+    if type(control) is not DependencyExecutionControl:
+        raise ProvenanceRecordError("production provenance control is unavailable")
+    binding = control.policy.binding
+    policy = control.policy
+    observations = control.observations
     if (
         type(binding) is not CandidateBinding
         or type(policy) is not DependencyPolicy
@@ -1102,9 +1229,12 @@ def export_provenance_decision(
         or not observations
         or any(type(item) is not ObservedDependency or item.binding != binding for item in observations)
         or len({item.component for item in observations}) != len(observations)
-        or not _is_v2_digest(entrypoint_fingerprint)
     ):
-        raise ShadowV2Error("typed provenance export is invalid")
+        raise ProvenanceRecordError("production provenance materialization is invalid")
+    try:
+        control.require(binding, DependencyStage.GIT_ENTRYPOINT, now=now)
+    except Exception as error:
+        raise ProvenanceRecordError("production provenance admission is not authorized") from error
     artifacts = tuple(
         PublicArtifactReference(item.component.value + "-artifact", item.artifact_digest)
         for item in observations
@@ -1112,7 +1242,7 @@ def export_provenance_decision(
         PublicArtifactReference(item.component.value + "-executable", item.executable_digest)
         for item in observations
     )
-    return ProvenanceDecision(
+    decision = ProvenanceDecision(
         binding.repository,
         binding.task_id,
         base_sha,
@@ -1124,8 +1254,20 @@ def export_provenance_decision(
         gate_identity,
         blocker,
         next_action,
-        ready_at,
+        now,
     )
+    return DurableProvenanceRecord(
+        decision, candidate_tree, policy.core_fingerprint,
+        tuple(item.fingerprint for item in observations), control.admission.receipt_digest,
+    )
+
+
+def export_provenance_decision(record: object) -> ProvenanceDecision:
+    """Export only a verified durable record; callers cannot supply raw fields."""
+
+    if type(record) is not DurableProvenanceRecord:
+        raise ProvenanceRecordError("durable provenance record is required for export")
+    return record.decision
 
 
 @dataclass(frozen=True)
@@ -1224,7 +1366,7 @@ class CaptureReadinessReceipt:
 
 def require_capture_readiness(
     profile: ShadowEvidenceProfile,
-    decision: ProvenanceDecision,
+    decision: ProvenanceDecision | DurableProvenanceRecord,
     recorder: RecorderBinding,
     store: AppendOnlyEvidenceStore,
     *,
@@ -1233,15 +1375,18 @@ def require_capture_readiness(
 ) -> CaptureReadinessReceipt:
     """Preflight every terminal-snapshot prerequisite before Recorder use."""
 
+    durable = decision if type(decision) is DurableProvenanceRecord else None
+    effective_decision = durable.decision if durable is not None else decision
     if (
         type(profile) is not ShadowEvidenceProfile
-        or type(decision) is not ProvenanceDecision
+        or type(effective_decision) is not ProvenanceDecision
         or type(recorder) is not RecorderBinding
         or type(store) is not AppendOnlyEvidenceStore
-        or decision.candidate_sha != candidate_sha
-        or decision.ready_at != ready_at
+        or effective_decision.candidate_sha != candidate_sha
+        or effective_decision.ready_at != ready_at
         or type(ready_at) is not int
         or ready_at < 0
+        or (profile.profile_id == PROVENANCE_DECISION_PROFILE and durable is None)
     ):
         raise ShadowV2Error("capture readiness preflight is incomplete")
     recorder_digest = _v2_digest({

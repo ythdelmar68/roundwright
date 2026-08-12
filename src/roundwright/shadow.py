@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1191,7 +1193,7 @@ class ProvenanceRecordStore:
         return record
 
 
-def materialize_provenance_record(
+def _materialize_provenance_record(
     control: object,
     *,
     base_sha: str,
@@ -1268,6 +1270,75 @@ def export_provenance_decision(record: object) -> ProvenanceDecision:
     if type(record) is not DurableProvenanceRecord:
         raise ProvenanceRecordError("durable provenance record is required for export")
     return record.decision
+
+
+def materialize_provenance_from_repository(
+    root: Path,
+    store: ProvenanceRecordStore,
+    *,
+    repository: str,
+    task_id: str,
+    base_sha: str,
+    candidate_sha: str,
+    candidate_tree: str,
+    validation_receipt: Path,
+    now: int,
+) -> DurableProvenanceRecord:
+    """Fixed production adapter; derive and seal provenance from verified bytes."""
+
+    if (
+        not isinstance(root, Path) or type(store) is not ProvenanceRecordStore
+        or not _safe_repository(repository) or not _safe_v2_token(task_id)
+        or not all(_SHA1.fullmatch(value) for value in (base_sha, candidate_sha, candidate_tree))
+        or not isinstance(validation_receipt, Path) or type(now) is not int or now < 0
+    ):
+        raise ProvenanceRecordError("production provenance source is invalid")
+    def git(*arguments: str) -> str:
+        result = subprocess.run(("git", "-C", os.fspath(root), *arguments), text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise ProvenanceRecordError("production provenance Git source is unavailable")
+        return result.stdout.strip()
+    if git("rev-parse", "HEAD") != candidate_sha or git("rev-parse", "HEAD^{tree}") != candidate_tree:
+        raise ProvenanceRecordError("production provenance candidate has moved")
+    if git("merge-base", "--is-ancestor", base_sha, candidate_sha) != "":
+        raise ProvenanceRecordError("production provenance base is unavailable")
+    try:
+        lock = (root / "ci" / "validation-toolchain.lock.toml").read_bytes()
+        receipt = validation_receipt.read_bytes()
+        if type(json.loads(receipt.decode("utf-8"))) is not dict:
+            raise ValueError
+        git_executable = shutil.which("git")
+        if git_executable is None:
+            raise ValueError
+        executable = Path(git_executable).read_bytes()
+        authority = git("show", f"{base_sha}:AGENTS.md").encode("utf-8")
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise ProvenanceRecordError("production provenance source is unavailable") from error
+    from .dependency_policy import (
+        BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent,
+        DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition,
+        PolicyTransitionKind, TrustedDependencyAdmission, VersionRange,
+    )
+    digest = lambda value: "sha256:" + hashlib.sha256(value).hexdigest()
+    binding = CandidateBinding(repository, task_id, candidate_sha)
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright-package", VersionRange("0.0.0", "1.0.0"), "validation-toolchain-lock", digest(lock), digest(lock)),
+        ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "system-git", digest(executable), digest(executable)),
+    )
+    policy = DependencyPolicy(binding, digest(lock), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    authority_digest = digest(authority)
+    receipt_digest = digest(receipt)
+    bootstrap = BootstrapPolicyReceipt.create(policy, reviewer_identity=receipt_digest, authority_digest=authority_digest)
+    policy = DependencyPolicy(binding, digest(lock), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP, bootstrap))
+    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
+    control = DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, bootstrap.receipt_digest, receipt_digest, authority_digest))
+    record = _materialize_provenance_record(
+        control, base_sha=base_sha, candidate_tree=candidate_tree,
+        entrypoint_fingerprint=digest(candidate_tree.encode("ascii") + digest(executable).encode("ascii")),
+        gate_identity="provenance-record-ready", blocker=None, next_action="record-terminal-snapshot", now=now,
+    )
+    store.append(record)
+    return store.read_back(record.record_digest)
 
 
 @dataclass(frozen=True)

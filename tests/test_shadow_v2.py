@@ -49,7 +49,7 @@ from roundwright.shadow import (
     AcceptedResultReference,
     compare_provenance_decision,
     export_provenance_decision,
-    materialize_provenance_record,
+    _materialize_provenance_record,
     replay_shadow_case,
     replay_shadow_v2_case,
     require_capture_readiness,
@@ -84,7 +84,7 @@ class ShadowV2Tests(unittest.TestCase):
             for item in components
         )
         control = DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, receipt.reviewer_identity, receipt.authority_digest))
-        return materialize_provenance_record(
+        return _materialize_provenance_record(
             control,
             base_sha="a" * 40,
             candidate_tree="d" * 40,

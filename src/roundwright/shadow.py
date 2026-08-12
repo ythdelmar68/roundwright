@@ -1779,7 +1779,7 @@ def reconcile_final_provenance_selection(
 
 @dataclass(frozen=True)
 class DurableProvenanceRecord:
-    """A candidate-bound projection produced only after a sealed control passes."""
+    """Legacy fixture-only record; never authority for the verified record store."""
 
     decision: ProvenanceDecision
     candidate_tree: str
@@ -2164,7 +2164,7 @@ class VerifiedProvenanceRecordStore:
 
 
 class ProvenanceRecordStore:
-    """Append-only, content-addressed local retention for terminal provenance."""
+    """Legacy fixture-only store; it cannot satisfy the verified-store boundary."""
 
     def __init__(self, root: Path, retention_identity: str) -> None:
         if not isinstance(root, Path) or not _safe_v2_token(retention_identity):

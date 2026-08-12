@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import unittest
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -682,6 +683,103 @@ class ShadowV2Tests(unittest.TestCase):
                 with self.subTest(family=family):
                     with self.assertRaises(ProvenanceRecordError):
                         store.read_back(record.candidate_sha, malformed["record_digest"])
+
+    def test_verified_durable_record_readback_denies_parser_store_and_link_bypasses(self) -> None:
+        record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
+        authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = VerifiedProvenanceRecordStore(root, record.retention_identity)
+            def write(digest_value, payload):
+                path = root / record.candidate_sha / f"{digest_value.removeprefix('sha256:')}.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+                return path
+            for name, payload in {
+                "duplicate-top": b'{"schema":"x","schema":"y"}',
+                "duplicate-nested": b'{"external":{"run_id":"a","run_id":"b"}}',
+                "non-finite": b'{"value":NaN}',
+                "infinite": b'{"value":Infinity}',
+                "noncanonical": record.payload + b" ",
+                "truncated": record.payload[:-1],
+            }.items():
+                digest_value = digest("f")
+                write(digest_value, payload)
+                with self.subTest(parser=name):
+                    with self.assertRaises(ProvenanceRecordError):
+                        store.read_back(record.candidate_sha, digest_value)
+            for name, mutate in {
+                "missing-top": lambda value: value.pop("external"),
+                "extra-top": lambda value: value.update(extra="x"),
+                "missing-nested": lambda value: value["external"].pop("run_id"),
+                "extra-nested": lambda value: value["artifacts"].update(extra="x"),
+                "unsafe-public": lambda value: value["selection"].update(route="C:/secret/token"),
+            }.items():
+                value = record.public_projection()
+                mutate(value)
+                value.pop("record_digest")
+                value["record_digest"] = "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+                write(value["record_digest"], json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode())
+                with self.subTest(shape=name):
+                    with self.assertRaises(ProvenanceRecordError):
+                        store.read_back(record.candidate_sha, value["record_digest"])
+            self.assertEqual(store.append(record, **authority), record.record_digest)
+            parsed = store.read_back(record.candidate_sha, record.record_digest)
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back("c" * 40, record.record_digest)
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back(record.candidate_sha, digest("e"))
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(parsed, **authority)
+            other_control, *_ = self.final_reconciliation_fixture(candidate="c" * 40)
+            with self.assertRaises(ProvenanceRecordError):
+                parsed.verify_against(**{**authority, "loaded_control": other_control})
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(parsed, **authority)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "verified-store"
+            store = VerifiedProvenanceRecordStore(root, record.retention_identity)
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(record, **{**authority, "now": 121})
+            self.assertFalse(root.exists())
+            self.assertFalse((root / record.candidate_sha).exists())
+            with patch.object(type(root), "is_symlink", return_value=True):
+                with self.assertRaises(ProvenanceRecordError):
+                    store.append(record, **authority)
+            self.assertFalse((root / record.candidate_sha).exists())
+        with TemporaryDirectory() as first, TemporaryDirectory() as second:
+            store = VerifiedProvenanceRecordStore(Path(first), record.retention_identity)
+            store.append(record, **authority)
+            wrong_store = VerifiedProvenanceRecordStore(Path(second), record.retention_identity)
+            with self.assertRaises(ProvenanceRecordError):
+                wrong_store.read_back(record.candidate_sha, record.record_digest)
+
+    def test_verified_durable_record_store_denies_real_link_traversal_when_supported(self) -> None:
+        record, control, selection, validation, artifacts, git_control, git, dependency = self.verified_record_fixture()
+        authority = {"loaded_control": control, "selection": selection, "validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as target:
+            root = Path(temporary) / "store-link"
+            try:
+                root.symlink_to(Path(target), target_is_directory=True)
+            except (NotImplementedError, OSError):
+                self.skipTest("the host cannot create a directory symlink")
+            store = VerifiedProvenanceRecordStore(root, record.retention_identity)
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(record, **authority)
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back(record.candidate_sha, record.record_digest)
+        with TemporaryDirectory() as temporary, TemporaryDirectory() as target:
+            base = Path(temporary)
+            link = base / "linked-parent"
+            try:
+                link.symlink_to(Path(target), target_is_directory=True)
+            except (NotImplementedError, OSError):
+                self.skipTest("the host cannot create an intermediate directory symlink")
+            store = VerifiedProvenanceRecordStore(link / "child", record.retention_identity)
+            with self.assertRaises(ProvenanceRecordError):
+                store.append(record, **authority)
+            with self.assertRaises(ProvenanceRecordError):
+                store.read_back(record.candidate_sha, record.record_digest)
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)

@@ -31,6 +31,7 @@ from roundwright.shadow import (
     CaptureMode,
     CandidateCommitReference,
     ComparisonOutcome,
+    CandidateArtifactProjection,
     ExternalSelectionControl,
     ExternalSelectionControlExpectation,
     ProvenanceRecordError,
@@ -42,6 +43,7 @@ from roundwright.shadow import (
     PROVENANCE_DECISION_PROFILE,
     ProviderAttemptManifest,
     RecorderBinding,
+    ReviewedGitObservation,
     ReplayClassification,
     ShadowEvidenceProfile,
     ShadowProducer,
@@ -50,6 +52,8 @@ from roundwright.shadow import (
     ShadowV2Event,
     ShadowV2EventGraph,
     ShadowV2Observation,
+    VerifiedProvenanceSelection,
+    VerifiedValidationToolchainProjection,
     AcceptedResultReference,
     compare_provenance_decision,
     export_provenance_decision,
@@ -134,6 +138,48 @@ class ShadowV2Tests(unittest.TestCase):
         retained = ExternalSelectionControl.load(payload, receipt, expected)
         self.assertIs(type(retained.payload), bytes)
         self.assertEqual(retained.payload, payload)
+
+    def test_reconciliation_projection_types_are_exact_and_public_safe(self) -> None:
+        toolchain = VerifiedValidationToolchainProjection(
+            digest("1"), "windows-x86_64-cpython-3.12.13", digest("2"),
+            digest("3"), digest("4"), digest("5"),
+        )
+        artifacts = CandidateArtifactProjection(
+            "ythdelmar68/roundwright", "task-47", "b" * 40, "c" * 40,
+            digest("6"), digest("7"), digest("8"),
+        )
+        git = ReviewedGitObservation(
+            "ythdelmar68/roundwright", "task-47", "b" * 40, digest("9"),
+            "reviewed-git", "2.53.0", digest("a"), digest("b"),
+        )
+        selection = VerifiedProvenanceSelection(
+            digest("c"), digest("d"), digest("e"), "roundlet-control-47", 101,
+            artifacts.projection_fingerprint, toolchain.projection_fingerprint,
+            git.observation_fingerprint, digest("f"),
+        )
+        self.assertTrue(all(value.startswith("sha256:") for value in (
+            toolchain.projection_fingerprint, artifacts.projection_fingerprint,
+            git.observation_fingerprint, selection.selection_fingerprint,
+        )))
+        for invalid in (
+            lambda: replace(toolchain, cache_key="secret-cache"),
+            lambda: replace(toolchain, receipt_digest="not-a-digest"),
+            lambda: replace(artifacts, task_id="private-token"),
+            lambda: replace(artifacts, candidate_tree="not-a-tree"),
+            lambda: replace(git, repository="Wrong/roundwright"),
+            lambda: replace(git, source_class="credentialed-git"),
+            lambda: replace(selection, retention_identity="token-retention"),
+            lambda: replace(selection, selection_at=-1),
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ProvenanceRecordError):
+                    invalid()
+        with self.assertRaises(ProvenanceRecordError):
+            replace(artifacts, projection_fingerprint=digest("0"))
+        with self.assertRaises(ProvenanceRecordError):
+            replace(git, candidate_sha="d" * 40, observation_fingerprint=git.observation_fingerprint)
+        with self.assertRaises(ProvenanceRecordError):
+            replace(selection, candidate_fingerprint=digest("0"), selection_fingerprint=selection.selection_fingerprint)
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         binding = CandidateBinding("ythdelmar68/roundwright", "task-47", candidate)

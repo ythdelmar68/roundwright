@@ -12,8 +12,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1184,6 +1182,177 @@ class ExternalSelectionControl:
 
 
 @dataclass(frozen=True)
+class VerifiedValidationToolchainProjection:
+    """Public-safe result already verified by the locked toolchain receipt verifier."""
+
+    lock_digest: str
+    cache_key: str
+    receipt_digest: str
+    requirements_digest: str
+    environment_digest: str
+    tool_digest: str
+    projection_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_v2_digest(self.lock_digest)
+            or not _safe_v2_token(self.cache_key)
+            or not all(_is_v2_digest(value) for value in (
+                self.receipt_digest, self.requirements_digest,
+                self.environment_digest, self.tool_digest,
+            ))
+        ):
+            raise ProvenanceRecordError("verified validation toolchain projection is invalid")
+        fingerprint = _v2_digest(self._payload())
+        if self.projection_fingerprint and self.projection_fingerprint != fingerprint:
+            raise ProvenanceRecordError("verified validation toolchain projection fingerprint is invalid")
+        object.__setattr__(self, "projection_fingerprint", fingerprint)
+
+    def _payload(self) -> dict[str, str]:
+        return {
+            "lock_digest": self.lock_digest,
+            "cache_key": self.cache_key,
+            "receipt_digest": self.receipt_digest,
+            "requirements_digest": self.requirements_digest,
+            "environment_digest": self.environment_digest,
+            "tool_digest": self.tool_digest,
+        }
+
+
+@dataclass(frozen=True)
+class CandidateArtifactProjection:
+    """Actual candidate source, package, and installed entrypoint identities."""
+
+    repository: str
+    task_id: str
+    candidate_sha: str
+    candidate_tree: str
+    source_digest: str
+    package_digest: str
+    installed_entrypoint_digest: str
+    projection_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_repository(self.repository)
+            or not _safe_v2_token(self.task_id)
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or not _SHA1.fullmatch(self.candidate_tree)
+            or not all(_is_v2_digest(value) for value in (
+                self.source_digest, self.package_digest,
+                self.installed_entrypoint_digest,
+            ))
+        ):
+            raise ProvenanceRecordError("candidate artifact projection is invalid")
+        fingerprint = _v2_digest(self._payload())
+        if self.projection_fingerprint and self.projection_fingerprint != fingerprint:
+            raise ProvenanceRecordError("candidate artifact projection fingerprint is invalid")
+        object.__setattr__(self, "projection_fingerprint", fingerprint)
+
+    def _payload(self) -> dict[str, str]:
+        return {
+            "repository": self.repository,
+            "task_id": self.task_id,
+            "candidate_sha": self.candidate_sha,
+            "candidate_tree": self.candidate_tree,
+            "source_digest": self.source_digest,
+            "package_digest": self.package_digest,
+            "installed_entrypoint_digest": self.installed_entrypoint_digest,
+        }
+
+
+@dataclass(frozen=True)
+class ReviewedGitObservation:
+    """Reviewed Git identity tied to the sealed Git entrypoint binding."""
+
+    repository: str
+    task_id: str
+    candidate_sha: str
+    binding_fingerprint: str
+    source_class: str
+    version: str
+    executable_digest: str
+    control_fingerprint: str
+    observation_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_repository(self.repository)
+            or not _safe_v2_token(self.task_id)
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or not all(_is_v2_digest(value) for value in (
+                self.binding_fingerprint, self.executable_digest,
+                self.control_fingerprint,
+            ))
+            or not _safe_v2_token(self.source_class)
+            or not _safe_v2_token(self.version)
+        ):
+            raise ProvenanceRecordError("reviewed Git observation is invalid")
+        fingerprint = _v2_digest(self._payload())
+        if self.observation_fingerprint and self.observation_fingerprint != fingerprint:
+            raise ProvenanceRecordError("reviewed Git observation fingerprint is invalid")
+        object.__setattr__(self, "observation_fingerprint", fingerprint)
+
+    def _payload(self) -> dict[str, str]:
+        return {
+            "repository": self.repository,
+            "task_id": self.task_id,
+            "candidate_sha": self.candidate_sha,
+            "binding_fingerprint": self.binding_fingerprint,
+            "source_class": self.source_class,
+            "version": self.version,
+            "executable_digest": self.executable_digest,
+            "control_fingerprint": self.control_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class VerifiedProvenanceSelection:
+    """Immutable skeleton retained only after later FINAL-control reconciliation."""
+
+    payload_digest: str
+    receipt_digest: str
+    contract_digest: str
+    retention_identity: str
+    selection_at: int
+    candidate_fingerprint: str
+    validation_fingerprint: str
+    git_fingerprint: str
+    control_fingerprint: str
+    selection_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not all(_is_v2_digest(value) for value in (
+                self.payload_digest, self.receipt_digest, self.contract_digest,
+                self.candidate_fingerprint, self.validation_fingerprint,
+                self.git_fingerprint, self.control_fingerprint,
+            ))
+            or not _safe_v2_token(self.retention_identity)
+            or type(self.selection_at) is not int
+            or self.selection_at < 0
+        ):
+            raise ProvenanceRecordError("verified provenance selection is invalid")
+        fingerprint = _v2_digest(self._payload())
+        if self.selection_fingerprint and self.selection_fingerprint != fingerprint:
+            raise ProvenanceRecordError("verified provenance selection fingerprint is invalid")
+        object.__setattr__(self, "selection_fingerprint", fingerprint)
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "payload_digest": self.payload_digest,
+            "receipt_digest": self.receipt_digest,
+            "contract_digest": self.contract_digest,
+            "retention_identity": self.retention_identity,
+            "selection_at": self.selection_at,
+            "candidate_fingerprint": self.candidate_fingerprint,
+            "validation_fingerprint": self.validation_fingerprint,
+            "git_fingerprint": self.git_fingerprint,
+            "control_fingerprint": self.control_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class DurableProvenanceRecord:
     """A candidate-bound projection produced only after a sealed control passes."""
 
@@ -1365,75 +1534,6 @@ def export_provenance_decision(record: object) -> ProvenanceDecision:
     if type(record) is not DurableProvenanceRecord:
         raise ProvenanceRecordError("durable provenance record is required for export")
     return record.decision
-
-
-def materialize_provenance_from_repository(
-    root: Path,
-    store: ProvenanceRecordStore,
-    *,
-    repository: str,
-    task_id: str,
-    base_sha: str,
-    candidate_sha: str,
-    candidate_tree: str,
-    validation_receipt: Path,
-    now: int,
-) -> DurableProvenanceRecord:
-    """Fixed production adapter; derive and seal provenance from verified bytes."""
-
-    if (
-        not isinstance(root, Path) or type(store) is not ProvenanceRecordStore
-        or not _safe_repository(repository) or not _safe_v2_token(task_id)
-        or not all(_SHA1.fullmatch(value) for value in (base_sha, candidate_sha, candidate_tree))
-        or not isinstance(validation_receipt, Path) or type(now) is not int or now < 0
-    ):
-        raise ProvenanceRecordError("production provenance source is invalid")
-    def git(*arguments: str) -> str:
-        result = subprocess.run(("git", "-C", os.fspath(root), *arguments), text=True, capture_output=True, check=False)
-        if result.returncode != 0:
-            raise ProvenanceRecordError("production provenance Git source is unavailable")
-        return result.stdout.strip()
-    if git("rev-parse", "HEAD") != candidate_sha or git("rev-parse", "HEAD^{tree}") != candidate_tree:
-        raise ProvenanceRecordError("production provenance candidate has moved")
-    if git("merge-base", "--is-ancestor", base_sha, candidate_sha) != "":
-        raise ProvenanceRecordError("production provenance base is unavailable")
-    try:
-        lock = (root / "ci" / "validation-toolchain.lock.toml").read_bytes()
-        receipt = validation_receipt.read_bytes()
-        if type(json.loads(receipt.decode("utf-8"))) is not dict:
-            raise ValueError
-        git_executable = shutil.which("git")
-        if git_executable is None:
-            raise ValueError
-        executable = Path(git_executable).read_bytes()
-        authority = git("show", f"{base_sha}:AGENTS.md").encode("utf-8")
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        raise ProvenanceRecordError("production provenance source is unavailable") from error
-    from .dependency_policy import (
-        BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent,
-        DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition,
-        PolicyTransitionKind, TrustedDependencyAdmission, VersionRange,
-    )
-    digest = lambda value: "sha256:" + hashlib.sha256(value).hexdigest()
-    binding = CandidateBinding(repository, task_id, candidate_sha)
-    components = (
-        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright-package", VersionRange("0.0.0", "1.0.0"), "validation-toolchain-lock", digest(lock), digest(lock)),
-        ComponentPolicy(DependencyComponent.GIT_EXECUTABLE, "git", VersionRange("2.0.0", "3.0.0"), "system-git", digest(executable), digest(executable)),
-    )
-    policy = DependencyPolicy(binding, digest(lock), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
-    authority_digest = digest(authority)
-    receipt_digest = digest(receipt)
-    bootstrap = BootstrapPolicyReceipt.create(policy, reviewer_identity=receipt_digest, authority_digest=authority_digest)
-    policy = DependencyPolicy(binding, digest(lock), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP, bootstrap))
-    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
-    control = DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, bootstrap.receipt_digest, receipt_digest, authority_digest))
-    record = _materialize_provenance_record(
-        control, base_sha=base_sha, candidate_tree=candidate_tree,
-        entrypoint_fingerprint=digest(candidate_tree.encode("ascii") + digest(executable).encode("ascii")),
-        gate_identity="provenance-record-ready", blocker=None, next_action="record-terminal-snapshot", now=now,
-    )
-    store.append(record)
-    return store.read_back(record.record_digest)
 
 
 @dataclass(frozen=True)

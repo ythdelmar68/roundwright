@@ -17,7 +17,7 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable, Iterable, Never
+from typing import Callable, Iterable, Mapping, Never
 
 
 SHADOW_CASE_SCHEMA = "roundwright-shadow-case/v1"
@@ -1086,6 +1086,86 @@ PROVENANCE_RECORD_SCHEMA = "roundwright-provenance-record/v1"
 
 class ProvenanceRecordError(ShadowV2Error):
     """Raised when production provenance cannot be sealed or read back."""
+
+
+EXTERNAL_SELECTION_CONTROL_SCHEMA = "roundwright-provenance-selection-control/v1"
+EXTERNAL_SELECTION_RECEIPT_SCHEMA = "roundwright-provenance-selection-control-receipt/v1"
+
+
+@dataclass(frozen=True)
+class ExternalSelectionControlExpectation:
+    run_id: str
+    contract_id: str
+    repository: str
+    task_id: str
+    base_sha: str
+    candidate_sha: str
+    candidate_tree: str
+    leaf: int
+    route: str
+    schema: str
+    profile: str
+    authority_agents_blob: str
+    skill_blob: str
+    qualification_blob: str
+
+
+@dataclass(frozen=True)
+class ExternalSelectionControl:
+    """Opaque Roundlet-produced selection control; REHEARSAL is never terminal-ready."""
+
+    payload_digest: str
+    receipt_digest: str
+    retention_identity: str
+    mode: str
+    capture_ready: bool
+    payload: Mapping[str, object]
+
+    @property
+    def terminal_ready(self) -> bool:
+        return self.mode == "FINAL" and self.capture_ready
+
+    @classmethod
+    def load(cls, payload_bytes: bytes, receipt_bytes: bytes, expected: ExternalSelectionControlExpectation) -> "ExternalSelectionControl":
+        if type(payload_bytes) is not bytes or type(receipt_bytes) is not bytes or type(expected) is not ExternalSelectionControlExpectation:
+            raise ProvenanceRecordError("external selection control is invalid")
+        try:
+            payload = json.loads(payload_bytes.decode("utf-8"))
+            receipt = json.loads(receipt_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ProvenanceRecordError("external selection control is invalid") from error
+        digest = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+        if type(payload) is not dict or type(receipt) is not dict or set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
+            raise ProvenanceRecordError("external selection control receipt is invalid")
+        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True:
+            raise ProvenanceRecordError("external selection control receipt is invalid")
+        selection = payload.get("selection")
+        authority = payload.get("authority")
+        roundlet = payload.get("roundlet")
+        if type(selection) is not dict or type(authority) is not dict or type(roundlet) is not dict or payload.get("schema") != EXTERNAL_SELECTION_CONTROL_SCHEMA:
+            raise ProvenanceRecordError("external selection control is invalid")
+        origin = authority.get("origin_main")
+        external = authority.get("external_validation_contract")
+        active = authority.get("active_roundlet_block")
+        if type(origin) is not dict or type(external) is not dict or type(active) is not dict:
+            raise ProvenanceRecordError("external selection control authority is invalid")
+        checks = (
+            roundlet.get("run_id") == expected.run_id, roundlet.get("contract_id") == expected.contract_id,
+            selection.get("repository") == expected.repository, selection.get("worker_task") == expected.task_id,
+            selection.get("base_sha") == expected.base_sha, selection.get("candidate_sha") == expected.candidate_sha,
+            selection.get("candidate_tree") == expected.candidate_tree, selection.get("active_leaf") == expected.leaf,
+            selection.get("route") == expected.route, selection.get("case_schema") == expected.schema,
+            selection.get("evidence_profile") == expected.profile, origin.get("commit") == expected.base_sha,
+            active.get("agents_blob") == expected.authority_agents_blob,
+            external.get("skill_blob") == expected.skill_blob, external.get("qualification_blob") == expected.qualification_blob,
+        )
+        if not all(checks):
+            raise ProvenanceRecordError("external selection control binding is invalid")
+        mode = payload.get("control_mode")
+        ready = payload.get("capture_ready")
+        if mode not in {"REHEARSAL", "FINAL"} or type(ready) is not bool or receipt.get("control_mode") != mode or receipt.get("capture_ready") is not ready:
+            raise ProvenanceRecordError("external selection control mode is invalid")
+        return cls(digest, _v2_digest(receipt), receipt["retention_identity"], mode, ready, payload)
 
 
 @dataclass(frozen=True)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -29,6 +31,8 @@ from roundwright.shadow import (
     CaptureMode,
     CandidateCommitReference,
     ComparisonOutcome,
+    ExternalSelectionControl,
+    ExternalSelectionControlExpectation,
     ProvenanceRecordError,
     ProvenanceRecordStore,
     EvidenceRole,
@@ -63,6 +67,28 @@ def digest(value: str) -> str:
 
 
 class ShadowV2Tests(unittest.TestCase):
+    def external_control_bytes(self):
+        payload = {
+            "schema": "roundwright-provenance-selection-control/v1", "control_mode": "REHEARSAL", "capture_ready": False,
+            "roundlet": {"run_id": "run-47", "contract_id": "contract-47"},
+            "selection": {"repository": "ythdelmar68/roundwright", "worker_task": "task-47", "base_sha": "a" * 40, "candidate_sha": "b" * 40, "candidate_tree": "c" * 40, "active_leaf": 47, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1"},
+            "authority": {"origin_main": {"commit": "a" * 40}, "active_roundlet_block": {"agents_blob": "d" * 40}, "external_validation_contract": {"skill_blob": "e" * 40, "qualification_blob": "f" * 40}},
+        }
+        content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        receipt = {"schema": "roundwright-provenance-selection-control-receipt/v1", "append_only": True, "capture_ready": False, "contract_sha256": digest("1"), "control_mode": "REHEARSAL", "payload_bytes": len(content), "payload_sha256": "sha256:" + hashlib.sha256(content).hexdigest(), "read_back": "VERIFIED", "retention_identity": "roundlet-control-47"}
+        expected = ExternalSelectionControlExpectation("run-47", "contract-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40)
+        return content, json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(), expected
+
+    def test_external_rehearsal_control_is_bound_but_never_terminal_ready(self) -> None:
+        payload, receipt, expected = self.external_control_bytes()
+        control = ExternalSelectionControl.load(payload, receipt, expected)
+        self.assertEqual(control.mode, "REHEARSAL")
+        self.assertFalse(control.terminal_ready)
+        for bad_payload, bad_receipt, bad_expected in ((payload + b" ", receipt, expected), (payload, b"{}", expected), (payload, receipt, replace(expected, candidate_sha="d" * 40))):
+            with self.subTest():
+                with self.assertRaises(ProvenanceRecordError):
+                    ExternalSelectionControl.load(bad_payload, bad_receipt, bad_expected)
+
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         binding = CandidateBinding("ythdelmar68/roundwright", "task-47", candidate)
         components = (

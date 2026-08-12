@@ -24,8 +24,9 @@ from roundwright.dependency_policy import (
     PolicyTransitionKind,
     TrustedDependencyAdmission,
     VersionRange,
+    DependencyPolicyError,
 )
-from roundwright.git_identity import GitEntrypointControl
+from roundwright.git_identity import GitEntrypointControl, GitIdentityError
 from roundwright.shadow import (
     AppendOnlyEvidenceStore,
     AttemptCommitReference,
@@ -203,9 +204,9 @@ class ShadowV2Tests(unittest.TestCase):
         return DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, receipt.reviewer_identity, receipt.authority_digest))
 
     def final_reconciliation_fixture(
-        self, mutate=None, *, leaf=47, source_class="bundled-native-git", reported_version="2.53.0.windows.3",
+        self, mutate=None, *, receipt_mutate=None, leaf=47, candidate="b" * 40, source_class="bundled-native-git", reported_version="2.53.0.windows.3",
     ):
-        dependency = self.dependency_control()
+        dependency = self.dependency_control(candidate=candidate)
         binding = dependency.policy.binding
         git_control = GitEntrypointControl(binding, dependency, 101)
         validation = VerifiedValidationToolchainProjection(
@@ -237,8 +238,10 @@ class ShadowV2Tests(unittest.TestCase):
         payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         receipt_value = json.loads(receipt)
         receipt_value.update({"control_mode": "FINAL", "capture_ready": True, "retention_identity": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/final-" + binding.candidate_sha, "payload_bytes": len(payload), "payload_sha256": "sha256:" + hashlib.sha256(payload).hexdigest()})
+        if receipt_mutate is not None:
+            receipt_mutate(receipt_value)
         receipt = json.dumps(receipt_value, sort_keys=True, separators=(",", ":")).encode()
-        expected = replace(expected, leaf=leaf, live_leaf=(1, "node-47", leaf, "now", digest("3")), payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
+        expected = replace(expected, leaf=leaf, candidate_sha=candidate, live_leaf=(1, "node-47", leaf, "now", digest("3")), payload_digest="sha256:" + hashlib.sha256(payload).hexdigest(), receipt_digest="sha256:" + hashlib.sha256(receipt).hexdigest())
         return ExternalSelectionControl.load(payload, receipt, expected), validation, artifacts, git_control, git, dependency
 
     def test_final_reconciliation_derives_all_fingerprints_from_verified_inputs(self) -> None:
@@ -347,6 +350,11 @@ class ShadowV2Tests(unittest.TestCase):
         selection = reconcile_final_provenance_selection(control, **arguments)
         with self.assertRaises(ProvenanceRecordError):
             verify_selection_for_durable_record(other, selection)
+        with self.assertRaises(ProvenanceRecordError):
+            verify_selection_for_durable_record(control, object.__new__(VerifiedProvenanceSelection))
+        object.__setattr__(selection, "candidate_fingerprint", digest("9"))
+        with self.assertRaises(ProvenanceRecordError):
+            verify_selection_for_durable_record(control, selection)
 
     def test_external_control_rejects_duplicate_and_nonfinite_json(self) -> None:
         payload, receipt, expected = self.external_control_bytes()
@@ -355,6 +363,102 @@ class ShadowV2Tests(unittest.TestCase):
             with self.subTest():
                 with self.assertRaises(ProvenanceRecordError):
                     ExternalSelectionControl.load(invalid_payload, invalid_receipt, expected)
+
+    def test_final_control_denies_pinned_receipt_and_json_shape_variants(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        for name, receipt_mutate in {
+            "capture-ready": lambda value: value.update(capture_ready=False),
+            "rehearsal-mode": lambda value: value.update(control_mode="REHEARSAL"),
+            "read-back": lambda value: value.update(read_back="PENDING"),
+            "append-only": lambda value: value.update(append_only=False),
+            "schema": lambda value: value.update(schema="other"),
+            "retention": lambda value: value.update(retention_identity="roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/rehearsal-" + "b" * 40),
+        }.items():
+            with self.subTest(receipt=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    self.final_reconciliation_fixture(receipt_mutate=receipt_mutate)
+        for mutate in (
+            lambda value: value.pop("read_back"),
+            lambda value: value.update(extra="forbidden"),
+        ):
+            with self.subTest(receipt=mutate):
+                with self.assertRaises(ProvenanceRecordError):
+                    self.final_reconciliation_fixture(receipt_mutate=mutate)
+        duplicate_receipt = control.receipt.removesuffix(b"}") + b',"schema":"other"}'
+        duplicate_expectation = replace(control.expected, receipt_digest="sha256:" + hashlib.sha256(duplicate_receipt).hexdigest())
+        with self.assertRaises(ProvenanceRecordError):
+            ExternalSelectionControl.load(control.payload, duplicate_receipt, duplicate_expectation)
+        duplicate_payload = control.payload.removesuffix(b"}") + b',"schema":"other"}'
+        receipt_value = json.loads(control.receipt)
+        receipt_value.update(payload_bytes=len(duplicate_payload), payload_sha256="sha256:" + hashlib.sha256(duplicate_payload).hexdigest())
+        duplicate_payload_receipt = json.dumps(receipt_value, sort_keys=True, separators=(",", ":")).encode()
+        duplicate_payload_expected = replace(
+            control.expected,
+            payload_digest="sha256:" + hashlib.sha256(duplicate_payload).hexdigest(),
+            receipt_digest="sha256:" + hashlib.sha256(duplicate_payload_receipt).hexdigest(),
+        )
+        with self.assertRaises(ProvenanceRecordError):
+            ExternalSelectionControl.load(duplicate_payload, duplicate_payload_receipt, duplicate_payload_expected)
+        self.assertIsNotNone(reconcile_final_provenance_selection(control, **arguments))
+
+    def test_final_reconciliation_denies_actual_validation_projection_drift(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        def revised_validation(**changes):
+            return replace(
+                validation,
+                requirements_fingerprint="", environments_fingerprint="", tools_fingerprint="",
+                projection_fingerprint="", **changes,
+            )
+        for name, changed in {
+            "lock": revised_validation(lock_digest=digest("9")),
+            "cache": revised_validation(cache_key="other-cache"),
+            "receipt": revised_validation(receipt_digest=digest("9")),
+        }.items():
+            with self.subTest(identity=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(control, **{**arguments, "validation": changed})
+        for family, values in (("requirements", validation.requirements), ("environments", validation.environments), ("tools", validation.tools)):
+            for index, item in enumerate(values):
+                changed_values = list(values)
+                changed_values[index] = replace(item, digest=digest("f"))
+                changed = revised_validation(**{family: tuple(changed_values)})
+                with self.subTest(family=family, name=item.name, field="digest"):
+                    with self.assertRaises(ProvenanceRecordError):
+                        reconcile_final_provenance_selection(control, **{**arguments, "validation": changed})
+                if family == "tools":
+                    changed_values = list(values)
+                    changed_values[index] = replace(item, version="9.9.9")
+                    changed = revised_validation(**{family: tuple(changed_values)})
+                    with self.subTest(family=family, name=item.name, field="version"):
+                        with self.assertRaises(ProvenanceRecordError):
+                            reconcile_final_provenance_selection(control, **{**arguments, "validation": changed})
+            for shape in (values[:-1], values + (values[0],), tuple(reversed(values))):
+                with self.subTest(family=family, shape=tuple(item.name for item in shape)):
+                    with self.assertRaises(ProvenanceRecordError):
+                        revised_validation(**{family: shape})
+
+    def test_final_reconciliation_denies_public_schema_and_terminal_projection_drift(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        for name, mutate in {
+            "route": lambda value: value["selection"].update(route="none"),
+            "case-schema": lambda value: value["selection"].update(case_schema="other"),
+            "profile": lambda value: value["selection"].update(evidence_profile="other"),
+            "capture-mode": lambda value: value["selection"].update(capture_mode="other"),
+            "gate": lambda value: value["selection"].update(gate="other"),
+            "blocker": lambda value: value["selection"].update(blocker="private"),
+            "next-action": lambda value: value["selection"].update(next_action="other"),
+            "public-extra": lambda value: value["public_safe_projection"].update(extra="private"),
+            "public-missing": lambda value: value["public_safe_projection"].pop("repository"),
+            "public-private": lambda value: value["public_safe_projection"].update(repository="C:/secret/token"),
+            "public-credential": lambda value: value["public_safe_projection"].update(route="token=secret"),
+        }.items():
+            with self.subTest(projection=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    changed, *_ = self.final_reconciliation_fixture(mutate)
+                    reconcile_final_provenance_selection(changed, **arguments)
 
     def test_final_reconciliation_denies_typed_dependency_and_admission_inputs(self) -> None:
         control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
@@ -371,23 +475,43 @@ class ShadowV2Tests(unittest.TestCase):
             "version-drift": (replace(package, version="1.0.1"), git_dependency),
             "artifact-drift": (replace(package, artifact_digest=digest("9")), git_dependency),
             "executable-drift": (replace(package, executable_digest=digest("9")), git_dependency),
+            "wrong-binding": (replace(package, binding=CandidateBinding("ythdelmar68/roundwright", "task-47", "c" * 40)), git_dependency),
+            "stale-observation": (replace(package, observed_at=0), git_dependency),
         }
-        for name, observations in forged_observations.items():
-            forged = replace(dependency, observations=observations)
+        def deny_at_matching_git_boundary(name, forged):
             with self.subTest(name=name):
+                # The Git control must point at the forged dependency control: using
+                # the original control would only prove an unrelated mismatch.
+                try:
+                    forged_git = GitEntrypointControl(forged.policy.binding, forged, 101)
+                except GitIdentityError:
+                    return
                 with self.assertRaises(ProvenanceRecordError):
-                    reconcile_final_provenance_selection(control, **{**arguments, "dependency_control": forged})
+                    reconcile_final_provenance_selection(
+                        control,
+                        **{**arguments, "dependency_control": forged, "git_control": forged_git},
+                    )
+        for name, observations in forged_observations.items():
+            deny_at_matching_git_boundary(name, replace(dependency, observations=observations))
         for name, admission in {
             "policy": replace(dependency.admission, policy_fingerprint=digest("9")),
             "receipt": replace(dependency.admission, receipt_digest=digest("9")),
             "reviewer": replace(dependency.admission, reviewer_identity=digest("9")),
             "authority": replace(dependency.admission, authority_digest=digest("9")),
-            "binding": replace(dependency.admission, binding=CandidateBinding("ythdelmar68/roundwright", "task-47", "c" * 40)),
         }.items():
-            with self.subTest(admission=name):
-                with self.assertRaises((ProvenanceRecordError, Exception)):
-                    forged = replace(dependency, admission=admission)
-                    reconcile_final_provenance_selection(control, **{**arguments, "dependency_control": forged})
+            deny_at_matching_git_boundary("admission-" + name, replace(dependency, admission=admission))
+        with self.assertRaises(DependencyPolicyError):
+            replace(
+                dependency,
+                admission=replace(
+                    dependency.admission,
+                    binding=CandidateBinding("ythdelmar68/roundwright", "task-47", "c" * 40),
+                ),
+            )
+        stale_policy = replace(dependency.policy, issued_at=0)
+        deny_at_matching_git_boundary("stale-policy", replace(dependency, policy=stale_policy))
+        conflicting = replace(dependency.admission, previous_policy=dependency.policy)
+        deny_at_matching_git_boundary("conflicting-previous-policy", replace(dependency, admission=conflicting))
         reversed_control = replace(dependency, observations=tuple(reversed(dependency.observations)))
         reversed_git_control = GitEntrypointControl(reversed_control.policy.binding, reversed_control, 101)
         self.assertEqual(
@@ -397,6 +521,23 @@ class ShadowV2Tests(unittest.TestCase):
             ).control_fingerprint,
             reconcile_final_provenance_selection(control, **arguments).control_fingerprint,
         )
+
+    def test_final_reconciliation_denies_typed_git_control_boundaries(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        wrong_binding = CandidateBinding("ythdelmar68/roundwright", "task-47", "c" * 40)
+        with self.assertRaises(GitIdentityError):
+            GitEntrypointControl(wrong_binding, dependency, 101)
+        moved_dependency = self.dependency_control(candidate="c" * 40)
+        moved_git = GitEntrypointControl(moved_dependency.policy.binding, moved_dependency, 101)
+        with self.assertRaises(ProvenanceRecordError):
+            reconcile_final_provenance_selection(
+                control,
+                **{**arguments, "dependency_control": moved_dependency, "git_control": moved_git},
+            )
+        different_now = GitEntrypointControl(dependency.policy.binding, dependency, 102)
+        with self.assertRaises(ProvenanceRecordError):
+            reconcile_final_provenance_selection(control, **{**arguments, "git_control": different_now})
 
     def test_final_reconciliation_denies_typed_git_artifact_and_candidate_drift(self) -> None:
         control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
@@ -429,10 +570,11 @@ class ShadowV2Tests(unittest.TestCase):
             with self.subTest(artifact=name):
                 with self.assertRaises(ProvenanceRecordError):
                     reconcile_final_provenance_selection(control, **{**arguments, "artifacts": artifact})
-        other_dependency = self.dependency_control(candidate="c" * 40)
-        other_git = GitEntrypointControl(other_dependency.policy.binding, other_dependency, 101)
+        _, other_validation, other_artifacts, other_git, other_observation, other_dependency = self.final_reconciliation_fixture(candidate="c" * 40)
         with self.assertRaises(ProvenanceRecordError):
-            reconcile_final_provenance_selection(control, **{**arguments, "dependency_control": other_dependency, "git_control": other_git})
+            reconcile_final_provenance_selection(control, validation=other_validation, artifacts=other_artifacts, git_control=other_git, git_observation=other_observation, dependency_control=other_dependency, now=101)
+        with self.assertRaises(ProvenanceRecordError):
+            reconcile_final_provenance_selection(control, **{**arguments, "git_control": other_git})
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)

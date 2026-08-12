@@ -1230,7 +1230,15 @@ class ExternalSelectionControl:
             raise ProvenanceRecordError("external selection control binding is invalid")
         mode = payload.get("control_mode")
         ready = payload.get("capture_ready")
-        if mode not in {"REHEARSAL", "FINAL"} or type(ready) is not bool or receipt.get("control_mode") != mode or receipt.get("capture_ready") is not ready:
+        if (
+            mode not in {"REHEARSAL", "FINAL"}
+            or type(ready) is not bool
+            or receipt.get("control_mode") != mode
+            or receipt.get("capture_ready") is not ready
+            or not receipt["retention_identity"].endswith(
+                f"/{mode.lower()}-{selection['candidate_sha']}"
+            )
+        ):
             raise ProvenanceRecordError("external selection control mode is invalid")
         value = object.__new__(cls)
         for name, item in {

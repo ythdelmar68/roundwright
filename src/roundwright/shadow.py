@@ -861,3 +861,558 @@ def _disposition_for(classification: ReplayClassification) -> MismatchDispositio
 
 def _public_identifier(value: str) -> str:
     return "sha256:" + _digest({"opaque": value})
+
+
+# Shadow v2 is deliberately isolated from the historical v1 state-machine
+# replay above.  v1 continues to own the synthetic six-state fixtures used by
+# already-retained evidence; a terminal snapshot must never be coerced into
+# that older shape.
+SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
+PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
+_V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
+_V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
+
+
+def _safe_v2_token(value: object) -> bool:
+    if type(value) is not str or not _V2_TOKEN.fullmatch(value):
+        return False
+    lowered = value.lower()
+    return not any(term in lowered for term in ("token", "secret", "credential", "password", "ghp_")) and not lowered.startswith("sk-")
+
+
+def _safe_repository(value: object) -> bool:
+    return type(value) is str and _V2_REPOSITORY.fullmatch(value) is not None
+
+
+def _is_v2_digest(value: object) -> bool:
+    return type(value) is str and _V2_DIGEST.fullmatch(value) is not None
+
+
+def _v2_digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+class ShadowV2Error(ShadowError):
+    """Raised when profile-defined terminal evidence is incomplete or mixed."""
+
+
+class CaptureMode(StrEnum):
+    TERMINAL_SNAPSHOT = "terminal-snapshot"
+
+
+class ShadowProducer(StrEnum):
+    DURABLE_PROVENANCE = "durable-provenance"
+
+
+@dataclass(frozen=True)
+class ShadowEvidenceProfile:
+    """One closed Phase-3 evidence profile and its capture-readiness contract."""
+
+    profile_id: str
+    capture_mode: CaptureMode
+    producer: ShadowProducer
+    readiness_point: str
+    arm_before: str
+    retention_readback_contract: str
+    missing_history_recapture: str
+    event_kinds: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.profile_id != PROVENANCE_DECISION_PROFILE
+            or type(self.capture_mode) is not CaptureMode
+            or type(self.producer) is not ShadowProducer
+            or any(not _safe_v2_token(value) for value in (
+                self.readiness_point,
+                self.arm_before,
+                self.retention_readback_contract,
+                self.missing_history_recapture,
+            ))
+            or type(self.event_kinds) is not tuple
+            or self.event_kinds != ("provenance-decision",)
+        ):
+            raise ShadowV2Error("shadow evidence profile is invalid")
+
+
+_PROVENANCE_PROFILE = ShadowEvidenceProfile(
+    PROVENANCE_DECISION_PROFILE,
+    CaptureMode.TERMINAL_SNAPSHOT,
+    ShadowProducer.DURABLE_PROVENANCE,
+    "schema-profile-exporter-comparator-recorder-store-readback-bound",
+    "before-terminal-provenance-export",
+    "append-only-content-addressed-readback",
+    "candidate-movement-requires-fresh-terminal-capture",
+    ("provenance-decision",),
+)
+
+
+def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
+    """Return the closed registry; later leaves cannot silently add a profile."""
+
+    return (_PROVENANCE_PROFILE,)
+
+
+def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
+    if profile_id != PROVENANCE_DECISION_PROFILE:
+        raise ShadowV2Error("shadow evidence profile is unavailable")
+    return _PROVENANCE_PROFILE
+
+
+@dataclass(frozen=True)
+class PublicArtifactReference:
+    """One path-free, content-addressed artifact or executable reference."""
+
+    kind: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        if not _safe_v2_token(self.kind) or not _is_v2_digest(self.digest):
+            raise ShadowV2Error("public artifact reference is invalid")
+
+
+@dataclass(frozen=True)
+class ProvenanceDecision:
+    """Typed, public-safe export of a durable candidate provenance decision."""
+
+    repository: str
+    task_id: str
+    base_sha: str
+    candidate_sha: str
+    policy_fingerprint: str
+    dependency_fingerprint: str
+    entrypoint_fingerprint: str
+    artifacts: tuple[PublicArtifactReference, ...]
+    gate_identity: str
+    blocker: str | None
+    next_action: str
+    ready_at: int
+    decision_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_repository(self.repository)
+            or not _safe_v2_token(self.task_id)
+            or not _SHA1.fullmatch(self.base_sha)
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or not all(_is_v2_digest(value) for value in (
+                self.policy_fingerprint,
+                self.dependency_fingerprint,
+                self.entrypoint_fingerprint,
+            ))
+            or type(self.artifacts) is not tuple
+            or not self.artifacts
+            or any(type(item) is not PublicArtifactReference for item in self.artifacts)
+            or len({item.kind for item in self.artifacts}) != len(self.artifacts)
+            or not _safe_v2_token(self.gate_identity)
+            or (self.blocker is not None and not _safe_v2_token(self.blocker))
+            or not _safe_v2_token(self.next_action)
+            or type(self.ready_at) is not int
+            or self.ready_at < 0
+        ):
+            raise ShadowV2Error("provenance decision is invalid")
+        digest = _v2_digest(self._payload())
+        if self.decision_digest and self.decision_digest != digest:
+            raise ShadowV2Error("provenance decision digest does not match immutable content")
+        object.__setattr__(self, "decision_digest", digest)
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "repository": self.repository,
+            "task_id": self.task_id,
+            "base_sha": self.base_sha,
+            "candidate_sha": self.candidate_sha,
+            "policy_fingerprint": self.policy_fingerprint,
+            "dependency_fingerprint": self.dependency_fingerprint,
+            "entrypoint_fingerprint": self.entrypoint_fingerprint,
+            "artifacts": tuple((item.kind, item.digest) for item in self.artifacts),
+            "gate_identity": self.gate_identity,
+            "blocker": self.blocker,
+            "next_action": self.next_action,
+            "ready_at": self.ready_at,
+        }
+
+    def curated_summary(self) -> dict[str, object]:
+        return {
+            "repository": self.repository,
+            "task": _public_identifier(self.task_id),
+            "base": self.base_sha,
+            "candidate": self.candidate_sha,
+            "policy": self.policy_fingerprint,
+            "dependency": self.dependency_fingerprint,
+            "entrypoint": self.entrypoint_fingerprint,
+            "artifacts": tuple((item.kind, item.digest) for item in self.artifacts),
+            "gate": _public_identifier(self.gate_identity),
+            "blocker": None if self.blocker is None else _public_identifier(self.blocker),
+            "next_action": _public_identifier(self.next_action),
+            "ready_at": self.ready_at,
+            "decision_digest": self.decision_digest,
+        }
+
+
+def export_provenance_decision(
+    binding: object,
+    policy: object,
+    observations: object,
+    *,
+    base_sha: str,
+    entrypoint_fingerprint: str,
+    gate_identity: str,
+    blocker: str | None,
+    next_action: str,
+    ready_at: int,
+) -> ProvenanceDecision:
+    """Export only typed policy/observation identities; never provider prose."""
+
+    from .dependency_policy import CandidateBinding, DependencyPolicy, ObservedDependency
+
+    if (
+        type(binding) is not CandidateBinding
+        or type(policy) is not DependencyPolicy
+        or policy.binding != binding
+        or not _SHA1.fullmatch(base_sha)
+        or type(observations) is not tuple
+        or not observations
+        or any(type(item) is not ObservedDependency or item.binding != binding for item in observations)
+        or len({item.component for item in observations}) != len(observations)
+        or not _is_v2_digest(entrypoint_fingerprint)
+    ):
+        raise ShadowV2Error("typed provenance export is invalid")
+    artifacts = tuple(
+        PublicArtifactReference(item.component.value + "-artifact", item.artifact_digest)
+        for item in observations
+    ) + tuple(
+        PublicArtifactReference(item.component.value + "-executable", item.executable_digest)
+        for item in observations
+    )
+    return ProvenanceDecision(
+        binding.repository,
+        binding.task_id,
+        base_sha,
+        binding.candidate_sha,
+        policy.core_fingerprint,
+        _v2_digest(tuple(item.fingerprint for item in observations)),
+        entrypoint_fingerprint,
+        artifacts,
+        gate_identity,
+        blocker,
+        next_action,
+        ready_at,
+    )
+
+
+@dataclass(frozen=True)
+class RecorderBinding:
+    """The reviewed Recorder identity required before an observation window opens."""
+
+    harness_merge: str
+    recorder_content: str
+    harness_tree: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.harness_merge != "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52"
+            or self.recorder_content != "87094a4e780c692a00135421840c0e6713af5d35"
+            or self.harness_tree != "0c594caa275262164fce1942ebd2142abe0e77bb"
+        ):
+            raise ShadowV2Error("reviewed Recorder binding is invalid")
+
+
+@dataclass(frozen=True)
+class RetentionReceipt:
+    retention_identity: str
+    content_digest: str
+    receipt_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if not _safe_v2_token(self.retention_identity) or not _is_v2_digest(self.content_digest):
+            raise ShadowV2Error("retention receipt is invalid")
+        digest = _v2_digest({"retention_identity": self.retention_identity, "content_digest": self.content_digest})
+        if self.receipt_digest and self.receipt_digest != digest:
+            raise ShadowV2Error("retention receipt digest is invalid")
+        object.__setattr__(self, "receipt_digest", digest)
+
+
+class AppendOnlyEvidenceStore:
+    """In-memory Recorder store contract: content addressed, append-only, readable."""
+
+    def __init__(self, retention_identity: str) -> None:
+        if not _safe_v2_token(retention_identity):
+            raise ShadowV2Error("retention store identity is invalid")
+        self._retention_identity = retention_identity
+        self._records: dict[str, bytes] = {}
+
+    @property
+    def retention_identity(self) -> str:
+        return self._retention_identity
+
+    def append(self, content: bytes) -> RetentionReceipt:
+        if type(content) is not bytes or not content:
+            raise ShadowV2Error("retention content is invalid")
+        digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        if digest in self._records:
+            raise ShadowV2Error("append-only retention rejects overwrite")
+        self._records[digest] = content
+        return RetentionReceipt(self._retention_identity, digest)
+
+    def read_back(self, receipt: RetentionReceipt) -> bytes:
+        if type(receipt) is not RetentionReceipt or receipt.retention_identity != self._retention_identity:
+            raise ShadowV2Error("retention read-back identity is invalid")
+        content = self._records.get(receipt.content_digest)
+        if content is None or "sha256:" + hashlib.sha256(content).hexdigest() != receipt.content_digest:
+            raise ShadowV2Error("retention read-back content is unavailable")
+        return content
+
+
+@dataclass(frozen=True)
+class CaptureReadinessReceipt:
+    profile_id: str
+    candidate_sha: str
+    ready_at: int
+    recorder_binding_digest: str
+    retention_identity: str
+    readiness_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            self.profile_id != PROVENANCE_DECISION_PROFILE
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or type(self.ready_at) is not int
+            or self.ready_at < 0
+            or not _is_v2_digest(self.recorder_binding_digest)
+            or not _safe_v2_token(self.retention_identity)
+        ):
+            raise ShadowV2Error("capture readiness receipt is invalid")
+        digest = _v2_digest({
+            "profile_id": self.profile_id,
+            "candidate_sha": self.candidate_sha,
+            "ready_at": self.ready_at,
+            "recorder_binding_digest": self.recorder_binding_digest,
+            "retention_identity": self.retention_identity,
+        })
+        if self.readiness_digest and self.readiness_digest != digest:
+            raise ShadowV2Error("capture readiness receipt digest is invalid")
+        object.__setattr__(self, "readiness_digest", digest)
+
+
+def require_capture_readiness(
+    profile: ShadowEvidenceProfile,
+    decision: ProvenanceDecision,
+    recorder: RecorderBinding,
+    store: AppendOnlyEvidenceStore,
+    *,
+    candidate_sha: str,
+    ready_at: int,
+) -> CaptureReadinessReceipt:
+    """Preflight every terminal-snapshot prerequisite before Recorder use."""
+
+    if (
+        type(profile) is not ShadowEvidenceProfile
+        or profile != _PROVENANCE_PROFILE
+        or type(decision) is not ProvenanceDecision
+        or type(recorder) is not RecorderBinding
+        or type(store) is not AppendOnlyEvidenceStore
+        or decision.candidate_sha != candidate_sha
+        or decision.ready_at != ready_at
+        or type(ready_at) is not int
+        or ready_at < 0
+    ):
+        raise ShadowV2Error("capture readiness preflight is incomplete")
+    recorder_digest = _v2_digest({
+        "harness_merge": recorder.harness_merge,
+        "recorder_content": recorder.recorder_content,
+        "harness_tree": recorder.harness_tree,
+    })
+    return CaptureReadinessReceipt(profile.profile_id, candidate_sha, ready_at, recorder_digest, store.retention_identity)
+
+
+@dataclass(frozen=True)
+class ShadowV2Observation:
+    sequence: int
+    event_id: str
+    lifecycle_correlation_id: str
+    profile_id: str
+    event_kind: str
+    provider_attempt_id: str | None
+    provider_call_made: bool
+    candidate_sha: str
+    decision_digest: str
+    evidence_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.sequence) is not int
+            or self.sequence != 1
+            or not all(_safe_v2_token(value) for value in (
+                self.event_id,
+                self.lifecycle_correlation_id,
+                self.event_kind,
+            ))
+            or self.profile_id != PROVENANCE_DECISION_PROFILE
+            or self.event_kind != "provenance-decision"
+            or self.provider_attempt_id is not None
+            or self.provider_call_made is not False
+            or not _SHA1.fullmatch(self.candidate_sha)
+            or not _is_v2_digest(self.decision_digest)
+        ):
+            raise ShadowV2Error("profile observation is invalid")
+        digest = _v2_digest(self._payload())
+        if self.evidence_digest and self.evidence_digest != digest:
+            raise ShadowV2Error("profile observation digest is invalid")
+        object.__setattr__(self, "evidence_digest", digest)
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "sequence": self.sequence,
+            "event_id": self.event_id,
+            "lifecycle_correlation_id": self.lifecycle_correlation_id,
+            "profile_id": self.profile_id,
+            "event_kind": self.event_kind,
+            "provider_attempt_id": self.provider_attempt_id,
+            "provider_call_made": self.provider_call_made,
+            "candidate_sha": self.candidate_sha,
+            "decision_digest": self.decision_digest,
+        }
+
+
+@dataclass(frozen=True)
+class ShadowV2Case:
+    case_id: str
+    lifecycle_correlation_id: str
+    profile: ShadowEvidenceProfile
+    decision: ProvenanceDecision
+    reference_decision: ProvenanceDecision
+    readiness: CaptureReadinessReceipt
+    observations: tuple[ShadowV2Observation, ...]
+    retention_class: str
+    retention_reference: str
+    schema: str = SHADOW_CASE_SCHEMA_V2
+    case_digest: str = ""
+
+    def __post_init__(self) -> None:
+        _validate_v2_case(self, verify_digest=False)
+        digest = _v2_digest(self._payload())
+        if self.case_digest and self.case_digest != digest:
+            raise ShadowV2Error("Shadow v2 case digest is invalid")
+        object.__setattr__(self, "case_digest", digest)
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "case_id": self.case_id,
+            "lifecycle_correlation_id": self.lifecycle_correlation_id,
+            "profile_id": self.profile.profile_id,
+            "decision_digest": self.decision.decision_digest,
+            "reference_decision_digest": self.reference_decision.decision_digest,
+            "readiness_digest": self.readiness.readiness_digest,
+            "observations": tuple(item.evidence_digest for item in self.observations),
+            "retention_class": self.retention_class,
+            "retention_reference": self.retention_reference,
+        }
+
+    def retention_payload(self) -> bytes:
+        """Canonical bytes for Recorder storage; no paths or provider payloads."""
+
+        return json.dumps(self._payload() | {"case_digest": self.case_digest}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class ShadowV2Report:
+    case_id: str
+    case_digest: str
+    outcome: ComparisonOutcome
+    classification: ReplayClassification
+    ready_at: int | None
+    detail: str
+    retention_reference: str
+    read_only: bool = True
+
+    def curated_summary(self) -> dict[str, object]:
+        return {
+            "case_id": _public_identifier(self.case_id),
+            "case_digest": self.case_digest,
+            "outcome": self.outcome.value,
+            "classification": self.classification.value,
+            "ready_at": self.ready_at,
+            "retention_reference": _public_identifier(self.retention_reference),
+            "read_only": self.read_only,
+        }
+
+
+def compare_provenance_decision(
+    expected: ProvenanceDecision,
+    observed: ProvenanceDecision,
+    *,
+    ready_at: int,
+) -> ComparisonOutcome:
+    """Compare only at the frozen bundle capture time, never wall-clock time."""
+
+    if (
+        type(expected) is not ProvenanceDecision
+        or type(observed) is not ProvenanceDecision
+        or type(ready_at) is not int
+        or ready_at < 0
+        or ready_at != expected.ready_at
+        or ready_at != observed.ready_at
+    ):
+        return ComparisonOutcome.INVALID
+    return ComparisonOutcome.MATCH if expected.decision_digest == observed.decision_digest else ComparisonOutcome.MISMATCH
+
+
+def replay_shadow_v2_case(case: ShadowV2Case) -> ShadowV2Report:
+    """Replay the profile-defined terminal snapshot without worker/provider access."""
+
+    try:
+        _validate_v2_case(case, verify_digest=True)
+    except (ShadowV2Error, AttributeError):
+        return ShadowV2Report("invalid-case", "none", ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH, None, "invalid-v2-case", "unavailable")
+    outcome = compare_provenance_decision(case.reference_decision, case.decision, ready_at=case.readiness.ready_at)
+    if outcome is ComparisonOutcome.MATCH:
+        return ShadowV2Report(case.case_id, case.case_digest, outcome, ReplayClassification.EXACT_MATCH, case.readiness.ready_at, "exact-terminal-provenance-match", case.retention_reference)
+    classification = ReplayClassification.CONTRACT_MISMATCH if outcome is ComparisonOutcome.MISMATCH else ReplayClassification.INCOMPLETE_EVIDENCE
+    return ShadowV2Report(case.case_id, case.case_digest, outcome, classification, case.readiness.ready_at, "terminal-provenance-comparison-failed", case.retention_reference)
+
+
+def replay_shadow_case(case: ShadowCase | ShadowV2Case) -> ShadowReport | ShadowV2Report:
+    """Dispatch only explicit v1 or v2 evidence; mixing fails closed."""
+
+    if type(case) is ShadowCase:
+        return ShadowExecutor().replay(case)
+    if type(case) is ShadowV2Case:
+        return replay_shadow_v2_case(case)
+    return ShadowV2Report("invalid-case", "none", ComparisonOutcome.INVALID, ReplayClassification.CONTRACT_MISMATCH, None, "mixed-or-unknown-shadow-case", "unavailable")
+
+
+def _validate_v2_case(case: object, *, verify_digest: bool) -> None:
+    if (
+        type(case) is not ShadowV2Case
+        or case.schema != SHADOW_CASE_SCHEMA_V2
+        or not _safe_v2_token(case.case_id)
+        or not _safe_v2_token(case.lifecycle_correlation_id)
+        or type(case.profile) is not ShadowEvidenceProfile
+        or case.profile != _PROVENANCE_PROFILE
+        or type(case.decision) is not ProvenanceDecision
+        or type(case.reference_decision) is not ProvenanceDecision
+        or type(case.readiness) is not CaptureReadinessReceipt
+        or type(case.observations) is not tuple
+        or len(case.observations) != 1
+        or any(type(item) is not ShadowV2Observation for item in case.observations)
+        or not _safe_v2_token(case.retention_class)
+        or not _safe_v2_token(case.retention_reference)
+    ):
+        raise ShadowV2Error("Shadow v2 case is invalid")
+    observation = case.observations[0]
+    if (
+        case.decision.candidate_sha != case.readiness.candidate_sha
+        or case.decision.ready_at != case.readiness.ready_at
+        or case.reference_decision.candidate_sha != case.decision.candidate_sha
+        or case.reference_decision.base_sha != case.decision.base_sha
+        or observation.lifecycle_correlation_id != case.lifecycle_correlation_id
+        or observation.candidate_sha != case.decision.candidate_sha
+        or observation.decision_digest != case.decision.decision_digest
+        or observation.profile_id != case.profile.profile_id
+        or observation.event_kind not in case.profile.event_kinds
+    ):
+        raise ShadowV2Error("Shadow v2 evidence is stale or mixed")
+    if verify_digest and case.case_digest != _v2_digest(case._payload()):
+        raise ShadowV2Error("Shadow v2 case digest is invalid")

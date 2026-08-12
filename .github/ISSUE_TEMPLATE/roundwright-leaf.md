@@ -43,6 +43,16 @@ Planning transaction state: `BLOCKED_SCHEDULING`
 - Evidence and comparison identity: <candidate, case, digest, result, or
   selection-time rule>
 
+## Capture-readiness preflight
+
+- Evidence profile: <schema/profile identity or N/A with reason>
+- Capture mode: <terminal-snapshot or profile-defined mode>
+- Producer: <durable typed source; never raw provider prose>
+- Capture readiness point: <all schema/exporter/comparator/Recorder/store/read-back bindings>
+- Arm-before boundary: <the exact export or observation boundary>
+- Retention/read-back contract: <append-only content-addressed identity and receipt>
+- Missing-history/recapture behavior: <candidate movement or missing history rule>
+
 ## Acceptance criteria
 
 - [ ] <typed, bounded, candidate-bound condition>

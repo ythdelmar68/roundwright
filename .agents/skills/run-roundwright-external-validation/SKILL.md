@@ -47,6 +47,25 @@ Record these bindings in the immutable Roundlet selection contract before an
 external process starts. Missing, duplicate, floating, stale, or conflicting
 identity is `BLOCKED`, not a prompt to guess or substitute.
 
+## Capture-readiness preflight
+
+Before opening an ephemeral observation window, invoking a Recorder, or
+dispatching a review that depends on capture evidence, require one selected
+Shadow evidence profile to declare and validate all of: capture mode, producer,
+readiness point, arm-before boundary, retention/read-back contract, and
+missing-history/recapture behavior. Bind its exact base and candidate, profile
+and case schema, typed exporter and comparator identities, reviewed Recorder
+identity, append-only content-addressed store identity, and immutable capture
+time. The preflight must pass before the arm-before boundary; an unarmed
+ephemeral observation is prohibited.
+
+For `roundwright-shadow-profile/provenance-decision/v1`, capture mode is
+`terminal-snapshot`. It may record only an exact stable terminal candidate after
+the v2 schema/profile, typed provenance exporter, immutable `ready_at`
+comparator, Recorder binding, retention store, and read-back path are ready.
+Candidate movement requires fresh capture. Never reconstruct missing historical
+v1 lifecycle evidence.
+
 ## Route the selected gate
 
 | Leaf declaration | Generic route | Required authority | Behavior |

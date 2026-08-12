@@ -136,6 +136,23 @@ It excludes credentials, tokens, raw provider/GitHub payloads or prose, raw
 logs, private paths, secret-bearing configuration, and internal owner
 reasoning. A public-safe projection is evidence, not an authority receipt.
 
+## Capture-readiness preflight
+
+Before an ephemeral observation begins, a selected Shadow profile must declare
+and validate its capture mode, producer, readiness point, arm-before boundary,
+retention/read-back contract, and missing-history/recapture behavior. The
+preflight binds the exact base/candidate, schema/profile, typed
+exporter/comparator, reviewed Recorder identity, append-only content-addressed
+store, and immutable capture time. It must pass before the profile's arm-before
+boundary; an unarmed observation, Recorder invocation, or review dispatch is
+invalid.
+
+`roundwright-shadow-profile/provenance-decision/v1` is a terminal-snapshot
+profile. Its immutable `ready_at` comparator, public-safe provenance decision,
+reviewed Recorder binding, and retention read-back must all be ready before
+exporting the terminal candidate. Candidate movement requires a fresh capture;
+the missing historical v1 lifecycle bundle is never reconstructed.
+
 ## Owner interaction and recovery
 
 Do not request repetitive owner approval when the route and both required

@@ -42,6 +42,16 @@ whether historical replay uses immutable bundle `ready_at` or is not
 applicable. A current wall-clock timestamp is never a substitute for captured
 evidence time.
 
+## Capture-readiness preflight
+
+For every declared Shadow capture, record one profile's capture mode, producer,
+readiness point, arm-before boundary, retention/read-back contract, and
+missing-history/recapture behavior. Before any ephemeral observation, bind the
+exact base/candidate, schema/profile, typed exporter/comparator, reviewed
+Recorder, append-only content-addressed store, and immutable capture time. The
+preflight must pass before the arm-before boundary. Candidate movement requires
+fresh capture; never reconstruct missing historical evidence.
+
 The external-validation declaration is a routing and evidence record. The
 standing Booleans in authoritative root policy remove repetitive approval only
 for a mechanically conforming selected route; the declaration alone never

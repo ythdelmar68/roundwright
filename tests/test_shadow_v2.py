@@ -356,6 +356,84 @@ class ShadowV2Tests(unittest.TestCase):
                 with self.assertRaises(ProvenanceRecordError):
                     ExternalSelectionControl.load(invalid_payload, invalid_receipt, expected)
 
+    def test_final_reconciliation_denies_typed_dependency_and_admission_inputs(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        package, git_dependency = dependency.observations
+        forged_observations = {
+            "missing-package": (git_dependency,),
+            "missing-git": (package,),
+            "duplicate-component": (package, package),
+            "wrong-policy-digest": (replace(package, policy_digest=digest("9")), git_dependency),
+            "future-observation": (replace(package, observed_at=102), git_dependency),
+            "identifier-drift": (replace(package, identifier="other-package"), git_dependency),
+            "source-drift": (replace(package, source_identity="other-source"), git_dependency),
+            "version-drift": (replace(package, version="1.0.1"), git_dependency),
+            "artifact-drift": (replace(package, artifact_digest=digest("9")), git_dependency),
+            "executable-drift": (replace(package, executable_digest=digest("9")), git_dependency),
+        }
+        for name, observations in forged_observations.items():
+            forged = replace(dependency, observations=observations)
+            with self.subTest(name=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(control, **{**arguments, "dependency_control": forged})
+        for name, admission in {
+            "policy": replace(dependency.admission, policy_fingerprint=digest("9")),
+            "receipt": replace(dependency.admission, receipt_digest=digest("9")),
+            "reviewer": replace(dependency.admission, reviewer_identity=digest("9")),
+            "authority": replace(dependency.admission, authority_digest=digest("9")),
+            "binding": replace(dependency.admission, binding=CandidateBinding("ythdelmar68/roundwright", "task-47", "c" * 40)),
+        }.items():
+            with self.subTest(admission=name):
+                with self.assertRaises((ProvenanceRecordError, Exception)):
+                    forged = replace(dependency, admission=admission)
+                    reconcile_final_provenance_selection(control, **{**arguments, "dependency_control": forged})
+        reversed_control = replace(dependency, observations=tuple(reversed(dependency.observations)))
+        reversed_git_control = GitEntrypointControl(reversed_control.policy.binding, reversed_control, 101)
+        self.assertEqual(
+            reconcile_final_provenance_selection(
+                control,
+                **{**arguments, "dependency_control": reversed_control, "git_control": reversed_git_control},
+            ).control_fingerprint,
+            reconcile_final_provenance_selection(control, **arguments).control_fingerprint,
+        )
+
+    def test_final_reconciliation_denies_typed_git_artifact_and_candidate_drift(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()
+        arguments = {"validation": validation, "artifacts": artifacts, "git_control": git_control, "git_observation": git, "dependency_control": dependency, "now": 101}
+        git_changes = {
+            "binding": replace(git, binding_fingerprint=digest("9"), observation_fingerprint=""),
+            "identifier": replace(git, identifier="other-git", observation_fingerprint=""),
+            "source": replace(git, source_identity="other-source", observation_fingerprint=""),
+            "source-class": replace(git, source_class="other-class", observation_fingerprint=""),
+            "normalized-version": replace(git, normalized_version="2.53.1", observation_fingerprint=""),
+            "reported-version": replace(git, reported_version="2.53.1.windows.3", observation_fingerprint=""),
+            "artifact": replace(git, artifact_digest=digest("9"), observation_fingerprint=""),
+            "executable": replace(git, executable_digest=digest("9"), observation_fingerprint=""),
+            "control": replace(git, control_fingerprint=digest("9"), observation_fingerprint=""),
+        }
+        for name, observation in git_changes.items():
+            with self.subTest(git=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(control, **{**arguments, "git_observation": observation})
+        for name, artifact in {
+            "repository": replace(artifacts, repository="other/roundwright", projection_fingerprint=""),
+            "task": replace(artifacts, task_id="other-task", projection_fingerprint=""),
+            "candidate": replace(artifacts, candidate_sha="c" * 40, projection_fingerprint=""),
+            "tree": replace(artifacts, candidate_tree="d" * 40, projection_fingerprint=""),
+            "source-identity": replace(artifacts, source_identity="other-source", projection_fingerprint=""),
+            "source-digest": replace(artifacts, source_digest=digest("9"), projection_fingerprint=""),
+            "package": replace(artifacts, package_digest=digest("9"), projection_fingerprint=""),
+            "entrypoint": replace(artifacts, installed_entrypoint_digest=digest("9"), projection_fingerprint=""),
+        }.items():
+            with self.subTest(artifact=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    reconcile_final_provenance_selection(control, **{**arguments, "artifacts": artifact})
+        other_dependency = self.dependency_control(candidate="c" * 40)
+        other_git = GitEntrypointControl(other_dependency.policy.binding, other_dependency, 101)
+        with self.assertRaises(ProvenanceRecordError):
+            reconcile_final_provenance_selection(control, **{**arguments, "dependency_control": other_dependency, "git_control": other_git})
+
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):
         control = self.dependency_control(candidate=candidate, ready_at=ready_at)
         return _materialize_provenance_record(

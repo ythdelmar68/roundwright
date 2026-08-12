@@ -29,10 +29,14 @@ Before provisioning, invocation, replay, or mutation:
    blob, qualification-contract blob, and public-safe evidence projection.
 5. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
-   `42830db90acbba499989cd434cdc46b4627042e2`. Use its repo-local locked uv
-   environment and exact instructions from that commit. Never use floating
-   `main`, install packages into global Python, or treat the toolbox as an
-   authority source or credential store.
+   `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52`. That canonical merge binds
+   Recorder content `87094a4e780c692a00135421840c0e6713af5d35` and tree
+   `0c594caa275262164fce1942ebd2142abe0e77bb` from reviewed Harness PR #4.
+   Use its repo-local locked uv environment and exact instructions from that
+   commit. Never use floating `main`, install packages into global Python, or
+   treat the toolbox as an authority source or credential store. The prior
+   `42830db90acbba499989cd434cdc46b4627042e2` pin is historical and cannot
+   substitute for a Recorder-selected gate.
 6. When the route names a disposable target, bind
    `ythdelmar68/roundlet-forward-test` at baseline
    `4f39ef0e4e616eb896950d3756c433b624771a97`, its exact root instructions, the

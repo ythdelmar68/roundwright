@@ -18,17 +18,25 @@ by the allowlisted owner.
 
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `42830db90acbba499989cd434cdc46b4627042e2`; tree `4107953c2d9a97c0446a5a9789bd823493cf4839` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52`; tree `0c594caa275262164fce1942ebd2142abe0e77bb` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
 | Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
 
-Harness PR #3 repaired content
+Harness PR #4 added reviewed Recorder content
+`87094a4e780c692a00135421840c0e6713af5d35`; canonical merge
+`10265c35c9d01d1fd26bd767ca3c1b245e4e9c52` has parents
+`42830db90acbba499989cd434cdc46b4627042e2` and that Recorder content and
+resolves to tree `0c594caa275262164fce1942ebd2142abe0e77bb`. Exact-head CI run
+`31576479468` passed.
+
+Harness PR #3 repaired historical phase-neutral toolbox content
 `e5ec738c67130b17a8e723b89a4b567e1873838d`; canonical merge
 `42830db90acbba499989cd434cdc46b4627042e2` has parents
 `2d412311d8ddbeb1db538111126a6e5dd62297b1` and that repaired content. Both
 resolve to tree `4107953c2d9a97c0446a5a9789bd823493cf4839`.
 Exact-head CI run `31115923833` passed, and independent COMPLETE review
 reported VALID/PASS without findings, as curated in Roundwright PR #57 comment
-`5207059725`.
+`5207059725`. This identity remains historical and cannot substitute for the
+Recorder pin when a selected gate requires Recorder evidence.
 
 The original harness pin
 `681c7e9359a3767892a615ffa032d42b51e7be15` remains non-qualifying. Prior

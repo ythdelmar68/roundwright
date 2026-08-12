@@ -79,14 +79,14 @@ class ShadowV2Tests(unittest.TestCase):
     def external_control_bytes(self):
         payload = {
             "schema": "roundwright-provenance-selection-control/v1", "control_mode": "REHEARSAL", "capture_ready": False,
-            "roundlet": {"run_id": "run-47", "contract_id": "contract-47", "orchestrator_task": "orchestrator-47"},
+            "roundlet": {"run_id": "ab8aea71a95647bdbe1e00e9d915d557", "contract_id": "contract-47", "orchestrator_task": "orchestrator-47"},
             "selection": {"repository": "ythdelmar68/roundwright", "worker_task": "task-47", "base_sha": "a" * 40, "candidate_sha": "b" * 40, "candidate_tree": "c" * 40, "active_leaf": 47, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1"},
             "authority": {"origin_main": {"commit": "a" * 40, "tree": "1" * 40}, "active_roundlet_block": {"agents_blob": "d" * 40, "block_sha256": digest("2")}, "external_validation_contract": {"skill_blob": "e" * 40, "qualification_blob": "f" * 40}, "live_leaf": {"issue_database_id": 1, "issue_node_id": "node-47", "number": 47, "updated_at": "now", "body_sha256": digest("3")}, "owner_instructions": [{"comment_id": 2, "comment_node_id": "node-2", "body_sha256": digest("4")}, {"comment_id": 3, "comment_node_id": "node-3", "body_sha256": digest("5")}]},
         }
         content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         receipt = {"schema": "roundwright-provenance-selection-control-receipt/v1", "append_only": True, "capture_ready": False, "contract_sha256": digest("1"), "control_mode": "REHEARSAL", "payload_bytes": len(content), "payload_sha256": "sha256:" + hashlib.sha256(content).hexdigest(), "read_back": "VERIFIED", "retention_identity": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/rehearsal-" + "b" * 40}
         receipt_bytes = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
-        expected = ExternalSelectionControlExpectation("run-47", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")), (3, "node-3", digest("5"))))
+        expected = ExternalSelectionControlExpectation("ab8aea71a95647bdbe1e00e9d915d557", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")), (3, "node-3", digest("5"))))
         return content, receipt_bytes, expected
 
     def test_external_rehearsal_control_is_bound_but_never_terminal_ready(self) -> None:
@@ -146,6 +146,14 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(retained.payload, payload)
         for retention in ("C:/private/control", "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/../final-" + "b" * 40, "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/final-token"):
             with self.subTest(retention=retention):
+                with self.assertRaises(ProvenanceRecordError):
+                    ExternalSelectionControl.load(*rebased(payload_value, {"retention_identity": retention}))
+        for name, retention in {
+            "wrong-run": "roundlet-local:" + "0" * 32 + "/rehearsal-" + "b" * 40,
+            "wrong-mode": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/final-" + "b" * 40,
+            "wrong-candidate": "roundlet-local:ab8aea71a95647bdbe1e00e9d915d557/rehearsal-" + "c" * 40,
+        }.items():
+            with self.subTest(retention=name):
                 with self.assertRaises(ProvenanceRecordError):
                     ExternalSelectionControl.load(*rebased(payload_value, {"retention_identity": retention}))
 

@@ -895,7 +895,17 @@ def _safe_repository(value: object) -> bool:
 
 
 def _safe_roundlet_retention_identity(value: object) -> bool:
-    return type(value) is str and _ROUNDLET_RETENTION_ID.fullmatch(value) is not None
+    return _parse_roundlet_retention_identity(value) is not None
+
+
+def _parse_roundlet_retention_identity(value: object) -> tuple[str, str, str] | None:
+    """Return the closed public-safe retention run, mode, and candidate tuple."""
+
+    if type(value) is not str or _ROUNDLET_RETENTION_ID.fullmatch(value) is None:
+        return None
+    prefix, tail = value.removeprefix("roundlet-local:").split("/", 1)
+    mode, candidate = tail.split("-", 1)
+    return prefix, mode, candidate
 
 
 def _is_v2_digest(value: object) -> bool:
@@ -1200,7 +1210,8 @@ class ExternalSelectionControl:
             raise ProvenanceRecordError("external selection control bytes are not pinned")
         if set(receipt) != {"append_only", "capture_ready", "contract_sha256", "control_mode", "payload_bytes", "payload_sha256", "read_back", "retention_identity", "schema"}:
             raise ProvenanceRecordError("external selection control receipt is invalid")
-        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True or not _safe_roundlet_retention_identity(receipt.get("retention_identity")):
+        retention = _parse_roundlet_retention_identity(receipt.get("retention_identity"))
+        if receipt.get("schema") != EXTERNAL_SELECTION_RECEIPT_SCHEMA or receipt.get("payload_sha256") != digest or receipt.get("payload_bytes") != len(payload_bytes) or receipt.get("contract_sha256") != expected.contract_digest or receipt.get("read_back") != "VERIFIED" or receipt.get("append_only") is not True or retention is None:
             raise ProvenanceRecordError("external selection control receipt is invalid")
         selection = payload.get("selection")
         authority = payload.get("authority")
@@ -1233,11 +1244,11 @@ class ExternalSelectionControl:
         if (
             mode not in {"REHEARSAL", "FINAL"}
             or type(ready) is not bool
+            or not re.fullmatch(r"[0-9a-f]{32}", expected.run_id)
+            or roundlet.get("run_id") != expected.run_id
             or receipt.get("control_mode") != mode
             or receipt.get("capture_ready") is not ready
-            or not receipt["retention_identity"].endswith(
-                f"/{mode.lower()}-{selection['candidate_sha']}"
-            )
+            or retention != (expected.run_id, mode.lower(), selection["candidate_sha"])
         ):
             raise ProvenanceRecordError("external selection control mode is invalid")
         value = object.__new__(cls)

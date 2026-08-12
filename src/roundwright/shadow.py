@@ -1182,40 +1182,87 @@ class ExternalSelectionControl:
 
 
 @dataclass(frozen=True)
+class NamedContentIdentity:
+    """A path-free named digest from the strict receipt verifier output."""
+
+    name: str
+    digest: str
+    version: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _safe_v2_token(self.name) or not _is_v2_digest(self.digest) or (self.version is not None and not _safe_v2_token(self.version)):
+            raise ProvenanceRecordError("named toolchain content identity is invalid")
+
+
+def _canonical_named_identities(
+    value: object, names: tuple[str, ...], *, tools: bool = False,
+) -> tuple[NamedContentIdentity, ...]:
+    if (
+        type(value) is not tuple
+        or len(value) != len(names)
+        or any(type(item) is not NamedContentIdentity for item in value)
+        or tuple(item.name for item in value) != names
+        or any((item.version is None) if tools else (item.version is not None) for item in value)
+    ):
+        raise ProvenanceRecordError("named toolchain content identities are incomplete")
+    return value
+
+
+@dataclass(frozen=True)
 class VerifiedValidationToolchainProjection:
     """Public-safe result already verified by the locked toolchain receipt verifier."""
 
     lock_digest: str
     cache_key: str
     receipt_digest: str
-    requirements_digest: str
-    environment_digest: str
-    tool_digest: str
+    requirements: tuple[NamedContentIdentity, ...]
+    environments: tuple[NamedContentIdentity, ...]
+    tools: tuple[NamedContentIdentity, ...]
+    requirements_fingerprint: str = ""
+    environments_fingerprint: str = ""
+    tools_fingerprint: str = ""
     projection_fingerprint: str = ""
 
     def __post_init__(self) -> None:
-        if (
-            not _is_v2_digest(self.lock_digest)
-            or not _safe_v2_token(self.cache_key)
-            or not all(_is_v2_digest(value) for value in (
-                self.receipt_digest, self.requirements_digest,
-                self.environment_digest, self.tool_digest,
-            ))
-        ):
+        if not _is_v2_digest(self.lock_digest) or not _safe_v2_token(self.cache_key) or not _is_v2_digest(self.receipt_digest):
             raise ProvenanceRecordError("verified validation toolchain projection is invalid")
-        fingerprint = _v2_digest(self._payload())
+        requirements = _canonical_named_identities(self.requirements, ("build", "pipx"))
+        environments = _canonical_named_identities(self.environments, ("python", "build", "pipx"))
+        tools = _canonical_named_identities(self.tools, ("uv", "managed_python", "python", "pipx"), tools=True)
+        requirement_fingerprint = _v2_digest(tuple((item.name, item.digest) for item in requirements))
+        environment_fingerprint = _v2_digest(tuple((item.name, item.digest) for item in environments))
+        tool_fingerprint = _v2_digest(tuple((item.name, item.version, item.digest) for item in tools))
+        for supplied, derived in (
+            (self.requirements_fingerprint, requirement_fingerprint),
+            (self.environments_fingerprint, environment_fingerprint),
+            (self.tools_fingerprint, tool_fingerprint),
+        ):
+            if supplied and supplied != derived:
+                raise ProvenanceRecordError("verified validation toolchain projection fingerprint is invalid")
+        payload = {
+            "lock_digest": self.lock_digest,
+            "cache_key": self.cache_key,
+            "receipt_digest": self.receipt_digest,
+            "requirements": tuple((item.name, item.digest) for item in requirements),
+            "environments": tuple((item.name, item.digest) for item in environments),
+            "tools": tuple((item.name, item.version, item.digest) for item in tools),
+        }
+        fingerprint = _v2_digest(payload)
         if self.projection_fingerprint and self.projection_fingerprint != fingerprint:
             raise ProvenanceRecordError("verified validation toolchain projection fingerprint is invalid")
+        object.__setattr__(self, "requirements_fingerprint", requirement_fingerprint)
+        object.__setattr__(self, "environments_fingerprint", environment_fingerprint)
+        object.__setattr__(self, "tools_fingerprint", tool_fingerprint)
         object.__setattr__(self, "projection_fingerprint", fingerprint)
 
-    def _payload(self) -> dict[str, str]:
+    def public_payload(self) -> dict[str, object]:
         return {
             "lock_digest": self.lock_digest,
             "cache_key": self.cache_key,
             "receipt_digest": self.receipt_digest,
-            "requirements_digest": self.requirements_digest,
-            "environment_digest": self.environment_digest,
-            "tool_digest": self.tool_digest,
+            "requirements": {item.name: item.digest for item in self.requirements},
+            "environments": {item.name: item.digest for item in self.environments},
+            "tools": {item.name: {"version": item.version, "digest": item.digest} for item in self.tools},
         }
 
 
@@ -1306,7 +1353,7 @@ class ReviewedGitObservation:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class VerifiedProvenanceSelection:
     """Immutable skeleton retained only after later FINAL-control reconciliation."""
 
@@ -1319,9 +1366,35 @@ class VerifiedProvenanceSelection:
     validation_fingerprint: str
     git_fingerprint: str
     control_fingerprint: str
-    selection_fingerprint: str = ""
+    selection_fingerprint: str
 
-    def __post_init__(self) -> None:
+    def __init__(self, *arguments: object, **keywords: object) -> None:
+        raise TypeError("verified provenance selections are produced by reconciliation only")
+
+    @classmethod
+    def _from_reconciliation(
+        cls, *, payload_digest: str, receipt_digest: str, contract_digest: str,
+        retention_identity: str, selection_at: int, candidate_fingerprint: str,
+        validation_fingerprint: str, git_fingerprint: str, control_fingerprint: str,
+    ) -> "VerifiedProvenanceSelection":
+        value = object.__new__(cls)
+        for name, item in {
+            "payload_digest": payload_digest,
+            "receipt_digest": receipt_digest,
+            "contract_digest": contract_digest,
+            "retention_identity": retention_identity,
+            "selection_at": selection_at,
+            "candidate_fingerprint": candidate_fingerprint,
+            "validation_fingerprint": validation_fingerprint,
+            "git_fingerprint": git_fingerprint,
+            "control_fingerprint": control_fingerprint,
+        }.items():
+            object.__setattr__(value, name, item)
+        value._validate()
+        object.__setattr__(value, "selection_fingerprint", _v2_digest(value._payload()))
+        return value
+
+    def _validate(self) -> None:
         if (
             not all(_is_v2_digest(value) for value in (
                 self.payload_digest, self.receipt_digest, self.contract_digest,
@@ -1333,10 +1406,6 @@ class VerifiedProvenanceSelection:
             or self.selection_at < 0
         ):
             raise ProvenanceRecordError("verified provenance selection is invalid")
-        fingerprint = _v2_digest(self._payload())
-        if self.selection_fingerprint and self.selection_fingerprint != fingerprint:
-            raise ProvenanceRecordError("verified provenance selection fingerprint is invalid")
-        object.__setattr__(self, "selection_fingerprint", fingerprint)
 
     def _payload(self) -> dict[str, object]:
         return {
@@ -1350,6 +1419,185 @@ class VerifiedProvenanceSelection:
             "git_fingerprint": self.git_fingerprint,
             "control_fingerprint": self.control_fingerprint,
         }
+
+
+def _selection_payload(control: ExternalSelectionControl) -> dict[str, object]:
+    try:
+        payload = json.loads(control.payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ProvenanceRecordError("external selection control is unavailable") from error
+    if type(payload) is not dict:
+        raise ProvenanceRecordError("external selection control is unavailable")
+    return payload
+
+
+def _control_fingerprint(control: object, *, now: int) -> tuple[str, tuple[str, ...]]:
+    from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicy, DependencyStage, ObservedDependency
+
+    if type(control) is not DependencyExecutionControl or type(control.policy) is not DependencyPolicy:
+        raise ProvenanceRecordError("dependency control is invalid")
+    binding = control.policy.binding
+    if type(binding) is not CandidateBinding or type(control.observations) is not tuple or not control.observations:
+        raise ProvenanceRecordError("dependency control is invalid")
+    observations = control.observations
+    if (
+        any(type(item) is not ObservedDependency or item.binding != binding or item.policy_digest != control.policy.policy_digest for item in observations)
+        or len({item.component for item in observations}) != len(observations)
+        or {item.component for item in observations} != {item.component for item in control.policy.components}
+    ):
+        raise ProvenanceRecordError("dependency observations are incomplete")
+    try:
+        control.require(binding, DependencyStage.GIT_ENTRYPOINT, now=now)
+    except Exception as error:
+        raise ProvenanceRecordError("dependency control is not admitted") from error
+    observation_fingerprints = tuple(item.fingerprint for item in observations)
+    admission = control.admission
+    fingerprint = _v2_digest({
+        "binding": binding.fingerprint,
+        "policy": control.policy.core_fingerprint,
+        "observations": observation_fingerprints,
+        "admission": (admission.policy_fingerprint, admission.receipt_digest, admission.reviewer_identity, admission.authority_digest),
+    })
+    return fingerprint, observation_fingerprints
+
+
+def reconcile_final_provenance_selection(
+    control: object,
+    *,
+    validation: object,
+    artifacts: object,
+    git_control: object,
+    git_observation: object,
+    dependency_control: object,
+    now: int,
+) -> VerifiedProvenanceSelection:
+    """Reconcile one pinned FINAL external control without minting any authority."""
+
+    from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyStage
+    from .git_identity import GitEntrypointControl
+
+    if (
+        type(control) is not ExternalSelectionControl
+        or type(validation) is not VerifiedValidationToolchainProjection
+        or type(artifacts) is not CandidateArtifactProjection
+        or type(git_control) is not GitEntrypointControl
+        or type(git_observation) is not ReviewedGitObservation
+        or type(dependency_control) is not DependencyExecutionControl
+        or type(now) is not int
+        or now < 0
+        or not control.terminal_ready
+    ):
+        raise ProvenanceRecordError("final provenance selection is unavailable")
+    payload = _selection_payload(control)
+    selection = payload.get("selection")
+    freshness = payload.get("freshness")
+    if type(selection) is not dict or type(freshness) is not dict:
+        raise ProvenanceRecordError("final provenance selection is invalid")
+    expected_selection = {
+        "repository", "worker_task", "base_sha", "candidate_sha", "candidate_tree", "active_leaf",
+        "route", "case_schema", "evidence_profile", "capture_mode", "gate", "blocker", "next_action",
+    }
+    if set(selection) != expected_selection or set(freshness) != {"selection_at", "valid_until", "candidate_movement_invalidates"}:
+        raise ProvenanceRecordError("final provenance selection is incomplete")
+    repository = selection["repository"]
+    task_id = selection["worker_task"]
+    base_sha = selection["base_sha"]
+    candidate_sha = selection["candidate_sha"]
+    candidate_tree = selection["candidate_tree"]
+    selection_at = freshness["selection_at"]
+    valid_until = freshness["valid_until"]
+    if (
+        not _safe_repository(repository) or not _safe_v2_token(task_id)
+        or not all(_SHA1.fullmatch(value) for value in (base_sha, candidate_sha, candidate_tree))
+        or selection["active_leaf"] != 47 or selection["route"] != "toolbox"
+        or selection["case_schema"] != SHADOW_CASE_SCHEMA_V2 or selection["evidence_profile"] != PROVENANCE_DECISION_PROFILE
+        or selection["capture_mode"] != CaptureMode.TERMINAL_SNAPSHOT.value
+        or not _safe_v2_token(selection["gate"]) or (selection["blocker"] is not None and not _safe_v2_token(selection["blocker"]))
+        or not _safe_v2_token(selection["next_action"])
+        or type(selection_at) is not int or type(valid_until) is not int or selection_at < 0 or valid_until < selection_at
+        or freshness["candidate_movement_invalidates"] is not True or not selection_at <= now <= valid_until
+    ):
+        raise ProvenanceRecordError("final provenance selection is invalid")
+    binding = dependency_control.policy.binding
+    if (
+        type(binding) is not CandidateBinding
+        or (binding.repository, binding.task_id, binding.candidate_sha) != (repository, task_id, candidate_sha)
+        or (artifacts.repository, artifacts.task_id, artifacts.candidate_sha, artifacts.candidate_tree) != (repository, task_id, candidate_sha, candidate_tree)
+        or (git_control.binding.repository, git_control.binding.task_id, git_control.binding.candidate_sha) != (repository, task_id, candidate_sha)
+        or git_control.dependency_control != dependency_control or git_control.now != selection_at
+        or (git_observation.repository, git_observation.task_id, git_observation.candidate_sha) != (repository, task_id, candidate_sha)
+        or git_observation.binding_fingerprint != binding.fingerprint
+    ):
+        raise ProvenanceRecordError("final provenance selection binding is invalid")
+    try:
+        git_control.dependency_control.require(git_control.binding, DependencyStage.GIT_ENTRYPOINT, now=selection_at)
+    except Exception as error:
+        raise ProvenanceRecordError("reviewed Git control is not admitted") from error
+    dependency_fingerprint, observation_fingerprints = _control_fingerprint(dependency_control, now=selection_at)
+    git_control_fingerprint = _v2_digest({
+        "binding": git_control.binding.fingerprint,
+        "dependency": dependency_fingerprint,
+        "now": git_control.now,
+    })
+    if git_observation.control_fingerprint != git_control_fingerprint:
+        raise ProvenanceRecordError("reviewed Git control does not match")
+    if payload.get("validation_toolchain") != validation.public_payload():
+        raise ProvenanceRecordError("strict validation projection does not match")
+    expected_artifacts = {
+        "candidate_source": artifacts.source_digest,
+        "candidate_package": artifacts.package_digest,
+        "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest,
+        "reviewed_git_entrypoint": {
+            "binding_fingerprint": git_observation.binding_fingerprint,
+            "source_class": git_observation.source_class,
+            "version": git_observation.version,
+            "executable_digest": git_observation.executable_digest,
+            "control_fingerprint": git_observation.control_fingerprint,
+        },
+    }
+    if payload.get("artifacts") != expected_artifacts:
+        raise ProvenanceRecordError("candidate artifact projection does not match")
+    admission = dependency_control.admission
+    expected_dependency = {
+        "binding_fingerprint": binding.fingerprint,
+        "policy_fingerprint": dependency_control.policy.core_fingerprint,
+        "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in dependency_control.observations],
+        "admission": {
+            "policy_fingerprint": admission.policy_fingerprint,
+            "receipt_digest": admission.receipt_digest,
+            "reviewer_identity": admission.reviewer_identity,
+            "authority_digest": admission.authority_digest,
+        },
+    }
+    if payload.get("dependency_control") != expected_dependency:
+        raise ProvenanceRecordError("dependency projection does not match")
+    candidate_fingerprint = _v2_digest({
+        "repository": repository, "task_id": task_id, "base_sha": base_sha,
+        "candidate_sha": candidate_sha, "candidate_tree": candidate_tree,
+        "artifacts": artifacts.projection_fingerprint,
+    })
+    expected_public = {
+        "repository": repository, "task_id": task_id, "base_sha": base_sha,
+        "candidate_sha": candidate_sha, "candidate_tree": candidate_tree,
+        "route": selection["route"], "case_schema": selection["case_schema"],
+        "evidence_profile": selection["evidence_profile"], "capture_mode": selection["capture_mode"],
+        "gate": selection["gate"], "blocker": selection["blocker"], "next_action": selection["next_action"],
+        "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint,
+        "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git_observation.observation_fingerprint,
+    }
+    if payload.get("public_safe_projection") != expected_public:
+        raise ProvenanceRecordError("public-safe selection projection does not match")
+    return VerifiedProvenanceSelection._from_reconciliation(
+        payload_digest=control.payload_digest,
+        receipt_digest=control.receipt_digest,
+        contract_digest=payload.get("control_contract_digest"),
+        retention_identity=control.retention_identity,
+        selection_at=selection_at,
+        candidate_fingerprint=candidate_fingerprint,
+        validation_fingerprint=validation.projection_fingerprint,
+        git_fingerprint=git_observation.observation_fingerprint,
+        control_fingerprint=_v2_digest({"dependency": dependency_fingerprint, "git_control": git_control_fingerprint, "observations": observation_fingerprints}),
+    )
 
 
 @dataclass(frozen=True)

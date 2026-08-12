@@ -60,7 +60,9 @@ class ExternalValidationContractTests(unittest.TestCase):
             "`none`/`none`",
             "`harness`/`toolbox`",
             "`harness+forward-test`/`toolbox+disposable-target`",
-            "42830db90acbba499989cd434cdc46b4627042e2",
+            "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52",
+            "87094a4e780c692a00135421840c0e6713af5d35",
+            "0c594caa275262164fce1942ebd2142abe0e77bb",
             "4f39ef0e4e616eb896950d3756c433b624771a97",
             "allow_external_validation_read_only: true",
             "allow_external_validation_disposable_target_mutation: true",
@@ -95,6 +97,10 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("Do not request repetitive owner approval", contract)
         self.assertIn("Phase 3 never mutates the forward-test target", contract)
         self.assertIn("top-level integer `ready_at`", contract)
+        self.assertIn("Harness PR #4", contract)
+        self.assertIn("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", contract)
+        self.assertIn("87094a4e780c692a00135421840c0e6713af5d35", contract)
+        self.assertIn("0c594caa275262164fce1942ebd2142abe0e77bb", contract)
         self.assertNotIn("fresh authenticated owner approval", contract)
 
 

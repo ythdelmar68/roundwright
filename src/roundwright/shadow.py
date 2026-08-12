@@ -871,8 +871,6 @@ def _public_identifier(value: str) -> str:
 # that older shape.
 SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
-_PROVENANCE_GIT_SOURCE_CLASS = "bundled-native-git"
-_PROVENANCE_GIT_REPORTED_VERSION = "2.53.0.windows.3"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1664,8 +1662,6 @@ def reconcile_final_provenance_selection(
         or artifacts.source_identity != package_observation.source_identity
         or artifacts.package_digest != package_observation.artifact_digest
         or artifacts.installed_entrypoint_digest != package_observation.executable_digest
-        or git_observation.source_class != _PROVENANCE_GIT_SOURCE_CLASS
-        or git_observation.reported_version != _PROVENANCE_GIT_REPORTED_VERSION
         or (git_observation.identifier, git_observation.source_identity, git_observation.normalized_version, git_observation.artifact_digest, git_observation.executable_digest) != (
             git_dependency_observation.identifier, git_dependency_observation.source_identity,
             git_dependency_observation.version, git_dependency_observation.artifact_digest,

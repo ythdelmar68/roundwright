@@ -201,7 +201,9 @@ class ShadowV2Tests(unittest.TestCase):
         )
         return DependencyExecutionControl(policy, observations, TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, receipt.reviewer_identity, receipt.authority_digest))
 
-    def final_reconciliation_fixture(self, mutate=None, *, leaf=47):
+    def final_reconciliation_fixture(
+        self, mutate=None, *, leaf=47, source_class="bundled-native-git", reported_version="2.53.0.windows.3",
+    ):
         dependency = self.dependency_control()
         binding = dependency.policy.binding
         git_control = GitEntrypointControl(binding, dependency, 101)
@@ -215,7 +217,7 @@ class ShadowV2Tests(unittest.TestCase):
         observations = tuple(item.fingerprint for item in dependency.observations)
         dependency_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"binding": binding.fingerprint, "policy": dependency.policy.core_fingerprint, "observations": observations, "admission": (dependency.admission.policy_fingerprint, dependency.admission.receipt_digest, dependency.admission.reviewer_identity, dependency.admission.authority_digest)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         git_control_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"binding": binding.fingerprint, "dependency": dependency_fingerprint, "now": 101}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
-        git = ReviewedGitObservation(binding.repository, binding.task_id, binding.candidate_sha, binding.fingerprint, "git", "git-source", "bundled-native-git", "2.53.0", "2.53.0.windows.3", digest("e"), digest("f"), git_control_fingerprint)
+        git = ReviewedGitObservation(binding.repository, binding.task_id, binding.candidate_sha, binding.fingerprint, "git", "git-source", source_class, "2.53.0", reported_version, digest("e"), digest("f"), git_control_fingerprint)
         candidate_fingerprint = "sha256:" + hashlib.sha256(json.dumps({"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "artifacts": artifacts.projection_fingerprint}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         payload, receipt, expected = self.external_control_bytes()
         value = json.loads(payload)
@@ -250,6 +252,11 @@ class ShadowV2Tests(unittest.TestCase):
         verify_selection_for_durable_record(control, selection)
         with self.assertRaises(TypeError):
             VerifiedProvenanceSelection()
+
+    def test_final_reconciliation_preserves_pinned_cross_platform_git_reporting(self) -> None:
+        control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture(reported_version="2.53.0")
+        selection = reconcile_final_provenance_selection(control, validation=validation, artifacts=artifacts, git_control=git_control, git_observation=git, dependency_control=dependency, now=101)
+        self.assertEqual(selection.git_fingerprint, git.observation_fingerprint)
 
     def test_reconciliation_requires_loaded_control_and_observation_bound_inputs(self) -> None:
         control, validation, artifacts, git_control, git, dependency = self.final_reconciliation_fixture()

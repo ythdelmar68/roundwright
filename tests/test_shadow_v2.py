@@ -39,6 +39,8 @@ from roundwright.shadow import (
     ExternalSelectionControlExpectation,
     ProvenanceRecordError,
     ProvenanceRecordStore,
+    ProvenanceDecision,
+    PublicArtifactReference,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -252,7 +254,7 @@ class ShadowV2Tests(unittest.TestCase):
         value["selection"] = {"repository": binding.repository, "worker_task": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "active_leaf": leaf, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot"}
         value["freshness"] = {"selection_at": 101, "valid_until": 120, "candidate_movement_invalidates": True}
         value["validation_toolchain"] = validation.public_payload()
-        value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "normalized_version": git.normalized_version, "reported_version": git.reported_version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}}
+        value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "normalized_version": git.normalized_version, "reported_version": git.reported_version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}, "export_artifact_kinds": ["candidate-source", "candidate-package", "installed-roundwright-entrypoint", "reviewed-git-artifact", "reviewed-git-executable"]}
         value["dependency_control"] = {"binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency.policy.core_fingerprint, "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in sorted(dependency.observations, key=lambda item: item.component.value)], "admission": {"policy_fingerprint": dependency.admission.policy_fingerprint, "receipt_digest": dependency.admission.receipt_digest, "reviewer_identity": dependency.admission.reviewer_identity, "authority_digest": dependency.admission.authority_digest}}
         recorder_digest = "sha256:" + hashlib.sha256(json.dumps({"harness_merge": "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "recorder_content": "87094a4e780c692a00135421840c0e6713af5d35", "harness_tree": "0c594caa275262164fce1942ebd2142abe0e77bb"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         store_identity = "sha256:" + hashlib.sha256(json.dumps({"run_id": "ab8aea71a95647bdbe1e00e9d915d557", "contract_id": "contract-47", "candidate_sha": binding.candidate_sha, "profile": "roundwright-shadow-profile/provenance-decision/v1", "recorder_binding_digest": recorder_digest}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -311,6 +313,7 @@ class ShadowV2Tests(unittest.TestCase):
             lambda: (control, {**arguments, "artifacts": replace(artifacts, package_digest=digest("9"), projection_fingerprint="")}),
             lambda: (self.final_reconciliation_fixture(lambda value: value["selection"].update(gate="another-gate"))[0], arguments),
             lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(store_identity=digest("9")))[0], arguments),
+            lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(store_identity="not-a-content-digest"))[0], arguments),
             lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(retention_contract="other-contract"))[0], arguments),
             lambda: (self.final_reconciliation_fixture(lambda value: value["recorder_store"].update(recorder_binding_digest=digest("a")))[0], arguments),
         ):
@@ -817,6 +820,27 @@ class ShadowV2Tests(unittest.TestCase):
     def export_authority(authority):
         return {name: value for name, value in authority.items() if name != "now"}
 
+    @staticmethod
+    def verified_store_snapshot(store):
+        if not store._root.exists():
+            return ()
+        return tuple(sorted(
+            (str(path.relative_to(store._root)), "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in store._root.rglob("*") if path.is_file()
+        ))
+
+    @staticmethod
+    def write_rebased_verified_document(store, candidate_sha, document):
+        document.pop("record_digest", None)
+        document["record_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        ).hexdigest()
+        payload = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        path = store._root / candidate_sha / f"{document['record_digest'].removeprefix('sha256:')}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return document["record_digest"]
+
     def test_verified_terminal_export_and_readiness_require_readback_authority(self) -> None:
         temporary, store, read_back, record, authority = self.verified_readback_fixture()
         self.addCleanup(temporary.cleanup)
@@ -827,6 +851,7 @@ class ShadowV2Tests(unittest.TestCase):
             "candidate-source", "candidate-package", "installed-roundwright-entrypoint",
             "reviewed-git-artifact", "reviewed-git-executable",
         ))
+        before_success = self.verified_store_snapshot(store)
         readiness = require_verified_provenance_capture_readiness(
             shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
             RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
@@ -837,6 +862,7 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(readiness.ready_at, 101)
         self.assertEqual(readiness.evidence_store_identity, authority["loaded_control"].expected.recorder_store_identity)
         readiness.verify()
+        self.assertEqual(self.verified_store_snapshot(store), before_success)
         readiness.verify_against(
             store, recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
             **export_authority,
@@ -849,10 +875,58 @@ class ShadowV2Tests(unittest.TestCase):
                 RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
                 AppendOnlyEvidenceStore("fixture-store"), candidate_sha=record.candidate_sha, ready_at=101,
             )
+        before = self.verified_store_snapshot(store)
+        with self.assertRaises(ProvenanceRecordError):
+            require_verified_provenance_capture_readiness(
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
+                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=102,
+                **export_authority,
+            )
+        self.assertEqual(self.verified_store_snapshot(store), before)
         with self.assertRaises(ProvenanceRecordError):
             export_provenance_decision(record, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
         with self.assertRaises(ProvenanceRecordError):
             export_provenance_decision(read_back, candidate_sha=record.candidate_sha, record_digest=record.record_digest, **export_authority)
+
+    def test_verified_export_denies_persisted_artifact_vocabulary_and_store_tampering(self) -> None:
+        temporary, store, _, record, authority = self.verified_readback_fixture()
+        self.addCleanup(temporary.cleanup)
+        export_authority = self.export_authority(authority)
+        for name, mutate in (
+            ("missing", lambda value: value.pop()),
+            ("extra", lambda value: value.append("extra-artifact")),
+            ("reordered", lambda value: value.reverse()),
+            ("duplicate", lambda value: value.append(value[-1])),
+        ):
+            document = record.public_projection()
+            mutate(document["artifacts"]["export_artifact_kinds"])
+            rebased_digest = self.write_rebased_verified_document(store, record.candidate_sha, document)
+            with self.subTest(vocabulary=name):
+                with self.assertRaises(ProvenanceRecordError):
+                    export_provenance_decision(
+                        store, candidate_sha=record.candidate_sha, record_digest=rebased_digest,
+                        **export_authority,
+                    )
+        path = store._root / record.candidate_sha / f"{record.record_digest.removeprefix('sha256:')}.json"
+        path.write_bytes(b"{}")
+        with self.assertRaises(ProvenanceRecordError):
+            export_provenance_decision(
+                store, candidate_sha=record.candidate_sha, record_digest=record.record_digest,
+                **export_authority,
+            )
+        decision = ProvenanceDecision(
+            "ythdelmar68/roundwright", "task-47", "a" * 40, record.candidate_sha,
+            digest("d"), digest("e"), digest("f"), (PublicArtifactReference("fixture", digest("1")),),
+            "recorder-capture-readiness", None, "record-terminal-snapshot", 101,
+        )
+        with self.assertRaises(ProvenanceRecordError):
+            require_verified_provenance_capture_readiness(
+                shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
+                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                candidate_sha=record.candidate_sha, record_digest=record.record_digest, ready_at=101,
+                **export_authority,
+            )
         with self.assertRaises(ProvenanceRecordError):
             require_verified_provenance_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,

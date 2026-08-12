@@ -1125,8 +1125,13 @@ class ProvenanceRecordError(ShadowV2Error):
 
 EXTERNAL_SELECTION_CONTROL_SCHEMA = "roundwright-provenance-selection-control/v1"
 EXTERNAL_SELECTION_RECEIPT_SCHEMA = "roundwright-provenance-selection-control-receipt/v1"
+_PROVENANCE_EXPORT_ARTIFACT_KINDS = (
+    "candidate-source", "candidate-package", "installed-roundwright-entrypoint",
+    "reviewed-git-artifact", "reviewed-git-executable",
+)
 _EXTERNAL_SELECTION_CONTROL_SEAL = object()
 _VERIFIED_PROVENANCE_SELECTION_SEAL = object()
+_VERIFIED_CAPTURE_READINESS_SEAL = object()
 
 
 @dataclass(frozen=True)
@@ -1742,6 +1747,7 @@ def reconcile_final_provenance_selection(
             "executable_digest": git_observation.executable_digest,
             "control_fingerprint": git_observation.control_fingerprint,
         },
+        "export_artifact_kinds": list(_PROVENANCE_EXPORT_ARTIFACT_KINDS),
     }
     if payload.get("artifacts") != expected_artifacts:
         raise ProvenanceRecordError("candidate artifact projection does not match")
@@ -1911,11 +1917,12 @@ def _verified_record_document(payload: bytes) -> dict[str, object]:
         or set(validation["requirements"]) != {"build", "pipx"}
         or set(validation["environments"]) != {"python", "build", "pipx"}
         or set(validation["tools"]) != {"uv", "managed_python", "python", "pipx"}
-        or set(artifacts) != {"candidate_source", "candidate_package", "installed_roundwright_entrypoint", "reviewed_git_entrypoint"}
+        or set(artifacts) != {"candidate_source", "candidate_package", "installed_roundwright_entrypoint", "reviewed_git_entrypoint", "export_artifact_kinds"}
         or type(artifacts.get("candidate_source")) is not dict
         or set(artifacts["candidate_source"]) != {"source_identity", "digest"}
         or type(artifacts.get("reviewed_git_entrypoint")) is not dict
         or set(artifacts["reviewed_git_entrypoint"]) != {"repository", "task_id", "candidate_sha", "binding_fingerprint", "identifier", "source_identity", "source_class", "normalized_version", "reported_version", "artifact_digest", "executable_digest", "control_fingerprint"}
+        or artifacts.get("export_artifact_kinds") != list(_PROVENANCE_EXPORT_ARTIFACT_KINDS)
     ):
         raise ProvenanceRecordError("verified provenance record is incomplete")
     try:
@@ -2093,6 +2100,7 @@ def materialize_verified_provenance_record(
             "candidate_package": artifacts.package_digest,
             "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest,
             "reviewed_git_entrypoint": git_observation._payload(),
+            "export_artifact_kinds": list(_PROVENANCE_EXPORT_ARTIFACT_KINDS),
         },
         "dependency": {
             "binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency_control.policy.core_fingerprint,
@@ -2365,7 +2373,7 @@ class VerifiedCaptureReadinessReceipt:
     def verify(self) -> None:
         if (
             type(self) is not VerifiedCaptureReadinessReceipt
-            or getattr(self, "_readiness_seal", None) is not _VERIFIED_PROVENANCE_RECORD_SEAL
+            or getattr(self, "_readiness_seal", None) is not _VERIFIED_CAPTURE_READINESS_SEAL
             or self.profile_id != PROVENANCE_DECISION_PROFILE
             or not _SHA1.fullmatch(self.candidate_sha)
             or type(self.ready_at) is not int or self.ready_at < 0
@@ -2463,6 +2471,8 @@ def _verified_terminal_export(
     source = projection["artifacts"]["candidate_source"]
     reviewed_git = projection["artifacts"]["reviewed_git_entrypoint"]
     try:
+        if projection["artifacts"].get("export_artifact_kinds") != list(_PROVENANCE_EXPORT_ARTIFACT_KINDS):
+            raise ProvenanceRecordError("verified provenance export artifact vocabulary is invalid")
         artifact_references = (
             PublicArtifactReference("candidate-source", source["digest"]),
             PublicArtifactReference("candidate-package", projection["artifacts"]["candidate_package"]),
@@ -2478,7 +2488,7 @@ def _verified_terminal_export(
             artifact_references, projection["selection"]["gate"], projection["selection"]["blocker"],
             projection["selection"]["next_action"], projection["selection"]["selection_at"],
         )
-    except (AttributeError, KeyError, TypeError, ShadowV2Error) as error:
+    except (AttributeError, KeyError, TypeError, ShadowV2Error, ProvenanceRecordError) as error:
         raise ProvenanceRecordError("verified provenance export projection is invalid") from error
     return decision, record
 
@@ -2571,7 +2581,7 @@ def require_verified_provenance_capture_readiness(
         object.__setattr__(value, name, item)
     digest = _v2_digest(values)
     object.__setattr__(value, "readiness_digest", digest)
-    object.__setattr__(value, "_readiness_seal", _VERIFIED_PROVENANCE_RECORD_SEAL)
+    object.__setattr__(value, "_readiness_seal", _VERIFIED_CAPTURE_READINESS_SEAL)
     value.verify()
     value.verify_against(
         store, loaded_control=loaded_control, selection=selection, validation=validation,

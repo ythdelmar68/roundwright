@@ -1096,6 +1096,7 @@ EXTERNAL_SELECTION_RECEIPT_SCHEMA = "roundwright-provenance-selection-control-re
 class ExternalSelectionControlExpectation:
     run_id: str
     contract_id: str
+    orchestrator_task: str
     repository: str
     task_id: str
     base_sha: str
@@ -1126,7 +1127,7 @@ class ExternalSelectionControl:
     retention_identity: str
     mode: str
     capture_ready: bool
-    payload: Mapping[str, object]
+    payload: bytes
 
     @property
     def terminal_ready(self) -> bool:
@@ -1162,7 +1163,7 @@ class ExternalSelectionControl:
         leaf = authority.get("live_leaf")
         instructions = authority.get("owner_instructions")
         checks = (
-            roundlet.get("run_id") == expected.run_id, roundlet.get("contract_id") == expected.contract_id,
+            roundlet.get("run_id") == expected.run_id, roundlet.get("contract_id") == expected.contract_id, roundlet.get("orchestrator_task") == expected.orchestrator_task,
             selection.get("repository") == expected.repository, selection.get("worker_task") == expected.task_id,
             selection.get("base_sha") == expected.base_sha, selection.get("candidate_sha") == expected.candidate_sha,
             selection.get("candidate_tree") == expected.candidate_tree, selection.get("active_leaf") == expected.leaf,
@@ -1171,7 +1172,7 @@ class ExternalSelectionControl:
             active.get("agents_blob") == expected.authority_agents_blob, active.get("block_sha256") == expected.authority_block_digest,
             external.get("skill_blob") == expected.skill_blob, external.get("qualification_blob") == expected.qualification_blob,
             type(leaf) is dict and tuple(leaf.get(key) for key in ("issue_database_id", "issue_node_id", "number", "updated_at", "body_sha256")) == expected.live_leaf,
-            type(instructions) is list and tuple(tuple(item.get(key) for key in ("comment_id", "comment_node_id", "body_sha256")) for item in instructions if type(item) is dict) == expected.owner_instructions,
+            type(instructions) is list and all(type(item) is dict for item in instructions) and tuple(tuple(item.get(key) for key in ("comment_id", "comment_node_id", "body_sha256")) for item in instructions) == expected.owner_instructions,
         )
         if not all(checks):
             raise ProvenanceRecordError("external selection control binding is invalid")
@@ -1179,7 +1180,7 @@ class ExternalSelectionControl:
         ready = payload.get("capture_ready")
         if mode not in {"REHEARSAL", "FINAL"} or type(ready) is not bool or receipt.get("control_mode") != mode or receipt.get("capture_ready") is not ready:
             raise ProvenanceRecordError("external selection control mode is invalid")
-        return cls(digest, _v2_digest(receipt), receipt["retention_identity"], mode, ready, payload)
+        return cls(digest, receipt_digest, receipt["retention_identity"], mode, ready, bytes(payload_bytes))
 
 
 @dataclass(frozen=True)

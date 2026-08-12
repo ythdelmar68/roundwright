@@ -1183,6 +1183,39 @@ class ShadowV2Tests(unittest.TestCase):
                 with self.assertRaises(ShadowV2Error):
                     self.lifecycle_case(invalid)
 
+    def test_graph_rejects_parent_order_and_accepted_result_cross_links(self) -> None:
+        graph = self.lifecycle_graph()
+        self_parent = replace(graph, attempts=(replace(graph.attempts[0], parent_attempt_id="worker-1"), *graph.attempts[1:]))
+        forward_parent = replace(graph, attempts=(replace(graph.attempts[0], parent_attempt_id="supervisor-1"), *graph.attempts[1:]))
+        multi_node_cycle = replace(
+            graph,
+            attempts=(
+                replace(graph.attempts[0], parent_attempt_id="supervisor-1"),
+                replace(graph.attempts[1], parent_attempt_id="worker-1"),
+                *graph.attempts[2:],
+            ),
+        )
+        missing_result_round = replace(graph, events=(*graph.events[:4], replace(graph.events[4], review_round_id=None), *graph.events[5:]))
+        event_result_round_mismatch = replace(graph, events=(*graph.events[:4], replace(graph.events[4], review_round_id="round-1"), *graph.events[5:]))
+        attempt_result_round_mismatch = replace(graph, attempts=(*graph.attempts[:3], replace(graph.attempts[3], review_round_id="round-1")))
+        result_round_mismatch = replace(graph, accepted_results=(replace(graph.accepted_results[0], review_round_id="round-1"),))
+        review_result_cross_link = replace(graph, review_rounds=(graph.review_rounds[0], replace(graph.review_rounds[1], accepted_result_id=None)))
+        # These are new immutable graph instances, so their enclosing case is
+        # coherently re-digested before validation rather than reusing a prior case.
+        for name, invalid in (
+            ("self-parent", self_parent),
+            ("forward-parent", forward_parent),
+            ("multi-node-cycle", multi_node_cycle),
+            ("missing-result-round", missing_result_round),
+            ("event-result-round-mismatch", event_result_round_mismatch),
+            ("attempt-result-round-mismatch", attempt_result_round_mismatch),
+            ("result-round-mismatch", result_round_mismatch),
+            ("review-result-cross-link", review_result_cross_link),
+        ):
+            with self.subTest(invalid=name):
+                with self.assertRaises(ShadowV2Error):
+                    self.lifecycle_case(invalid)
+
     def test_graph_core_supports_many_to_many_attempt_commit_cardinality(self) -> None:
         graph = self.lifecycle_graph()
         flexible = replace(self.lifecycle_profile(), minimum_commits=0, maximum_commits=3)

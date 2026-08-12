@@ -2974,8 +2974,14 @@ class ShadowV2EventGraph:
         if any(commit not in {commit_sha for _, commit_sha in edge_pairs} for commit in commits):
             raise ShadowV2Error("candidate commit is orphaned from lifecycle attempts")
         for attempt in self.attempts:
-            if attempt.parent_attempt_id is not None and attempt.parent_attempt_id not in attempts:
-                raise ShadowV2Error("lifecycle attempt parent is unavailable")
+            if attempt.parent_attempt_id is not None:
+                parent = attempts.get(attempt.parent_attempt_id)
+                if parent is None:
+                    raise ShadowV2Error("lifecycle attempt parent is unavailable")
+                # A parent edge is strictly historical.  This rejects self and
+                # forward references and, by induction, every parent cycle.
+                if parent.ordinal >= attempt.ordinal:
+                    raise ShadowV2Error("lifecycle attempt parent must precede child")
             if attempt.review_round_id is not None and attempt.review_round_id not in rounds:
                 raise ShadowV2Error("lifecycle attempt review round is unavailable")
         for provider in self.provider_attempts:
@@ -2987,9 +2993,14 @@ class ShadowV2EventGraph:
             if review.accepted_result_id is not None and review.accepted_result_id not in results:
                 raise ShadowV2Error("accepted review result is unavailable")
         event_ids = {item.event_id for item in self.events}
+        events = {item.event_id: item for item in self.events}
         for result in self.accepted_results:
             if result.review_round_id not in rounds or result.event_id not in event_ids or result.candidate_sha != candidate_sha:
                 raise ShadowV2Error("accepted result reference is invalid")
+            if rounds[result.review_round_id].accepted_result_id != result.result_id:
+                raise ShadowV2Error("accepted result is not bound to its review round")
+            if events[result.event_id].accepted_result_id != result.result_id:
+                raise ShadowV2Error("accepted result is not bound to its event")
         for review in self.review_rounds:
             if review.accepted_result_id is not None:
                 result = results[review.accepted_result_id]
@@ -3008,7 +3019,15 @@ class ShadowV2EventGraph:
                 raise ShadowV2Error("event commit is unavailable")
             if event.accepted_result_id is not None:
                 result = results.get(event.accepted_result_id)
-                if result is None or result.event_id != event.event_id:
+                attempt = attempts[event.lifecycle_attempt_id]
+                if (
+                    result is None
+                    or event.review_round_id is None
+                    or result.event_id != event.event_id
+                    or result.review_round_id != event.review_round_id
+                    or attempt.review_round_id != event.review_round_id
+                    or rounds[event.review_round_id].accepted_result_id != result.result_id
+                ):
                     raise ShadowV2Error("event accepted result is invalid")
         event_provider_ids = tuple(item.provider_attempt_id for item in self.events if item.provider_attempt_id is not None)
         if set(event_provider_ids) != set(providers) or len(event_provider_ids) != len(providers):

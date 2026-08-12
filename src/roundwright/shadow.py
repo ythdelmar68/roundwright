@@ -17,7 +17,7 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Never
+from typing import Callable, Iterable, Never
 
 
 SHADOW_CASE_SCHEMA = "roundwright-shadow-case/v1"

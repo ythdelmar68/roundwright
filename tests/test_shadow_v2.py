@@ -72,12 +72,12 @@ class ShadowV2Tests(unittest.TestCase):
             "schema": "roundwright-provenance-selection-control/v1", "control_mode": "REHEARSAL", "capture_ready": False,
             "roundlet": {"run_id": "run-47", "contract_id": "contract-47", "orchestrator_task": "orchestrator-47"},
             "selection": {"repository": "ythdelmar68/roundwright", "worker_task": "task-47", "base_sha": "a" * 40, "candidate_sha": "b" * 40, "candidate_tree": "c" * 40, "active_leaf": 47, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1"},
-            "authority": {"origin_main": {"commit": "a" * 40, "tree": "1" * 40}, "active_roundlet_block": {"agents_blob": "d" * 40, "block_sha256": digest("2")}, "external_validation_contract": {"skill_blob": "e" * 40, "qualification_blob": "f" * 40}, "live_leaf": {"issue_database_id": 1, "issue_node_id": "node-47", "number": 47, "updated_at": "now", "body_sha256": digest("3")}, "owner_instructions": [{"comment_id": 2, "comment_node_id": "node-2", "body_sha256": digest("4")}]},
+            "authority": {"origin_main": {"commit": "a" * 40, "tree": "1" * 40}, "active_roundlet_block": {"agents_blob": "d" * 40, "block_sha256": digest("2")}, "external_validation_contract": {"skill_blob": "e" * 40, "qualification_blob": "f" * 40}, "live_leaf": {"issue_database_id": 1, "issue_node_id": "node-47", "number": 47, "updated_at": "now", "body_sha256": digest("3")}, "owner_instructions": [{"comment_id": 2, "comment_node_id": "node-2", "body_sha256": digest("4")}, {"comment_id": 3, "comment_node_id": "node-3", "body_sha256": digest("5")}]},
         }
         content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         receipt = {"schema": "roundwright-provenance-selection-control-receipt/v1", "append_only": True, "capture_ready": False, "contract_sha256": digest("1"), "control_mode": "REHEARSAL", "payload_bytes": len(content), "payload_sha256": "sha256:" + hashlib.sha256(content).hexdigest(), "read_back": "VERIFIED", "retention_identity": "roundlet-control-47"}
         receipt_bytes = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
-        expected = ExternalSelectionControlExpectation("run-47", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")),))
+        expected = ExternalSelectionControlExpectation("run-47", "contract-47", "orchestrator-47", "ythdelmar68/roundwright", "task-47", "a" * 40, "b" * 40, "c" * 40, 47, "toolbox", "roundwright-shadow-case/v2", "roundwright-shadow-profile/provenance-decision/v1", "d" * 40, "e" * 40, "f" * 40, "sha256:" + hashlib.sha256(content).hexdigest(), "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(), digest("1"), "1" * 40, digest("2"), (1, "node-47", 47, "now", digest("3")), ((2, "node-2", digest("4")), (3, "node-3", digest("5"))))
         return content, receipt_bytes, expected
 
     def test_external_rehearsal_control_is_bound_but_never_terminal_ready(self) -> None:
@@ -103,6 +103,8 @@ class ShadowV2Tests(unittest.TestCase):
         changed["selection"]["candidate_sha"] = "d" * 40
         together = rebased(changed)
         with self.assertRaises(ProvenanceRecordError):
+            ExternalSelectionControl.load(together[0], together[1], expected)
+        with self.assertRaises(ProvenanceRecordError):
             ExternalSelectionControl.load(*together)
         bad_contract = rebased(payload_value, {"contract_sha256": digest("9")})
         with self.assertRaises(ProvenanceRecordError):
@@ -111,12 +113,16 @@ class ShadowV2Tests(unittest.TestCase):
             lambda value: value["authority"]["origin_main"].update(tree="9" * 40),
             lambda value: value["authority"]["active_roundlet_block"].update(block_sha256=digest("9")),
             lambda value: value["authority"]["live_leaf"].update(issue_database_id=9),
+            lambda value: value["authority"]["live_leaf"].update(number=9),
             lambda value: value["authority"]["live_leaf"].update(issue_node_id="wrong"),
             lambda value: value["authority"]["live_leaf"].update(updated_at="later"),
             lambda value: value["authority"]["live_leaf"].update(body_sha256=digest("9")),
             lambda value: value["authority"].update(owner_instructions=[]),
             lambda value: value["authority"].update(owner_instructions=value["authority"]["owner_instructions"] * 2),
+            lambda value: value["authority"]["owner_instructions"].reverse(),
             lambda value: value["authority"]["owner_instructions"][0].update(comment_id=9),
+            lambda value: value["authority"]["owner_instructions"][0].update(comment_node_id="wrong"),
+            lambda value: value["authority"]["owner_instructions"][0].update(body_sha256=digest("9")),
             lambda value: value["authority"].update(owner_instructions=["invalid"]),
             lambda value: value["roundlet"].update(orchestrator_task="wrong"),
         ):
@@ -125,9 +131,8 @@ class ShadowV2Tests(unittest.TestCase):
             with self.subTest(mutate=mutate):
                 with self.assertRaises(ProvenanceRecordError):
                     ExternalSelectionControl.load(*rebased(value))
-        source = json.loads(payload)
         retained = ExternalSelectionControl.load(payload, receipt, expected)
-        source["selection"]["candidate_sha"] = "d" * 40
+        self.assertIs(type(retained.payload), bytes)
         self.assertEqual(retained.payload, payload)
 
     def record(self, *, candidate: str = "b" * 40, ready_at: int = 101):

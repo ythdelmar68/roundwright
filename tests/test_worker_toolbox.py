@@ -15,7 +15,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerCapabilityContract, WorkerParserDiagnostic, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
@@ -65,7 +65,7 @@ class TemporaryReviewedRecorder:
 
 class FakeHandle:
     id = "turn-43"
-    def __init__(self, events, text=None): self.events, self.text = events, text or '{"status":"complete","action":"planning"}'
+    def __init__(self, events, text=None): self.events, self.text = events, text or '{"status":"complete","action":"planning","blocker":null}'
     def stream(self):
         self.events.append("stream")
         item = SimpleNamespace(type="agentMessage", phase="final_answer", text=self.text)
@@ -132,11 +132,11 @@ class WorkerToolboxTests(unittest.TestCase):
                 return service.record_document(document, store)
             recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=record, verify_recording=service.verify_recording)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value)))
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value)))
         self.assertEqual(self.events[0], "enter")
         self.assertEqual(self.events[2], ("checkpoint-session", "thread-43"))
         self.assertEqual(self.events[4], ("checkpoint-turn", "thread-43", "turn-43"))
-        self.assertIn(("checkpoint-result", "thread-43", "turn-43", "accepted", None), self.events)
+        self.assertIn(("checkpoint-result", "thread-43", "turn-43", "accepted", None, None), self.events)
         self.assertFalse(self.events[1][1]["ephemeral"])
         payload = json.loads(self.events[3][1])
         self.assertEqual((payload["action"], payload["tools"], payload["capability_contract"]), ("planning", [], "no-tools-self-contained/v1"))
@@ -145,11 +145,15 @@ class WorkerToolboxTests(unittest.TestCase):
         schema = self.events[3][2]["output_schema"]
         turn_options = self.events[3][2]
         self.assertEqual((turn_options["approval_mode"], turn_options["cwd"], turn_options["model"], turn_options["sandbox"]), ("deny-all", str(ROOT), "gpt-5.6-terra", "read-only"))
-        complete, blocked = schema["oneOf"]
-        self.assertEqual(complete["properties"]["action"]["enum"], ["planning"])
-        self.assertEqual(complete["required"], ["status", "action"])
-        self.assertEqual(blocked["required"], ["status", "action", "blocker"])
-        self.assertEqual(blocked["properties"]["blocker"]["enum"], ["provider-blocked"])
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["properties"]["action"]["enum"], ["planning"])
+        self.assertEqual(schema["required"], ["status", "action", "blocker"])
+        self.assertEqual(schema["properties"]["blocker"], {"type": ["string", "null"], "enum": [None, "provider-blocked"]})
+        self.assertNotIn("oneOf", schema)
+        self.assertEqual(schema["allOf"], [{"anyOf": [
+            {"properties": {"status": {"enum": ["complete"]}, "blocker": {"type": "null"}}},
+            {"properties": {"status": {"enum": ["blocked"]}, "blocker": {"type": "string", "enum": ["provider-blocked"]}}},
+        ]}])
         self.assertNotIn("const", json.dumps(schema))
         self.assertEqual(service.calls, ["seal", "verify"])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
@@ -162,7 +166,7 @@ class WorkerToolboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=lambda *_: None, verify_recording=lambda *_: None)
             with self.assertRaises(Exception):
-                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d: None)
+                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e: None)
         self.assertEqual(self.events, [])
 
     def test_native_qualification_rejects_unenforceable_abstract_tool_labels(self):
@@ -185,7 +189,7 @@ class WorkerToolboxTests(unittest.TestCase):
         from roundwright.worker_toolbox import _consume_public_result
         events = []
         response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"provider-blocked"}'), WorkerAction.IMPLEMENTATION)
-        self.assertEqual((response.kind, response.structured_output, response.blocker), ("blocked", None, "provider-blocked"))
+        self.assertEqual((response.kind, response.structured_output, response.blocker, response.outcome_source), ("blocked", None, "provider-blocked", WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED))
 
     def test_provider_lifecycle_fields_are_rejected_before_shadow_comparison(self):
         from roundwright.worker_toolbox import _consume_public_result
@@ -194,12 +198,12 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_repair_projection_matches_the_live_contract_constants(self):
         from roundwright.worker_toolbox import _consume_public_result
-        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair"}'), WorkerAction.REPAIR)
+        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","blocker":null}'), WorkerAction.REPAIR)
         self.assertEqual((response.kind, response.structured_output), ("accepted", {"status": "complete", "action": "repair"}))
 
     def test_realistic_provider_shapes_are_locally_validated_and_digestable(self):
         from roundwright.worker_toolbox import _consume_public_result
-        valid = _consume_public_result(FakeHandle([], '{"action":"repair","status":"complete"}'), WorkerAction.REPAIR)
+        valid = _consume_public_result(FakeHandle([], '{"action":"repair","status":"complete","blocker":null}'), WorkerAction.REPAIR)
         self.assertEqual(digest(valid.structured_output), digest({"status": "complete", "action": "repair"}))
         for response in ('{}', '{"status":"complete"}', '{"status":"complete","action":"implementation"}', '{"status":"other","action":"repair"}', '{"status":"complete","action":"repair","extra":"x"}'):
             with self.subTest(response=response):
@@ -207,14 +211,16 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_locked_sdk_item_completed_wire_language_and_diagnostics(self):
         from roundwright.worker_toolbox import _consume_public_result
-        valid = _consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43")), WorkerAction.REPAIR)
+        valid = _consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair","blocker":null}'), sdk_turn("turn-43")), WorkerAction.REPAIR)
         self.assertEqual((valid.kind, valid.structured_output), ("accepted", {"status": "complete", "action": "repair"}))
         cases = (
             ('```json\n{"status":"complete","action":"repair"}\n```', WorkerParserDiagnostic.SYNTAX),
             ('[]', WorkerParserDiagnostic.SHAPE),
-            ('{"status":"complete","action":"repair","blocker":null}', WorkerParserDiagnostic.SHAPE),
-            ('{"status":"complete","action":"implementation"}', WorkerParserDiagnostic.ACTION),
-            ('{"status":1,"action":"repair"}', WorkerParserDiagnostic.STATUS),
+            ('{"status":"complete","action":"repair"}', WorkerParserDiagnostic.SHAPE),
+            ('{"status":"complete","action":"implementation","blocker":null}', WorkerParserDiagnostic.ACTION),
+            ('{"status":1,"action":"repair","blocker":null}', WorkerParserDiagnostic.STATUS),
+            ('{"status":"complete","action":"repair","blocker":"provider-blocked"}', WorkerParserDiagnostic.SHAPE),
+            ('{"status":"blocked","action":"repair","blocker":null}', WorkerParserDiagnostic.BLOCKER),
             ('{"status":"blocked","action":"repair","blocker":""}', WorkerParserDiagnostic.BLOCKER),
             ('{"status":"blocked","action":"repair","blocker":"provider-blocked","extra":true}', WorkerParserDiagnostic.BLOCKER),
         )
@@ -233,14 +239,14 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual((multiple.kind, multiple.diagnostic), ("invalid", WorkerParserDiagnostic.SHAPE))
         self.assertEqual(_consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43", "in_progress")), WorkerAction.REPAIR).kind, "incomplete")
         failed = _consume_public_result(ProtocolHandle(sdk_turn("turn-43", "failed")), WorkerAction.REPAIR)
-        self.assertEqual((failed.kind, failed.blocker), ("blocked", "provider-failed"))
+        self.assertEqual((failed.kind, failed.blocker, failed.outcome_source), ("blocked", "provider-failed", WorkerOutcomeSource.SDK_TURN_FAILED))
 
     def test_parser_uses_only_the_exact_turn_final_agent_message(self):
         from roundwright.worker_toolbox import _consume_public_result
         class Handle:
             id = "turn-43"
             def stream(self):
-                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair"}')
+                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","blocker":null}')
                 wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","deterministic_state":"wrong"}')
                 class Stream(list):
                     def close(self): pass
@@ -278,7 +284,7 @@ class WorkerToolboxTests(unittest.TestCase):
         class Handle:
             id = "turn-43"
             def stream(self):
-                item = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair"}')
+                item = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","blocker":null}')
                 class Stream:
                     def __init__(self): self.values = [SimpleNamespace(method="item/completed", payload=SimpleNamespace(item=item, turn_id="turn-43")), SimpleNamespace(method="turn/completed", payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))]
                     def __iter__(self): return self
@@ -312,9 +318,9 @@ class WorkerToolboxTests(unittest.TestCase):
             service = TemporaryReviewedRecorder()
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value)))
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value)))
         self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
-        self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None), events)
+        self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None), events)
         self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
         self.assertEqual(service.calls, [])
         self.assertEqual(events.count("interrupt"), 1)

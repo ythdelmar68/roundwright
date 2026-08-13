@@ -30,6 +30,7 @@ from .codex_worker import (
     WorkerResultKind,
     WorkerAction,
     WorkerParserDiagnostic,
+    WorkerOutcomeSource,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
@@ -72,17 +73,19 @@ def _result_schema(action: str) -> dict[str, object]:
     validate it locally.  Its constrained-output dialect accepts JSON Schema
     enum values; deterministic parser validation below remains authoritative.
     """
-    return {"oneOf": [
-        {"type": "object", "properties": {
-            "status": {"type": "string", "enum": ["complete"]},
-            "action": {"type": "string", "enum": [action]},
-        }, "required": ["status", "action"], "additionalProperties": False},
-        {"type": "object", "properties": {
-            "status": {"type": "string", "enum": ["blocked"]},
-            "action": {"type": "string", "enum": [action]},
-            "blocker": {"type": "string", "enum": ["provider-blocked"]},
-        }, "required": ["status", "action", "blocker"], "additionalProperties": False},
-    ]}
+    # The locked structured-output path requires an object at the root and
+    # every root property to be required.  Keep the status/blocker relation
+    # inside that object: the provider can express exactly the two parser
+    # branches, while no top-level union crosses the native SDK boundary.
+    return {"type": "object", "properties": {
+        "status": {"type": "string", "enum": ["complete", "blocked"]},
+        "action": {"type": "string", "enum": [action]},
+        "blocker": {"type": ["string", "null"], "enum": [None, "provider-blocked"]},
+    }, "required": ["status", "action", "blocker"], "additionalProperties": False,
+        "allOf": [{"anyOf": [
+            {"properties": {"status": {"enum": ["complete"]}, "blocker": {"type": "null"}}},
+            {"properties": {"status": {"enum": ["blocked"]}, "blocker": {"type": "string", "enum": ["provider-blocked"]}}},
+        ]}]}
 
 
 def _digest(value: object) -> str:
@@ -291,7 +294,7 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
                         return _invalid(WorkerParserDiagnostic.EXACT_TURN)
                     status = getattr(getattr(turn, "status", None), "value", getattr(turn, "status", None))
                     if status == "failed":
-                        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-failed")
+                        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED)
                     if status != "completed":
                         return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
                     completed = True
@@ -330,14 +333,14 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
         if type(parsed.get("status")) is not str or parsed["status"] not in {"complete", "blocked"}:
             return _invalid(WorkerParserDiagnostic.STATUS)
         if parsed["status"] == "complete":
-            if set(parsed) != {"status", "action"}:
+            if set(parsed) != {"status", "action", "blocker"} or parsed["blocker"] is not None:
                 return _invalid(WorkerParserDiagnostic.SHAPE)
             # The provider never manufactures a result digest. Canonical JSON
             # normalization in CodexWorkerAdapter binds this validated content.
             return NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": action.value})
         if set(parsed) != {"status", "action", "blocker"} or parsed["blocker"] != "provider-blocked":
             return _invalid(WorkerParserDiagnostic.BLOCKER)
-        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-blocked")
+        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-blocked", outcome_source=WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED)
     except TimeoutError:
         return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
     except Exception:
@@ -402,7 +405,7 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "capability_contract": "no-tools-self-contained/v1", "provider_instruction": "No provider tools or repository inspection are declared or required; decide only from this normalized public input.", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": []}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
     return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 

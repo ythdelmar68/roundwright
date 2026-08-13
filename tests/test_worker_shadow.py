@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, WorkerAction, WorkerParserDiagnostic, WorkerResultKind, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, WorkerAction, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerResultKind, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
@@ -71,7 +71,7 @@ class WorkerShadowTests(unittest.TestCase):
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
-        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}"))
+        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}"))
 
     def test_profile_declares_arm_before_and_recapture(self):
         profile = worker_adapter_shadow_profile()
@@ -79,7 +79,7 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_pre_dispatch_arming_and_exact_time_flow_through_turn_envelope_seal_and_readback(self):
         result = self.qualify()
-        self.assertEqual(self.events, [("prepare", self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted:", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
+        self.assertEqual(self.events, [("prepare", self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted::", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at, result.comparison.disposition), (101, 101, WorkerShadowDisposition.MATCH))
         self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))
 
@@ -122,12 +122,13 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_nonqualifying_categories_have_distinct_local_projections_and_no_recorder(self):
         cases = (
-            (WorkerResultKind.INVALID, None, "invalid", "fresh-bounded-attempt-recapture"),
-            (WorkerResultKind.INCOMPLETE, None, "incomplete", "fresh-bounded-attempt-recapture"),
-            (WorkerResultKind.AMBIGUOUS, None, "ambiguous", "fresh-bounded-attempt-recapture"),
-            (WorkerResultKind.BLOCKED, "owner-input", "blocked", "owner-input"),
+            (WorkerResultKind.INVALID, None, None, "invalid", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.INCOMPLETE, None, None, "incomplete", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.AMBIGUOUS, None, None, "ambiguous", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.BLOCKED, "provider-blocked", WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED, "blocked", "owner-input"),
+            (WorkerResultKind.BLOCKED, "provider-failed", WorkerOutcomeSource.SDK_TURN_FAILED, "blocked", "owner-input"),
         )
-        for kind, blocker, state, next_action in cases:
+        for kind, blocker, source, state, next_action in cases:
             with self.subTest(kind=kind):
                 self.events.clear()
                 self.backend.response = NativeWorkerResponse(
@@ -135,13 +136,16 @@ class WorkerShadowTests(unittest.TestCase):
                     failure=None if kind is not WorkerResultKind.BLOCKED else CodexFailure.UNKNOWN,
                     blocker=blocker,
                     diagnostic=WorkerParserDiagnostic.SHAPE if kind is WorkerResultKind.INVALID else None,
+                    outcome_source=source,
                 )
                 result = self.qualify()
                 self.assertEqual((result.envelope.deterministic_state, result.envelope.next_action, result.record), (state, next_action, None))
                 self.assertEqual(result.comparison.disposition, WorkerShadowDisposition.MATCH)
                 self.assertTrue(any(type(event) is str and event.startswith(f"result:thread-43:turn-43:{kind.value}:") for event in self.events))
                 if kind is WorkerResultKind.INVALID:
-                    self.assertIn("result:thread-43:turn-43:invalid:shape", self.events)
+                    self.assertIn("result:thread-43:turn-43:invalid:shape:", self.events)
+                if source is not None:
+                    self.assertIn(f"result:thread-43:turn-43:blocked::{source.value}", self.events)
                 self.assertFalse(any(isinstance(event, tuple) and event[0] == "seal" for event in self.events))
 
 

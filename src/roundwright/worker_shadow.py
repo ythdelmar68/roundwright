@@ -211,7 +211,7 @@ def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWork
     accepted = None if result.output is None else _hash(result.output)
     if accepted is not None and accepted != result.output_fingerprint: raise WorkerShadowError("Worker Shadow accepted result is not bound to the adapter output")
     if expected:
-        state, blocker, next_action = binding.deterministic_state, binding.blocker, binding.next_action
+        state, blocker, next_action = _expected_worker_transition(request.action, result, binding)
     else:
         state, blocker, next_action = _observed_worker_transition(request.action, result)
     return WorkerShadowEnvelope(request.context.task_id, result.session_identity, provider_attempt_id, external_turn_identity, binding.base_sha, binding.candidate_sha, binding.profile_identity, request.context.configuration_digest, binding.runtime_fingerprint, request.input_digest, result.kind, accepted, state, blocker, next_action, ready_at)
@@ -254,6 +254,10 @@ def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequ
     comparison = compare_worker_shadow_envelopes(expected, observed)
     if comparison.disposition is not WorkerShadowDisposition.MATCH:
         raise WorkerShadowMismatchError(comparison)
+    if result.kind is not WorkerResultKind.ACCEPTED:
+        # A checked failure projection is diagnostic only. It is never a
+        # qualifying capture and therefore cannot reach the Recorder.
+        return WorkerQualificationResult(result, observed, None, comparison)
     record = record_worker_shadow_envelope(readiness, observed, recorder, case_id=binding.case_id)
     return WorkerQualificationResult(result, observed, record, comparison)
 
@@ -273,8 +277,12 @@ def _observed_worker_transition(action, result: CodexWorkerResult) -> tuple[str,
     """
     if result.kind is WorkerResultKind.BLOCKED:
         return "blocked", result.blocker, "owner-input"
-    if result.kind is not WorkerResultKind.ACCEPTED:
-        return "ambiguous", None, "recapture"
+    if result.kind is WorkerResultKind.INVALID:
+        return "invalid", None, "fresh-bounded-attempt-recapture"
+    if result.kind is WorkerResultKind.INCOMPLETE:
+        return "incomplete", None, "fresh-bounded-attempt-recapture"
+    if result.kind is WorkerResultKind.AMBIGUOUS:
+        return "ambiguous", None, "fresh-bounded-attempt-recapture"
     accepted = {
         "planning": ("planning-complete", None, "supervisor-review"),
         "implementation": ("implementation-complete", None, "supervisor-review"),
@@ -284,6 +292,22 @@ def _observed_worker_transition(action, result: CodexWorkerResult) -> tuple[str,
         return accepted[action.value]
     except (AttributeError, KeyError) as error:
         raise WorkerShadowError("Worker observed lifecycle action is invalid") from error
+
+
+def _expected_worker_transition(action, result: CodexWorkerResult, binding: WorkerQualificationBinding) -> tuple[str, str | None, str]:
+    """Independent deterministic expectation for either success or failure."""
+    if result.kind is WorkerResultKind.ACCEPTED:
+        return binding.deterministic_state, binding.blocker, binding.next_action
+    failure = {
+        WorkerResultKind.BLOCKED: ("blocked", result.blocker, "owner-input"),
+        WorkerResultKind.INVALID: ("invalid", None, "fresh-bounded-attempt-recapture"),
+        WorkerResultKind.INCOMPLETE: ("incomplete", None, "fresh-bounded-attempt-recapture"),
+        WorkerResultKind.AMBIGUOUS: ("ambiguous", None, "fresh-bounded-attempt-recapture"),
+    }
+    try:
+        return failure[result.kind]
+    except KeyError as error:
+        raise WorkerShadowError("Worker expected lifecycle result is invalid") from error
 
 
 def _token(value: object) -> bool: return type(value) is str and bool(_TOKEN.fullmatch(value))

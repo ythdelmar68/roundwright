@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, WorkerAction, WorkerResultKind, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
-from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
 
@@ -63,7 +63,7 @@ class WorkerShadowTests(unittest.TestCase):
         self.events = []
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result")}))
+        self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation"}))
         self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="provider-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Qualify Worker", constraints=("No GitHub",), acceptance_criteria=("Structured result",), resume_session_identity=None), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
@@ -119,6 +119,27 @@ class WorkerShadowTests(unittest.TestCase):
         self.backend.response = NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "provider-string", "next_action": "provider-action"})
         result = self.qualify()
         self.assertEqual((result.envelope.deterministic_state, result.envelope.next_action), ("implementation-complete", "supervisor-review"))
+
+    def test_nonqualifying_categories_have_distinct_local_projections_and_no_recorder(self):
+        cases = (
+            (WorkerResultKind.INVALID, None, "invalid", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.INCOMPLETE, None, "incomplete", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.AMBIGUOUS, None, "ambiguous", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.BLOCKED, "owner-input", "blocked", "owner-input"),
+        )
+        for kind, blocker, state, next_action in cases:
+            with self.subTest(kind=kind):
+                self.events.clear()
+                self.backend.response = NativeWorkerResponse(
+                    kind,
+                    failure=None if kind is not WorkerResultKind.BLOCKED else CodexFailure.UNKNOWN,
+                    blocker=blocker,
+                )
+                result = self.qualify()
+                self.assertEqual((result.envelope.deterministic_state, result.envelope.next_action, result.record), (state, next_action, None))
+                self.assertEqual(result.comparison.disposition, WorkerShadowDisposition.MATCH)
+                self.assertIn(f"result:thread-43:turn-43:{kind.value}", self.events)
+                self.assertFalse(any(isinstance(event, tuple) and event[0] == "seal" for event in self.events))
 
 
 if __name__ == "__main__": unittest.main()

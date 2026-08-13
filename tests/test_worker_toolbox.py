@@ -19,7 +19,7 @@ from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContex
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
-from roundwright.worker_shadow import WorkerQualificationBinding, WorkerShadowMismatchError, require_worker_shadow_capture_readiness
+from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
 
 
@@ -65,7 +65,7 @@ class TemporaryReviewedRecorder:
 
 class FakeHandle:
     id = "turn-43"
-    def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '"}')
+    def __init__(self, events, text=None): self.events, self.text = events, text or '{"status":"complete","action":"implementation"}'
     def stream(self):
         self.events.append("stream")
         item = SimpleNamespace(type="agentMessage", phase="final_answer", text=self.text)
@@ -125,7 +125,7 @@ class WorkerToolboxTests(unittest.TestCase):
         turn_options = self.events[3][2]
         self.assertEqual((turn_options["approval_mode"], turn_options["cwd"], turn_options["model"], turn_options["sandbox"]), ("deny-all", str(ROOT), "gpt-5.6-terra", "read-only"))
         self.assertEqual(schema["properties"]["action"]["enum"], ["implementation"])
-        self.assertEqual(set(schema["properties"]), {"status", "action", "result_digest", "blocker"})
+        self.assertEqual(set(schema["properties"]), {"status", "action", "blocker"})
         self.assertNotIn("const", json.dumps(schema))
         self.assertEqual(service.calls, ["seal", "verify"])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
@@ -148,21 +148,29 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_provider_lifecycle_fields_are_rejected_before_shadow_comparison(self):
         from roundwright.worker_toolbox import _consume_public_result
-        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"complete","next_action":"compare"}'), WorkerAction.REPAIR)
+        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","deterministic_state":"complete","next_action":"compare"}'), WorkerAction.REPAIR)
         self.assertEqual(response.kind, "invalid")
 
     def test_repair_projection_matches_the_live_contract_constants(self):
         from roundwright.worker_toolbox import _consume_public_result
-        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '"}'), WorkerAction.REPAIR)
-        self.assertEqual(response.kind, "accepted")
+        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair"}'), WorkerAction.REPAIR)
+        self.assertEqual((response.kind, response.structured_output), ("accepted", {"status": "complete", "action": "repair"}))
+
+    def test_realistic_provider_shapes_are_locally_validated_and_digestable(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        valid = _consume_public_result(FakeHandle([], '{"action":"repair","status":"complete"}'), WorkerAction.REPAIR)
+        self.assertEqual(digest(valid.structured_output), digest({"status": "complete", "action": "repair"}))
+        for response in ('{}', '{"status":"complete"}', '{"status":"complete","action":"implementation"}', '{"status":"other","action":"repair"}', '{"status":"complete","action":"repair","extra":"x"}'):
+            with self.subTest(response=response):
+                self.assertEqual(_consume_public_result(FakeHandle([], response), WorkerAction.REPAIR).kind, "invalid")
 
     def test_parser_uses_only_the_exact_turn_final_agent_message(self):
         from roundwright.worker_toolbox import _consume_public_result
         class Handle:
             id = "turn-43"
             def stream(self):
-                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '"}')
-                wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "d" * 64 + '","deterministic_state":"wrong"}')
+                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair"}')
+                wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","deterministic_state":"wrong"}')
                 class Stream(list):
                     def close(self): pass
                 return Stream((SimpleNamespace(payload=SimpleNamespace(item=wrong, turn_id="other-turn")), SimpleNamespace(payload=SimpleNamespace(item=final, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))))
@@ -199,7 +207,7 @@ class WorkerToolboxTests(unittest.TestCase):
         class Handle:
             id = "turn-43"
             def stream(self):
-                item = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '"}')
+                item = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair"}')
                 class Stream:
                     def __init__(self): self.values = [SimpleNamespace(payload=SimpleNamespace(item=item, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))]
                     def __iter__(self): return self
@@ -233,10 +241,10 @@ class WorkerToolboxTests(unittest.TestCase):
             service = TemporaryReviewedRecorder()
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-            with self.assertRaises(WorkerShadowMismatchError):
-                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind: events.append(("result", session, turn, kind.value)))
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind: events.append(("result", session, turn, kind.value)))
         self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
         self.assertIn(("result", "thread-43", "turn-43", "ambiguous"), events)
+        self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
         self.assertEqual(service.calls, [])
         self.assertEqual(events.count("interrupt"), 1)
 

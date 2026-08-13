@@ -47,9 +47,6 @@ from .codex_worker import CodexWorkerAdapter
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
-_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-
-
 @dataclass(frozen=True)
 class CompletionDeadline:
     """Explicit bounded completion contract, always inside the host deadline."""
@@ -76,7 +73,7 @@ def _result_schema(action: str) -> dict[str, object]:
     return {"type": "object", "properties": {
         "status": {"type": "string", "enum": ["complete", "blocked"]},
         "action": {"type": "string", "enum": [action]},
-        "result_digest": {"type": "string"}, "blocker": {"type": "string"},
+        "blocker": {"type": "string"},
     }, "required": ["status", "action"], "additionalProperties": False}
 
 
@@ -301,9 +298,11 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
         if type(parsed) is not dict or parsed.get("action") != action.value or parsed.get("status") not in {"complete", "blocked"}:
             return NativeWorkerResponse(WorkerResultKind.INVALID)
         if parsed["status"] == "complete":
-            if set(parsed) != {"status", "action", "result_digest"} or not _DIGEST.fullmatch(parsed["result_digest"]):
+            if set(parsed) != {"status", "action"}:
                 return NativeWorkerResponse(WorkerResultKind.INVALID)
-            return NativeWorkerResponse(WorkerResultKind.ACCEPTED, parsed)
+            # The provider never manufactures a result digest. Canonical JSON
+            # normalization in CodexWorkerAdapter binds this validated content.
+            return NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": action.value})
         if set(parsed) != {"status", "action", "blocker"} or type(parsed["blocker"]) is not str or not _TOKEN.fullmatch(parsed["blocker"]):
             return NativeWorkerResponse(WorkerResultKind.INVALID)
         return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker=parsed["blocker"])

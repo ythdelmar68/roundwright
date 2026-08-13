@@ -228,9 +228,43 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
             raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
+class _HarnessCleanupOwner:
+    """Own the one interrupt/close sequence for a native Worker session."""
+
+    def __init__(self, codex: object) -> None:
+        self._codex = codex
+        self._aborted = False
+        self._closed = False
+
+    def abort(self, handle: object) -> None:
+        """Best-effort, exact-turn interruption; duplicate requests are inert."""
+        if self._aborted:
+            return
+        self._aborted = True
+        try:
+            interrupt = getattr(handle, "interrupt", None)
+            if callable(interrupt):
+                interrupt()
+        except Exception:
+            # Cleanup diagnostics intentionally remain closed and text-free.
+            pass
+
+    def close(self) -> None:
+        """Close the underlying client at most once after any interruption."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            _close(self._codex)
+        except Exception:
+            # A cleanup failure cannot make the turn Recorder-eligible.
+            pass
+
+
 class _HarnessWorkerSession(NativeWorkerSession):
     def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._thread, self._codex, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock, self._started = thread, codex, approval_mode, cwd, model, sandbox, effort_factory, effort, completion, clock, False
+        self._thread, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock, self._started = thread, approval_mode, cwd, model, sandbox, effort_factory, effort, completion, clock, False
+        self._cleanup = _HarnessCleanupOwner(codex)
 
     def identity(self) -> str:
         value = getattr(self._thread, "id", None)
@@ -239,7 +273,7 @@ class _HarnessWorkerSession(NativeWorkerSession):
         return value
 
     def close(self) -> None:
-        _close(self._codex)
+        self._cleanup.close()
 
     def start_turn(self, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> NativeWorkerTurn:
         if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface or request.action is not WorkerAction.PLANNING or tools.capability_contract.value != "no-tools-self-contained/v1":
@@ -250,15 +284,15 @@ class _HarnessWorkerSession(NativeWorkerSession):
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
         try:
             handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
-            return _HarnessWorkerTurn(handle, self._codex, request.action, self._completion, self._clock)
+            return _HarnessWorkerTurn(handle, self._cleanup, request.action, self._completion, self._clock)
         except Exception as error:
-            _close(self._codex)
+            self._cleanup.close()
             raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 class _HarnessWorkerTurn(NativeWorkerTurn):
-    def __init__(self, handle: object, codex: object, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._handle, self._codex, self._action, self._completion, self._clock, self._read = handle, codex, action, completion, clock, False
+    def __init__(self, handle: object, cleanup: _HarnessCleanupOwner, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+        self._handle, self._cleanup, self._action, self._completion, self._clock, self._read = handle, cleanup, action, completion, clock, False
 
     def identity(self) -> str:
         value = getattr(self._handle, "id", None)
@@ -267,19 +301,22 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
         return value
 
     def abort(self) -> None:
-        # The adapter owns the paired session/client close on pre-response
-        # exits; interruption itself must target this exact turn once.
-        interrupt = getattr(self._handle, "interrupt", None)
-        if callable(interrupt): interrupt()
+        self._cleanup.abort(self._handle)
 
     def read_response(self) -> NativeWorkerResponse:
         if self._read:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._read = True
         try:
-            return _consume_public_result(self._handle, self._action, completion=self._completion, clock=self._clock, cancel=lambda: _cancel_turn(self._handle, self._codex))
+            response = _consume_public_result(self._handle, self._action, completion=self._completion, clock=self._clock, cancel=self.abort)
+            if response.kind is WorkerResultKind.AMBIGUOUS:
+                self.abort()
+            return response
+        except Exception:
+            self.abort()
+            raise
         finally:
-            _close(self._codex)
+            self._cleanup.close()
 
 
 def _consume_public_result(handle: object, action: WorkerAction, *, completion: CompletionDeadline | None = None, clock: Callable[[], float] = time.monotonic, cancel: Callable[[], None] | None = None) -> NativeWorkerResponse:
@@ -431,16 +468,6 @@ def _bounded_events(stream: object, *, completion: CompletionDeadline | None, cl
         if kind == "event": yield value
         elif kind == "end": return
         else: raise RuntimeError("native stream failed")
-
-
-def _cancel_turn(handle: object, codex: object) -> None:
-    """Best effort: interrupt the exact turn, then close its stream/client."""
-    try:
-        interrupt = getattr(handle, "interrupt", None)
-        if callable(interrupt): interrupt()
-    except Exception:
-        pass
-    _close(codex)
 
 
 def _close(value: object) -> None:

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
-from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
@@ -367,6 +367,85 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
         self.assertEqual(service.calls, [])
         self.assertEqual(events.count("interrupt"), 1)
+        self.assertEqual(events.count("client-close"), 1)
+        self.assertLess(events.index("interrupt"), events.index("client-close"))
+
+    def test_concrete_read_failures_abort_then_close_once_without_evidence(self):
+        for name, failure in (("typed", CodexAdapterError(CodexFailure.UNKNOWN)), ("generic", RuntimeError("closed"))):
+            with self.subTest(name=name):
+                events, calls = [], []
+
+                class Handle:
+                    id = "turn-43"
+                    def stream(self):
+                        calls.append("stream")
+                        raise failure
+                    def interrupt(self): events.append("interrupt")
+
+                class Thread:
+                    id = "thread-43"
+                    def turn(self, *_args, **_kwargs):
+                        calls.append("turn")
+                        return Handle()
+
+                class Codex:
+                    def __enter__(self): return self
+                    def __exit__(self, *_args): events.append("client-close")
+                    def thread_start(self, **_kwargs): return Thread()
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    service = TemporaryReviewedRecorder()
+                    recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
+                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+
+                self.assertEqual(calls, ["turn", "stream"])
+                self.assertEqual(events[:4], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt", "client-close"])
+                self.assertEqual(events.count("interrupt"), 1)
+                self.assertEqual(events.count("client-close"), 1)
+                self.assertLess(events.index("interrupt"), events.index("client-close"))
+                self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None, None), events)
+                self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
+                self.assertEqual(service.calls, [])
+
+    def test_concrete_success_closes_once_without_interrupt(self):
+        events = []
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        session = backend.open_session(self.profile, resume_session_identity=None)
+        turn = session.start_turn(self.request, BoundedWorkerToolSurface(()))
+        self.assertEqual(turn.read_response().kind, "accepted")
+        session.close()
+        self.assertEqual(events.count("exit"), 1)
+        self.assertNotIn("interrupt", events)
+
+    def test_concrete_explicit_cancellation_is_idempotent_and_ordered(self):
+        events = []
+
+        class Handle:
+            id = "turn-43"
+            def stream(self): raise AssertionError("cancellation must not consume a response")
+            def interrupt(self): events.append("interrupt")
+
+        class Thread:
+            id = "thread-43"
+            def turn(self, *_args, **_kwargs):
+                events.append("provider-turn")
+                return Handle()
+
+        class Codex:
+            def __enter__(self): return self
+            def __exit__(self, *_args): events.append("client-close")
+            def thread_start(self, **_kwargs): return Thread()
+
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        session = backend.open_session(self.profile, resume_session_identity=None)
+        turn = session.start_turn(self.request, BoundedWorkerToolSurface(()))
+        self.assertEqual((session.identity(), turn.identity()), ("thread-43", "turn-43"))
+        turn.abort()
+        session.close()
+        turn.abort()
+        session.close()
+        self.assertEqual(events, ["provider-turn", "interrupt", "client-close"])
 
     def test_completion_deadline_requires_operational_host_headroom(self):
         self.assertEqual(CompletionDeadline(9000, 10000).receipt()["headroom_ms"], 1000)

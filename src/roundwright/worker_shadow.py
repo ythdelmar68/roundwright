@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Callable, Mapping, Protocol
 
-from .codex_worker import CodexWorkerAdapter, CodexWorkerRequest, CodexWorkerResult, WorkerResultKind, expected_lifecycle
+from .codex_worker import CodexWorkerAdapter, CodexWorkerRequest, CodexWorkerResult, WorkerParserDiagnostic, WorkerResultKind, expected_lifecycle
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 
 WORKER_ADAPTER_PROFILE = "roundwright-shadow-profile/worker-adapter/v1"
@@ -232,7 +232,7 @@ def record_worker_shadow_envelope(readiness: WorkerShadowCaptureReadiness, envel
     return WorkerShadowRecord(readiness.readiness_digest, envelope.envelope_digest, sealed)
 
 
-def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind], None]) -> WorkerQualificationResult:
+def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None], None]) -> WorkerQualificationResult:
     """One armed, bounded turn; never retries or starts a second Worker."""
     if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity) or (request.context.task_id, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.task_id, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest): raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
     if (adapter.profile_identity, adapter.runtime_fingerprint) != (binding.profile_identity, binding.runtime_fingerprint): raise WorkerShadowError("Worker qualification runtime identity has drifted")
@@ -246,7 +246,7 @@ def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequ
     result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
     if result.turn_identity is None: return WorkerQualificationResult(result, None, None, None)
     try:
-        checkpoint_result(result.session_identity, result.turn_identity, result.kind)  # type: ignore[arg-type]
+        checkpoint_result(result.session_identity, result.turn_identity, result.kind, result.diagnostic)  # type: ignore[arg-type]
     except Exception as error:
         raise WorkerShadowError("Worker response-stage checkpoint is invalid") from error
     observed = export_worker_shadow_envelope(request, result, provider_attempt_id=request.attempt_id, external_turn_identity=result.turn_identity, binding=binding, ready_at=readiness.ready_at)

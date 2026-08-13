@@ -15,7 +15,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerParserDiagnostic, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
@@ -72,7 +72,7 @@ class FakeHandle:
         turn = SimpleNamespace(id=self.id, status="completed")
         class Stream(list):
             def close(inner): self.events.append("stream-close")
-        return Stream((SimpleNamespace(payload=SimpleNamespace(item=item, turn_id=self.id)), SimpleNamespace(payload=SimpleNamespace(turn=turn))))
+        return Stream((SimpleNamespace(method="item/completed", payload=SimpleNamespace(item=item, turn_id=self.id)), SimpleNamespace(method="turn/completed", payload=SimpleNamespace(turn=turn))))
 
 
 class FakeThread:
@@ -88,6 +88,26 @@ class FakeCodex:
     def __exit__(self, *_): self.events.append("exit")
     def thread_start(self, **kwargs): self.events.append(("start", kwargs)); return FakeThread(self.events, self.text)
     def thread_resume(self, identity, **kwargs): self.events.append(("resume", identity, kwargs)); return FakeThread(self.events, self.text)
+
+
+def sdk_item(turn_id, text, *, phase="final_answer"):
+    """Mirror 0.144.4 ``item/completed`` / ``AgentMessageThreadItem`` fields."""
+    item = SimpleNamespace(root=SimpleNamespace(type="agentMessage", phase=SimpleNamespace(value=phase), text=text))
+    return SimpleNamespace(method="item/completed", payload=SimpleNamespace(item=item, turn_id=turn_id))
+
+
+def sdk_turn(turn_id, status="completed"):
+    """Mirror 0.144.4 ``turn/completed`` / ``Turn.status`` fields."""
+    return SimpleNamespace(method="turn/completed", payload=SimpleNamespace(turn=SimpleNamespace(id=turn_id, status=SimpleNamespace(value=status))))
+
+
+class ProtocolHandle:
+    id = "turn-43"
+    def __init__(self, *events): self._events = events
+    def stream(self):
+        class Stream(list):
+            def close(self): pass
+        return Stream(self._events)
 
 
 class WorkerToolboxTests(unittest.TestCase):
@@ -112,11 +132,11 @@ class WorkerToolboxTests(unittest.TestCase):
                 return service.record_document(document, store)
             recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=record, verify_recording=service.verify_recording)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind: self.events.append(("checkpoint-result", session, turn, kind.value)))
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value)))
         self.assertEqual(self.events[0], "enter")
         self.assertEqual(self.events[2], ("checkpoint-session", "thread-43"))
         self.assertEqual(self.events[4], ("checkpoint-turn", "thread-43", "turn-43"))
-        self.assertIn(("checkpoint-result", "thread-43", "turn-43", "accepted"), self.events)
+        self.assertIn(("checkpoint-result", "thread-43", "turn-43", "accepted", None), self.events)
         self.assertFalse(self.events[1][1]["ephemeral"])
         payload = json.loads(self.events[3][1])
         self.assertEqual((payload["action"], payload["objective"], payload["constraints"], payload["acceptance_criteria"], payload["tools"]), ("implementation", "qualify", ["read-only"], ["structured"], ["workspace-read"]))
@@ -124,11 +144,15 @@ class WorkerToolboxTests(unittest.TestCase):
         schema = self.events[3][2]["output_schema"]
         turn_options = self.events[3][2]
         self.assertEqual((turn_options["approval_mode"], turn_options["cwd"], turn_options["model"], turn_options["sandbox"]), ("deny-all", str(ROOT), "gpt-5.6-terra", "read-only"))
-        self.assertEqual(schema["properties"]["action"]["enum"], ["implementation"])
-        self.assertEqual(set(schema["properties"]), {"status", "action", "blocker"})
+        complete, blocked = schema["oneOf"]
+        self.assertEqual(complete["properties"]["action"]["enum"], ["implementation"])
+        self.assertEqual(complete["required"], ["status", "action"])
+        self.assertEqual(blocked["required"], ["status", "action", "blocker"])
+        self.assertEqual(blocked["properties"]["blocker"]["enum"], ["provider-blocked"])
         self.assertNotIn("const", json.dumps(schema))
         self.assertEqual(service.calls, ["seal", "verify"])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
+        self.assertEqual((result.result.kind, result.result.output_fingerprint), ("accepted", digest({"status": "complete", "action": "implementation"})))
         self.assertNotIn("qualify", json.dumps(result.record.receipt.__dict__))
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
@@ -137,14 +161,14 @@ class WorkerToolboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=lambda *_: None, verify_recording=lambda *_: None)
             with self.assertRaises(Exception):
-                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c: None)
+                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d: None)
         self.assertEqual(self.events, [])
 
     def test_blocked_provider_output_cannot_become_accepted_evidence(self):
         from roundwright.worker_toolbox import _consume_public_result
         events = []
-        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"owner-input"}'), WorkerAction.IMPLEMENTATION)
-        self.assertEqual((response.kind, response.structured_output, response.blocker), ("blocked", None, "owner-input"))
+        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"provider-blocked"}'), WorkerAction.IMPLEMENTATION)
+        self.assertEqual((response.kind, response.structured_output, response.blocker), ("blocked", None, "provider-blocked"))
 
     def test_provider_lifecycle_fields_are_rejected_before_shadow_comparison(self):
         from roundwright.worker_toolbox import _consume_public_result
@@ -164,6 +188,36 @@ class WorkerToolboxTests(unittest.TestCase):
             with self.subTest(response=response):
                 self.assertEqual(_consume_public_result(FakeHandle([], response), WorkerAction.REPAIR).kind, "invalid")
 
+    def test_locked_sdk_item_completed_wire_language_and_diagnostics(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        valid = _consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43")), WorkerAction.REPAIR)
+        self.assertEqual((valid.kind, valid.structured_output), ("accepted", {"status": "complete", "action": "repair"}))
+        cases = (
+            ('```json\n{"status":"complete","action":"repair"}\n```', WorkerParserDiagnostic.SYNTAX),
+            ('[]', WorkerParserDiagnostic.SHAPE),
+            ('{"status":"complete","action":"repair","blocker":null}', WorkerParserDiagnostic.SHAPE),
+            ('{"status":"complete","action":"implementation"}', WorkerParserDiagnostic.ACTION),
+            ('{"status":1,"action":"repair"}', WorkerParserDiagnostic.STATUS),
+            ('{"status":"blocked","action":"repair","blocker":""}', WorkerParserDiagnostic.BLOCKER),
+            ('{"status":"blocked","action":"repair","blocker":"provider-blocked","extra":true}', WorkerParserDiagnostic.BLOCKER),
+        )
+        for text, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                response = _consume_public_result(ProtocolHandle(sdk_item("turn-43", text), sdk_turn("turn-43")), WorkerAction.REPAIR)
+                self.assertEqual((response.kind, response.diagnostic), ("invalid", diagnostic))
+
+    def test_locked_sdk_parser_rejects_wrong_turn_nonfinal_multiple_and_unfinished_events(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        wrong_turn = _consume_public_result(ProtocolHandle(sdk_item("other-turn", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43")), WorkerAction.REPAIR)
+        self.assertEqual((wrong_turn.kind, wrong_turn.diagnostic), ("invalid", WorkerParserDiagnostic.EXACT_TURN))
+        non_final = _consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}', phase="commentary"), sdk_turn("turn-43")), WorkerAction.REPAIR)
+        self.assertEqual((non_final.kind, non_final.diagnostic), ("invalid", WorkerParserDiagnostic.NON_FINAL))
+        multiple = _consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43")), WorkerAction.REPAIR)
+        self.assertEqual((multiple.kind, multiple.diagnostic), ("invalid", WorkerParserDiagnostic.SHAPE))
+        self.assertEqual(_consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43", "in_progress")), WorkerAction.REPAIR).kind, "incomplete")
+        failed = _consume_public_result(ProtocolHandle(sdk_turn("turn-43", "failed")), WorkerAction.REPAIR)
+        self.assertEqual((failed.kind, failed.blocker), ("blocked", "provider-failed"))
+
     def test_parser_uses_only_the_exact_turn_final_agent_message(self):
         from roundwright.worker_toolbox import _consume_public_result
         class Handle:
@@ -173,9 +227,9 @@ class WorkerToolboxTests(unittest.TestCase):
                 wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","deterministic_state":"wrong"}')
                 class Stream(list):
                     def close(self): pass
-                return Stream((SimpleNamespace(payload=SimpleNamespace(item=wrong, turn_id="other-turn")), SimpleNamespace(payload=SimpleNamespace(item=final, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))))
+                return Stream((SimpleNamespace(method="item/completed", payload=SimpleNamespace(item=wrong, turn_id="other-turn")), SimpleNamespace(method="item/completed", payload=SimpleNamespace(item=final, turn_id="turn-43")), SimpleNamespace(method="turn/completed", payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))))
         response = _consume_public_result(Handle(), WorkerAction.REPAIR)
-        self.assertEqual(response.kind, "accepted")
+        self.assertEqual((response.kind, response.diagnostic), ("invalid", WorkerParserDiagnostic.EXACT_TURN))
 
     def test_resume_rebinds_full_runtime_on_a_new_client(self):
         events = []
@@ -209,7 +263,7 @@ class WorkerToolboxTests(unittest.TestCase):
             def stream(self):
                 item = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair"}')
                 class Stream:
-                    def __init__(self): self.values = [SimpleNamespace(payload=SimpleNamespace(item=item, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))]
+                    def __init__(self): self.values = [SimpleNamespace(method="item/completed", payload=SimpleNamespace(item=item, turn_id="turn-43")), SimpleNamespace(method="turn/completed", payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))]
                     def __iter__(self): return self
                     def __next__(self):
                         time.sleep(0.005)
@@ -241,9 +295,9 @@ class WorkerToolboxTests(unittest.TestCase):
             service = TemporaryReviewedRecorder()
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind: events.append(("result", session, turn, kind.value)))
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value)))
         self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
-        self.assertIn(("result", "thread-43", "turn-43", "ambiguous"), events)
+        self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None), events)
         self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
         self.assertEqual(service.calls, [])
         self.assertEqual(events.count("interrupt"), 1)

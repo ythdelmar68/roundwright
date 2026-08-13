@@ -29,6 +29,7 @@ from .codex_worker import (
     NativeWorkerTurn,
     WorkerResultKind,
     WorkerAction,
+    WorkerParserDiagnostic,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
@@ -70,11 +71,17 @@ def _result_schema(action: str) -> dict[str, object]:
     validate it locally.  Its constrained-output dialect accepts JSON Schema
     enum values; deterministic parser validation below remains authoritative.
     """
-    return {"type": "object", "properties": {
-        "status": {"type": "string", "enum": ["complete", "blocked"]},
-        "action": {"type": "string", "enum": [action]},
-        "blocker": {"type": "string"},
-    }, "required": ["status", "action"], "additionalProperties": False}
+    return {"oneOf": [
+        {"type": "object", "properties": {
+            "status": {"type": "string", "enum": ["complete"]},
+            "action": {"type": "string", "enum": [action]},
+        }, "required": ["status", "action"], "additionalProperties": False},
+        {"type": "object", "properties": {
+            "status": {"type": "string", "enum": ["blocked"]},
+            "action": {"type": "string", "enum": [action]},
+            "blocker": {"type": "string", "enum": ["provider-blocked"]},
+        }, "required": ["status", "action", "blocker"], "additionalProperties": False},
+    ]}
 
 
 def _digest(value: object) -> str:
@@ -272,44 +279,72 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
         stream = handle.stream()
         response: str | None = None
         completed = False
+        saw_non_final = False
         try:
             for event in _bounded_events(stream, completion=completion, clock=clock, cancel=cancel):
+                method = getattr(event, "method", None)
                 payload = getattr(event, "payload", event)
                 turn = getattr(payload, "turn", None)
-                if turn is not None and getattr(turn, "id", None) == getattr(handle, "id", None):
+                if method == "turn/completed":
+                    if turn is None or getattr(turn, "id", None) != getattr(handle, "id", None):
+                        return _invalid(WorkerParserDiagnostic.EXACT_TURN)
                     status = getattr(getattr(turn, "status", None), "value", getattr(turn, "status", None))
                     if status == "failed":
-                        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN)
-                    completed = status == "completed"
-                if getattr(payload, "turn_id", None) != getattr(handle, "id", None):
+                        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-failed")
+                    if status != "completed":
+                        return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
+                    completed = True
                     continue
+                if method != "item/completed":
+                    continue
+                if getattr(payload, "turn_id", None) != getattr(handle, "id", None):
+                    return _invalid(WorkerParserDiagnostic.EXACT_TURN)
                 item = getattr(payload, "item", None)
                 item = getattr(item, "root", item)
                 text = getattr(item, "text", None)
                 phase = getattr(getattr(item, "phase", None), "value", getattr(item, "phase", None))
-                if getattr(item, "type", None) == "agentMessage" and phase == "final_answer" and type(text) is str:
-                    response = text
+                if getattr(item, "type", None) != "agentMessage":
+                    continue
+                if phase != "final_answer":
+                    saw_non_final = True
+                    continue
+                if type(text) is not str or response is not None:
+                    return _invalid(WorkerParserDiagnostic.SHAPE)
+                response = text
         finally:
             close = getattr(stream, "close", None)
             if callable(close): close()
-        if not completed or response is None:
+        if not completed:
             return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
-        parsed = json.loads(response)
-        if type(parsed) is not dict or parsed.get("action") != action.value or parsed.get("status") not in {"complete", "blocked"}:
-            return NativeWorkerResponse(WorkerResultKind.INVALID)
+        if response is None:
+            return _invalid(WorkerParserDiagnostic.NON_FINAL if saw_non_final else WorkerParserDiagnostic.SHAPE)
+        try:
+            parsed = json.loads(response)
+        except (TypeError, ValueError):
+            return _invalid(WorkerParserDiagnostic.SYNTAX)
+        if type(parsed) is not dict:
+            return _invalid(WorkerParserDiagnostic.SHAPE)
+        if type(parsed.get("action")) is not str or parsed["action"] != action.value:
+            return _invalid(WorkerParserDiagnostic.ACTION)
+        if type(parsed.get("status")) is not str or parsed["status"] not in {"complete", "blocked"}:
+            return _invalid(WorkerParserDiagnostic.STATUS)
         if parsed["status"] == "complete":
             if set(parsed) != {"status", "action"}:
-                return NativeWorkerResponse(WorkerResultKind.INVALID)
+                return _invalid(WorkerParserDiagnostic.SHAPE)
             # The provider never manufactures a result digest. Canonical JSON
             # normalization in CodexWorkerAdapter binds this validated content.
             return NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": action.value})
-        if set(parsed) != {"status", "action", "blocker"} or type(parsed["blocker"]) is not str or not _TOKEN.fullmatch(parsed["blocker"]):
-            return NativeWorkerResponse(WorkerResultKind.INVALID)
-        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker=parsed["blocker"])
+        if set(parsed) != {"status", "action", "blocker"} or parsed["blocker"] != "provider-blocked":
+            return _invalid(WorkerParserDiagnostic.BLOCKER)
+        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-blocked")
     except TimeoutError:
         return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
     except Exception:
-        return NativeWorkerResponse(WorkerResultKind.INVALID)
+        return _invalid(WorkerParserDiagnostic.SHAPE)
+
+
+def _invalid(diagnostic: WorkerParserDiagnostic) -> NativeWorkerResponse:
+    return NativeWorkerResponse(WorkerResultKind.INVALID, diagnostic=diagnostic)
 
 
 def _bounded_events(stream: object, *, completion: CompletionDeadline | None, clock: Callable[[], float], cancel: Callable[[], None] | None):
@@ -364,7 +399,7 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools]}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
     return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 

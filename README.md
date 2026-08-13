@@ -48,9 +48,11 @@ typed non-success outcomes for the provider-neutral lifecycle to recover.
 `roundwright-shadow-profile/worker-adapter/v1` evidence boundary. It arms a
 candidate-bound v2 capture before the first selected live Worker attempt, then
 exports only task/thread/attempt, runtime/configuration, deterministic state,
-blocker, next-action, and accepted-result digests. The profile requires an
-exact Recorder binding and independent append-only store read-back; a missing
-or stale history must be recaptured as a fresh bounded attempt.
+blocker, next-action, and accepted-result digests. The operational path uses
+the reviewed Harness Recorder and an exact external append-only store identity
+outside product Git, seals and independently verifies its receipt, and never
+claims a recording during pre-dispatch arming. A missing or stale history must
+be recaptured as a fresh bounded attempt.
 
 ### Opt-in live provider-health fixture
 

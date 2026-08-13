@@ -1,8 +1,8 @@
-"""Hermetic contracts for the Worker-adapter Shadow capture boundary."""
-
+"""Hermetic integration contracts for the operational Worker Shadow boundary."""
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import unittest
 from dataclasses import replace
@@ -11,110 +11,98 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import CodexWorkerContext, CodexWorkerRequest, CodexWorkerResult, WorkerAction, WorkerResultKind
-from roundwright.shadow import AppendOnlyEvidenceStore, RecorderBinding
-from roundwright.worker_shadow import (
-    WORKER_ADAPTER_PROFILE,
-    WorkerShadowDisposition,
-    WorkerShadowError,
-    compare_worker_shadow_envelopes,
-    export_worker_shadow_envelope,
-    record_worker_shadow_envelope,
-    require_worker_shadow_capture_readiness,
-    worker_adapter_shadow_profile,
-)
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, WorkerAction, WorkerResultKind, WorkerTool
+from roundwright.configuration import ProviderProfile, ReasoningEffort
+from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.shadow import RecorderBinding
+from roundwright.worker_shadow import ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
 
 
-def digest(value: str) -> str:
-    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+def digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class Turn:
+    def __init__(self, events): self.events = events
+    def identity(self): return "turn-43"
+    def read_response(self): self.events.append("read"); return NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete"})
+
+
+class Session:
+    def __init__(self, events): self.events = events
+    def identity(self): return "thread-43"
+    def start_turn(self, _request, _tools): self.events.append("turn-start"); return Turn(self.events)
+
+
+class Backend:
+    def __init__(self, events): self.events, self.calls = events, 0
+    def open_session(self, _profile, *, resume_session_identity): self.calls += 1; self.events.append(f"open:{resume_session_identity}"); return Session(self.events)
+
+
+class Recorder:
+    def __init__(self, events, *, fail=False): self.events, self.fail, self.receipt = events, fail, None
+    def seal(self, document, *, store_identity):
+        self.events.append(("seal", document["ready_at"], store_identity))
+        if self.fail: raise RuntimeError("unavailable")
+        evidence = digest(document)
+        self.receipt = ExternalRecorderReceipt(WORKER_ADAPTER_PROFILE, document["case_id"], document["candidate_sha"], document["ready_at"], evidence, digest("manifest"), digest("bundle"), digest({"store": store_identity}), digest("receipt"))
+        return self.receipt
+    def verify(self, bundle_digest, *, store_identity):
+        self.events.append(("verify", bundle_digest, store_identity))
+        if self.receipt is None or self.receipt.bundle_digest != bundle_digest: raise RuntimeError("missing")
+        return self.receipt
 
 
 class WorkerShadowTests(unittest.TestCase):
-    candidate = "b" * 40
+    base, candidate = "a" * 40, "b" * 40
+    def setUp(self):
+        self.events = []
+        profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
+        self.backend = Backend(self.events)
+        self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
+        context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
+        self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, digest("request"), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
+        self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"), store_identity=digest("external-store"))
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, "qualification-complete", None, "compare-shadow")
 
-    def request(self) -> CodexWorkerRequest:
-        context = CodexWorkerContext(
-            "task-43", *(digest(value) for value in (
-                "source", "repository", "worktree", "branch", "base", "candidate", "policy", "configuration",
-            )),
-        )
-        return CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, digest("request"), context, "Implement issue 43", ("No GitHub",), ("Structured output",))
+    def qualify(self, readiness=None, binding=None, recorder=None):
+        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"))
 
-    def result(self) -> CodexWorkerResult:
-        output = {"status": "complete"}
-        # The adapter's canonical result fingerprint is exactly this JSON hash.
-        output_digest = "sha256:" + hashlib.sha256(b'{"status":"complete"}').hexdigest()
-        return CodexWorkerResult(WorkerResultKind.ACCEPTED, "thread-43", "turn-43", output, output_digest, None)
-
-    def envelope(self):
-        return export_worker_shadow_envelope(
-            self.request(), self.result(), provider_attempt_id="provider-43", external_turn_identity="turn-43",
-            base_sha="a" * 40, candidate_sha=self.candidate, profile_identity=digest("profile"),
-            runtime_fingerprint=digest("runtime"), deterministic_state="implementing", blocker=None,
-            next_action="record-candidate", ready_at=101,
-        )
-
-    def readiness(self, store: AppendOnlyEvidenceStore, *, candidate: str | None = None, ready_at: int = 101):
-        return require_worker_shadow_capture_readiness(
-            candidate_sha=self.candidate if candidate is None else candidate, ready_at=ready_at,
-            native_channel_producer_identity=digest("native-channel"), exporter_identity=digest("exporter"),
-            comparator_identity=digest("comparator"),
-            recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
-            store=store,
-        )
-
-    def test_profile_declares_arm_before_and_recapture_contract(self) -> None:
+    def test_profile_declares_arm_before_and_recapture(self):
         profile = worker_adapter_shadow_profile()
-        self.assertEqual(profile.profile_id, WORKER_ADAPTER_PROFILE)
-        self.assertEqual(profile.arm_before, "before-first-selected-live-worker-provider-attempt")
-        self.assertEqual(profile.missing_history_recapture, "fresh-bounded-attempt-recapture")
+        self.assertEqual((profile.profile_id, profile.arm_before, profile.missing_history_recapture), (WORKER_ADAPTER_PROFILE, "before-first-selected-live-worker-provider-attempt", "fresh-bounded-attempt-recapture"))
 
-    def test_exact_envelope_exports_no_provider_prose_and_comparison_is_deterministic(self) -> None:
-        expected = self.envelope()
-        replay = self.envelope()
-        comparison = compare_worker_shadow_envelopes(expected, replay)
-        self.assertEqual((comparison.disposition, comparison.differing_fields), (WorkerShadowDisposition.MATCH, ()))
-        changed = replace(replay, deterministic_state="diff-review", envelope_digest="")
-        mismatch = compare_worker_shadow_envelopes(expected, changed)
-        self.assertEqual((mismatch.disposition, mismatch.differing_fields), (WorkerShadowDisposition.MISMATCH, ("deterministic_state",)))
-        self.assertNotIn("complete", expected.canonical_bytes().decode("ascii"))
+    def test_pre_dispatch_arming_and_exact_time_flow_through_turn_envelope_seal_and_readback(self):
+        result = self.qualify()
+        self.assertEqual(self.events, ["open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
+        self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at, result.comparison.disposition), (101, 101, WorkerShadowDisposition.MATCH))
+        self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))
 
-    def test_arming_rejects_candidate_and_capture_time_drift_before_recording(self) -> None:
-        store = AppendOnlyEvidenceStore("worker-shadow-store")
-        envelope = self.envelope()
-        for readiness in (self.readiness(store, candidate="c" * 40), self.readiness(store, ready_at=102)):
-            with self.subTest(readiness=readiness):
-                with self.assertRaisesRegex(WorkerShadowError, "unarmed or stale"):
-                    record_worker_shadow_envelope(readiness, envelope, store)
+    def test_readiness_or_identity_drift_blocks_before_provider_call(self):
+        for invalid in (replace(self.readiness, candidate_sha="c" * 40, readiness_digest=""), replace(self.readiness, exporter_identity=digest("other"), readiness_digest=""), replace(self.binding, profile_identity=digest("other")), replace(self.binding, configuration_digest=digest("other"))):
+            with self.subTest(invalid=invalid):
+                self.events.clear(); self.backend.calls = 0
+                if isinstance(invalid, type(self.readiness)):
+                    with self.assertRaises(WorkerShadowError): self.qualify(readiness=invalid)
+                else:
+                    with self.assertRaises(WorkerShadowError): self.qualify(binding=invalid)
+                self.assertEqual(self.backend.calls, 0)
+                self.assertEqual(self.events, [])
 
-    def test_append_only_store_is_read_back_and_same_thread_replay_stays_one_identity(self) -> None:
-        store = AppendOnlyEvidenceStore("worker-shadow-store")
-        readiness = self.readiness(store)
-        envelope = self.envelope()
-        replay = self.envelope()
-        self.assertEqual((envelope.worker_thread_identity, envelope.provider_attempt_id, envelope.envelope_digest), (replay.worker_thread_identity, replay.provider_attempt_id, replay.envelope_digest))
-        record = record_worker_shadow_envelope(readiness, envelope, store)
-        self.assertEqual((record.candidate_sha, record.ready_at, record.envelope_digest), (self.candidate, 101, envelope.envelope_digest))
-        with self.assertRaisesRegex(WorkerShadowError, "read-back"):
-            record_worker_shadow_envelope(readiness, replay, store)
+    def test_external_recorder_failure_is_not_misreported_as_recorded(self):
+        recorder = Recorder(self.events, fail=True)
+        with self.assertRaisesRegex(WorkerShadowError, "seal or read-back"):
+            self.qualify(recorder=recorder)
+        self.assertEqual(self.events[-1][0], "seal")
+        self.assertFalse(any(isinstance(event, tuple) and event[0] == "verify" for event in self.events))
 
-    def test_turn_and_accepted_result_identity_drift_fails_closed(self) -> None:
-        with self.assertRaisesRegex(WorkerShadowError, "turn identity"):
-            export_worker_shadow_envelope(
-                self.request(), self.result(), provider_attempt_id="provider-43", external_turn_identity="other-turn",
-                base_sha="a" * 40, candidate_sha=self.candidate, profile_identity=digest("profile"), runtime_fingerprint=digest("runtime"),
-                deterministic_state="implementing", blocker=None, next_action="record-candidate", ready_at=101,
-            )
-        with self.assertRaises(WorkerShadowError):
-            replace(self.envelope(), accepted_result_digest=None)
-        forged = CodexWorkerResult(WorkerResultKind.ACCEPTED, "thread-43", "turn-43", {"status": "complete"}, digest("forged"), None)
-        with self.assertRaisesRegex(WorkerShadowError, "not bound"):
-            export_worker_shadow_envelope(
-                self.request(), forged, provider_attempt_id="provider-43", external_turn_identity="turn-43",
-                base_sha="a" * 40, candidate_sha=self.candidate, profile_identity=digest("profile"), runtime_fingerprint=digest("runtime"),
-                deterministic_state="implementing", blocker=None, next_action="record-candidate", ready_at=101,
-            )
+    def test_same_thread_result_has_one_turn_and_deterministic_comparison(self):
+        first = self.qualify()
+        self.assertEqual((first.envelope.worker_thread_identity, first.envelope.provider_attempt_id, first.envelope.external_turn_identity), ("thread-43", "provider-43", "turn-43"))
+        changed = replace(first.envelope, deterministic_state="diff-review", envelope_digest="")
+        comparison = compare_worker_shadow_envelopes(first.envelope, changed)
+        self.assertEqual((comparison.disposition, comparison.differing_fields), (WorkerShadowDisposition.MISMATCH, ("deterministic_state",)))
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == "__main__": unittest.main()

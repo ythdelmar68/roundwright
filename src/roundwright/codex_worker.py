@@ -248,6 +248,14 @@ class CodexWorkerAdapter:
 
         return (self._audit.audit.sdk_version, self._audit.audit.runtime_version, self._audit.profile_identity)
 
+    @property
+    def profile_identity(self) -> str:
+        return self._audit.profile_identity
+
+    @property
+    def runtime_fingerprint(self) -> str:
+        return self._audit.runtime_fingerprint
+
     def dispatch(
         self,
         request: CodexWorkerRequest,

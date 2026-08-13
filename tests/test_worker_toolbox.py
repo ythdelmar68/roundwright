@@ -62,7 +62,7 @@ class TemporaryReviewedRecorder:
 
 class FakeHandle:
     id = "turn-43"
-    def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"implementation-complete","next_action":"supervisor-review"}')
+    def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '"}')
     def stream(self):
         self.events.append("stream")
         item = SimpleNamespace(type="agentMessage", phase="final_answer", text=self.text)
@@ -118,9 +118,10 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual((payload["action"], payload["objective"], payload["constraints"], payload["acceptance_criteria"], payload["tools"]), ("implementation", "qualify", ["read-only"], ["structured"], ["workspace-read"]))
         self.assertEqual(payload["context"]["task_id"], "task-43")
         schema = self.events[3][2]["output_schema"]
-        self.assertEqual(schema["properties"]["deterministic_state"]["enum"], ["implementation-complete", "blocked"])
+        turn_options = self.events[3][2]
+        self.assertEqual((turn_options["approval_mode"], turn_options["cwd"], turn_options["model"], turn_options["sandbox"]), ("deny-all", str(ROOT), "gpt-5.6-terra", "read-only"))
         self.assertEqual(schema["properties"]["action"]["enum"], ["implementation"])
-        self.assertEqual(schema["properties"]["next_action"]["enum"], ["supervisor-review", "owner-input"])
+        self.assertEqual(set(schema["properties"]), {"status", "action", "result_digest", "blocker"})
         self.assertNotIn("const", json.dumps(schema))
         self.assertEqual(service.calls, ["seal", "verify"])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
@@ -138,17 +139,17 @@ class WorkerToolboxTests(unittest.TestCase):
     def test_blocked_provider_output_cannot_become_accepted_evidence(self):
         from roundwright.worker_toolbox import _consume_public_result
         events = []
-        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"owner-input","deterministic_state":"blocked","next_action":"owner-input"}'), WorkerAction.IMPLEMENTATION)
+        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"owner-input"}'), WorkerAction.IMPLEMENTATION)
         self.assertEqual((response.kind, response.structured_output, response.blocker), ("blocked", None, "owner-input"))
 
-    def test_mismatched_complete_projection_is_invalid_before_shadow_comparison(self):
+    def test_provider_lifecycle_fields_are_rejected_before_shadow_comparison(self):
         from roundwright.worker_toolbox import _consume_public_result
         response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"complete","next_action":"compare"}'), WorkerAction.REPAIR)
         self.assertEqual(response.kind, "invalid")
 
     def test_repair_projection_matches_the_live_contract_constants(self):
         from roundwright.worker_toolbox import _consume_public_result
-        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"qualification-complete","next_action":"supervisor-review"}'), WorkerAction.REPAIR)
+        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '"}'), WorkerAction.REPAIR)
         self.assertEqual(response.kind, "accepted")
 
     def test_parser_uses_only_the_exact_turn_final_agent_message(self):
@@ -156,8 +157,8 @@ class WorkerToolboxTests(unittest.TestCase):
         class Handle:
             id = "turn-43"
             def stream(self):
-                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"qualification-complete","next_action":"supervisor-review"}')
-                wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "d" * 64 + '","deterministic_state":"wrong","next_action":"wrong"}')
+                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '"}')
+                wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "d" * 64 + '","deterministic_state":"wrong"}')
                 class Stream(list):
                     def close(self): pass
                 return Stream((SimpleNamespace(payload=SimpleNamespace(item=wrong, turn_id="other-turn")), SimpleNamespace(payload=SimpleNamespace(item=final, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))))

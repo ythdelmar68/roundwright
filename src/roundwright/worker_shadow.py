@@ -212,12 +212,8 @@ def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWork
     if accepted is not None and accepted != result.output_fingerprint: raise WorkerShadowError("Worker Shadow accepted result is not bound to the adapter output")
     if expected:
         state, blocker, next_action = binding.deterministic_state, binding.blocker, binding.next_action
-    elif result.kind is WorkerResultKind.ACCEPTED:
-        state, blocker, next_action = result.output["deterministic_state"], None, result.output["next_action"]  # type: ignore[index]
-    elif result.kind is WorkerResultKind.BLOCKED:
-        state, blocker, next_action = "blocked", result.blocker, "owner-input"
     else:
-        state, blocker, next_action = "ambiguous", None, "recapture"
+        state, blocker, next_action = _observed_worker_transition(request.action, result)
     return WorkerShadowEnvelope(request.context.task_id, result.session_identity, provider_attempt_id, external_turn_identity, binding.base_sha, binding.candidate_sha, binding.profile_identity, request.context.configuration_digest, binding.runtime_fingerprint, request.input_digest, result.kind, accepted, state, blocker, next_action, ready_at)
 
 
@@ -262,6 +258,28 @@ def compare_worker_shadow_envelopes(expected: WorkerShadowEnvelope, observed: Wo
     if type(expected) is not WorkerShadowEnvelope or type(observed) is not WorkerShadowEnvelope: raise WorkerShadowError("Worker Shadow comparison input is invalid")
     fields = tuple(key for key in expected.payload() if expected.payload()[key] != observed.payload()[key])
     return WorkerShadowComparison(WorkerShadowDisposition.MATCH if not fields else WorkerShadowDisposition.MISMATCH, expected.envelope_digest, observed.envelope_digest, fields)
+
+
+def _observed_worker_transition(action, result: CodexWorkerResult) -> tuple[str, str | None, str]:
+    """State-machine projection from a checkpointed typed result, never provider prose.
+
+    This intentionally does not reuse ``expected_lifecycle``: it models the
+    observed local state transition independently, so a mapping defect remains
+    visible to the comparison gate before any Recorder call.
+    """
+    if result.kind is WorkerResultKind.BLOCKED:
+        return "blocked", result.blocker, "owner-input"
+    if result.kind is not WorkerResultKind.ACCEPTED:
+        return "ambiguous", None, "recapture"
+    accepted = {
+        "planning": ("planning-complete", None, "supervisor-review"),
+        "implementation": ("implementation-complete", None, "supervisor-review"),
+        "repair": ("qualification-complete", None, "supervisor-review"),
+    }
+    try:
+        return accepted[action.value]
+    except (AttributeError, KeyError) as error:
+        raise WorkerShadowError("Worker observed lifecycle action is invalid") from error
 
 
 def _token(value: object) -> bool: return type(value) is str and bool(_TOKEN.fullmatch(value))

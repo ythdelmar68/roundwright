@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 
@@ -62,7 +63,7 @@ class WorkerShadowTests(unittest.TestCase):
         self.events = []
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "implementation-complete", "next_action": "supervisor-review"}))
+        self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result")}))
         self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="provider-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Qualify Worker", constraints=("No GitHub",), acceptance_criteria=("Structured result",), resume_session_identity=None), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
@@ -108,11 +109,16 @@ class WorkerShadowTests(unittest.TestCase):
         self.assertEqual((comparison.disposition, comparison.differing_fields), (WorkerShadowDisposition.MISMATCH, ("deterministic_state",)))
 
     def test_observed_lifecycle_mismatch_is_rejected_before_seal(self):
-        self.backend.response = NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "different-state", "next_action": "different-next"})
-        with self.assertRaises(WorkerShadowMismatchError) as captured:
-            self.qualify()
+        with patch("roundwright.worker_shadow._observed_worker_transition", return_value=("different-state", None, "different-next")):
+            with self.assertRaises(WorkerShadowMismatchError) as captured:
+                self.qualify()
         self.assertEqual(captured.exception.comparison.diagnostic(), {"disposition": "mismatch", "differing_fields": ("deterministic_state", "next_action")})
         self.assertFalse(any(isinstance(event, tuple) and event[0] == "seal" for event in self.events))
+
+    def test_provider_output_cannot_control_the_lifecycle_projection(self):
+        self.backend.response = NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "provider-string", "next_action": "provider-action"})
+        result = self.qualify()
+        self.assertEqual((result.envelope.deterministic_state, result.envelope.next_action), ("implementation-complete", "supervisor-review"))
 
 
 if __name__ == "__main__": unittest.main()

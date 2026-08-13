@@ -26,7 +26,6 @@ from .codex_worker import (
     NativeWorkerTurn,
     WorkerResultKind,
     WorkerAction,
-    expected_lifecycle,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
@@ -55,14 +54,11 @@ def _result_schema(action: str) -> dict[str, object]:
     validate it locally.  Its constrained-output dialect accepts JSON Schema
     enum values; deterministic parser validation below remains authoritative.
     """
-    lifecycle_state, _, lifecycle_next = expected_lifecycle(WorkerAction(action))
     return {"type": "object", "properties": {
         "status": {"type": "string", "enum": ["complete", "blocked"]},
         "action": {"type": "string", "enum": [action]},
         "result_digest": {"type": "string"}, "blocker": {"type": "string"},
-        "deterministic_state": {"type": "string", "enum": [lifecycle_state, "blocked"]},
-        "next_action": {"type": "string", "enum": [lifecycle_next, "owner-input"]},
-    }, "required": ["status", "action", "deterministic_state", "next_action"], "additionalProperties": False}
+    }, "required": ["status", "action"], "additionalProperties": False}
 
 
 def _digest(value: object) -> str:
@@ -283,14 +279,13 @@ def _consume_public_result(handle: object, action: WorkerAction) -> NativeWorker
         if not completed or response is None:
             return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
         parsed = json.loads(response)
-        lifecycle_state, _, lifecycle_next = expected_lifecycle(action)
         if type(parsed) is not dict or parsed.get("action") != action.value or parsed.get("status") not in {"complete", "blocked"}:
             return NativeWorkerResponse(WorkerResultKind.INVALID)
         if parsed["status"] == "complete":
-            if set(parsed) != {"status", "action", "result_digest", "deterministic_state", "next_action"} or parsed["deterministic_state"] != lifecycle_state or parsed["next_action"] != lifecycle_next or not _DIGEST.fullmatch(parsed["result_digest"]):
+            if set(parsed) != {"status", "action", "result_digest"} or not _DIGEST.fullmatch(parsed["result_digest"]):
                 return NativeWorkerResponse(WorkerResultKind.INVALID)
             return NativeWorkerResponse(WorkerResultKind.ACCEPTED, parsed)
-        if set(parsed) != {"status", "action", "blocker", "deterministic_state", "next_action"} or parsed["deterministic_state"] != "blocked" or not all(type(parsed[key]) is str and _TOKEN.fullmatch(parsed[key]) for key in ("action", "blocker", "deterministic_state", "next_action")):
+        if set(parsed) != {"status", "action", "blocker"} or type(parsed["blocker"]) is not str or not _TOKEN.fullmatch(parsed["blocker"]):
             return NativeWorkerResponse(WorkerResultKind.INVALID)
         return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker=parsed["blocker"])
     except Exception:
@@ -308,8 +303,7 @@ def _close(value: object) -> None:
 
 def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> dict[str, object]:
     """Action-specific, immutable provider payload; never retained verbatim."""
-    state, blocker, next_action = expected_lifecycle(request.action)
-    return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools], "expected_lifecycle": {"deterministic_state": state, "blocker": blocker, "next_action": next_action}}
+    return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools]}
 
 
 def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> WorkerQualificationResult:

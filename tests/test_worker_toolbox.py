@@ -65,11 +65,11 @@ class FakeHandle:
     def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"implementation-complete","next_action":"supervisor-review"}')
     def stream(self):
         self.events.append("stream")
-        item = SimpleNamespace(text=self.text)
+        item = SimpleNamespace(type="agentMessage", phase="final_answer", text=self.text)
         turn = SimpleNamespace(id=self.id, status="completed")
         class Stream(list):
             def close(inner): self.events.append("stream-close")
-        return Stream((SimpleNamespace(payload=SimpleNamespace(item=item)), SimpleNamespace(payload=SimpleNamespace(turn=turn))))
+        return Stream((SimpleNamespace(payload=SimpleNamespace(item=item, turn_id=self.id)), SimpleNamespace(payload=SimpleNamespace(turn=turn))))
 
 
 class FakeThread:
@@ -117,6 +117,11 @@ class WorkerToolboxTests(unittest.TestCase):
         payload = json.loads(self.events[3][1])
         self.assertEqual((payload["action"], payload["objective"], payload["constraints"], payload["acceptance_criteria"], payload["tools"]), ("implementation", "qualify", ["read-only"], ["structured"], ["workspace-read"]))
         self.assertEqual(payload["context"]["task_id"], "task-43")
+        schema = self.events[3][2]["output_schema"]
+        self.assertEqual(schema["properties"]["deterministic_state"]["enum"], ["implementation-complete", "blocked"])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["implementation"])
+        self.assertEqual(schema["properties"]["next_action"]["enum"], ["supervisor-review", "owner-input"])
+        self.assertNotIn("const", json.dumps(schema))
         self.assertEqual(service.calls, ["seal", "verify"])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
         self.assertNotIn("qualify", json.dumps(result.record.receipt.__dict__))
@@ -144,6 +149,19 @@ class WorkerToolboxTests(unittest.TestCase):
     def test_repair_projection_matches_the_live_contract_constants(self):
         from roundwright.worker_toolbox import _consume_public_result
         response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"qualification-complete","next_action":"supervisor-review"}'), WorkerAction.REPAIR)
+        self.assertEqual(response.kind, "accepted")
+
+    def test_parser_uses_only_the_exact_turn_final_agent_message(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        class Handle:
+            id = "turn-43"
+            def stream(self):
+                final = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"qualification-complete","next_action":"supervisor-review"}')
+                wrong = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "d" * 64 + '","deterministic_state":"wrong","next_action":"wrong"}')
+                class Stream(list):
+                    def close(self): pass
+                return Stream((SimpleNamespace(payload=SimpleNamespace(item=wrong, turn_id="other-turn")), SimpleNamespace(payload=SimpleNamespace(item=final, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))))
+        response = _consume_public_result(Handle(), WorkerAction.REPAIR)
         self.assertEqual(response.kind, "accepted")
 
     def test_resume_rebinds_full_runtime_on_a_new_client(self):

@@ -108,10 +108,10 @@ class WorkerShadowTests(unittest.TestCase):
         self.assertEqual((comparison.disposition, comparison.differing_fields), (WorkerShadowDisposition.MISMATCH, ("deterministic_state",)))
 
     def test_observed_lifecycle_mismatch_is_rejected_before_seal(self):
-        self.backend.response = NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "different-state", "next_action": "supervisor-review"})
+        self.backend.response = NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "different-state", "next_action": "different-next"})
         with self.assertRaises(WorkerShadowMismatchError) as captured:
             self.qualify()
-        self.assertEqual(captured.exception.comparison.diagnostic(), {"disposition": "mismatch", "differing_fields": ("deterministic_state",)})
+        self.assertEqual(captured.exception.comparison.diagnostic(), {"disposition": "mismatch", "differing_fields": ("deterministic_state", "next_action")})
         self.assertFalse(any(isinstance(event, tuple) and event[0] == "seal" for event in self.events))
 
 

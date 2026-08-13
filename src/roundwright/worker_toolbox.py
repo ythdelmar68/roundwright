@@ -49,12 +49,20 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _result_schema(action: str) -> dict[str, object]:
-    """Closed response schema for one provider-neutral lifecycle action."""
+    """0.144.4 wire-safe JSON Schema: enum, not unsupported ``const``.
+
+    The locked client passes this object through as ``Any`` and does not
+    validate it locally.  Its constrained-output dialect accepts JSON Schema
+    enum values; deterministic parser validation below remains authoritative.
+    """
     lifecycle_state, _, lifecycle_next = expected_lifecycle(WorkerAction(action))
-    return {"oneOf": [
-        {"type": "object", "properties": {"status": {"const": "complete"}, "action": {"const": action}, "result_digest": {"type": "string"}, "deterministic_state": {"const": lifecycle_state}, "next_action": {"const": lifecycle_next}}, "required": ["status", "action", "result_digest", "deterministic_state", "next_action"], "additionalProperties": False},
-        {"type": "object", "properties": {"status": {"const": "blocked"}, "action": {"const": action}, "blocker": {"type": "string"}, "deterministic_state": {"const": "blocked"}, "next_action": {"type": "string"}}, "required": ["status", "action", "blocker", "deterministic_state", "next_action"], "additionalProperties": False},
-    ]}
+    return {"type": "object", "properties": {
+        "status": {"type": "string", "enum": ["complete", "blocked"]},
+        "action": {"type": "string", "enum": [action]},
+        "result_digest": {"type": "string"}, "blocker": {"type": "string"},
+        "deterministic_state": {"type": "string", "enum": [lifecycle_state, "blocked"]},
+        "next_action": {"type": "string", "enum": [lifecycle_next, "owner-input"]},
+    }, "required": ["status", "action", "deterministic_state", "next_action"], "additionalProperties": False}
 
 
 def _digest(value: object) -> str:
@@ -192,7 +200,7 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
                 thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions="One bounded lifecycle Worker turn only. Use only the declared tools and return only the requested schema.", model=profile.model, sandbox=self._sandbox)
-            return _HarnessWorkerSession(thread, codex, self._sandbox, self._effort_factory, profile.reasoning_effort.value)
+            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value)
         except CodexAdapterError:
             _close(codex)
             raise
@@ -202,8 +210,8 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
 
 
 class _HarnessWorkerSession(NativeWorkerSession):
-    def __init__(self, thread: object, codex: object, sandbox: object, effort_factory: Callable[[str], object], effort: str) -> None:
-        self._thread, self._codex, self._sandbox, self._effort_factory, self._effort, self._started = thread, codex, sandbox, effort_factory, effort, False
+    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str) -> None:
+        self._thread, self._codex, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._started = thread, codex, approval_mode, cwd, model, sandbox, effort_factory, effort, False
 
     def identity(self) -> str:
         value = getattr(self._thread, "id", None)
@@ -219,7 +227,7 @@ class _HarnessWorkerSession(NativeWorkerSession):
         # lifecycle projection below can cross the SDK boundary.
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
         try:
-            handle = self._thread.turn(prompt, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
+            handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
             return _HarnessWorkerTurn(handle, self._codex, request.action)
         except Exception as error:
             _close(self._codex)
@@ -261,10 +269,13 @@ def _consume_public_result(handle: object, action: WorkerAction) -> NativeWorker
                     if status == "failed":
                         return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN)
                     completed = status == "completed"
+                if getattr(payload, "turn_id", None) != getattr(handle, "id", None):
+                    continue
                 item = getattr(payload, "item", None)
                 item = getattr(item, "root", item)
                 text = getattr(item, "text", None)
-                if type(text) is str:
+                phase = getattr(getattr(item, "phase", None), "value", getattr(item, "phase", None))
+                if getattr(item, "type", None) == "agentMessage" and phase == "final_answer" and type(text) is str:
                     response = text
         finally:
             close = getattr(stream, "close", None)

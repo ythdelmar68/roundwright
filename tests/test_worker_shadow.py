@@ -71,7 +71,7 @@ class WorkerShadowTests(unittest.TestCase):
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
-        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"))
+        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind: self.events.append(f"result:{session}:{turn}:{kind.value}"))
 
     def test_profile_declares_arm_before_and_recapture(self):
         profile = worker_adapter_shadow_profile()
@@ -79,7 +79,7 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_pre_dispatch_arming_and_exact_time_flow_through_turn_envelope_seal_and_readback(self):
         result = self.qualify()
-        self.assertEqual(self.events, [("prepare", self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
+        self.assertEqual(self.events, [("prepare", self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at, result.comparison.disposition), (101, 101, WorkerShadowDisposition.MATCH))
         self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))
 

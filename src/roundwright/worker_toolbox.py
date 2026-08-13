@@ -13,6 +13,9 @@ import importlib
 import json
 import os
 import re
+import queue
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -45,6 +48,22 @@ from .codex_worker import CodexWorkerAdapter
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class CompletionDeadline:
+    """Explicit bounded completion contract, always inside the host deadline."""
+
+    application_timeout_ms: int
+    host_timeout_ms: int
+    headroom_ms: int = 500
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not int for value in (self.application_timeout_ms, self.host_timeout_ms, self.headroom_ms)) or self.application_timeout_ms <= 0 or self.headroom_ms < 250 or self.host_timeout_ms < self.application_timeout_ms + self.headroom_ms:
+            raise WorkerShadowError("Worker completion deadline lacks host-timeout headroom")
+
+    def receipt(self) -> dict[str, object]:
+        return {"schema": "roundwright-worker-completion-timeout/v1", "application_timeout_ms": self.application_timeout_ms, "host_timeout_ms": self.host_timeout_ms, "headroom_ms": self.host_timeout_ms - self.application_timeout_ms}
 
 
 def _result_schema(action: str) -> dict[str, object]:
@@ -169,7 +188,7 @@ class HarnessExternalWorkerRecorder(ExternalWorkerRecorder):
 class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
     """Executable deny-all/read-only bridge over the reviewed native SDK API."""
 
-    def __init__(self, *, cwd: Path, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None) -> None:
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise WorkerShadowError("native Worker working directory is invalid")
         if codex_factory is None:
@@ -179,9 +198,9 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 codex_factory, approval_mode, sandbox, effort_factory = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             except Exception as error:
                 raise WorkerShadowError("reviewed native Worker SDK is unavailable") from error
-        if not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory):
+        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock):
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
-        self._cwd, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory = cwd, codex_factory, approval_mode, sandbox, effort_factory
+        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
 
     def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None) -> NativeWorkerSession:
         if type(profile) is not ProviderProfile:
@@ -196,7 +215,7 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
                 thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions="One bounded lifecycle Worker turn only. Use only the declared tools and return only the requested schema.", model=profile.model, sandbox=self._sandbox)
-            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value)
+            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value, self._completion, self._clock)
         except CodexAdapterError:
             _close(codex)
             raise
@@ -206,8 +225,8 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
 
 
 class _HarnessWorkerSession(NativeWorkerSession):
-    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str) -> None:
-        self._thread, self._codex, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._started = thread, codex, approval_mode, cwd, model, sandbox, effort_factory, effort, False
+    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+        self._thread, self._codex, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock, self._started = thread, codex, approval_mode, cwd, model, sandbox, effort_factory, effort, completion, clock, False
 
     def identity(self) -> str:
         value = getattr(self._thread, "id", None)
@@ -224,15 +243,15 @@ class _HarnessWorkerSession(NativeWorkerSession):
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
         try:
             handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
-            return _HarnessWorkerTurn(handle, self._codex, request.action)
+            return _HarnessWorkerTurn(handle, self._codex, request.action, self._completion, self._clock)
         except Exception as error:
             _close(self._codex)
             raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 class _HarnessWorkerTurn(NativeWorkerTurn):
-    def __init__(self, handle: object, codex: object, action: WorkerAction) -> None:
-        self._handle, self._codex, self._action, self._read = handle, codex, action, False
+    def __init__(self, handle: object, codex: object, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+        self._handle, self._codex, self._action, self._completion, self._clock, self._read = handle, codex, action, completion, clock, False
 
     def identity(self) -> str:
         value = getattr(self._handle, "id", None)
@@ -245,19 +264,19 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._read = True
         try:
-            return _consume_public_result(self._handle, self._action)
+            return _consume_public_result(self._handle, self._action, completion=self._completion, clock=self._clock, cancel=lambda: _cancel_turn(self._handle, self._codex))
         finally:
             _close(self._codex)
 
 
-def _consume_public_result(handle: object, action: WorkerAction) -> NativeWorkerResponse:
+def _consume_public_result(handle: object, action: WorkerAction, *, completion: CompletionDeadline | None = None, clock: Callable[[], float] = time.monotonic, cancel: Callable[[], None] | None = None) -> NativeWorkerResponse:
     """Consume the SDK stream without propagating SDK text or payloads."""
     try:
         stream = handle.stream()
         response: str | None = None
         completed = False
         try:
-            for event in stream:
+            for event in _bounded_events(stream, completion=completion, clock=clock, cancel=cancel):
                 payload = getattr(event, "payload", event)
                 turn = getattr(payload, "turn", None)
                 if turn is not None and getattr(turn, "id", None) == getattr(handle, "id", None):
@@ -288,8 +307,48 @@ def _consume_public_result(handle: object, action: WorkerAction) -> NativeWorker
         if set(parsed) != {"status", "action", "blocker"} or type(parsed["blocker"]) is not str or not _TOKEN.fullmatch(parsed["blocker"]):
             return NativeWorkerResponse(WorkerResultKind.INVALID)
         return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker=parsed["blocker"])
+    except TimeoutError:
+        return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
     except Exception:
         return NativeWorkerResponse(WorkerResultKind.INVALID)
+
+
+def _bounded_events(stream: object, *, completion: CompletionDeadline | None, clock: Callable[[], float], cancel: Callable[[], None] | None):
+    """Do not let ``next_turn_notification`` outlive the application deadline."""
+    if completion is None:
+        yield from stream  # type: ignore[misc]
+        return
+    events: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+    iterator = iter(stream)
+    def next_event() -> None:
+        try: events.put(("event", next(iterator)))
+        except StopIteration: events.put(("end", None))
+        except BaseException: events.put(("error", None))
+    deadline = clock() + completion.application_timeout_ms / 1000
+    while True:
+        worker = threading.Thread(target=next_event, daemon=True)
+        worker.start()
+        remaining = deadline - clock()
+        if remaining <= 0:
+            if cancel is not None: cancel()
+            raise TimeoutError
+        try: kind, value = events.get(timeout=remaining)
+        except queue.Empty:
+            if cancel is not None: cancel()
+            raise TimeoutError
+        if kind == "event": yield value
+        elif kind == "end": return
+        else: raise RuntimeError("native stream failed")
+
+
+def _cancel_turn(handle: object, codex: object) -> None:
+    """Best effort: interrupt the exact turn, then close its stream/client."""
+    try:
+        interrupt = getattr(handle, "interrupt", None)
+        if callable(interrupt): interrupt()
+    except Exception:
+        pass
+    _close(codex)
 
 
 def _close(value: object) -> None:
@@ -306,9 +365,9 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools]}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
-    return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+    return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 
 
 def main() -> int:
@@ -322,7 +381,12 @@ def main() -> int:
     if os.environ.get("ROUNDWRIGHT_RUN_LIVE_WORKER_ADAPTER") != "1":
         print('{"schema":"roundwright-live-worker-adapter/v1","status":"disabled"}')
         return 2
-    print('{"schema":"roundwright-live-worker-adapter/v1","status":"blocked","reason":"typed-orchestrator-binding-required"}')
+    try:
+        completion = CompletionDeadline(int(os.environ["ROUNDWRIGHT_APPLICATION_TIMEOUT_MS"]), int(os.environ["ROUNDWRIGHT_HOST_TIMEOUT_MS"]))
+    except (KeyError, ValueError, WorkerShadowError):
+        print('{"schema":"roundwright-live-worker-adapter/v1","status":"blocked","reason":"explicit-host-timeout-with-headroom-required"}')
+        return 2
+    print(json.dumps({"schema": "roundwright-live-worker-adapter/v1", "status": "blocked", "reason": "typed-orchestrator-binding-required", "completion": completion.receipt()}, sort_keys=True, separators=(",", ":")))
     return 2
 
 

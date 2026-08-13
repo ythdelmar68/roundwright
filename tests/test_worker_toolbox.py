@@ -5,7 +5,10 @@ import hashlib
 import json
 import sys
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,8 +19,8 @@ from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContex
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
-from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
-from roundwright.worker_toolbox import HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
+from roundwright.worker_shadow import WorkerQualificationBinding, WorkerShadowMismatchError, require_worker_shadow_capture_readiness
+from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
 
 
 def digest(value: object) -> str:
@@ -108,11 +111,12 @@ class WorkerToolboxTests(unittest.TestCase):
                 service.last_document = document
                 return service.record_document(document, store)
             recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=record, verify_recording=service.verify_recording)
-            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)))
+            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind: self.events.append(("checkpoint-result", session, turn, kind.value)))
         self.assertEqual(self.events[0], "enter")
         self.assertEqual(self.events[2], ("checkpoint-session", "thread-43"))
         self.assertEqual(self.events[4], ("checkpoint-turn", "thread-43", "turn-43"))
+        self.assertIn(("checkpoint-result", "thread-43", "turn-43", "accepted"), self.events)
         self.assertFalse(self.events[1][1]["ephemeral"])
         payload = json.loads(self.events[3][1])
         self.assertEqual((payload["action"], payload["objective"], payload["constraints"], payload["acceptance_criteria"], payload["tools"]), ("implementation", "qualify", ["read-only"], ["structured"], ["workspace-read"]))
@@ -129,11 +133,11 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
         self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         with tempfile.TemporaryDirectory() as temporary:
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=lambda *_: None, verify_recording=lambda *_: None)
             with self.assertRaises(Exception):
-                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None)
+                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c: None)
         self.assertEqual(self.events, [])
 
     def test_blocked_provider_output_cannot_become_accepted_evidence(self):
@@ -167,11 +171,93 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_resume_rebinds_full_runtime_on_a_new_client(self):
         events = []
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity="thread-43")
         self.assertEqual(session.identity(), "thread-43")
         kind, identity, kwargs = events[1]
         self.assertEqual((kind, identity, kwargs["approval_mode"], kwargs["sandbox"], kwargs["model"]), ("resume", "thread-43", "deny-all", "read-only", "gpt-5.6-terra"))
+
+    def test_deadline_returns_ambiguous_and_closes_the_exact_turn(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        events, released = [], __import__("threading").Event()
+        class Stream:
+            def __iter__(self): return self
+            def __next__(self): released.wait(); raise StopIteration
+            def close(self): events.append("stream-close"); released.set()
+        class Handle:
+            id = "turn-43"
+            def stream(self): return Stream()
+            def interrupt(self): events.append("interrupt")
+        started = time.monotonic()
+        response = _consume_public_result(Handle(), WorkerAction.REPAIR, completion=CompletionDeadline(25, 600), cancel=lambda: events.append("cancel"))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(response.kind, "ambiguous")
+        self.assertEqual(events, ["cancel", "stream-close"])
+
+    def test_delayed_exact_turn_completion_before_deadline_is_accepted(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        class Handle:
+            id = "turn-43"
+            def stream(self):
+                item = SimpleNamespace(type="agentMessage", phase="final_answer", text='{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '"}')
+                class Stream:
+                    def __init__(self): self.values = [SimpleNamespace(payload=SimpleNamespace(item=item, turn_id="turn-43")), SimpleNamespace(payload=SimpleNamespace(turn=SimpleNamespace(id="turn-43", status="completed")))]
+                    def __iter__(self): return self
+                    def __next__(self):
+                        time.sleep(0.005)
+                        if not self.values: raise StopIteration
+                        return self.values.pop(0)
+                    def close(self): pass
+                return Stream()
+        self.assertEqual(_consume_public_result(Handle(), WorkerAction.REPAIR, completion=CompletionDeadline(100, 600)).kind, "accepted")
+
+    def test_timeout_is_result_checkpointed_before_recorder_and_never_retried(self):
+        events, released = [], __import__("threading").Event()
+        class Handle:
+            id = "turn-43"
+            def stream(self):
+                class Stream:
+                    def __iter__(self): return self
+                    def __next__(self): released.wait(); raise StopIteration
+                    def close(self): released.set()
+                return Stream()
+            def interrupt(self): events.append("interrupt")
+        class Thread:
+            id = "thread-43"
+            def turn(self, *_args, **_kwargs): return Handle()
+        class Codex:
+            def __enter__(self): return self
+            def __exit__(self, *_args): events.append("client-close")
+            def thread_start(self, **_kwargs): return Thread()
+        with tempfile.TemporaryDirectory() as temporary:
+            service = TemporaryReviewedRecorder()
+            recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
+            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+            with self.assertRaises(WorkerShadowMismatchError):
+                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind: events.append(("result", session, turn, kind.value)))
+        self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
+        self.assertIn(("result", "thread-43", "turn-43", "ambiguous"), events)
+        self.assertEqual(service.calls, [])
+        self.assertEqual(events.count("interrupt"), 1)
+
+    def test_completion_deadline_requires_operational_host_headroom(self):
+        self.assertEqual(CompletionDeadline(9000, 10000).receipt()["headroom_ms"], 1000)
+        with self.assertRaises(Exception): CompletionDeadline(10000, 10000)
+
+    def test_operational_entrypoint_requires_and_reports_explicit_headroom(self):
+        from roundwright.worker_toolbox import main
+        import os
+        prior = dict(os.environ)
+        try:
+            os.environ["ROUNDWRIGHT_RUN_LIVE_WORKER_ADAPTER"] = "1"
+            os.environ["ROUNDWRIGHT_APPLICATION_TIMEOUT_MS"] = "9000"
+            os.environ["ROUNDWRIGHT_HOST_TIMEOUT_MS"] = "10000"
+            output = StringIO()
+            with redirect_stdout(output): self.assertEqual(main(), 2)
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["completion"], {"schema": "roundwright-worker-completion-timeout/v1", "application_timeout_ms": 9000, "host_timeout_ms": 10000, "headroom_ms": 1000})
+        finally:
+            os.environ.clear(); os.environ.update(prior)
 
 
 if __name__ == "__main__": unittest.main()

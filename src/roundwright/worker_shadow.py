@@ -194,11 +194,19 @@ def require_worker_shadow_capture_readiness(*, candidate_sha: str, ready_at: int
     return WorkerShadowCaptureReadiness(candidate_sha, ready_at, native_channel_producer_identity, exporter_identity, comparator_identity, recorder_digest, store_identity)
 
 
-def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWorkerResult, *, provider_attempt_id: str, external_turn_identity: str, binding: WorkerQualificationBinding, ready_at: int) -> WorkerShadowEnvelope:
-    if type(request) is not CodexWorkerRequest or type(result) is not CodexWorkerResult or not _token(provider_attempt_id) or not _token(external_turn_identity) or result.turn_identity != external_turn_identity or request.context.task_id == "": raise WorkerShadowError("Worker Shadow turn identity is invalid")
+def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWorkerResult, *, provider_attempt_id: str, external_turn_identity: str, binding: WorkerQualificationBinding, ready_at: int, expected: bool = False) -> WorkerShadowEnvelope:
+    if type(request) is not CodexWorkerRequest or type(result) is not CodexWorkerResult or not _token(provider_attempt_id) or not _token(external_turn_identity) or result.session_identity is None or result.turn_identity != external_turn_identity or request.context.task_id == "": raise WorkerShadowError("Worker Shadow turn identity is invalid")
     accepted = None if result.output is None else _hash(result.output)
     if accepted is not None and accepted != result.output_fingerprint: raise WorkerShadowError("Worker Shadow accepted result is not bound to the adapter output")
-    return WorkerShadowEnvelope(request.context.task_id, result.session_identity, provider_attempt_id, external_turn_identity, binding.base_sha, binding.candidate_sha, binding.profile_identity, request.context.configuration_digest, binding.runtime_fingerprint, request.input_digest, result.kind, accepted, binding.deterministic_state, binding.blocker, binding.next_action, ready_at)
+    if expected:
+        state, blocker, next_action = binding.deterministic_state, binding.blocker, binding.next_action
+    elif result.kind is WorkerResultKind.ACCEPTED:
+        state, blocker, next_action = result.output["deterministic_state"], None, result.output["next_action"]  # type: ignore[index]
+    elif result.kind is WorkerResultKind.BLOCKED:
+        state, blocker, next_action = "blocked", result.blocker, "owner-input"
+    else:
+        state, blocker, next_action = "ambiguous", None, "recapture"
+    return WorkerShadowEnvelope(request.context.task_id, result.session_identity, provider_attempt_id, external_turn_identity, binding.base_sha, binding.candidate_sha, binding.profile_identity, request.context.configuration_digest, binding.runtime_fingerprint, request.input_digest, result.kind, accepted, state, blocker, next_action, ready_at)
 
 
 def record_worker_shadow_envelope(readiness: WorkerShadowCaptureReadiness, envelope: WorkerShadowEnvelope, recorder: ExternalWorkerRecorder, *, case_id: str) -> WorkerShadowRecord:
@@ -227,9 +235,13 @@ def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequ
     # The adapter does not receive a clock; every outward artifact consumes the pre-bound ready_at.
     result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
     if result.turn_identity is None: return WorkerQualificationResult(result, None, None, None)
-    envelope = export_worker_shadow_envelope(request, result, provider_attempt_id=request.attempt_id, external_turn_identity=result.turn_identity, binding=binding, ready_at=readiness.ready_at)
-    record = record_worker_shadow_envelope(readiness, envelope, recorder, case_id=binding.case_id)
-    return WorkerQualificationResult(result, envelope, record, compare_worker_shadow_envelopes(envelope, envelope))
+    observed = export_worker_shadow_envelope(request, result, provider_attempt_id=request.attempt_id, external_turn_identity=result.turn_identity, binding=binding, ready_at=readiness.ready_at)
+    expected = export_worker_shadow_envelope(request, result, provider_attempt_id=request.attempt_id, external_turn_identity=result.turn_identity, binding=binding, ready_at=readiness.ready_at, expected=True)
+    comparison = compare_worker_shadow_envelopes(expected, observed)
+    if comparison.disposition is not WorkerShadowDisposition.MATCH:
+        raise WorkerShadowError("Worker Shadow observed lifecycle state differs from the deterministic binding")
+    record = record_worker_shadow_envelope(readiness, observed, recorder, case_id=binding.case_id)
+    return WorkerQualificationResult(result, observed, record, comparison)
 
 
 def compare_worker_shadow_envelopes(expected: WorkerShadowEnvelope, observed: WorkerShadowEnvelope) -> WorkerShadowComparison:

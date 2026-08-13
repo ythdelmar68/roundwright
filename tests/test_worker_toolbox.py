@@ -12,7 +12,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerTool
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
@@ -62,10 +62,10 @@ class TemporaryReviewedRecorder:
 
 class FakeHandle:
     id = "turn-43"
-    def __init__(self, events): self.events = events
+    def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"complete","next_action":"compare"}')
     def stream(self):
         self.events.append("stream")
-        item = SimpleNamespace(text='{"status":"complete"}')
+        item = SimpleNamespace(text=self.text)
         turn = SimpleNamespace(id=self.id, status="completed")
         class Stream(list):
             def close(inner): self.events.append("stream-close")
@@ -74,16 +74,17 @@ class FakeHandle:
 
 class FakeThread:
     id = "thread-43"
-    def __init__(self, events): self.events = events
+    def __init__(self, events, text=None): self.events, self.text = events, text
     def turn(self, prompt, **kwargs):
-        self.events.append(("turn", prompt, kwargs)); return FakeHandle(self.events)
+        self.events.append(("turn", prompt, kwargs)); return FakeHandle(self.events, self.text)
 
 
 class FakeCodex:
-    def __init__(self, events): self.events = events
+    def __init__(self, events, text=None): self.events, self.text = events, text
     def __enter__(self): self.events.append("enter"); return self
     def __exit__(self, *_): self.events.append("exit")
-    def thread_start(self, **kwargs): self.events.append(("start", kwargs)); return FakeThread(self.events)
+    def thread_start(self, **kwargs): self.events.append(("start", kwargs)); return FakeThread(self.events, self.text)
+    def thread_resume(self, identity, **kwargs): self.events.append(("resume", identity, kwargs)); return FakeThread(self.events, self.text)
 
 
 class WorkerToolboxTests(unittest.TestCase):
@@ -94,7 +95,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         self.audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(self.profile.model, self.profile.reasoning_effort.value),)), self.profile)
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "config")))
-        self.request = CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, digest("request"), context, "qualify", ("read-only",), ("structured",))
+        self.request = CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="qualify", constraints=("read-only",), acceptance_criteria=("structured",), resume_session_identity=None), context, "qualify", ("read-only",), ("structured",))
         self.recorder_binding = RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb")
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "complete", None, "compare")
@@ -112,6 +113,10 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual(self.events[0], "enter")
         self.assertEqual(self.events[2], ("checkpoint-session", "thread-43"))
         self.assertEqual(self.events[4], ("checkpoint-turn", "thread-43", "turn-43"))
+        self.assertFalse(self.events[1][1]["ephemeral"])
+        payload = json.loads(self.events[3][1])
+        self.assertEqual((payload["action"], payload["objective"], payload["constraints"], payload["acceptance_criteria"], payload["tools"]), ("implementation", "qualify", ["read-only"], ["structured"], ["workspace-read"]))
+        self.assertEqual(payload["context"]["task_id"], "task-43")
         self.assertEqual(service.calls, ["seal", "verify"])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
         self.assertNotIn("qualify", json.dumps(result.record.receipt.__dict__))
@@ -124,6 +129,20 @@ class WorkerToolboxTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None)
         self.assertEqual(self.events, [])
+
+    def test_blocked_provider_output_cannot_become_accepted_evidence(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        events = []
+        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"owner-input","deterministic_state":"blocked","next_action":"owner-input"}'), "implementation")
+        self.assertEqual((response.kind, response.structured_output, response.blocker), ("blocked", None, "owner-input"))
+
+    def test_resume_rebinds_full_runtime_on_a_new_client(self):
+        events = []
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        session = backend.open_session(self.profile, resume_session_identity="thread-43")
+        self.assertEqual(session.identity(), "thread-43")
+        kind, identity, kwargs = events[1]
+        self.assertEqual((kind, identity, kwargs["approval_mode"], kwargs["sandbox"], kwargs["model"]), ("resume", "thread-43", "deny-all", "read-only", "gpt-5.6-terra"))
 
 
 if __name__ == "__main__": unittest.main()

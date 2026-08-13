@@ -144,6 +144,12 @@ class CodexWorkerRequest:
             or not _items(self.constraints)
             or not _items(self.acceptance_criteria)
             or (self.resume_session_identity is not None and (type(self.resume_session_identity) is not str or not _TOKEN.fullmatch(self.resume_session_identity)))
+            or self.input_digest != worker_request_digest(
+                attempt_id=self.attempt_id, action=self.action, context=self.context,
+                objective=self.objective, constraints=self.constraints,
+                acceptance_criteria=self.acceptance_criteria,
+                resume_session_identity=self.resume_session_identity,
+            )
         ):
             raise CodexWorkerError("Worker request is invalid")
 
@@ -155,19 +161,21 @@ class NativeWorkerResponse:
     kind: WorkerResultKind
     structured_output: Mapping[str, object] | None = None
     failure: CodexFailure | None = None
+    blocker: str | None = None
 
     def __post_init__(self) -> None:
         valid = (
             type(self.kind) is WorkerResultKind
             and (self.structured_output is None or type(self.structured_output) is dict)
             and (self.failure is None or type(self.failure) is CodexFailure)
+            and (self.blocker is None or (type(self.blocker) is str and _TOKEN.fullmatch(self.blocker)))
         )
         if self.kind is WorkerResultKind.ACCEPTED:
-            valid = valid and self.structured_output is not None and self.failure is None
+            valid = valid and self.structured_output is not None and self.failure is None and self.blocker is None
         elif self.kind is WorkerResultKind.BLOCKED:
-            valid = valid and self.structured_output is None and self.failure is not None
+            valid = valid and self.structured_output is None and self.failure is not None and self.blocker is not None
         else:
-            valid = valid and self.structured_output is None and self.failure is None
+            valid = valid and self.structured_output is None and self.failure is None and self.blocker is None
         if not valid:
             raise CodexWorkerError("native Worker response is invalid")
 
@@ -177,28 +185,29 @@ class CodexWorkerResult:
     """Owner-safe outcome available only after both external IDs are durable."""
 
     kind: WorkerResultKind
-    session_identity: str
+    session_identity: str | None
     turn_identity: str | None
     output: Mapping[str, object] | None
     output_fingerprint: str | None
     failure: CodexFailure | None
+    blocker: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.kind) is not WorkerResultKind or type(self.session_identity) is not str or not _TOKEN.fullmatch(self.session_identity):
+        if type(self.kind) is not WorkerResultKind or (self.session_identity is not None and (type(self.session_identity) is not str or not _TOKEN.fullmatch(self.session_identity))):
             raise CodexWorkerError("Worker result is invalid")
         if self.turn_identity is not None and (type(self.turn_identity) is not str or not _TOKEN.fullmatch(self.turn_identity)):
             raise CodexWorkerError("Worker result is invalid")
         if self.kind is WorkerResultKind.ACCEPTED:
-            if type(self.output) is not dict or type(self.output_fingerprint) is not str or not _DIGEST.fullmatch(self.output_fingerprint) or self.failure is not None or self.turn_identity is None:
+            if type(self.output) is not dict or type(self.output_fingerprint) is not str or not _DIGEST.fullmatch(self.output_fingerprint) or self.failure is not None or self.blocker is not None or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.BLOCKED:
-            if self.output is not None or self.output_fingerprint is not None or type(self.failure) is not CodexFailure or self.turn_identity is None:
+            if self.output is not None or self.output_fingerprint is not None or type(self.failure) is not CodexFailure or type(self.blocker) is not str or not _TOKEN.fullmatch(self.blocker) or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind in (WorkerResultKind.INVALID, WorkerResultKind.INCOMPLETE):
-            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.turn_identity is None:
+            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.AMBIGUOUS:
-            if self.output is not None or self.output_fingerprint is not None or self.failure is not None:
+            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None:
                 raise CodexWorkerError("Worker result is invalid")
 
 
@@ -272,27 +281,36 @@ class CodexWorkerAdapter:
 
         if type(request) is not CodexWorkerRequest or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexWorkerError("Worker dispatch is invalid")
+        session_identity: str | None = None
+        turn_identity: str | None = None
         try:
             session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity)
             session_identity = _identity(session, "session")
             if request.resume_session_identity is not None and session_identity != request.resume_session_identity:
                 raise CodexWorkerError("native Worker session drifted from the durable session")
             checkpoint_session(session_identity)
+        except CodexAdapterError:
+            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
+        except CodexWorkerError:
+            raise
+        except Exception:
+            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
+        try:
             turn = session.start_turn(request, self._tools)
             turn_identity = _identity(turn, "turn")
             checkpoint_turn(session_identity, turn_identity)
-        except CodexAdapterError as error:
-            return CodexWorkerResult(WorkerResultKind.BLOCKED, request.resume_session_identity or "unavailable-session", "unavailable-turn", None, None, error.failure)
+        except CodexAdapterError:
+            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         except CodexWorkerError:
             raise
         except Exception:
             # No response is read when session/turn creation or durable checkpoint
             # fails.  A caller must recover from the persisted lifecycle state.
-            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, request.resume_session_identity or "unavailable-session", None, None, None, None)
+            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         try:
             response = turn.read_response()
-        except CodexAdapterError as error:
-            return CodexWorkerResult(WorkerResultKind.BLOCKED, session_identity, turn_identity, None, None, error.failure)
+        except CodexAdapterError:
+            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         except Exception:
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         if type(response) is not NativeWorkerResponse:
@@ -303,7 +321,12 @@ class CodexWorkerAdapter:
             except CodexWorkerError:
                 return CodexWorkerResult(WorkerResultKind.INVALID, session_identity, turn_identity, None, None, None)
             return CodexWorkerResult(WorkerResultKind.ACCEPTED, session_identity, turn_identity, output, _digest(output), None)
-        return CodexWorkerResult(response.kind, session_identity, turn_identity, None, None, response.failure)
+        return CodexWorkerResult(response.kind, session_identity, turn_identity, None, None, response.failure, response.blocker)
+
+
+def worker_request_digest(*, attempt_id: str, action: WorkerAction, context: CodexWorkerContext, objective: str, constraints: tuple[str, ...], acceptance_criteria: tuple[str, ...], resume_session_identity: str | None) -> str:
+    """Canonical identity for every immutable field of a Worker request."""
+    return _digest({"attempt_id": attempt_id, "action": action.value, "context_digest": context.digest, "objective": objective, "constraints": constraints, "acceptance_criteria": acceptance_criteria, "resume_session_identity": resume_session_identity})
 
 
 def _identity(value: object, name: str) -> str:

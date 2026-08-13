@@ -20,6 +20,7 @@ from roundwright.codex_worker import (
     WorkerAction,
     WorkerResultKind,
     WorkerTool,
+    worker_request_digest,
 )
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
@@ -67,7 +68,7 @@ class CodexWorkerAdapterTests(unittest.TestCase):
 
     def request(self, *, resume: str | None = None) -> CodexWorkerRequest:
         context = CodexWorkerContext("task-43", *(digest(name) for name in ("source", "repository", "worktree", "branch", "base", "candidate", "policy", "configuration")))
-        return CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, digest("input"), context, "Implement only issue 43.", ("No GitHub",), ("Use only bounded tools",), resume)
+        return CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Implement only issue 43.", constraints=("No GitHub",), acceptance_criteria=("Use only bounded tools",), resume_session_identity=resume), context, "Implement only issue 43.", ("No GitHub",), ("Use only bounded tools",), resume)
 
     def dispatch(self, adapter, request, events):
         return adapter.dispatch(request, checkpoint_session=lambda session: events.append(f"session:{session}"), checkpoint_turn=lambda session, turn: events.append(f"turn:{session}:{turn}"))
@@ -107,11 +108,21 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         events: list[str] = []
         turn = FakeTurn("turn-43", CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED), events)
         result = self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events), self.request(), events)
-        self.assertEqual((result.kind, result.failure), (WorkerResultKind.BLOCKED, CodexFailure.SANDBOX_OR_APPROVAL_DENIED))
+        self.assertEqual((result.kind, result.failure), (WorkerResultKind.AMBIGUOUS, None))
+
+    def test_pre_session_failure_has_no_fabricated_turn_identity(self) -> None:
+        events: list[str] = []
+        result = self.dispatch(self.adapter(FakeBackend(CodexAdapterError(CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE)), events), self.request(), events)
+        self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, None, None))
         events = []
         backend = FakeBackend(CodexAdapterError(CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE))
         result = self.dispatch(self.adapter(backend, events), self.request(resume="thread-43"), events)
-        self.assertEqual((result.kind, result.failure), (WorkerResultKind.BLOCKED, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE))
+        self.assertEqual((result.kind, result.failure), (WorkerResultKind.AMBIGUOUS, None))
+
+    def test_request_digest_binds_every_immutable_request_field(self) -> None:
+        request = self.request()
+        with self.assertRaises(CodexWorkerError):
+            CodexWorkerRequest(request.attempt_id, request.action, request.input_digest, request.context, "different objective", request.constraints, request.acceptance_criteria)
 
     def test_adapter_rejects_unqualified_profile_or_empty_tools(self) -> None:
         profile = self.profile()

@@ -41,6 +41,9 @@ class Backend:
 
 class Recorder:
     def __init__(self, events, *, fail=False): self.events, self.fail, self.receipt = events, fail, None
+    def prepare(self, *, store_identity):
+        self.events.append(("prepare", store_identity))
+        if self.fail: raise RuntimeError("unavailable")
     def seal(self, document, *, store_identity):
         self.events.append(("seal", document["ready_at"], store_identity))
         if self.fail: raise RuntimeError("unavailable")
@@ -64,7 +67,7 @@ class WorkerShadowTests(unittest.TestCase):
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, digest("request"), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"), store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, "qualification-complete", None, "compare-shadow")
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "qualification-complete", None, "compare-shadow")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
         return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"))
@@ -75,7 +78,7 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_pre_dispatch_arming_and_exact_time_flow_through_turn_envelope_seal_and_readback(self):
         result = self.qualify()
-        self.assertEqual(self.events, ["open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
+        self.assertEqual(self.events, [("prepare", self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at, result.comparison.disposition), (101, 101, WorkerShadowDisposition.MATCH))
         self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))
 
@@ -92,9 +95,9 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_external_recorder_failure_is_not_misreported_as_recorded(self):
         recorder = Recorder(self.events, fail=True)
-        with self.assertRaisesRegex(WorkerShadowError, "seal or read-back"):
+        with self.assertRaisesRegex(WorkerShadowError, "pre-dispatch readiness"):
             self.qualify(recorder=recorder)
-        self.assertEqual(self.events[-1][0], "seal")
+        self.assertEqual(self.events[-1][0], "prepare")
         self.assertFalse(any(isinstance(event, tuple) and event[0] == "verify" for event in self.events))
 
     def test_same_thread_result_has_one_turn_and_deterministic_comparison(self):

@@ -48,6 +48,7 @@ from .codex_worker import CodexWorkerAdapter
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+_NO_TOOL_INSTRUCTIONS = "One bounded planning observation only. No provider tools or repository inspection are declared or required. Decide only from the normalized public turn input. Return only the requested schema."
 @dataclass(frozen=True)
 class CompletionDeadline:
     """Explicit bounded completion contract, always inside the host deadline."""
@@ -213,12 +214,12 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
         try:
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
             if resume_session_identity is None:
-                thread = client.thread_start(approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions="One bounded lifecycle Worker turn only. Use only the declared tools and return only the requested schema.", ephemeral=False, model=profile.model, sandbox=self._sandbox)
+                thread = client.thread_start(approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=_NO_TOOL_INSTRUCTIONS, ephemeral=False, model=profile.model, sandbox=self._sandbox)
             else:
                 resume = getattr(client, "thread_resume", None)
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-                thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions="One bounded lifecycle Worker turn only. Use only the declared tools and return only the requested schema.", model=profile.model, sandbox=self._sandbox)
+                thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=_NO_TOOL_INSTRUCTIONS, model=profile.model, sandbox=self._sandbox)
             return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value, self._completion, self._clock)
         except CodexAdapterError:
             _close(codex)
@@ -239,7 +240,7 @@ class _HarnessWorkerSession(NativeWorkerSession):
         return value
 
     def start_turn(self, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> NativeWorkerTurn:
-        if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface:
+        if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface or request.action is not WorkerAction.PLANNING or tools.capability_contract.value != "no-tools-self-contained/v1":
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
         # The full canonical request is transient. Only the validated structured
@@ -396,7 +397,9 @@ def _close(value: object) -> None:
 
 def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> dict[str, object]:
     """Action-specific, immutable provider payload; never retained verbatim."""
-    return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools]}
+    if type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface or request.action is not WorkerAction.PLANNING or tools.capability_contract.value != "no-tools-self-contained/v1":
+        raise WorkerShadowError("native Worker capability contract is invalid")
+    return {"schema": "roundwright-worker-native/v1", "capability_contract": "no-tools-self-contained/v1", "provider_instruction": "No provider tools or repository inspection are declared or required; decide only from this normalized public input.", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": []}
 
 
 def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None], None]) -> WorkerQualificationResult:

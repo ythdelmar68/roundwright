@@ -43,6 +43,13 @@ class WorkerTool(StrEnum):
     VALIDATION_EXECUTE = "validation-execute"
 
 
+class WorkerCapabilityContract(StrEnum):
+    """Truthful provider capability contracts, never inferred from labels."""
+
+    NO_TOOLS_SELF_CONTAINED = "no-tools-self-contained/v1"
+    ORCHESTRATION_DECLARED_ONLY = "orchestration-declared-only/v1"
+
+
 class WorkerResultKind(StrEnum):
     ACCEPTED = "accepted"
     BLOCKED = "blocked"
@@ -83,18 +90,21 @@ _VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 
 @dataclass(frozen=True)
 class BoundedWorkerToolSurface:
-    """Immutable least-privilege tools that the native backend may receive."""
+    """Orchestrator-declared tools; non-empty labels are not SDK enforcement."""
 
     tools: tuple[WorkerTool, ...]
 
     def __post_init__(self) -> None:
         if (
             type(self.tools) is not tuple
-            or not self.tools
             or any(type(tool) is not WorkerTool for tool in self.tools)
             or len(set(self.tools)) != len(self.tools)
         ):
             raise CodexWorkerError("Worker tool surface is invalid")
+
+    @property
+    def capability_contract(self) -> WorkerCapabilityContract:
+        return WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED if not self.tools else WorkerCapabilityContract.ORCHESTRATION_DECLARED_ONLY
 
 
 @dataclass(frozen=True)
@@ -297,6 +307,10 @@ class CodexWorkerAdapter:
     @property
     def runtime_fingerprint(self) -> str:
         return self._audit.runtime_fingerprint
+
+    @property
+    def capability_contract(self) -> WorkerCapabilityContract:
+        return self._tools.capability_contract
 
     def dispatch(
         self,

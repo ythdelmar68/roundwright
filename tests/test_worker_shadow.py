@@ -64,7 +64,7 @@ class WorkerShadowTests(unittest.TestCase):
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
         self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation"}))
-        self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
+        self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface(()))
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="provider-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Qualify Worker", constraints=("No GitHub",), acceptance_criteria=("Structured result",), resume_session_identity=None), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"), store_identity=digest("external-store"))

@@ -127,8 +127,7 @@ class CodexWorkerAdapterTests(unittest.TestCase):
     def test_adapter_rejects_unqualified_profile_or_empty_tools(self) -> None:
         profile = self.profile()
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        with self.assertRaises(CodexWorkerError):
-            BoundedWorkerToolSurface(())
+        self.assertEqual(BoundedWorkerToolSurface(()).capability_contract.value, "no-tools-self-contained/v1")
         with self.assertRaises(CodexWorkerError):
             CodexWorkerAdapter(FakeBackend(None), ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH), audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
 

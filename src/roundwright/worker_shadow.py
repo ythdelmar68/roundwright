@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Callable, Mapping, Protocol
 
-from .codex_worker import CodexWorkerAdapter, CodexWorkerRequest, CodexWorkerResult, WorkerParserDiagnostic, WorkerResultKind, expected_lifecycle
+from .codex_worker import CodexWorkerAdapter, CodexWorkerRequest, CodexWorkerResult, WorkerCapabilityContract, WorkerParserDiagnostic, WorkerResultKind, expected_lifecycle
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 
 WORKER_ADAPTER_PROFILE = "roundwright-shadow-profile/worker-adapter/v1"
@@ -120,6 +120,7 @@ class WorkerShadowCaptureReadiness:
     comparator_identity: str
     recorder_binding_digest: str
     store_identity: str
+    capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value
     schema: str = WORKER_ADAPTER_SCHEMA
     profile_id: str = WORKER_ADAPTER_PROFILE
     retention_contract: str = "append-only-content-addressed-readback"
@@ -127,14 +128,14 @@ class WorkerShadowCaptureReadiness:
     readiness_digest: str = ""
 
     def __post_init__(self) -> None:
-        if self.schema != WORKER_ADAPTER_SCHEMA or self.profile_id != WORKER_ADAPTER_PROFILE or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not all(_digest(value) for value in (self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or self.retention_contract != "append-only-content-addressed-readback" or self.missing_history_action != "fresh-bounded-attempt-recapture":
+        if self.schema != WORKER_ADAPTER_SCHEMA or self.profile_id != WORKER_ADAPTER_PROFILE or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not all(_digest(value) for value in (self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or self.retention_contract != "append-only-content-addressed-readback" or self.missing_history_action != "fresh-bounded-attempt-recapture":
             raise WorkerShadowError("Worker Shadow capture readiness is invalid")
         digest = _hash(self.payload())
         if self.readiness_digest and self.readiness_digest != digest: raise WorkerShadowError("Worker Shadow capture readiness digest is invalid")
         object.__setattr__(self, "readiness_digest", digest)
 
     def payload(self) -> dict[str, object]:
-        return {"schema": self.schema, "profile_id": self.profile_id, "candidate_sha": self.candidate_sha, "ready_at": self.ready_at, "native_channel_producer_identity": self.native_channel_producer_identity, "exporter_identity": self.exporter_identity, "comparator_identity": self.comparator_identity, "recorder_binding_digest": self.recorder_binding_digest, "store_identity": self.store_identity, "retention_contract": self.retention_contract, "missing_history_action": self.missing_history_action}
+        return {"schema": self.schema, "profile_id": self.profile_id, "candidate_sha": self.candidate_sha, "ready_at": self.ready_at, "native_channel_producer_identity": self.native_channel_producer_identity, "exporter_identity": self.exporter_identity, "comparator_identity": self.comparator_identity, "recorder_binding_digest": self.recorder_binding_digest, "store_identity": self.store_identity, "capability_contract": self.capability_contract, "retention_contract": self.retention_contract, "missing_history_action": self.missing_history_action}
 
 
 @dataclass(frozen=True)
@@ -157,9 +158,10 @@ class WorkerQualificationBinding:
     deterministic_state: str
     blocker: str | None
     next_action: str
+    capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value
 
     def __post_init__(self) -> None:
-        if not _token(self.case_id) or not _token(self.task_id) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or not all(_digest(value) for value in (self.base_fingerprint, self.candidate_fingerprint, self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or not _token(self.deterministic_state) or not _token(self.next_action) or (self.blocker is not None and not _token(self.blocker)):
+        if not _token(self.case_id) or not _token(self.task_id) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not all(_digest(value) for value in (self.base_fingerprint, self.candidate_fingerprint, self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or not _token(self.deterministic_state) or not _token(self.next_action) or (self.blocker is not None and not _token(self.blocker)):
             raise WorkerShadowError("Worker qualification binding is invalid")
 
 
@@ -199,11 +201,11 @@ def worker_adapter_shadow_profile() -> ShadowEvidenceProfile:
     return ShadowEvidenceProfile(WORKER_ADAPTER_PROFILE, CaptureMode.LIFECYCLE_GRAPH, ShadowProducer.PROFILE_DEFINED, "v2-native-channel-exporter-comparator-recorder-store-readback-bound", "before-first-selected-live-worker-provider-attempt", "append-only-content-addressed-readback", "fresh-bounded-attempt-recapture", ("worker-request-response-envelope",), 0, 0, False)
 
 
-def require_worker_shadow_capture_readiness(*, candidate_sha: str, ready_at: int, native_channel_producer_identity: str, exporter_identity: str, comparator_identity: str, recorder: RecorderBinding, store_identity: str) -> WorkerShadowCaptureReadiness:
+def require_worker_shadow_capture_readiness(*, candidate_sha: str, ready_at: int, native_channel_producer_identity: str, exporter_identity: str, comparator_identity: str, recorder: RecorderBinding, store_identity: str, capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value) -> WorkerShadowCaptureReadiness:
     """Bind external retention before dispatch, without creating a recording."""
     if type(recorder) is not RecorderBinding: raise WorkerShadowError("Worker Shadow capture preflight is incomplete")
     recorder_digest = _hash({"harness_merge": recorder.harness_merge, "recorder_content": recorder.recorder_content, "harness_tree": recorder.harness_tree})
-    return WorkerShadowCaptureReadiness(candidate_sha, ready_at, native_channel_producer_identity, exporter_identity, comparator_identity, recorder_digest, store_identity)
+    return WorkerShadowCaptureReadiness(candidate_sha, ready_at, native_channel_producer_identity, exporter_identity, comparator_identity, recorder_digest, store_identity, capability_contract)
 
 
 def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWorkerResult, *, provider_attempt_id: str, external_turn_identity: str, binding: WorkerQualificationBinding, ready_at: int, expected: bool = False) -> WorkerShadowEnvelope:
@@ -234,7 +236,7 @@ def record_worker_shadow_envelope(readiness: WorkerShadowCaptureReadiness, envel
 
 def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None], None]) -> WorkerQualificationResult:
     """One armed, bounded turn; never retries or starts a second Worker."""
-    if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity) or (request.context.task_id, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.task_id, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest): raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
+    if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity, readiness.capability_contract) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity, binding.capability_contract) or (request.context.task_id, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.task_id, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest) or adapter.capability_contract.value != readiness.capability_contract: raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
     if (adapter.profile_identity, adapter.runtime_fingerprint) != (binding.profile_identity, binding.runtime_fingerprint): raise WorkerShadowError("Worker qualification runtime identity has drifted")
     if (binding.deterministic_state, binding.blocker, binding.next_action) != expected_lifecycle(request.action):
         raise WorkerShadowError("Worker qualification deterministic lifecycle binding is invalid")

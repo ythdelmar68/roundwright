@@ -282,11 +282,13 @@ class CodexWorkerResult:
 
 class NativeWorkerTurn(Protocol):
     def identity(self) -> str: ...
+    def abort(self) -> None: ...
     def read_response(self) -> NativeWorkerResponse: ...
 
 
 class NativeWorkerSession(Protocol):
     def identity(self) -> str: ...
+    def close(self) -> None: ...
     def start_turn(self, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> NativeWorkerTurn: ...
 
 
@@ -356,29 +358,38 @@ class CodexWorkerAdapter:
             raise CodexWorkerError("Worker dispatch is invalid")
         session_identity: str | None = None
         turn_identity: str | None = None
+        session: NativeWorkerSession | None = None
+        turn: NativeWorkerTurn | None = None
         try:
             session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity)
             session_identity = _identity(session, "session")
             if request.resume_session_identity is not None and session_identity != request.resume_session_identity:
-                raise CodexWorkerError("native Worker session drifted from the durable session")
+                _close_session(session)
+                return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
             checkpoint_session(session_identity)
         except CodexAdapterError:
+            _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
         except CodexWorkerError:
+            _close_session(session)
             raise
         except Exception:
+            _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
         try:
             turn = session.start_turn(request, self._tools)
             turn_identity = _identity(turn, "turn")
             checkpoint_turn(session_identity, turn_identity)
         except CodexAdapterError:
+            _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         except CodexWorkerError:
+            _abort_turn(turn); _close_session(session)
             raise
         except Exception:
             # No response is read when session/turn creation or durable checkpoint
             # fails.  A caller must recover from the persisted lifecycle state.
+            _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         try:
             response = turn.read_response()
@@ -410,6 +421,19 @@ def _identity(value: object, name: str) -> str:
     if type(identity) is not str or not _TOKEN.fullmatch(identity):
         raise CodexWorkerError(f"native Worker {name} identity is invalid")
     return identity
+
+
+def _abort_turn(turn: NativeWorkerTurn | None) -> None:
+    """Best-effort cleanup only; never read an uncheckpointed response."""
+    if turn is not None:
+        try: turn.abort()
+        except Exception: pass
+
+
+def _close_session(session: NativeWorkerSession | None) -> None:
+    if session is not None:
+        try: session.close()
+        except Exception: pass
 
 
 def _text(value: object) -> bool:

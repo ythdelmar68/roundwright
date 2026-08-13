@@ -121,7 +121,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.request = CodexWorkerRequest("attempt-43", WorkerAction.PLANNING, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.PLANNING, context=context, objective="Observe the supplied issue scope and plan a bounded repair.", constraints=("No provider tools or repository inspection.", "No GitHub or mutations."), acceptance_criteria=("Return the strict planning status and action.",), resume_session_identity=None), context, "Observe the supplied issue scope and plan a bounded repair.", ("No provider tools or repository inspection.", "No GitHub or mutations."), ("Return the strict planning status and action.",))
         self.recorder_binding = RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb")
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "planning-complete", None, "supervisor-review")
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "planning-complete", None, "supervisor-review")
 
     def test_concrete_bridge_checkpoints_then_seals_and_readbacks_once(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -157,7 +157,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertNotIn("Observe", json.dumps(result.record.receipt.__dict__))
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
-        self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
+        self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.attempt_id, self.binding.input_digest, self.binding.resume_session_identity, self.binding.source_digest, self.binding.repository_fingerprint, self.binding.worktree_fingerprint, self.binding.branch_fingerprint, self.binding.policy_fingerprint, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
         backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         with tempfile.TemporaryDirectory() as temporary:
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=lambda *_: None, verify_recording=lambda *_: None)
@@ -309,6 +309,18 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(response.kind, "ambiguous")
         self.assertEqual(events, ["cancel", "stream-close"])
+
+    def test_stream_failure_is_ambiguous_not_a_fresh_attempt_input_error(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        class Handle:
+            id = "turn-43"
+            def stream(self):
+                class Stream:
+                    def __iter__(self): return self
+                    def __next__(self): raise OSError("transport is unavailable")
+                    def close(self): pass
+                return Stream()
+        self.assertEqual(_consume_public_result(Handle(), WorkerAction.REPAIR).kind, "ambiguous")
 
     def test_delayed_exact_turn_completion_before_deadline_is_accepted(self):
         from roundwright.worker_toolbox import _consume_public_result

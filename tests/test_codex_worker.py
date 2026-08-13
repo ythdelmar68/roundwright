@@ -34,6 +34,7 @@ class FakeTurn:
     def __init__(self, identity: str, response: object, events: list[str]) -> None:
         self._identity, self._response, self._events = identity, response, events
     def identity(self) -> str: return self._identity
+    def abort(self): self._events.append("abort")
     def read_response(self):
         self._events.append("read")
         if isinstance(self._response, Exception): raise self._response
@@ -44,6 +45,7 @@ class FakeSession:
     def __init__(self, identity: str, turn: FakeTurn, events: list[str]) -> None:
         self._identity, self._turn, self._events = identity, turn, events
     def identity(self) -> str: return self._identity
+    def close(self): self._events.append("close")
     def start_turn(self, request, tools):
         self._events.append(f"start:{request.action.value}:{','.join(item.value for item in tools.tools)}")
         return self._turn
@@ -85,9 +87,9 @@ class CodexWorkerAdapterTests(unittest.TestCase):
     def test_resume_must_preserve_the_persisted_worker_thread(self) -> None:
         events: list[str] = []
         backend = FakeBackend(FakeSession("other-thread", FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.INCOMPLETE), events), events))
-        with self.assertRaisesRegex(CodexWorkerError, "drifted"):
-            self.dispatch(self.adapter(backend, events), self.request(resume="thread-43"), events)
-        self.assertEqual(events, [])
+        result = self.dispatch(self.adapter(backend, events), self.request(resume="thread-43"), events)
+        self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, "other-thread", None))
+        self.assertEqual(events, ["close"])
         self.assertEqual(backend.resumes, ["thread-43"])
 
     def test_checkpoint_failure_never_consumes_output(self) -> None:
@@ -97,6 +99,14 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         result = adapter.dispatch(self.request(), checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: (_ for _ in ()).throw(RuntimeError("storage unavailable")))
         self.assertEqual(result.kind, WorkerResultKind.AMBIGUOUS)
         self.assertNotIn("read", events)
+        self.assertEqual(events, ["start:implementation:workspace-read,workspace-write,validation-execute", "abort", "close"])
+
+    def test_session_checkpoint_failure_closes_without_starting_a_turn(self) -> None:
+        events: list[str] = []
+        turn = FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}), events)
+        result = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events).dispatch(self.request(), checkpoint_session=lambda _session: (_ for _ in ()).throw(RuntimeError("storage unavailable")), checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, "thread-43", None))
+        self.assertEqual(events, ["close"])
 
     def test_invalid_output_is_never_accepted(self) -> None:
         events: list[str] = []

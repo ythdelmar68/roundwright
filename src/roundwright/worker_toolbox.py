@@ -238,6 +238,9 @@ class _HarnessWorkerSession(NativeWorkerSession):
             raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
         return value
 
+    def close(self) -> None:
+        _close(self._codex)
+
     def start_turn(self, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> NativeWorkerTurn:
         if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface or request.action is not WorkerAction.PLANNING or tools.capability_contract.value != "no-tools-self-contained/v1":
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
@@ -262,6 +265,12 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
         if type(value) is not str:
             raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
         return value
+
+    def abort(self) -> None:
+        # The adapter owns the paired session/client close on pre-response
+        # exits; interruption itself must target this exact turn once.
+        interrupt = getattr(self._handle, "interrupt", None)
+        if callable(interrupt): interrupt()
 
     def read_response(self) -> NativeWorkerResponse:
         if self._read:
@@ -341,7 +350,9 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
     except TimeoutError:
         return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
     except Exception:
-        return _invalid(WorkerParserDiagnostic.SHAPE)
+        # Iterator and transport failure leave terminal completion unknown;
+        # retain no stream details and require exact-turn recovery.
+        return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
 
 
 def _invalid(diagnostic: WorkerParserDiagnostic) -> NativeWorkerResponse:

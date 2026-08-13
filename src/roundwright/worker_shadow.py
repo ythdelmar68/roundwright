@@ -143,6 +143,14 @@ class WorkerQualificationBinding:
     """Exact candidate/runtime identities required before an SDK call."""
     case_id: str
     task_id: str
+    attempt_id: str
+    input_digest: str
+    resume_session_identity: str | None
+    source_digest: str
+    repository_fingerprint: str
+    worktree_fingerprint: str
+    branch_fingerprint: str
+    policy_fingerprint: str
     base_sha: str
     candidate_sha: str
     base_fingerprint: str
@@ -161,7 +169,7 @@ class WorkerQualificationBinding:
     capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value
 
     def __post_init__(self) -> None:
-        if not _token(self.case_id) or not _token(self.task_id) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not all(_digest(value) for value in (self.base_fingerprint, self.candidate_fingerprint, self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or not _token(self.deterministic_state) or not _token(self.next_action) or (self.blocker is not None and not _token(self.blocker)):
+        if not _token(self.case_id) or not _token(self.task_id) or not _token(self.attempt_id) or (self.resume_session_identity is not None and not _token(self.resume_session_identity)) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not all(_digest(value) for value in (self.input_digest, self.source_digest, self.repository_fingerprint, self.worktree_fingerprint, self.branch_fingerprint, self.policy_fingerprint, self.base_fingerprint, self.candidate_fingerprint, self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or not _token(self.deterministic_state) or not _token(self.next_action) or (self.blocker is not None and not _token(self.blocker)):
             raise WorkerShadowError("Worker qualification binding is invalid")
 
 
@@ -236,7 +244,7 @@ def record_worker_shadow_envelope(readiness: WorkerShadowCaptureReadiness, envel
 
 def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """One armed, bounded turn; never retries or starts a second Worker."""
-    if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity, readiness.capability_contract) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity, binding.capability_contract) or (request.context.task_id, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.task_id, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest) or adapter.capability_contract.value != readiness.capability_contract: raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
+    if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity, readiness.capability_contract) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity, binding.capability_contract) or (request.attempt_id, request.input_digest, request.resume_session_identity, request.context.task_id, request.context.source_digest, request.context.repository_fingerprint, request.context.worktree_fingerprint, request.context.branch_fingerprint, request.context.policy_fingerprint, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.attempt_id, binding.input_digest, binding.resume_session_identity, binding.task_id, binding.source_digest, binding.repository_fingerprint, binding.worktree_fingerprint, binding.branch_fingerprint, binding.policy_fingerprint, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest) or adapter.capability_contract.value != readiness.capability_contract: raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
     if (adapter.profile_identity, adapter.runtime_fingerprint) != (binding.profile_identity, binding.runtime_fingerprint): raise WorkerShadowError("Worker qualification runtime identity has drifted")
     if (binding.deterministic_state, binding.blocker, binding.next_action) != expected_lifecycle(request.action):
         raise WorkerShadowError("Worker qualification deterministic lifecycle binding is invalid")
@@ -284,7 +292,7 @@ def _observed_worker_transition(action, result: CodexWorkerResult) -> tuple[str,
     if result.kind is WorkerResultKind.INCOMPLETE:
         return "incomplete", None, "fresh-bounded-attempt-recapture"
     if result.kind is WorkerResultKind.AMBIGUOUS:
-        return "ambiguous", None, "fresh-bounded-attempt-recapture"
+        return "blocked", "exact-turn-recovery", "blocked-ambiguous-turn"
     accepted = {
         "planning": ("planning-complete", None, "supervisor-review"),
         "implementation": ("implementation-complete", None, "supervisor-review"),
@@ -304,7 +312,7 @@ def _expected_worker_transition(action, result: CodexWorkerResult, binding: Work
         WorkerResultKind.BLOCKED: ("blocked", result.blocker, "owner-input"),
         WorkerResultKind.INVALID: ("invalid", None, "fresh-bounded-attempt-recapture"),
         WorkerResultKind.INCOMPLETE: ("incomplete", None, "fresh-bounded-attempt-recapture"),
-        WorkerResultKind.AMBIGUOUS: ("ambiguous", None, "fresh-bounded-attempt-recapture"),
+        WorkerResultKind.AMBIGUOUS: ("blocked", "exact-turn-recovery", "blocked-ambiguous-turn"),
     }
     try:
         return failure[result.kind]

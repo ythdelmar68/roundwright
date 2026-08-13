@@ -26,12 +26,14 @@ def digest(value: object) -> str:
 class Turn:
     def __init__(self, events, response): self.events, self.response = events, response
     def identity(self): return "turn-43"
+    def abort(self): self.events.append("abort")
     def read_response(self): self.events.append("read"); return self.response
 
 
 class Session:
     def __init__(self, events, response): self.events, self.response = events, response
     def identity(self): return "thread-43"
+    def close(self): self.events.append("close")
     def start_turn(self, _request, _tools): self.events.append("turn-start"); return Turn(self.events, self.response)
 
 
@@ -68,7 +70,7 @@ class WorkerShadowTests(unittest.TestCase):
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="provider-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Qualify Worker", constraints=("No GitHub",), acceptance_criteria=("Structured result",), resume_session_identity=None), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"), store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
         return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}:{'' if category is None else category.value}"))
@@ -84,7 +86,7 @@ class WorkerShadowTests(unittest.TestCase):
         self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))
 
     def test_readiness_or_identity_drift_blocks_before_provider_call(self):
-        for invalid in (replace(self.readiness, candidate_sha="c" * 40, readiness_digest=""), replace(self.readiness, exporter_identity=digest("other"), readiness_digest=""), replace(self.binding, profile_identity=digest("other")), replace(self.binding, configuration_digest=digest("other"))):
+        for invalid in (replace(self.readiness, candidate_sha="c" * 40, readiness_digest=""), replace(self.readiness, exporter_identity=digest("other"), readiness_digest=""), replace(self.binding, profile_identity=digest("other")), replace(self.binding, configuration_digest=digest("other")), replace(self.binding, attempt_id="other-attempt"), replace(self.binding, input_digest=digest("other")), replace(self.binding, resume_session_identity="other-thread"), replace(self.binding, source_digest=digest("other")), replace(self.binding, repository_fingerprint=digest("other")), replace(self.binding, worktree_fingerprint=digest("other")), replace(self.binding, branch_fingerprint=digest("other")), replace(self.binding, policy_fingerprint=digest("other"))):
             with self.subTest(invalid=invalid):
                 self.events.clear(); self.backend.calls = 0
                 if isinstance(invalid, type(self.readiness)):
@@ -124,7 +126,7 @@ class WorkerShadowTests(unittest.TestCase):
         cases = (
             (WorkerResultKind.INVALID, None, None, "invalid", "fresh-bounded-attempt-recapture"),
             (WorkerResultKind.INCOMPLETE, None, None, "incomplete", "fresh-bounded-attempt-recapture"),
-            (WorkerResultKind.AMBIGUOUS, None, None, "ambiguous", "fresh-bounded-attempt-recapture"),
+            (WorkerResultKind.AMBIGUOUS, None, None, "blocked", "blocked-ambiguous-turn"),
             (WorkerResultKind.BLOCKED, "provider-blocked", WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED, "blocked", "owner-input"),
             (WorkerResultKind.BLOCKED, "provider-failed", WorkerOutcomeSource.SDK_TURN_FAILED, "blocked", "owner-input"),
         )

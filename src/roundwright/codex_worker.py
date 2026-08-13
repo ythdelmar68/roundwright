@@ -77,6 +77,19 @@ class WorkerOutcomeSource(StrEnum):
     PROVIDER_STRUCTURED_BLOCKED = "provider-structured-blocked"
 
 
+class WorkerSdkTurnErrorCategory(StrEnum):
+    """Closed, public-safe projection of a failed native SDK turn."""
+
+    BAD_REQUEST = "bad-request"
+    UNAUTHORIZED = "unauthorized"
+    SANDBOX = "sandbox"
+    OVERLOAD = "overload"
+    HTTP = "http"
+    STREAM = "stream"
+    CONNECTION = "connection"
+    MISSING_OR_UNKNOWN = "missing-or-unknown"
+
+
 def expected_lifecycle(action: WorkerAction) -> tuple[str, str | None, str]:
     """The provider-neutral terminal projection for each Worker lifecycle role."""
 
@@ -206,6 +219,7 @@ class NativeWorkerResponse:
     blocker: str | None = None
     diagnostic: WorkerParserDiagnostic | None = None
     outcome_source: WorkerOutcomeSource | None = None
+    sdk_error_category: WorkerSdkTurnErrorCategory | None = None
 
     def __post_init__(self) -> None:
         valid = (
@@ -215,15 +229,16 @@ class NativeWorkerResponse:
             and (self.blocker is None or (type(self.blocker) is str and _TOKEN.fullmatch(self.blocker)))
             and (self.diagnostic is None or type(self.diagnostic) is WorkerParserDiagnostic)
             and (self.outcome_source is None or type(self.outcome_source) is WorkerOutcomeSource)
+            and (self.sdk_error_category is None or type(self.sdk_error_category) is WorkerSdkTurnErrorCategory)
         )
         if self.kind is WorkerResultKind.ACCEPTED:
-            valid = valid and self.structured_output is not None and self.failure is None and self.blocker is None and self.diagnostic is None and self.outcome_source is None
+            valid = valid and self.structured_output is not None and self.failure is None and self.blocker is None and self.diagnostic is None and self.outcome_source is None and self.sdk_error_category is None
         elif self.kind is WorkerResultKind.BLOCKED:
-            valid = valid and self.structured_output is None and self.failure is not None and self.blocker is not None and self.diagnostic is None and type(self.outcome_source) is WorkerOutcomeSource
+            valid = valid and self.structured_output is None and self.failure is not None and self.blocker is not None and self.diagnostic is None and type(self.outcome_source) is WorkerOutcomeSource and ((self.outcome_source is WorkerOutcomeSource.SDK_TURN_FAILED and type(self.sdk_error_category) is WorkerSdkTurnErrorCategory) or (self.outcome_source is WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED and self.sdk_error_category is None))
         elif self.kind is WorkerResultKind.INVALID:
-            valid = valid and self.structured_output is None and self.failure is None and self.blocker is None and type(self.diagnostic) is WorkerParserDiagnostic and self.outcome_source is None
+            valid = valid and self.structured_output is None and self.failure is None and self.blocker is None and type(self.diagnostic) is WorkerParserDiagnostic and self.outcome_source is None and self.sdk_error_category is None
         else:
-            valid = valid and self.structured_output is None and self.failure is None and self.blocker is None and self.diagnostic is None and self.outcome_source is None
+            valid = valid and self.structured_output is None and self.failure is None and self.blocker is None and self.diagnostic is None and self.outcome_source is None and self.sdk_error_category is None
         if not valid:
             raise CodexWorkerError("native Worker response is invalid")
 
@@ -241,6 +256,7 @@ class CodexWorkerResult:
     blocker: str | None = None
     diagnostic: WorkerParserDiagnostic | None = None
     outcome_source: WorkerOutcomeSource | None = None
+    sdk_error_category: WorkerSdkTurnErrorCategory | None = None
 
     def __post_init__(self) -> None:
         if type(self.kind) is not WorkerResultKind or (self.session_identity is not None and (type(self.session_identity) is not str or not _TOKEN.fullmatch(self.session_identity))):
@@ -248,19 +264,19 @@ class CodexWorkerResult:
         if self.turn_identity is not None and (type(self.turn_identity) is not str or not _TOKEN.fullmatch(self.turn_identity)):
             raise CodexWorkerError("Worker result is invalid")
         if self.kind is WorkerResultKind.ACCEPTED:
-            if type(self.output) is not dict or type(self.output_fingerprint) is not str or not _DIGEST.fullmatch(self.output_fingerprint) or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None or self.session_identity is None or self.turn_identity is None:
+            if type(self.output) is not dict or type(self.output_fingerprint) is not str or not _DIGEST.fullmatch(self.output_fingerprint) or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None or self.sdk_error_category is not None or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.BLOCKED:
-            if self.output is not None or self.output_fingerprint is not None or type(self.failure) is not CodexFailure or type(self.blocker) is not str or not _TOKEN.fullmatch(self.blocker) or self.diagnostic is not None or type(self.outcome_source) is not WorkerOutcomeSource or self.session_identity is None or self.turn_identity is None:
+            if self.output is not None or self.output_fingerprint is not None or type(self.failure) is not CodexFailure or type(self.blocker) is not str or not _TOKEN.fullmatch(self.blocker) or self.diagnostic is not None or type(self.outcome_source) is not WorkerOutcomeSource or ((self.outcome_source is WorkerOutcomeSource.SDK_TURN_FAILED and type(self.sdk_error_category) is not WorkerSdkTurnErrorCategory) or (self.outcome_source is WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED and self.sdk_error_category is not None)) or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.INVALID:
-            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or type(self.diagnostic) is not WorkerParserDiagnostic or self.outcome_source is not None or self.session_identity is None or self.turn_identity is None:
+            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or type(self.diagnostic) is not WorkerParserDiagnostic or self.outcome_source is not None or self.sdk_error_category is not None or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.INCOMPLETE:
-            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None or self.session_identity is None or self.turn_identity is None:
+            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None or self.sdk_error_category is not None or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.AMBIGUOUS:
-            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None:
+            if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None or self.sdk_error_category is not None:
                 raise CodexWorkerError("Worker result is invalid")
 
 
@@ -378,7 +394,7 @@ class CodexWorkerAdapter:
             except CodexWorkerError:
                 return CodexWorkerResult(WorkerResultKind.INVALID, session_identity, turn_identity, None, None, None, diagnostic=WorkerParserDiagnostic.SHAPE)
             return CodexWorkerResult(WorkerResultKind.ACCEPTED, session_identity, turn_identity, output, _digest(output), None)
-        return CodexWorkerResult(response.kind, session_identity, turn_identity, None, None, response.failure, response.blocker, response.diagnostic, response.outcome_source)
+        return CodexWorkerResult(response.kind, session_identity, turn_identity, None, None, response.failure, response.blocker, response.diagnostic, response.outcome_source, response.sdk_error_category)
 
 
 def worker_request_digest(*, attempt_id: str, action: WorkerAction, context: CodexWorkerContext, objective: str, constraints: tuple[str, ...], acceptance_criteria: tuple[str, ...], resume_session_identity: str | None) -> str:

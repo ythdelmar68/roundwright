@@ -31,6 +31,7 @@ from .codex_worker import (
     WorkerAction,
     WorkerParserDiagnostic,
     WorkerOutcomeSource,
+    WorkerSdkTurnErrorCategory,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
@@ -73,19 +74,14 @@ def _result_schema(action: str) -> dict[str, object]:
     validate it locally.  Its constrained-output dialect accepts JSON Schema
     enum values; deterministic parser validation below remains authoritative.
     """
-    # The locked structured-output path requires an object at the root and
-    # every root property to be required.  Keep the status/blocker relation
-    # inside that object: the provider can express exactly the two parser
-    # branches, while no top-level union crosses the native SDK boundary.
+    # The reviewed Harness path proves this strict, flat root-object form.
+    # Cross-field semantics remain local: composed/conditional schemas have
+    # not been qualified against the locked Structured Outputs dialect.
     return {"type": "object", "properties": {
         "status": {"type": "string", "enum": ["complete", "blocked"]},
         "action": {"type": "string", "enum": [action]},
         "blocker": {"type": ["string", "null"], "enum": [None, "provider-blocked"]},
-    }, "required": ["status", "action", "blocker"], "additionalProperties": False,
-        "allOf": [{"anyOf": [
-            {"properties": {"status": {"enum": ["complete"]}, "blocker": {"type": "null"}}},
-            {"properties": {"status": {"enum": ["blocked"]}, "blocker": {"type": "string", "enum": ["provider-blocked"]}}},
-        ]}]}
+    }, "required": ["status", "action", "blocker"], "additionalProperties": False}
 
 
 def _digest(value: object) -> str:
@@ -286,28 +282,29 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
         saw_non_final = False
         try:
             for event in _bounded_events(stream, completion=completion, clock=clock, cancel=cancel):
-                method = getattr(event, "method", None)
-                payload = getattr(event, "payload", event)
-                turn = getattr(payload, "turn", None)
+                method = _field(event, "method")
+                payload = _field(event, "payload") or event
+                turn = _field(payload, "turn")
                 if method == "turn/completed":
-                    if turn is None or getattr(turn, "id", None) != getattr(handle, "id", None):
+                    if turn is None or _field(turn, "id") != _field(handle, "id"):
                         return _invalid(WorkerParserDiagnostic.EXACT_TURN)
-                    status = getattr(getattr(turn, "status", None), "value", getattr(turn, "status", None))
+                    status = _value(_field(turn, "status"))
                     if status == "failed":
-                        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED)
+                        failure, category = _turn_failure(_field(turn, "error"))
+                        return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=failure, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category)
                     if status != "completed":
                         return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
                     completed = True
                     continue
                 if method != "item/completed":
                     continue
-                if getattr(payload, "turn_id", None) != getattr(handle, "id", None):
+                if _field(payload, "turn_id", "turnId") != _field(handle, "id"):
                     return _invalid(WorkerParserDiagnostic.EXACT_TURN)
-                item = getattr(payload, "item", None)
-                item = getattr(item, "root", item)
-                text = getattr(item, "text", None)
-                phase = getattr(getattr(item, "phase", None), "value", getattr(item, "phase", None))
-                if getattr(item, "type", None) != "agentMessage":
+                item = _field(payload, "item")
+                item = _field(item, "root") or item
+                text = _field(item, "text")
+                phase = _value(_field(item, "phase"))
+                if _field(item, "type") != "agentMessage":
                     continue
                 if phase != "final_answer":
                     saw_non_final = True
@@ -349,6 +346,52 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
 
 def _invalid(diagnostic: WorkerParserDiagnostic) -> NativeWorkerResponse:
     return NativeWorkerResponse(WorkerResultKind.INVALID, diagnostic=diagnostic)
+
+
+def _field(value: object, name: str, alias: str | None = None) -> object | None:
+    """Read the SDK's model fields or its serialized camel-case mapping."""
+    if isinstance(value, Mapping):
+        return value.get(name, value.get(alias) if alias is not None else None)
+    return getattr(value, name, None)
+
+
+def _value(value: object) -> object:
+    return getattr(value, "value", value)
+
+
+def _turn_failure(error: object) -> tuple[CodexFailure, WorkerSdkTurnErrorCategory]:
+    """Project only typed SDK ``codexErrorInfo`` values, never error text."""
+    detail = _field(error, "codex_error_info", "codexErrorInfo")
+    root = _field(detail, "root")
+    if root is not None:
+        detail = root
+    value = _value(detail)
+    if type(value) is not str:
+        value = None
+    if value == "badRequest":
+        return CodexFailure.UNKNOWN, WorkerSdkTurnErrorCategory.BAD_REQUEST
+    if value == "unauthorized":
+        # A turn-level unauthorized code does not prove a credential state.
+        return CodexFailure.UNKNOWN, WorkerSdkTurnErrorCategory.UNAUTHORIZED
+    if value in {"sandboxError", "cyberPolicy"}:
+        return CodexFailure.SANDBOX_OR_APPROVAL_DENIED, WorkerSdkTurnErrorCategory.SANDBOX
+    if value in {"serverOverloaded", "internalServerError"}:
+        return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.OVERLOAD
+    if isinstance(detail, Mapping):
+        if "httpConnectionFailed" in detail:
+            return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.HTTP
+        if "responseStreamConnectionFailed" in detail:
+            return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.CONNECTION
+        if "responseStreamDisconnected" in detail or "responseTooManyFailedAttempts" in detail:
+            return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.STREAM
+    name = type(detail).__name__
+    if name == "HttpConnectionFailedCodexErrorInfo":
+        return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.HTTP
+    if name == "ResponseStreamConnectionFailedCodexErrorInfo":
+        return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.CONNECTION
+    if name in {"ResponseStreamDisconnectedCodexErrorInfo", "ResponseTooManyFailedAttemptsCodexErrorInfo"}:
+        return CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, WorkerSdkTurnErrorCategory.STREAM
+    return CodexFailure.UNKNOWN, WorkerSdkTurnErrorCategory.MISSING_OR_UNKNOWN
 
 
 def _bounded_events(stream: object, *, completion: CompletionDeadline | None, clock: Callable[[], float], cancel: Callable[[], None] | None):
@@ -405,7 +448,7 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "capability_contract": "no-tools-self-contained/v1", "provider_instruction": "No provider tools or repository inspection are declared or required; decide only from this normalized public input.", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": []}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
     return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 

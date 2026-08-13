@@ -1012,14 +1012,27 @@ _PROVENANCE_PROFILE = ShadowEvidenceProfile(
     ("provenance-decision",),
 )
 
+_WORKER_ADAPTER_PROFILE = ShadowEvidenceProfile(
+    "roundwright-shadow-profile/worker-adapter/v1",
+    CaptureMode.LIFECYCLE_GRAPH,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-native-channel-exporter-comparator-recorder-store-readback-bound",
+    "before-first-selected-live-worker-provider-attempt",
+    "append-only-content-addressed-readback",
+    "fresh-bounded-attempt-recapture",
+    ("worker-request-response-envelope",),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
 
-    return (_PROVENANCE_PROFILE,)
+    return (_PROVENANCE_PROFILE, _WORKER_ADAPTER_PROFILE)
 
 
 def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
+    if profile_id == "roundwright-shadow-profile/worker-adapter/v1":
+        return _WORKER_ADAPTER_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

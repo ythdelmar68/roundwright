@@ -44,6 +44,14 @@ policy activation, branch/worktree, review, ready, merge, close, or cleanup
 authority.  Invalid, incomplete, cancelled/denied, or ambiguous turns remain
 typed non-success outcomes for the provider-neutral lifecycle to recover.
 
+`roundwright.worker_shadow` provides the corresponding
+`roundwright-shadow-profile/worker-adapter/v1` evidence boundary. It arms a
+candidate-bound v2 capture before the first selected live Worker attempt, then
+exports only task/thread/attempt, runtime/configuration, deterministic state,
+blocker, next-action, and accepted-result digests. The profile requires an
+exact Recorder binding and independent append-only store read-back; a missing
+or stale history must be recaptured as a fresh bounded attempt.
+
 ### Opt-in live provider-health fixture
 
 Hermetic coverage remains in `tests/test_provider_health.py` and

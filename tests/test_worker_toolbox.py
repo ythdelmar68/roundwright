@@ -62,7 +62,7 @@ class TemporaryReviewedRecorder:
 
 class FakeHandle:
     id = "turn-43"
-    def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"complete","next_action":"compare"}')
+    def __init__(self, events, text=None): self.events, self.text = events, text or ('{"status":"complete","action":"implementation","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"implementation-complete","next_action":"supervisor-review"}')
     def stream(self):
         self.events.append("stream")
         item = SimpleNamespace(text=self.text)
@@ -98,7 +98,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.request = CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="qualify", constraints=("read-only",), acceptance_criteria=("structured",), resume_session_identity=None), context, "qualify", ("read-only",), ("structured",))
         self.recorder_binding = RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb")
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "complete", None, "compare")
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
 
     def test_concrete_bridge_checkpoints_then_seals_and_readbacks_once(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -133,8 +133,18 @@ class WorkerToolboxTests(unittest.TestCase):
     def test_blocked_provider_output_cannot_become_accepted_evidence(self):
         from roundwright.worker_toolbox import _consume_public_result
         events = []
-        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"owner-input","deterministic_state":"blocked","next_action":"owner-input"}'), "implementation")
+        response = _consume_public_result(FakeHandle(events, '{"status":"blocked","action":"implementation","blocker":"owner-input","deterministic_state":"blocked","next_action":"owner-input"}'), WorkerAction.IMPLEMENTATION)
         self.assertEqual((response.kind, response.structured_output, response.blocker), ("blocked", None, "owner-input"))
+
+    def test_mismatched_complete_projection_is_invalid_before_shadow_comparison(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"complete","next_action":"compare"}'), WorkerAction.REPAIR)
+        self.assertEqual(response.kind, "invalid")
+
+    def test_repair_projection_matches_the_live_contract_constants(self):
+        from roundwright.worker_toolbox import _consume_public_result
+        response = _consume_public_result(FakeHandle([], '{"status":"complete","action":"repair","result_digest":"sha256:' + "c" * 64 + '","deterministic_state":"qualification-complete","next_action":"supervisor-review"}'), WorkerAction.REPAIR)
+        self.assertEqual(response.kind, "accepted")
 
     def test_resume_rebinds_full_runtime_on_a_new_client(self):
         events = []

@@ -25,6 +25,8 @@ from .codex_worker import (
     NativeWorkerSession,
     NativeWorkerTurn,
     WorkerResultKind,
+    WorkerAction,
+    expected_lifecycle,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
@@ -48,8 +50,9 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 def _result_schema(action: str) -> dict[str, object]:
     """Closed response schema for one provider-neutral lifecycle action."""
+    lifecycle_state, _, lifecycle_next = expected_lifecycle(WorkerAction(action))
     return {"oneOf": [
-        {"type": "object", "properties": {"status": {"const": "complete"}, "action": {"const": action}, "result_digest": {"type": "string"}, "deterministic_state": {"type": "string"}, "next_action": {"type": "string"}}, "required": ["status", "action", "result_digest", "deterministic_state", "next_action"], "additionalProperties": False},
+        {"type": "object", "properties": {"status": {"const": "complete"}, "action": {"const": action}, "result_digest": {"type": "string"}, "deterministic_state": {"const": lifecycle_state}, "next_action": {"const": lifecycle_next}}, "required": ["status", "action", "result_digest", "deterministic_state", "next_action"], "additionalProperties": False},
         {"type": "object", "properties": {"status": {"const": "blocked"}, "action": {"const": action}, "blocker": {"type": "string"}, "deterministic_state": {"const": "blocked"}, "next_action": {"type": "string"}}, "required": ["status", "action", "blocker", "deterministic_state", "next_action"], "additionalProperties": False},
     ]}
 
@@ -217,14 +220,14 @@ class _HarnessWorkerSession(NativeWorkerSession):
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
         try:
             handle = self._thread.turn(prompt, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
-            return _HarnessWorkerTurn(handle, self._codex, request.action.value)
+            return _HarnessWorkerTurn(handle, self._codex, request.action)
         except Exception as error:
             _close(self._codex)
             raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 class _HarnessWorkerTurn(NativeWorkerTurn):
-    def __init__(self, handle: object, codex: object, action: str) -> None:
+    def __init__(self, handle: object, codex: object, action: WorkerAction) -> None:
         self._handle, self._codex, self._action, self._read = handle, codex, action, False
 
     def identity(self) -> str:
@@ -243,7 +246,7 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
             _close(self._codex)
 
 
-def _consume_public_result(handle: object, action: str) -> NativeWorkerResponse:
+def _consume_public_result(handle: object, action: WorkerAction) -> NativeWorkerResponse:
     """Consume the SDK stream without propagating SDK text or payloads."""
     try:
         stream = handle.stream()
@@ -269,10 +272,11 @@ def _consume_public_result(handle: object, action: str) -> NativeWorkerResponse:
         if not completed or response is None:
             return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
         parsed = json.loads(response)
-        if type(parsed) is not dict or parsed.get("action") != action or parsed.get("status") not in {"complete", "blocked"}:
+        lifecycle_state, _, lifecycle_next = expected_lifecycle(action)
+        if type(parsed) is not dict or parsed.get("action") != action.value or parsed.get("status") not in {"complete", "blocked"}:
             return NativeWorkerResponse(WorkerResultKind.INVALID)
         if parsed["status"] == "complete":
-            if set(parsed) != {"status", "action", "result_digest", "deterministic_state", "next_action"} or not all(type(parsed[key]) is str and _TOKEN.fullmatch(parsed[key]) for key in ("action", "deterministic_state", "next_action")) or not _DIGEST.fullmatch(parsed["result_digest"]):
+            if set(parsed) != {"status", "action", "result_digest", "deterministic_state", "next_action"} or parsed["deterministic_state"] != lifecycle_state or parsed["next_action"] != lifecycle_next or not _DIGEST.fullmatch(parsed["result_digest"]):
                 return NativeWorkerResponse(WorkerResultKind.INVALID)
             return NativeWorkerResponse(WorkerResultKind.ACCEPTED, parsed)
         if set(parsed) != {"status", "action", "blocker", "deterministic_state", "next_action"} or parsed["deterministic_state"] != "blocked" or not all(type(parsed[key]) is str and _TOKEN.fullmatch(parsed[key]) for key in ("action", "blocker", "deterministic_state", "next_action")):
@@ -293,7 +297,8 @@ def _close(value: object) -> None:
 
 def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> dict[str, object]:
     """Action-specific, immutable provider payload; never retained verbatim."""
-    return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools]}
+    state, blocker, next_action = expected_lifecycle(request.action)
+    return {"schema": "roundwright-worker-native/v1", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": [item.value for item in tools.tools], "expected_lifecycle": {"deterministic_state": state, "blocker": blocker, "next_action": next_action}}
 
 
 def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> WorkerQualificationResult:

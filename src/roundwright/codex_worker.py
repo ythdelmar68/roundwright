@@ -51,6 +51,19 @@ class WorkerResultKind(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
+def expected_lifecycle(action: WorkerAction) -> tuple[str, str | None, str]:
+    """The provider-neutral terminal projection for each Worker lifecycle role."""
+
+    if type(action) is not WorkerAction:
+        raise CodexWorkerError("Worker action is invalid")
+    values = {
+        WorkerAction.PLANNING: ("planning-complete", None, "supervisor-review"),
+        WorkerAction.IMPLEMENTATION: ("implementation-complete", None, "supervisor-review"),
+        WorkerAction.REPAIR: ("qualification-complete", None, "supervisor-review"),
+    }
+    return values[action]
+
+
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")

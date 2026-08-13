@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Callable, Mapping, Protocol
 
-from .codex_worker import CodexWorkerAdapter, CodexWorkerRequest, CodexWorkerResult, WorkerResultKind
+from .codex_worker import CodexWorkerAdapter, CodexWorkerRequest, CodexWorkerResult, WorkerResultKind, expected_lifecycle
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 
 WORKER_ADAPTER_PROFILE = "roundwright-shadow-profile/worker-adapter/v1"
@@ -26,6 +26,14 @@ _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 
 
 class WorkerShadowError(ValueError): pass
+
+
+class WorkerShadowMismatchError(WorkerShadowError):
+    """Safe diagnostic for a live mismatch; it never carries provider text."""
+
+    def __init__(self, comparison: "WorkerShadowComparison") -> None:
+        self.comparison = comparison
+        super().__init__("Worker Shadow observed lifecycle state differs: " + ",".join(comparison.differing_fields))
 
 
 class WorkerShadowDisposition(StrEnum):
@@ -174,6 +182,10 @@ class WorkerShadowComparison:
     def __post_init__(self) -> None:
         if type(self.disposition) is not WorkerShadowDisposition or not _digest(self.expected_digest) or not _digest(self.observed_digest) or type(self.differing_fields) is not tuple or any(not _token(value) for value in self.differing_fields): raise WorkerShadowError("Worker Shadow comparison is invalid")
 
+    def diagnostic(self) -> dict[str, object]:
+        """Public-safe mismatch result: field names and typed disposition only."""
+        return {"disposition": self.disposition.value, "differing_fields": self.differing_fields}
+
 
 @dataclass(frozen=True)
 class WorkerQualificationResult:
@@ -228,6 +240,8 @@ def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequ
     """One armed, bounded turn; never retries or starts a second Worker."""
     if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity) or (request.context.task_id, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.task_id, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest): raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
     if (adapter.profile_identity, adapter.runtime_fingerprint) != (binding.profile_identity, binding.runtime_fingerprint): raise WorkerShadowError("Worker qualification runtime identity has drifted")
+    if (binding.deterministic_state, binding.blocker, binding.next_action) != expected_lifecycle(request.action):
+        raise WorkerShadowError("Worker qualification deterministic lifecycle binding is invalid")
     try:
         recorder.prepare(store_identity=readiness.store_identity)
     except Exception as error:
@@ -239,7 +253,7 @@ def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequ
     expected = export_worker_shadow_envelope(request, result, provider_attempt_id=request.attempt_id, external_turn_identity=result.turn_identity, binding=binding, ready_at=readiness.ready_at, expected=True)
     comparison = compare_worker_shadow_envelopes(expected, observed)
     if comparison.disposition is not WorkerShadowDisposition.MATCH:
-        raise WorkerShadowError("Worker Shadow observed lifecycle state differs from the deterministic binding")
+        raise WorkerShadowMismatchError(comparison)
     record = record_worker_shadow_envelope(readiness, observed, recorder, case_id=binding.case_id)
     return WorkerQualificationResult(result, observed, record, comparison)
 

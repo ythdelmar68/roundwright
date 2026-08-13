@@ -15,7 +15,7 @@ from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapte
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
-from roundwright.worker_shadow import ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
+from roundwright.worker_shadow import ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
 
 
 def digest(value: object) -> str:
@@ -23,20 +23,20 @@ def digest(value: object) -> str:
 
 
 class Turn:
-    def __init__(self, events): self.events = events
+    def __init__(self, events, response): self.events, self.response = events, response
     def identity(self): return "turn-43"
-    def read_response(self): self.events.append("read"); return NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "qualification-complete", "next_action": "compare-shadow"})
+    def read_response(self): self.events.append("read"); return self.response
 
 
 class Session:
-    def __init__(self, events): self.events = events
+    def __init__(self, events, response): self.events, self.response = events, response
     def identity(self): return "thread-43"
-    def start_turn(self, _request, _tools): self.events.append("turn-start"); return Turn(self.events)
+    def start_turn(self, _request, _tools): self.events.append("turn-start"); return Turn(self.events, self.response)
 
 
 class Backend:
-    def __init__(self, events): self.events, self.calls = events, 0
-    def open_session(self, _profile, *, resume_session_identity): self.calls += 1; self.events.append(f"open:{resume_session_identity}"); return Session(self.events)
+    def __init__(self, events, response): self.events, self.calls, self.response = events, 0, response
+    def open_session(self, _profile, *, resume_session_identity): self.calls += 1; self.events.append(f"open:{resume_session_identity}"); return Session(self.events, self.response)
 
 
 class Recorder:
@@ -62,12 +62,12 @@ class WorkerShadowTests(unittest.TestCase):
         self.events = []
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        self.backend = Backend(self.events)
+        self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "implementation-complete", "next_action": "supervisor-review"}))
         self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="provider-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Qualify Worker", constraints=("No GitHub",), acceptance_criteria=("Structured result",), resume_session_identity=None), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"), store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "qualification-complete", None, "compare-shadow")
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
         return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"))
@@ -108,9 +108,10 @@ class WorkerShadowTests(unittest.TestCase):
         self.assertEqual((comparison.disposition, comparison.differing_fields), (WorkerShadowDisposition.MISMATCH, ("deterministic_state",)))
 
     def test_observed_lifecycle_mismatch_is_rejected_before_seal(self):
-        self.binding = replace(self.binding, deterministic_state="other-state")
-        with self.assertRaisesRegex(WorkerShadowError, "observed lifecycle"):
+        self.backend.response = NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation", "result_digest": digest("result"), "deterministic_state": "different-state", "next_action": "supervisor-review"})
+        with self.assertRaises(WorkerShadowMismatchError) as captured:
             self.qualify()
+        self.assertEqual(captured.exception.comparison.diagnostic(), {"disposition": "mismatch", "differing_fields": ("deterministic_state",)})
         self.assertFalse(any(isinstance(event, tuple) and event[0] == "seal" for event in self.events))
 
 

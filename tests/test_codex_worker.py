@@ -118,7 +118,32 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         events: list[str] = []
         turn = FakeTurn("turn-43", CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED), events)
         result = self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events), self.request(), events)
-        self.assertEqual((result.kind, result.failure), (WorkerResultKind.AMBIGUOUS, None))
+        self.assertEqual((result.kind, result.failure, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, None, "thread-43", "turn-43"))
+        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read", "abort", "close"])
+
+    def test_generic_read_failure_aborts_then_closes_once_without_a_second_turn(self) -> None:
+        events: list[str] = []
+        turn = FakeTurn("turn-43", RuntimeError("private transport detail"), events)
+        backend = FakeBackend(FakeSession("thread-43", turn, events))
+        result = self.dispatch(self.adapter(backend, events), self.request(), events)
+        self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, "thread-43", "turn-43"))
+        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read", "abort", "close"])
+        self.assertEqual(backend.resumes, [None])
+
+    def test_cleanup_failures_preserve_the_ambiguous_exact_turn(self) -> None:
+        events: list[str] = []
+        class FailingTurn(FakeTurn):
+            def abort(self):
+                self._events.append("abort")
+                raise RuntimeError("private cleanup detail")
+        class FailingSession(FakeSession):
+            def close(self):
+                self._events.append("close")
+                raise RuntimeError("private cleanup detail")
+        turn = FailingTurn("turn-43", RuntimeError("private provider detail"), events)
+        result = self.dispatch(self.adapter(FakeBackend(FailingSession("thread-43", turn, events)), events), self.request(), events)
+        self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, "thread-43", "turn-43"))
+        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read", "abort", "close"])
 
     def test_pre_session_failure_has_no_fabricated_turn_identity(self) -> None:
         events: list[str] = []

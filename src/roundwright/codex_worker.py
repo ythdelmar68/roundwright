@@ -394,8 +394,10 @@ class CodexWorkerAdapter:
         try:
             response = turn.read_response()
         except CodexAdapterError:
+            _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         except Exception:
+            _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         if type(response) is not NativeWorkerResponse:
             return CodexWorkerResult(WorkerResultKind.INVALID, session_identity, turn_identity, None, None, None, diagnostic=WorkerParserDiagnostic.SHAPE)

@@ -27,7 +27,10 @@ class Turn:
     def __init__(self, events, response): self.events, self.response = events, response
     def identity(self): return "turn-43"
     def abort(self): self.events.append("abort")
-    def read_response(self): self.events.append("read"); return self.response
+    def read_response(self):
+        self.events.append("read")
+        if isinstance(self.response, Exception): raise self.response
+        return self.response
 
 
 class Session:
@@ -151,6 +154,15 @@ class WorkerShadowTests(unittest.TestCase):
                     suffix = ":missing-or-unknown" if source is WorkerOutcomeSource.SDK_TURN_FAILED else ":"
                     self.assertIn(f"result:thread-43:turn-43:blocked::{source.value}{suffix}", self.events)
                 self.assertFalse(any(isinstance(event, tuple) and event[0] == "seal" for event in self.events))
+
+    def test_read_failure_keeps_exact_turn_ambiguous_and_never_seals(self):
+        self.backend.response = RuntimeError("private provider failure")
+        result = self.qualify()
+        self.assertEqual((result.result.kind, result.result.session_identity, result.result.turn_identity, result.record), (WorkerResultKind.AMBIGUOUS, "thread-43", "turn-43", None))
+        self.assertIn("abort", self.events)
+        self.assertIn("close", self.events)
+        self.assertLess(self.events.index("abort"), self.events.index("close"))
+        self.assertFalse(any(isinstance(event, tuple) and event[0] in {"seal", "verify"} for event in self.events))
 
 
 if __name__ == "__main__": unittest.main()

@@ -193,7 +193,10 @@ class CodexSupervisorAdapter:
             verdict, findings = _output(response.structured_output)
         except CodexSupervisorError:
             return CodexSupervisorResult(SupervisorResultKind.INVALID, session_identity, turn_identity, diagnostic=SupervisorDiagnostic.SHAPE)
-        return CodexSupervisorResult(SupervisorResultKind.ACCEPTED, session_identity, turn_identity, verdict, findings, _digest({"verdict": verdict.value, "findings": findings}))
+        # The native schema intentionally contains no ambient context.  Bind
+        # its parsed verdict to the persisted request here, so identical prose
+        # cannot be replayed across attempts, profiles, rounds, or candidates.
+        return CodexSupervisorResult(SupervisorResultKind.ACCEPTED, session_identity, turn_identity, verdict, findings, _digest({"input_digest": request.input_digest, "profile_identity": request.selected_profile_identity, "within_round_attempt": request.within_round_attempt, "candidate_sha": request.context.candidate_sha, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "verdict": verdict.value, "findings": findings}))
 
 
 @dataclass(frozen=True)

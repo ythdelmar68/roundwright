@@ -182,6 +182,8 @@ class InMemorySupervisorRuntimeStore:
     def __init__(self, source_identity: str) -> None:
         if not _DIGEST.fullmatch(source_identity): raise RuntimeBindingError("supervisor runtime source is invalid")
         self._source_identity = source_identity; self._records: dict[str, str] = {}
+    @property
+    def source_identity(self) -> str: return self._source_identity
     def persist(self, runtime: RuntimeBinding, *, candidate_sha: str, context_identity: str, ready_at: int, freshness_until: int) -> SupervisorRuntimeBindingReceipt:
         if type(runtime) is not RuntimeBinding or not _SHA.fullmatch(candidate_sha) or not _DIGEST.fullmatch(context_identity) or type(ready_at) is not int or type(freshness_until) is not int or freshness_until < ready_at:
             raise RuntimeBindingError("supervisor runtime persist is invalid")
@@ -214,6 +216,8 @@ class FileSupervisorRuntimeStore:
         candidate.mkdir(parents=True, exist_ok=True); resolved = candidate.resolve(strict=True)
         if candidate.is_symlink() or not resolved.is_dir(): raise RuntimeBindingError("supervisor runtime root is invalid")
         self._root = resolved; self._source_identity = source_identity
+    @property
+    def source_identity(self) -> str: return self._source_identity
 
     @staticmethod
     def _digest_material(material: str) -> str: return "sha256:" + hashlib.sha256(material.encode()).hexdigest()

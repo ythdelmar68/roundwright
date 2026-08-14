@@ -31,7 +31,7 @@ from .candidate_review import (
     record_diff_review,
     record_implementation_candidate,
 )
-from .configuration import RepositoryIdentity, ReviewPolicy, resolve_dispatch_configuration
+from .configuration import RepositoryIdentity, ReviewPolicy, TrustedReviewAuthorityReceipt, resolve_dispatch_configuration
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAdmission, execute_after_dependency_preflight
 from .gates import (
     EvidenceOutcome,
@@ -516,6 +516,7 @@ def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot
         home=repository.root,
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=trusted_review_floor,
+        trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(trusted_policy_snapshot, trusted_review_floor),
     )
 
 

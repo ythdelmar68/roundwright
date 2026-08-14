@@ -21,6 +21,7 @@ from roundwright.configuration import (
     ReviewDisposition,
     ReviewMode,
     ReviewOutcome,
+    TrustedReviewAuthorityReceipt,
     load_configuration,
     parse_cli_overrides,
     resolve_dispatch_configuration,
@@ -393,6 +394,7 @@ class ConfigurationTests(unittest.TestCase):
                 environment={},
                 trusted_policy_snapshot=snapshot,
                 trusted_review_floor=accepted_floor,
+                trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, accepted_floor),
             )
             self.assertEqual(resolved.trusted_review_floor, accepted_floor)
             self.assertNotEqual(resolved.resolved_digest, load_configuration(cwd=root, environment={}).resolved_digest)
@@ -402,18 +404,28 @@ class ConfigurationTests(unittest.TestCase):
                 environment={},
                 trusted_policy_snapshot=snapshot,
                 trusted_review_floor=changed_floor,
+                trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, changed_floor),
             )
             self.assertNotEqual(resolved.pin().digest, drifted.pin().digest)
+            with self.assertRaisesRegex(ConfigurationError, "authority receipt"):
+                resolve_dispatch_configuration(
+                    cwd=root,
+                    environment={},
+                    trusted_policy_snapshot=snapshot,
+                    trusted_review_floor=accepted_floor,
+                    trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, changed_floor),
+                )
             with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
-                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=None, trusted_review_floor=accepted_floor)
+                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=None, trusted_review_floor=accepted_floor, trusted_review_authority_receipt=None)
             with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
-                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=snapshot, trusted_review_floor=None)
+                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=snapshot, trusted_review_floor=None, trusted_review_authority_receipt=None)
             with self.assertRaisesRegex(ConfigurationError, "trusted policy floor"):
                 resolve_dispatch_configuration(
                     cwd=root,
                     environment={},
                     trusted_policy_snapshot=snapshot,
                     trusted_review_floor=baseline.__class__(4, 10, 3, baseline.on_final_findings),
+                    trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, baseline.__class__(4, 10, 3, baseline.on_final_findings)),
                 )
 
 

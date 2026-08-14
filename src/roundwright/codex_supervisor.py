@@ -23,6 +23,10 @@ class CodexSupervisorError(ValueError):
     """Raised when a Supervisor boundary would lose identity or authority."""
 
 
+class _CandidateBindingDrift(CodexSupervisorError):
+    """A schema-valid native result is bound to a different candidate."""
+
+
 class SupervisorVerdict(StrEnum):
     PASS = "pass"
     FINDINGS = "findings"
@@ -191,6 +195,8 @@ class CodexSupervisorAdapter:
             return CodexSupervisorResult(response.kind, session_identity, turn_identity, diagnostic=response.diagnostic)
         try:
             verdict, findings = _output(response.structured_output, request)
+        except _CandidateBindingDrift:
+            return CodexSupervisorResult(SupervisorResultKind.INVALID, session_identity, turn_identity, diagnostic=SupervisorDiagnostic.CANDIDATE)
         except CodexSupervisorError:
             return CodexSupervisorResult(SupervisorResultKind.INVALID, session_identity, turn_identity, diagnostic=SupervisorDiagnostic.SHAPE)
         # The native schema intentionally contains no ambient context.  Bind
@@ -241,6 +247,8 @@ def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dic
 
 def _output(value: object, request: CodexSupervisorRequest) -> tuple[SupervisorVerdict, tuple[str, ...]]:
     binding = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
+    if type(value) is dict and set(value) == {"verdict", "findings", "binding"} and type(value.get("binding")) is dict and set(value["binding"]) == set(binding) and value["binding"].get("candidate_sha") != binding["candidate_sha"]:
+        raise _CandidateBindingDrift("Supervisor output candidate has drifted")
     if type(value) is not dict or set(value) != {"verdict", "findings", "binding"} or type(value["verdict"]) is not str or type(value["findings"]) is not list or any(not _token(item) for item in value["findings"]) or value["binding"] != binding:
         raise CodexSupervisorError("Supervisor output is malformed")
     try:

@@ -22,7 +22,7 @@ from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorResultKind,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.configuration import ConfigurationError, ConfigurationSource, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewMode, ReviewPolicy, load_configuration, resolve_dispatch_configuration
+from roundwright.configuration import ConfigurationError, ConfigurationSource, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
@@ -79,7 +79,8 @@ class SupervisorTests(unittest.TestCase):
         self.events = []
         floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
         snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
-        self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor).pin()
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority).pin()
         self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
         self.profiles = (
             ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH, "primary"),
@@ -139,6 +140,52 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
         self.assertIn("closed", events)
 
+    def test_native_stream_rejections_advance_only_the_attempt_position(self):
+        """Native stream/parser failures are typed, bounded, and never sealed."""
+        def native_adapter(events, *, completed="completed", binding=None, text=None):
+            class Handle:
+                id = "turn-native-rejected"
+                def stream(self):
+                    stream = []
+                    response_text = getattr(self, "stream_text", text)
+                    if response_text is not None:
+                        stream.append({"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": response_text}}})
+                    stream.append({"method": "turn/completed", "payload": {"turn": {"id": binding if binding is not None else self.id, "status": completed}}})
+                    return iter(stream)
+            class Thread:
+                id = "session-native-rejected"
+                def turn(self, prompt, **kwargs):
+                    events.append(kwargs)
+                    if text == "__stale_candidate__":
+                        material = json.loads(prompt)["review_material"]
+                        Handle.stream_text = json.dumps({"verdict": "pass", "findings": [], "binding": {key: material[key] for key in ("input_digest", "within_round_attempt", "profile_identity")} | {"candidate_sha": "f" * 40}})
+                    return Handle()
+            class Codex:
+                def __enter__(self): return self
+                def __exit__(self, *_args): return None
+                def thread_start(self): return Thread()
+            profile = self.profiles[0]
+            audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
+            return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+
+        cases = (
+            ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None),
+            ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT),
+            ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE),
+            ("malformed-output", {"text": "not-json"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SYNTAX),
+            ("missing-result", {}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SHAPE),
+        )
+        for name, values, kind, diagnostic in cases:
+            with self.subTest(name=name):
+                events = []
+                primary = native_adapter(events, **values)
+                first = self.request(1, primary)
+                rejected = primary.dispatch(first, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((rejected.kind, rejected.diagnostic), (kind, diagnostic))
+                fallback = self.adapter(self.profiles[1], "native-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+                ordered = dispatch_ordered_supervisor_attempts((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, first.context.review_epoch, first.context.review_round, first.context.review_mode), ((primary.profile_identity, fallback.profile_identity), SupervisorResultKind.ACCEPTED, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
+
     def test_armed_capture_uses_one_plan_for_prepare_seal_and_readback(self):
         adapter = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
         request = self.request(1, adapter)
@@ -175,7 +222,7 @@ class SupervisorTests(unittest.TestCase):
 
     def trusted_receipt(self, binding, policy, readiness, *, ready_at=101, freshness_until=120):
         value = policy.policy
-        return TrustedReviewPolicyReceipt(readiness.producer_identity, readiness.exporter_identity, binding.candidate_sha, policy.configuration_digest, policy.policy_digest, policy.profile_identities, value.complete_rounds, value.max_rounds, value.max_supervisor_attempts_per_round, value.on_final_findings.value, ready_at, freshness_until)
+        return TrustedReviewPolicyReceipt(readiness.producer_identity, readiness.exporter_identity, binding.candidate_sha, policy.configuration_digest, policy.policy_digest, policy.profile_identities, value.complete_rounds, value.max_rounds, value.max_supervisor_attempts_per_round, value.on_final_findings.value, ready_at, freshness_until, policy.configuration.trusted_floor_authority_receipt_digest)
 
     def runtime_store(self):
         return InMemorySupervisorRuntimeStore(self.configuration.runtime_store_authority_identity)
@@ -610,14 +657,27 @@ class SupervisorTests(unittest.TestCase):
             def read(self, *_args, **_kwargs): raise AssertionError("runtime read must not run")
         with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=NeverStore(), trusted_policy_receipt=None, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((recorder.calls, self.events), ([], []))
-        receipt = self.trusted_receipt(binding, policy, readiness)
-        for field, value in (("source_identity", digest("self-minted-source")), ("authority_identity", digest("self-minted-authority")), ("candidate_sha", "d" * 40), ("attempt_budget", 1), ("freshness_until", 100)):
-            with self.subTest(field=field):
-                with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=NeverStore(), trusted_policy_receipt=replace(receipt, **{field: value}), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-        class WrongRuntimeSource(NeverStore):
-            source_identity = digest("self-minted-runtime-source")
-        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=WrongRuntimeSource(), trusted_policy_receipt=receipt, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
 
+    def test_sequence_rejects_joint_authority_and_clone_echo_before_downstream_calls(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),) + (NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 2)
+        counts = {name: 0 for name in ("prepare", "read_plan", "append", "finalize", "read")}
+        for name in counts:
+            original = getattr(lifecycle, name)
+            setattr(lifecycle, name, lambda *args, _name=name, _original=original, **kwargs: (counts.__setitem__(_name, counts[_name] + 1), _original(*args, **kwargs))[1])
+        class CloneEchoStore:
+            source_identity = policy.configuration.runtime_store_authority_identity
+            def persist(self, *_args, **_kwargs): raise AssertionError("must not persist")
+            def read(self, *_args, **_kwargs): raise AssertionError("must not read")
+        receipt = replace(self.trusted_receipt(binding, policy, readiness), authority_receipt_digest=digest("jointly-minted-authority"))
+        with self.assertRaises(SupervisorShadowError):
+            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=CloneEchoStore(), trusted_policy_receipt=receipt, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
+        receipt = self.trusted_receipt(binding, policy, readiness)
+        for field, value in (("source_identity", digest("self-minted-source")), ("authority_identity", digest("self-minted-authority")), ("authority_receipt_digest", digest("self-minted-receipt")), ("candidate_sha", "d" * 40), ("freshness_until", 100)):
+            with self.subTest(field=field):
+                with self.assertRaises(SupervisorShadowError):
+                    qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=replace(receipt, **{field: value}), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
     def test_sequence_runtime_read_preflight_failure_has_zero_adapter_calls(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         class ReadFailingStore:

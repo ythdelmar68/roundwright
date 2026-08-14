@@ -133,6 +133,63 @@ class ReviewPolicy:
 
 
 @dataclass(frozen=True)
+class TrustedReviewAuthorityReceipt:
+    """Independent control-plane binding for a dispatch-capable review floor.
+
+    The receipt deliberately carries the floor and the authorized durable
+    runtime source together.  Qualification must compare this immutable
+    binding with configuration and readiness; neither value may be learned
+    from a readiness object or a runtime-store response.
+    """
+
+    source_identity: str
+    authority_identity: str
+    policy_snapshot_digest: str
+    trusted_review_floor: ReviewPolicy
+    runtime_store_source_identity: str
+
+    def __post_init__(self) -> None:
+        if (not all(_is_digest(value) for value in (
+            self.source_identity, self.authority_identity,
+            self.policy_snapshot_digest, self.runtime_store_source_identity,
+        )) or type(self.trusted_review_floor) is not ReviewPolicy):
+            raise ConfigurationError("trusted review authority receipt is invalid")
+        self.trusted_review_floor.enforce_floor(self.trusted_review_floor)
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-trusted-review-authority/v1",
+            "source_identity": self.source_identity,
+            "authority_identity": self.authority_identity,
+            "policy_snapshot_digest": self.policy_snapshot_digest,
+            "trusted_review_floor": _review_policy_payload(self.trusted_review_floor),
+            "runtime_store_source_identity": self.runtime_store_source_identity,
+        }
+
+    @property
+    def receipt_digest(self) -> str:
+        return _digest(self.payload())
+
+    @classmethod
+    def from_snapshot(cls, snapshot: object, floor: object) -> "TrustedReviewAuthorityReceipt":
+        if not _is_trusted_review_floor_evidence(snapshot, floor):
+            raise ConfigurationError("trusted review policy evidence is unavailable")
+        assert type(snapshot) is TrustedPolicySnapshot
+        assert type(floor) is ReviewPolicy
+        source = "sha256:" + snapshot.source.source_fingerprint
+        authority = "sha256:" + snapshot.source.revision_fingerprint
+        policy_digest = "sha256:" + snapshot.policy_digest
+        runtime_source = _digest({
+            "schema": "roundwright-supervisor-runtime-store-authority/v2",
+            "source_identity": source,
+            "authority_identity": authority,
+            "policy_snapshot_digest": policy_digest,
+            "trusted_review_floor": _review_policy_payload(floor),
+        })
+        return cls(source, authority, policy_digest, floor, runtime_source)
+
+
+@dataclass(frozen=True)
 class ResolvedConfigurationBinding:
     """Immutable evidence pinned before dispatch, review, Shadow, or mutation."""
 
@@ -165,7 +222,8 @@ class ResolvedConfigurationBinding:
             self.review_policy.enforce_floor(self.trusted_review_floor)
             if self.review_policy.max_supervisor_attempts_per_round != len(self.supervisor_profile_identities): raise ValueError
             has_trusted_evidence = "trusted_floor_evidence" in material
-            if self.trusted_floor_evidence_required != has_trusted_evidence or (has_trusted_evidence and (type(material["trusted_floor_evidence"]) is not dict or set(material["trusted_floor_evidence"]) != {"source_identity", "authority_identity"} or not all(type(material["trusted_floor_evidence"][name]) is str and len(material["trusted_floor_evidence"][name]) == 71 and material["trusted_floor_evidence"][name].startswith("sha256:") and all(character in "0123456789abcdef" for character in material["trusted_floor_evidence"][name][7:]) for name in ("source_identity", "authority_identity")))): raise ValueError
+            trusted_keys = {"source_identity", "authority_identity", "policy_snapshot_digest", "runtime_store_source_identity", "authority_receipt_digest"}
+            if self.trusted_floor_evidence_required != has_trusted_evidence or (has_trusted_evidence and (type(material["trusted_floor_evidence"]) is not dict or set(material["trusted_floor_evidence"]) != trusted_keys or not all(_is_digest(material["trusted_floor_evidence"][name]) for name in trusted_keys))): raise ValueError
             object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
             object.__setattr__(self, "supervisor_profile_identities", tuple(self.supervisor_profile_identities))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -200,10 +258,14 @@ class ResolvedConfigurationBinding:
         return None if value is None else value["authority_identity"]
 
     @property
+    def trusted_floor_authority_receipt_digest(self) -> str | None:
+        value = json.loads(self.canonical_material).get("trusted_floor_evidence")
+        return None if value is None else value["authority_receipt_digest"]
+
+    @property
     def runtime_store_authority_identity(self) -> str | None:
-        if self.trusted_floor_source_identity is None or self.trusted_floor_authority_identity is None:
-            return None
-        return _digest({"schema": "roundwright-supervisor-runtime-store-authority/v1", "configuration_digest": self.digest, "trusted_floor_source_identity": self.trusted_floor_source_identity, "trusted_floor_authority_identity": self.trusted_floor_authority_identity})
+        value = json.loads(self.canonical_material).get("trusted_floor_evidence")
+        return None if value is None else value["runtime_store_source_identity"]
 
 
 @dataclass(frozen=True)
@@ -249,6 +311,7 @@ class Configuration:
     repository_configuration_root: Path | None = None
     trusted_review_floor: ReviewPolicy | None = None
     trusted_policy_snapshot: TrustedPolicySnapshot | None = None
+    trusted_review_authority_receipt: TrustedReviewAuthorityReceipt | None = None
 
     @property
     def repository(self) -> RepositoryIdentity | None:
@@ -304,12 +367,16 @@ class Configuration:
             "trusted_review_floor": _review_policy_payload(trusted_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         }
-        if self.trusted_policy_snapshot is not None:
-            if not _is_trusted_review_floor_evidence(self.trusted_policy_snapshot, trusted_floor):
+        if self.trusted_policy_snapshot is not None or self.trusted_review_authority_receipt is not None:
+            authority = self.trusted_review_authority_receipt
+            if authority is None or not _is_trusted_review_floor_evidence(self.trusted_policy_snapshot, trusted_floor) or authority != TrustedReviewAuthorityReceipt.from_snapshot(self.trusted_policy_snapshot, trusted_floor):
                 raise ConfigurationError("trusted review policy evidence is unavailable")
             material["trusted_floor_evidence"] = {
-                "source_identity": "sha256:" + self.trusted_policy_snapshot.source.source_fingerprint,
-                "authority_identity": "sha256:" + self.trusted_policy_snapshot.source.revision_fingerprint,
+                "source_identity": authority.source_identity,
+                "authority_identity": authority.authority_identity,
+                "policy_snapshot_digest": authority.policy_snapshot_digest,
+                "runtime_store_source_identity": authority.runtime_store_source_identity,
+                "authority_receipt_digest": authority.receipt_digest,
             }
         canonical_material = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return ResolvedConfigurationBinding(
@@ -430,11 +497,14 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     )
 
 
-def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_review_floor: object, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, platform: str | None = None, home: Path | None = None, git_binding: object | None = None, git_entrypoint_control: object | None = None) -> Configuration:
+def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_review_floor: object, trusted_review_authority_receipt: object | None = None, cwd: Path | None = None, environment: Mapping[str, str] | None = None, cli_values: Mapping[str, object] | None = None, user_config: Path | None = None, authoritative_repository_root: Path | None = None, platform: str | None = None, home: Path | None = None, git_binding: object | None = None, git_entrypoint_control: object | None = None) -> Configuration:
     """Resolve dispatch-capable configuration only under typed trusted control evidence."""
 
     if not _is_trusted_review_floor_evidence(trusted_policy_snapshot, trusted_review_floor):
         raise ConfigurationError("trusted review policy evidence is unavailable")
+    expected_authority = TrustedReviewAuthorityReceipt.from_snapshot(trusted_policy_snapshot, trusted_review_floor)
+    if type(trusted_review_authority_receipt) is not TrustedReviewAuthorityReceipt or trusted_review_authority_receipt != expected_authority:
+        raise ConfigurationError("trusted review authority receipt is unavailable")
     try:
         trusted_policy_snapshot.policy_digest
     except (AttributeError, TypeError, ValueError):
@@ -450,7 +520,7 @@ def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_r
         home=home,
         git_binding=git_binding,
         git_entrypoint_control=git_entrypoint_control,
-    ), trusted_policy_snapshot=trusted_policy_snapshot)
+    ), trusted_policy_snapshot=trusted_policy_snapshot, trusted_review_authority_receipt=trusted_review_authority_receipt)
 
 
 def _is_trusted_review_floor_evidence(snapshot: object, floor: object) -> bool:
@@ -807,6 +877,10 @@ def _review_policy_payload(policy: ReviewPolicy | None) -> dict[str, object] | N
 def _digest(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _is_digest(value: object) -> bool:
+    return type(value) is str and len(value) == 71 and value.startswith("sha256:") and all(character in "0123456789abcdef" for character in value[7:])
 
 
 def _environment_directory(environment: Mapping[str, str], name: str, fallback: Path) -> Path:

@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 from .configuration import Configuration
+from .dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationControl, ProviderQualificationReport, RoleBoundCodexCredentialStore, required_provider_selections
 from .provider_recovery import ProviderRole
 
@@ -61,6 +62,31 @@ class LiveProviderHealthFixtureResult:
             "retention_identity": "orchestrator-capture-required",
         }
         return {**payload, "manifest": {**manifest, "bundle_digest": _digest({"payload": payload, "manifest": manifest})}}
+
+
+def bind_harness_provider_qualification_control(contract: CodexHealthContract, configuration: Configuration, *, candidate_sha: str, now: int) -> ProviderQualificationControl:
+    """Adapt the pinned Harness three-value factory without ambient authority.
+
+    The Harness owns the native channel and exact runtime contract; the
+    candidate owns the dependency-policy control required by its stricter
+    fixture.  This creates one short-lived, candidate-bound bootstrap receipt
+    from those already-resolved identities, rather than weakening the fixture
+    or asking the immutable Harness to return candidate internals.
+    """
+    if type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(candidate_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", candidate_sha) is None or type(now) is not int or now < 0:
+        raise ProviderHealthError("live provider qualification binding is invalid")
+    binding = CandidateBinding("ythdelmar68/roundwright", "live-provider-health", candidate_sha)
+    digest = lambda value: _digest({"schema": "roundwright-live-provider-health-control/v1", "candidate": candidate_sha, "contract": contract.fingerprint, "configuration": configuration.resolved_digest, "value": value})
+    components = (
+        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "candidate-roundwright", digest("package-artifact"), digest("package-executable")),
+        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange("0.0.0", "1.0.0"), "harness-codex-sdk", digest("runtime-artifact"), digest("runtime-executable")),
+    )
+    policy = DependencyPolicy(binding, digest("policy"), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("reviewer"), authority_digest=digest("authority"))
+    policy = DependencyPolicy(binding, policy.policy_digest, now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
+    admission = TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("reviewer"), digest("authority"))
+    return ProviderQualificationControl(binding, DependencyExecutionControl(policy, observations, admission), now)
 
 
 def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, qualification_control: ProviderQualificationControl, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:

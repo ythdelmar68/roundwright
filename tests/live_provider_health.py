@@ -8,7 +8,7 @@ import sys
 import time
 from roundwright.configuration import Configuration
 from roundwright.provider_health import CodexHealthContract, ProviderQualificationControl, RoleBoundCodexCredentialStore
-from roundwright.provider_health_live import run_bounded_live_provider_health_fixture
+from roundwright.provider_health_live import bind_harness_provider_qualification_control, run_bounded_live_provider_health_fixture
 
 _SCHEMA = "roundwright-live-provider-health/v1"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -21,9 +21,13 @@ def main() -> int:
         factory_name, commit, case = os.environ["ROUNDWRIGHT_LIVE_PROVIDER_FACTORY"], os.environ["ROUNDWRIGHT_CONTRACT_COMMIT"], os.environ["ROUNDWRIGHT_SHADOW_CASE_ID"]
         candidate = os.environ.get("ROUNDWRIGHT_CANDIDATE_SHA") or None
         if not _FACTORY.fullmatch(factory_name) or not _COMMIT.fullmatch(commit) or not _CASE.fullmatch(case) or (candidate is not None and not _COMMIT.fullmatch(candidate)): raise ValueError
+        now = int(time.time())
         module, name = factory_name.split(":"); factory = getattr(importlib.import_module(module), name); value = factory()
-        if type(value) is not tuple or len(value) != 4 or type(value[0]) is not RoleBoundCodexCredentialStore or type(value[1]) is not CodexHealthContract or type(value[2]) is not Configuration or type(value[3]) is not ProviderQualificationControl or value[1].contract_commit != commit: raise ValueError
-        result = run_bounded_live_provider_health_fixture(*value, enabled=True, contract_commit=commit, candidate_sha=candidate, case_id=case, now=int(time.time()), freshness_seconds=60)
+        if type(value) is not tuple or len(value) not in {3, 4} or type(value[0]) is not RoleBoundCodexCredentialStore or type(value[1]) is not CodexHealthContract or type(value[2]) is not Configuration or value[1].contract_commit != commit: raise ValueError
+        if len(value) == 3:
+            value = (*value, bind_harness_provider_qualification_control(value[1], value[2], candidate_sha=candidate or commit, now=now))
+        if type(value[3]) is not ProviderQualificationControl: raise ValueError
+        result = run_bounded_live_provider_health_fixture(*value, enabled=True, contract_commit=commit, candidate_sha=candidate, case_id=case, now=now, freshness_seconds=60)
         evidence = result.owner_safe_evidence()
         sys.stdout.write(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"); return 0 if evidence["status"] == "ready" else 1
     except Exception:

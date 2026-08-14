@@ -32,6 +32,10 @@ def live_provider_factory():
     test = LiveFixtureTests(); store, configuration, _ = test.fixture()
     return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration, qualification_control()
 
+def three_value_live_provider_factory():
+    test = LiveFixtureTests(); store, configuration, _ = test.fixture()
+    return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration
+
 def blocked_live_provider_factory():
     test = LiveFixtureTests(); store, configuration, channels = test.fixture()
     channels[ProviderRole.WORKER][1].outcome = ProbeOutcome(False, CodexFailure.AUTH_EXPIRED)
@@ -144,3 +148,7 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=capture_time).outcome, ComparisonOutcome.MATCH)
         self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=capture_time + 10_000).outcome, ComparisonOutcome.INVALID)
         self.assertFalse(any(marker in lines[0].lower() for marker in ("secret-token", "c:/private", "payload", "_backend", "0x")))
+        output = io.StringIO()
+        env = {"ROUNDWRIGHT_RUN_LIVE_PROVIDER_HEALTH":"1", "ROUNDWRIGHT_LIVE_PROVIDER_FACTORY":"tests.test_provider_health_live:three_value_live_provider_factory", "ROUNDWRIGHT_CONTRACT_COMMIT":"b" * 40, "ROUNDWRIGHT_CANDIDATE_SHA":"c" * 40, "ROUNDWRIGHT_SHADOW_CASE_ID":"case-42-harness-three"}
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(output), mock.patch.object(live_harness.time, "time", return_value=100): self.assertEqual(live_harness.main(), 0)
+        self.assertEqual(json.loads(output.getvalue())["status"], "ready")

@@ -31,7 +31,7 @@ from .candidate_review import (
     record_diff_review,
     record_implementation_candidate,
 )
-from .configuration import RepositoryIdentity, ReviewPolicy, TrustedReviewAuthorityReceipt, resolve_dispatch_configuration
+from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy, TrustedReviewAuthorityReceipt, resolve_dispatch_configuration
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicy, DependencyPolicyError, DependencyStage, ObservedDependency, TrustedDependencyAdmission, execute_after_dependency_preflight
 from .gates import (
     EvidenceOutcome,
@@ -100,6 +100,9 @@ def run_once_local_slice(
     git_entrypoint_control: GitEntrypointControl,
     trusted_policy_snapshot: TrustedPolicySnapshot | None = None,
     trusted_review_floor: ReviewPolicy | None = None,
+    review_authority_expectation: ReviewAuthorityExpectation | None = None,
+    review_authority_store: FileReviewAuthorityStore | None = None,
+    review_authority_evidence: ReviewAuthorityEvidenceReceipt | None = None,
     candidate_dependency_evidence: Callable[[CandidateBinding], tuple[DependencyPolicy, Iterable[ObservedDependency]]] | None = None,
     trusted_dependency_admission: Callable[[CandidateBinding], TrustedDependencyAdmission] | None = None,
     candidate_validation: Callable[[CandidateBinding, VerificationKind], str] | None = None,
@@ -152,7 +155,7 @@ def run_once_local_slice(
         str(fixture.worktree.resolve(strict=False)),
         base_sha,
     )
-    configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor)
+    configuration = _local_configuration(repository, trusted_policy_snapshot, trusted_review_floor, review_authority_expectation, review_authority_store, review_authority_evidence, base_sha, epoch)
     runtime_binding = configuration.pin().runtime_binding()
     dispatch_control = _materialize_dispatch_control(candidate_dependency_evidence, trusted_dependency_admission, base_dependency_binding, epoch)
     database = check_database(repository)
@@ -505,8 +508,8 @@ def _health_context(context, identity, role, profile, now):
     )
 
 
-def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot: object, trusted_review_floor: object):
-    """Resolve the fixture configuration without invoking repository discovery commands."""
+def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot: object, trusted_review_floor: object, review_authority_expectation: object, review_authority_store: object, review_authority_evidence: object, candidate_sha: object, evidence_time: object):
+    """Consume caller-provisioned authority evidence; never mint it locally."""
 
     return resolve_dispatch_configuration(
         # A repo-local Python makes os.__file__ a descendant of the checkout.
@@ -516,7 +519,14 @@ def _local_configuration(repository: RepositoryIdentity, trusted_policy_snapshot
         home=repository.root,
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=trusted_review_floor,
-        trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(trusted_policy_snapshot, trusted_review_floor),
+        trusted_review_authority_receipt=None if type(review_authority_expectation) is not ReviewAuthorityExpectation else TrustedReviewAuthorityReceipt(
+            review_authority_expectation.source_identity, review_authority_expectation.authority_identity, review_authority_expectation.policy_snapshot_digest, review_authority_expectation.trusted_review_floor, review_authority_expectation.runtime_store_source_identity,
+        ),
+        review_authority_expectation=review_authority_expectation,
+        review_authority_store=review_authority_store,
+        review_authority_evidence=review_authority_evidence,
+        candidate_sha=candidate_sha,
+        evidence_time=evidence_time,
     )
 
 

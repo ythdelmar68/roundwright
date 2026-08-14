@@ -60,7 +60,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, r'''%s''')
-from roundwright.configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewPolicy
+from roundwright.configuration import FileReviewAuthorityStore, FinalFindingsPolicy, RepositoryIdentity, ReviewAuthorityExpectation, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration
 from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, DependencyStage, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.git_identity import GitEntrypointControl
 from roundwright.local_slice import LocalSliceFixture, render_local_slice_status, run_once_local_slice
@@ -108,6 +108,9 @@ def run_slice(value):
         git_entrypoint_control=git_entrypoint_control(value),
         trusted_policy_snapshot=trusted_policy_snapshot,
         trusted_review_floor=trusted_review_floor,
+        review_authority_expectation=local_expectation,
+        review_authority_store=local_authority_store,
+        review_authority_evidence=local_authority_evidence,
         candidate_dependency_evidence=candidate_dependency_evidence,
         trusted_dependency_admission=trusted_dependency_admission,
         candidate_validation=candidate_validation,
@@ -157,6 +160,11 @@ def no_credential(name, *args, **kwargs):
 os.getenv = no_credential
 repository = RepositoryIdentity.from_root(root)
 sealed_base = original_run(['git', '-C', str(root), 'rev-parse', 'refs/remotes/origin/main'], check=True, text=True, capture_output=True).stdout.strip()
+local_authority = TrustedReviewAuthorityReceipt.from_snapshot(trusted_policy_snapshot, trusted_review_floor)
+local_anchor = load_configuration(cwd=Path(repository.root.anchor), environment={}, home=repository.root, trusted_review_floor=trusted_review_floor).resolved_digest
+local_expectation = ReviewAuthorityExpectation(local_authority.source_identity, local_authority.authority_identity, local_authority.runtime_store_source_identity, local_authority.receipt_digest, local_authority.policy_snapshot_digest, trusted_review_floor, sealed_base, local_anchor, 1893456000, 1893456060)
+local_authority_store = FileReviewAuthorityStore(root.parent / 'review-authority', expectation=local_expectation)
+local_authority_evidence = local_authority_store.persist(local_authority, candidate_sha=sealed_base, configuration_anchor_digest=local_anchor, ready_at=1893456000, freshness_until=1893456060)
 def git_entrypoint_control(value):
     binding = CandidateBinding(value.repository_id, value.task_id, sealed_base)
     components = (

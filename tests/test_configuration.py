@@ -24,6 +24,7 @@ from roundwright.configuration import (
     ReviewPolicy,
     FileReviewAuthorityStore,
     ReviewAuthorityEvidenceReceipt,
+    ReviewAuthorityExpectation,
     TrustedReviewAuthorityReceipt,
     load_configuration,
     parse_cli_overrides,
@@ -392,22 +393,41 @@ class ConfigurationTests(unittest.TestCase):
             root = Path(temporary)
             baseline = load_configuration(cwd=root, environment={}).review_policy
             accepted_floor = baseline.__class__(2, 9, 2, baseline.on_final_findings)
+            def authority_inputs(floor):
+                authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+                anchor = load_configuration(cwd=root, environment={}, trusted_review_floor=floor).resolved_digest
+                expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, anchor, 10, 20)
+                store = FileReviewAuthorityStore(root / authority.receipt_digest.removeprefix("sha256:"), expectation=expectation)
+                evidence = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest=anchor, ready_at=10, freshness_until=20)
+                return authority, expectation, store, evidence
+            authority, expectation, store, evidence = authority_inputs(accepted_floor)
             resolved = resolve_dispatch_configuration(
                 cwd=root,
                 environment={},
                 trusted_policy_snapshot=snapshot,
                 trusted_review_floor=accepted_floor,
-                trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, accepted_floor),
+                trusted_review_authority_receipt=authority,
+                review_authority_expectation=expectation,
+                review_authority_store=store,
+                review_authority_evidence=evidence,
+                candidate_sha="c" * 40,
+                evidence_time=10,
             )
             self.assertEqual(resolved.trusted_review_floor, accepted_floor)
             self.assertNotEqual(resolved.resolved_digest, load_configuration(cwd=root, environment={}).resolved_digest)
             changed_floor = baseline.__class__(1, 8, 1, baseline.on_final_findings)
+            changed_authority, changed_expectation, changed_store, changed_evidence = authority_inputs(changed_floor)
             drifted = resolve_dispatch_configuration(
                 cwd=root,
                 environment={},
                 trusted_policy_snapshot=snapshot,
                 trusted_review_floor=changed_floor,
-                trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, changed_floor),
+                trusted_review_authority_receipt=changed_authority,
+                review_authority_expectation=changed_expectation,
+                review_authority_store=changed_store,
+                review_authority_evidence=changed_evidence,
+                candidate_sha="c" * 40,
+                evidence_time=10,
             )
             self.assertNotEqual(resolved.pin().digest, drifted.pin().digest)
             with self.assertRaisesRegex(ConfigurationError, "authority receipt"):
@@ -416,13 +436,18 @@ class ConfigurationTests(unittest.TestCase):
                     environment={},
                     trusted_policy_snapshot=snapshot,
                     trusted_review_floor=accepted_floor,
-                    trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, changed_floor),
+                    trusted_review_authority_receipt=changed_authority,
+                    review_authority_expectation=expectation,
+                    review_authority_store=store,
+                    review_authority_evidence=evidence,
+                    candidate_sha="c" * 40,
+                    evidence_time=10,
                 )
             with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
                 resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=None, trusted_review_floor=accepted_floor, trusted_review_authority_receipt=None)
             with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
                 resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=snapshot, trusted_review_floor=None, trusted_review_authority_receipt=None)
-            with self.assertRaisesRegex(ConfigurationError, "trusted policy floor"):
+            with self.assertRaisesRegex(ConfigurationError, "independent review authority evidence"):
                 resolve_dispatch_configuration(
                     cwd=root,
                     environment={},
@@ -437,10 +462,11 @@ class ConfigurationTests(unittest.TestCase):
         authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "authority"
-            store = FileReviewAuthorityStore(root, source_identity=authority.source_identity, authority_identity=authority.authority_identity, runtime_store_source_identity=authority.runtime_store_source_identity)
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+            store = FileReviewAuthorityStore(root, expectation=expectation)
             receipt = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest="sha256:" + "d" * 64, ready_at=10, freshness_until=20)
-            self.assertEqual(FileReviewAuthorityStore(root, source_identity=authority.source_identity, authority_identity=authority.authority_identity, runtime_store_source_identity=authority.runtime_store_source_identity).read(receipt, evidence_time=10), receipt)
-            self.assertIsNot(FileReviewAuthorityStore(root, source_identity=authority.source_identity, authority_identity=authority.authority_identity, runtime_store_source_identity=authority.runtime_store_source_identity).read(receipt, evidence_time=11), receipt)
+            self.assertEqual(FileReviewAuthorityStore(root, expectation=expectation).read(receipt, evidence_time=10), receipt)
+            self.assertIsNot(FileReviewAuthorityStore(root, expectation=expectation).read(receipt, evidence_time=11), receipt)
             path = store._path(receipt.record_identity)
             path.write_text('{"tampered":true}\n', encoding="utf-8")
             with self.assertRaises(ConfigurationError):

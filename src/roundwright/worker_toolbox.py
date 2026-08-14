@@ -37,6 +37,7 @@ from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .shadow import RecorderBinding
 from .worker_shadow import (
+    ExternalCapturePlanReceipt,
     ExternalRecorderReceipt,
     ExternalWorkerRecorder,
     WorkerQualificationBinding,
@@ -112,52 +113,58 @@ class HarnessExternalWorkerRecorder(ExternalWorkerRecorder):
         store_root: Path,
         store_identity: str,
         recorder: RecorderBinding,
-        record_document: Callable[[Mapping[str, Any], Path], object],
-        verify_recording: Callable[[Path, str], object],
+        prepare_capture: Callable[[Mapping[str, Any]], object],
+        record_capture: Callable[[Mapping[str, Any], Mapping[str, Any], Path], object],
+        verify_capture: Callable[[Mapping[str, Any], Path, str], object],
     ) -> None:
-        if not isinstance(store_root, Path) or type(store_identity) is not str or type(recorder) is not RecorderBinding or not callable(record_document) or not callable(verify_recording):
+        if not isinstance(store_root, Path) or type(store_identity) is not str or type(recorder) is not RecorderBinding or not callable(prepare_capture) or not callable(record_capture) or not callable(verify_capture):
             raise WorkerShadowError("reviewed external Recorder binding is invalid")
         self._store_root = store_root
         self._store_identity = store_identity
         self._recorder = recorder
-        self._record_document = record_document
-        self._verify_recording = verify_recording
+        self._prepare_capture = prepare_capture
+        self._record_capture = record_capture
+        self._verify_capture = verify_capture
 
     @classmethod
-    def from_reviewed_toolbox(cls, *, store_root: Path, store_identity: str, recorder: RecorderBinding, module_name: str = "roundwright_harness.recording") -> "HarnessExternalWorkerRecorder":
+    def from_reviewed_toolbox(cls, *, store_root: Path, store_identity: str, recorder: RecorderBinding, module_name: str = "roundwright_harness.capture") -> "HarnessExternalWorkerRecorder":
         """Load the reviewed Harness module only at the operational boundary."""
 
         try:
             module = importlib.import_module(module_name)
-            record_document = getattr(module, "record_document")
-            verify_recording = getattr(module, "verify_recording")
+            prepare_capture = getattr(module, "prepare_capture")
+            record_capture = getattr(module, "record_capture")
+            verify_capture = getattr(module, "verify_capture")
         except Exception as error:
             raise WorkerShadowError("reviewed external Recorder is unavailable") from error
-        return cls(store_root=store_root, store_identity=store_identity, recorder=recorder, record_document=record_document, verify_recording=verify_recording)
+        return cls(store_root=store_root, store_identity=store_identity, recorder=recorder, prepare_capture=prepare_capture, record_capture=record_capture, verify_capture=verify_capture)
 
-    def seal(self, document: Mapping[str, object], *, store_identity: str) -> ExternalRecorderReceipt:
+    def seal(self, plan: Mapping[str, object], document: Mapping[str, object], *, store_identity: str) -> ExternalRecorderReceipt:
         self._require_store(store_identity)
         try:
-            return self._receipt(self._record_document(document, self._store_root))
+            return self._receipt(self._record_capture(plan, document, self._store_root))
         except WorkerShadowError:
             raise
         except Exception as error:
             raise WorkerShadowError("reviewed external Recorder rejected the public evidence") from error
 
-    def prepare(self, *, store_identity: str) -> None:
+    def prepare(self, plan: Mapping[str, object], *, store_identity: str) -> ExternalCapturePlanReceipt:
         """Prove the selected external retention target is usable without sealing."""
         self._require_store(store_identity)
         try:
+            public = self._prepare_capture(plan).as_dict()
+            receipt = ExternalCapturePlanReceipt(public["plan_digest"], public["profile"], public["case_id"], public["candidate_sha"], public["ready_at"], public["receipt_digest"])
             parent = self._store_root.parent
             if not parent.is_dir() or (self._store_root.exists() and (self._store_root.is_symlink() or not self._store_root.is_dir())):
                 raise WorkerShadowError("external Recorder store is unavailable")
+            return receipt
         except OSError as error:
             raise WorkerShadowError("external Recorder store is unavailable") from error
 
-    def verify(self, bundle_digest: str, *, store_identity: str) -> ExternalRecorderReceipt:
+    def verify(self, plan: Mapping[str, object], bundle_digest: str, *, store_identity: str) -> ExternalRecorderReceipt:
         self._require_store(store_identity)
         try:
-            return self._receipt(self._verify_recording(self._store_root, bundle_digest))
+            return self._receipt(self._verify_capture(plan, self._store_root, bundle_digest))
         except WorkerShadowError:
             raise
         except Exception as error:
@@ -173,16 +180,16 @@ class HarnessExternalWorkerRecorder(ExternalWorkerRecorder):
             public = value.as_dict()  # type: ignore[union-attr]
             receipt = ExternalRecorderReceipt(
                 profile=public["profile"], case_id=public["case_id"], candidate_sha=public["candidate_sha"],
-                ready_at=public["ready_at"], evidence_digest=public["evidence_digest"], manifest_digest=public["manifest_digest"],
+                ready_at=public["ready_at"], capture_plan_digest=public["capture_plan_digest"], evidence_digest=public["evidence_digest"], manifest_digest=public["manifest_digest"],
                 bundle_digest=public["bundle_digest"], retention_identity=public["retention_identity"], receipt_digest=public["receipt_digest"],
             )
         except (AttributeError, KeyError, TypeError, WorkerShadowError) as error:
             raise WorkerShadowError("reviewed external Recorder receipt is invalid") from error
         core = {
-            "schema": "roundwright-harness-recording-receipt/v1", "status": "sealed", "evidence_schema": "roundwright-shadow-case/v2",
+            "schema": "roundwright-harness-bound-capture-receipt/v1", "status": "sealed", "capture_plan_digest": receipt.capture_plan_digest,
             "profile": receipt.profile, "case_id": receipt.case_id, "candidate_sha": receipt.candidate_sha, "ready_at": receipt.ready_at,
             "evidence_digest": receipt.evidence_digest, "manifest_digest": receipt.manifest_digest, "bundle_digest": receipt.bundle_digest,
-            "retention_identity": receipt.retention_identity,
+            "retention_identity": receipt.retention_identity, "recording_receipt_digest": public["recording_receipt_digest"],
         }
         if receipt.receipt_digest != _digest(core):
             raise WorkerShadowError("reviewed external Recorder receipt digest is invalid")

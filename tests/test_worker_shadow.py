@@ -16,7 +16,7 @@ from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapte
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
-from roundwright.worker_shadow import ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
+from roundwright.worker_shadow import ExternalCapturePlanReceipt, ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
 
 
 def digest(value: object) -> str:
@@ -47,17 +47,19 @@ class Backend:
 
 class Recorder:
     def __init__(self, events, *, fail=False): self.events, self.fail, self.receipt = events, fail, None
-    def prepare(self, *, store_identity):
-        self.events.append(("prepare", store_identity))
+    def prepare(self, plan, *, store_identity):
+        self.events.append(("prepare", digest(plan), store_identity))
         if self.fail: raise RuntimeError("unavailable")
-    def seal(self, document, *, store_identity):
-        self.events.append(("seal", document["ready_at"], store_identity))
+        core = {"schema": "roundwright-harness-capture-plan-receipt/v1", "status": "ready", "plan_digest": digest(plan), "profile": plan["profile"], "case_id": plan["case_id"], "candidate_sha": plan["candidate_sha"], "ready_at": plan["ready_at"]}
+        return ExternalCapturePlanReceipt(digest(plan), plan["profile"], plan["case_id"], plan["candidate_sha"], plan["ready_at"], digest(core))
+    def seal(self, plan, document, *, store_identity):
+        self.events.append(("seal", digest(plan), document["ready_at"], store_identity))
         if self.fail: raise RuntimeError("unavailable")
         evidence = digest(document)
-        self.receipt = ExternalRecorderReceipt(WORKER_ADAPTER_PROFILE, document["case_id"], document["candidate_sha"], document["ready_at"], evidence, digest("manifest"), digest("bundle"), digest({"store": store_identity}), digest("receipt"))
+        self.receipt = ExternalRecorderReceipt(WORKER_ADAPTER_PROFILE, document["case_id"], document["candidate_sha"], document["ready_at"], digest(plan), evidence, digest("manifest"), digest("bundle"), digest({"store": store_identity}), digest("receipt"))
         return self.receipt
-    def verify(self, bundle_digest, *, store_identity):
-        self.events.append(("verify", bundle_digest, store_identity))
+    def verify(self, plan, bundle_digest, *, store_identity):
+        self.events.append(("verify", digest(plan), bundle_digest, store_identity))
         if self.receipt is None or self.receipt.bundle_digest != bundle_digest: raise RuntimeError("missing")
         return self.receipt
 
@@ -72,8 +74,8 @@ class WorkerShadowTests(unittest.TestCase):
         self.adapter = CodexWorkerAdapter(self.backend, profile, audit, BoundedWorkerToolSurface(()))
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         self.request = CodexWorkerRequest("provider-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="provider-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Qualify Worker", constraints=("No GitHub",), acceptance_criteria=("Structured result",), resume_session_identity=None), context, "Qualify Worker", ("No GitHub",), ("Structured result",))
-        self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"), store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "implementation-complete", None, "supervisor-review")
+        self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, case_id="case-43", observation_identity=self.request.input_digest, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"), store_identity=digest("external-store"))
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, self.readiness.capture_plan_digest, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
         return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}:{'' if category is None else category.value}"))
@@ -84,12 +86,13 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_pre_dispatch_arming_and_exact_time_flow_through_turn_envelope_seal_and_readback(self):
         result = self.qualify()
-        self.assertEqual(self.events, [("prepare", self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted:::", ("seal", 101, self.readiness.store_identity), ("verify", digest("bundle"), self.readiness.store_identity)])
+        self.assertEqual(self.events, [("prepare", self.readiness.capture_plan_digest, self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted:::", ("seal", self.readiness.capture_plan_digest, 101, self.readiness.store_identity), ("verify", self.readiness.capture_plan_digest, digest("bundle"), self.readiness.store_identity)])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at, result.comparison.disposition), (101, 101, WorkerShadowDisposition.MATCH))
+        self.assertEqual(result.envelope.capture_plan_digest, self.readiness.capture_plan_digest)
         self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))
 
     def test_readiness_or_identity_drift_blocks_before_provider_call(self):
-        for invalid in (replace(self.readiness, candidate_sha="c" * 40, readiness_digest=""), replace(self.readiness, exporter_identity=digest("other"), readiness_digest=""), replace(self.binding, profile_identity=digest("other")), replace(self.binding, configuration_digest=digest("other")), replace(self.binding, attempt_id="other-attempt"), replace(self.binding, input_digest=digest("other")), replace(self.binding, resume_session_identity="other-thread"), replace(self.binding, source_digest=digest("other")), replace(self.binding, repository_fingerprint=digest("other")), replace(self.binding, worktree_fingerprint=digest("other")), replace(self.binding, branch_fingerprint=digest("other")), replace(self.binding, policy_fingerprint=digest("other"))):
+        for invalid in (replace(self.readiness, candidate_sha="c" * 40, capture_plan_digest="", readiness_digest=""), replace(self.readiness, exporter_identity=digest("other"), capture_plan_digest="", readiness_digest=""), replace(self.binding, profile_identity=digest("other")), replace(self.binding, configuration_digest=digest("other")), replace(self.binding, attempt_id="other-attempt"), replace(self.binding, input_digest=digest("other")), replace(self.binding, resume_session_identity="other-thread"), replace(self.binding, source_digest=digest("other")), replace(self.binding, repository_fingerprint=digest("other")), replace(self.binding, worktree_fingerprint=digest("other")), replace(self.binding, branch_fingerprint=digest("other")), replace(self.binding, policy_fingerprint=digest("other"))):
             with self.subTest(invalid=invalid):
                 self.events.clear(); self.backend.calls = 0
                 if isinstance(invalid, type(self.readiness)):
@@ -105,6 +108,17 @@ class WorkerShadowTests(unittest.TestCase):
             self.qualify(recorder=recorder)
         self.assertEqual(self.events[-1][0], "prepare")
         self.assertFalse(any(isinstance(event, tuple) and event[0] == "verify" for event in self.events))
+
+    def test_drifted_plan_receipt_blocks_before_provider_call(self):
+        class DriftRecorder(Recorder):
+            def prepare(inner, plan, *, store_identity):
+                receipt = super(DriftRecorder, inner).prepare(plan, store_identity=store_identity)
+                changed = {"schema": "roundwright-harness-capture-plan-receipt/v1", "status": "ready", "plan_digest": digest("other-plan"), "profile": receipt.profile, "case_id": receipt.case_id, "candidate_sha": receipt.candidate_sha, "ready_at": receipt.ready_at}
+                return ExternalCapturePlanReceipt(changed["plan_digest"], receipt.profile, receipt.case_id, receipt.candidate_sha, receipt.ready_at, digest(changed))
+        self.backend.calls = 0
+        with self.assertRaisesRegex(WorkerShadowError, "capture-plan receipt drifted"):
+            self.qualify(recorder=DriftRecorder(self.events))
+        self.assertEqual(self.backend.calls, 0)
 
     def test_same_thread_result_has_one_turn_and_deterministic_comparison(self):
         first = self.qualify()

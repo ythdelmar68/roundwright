@@ -29,14 +29,16 @@ Before provisioning, invocation, replay, or mutation:
    blob, qualification-contract blob, and public-safe evidence projection.
 5. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
-   `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52`. That canonical merge binds
-   Recorder content `87094a4e780c692a00135421840c0e6713af5d35` and tree
-   `0c594caa275262164fce1942ebd2142abe0e77bb` from reviewed Harness PR #4.
+   `1bb063d3f8f1fef9a24b3147b8bc99794e4637a7`. That canonical merge binds
+   capture-plan/Recorder content `cf669e186a739a8597cfaf9f050ce3bdcadda334`
+   and tree `632dcc3ecb3b8664de860844af2215ad5ade83e1` from reviewed
+   Harness PR #6.
    Use its repo-local locked uv environment and exact instructions from that
    commit. Never use floating `main`, install packages into global Python, or
    treat the toolbox as an authority source or credential store. The prior
-   `42830db90acbba499989cd434cdc46b4627042e2` pin is historical and cannot
-   substitute for a Recorder-selected gate.
+   Recorder merge `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52` and toolbox
+   merge `42830db90acbba499989cd434cdc46b4627042e2` are historical and
+   cannot substitute for a capture-plan-selected gate.
 6. When the route names a disposable target, bind
    `ythdelmar68/roundlet-forward-test` at baseline
    `4f39ef0e4e616eb896950d3756c433b624771a97`, its exact root instructions, the
@@ -58,6 +60,20 @@ and case schema, typed exporter and comparator identities, reviewed Recorder
 identity, append-only content-addressed store identity, and immutable capture
 time. The preflight must pass before the arm-before boundary; an unarmed
 ephemeral observation is prohibited.
+
+Construct exactly one closed `roundwright-harness-capture-plan/v1` document
+before dispatch. It binds the profile, case, exact candidate, immutable
+`ready_at`, producer, exporter, comparator, Recorder, store, and observation
+identities. Run the reviewed Harness `prepare-capture` operation and retain its
+path-free plan receipt. The readiness receipt, live dispatch, typed exporter,
+comparison, `record-capture`, and `verify-capture` operations must consume that
+same plan digest. Never rebuild or project a second ad hoc plan between stages.
+Any candidate, case, time, component, observation, or digest movement invalidates
+the plan before provider dispatch and requires a fresh bounded capture.
+Project that exact plan digest in curated public-safe readiness, result, and
+handoff GitHub trace events, and require semantic read-back before advancing
+Roundlet state. A missing trace receipt is a pending trace retry, not a reason
+to call the provider again or ask for repeated owner approval.
 
 For `roundwright-shadow-profile/provenance-decision/v1`, capture mode is
 `terminal-snapshot`. It may record only an exact stable terminal candidate after
@@ -86,6 +102,13 @@ authorizes an operation in the Roundwright repository.
   route. A matching standing value removes repetitive per-attempt owner
   approval; it does not waive any identity, credential, sandbox, or evidence
   check.
+- Treat authoritative `roundlet.enabled: true` as standing authorization for
+  Roundlet's ordinary curated public-safe GitHub lifecycle trace and semantic
+  read-back. Treat `allow_external_validation_read_only: true` as standing
+  authorization for a conforming leaf-selected public-safe read-only provider
+  observation. Neither requires a new candidate-specific owner prompt when all
+  immutable bindings reconcile; neither permits credentials, raw output,
+  mutation, publication, or a different route.
 - Reconcile the exact harness checkout and its tracked lock before use. Run
   `uv sync --locked`, credential-free doctor/tests, and any live command only
   as defined by the selected harness commit and leaf.

@@ -39,21 +39,41 @@ class Receipt:
         return {**core, "receipt_digest": digest(core)}
 
 
+class PlanReceipt:
+    def __init__(self, plan): self.plan, self.plan_digest = plan, digest(plan)
+    def as_dict(self):
+        core = {"schema": "roundwright-harness-capture-plan-receipt/v1", "status": "ready", "plan_digest": self.plan_digest, "profile": self.plan["profile"], "case_id": self.plan["case_id"], "candidate_sha": self.plan["candidate_sha"], "ready_at": self.plan["ready_at"]}
+        return {**core, "receipt_digest": digest(core)}
+
+
+class BoundReceipt:
+    def __init__(self, plan, recording): self.plan, self.recording = PlanReceipt(plan), recording
+    def as_dict(self):
+        recorded = self.recording.as_dict()
+        core = {"schema": "roundwright-harness-bound-capture-receipt/v1", "status": "sealed", "capture_plan_digest": self.plan.plan_digest, "profile": recorded["profile"], "case_id": recorded["case_id"], "candidate_sha": recorded["candidate_sha"], "ready_at": recorded["ready_at"], "evidence_digest": recorded["evidence_digest"], "manifest_digest": recorded["manifest_digest"], "bundle_digest": recorded["bundle_digest"], "retention_identity": recorded["retention_identity"], "recording_receipt_digest": recorded["receipt_digest"]}
+        return {**core, "receipt_digest": digest(core)}
+
+
 class TemporaryReviewedRecorder:
     """A disk-backed reviewed-Recorder contract, not a protocol mock."""
     def __init__(self): self.calls = []
-    def record_document(self, document, root):
+    def prepare_capture(self, plan):
+        self.calls.append("prepare")
+        return PlanReceipt(plan)
+    def record_capture(self, plan, document, root):
+        if document["capture_plan_digest"] != digest(plan): raise ValueError("plan mismatch")
         receipt = Receipt(document); root.mkdir(exist_ok=True)
         (root / (receipt.bundle_digest[7:] + ".json")).write_text(json.dumps(receipt.as_dict(), sort_keys=True), encoding="utf-8")
         self.calls.append("seal")
-        return receipt
-    def verify_recording(self, root, bundle_digest):
+        self._last_plan, self._last_document = plan, document
+        return BoundReceipt(plan, receipt)
+    def verify_capture(self, plan, root, bundle_digest):
         self.calls.append("verify")
         value = json.loads((root / (bundle_digest[7:] + ".json")).read_text(encoding="utf-8"))
         document = self.last_document
         receipt = Receipt(document)
-        if receipt.as_dict() != value: raise ValueError("read-back mismatch")
-        return receipt
+        if plan != self._last_plan or receipt.as_dict() != value: raise ValueError("read-back mismatch")
+        return BoundReceipt(plan, receipt)
     @property
     def last_document(self):
         # The public document is reconstructed from sealed content in a real
@@ -119,18 +139,15 @@ class WorkerToolboxTests(unittest.TestCase):
         self.audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(self.profile.model, self.profile.reasoning_effort.value),)), self.profile)
         context = CodexWorkerContext("task-43", *(digest(value) for value in ("source", "repo", "worktree", "branch", "base", "candidate", "policy", "config")))
         self.request = CodexWorkerRequest("attempt-43", WorkerAction.PLANNING, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.PLANNING, context=context, objective="Observe the supplied issue scope and plan a bounded repair.", constraints=("No provider tools or repository inspection.", "No GitHub or mutations."), acceptance_criteria=("Return the strict planning status and action.",), resume_session_identity=None), context, "Observe the supplied issue scope and plan a bounded repair.", ("No provider tools or repository inspection.", "No GitHub or mutations."), ("Return the strict planning status and action.",))
-        self.recorder_binding = RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb")
-        self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
-        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, "planning-complete", None, "supervisor-review")
+        self.recorder_binding = RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1")
+        self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, case_id="case-43", observation_identity=self.request.input_digest, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
+        self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, self.readiness.capture_plan_digest, "planning-complete", None, "supervisor-review")
 
     def test_concrete_bridge_checkpoints_then_seals_and_readbacks_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "external-store"
             service = TemporaryReviewedRecorder()
-            def record(document, store):
-                service.last_document = document
-                return service.record_document(document, store)
-            recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=record, verify_recording=service.verify_recording)
+            recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
             result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
         self.assertEqual(self.events[0], "enter")
@@ -151,16 +168,17 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["blocker"], {"type": ["string", "null"], "enum": [None, "provider-blocked"]})
         self.assertTrue({"allOf", "anyOf", "oneOf", "if", "then", "else"}.isdisjoint(schema))
         self.assertNotIn("const", json.dumps(schema))
-        self.assertEqual(service.calls, ["seal", "verify"])
+        self.assertEqual(service.calls, ["prepare", "seal", "verify"])
+        self.assertEqual(result.record.receipt.capture_plan_digest, self.readiness.capture_plan_digest)
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
         self.assertEqual((result.result.kind, result.result.output_fingerprint), ("accepted", digest({"status": "complete", "action": "planning"})))
         self.assertNotIn("Observe", json.dumps(result.record.receipt.__dict__))
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
-        self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.attempt_id, self.binding.input_digest, self.binding.resume_session_identity, self.binding.source_digest, self.binding.repository_fingerprint, self.binding.worktree_fingerprint, self.binding.branch_fingerprint, self.binding.policy_fingerprint, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
+        self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.attempt_id, self.binding.input_digest, self.binding.resume_session_identity, self.binding.source_digest, self.binding.repository_fingerprint, self.binding.worktree_fingerprint, self.binding.branch_fingerprint, self.binding.policy_fingerprint, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.capture_plan_digest, self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
         backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         with tempfile.TemporaryDirectory() as temporary:
-            recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=lambda *_: None, verify_recording=lambda *_: None)
+            recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=lambda *_: None, record_capture=lambda *_: None, verify_capture=lambda *_: None)
             with self.assertRaises(Exception):
                 run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e, _f: None)
         self.assertEqual(self.events, [])
@@ -359,13 +377,13 @@ class WorkerToolboxTests(unittest.TestCase):
             def thread_start(self, **_kwargs): return Thread()
         with tempfile.TemporaryDirectory() as temporary:
             service = TemporaryReviewedRecorder()
-            recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
+            recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
             backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
             result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
         self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
         self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None, None), events)
         self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
-        self.assertEqual(service.calls, [])
+        self.assertEqual(service.calls, ["prepare"])
         self.assertEqual(events.count("interrupt"), 1)
         self.assertEqual(events.count("client-close"), 1)
         self.assertLess(events.index("interrupt"), events.index("client-close"))
@@ -399,7 +417,7 @@ class WorkerToolboxTests(unittest.TestCase):
 
                 with tempfile.TemporaryDirectory() as temporary:
                     service = TemporaryReviewedRecorder()
-                    recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
+                    recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
                     backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
                     result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
 
@@ -411,7 +429,7 @@ class WorkerToolboxTests(unittest.TestCase):
                 self.assertEqual(events.count("interrupt"), 1)
                 self.assertEqual(events.count("client-close"), 1)
                 self.assertLess(events.index("interrupt"), events.index("client-close"))
-                self.assertEqual(service.calls, [])
+                self.assertEqual(service.calls, ["prepare"])
 
     def test_concrete_read_failures_abort_then_close_once_without_evidence(self):
         for name, failure in (("typed", CodexAdapterError(CodexFailure.UNKNOWN)), ("generic", RuntimeError("closed"))):
@@ -438,7 +456,7 @@ class WorkerToolboxTests(unittest.TestCase):
 
                 with tempfile.TemporaryDirectory() as temporary:
                     service = TemporaryReviewedRecorder()
-                    recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
+                    recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
                     backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
                     result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
 
@@ -449,7 +467,7 @@ class WorkerToolboxTests(unittest.TestCase):
                 self.assertLess(events.index("interrupt"), events.index("client-close"))
                 self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None, None), events)
                 self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
-                self.assertEqual(service.calls, [])
+                self.assertEqual(service.calls, ["prepare"])
 
     def test_concrete_success_closes_once_without_interrupt(self):
         events = []

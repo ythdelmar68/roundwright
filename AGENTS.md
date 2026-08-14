@@ -45,6 +45,16 @@ Before an immutable Roundwright N becomes mutation-capable, a separate owner-rev
 
 Release, tag, publish, version bump, repository visibility changes, force push, reset, rebase, and destruction of unique unmerged work remain prohibited.
 
+Within this repository, `roundlet.enabled: true` is standing authorization for
+Roundlet's ordinary reversible lifecycle operations, including curated
+public-safe GitHub trace publication and semantic read-back. The independent
+`allow_external_validation_read_only: true` switch is standing authorization
+for a conforming leaf-selected, candidate-bound, public-safe read-only provider
+observation. Once exact identity, route, policy, and capture-plan bindings
+reconcile, neither action needs fresh per-candidate owner approval. These
+meanings do not authorize raw provider output, credentials, hidden reasoning,
+publication, a different route, or any unlisted mutation.
+
 GitHub trace text must be curated and public-safe. Never post raw run artifacts, private evidence, credentials, internal owner reasoning, confidential source context, or private migration provenance. Missing, stale, conflicting, or unverifiable identity, authority, review, check, or read-back evidence fails closed.
 
 Roundlet runtime state remains local-only under `.roundlet/` in the authoritative checkout and must be excluded through local `.git/info/exclude`, not committed or added to repository-wide ignore rules.

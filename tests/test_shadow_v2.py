@@ -260,7 +260,7 @@ class ShadowV2Tests(unittest.TestCase):
         value["validation_toolchain"] = validation.public_payload()
         value["artifacts"] = {"candidate_source": {"source_identity": artifacts.source_identity, "digest": artifacts.source_digest}, "candidate_package": artifacts.package_digest, "installed_roundwright_entrypoint": artifacts.installed_entrypoint_digest, "reviewed_git_entrypoint": {"binding_fingerprint": git.binding_fingerprint, "identifier": git.identifier, "source_identity": git.source_identity, "source_class": git.source_class, "normalized_version": git.normalized_version, "reported_version": git.reported_version, "artifact_digest": git.artifact_digest, "executable_digest": git.executable_digest, "control_fingerprint": git.control_fingerprint}, "export_artifact_kinds": ["candidate-source", "candidate-package", "installed-roundwright-entrypoint", "reviewed-git-artifact", "reviewed-git-executable"]}
         value["dependency_control"] = {"binding_fingerprint": binding.fingerprint, "policy_fingerprint": dependency.policy.core_fingerprint, "observations": [{"component": item.component.value, "fingerprint": item.fingerprint} for item in sorted(dependency.observations, key=lambda item: item.component.value)], "admission": {"policy_fingerprint": dependency.admission.policy_fingerprint, "receipt_digest": dependency.admission.receipt_digest, "reviewer_identity": dependency.admission.reviewer_identity, "authority_digest": dependency.admission.authority_digest}}
-        recorder_digest = "sha256:" + hashlib.sha256(json.dumps({"harness_merge": "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "recorder_content": "87094a4e780c692a00135421840c0e6713af5d35", "harness_tree": "0c594caa275262164fce1942ebd2142abe0e77bb"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        recorder_digest = "sha256:" + hashlib.sha256(json.dumps({"harness_merge": "1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "recorder_content": "cf669e186a739a8597cfaf9f050ce3bdcadda334", "harness_tree": "632dcc3ecb3b8664de860844af2215ad5ade83e1"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         store_identity = "sha256:" + hashlib.sha256(json.dumps({"run_id": "ab8aea71a95647bdbe1e00e9d915d557", "contract_id": "contract-47", "candidate_sha": binding.candidate_sha, "profile": "roundwright-shadow-profile/provenance-decision/v1", "recorder_binding_digest": recorder_digest}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         value["recorder_store"] = {"profile": "roundwright-shadow-profile/provenance-decision/v1", "candidate_sha": binding.candidate_sha, "recorder_binding_digest": recorder_digest, "store_identity": store_identity, "retention_contract": "append-only-content-addressed-readback"}
         value["public_safe_projection"] = {"repository": binding.repository, "task_id": binding.task_id, "base_sha": "a" * 40, "candidate_sha": binding.candidate_sha, "candidate_tree": "c" * 40, "route": "toolbox", "case_schema": "roundwright-shadow-case/v2", "evidence_profile": "roundwright-shadow-profile/provenance-decision/v1", "capture_mode": "terminal-snapshot", "gate": "recorder-capture-readiness", "blocker": None, "next_action": "record-terminal-snapshot", "candidate_fingerprint": candidate_fingerprint, "validation_fingerprint": validation.projection_fingerprint, "dependency_fingerprint": dependency_fingerprint, "git_fingerprint": git.observation_fingerprint, "recorder_store_fingerprint": "sha256:" + hashlib.sha256(json.dumps(value["recorder_store"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
@@ -867,7 +867,7 @@ class ShadowV2Tests(unittest.TestCase):
         before_success = self.verified_store_snapshot(store)
         readiness = require_verified_provenance_capture_readiness(
             shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
-            RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+            RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"),
             candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=101, **export_authority,
         )
         self.assertIs(type(readiness), VerifiedCaptureReadinessReceipt)
@@ -877,7 +877,7 @@ class ShadowV2Tests(unittest.TestCase):
         readiness.verify()
         self.assertEqual(self.verified_store_snapshot(store), before_success)
         readiness.verify_against(
-            store, recorder=RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+            store, recorder=RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"),
             **export_authority,
         )
         with self.assertRaises(TypeError):
@@ -885,14 +885,14 @@ class ShadowV2Tests(unittest.TestCase):
         with self.assertRaises(ShadowV2Error):
             require_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), self.record(),
-                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"),
                 AppendOnlyEvidenceStore("fixture-store"), candidate_sha=record.candidate_sha, ready_at=101,
             )
         before = self.verified_store_snapshot(store)
         with self.assertRaises(ProvenanceRecordError):
             require_verified_provenance_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), store, decision,
-                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"),
                 candidate_sha=decision.candidate_sha, record_digest=record.record_digest, ready_at=102,
                 **export_authority,
             )
@@ -934,9 +934,9 @@ class ShadowV2Tests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         export_authority = self.export_authority(authority)
         recorder = RecorderBinding(
-            "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52",
-            "87094a4e780c692a00135421840c0e6713af5d35",
-            "0c594caa275262164fce1942ebd2142abe0e77bb",
+            "1bb063d3f8f1fef9a24b3147b8bc99794e4637a7",
+            "cf669e186a739a8597cfaf9f050ce3bdcadda334",
+            "632dcc3ecb3b8664de860844af2215ad5ade83e1",
         )
         decision = export_provenance_decision(
             store, candidate_sha=record.candidate_sha, record_digest=record.record_digest,
@@ -1017,9 +1017,9 @@ class ShadowV2Tests(unittest.TestCase):
             shadow_evidence_profile(PROVENANCE_DECISION_PROFILE),
             self.record(candidate=candidate, ready_at=ready_at),
             RecorderBinding(
-                "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52",
-                "87094a4e780c692a00135421840c0e6713af5d35",
-                "0c594caa275262164fce1942ebd2142abe0e77bb",
+                "1bb063d3f8f1fef9a24b3147b8bc99794e4637a7",
+                "cf669e186a739a8597cfaf9f050ce3bdcadda334",
+                "632dcc3ecb3b8664de860844af2215ad5ade83e1",
             ),
             AppendOnlyEvidenceStore("roundlet-provenance-retention"),
             candidate_sha=candidate,
@@ -1073,7 +1073,7 @@ class ShadowV2Tests(unittest.TestCase):
         with self.assertRaises(ShadowV2Error):
             _require_legacy_capture_readiness(
                 shadow_evidence_profile(PROVENANCE_DECISION_PROFILE), self.record(),
-                RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+                RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"),
                 AppendOnlyEvidenceStore("roundlet-provenance-retention"),
                 candidate_sha="c" * 40, ready_at=101,
             )
@@ -1156,7 +1156,7 @@ class ShadowV2Tests(unittest.TestCase):
         profile = self.lifecycle_profile() if profile is None else profile
         readiness = _require_legacy_capture_readiness(
             profile, decision,
-            RecorderBinding("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", "87094a4e780c692a00135421840c0e6713af5d35", "0c594caa275262164fce1942ebd2142abe0e77bb"),
+            RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"),
             AppendOnlyEvidenceStore("roundlet-provenance-retention"), candidate_sha="b" * 40, ready_at=101,
         )
         return ShadowV2Case(

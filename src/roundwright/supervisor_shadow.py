@@ -106,6 +106,7 @@ def compare_supervisor_envelopes(expected: SupervisorShadowEnvelope, observed: S
     return SupervisorShadowComparison(SupervisorShadowDisposition.MATCH if not fields else SupervisorShadowDisposition.MISMATCH, expected.envelope_digest, observed.envelope_digest, fields)
 
 def qualify_supervisor_attempt(adapter: CodexSupervisorAdapter, request: CodexSupervisorRequest, readiness: SupervisorShadowReadiness, binding: SupervisorQualificationBinding, recorder: ExternalSupervisorRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorQualificationResult:
+    raise SupervisorShadowError("Supervisor single-attempt qualification is disabled; use qualify_supervisor_sequence")
     if type(adapter) is not CodexSupervisorAdapter or type(request) is not CodexSupervisorRequest or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.case_id, readiness.observation_identity, readiness.capture_plan_digest) != (binding.candidate_sha, binding.case_id, binding.input_digest, binding.capture_plan_digest) or (adapter.profile_identity, adapter.runtime_fingerprint) != (binding.profile_identity, binding.runtime_fingerprint): raise SupervisorShadowError("Supervisor qualification pre-dispatch binding is invalid")
     try: prepared = recorder.prepare(readiness.capture_plan(), store_identity=readiness.store_identity)
     except Exception as error: raise SupervisorShadowError("Supervisor Recorder pre-dispatch readiness is invalid") from error
@@ -267,12 +268,12 @@ class CompleteSupervisorLifecycleRecord:
 
 
 class ExternalSupervisorLifecycle(Protocol):
-    """Append/read an immutable expected contract before provider events."""
-
-    def prepare_expected(self, expected: SupervisorExpectedLifecycle) -> SupervisorExpectedLifecycleReceipt: ...
-    def read_expected(self, receipt: SupervisorExpectedLifecycleReceipt) -> SupervisorExpectedLifecycle: ...
-    def persist(self, record_identity: str, observation_identity: str, attempts: tuple["SupervisorSequenceAttempt", ...], result: SupervisorFailoverResult) -> None: ...
-    def read(self, record_identity: str) -> tuple[str, tuple["SupervisorSequenceAttempt", ...], SupervisorFailoverResult]: ...
+    """Receipt-bound durable lifecycle protocol used by ordered qualification."""
+    def prepare(self, plan: SupervisorExpectedLifecycle, *, freshness_until: int) -> LifecycleChainReceipt: ...
+    def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt: ...
+    def finalize(self, record_identity: str, terminal: SupervisorTerminalRecord, *, evidence_time: int) -> LifecycleChainReceipt: ...
+    def read_plan(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt]: ...
+    def read(self, record_identity: str, *, evidence_time: int) -> CompleteSupervisorLifecycleRecord: ...
 
 class InMemorySupervisorLifecycle:
     """Provider-free append-only canonical lifecycle chain for qualification tests."""
@@ -310,6 +311,14 @@ class InMemorySupervisorLifecycle:
         content = _hash(plan.payload()); receipt = LifecycleChainReceipt(binding, content, _hash({"genesis": binding.binding_digest}), 0)
         self._records[record_identity] = {"plan": self._material(plan.payload()), "receipt": self._material(receipt.payload()), "events": [], "terminal": None}
         return receipt
+    def read_plan(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt]:
+        record = self._records.get(record_identity)
+        if record is None: raise SupervisorShadowError("Supervisor lifecycle plan is missing")
+        plan = self._plan(record["plan"]); stored_receipt = self._receipt(record["receipt"])
+        binding = self._binding(plan, stored_receipt.freshness_until); self._evidence_time(binding, evidence_time)
+        receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
+        if stored_receipt != receipt or binding.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle plan receipt was tampered")
+        return plan, receipt
     def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
         record = self._records.get(record_identity)
         if record is None or record["terminal"] is not None or type(event) is not SupervisorAttemptEvent or event.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle append is invalid")
@@ -336,10 +345,7 @@ class InMemorySupervisorLifecycle:
     def read_chain(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], SupervisorTerminalRecord, LifecycleChainReceipt]:
         record = self._records.get(record_identity)
         if record is None or record["terminal"] is None: raise SupervisorShadowError("Supervisor lifecycle read is incomplete")
-        plan = self._plan(record["plan"]); stored_plan_receipt = self._receipt(record["receipt"])
-        binding = self._binding(plan, stored_plan_receipt.freshness_until); self._evidence_time(binding, evidence_time)
-        plan_receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
-        if stored_plan_receipt != plan_receipt or binding.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle plan receipt was tampered")
+        plan, plan_receipt = self.read_plan(record_identity, evidence_time=evidence_time); binding = plan_receipt.binding
         events = record["events"]; terminal = record["terminal"]
         if type(events) is not list or type(terminal) is not tuple or len(terminal) != 2: raise SupervisorShadowError("Supervisor lifecycle read is invalid")
         rebuilt: list[SupervisorAttemptEvent] = []; previous = plan_receipt
@@ -442,20 +448,29 @@ def compare_supervisor_sequences(expected: SupervisorSequenceEnvelope, observed:
     return SupervisorShadowComparison(SupervisorShadowDisposition.MATCH if not fields else SupervisorShadowDisposition.MISMATCH, expected.envelope_digest, observed.envelope_digest, fields)
 
 
-def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
+def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> SupervisorSequenceEnvelope:
+    plan = record.expected_plan; binding = plan.binding
+    attempts = tuple(SupervisorSequenceAttempt(event.ordinal, event.profile_identity, event.request_identity, event.result_kind, event.result_identity, event.verdict) for event in record.events)
+    if record.terminal.terminal == "accepted":
+        accepted = attempts[-1]
+        return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.ACCEPTED, attempts, accepted.ordinal, record.terminal.accepted_result_identity, accepted.verdict, None, "apply-bound-review-result")
+    return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
+
+
+def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, evidence_time: int, freshness_until: int, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
     """Capture exactly one terminal product failover sequence under one plan."""
-    if type(adapters) is not tuple or type(requests) is not tuple or not adapters or len(adapters) != len(requests) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or not callable(getattr(lifecycle, "prepare_expected", None)) or not callable(getattr(lifecycle, "read_expected", None)) or not callable(getattr(lifecycle, "persist", None)) or not callable(getattr(lifecycle, "read", None)) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn):
+    if type(adapters) is not tuple or type(requests) is not tuple or not adapters or len(adapters) != len(requests) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or not all(callable(getattr(lifecycle, name, None)) for name in ("prepare", "append", "finalize", "read_plan", "read")) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn) or type(evidence_time) is not int or type(freshness_until) is not int or freshness_until < evidence_time:
         raise SupervisorShadowError("Supervisor sequence pre-dispatch binding is invalid")
     context = requests[0].context
     if any(request.context != context or request.within_round_attempt != ordinal for ordinal, request in enumerate(requests, start=1)) or (context.task_id, context.base_sha, context.candidate_sha, context.review_epoch, context.review_round, context.review_mode.value) != (binding.task_id, binding.base_sha, binding.candidate_sha, binding.review_epoch, binding.review_round, binding.review_mode) or tuple(request.input_digest for request in requests) != binding.request_identities or tuple(request.selected_profile_identity for request in requests) != binding.profile_identities or tuple(adapter.profile_identity for adapter in adapters) != binding.profile_identities or tuple(adapter.runtime_fingerprint for adapter in adapters) != binding.runtime_fingerprints or (context.policy_digest, context.configuration_digest, binding.profile_identities, len(requests), context.review_mode) != (resolved_policy.policy_digest, resolved_policy.configuration_digest, resolved_policy.profile_identities, resolved_policy.policy.max_supervisor_attempts_per_round, resolved_policy.policy.mode_for_round(context.review_round)) or (readiness.candidate_sha, readiness.case_id, readiness.capture_plan_digest, readiness.observation_identity) != (binding.candidate_sha, binding.case_id, binding.capture_plan_digest, supervisor_sequence_observation_identity(requests)):
         raise SupervisorShadowError("Supervisor sequence context has drifted")
     expected_plan = SupervisorExpectedLifecycle(binding, resolved_policy.policy_digest, resolved_policy.configuration_digest, _hash(resolved_policy.runtime.complete_columns()), readiness.ready_at, readiness.observation_identity)
     try:
-        expected_receipt = lifecycle.prepare_expected(expected_plan)
-        expected_readback = lifecycle.read_expected(expected_receipt)
+        expected_receipt = lifecycle.prepare(expected_plan, freshness_until=freshness_until)
+        expected_readback, authenticated_receipt = lifecycle.read_plan(expected_receipt.record_identity, evidence_time=evidence_time)
     except Exception as error:
         raise SupervisorShadowError("Supervisor expected lifecycle pre-dispatch read-back failed") from error
-    if expected_readback != expected_plan or (expected_receipt.source_identity, expected_receipt.candidate_sha, expected_receipt.capture_plan_digest, expected_receipt.observation_identity, expected_receipt.ready_at) != (expected_plan.source_identity, binding.candidate_sha, binding.capture_plan_digest, readiness.observation_identity, readiness.ready_at) or expected_receipt.record_digest != _hash(expected_plan.payload()):
+    if expected_readback != expected_plan or authenticated_receipt != expected_receipt or (expected_receipt.candidate_sha, expected_receipt.capture_plan_digest, expected_receipt.observation_identity, expected_receipt.ready_at) != (binding.candidate_sha, binding.capture_plan_digest, readiness.observation_identity, readiness.ready_at):
         raise SupervisorShadowError("Supervisor expected lifecycle pre-dispatch drifted")
     try:
         prepared = recorder.prepare(readiness.capture_plan(), store_identity=readiness.store_identity)
@@ -463,16 +478,23 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         raise SupervisorShadowError("Supervisor sequence Recorder pre-dispatch readiness is invalid") from error
     if (prepared.plan_digest, prepared.profile, prepared.case_id, prepared.candidate_sha, prepared.ready_at) != (readiness.capture_plan_digest, SUPERVISOR_FAILOVER_PROFILE, readiness.case_id, readiness.candidate_sha, readiness.ready_at):
         raise SupervisorShadowError("Supervisor sequence capture-plan receipt drifted")
-    observed_attempts: list[SupervisorSequenceAttempt] = []
-    failover = dispatch_ordered_supervisor_attempts(requests, adapters, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=lambda ordinal, request, result: observed_attempts.append(_sequence_attempt(ordinal, request, result)))
+    observed_attempts: list[SupervisorSequenceAttempt] = []; prior = expected_receipt
+    def checkpoint_result(ordinal: int, request: CodexSupervisorRequest, result: CodexSupervisorResult) -> None:
+        nonlocal prior
+        observed = _sequence_attempt(ordinal, request, result); observed_attempts.append(observed)
+        event = SupervisorAttemptEvent(expected_receipt.record_identity, expected_receipt.source_identity, expected_receipt.observation_identity, expected_receipt.candidate_sha, expected_receipt.context_identity, expected_receipt.plan_identity, expected_receipt.capture_plan_digest, ordinal, prior.receipt_digest, request.input_digest, request.selected_profile_identity, adapters[ordinal - 1].runtime_fingerprint, result.kind.value, observed.result_identity, observed.result_identity if result.kind is SupervisorResultKind.ACCEPTED else None, observed.verdict, expected_receipt.ready_at, expected_receipt.freshness_until)
+        try: prior = lifecycle.append(expected_receipt.record_identity, event, evidence_time=evidence_time)
+        except Exception as error: raise SupervisorShadowError("Supervisor durable lifecycle append failed") from error
+    failover = dispatch_ordered_supervisor_attempts(requests, adapters, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
     attempts = tuple(observed_attempts)
-    lifecycle_identity = supervisor_sequence_lifecycle_identity(binding)
     try:
-        lifecycle.persist(lifecycle_identity, readiness.observation_identity, attempts, failover)
-        read_identity, lifecycle_attempts, lifecycle_failover = lifecycle.read(lifecycle_identity)
+        accepted = failover.result is not None
+        terminal = SupervisorTerminalRecord(expected_receipt.record_identity, expected_receipt.source_identity, expected_receipt.observation_identity, expected_receipt.candidate_sha, expected_receipt.context_identity, expected_receipt.plan_identity, expected_receipt.capture_plan_digest, prior.receipt_digest, len(attempts), "accepted" if accepted else "exhausted", attempts[-1].result_identity if accepted else None, None if accepted else "attempt-budget-exhausted", "apply-bound-review-result" if accepted else "retain-terminal-product-block", expected_receipt.ready_at)
+        lifecycle.finalize(expected_receipt.record_identity, terminal, evidence_time=evidence_time)
+        durable_record = lifecycle.read(expected_receipt.record_identity, evidence_time=evidence_time)
     except Exception as error:
         raise SupervisorShadowError("Supervisor durable lifecycle read-back failed") from error
-    expected = derive_expected_supervisor_sequence(binding, resolved_policy, lifecycle_attempts, lifecycle_failover, read_identity)
+    expected = _durable_sequence_envelope(durable_record)
     observed = export_supervisor_sequence(binding, attempts, failover)
     comparison = compare_supervisor_sequences(expected, observed)
     if comparison.disposition is not SupervisorShadowDisposition.MATCH:

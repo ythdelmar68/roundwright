@@ -253,6 +253,26 @@ class SupervisorLifecycleChainBinding:
     @property
     def binding_digest(self) -> str: return _hash(self.payload())
 
+
+@dataclass(frozen=True)
+class TrustedReviewPolicyReceipt:
+    """Independent, canonical policy-floor evidence required for Supervisor work."""
+    source_identity: str; authority_identity: str; candidate_sha: str; configuration_digest: str; policy_digest: str; supervisor_profile_identities: tuple[str, ...]; complete_rounds: int; max_rounds: int; attempt_budget: int; on_final_findings: str; ready_at: int; freshness_until: int
+    def __post_init__(self) -> None:
+        if not all(_digest(value) for value in (self.source_identity, self.authority_identity, self.configuration_digest, self.policy_digest)) or not _SHA.fullmatch(self.candidate_sha) or type(self.supervisor_profile_identities) is not tuple or not self.supervisor_profile_identities or len(set(self.supervisor_profile_identities)) != len(self.supervisor_profile_identities) or any(not _digest(value) for value in self.supervisor_profile_identities) or type(self.complete_rounds) is not int or type(self.max_rounds) is not int or type(self.attempt_budget) is not int or self.complete_rounds < 1 or self.max_rounds < self.complete_rounds or self.attempt_budget != len(self.supervisor_profile_identities) or self.on_final_findings != "worker-final-repair-then-merge" or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.ready_at < 0 or self.freshness_until < self.ready_at:
+            raise SupervisorShadowError("Trusted review policy receipt is invalid")
+    def payload(self) -> dict[str, object]: return {"schema": "roundwright-trusted-review-policy-receipt/v1", "source_identity": self.source_identity, "authority_identity": self.authority_identity, "candidate_sha": self.candidate_sha, "configuration_digest": self.configuration_digest, "policy_digest": self.policy_digest, "supervisor_profile_identities": list(self.supervisor_profile_identities), "complete_rounds": self.complete_rounds, "max_rounds": self.max_rounds, "attempt_budget": self.attempt_budget, "on_final_findings": self.on_final_findings, "ready_at": self.ready_at, "freshness_until": self.freshness_until}
+    @property
+    def receipt_digest(self) -> str: return _hash(self.payload())
+    @classmethod
+    def from_canonical(cls, material: object) -> "TrustedReviewPolicyReceipt":
+        if type(material) is not str: raise SupervisorShadowError("Trusted review policy receipt material is invalid")
+        try:
+            payload = json.loads(material); expected = {"schema", "source_identity", "authority_identity", "candidate_sha", "configuration_digest", "policy_digest", "supervisor_profile_identities", "complete_rounds", "max_rounds", "attempt_budget", "on_final_findings", "ready_at", "freshness_until"}
+            if type(payload) is not dict or set(payload) != expected or payload["schema"] != "roundwright-trusted-review-policy-receipt/v1" or json.dumps(payload, sort_keys=True, separators=(",", ":")) != material: raise ValueError
+            return cls(payload["source_identity"], payload["authority_identity"], payload["candidate_sha"], payload["configuration_digest"], payload["policy_digest"], tuple(payload["supervisor_profile_identities"]), payload["complete_rounds"], payload["max_rounds"], payload["attempt_budget"], payload["on_final_findings"], payload["ready_at"], payload["freshness_until"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error: raise SupervisorShadowError("Trusted review policy receipt material is invalid") from error
+
 @dataclass(frozen=True)
 class CompleteSupervisorLifecycleRecord:
     expected_plan: SupervisorExpectedLifecycle; plan_receipt: LifecycleChainReceipt; events: tuple[SupervisorAttemptEvent, ...]; terminal: SupervisorTerminalRecord; terminal_receipt: LifecycleChainReceipt
@@ -654,7 +674,7 @@ def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> Sup
     return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
 
 
-def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, evidence_time: int, freshness_until: int, runtime_store: ExternalSupervisorRuntimeStore, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
+def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, evidence_time: int, freshness_until: int, runtime_store: ExternalSupervisorRuntimeStore, trusted_policy_receipt: TrustedReviewPolicyReceipt, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
     """Capture exactly one terminal product failover sequence under one plan."""
     if type(adapters) is not tuple or type(requests) is not tuple or not adapters or len(adapters) != len(requests) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or not all(callable(getattr(lifecycle, name, None)) for name in ("prepare", "append", "finalize", "read_plan", "read")) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn) or type(evidence_time) is not int or type(freshness_until) is not int or freshness_until < evidence_time:
         raise SupervisorShadowError("Supervisor sequence pre-dispatch binding is invalid")
@@ -664,6 +684,11 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
     if not callable(getattr(runtime_store, "persist", None)) or not callable(getattr(runtime_store, "read", None)):
         raise SupervisorShadowError("Supervisor runtime preflight is invalid")
     try:
+        if type(trusted_policy_receipt) is not TrustedReviewPolicyReceipt or trusted_policy_receipt.source_identity == resolved_policy.configuration_digest or not trusted_policy_receipt.ready_at <= evidence_time <= trusted_policy_receipt.freshness_until or (trusted_policy_receipt.candidate_sha, trusted_policy_receipt.configuration_digest, trusted_policy_receipt.policy_digest, trusted_policy_receipt.supervisor_profile_identities, trusted_policy_receipt.complete_rounds, trusted_policy_receipt.max_rounds, trusted_policy_receipt.attempt_budget, trusted_policy_receipt.on_final_findings) != (binding.candidate_sha, resolved_policy.configuration_digest, resolved_policy.policy_digest, resolved_policy.profile_identities, resolved_policy.policy.complete_rounds, resolved_policy.policy.max_rounds, resolved_policy.policy.max_supervisor_attempts_per_round, resolved_policy.policy.on_final_findings.value):
+            raise SupervisorShadowError("Trusted review policy receipt is invalid")
+        material = json.dumps(trusted_policy_receipt.payload(), sort_keys=True, separators=(",", ":"))
+        if TrustedReviewPolicyReceipt.from_canonical(material) != trusted_policy_receipt:
+            raise SupervisorShadowError("Trusted review policy receipt drifted")
         context_identity = _hash({"task_id": binding.task_id, "base_sha": binding.base_sha, "candidate_sha": binding.candidate_sha, "requests": binding.request_identities, "profiles": binding.profile_identities, "runtime": binding.runtime_fingerprints, "epoch": binding.review_epoch, "round": binding.review_round, "mode": binding.review_mode, "capture_plan": binding.capture_plan_digest})
         runtime_receipt = runtime_store.persist(resolved_policy.runtime, candidate_sha=binding.candidate_sha, context_identity=context_identity, ready_at=readiness.ready_at, freshness_until=freshness_until)
         if type(runtime_receipt) is not SupervisorRuntimeBindingReceipt or (runtime_receipt.candidate_sha, runtime_receipt.context_identity, runtime_receipt.resolved_configuration_digest, runtime_receipt.ready_at, runtime_receipt.freshness_until) != (binding.candidate_sha, context_identity, resolved_policy.configuration_digest, readiness.ready_at, freshness_until):

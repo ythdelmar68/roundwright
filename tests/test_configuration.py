@@ -21,6 +21,9 @@ from roundwright.configuration import (
     ReviewDisposition,
     ReviewMode,
     ReviewOutcome,
+    ReviewPolicy,
+    FileReviewAuthorityStore,
+    ReviewAuthorityEvidenceReceipt,
     TrustedReviewAuthorityReceipt,
     load_configuration,
     parse_cli_overrides,
@@ -427,6 +430,21 @@ class ConfigurationTests(unittest.TestCase):
                     trusted_review_floor=baseline.__class__(4, 10, 3, baseline.on_final_findings),
                     trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, baseline.__class__(4, 10, 3, baseline.on_final_findings)),
                 )
+
+    def test_file_review_authority_store_rehydrates_and_rejects_tamper(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "authority"
+            store = FileReviewAuthorityStore(root, source_identity=authority.source_identity, authority_identity=authority.authority_identity, runtime_store_source_identity=authority.runtime_store_source_identity)
+            receipt = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest="sha256:" + "d" * 64, ready_at=10, freshness_until=20)
+            self.assertEqual(FileReviewAuthorityStore(root, source_identity=authority.source_identity, authority_identity=authority.authority_identity, runtime_store_source_identity=authority.runtime_store_source_identity).read(receipt, evidence_time=10), receipt)
+            self.assertIsNot(FileReviewAuthorityStore(root, source_identity=authority.source_identity, authority_identity=authority.authority_identity, runtime_store_source_identity=authority.runtime_store_source_identity).read(receipt, evidence_time=11), receipt)
+            path = store._path(receipt.record_identity)
+            path.write_text('{"tampered":true}\n', encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                store.read(receipt, evidence_time=10)
 
 
 if __name__ == "__main__":

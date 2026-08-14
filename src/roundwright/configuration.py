@@ -190,6 +190,166 @@ class TrustedReviewAuthorityReceipt:
 
 
 @dataclass(frozen=True)
+class ReviewAuthorityEvidenceReceipt:
+    """Append-only authority observation consumed by dispatch-capable review.
+
+    This receipt intentionally has a different lifecycle from the convenient
+    ``TrustedReviewAuthorityReceipt`` value above.  The latter describes a
+    policy claim; this value proves that an independently pinned authority
+    source persisted and was read back for one candidate/configuration/time
+    interval before a Supervisor sequence can run.
+    """
+
+    source_identity: str
+    authority_identity: str
+    runtime_store_source_identity: str
+    authority_receipt_digest: str
+    policy_snapshot_digest: str
+    trusted_review_floor: ReviewPolicy
+    candidate_sha: str
+    configuration_anchor_digest: str
+    ready_at: int
+    freshness_until: int
+    record_identity: str
+
+    def __post_init__(self) -> None:
+        if (not all(_is_digest(value) for value in (
+            self.source_identity, self.authority_identity,
+            self.runtime_store_source_identity, self.authority_receipt_digest,
+            self.policy_snapshot_digest, self.configuration_anchor_digest,
+            self.record_identity,
+        )) or type(self.trusted_review_floor) is not ReviewPolicy
+                or type(self.candidate_sha) is not str or len(self.candidate_sha) != 40
+                or any(character not in "0123456789abcdef" for character in self.candidate_sha)
+                or type(self.ready_at) is not int or type(self.freshness_until) is not int
+                or self.freshness_until < self.ready_at):
+            raise ConfigurationError("review authority evidence receipt is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-review-authority-evidence/v1",
+            "source_identity": self.source_identity,
+            "authority_identity": self.authority_identity,
+            "runtime_store_source_identity": self.runtime_store_source_identity,
+            "authority_receipt_digest": self.authority_receipt_digest,
+            "policy_snapshot_digest": self.policy_snapshot_digest,
+            "trusted_review_floor": _review_policy_payload(self.trusted_review_floor),
+            "candidate_sha": self.candidate_sha,
+            "configuration_anchor_digest": self.configuration_anchor_digest,
+            "ready_at": self.ready_at,
+            "freshness_until": self.freshness_until,
+            "record_identity": self.record_identity,
+        }
+
+    @property
+    def receipt_digest(self) -> str:
+        return _digest(self.payload())
+
+    @classmethod
+    def from_canonical(cls, material: str) -> "ReviewAuthorityEvidenceReceipt":
+        try:
+            value = json.loads(material)
+            if type(value) is not dict or json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != material or set(value) != {
+                "schema", "source_identity", "authority_identity", "runtime_store_source_identity",
+                "authority_receipt_digest", "policy_snapshot_digest", "trusted_review_floor",
+                "candidate_sha", "configuration_anchor_digest", "ready_at", "freshness_until", "record_identity",
+            } or value["schema"] != "roundwright-review-authority-evidence/v1":
+                raise ValueError
+            floor = ReviewPolicy(
+                value["trusted_review_floor"]["complete_rounds"],
+                value["trusted_review_floor"]["max_rounds"],
+                value["trusted_review_floor"]["max_supervisor_attempts_per_round"],
+                FinalFindingsPolicy(value["trusted_review_floor"]["on_final_findings"]),
+            )
+            return cls(
+                value["source_identity"], value["authority_identity"], value["runtime_store_source_identity"],
+                value["authority_receipt_digest"], value["policy_snapshot_digest"], floor,
+                value["candidate_sha"], value["configuration_anchor_digest"], value["ready_at"],
+                value["freshness_until"], value["record_identity"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ConfigurationError("review authority evidence is not canonical") from error
+
+
+class FileReviewAuthorityStore:
+    """Explicit-root append-only store for independently pinned authority data."""
+
+    def __init__(self, root: str | Path, *, source_identity: str, authority_identity: str, runtime_store_source_identity: str) -> None:
+        if not isinstance(root, (str, os.PathLike)) or not all(_is_digest(value) for value in (source_identity, authority_identity, runtime_store_source_identity)):
+            raise ConfigurationError("review authority store source is invalid")
+        candidate = Path(root)
+        if candidate.is_symlink():
+            raise ConfigurationError("review authority store root is invalid")
+        candidate.mkdir(parents=True, exist_ok=True)
+        resolved = candidate.resolve(strict=True)
+        if candidate.is_symlink() or not resolved.is_dir():
+            raise ConfigurationError("review authority store root is invalid")
+        self._root = resolved
+        self.source_identity = source_identity
+        self.authority_identity = authority_identity
+        self.runtime_store_source_identity = runtime_store_source_identity
+
+    def _path(self, record_identity: str) -> Path:
+        if not _is_digest(record_identity):
+            raise ConfigurationError("review authority record identity is invalid")
+        path = self._root / record_identity.removeprefix("sha256:") / "authority.json"
+        try:
+            path.parent.relative_to(self._root)
+        except ValueError as error:
+            raise ConfigurationError("review authority record escapes its root") from error
+        return path
+
+    def persist(self, authority: TrustedReviewAuthorityReceipt, *, candidate_sha: str, configuration_anchor_digest: str, ready_at: int, freshness_until: int) -> ReviewAuthorityEvidenceReceipt:
+        if type(authority) is not TrustedReviewAuthorityReceipt or (authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity) != (self.source_identity, self.authority_identity, self.runtime_store_source_identity):
+            raise ConfigurationError("review authority source is not independently pinned")
+        provisional = {
+            "source_identity": authority.source_identity,
+            "authority_identity": authority.authority_identity,
+            "runtime_store_source_identity": authority.runtime_store_source_identity,
+            "authority_receipt_digest": authority.receipt_digest,
+            "policy_snapshot_digest": authority.policy_snapshot_digest,
+            "trusted_review_floor": _review_policy_payload(authority.trusted_review_floor),
+            "candidate_sha": candidate_sha,
+            "configuration_anchor_digest": configuration_anchor_digest,
+            "ready_at": ready_at,
+            "freshness_until": freshness_until,
+        }
+        record = _digest(provisional)
+        receipt = ReviewAuthorityEvidenceReceipt(
+            authority.source_identity, authority.authority_identity,
+            authority.runtime_store_source_identity, authority.receipt_digest,
+            authority.policy_snapshot_digest, authority.trusted_review_floor,
+            candidate_sha, configuration_anchor_digest, ready_at, freshness_until,
+            record,
+        )
+        path = self._path(record)
+        path.parent.mkdir(parents=False, exist_ok=False)
+        try:
+            with path.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(json.dumps(receipt.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n")
+        except Exception:
+            raise
+        return receipt
+
+    def read(self, receipt: ReviewAuthorityEvidenceReceipt, *, evidence_time: int) -> ReviewAuthorityEvidenceReceipt:
+        if type(receipt) is not ReviewAuthorityEvidenceReceipt or type(evidence_time) is not int or not receipt.ready_at <= evidence_time <= receipt.freshness_until:
+            raise ConfigurationError("review authority evidence time is invalid")
+        if (receipt.source_identity, receipt.authority_identity, receipt.runtime_store_source_identity) != (self.source_identity, self.authority_identity, self.runtime_store_source_identity):
+            raise ConfigurationError("review authority source drifted")
+        path = self._path(receipt.record_identity)
+        try:
+            material = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ConfigurationError("review authority evidence is unavailable") from error
+        if path.is_symlink() or material.endswith("\n") is False:
+            raise ConfigurationError("review authority evidence is invalid")
+        parsed = ReviewAuthorityEvidenceReceipt.from_canonical(material[:-1])
+        if parsed != receipt or parsed.record_identity != _digest({key: value for key, value in parsed.payload().items() if key not in {"schema", "record_identity"}}):
+            raise ConfigurationError("review authority evidence has drifted")
+        return parsed
+
+
+@dataclass(frozen=True)
 class ResolvedConfigurationBinding:
     """Immutable evidence pinned before dispatch, review, Shadow, or mutation."""
 

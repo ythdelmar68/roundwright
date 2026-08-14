@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from importlib import resources
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Generic, Mapping, TypeVar
 from .runtime_binding import RuntimeBinding
 from .policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
@@ -141,6 +142,9 @@ class ResolvedConfigurationBinding:
     worker_profile_identity: str
     supervisor_profile_identities: tuple[str, ...]
     review_policy: ReviewPolicy
+    repository_root_identity: str | None
+    cache_directory_identity: str
+    trusted_review_floor: ReviewPolicy
     canonical_material: str = ""
 
     def __post_init__(self) -> None:
@@ -148,11 +152,18 @@ class ResolvedConfigurationBinding:
             material = json.loads(self.canonical_material)
             if type(material) is not dict or json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != self.canonical_material or self.digest != _digest(material):
                 raise ValueError
+            if set(material) != {"schema_version", "worker", "supervisor_attempt_profiles", "paths", "review", "trusted_review_floor", "sources"} or set(material["paths"]) != {"repository_root", "cache_directory"}:
+                raise ValueError
             policy = material["review"]
             profiles = tuple(_digest(item) for item in material["supervisor_attempt_profiles"])
             sources = {name: value.value for name, value in self.sources.items()}
-            if material["schema_version"] != self.schema_version or _digest(material["worker"]) != self.worker_profile_identity or profiles != self.supervisor_profile_identities or material["sources"] != sources or material["review"] != _review_policy_payload(self.review_policy):
+            expected_source_keys = {"repository_root", "cache_directory", "roles.worker", "roles.supervisor.attempt_profiles", "review.complete_rounds", "review.max_rounds", "review.max_supervisor_attempts_per_round", "review.on_final_findings"}
+            if set(material["sources"]) != expected_source_keys or set(sources) != expected_source_keys or material["schema_version"] != self.schema_version or _digest(material["worker"]) != self.worker_profile_identity or profiles != self.supervisor_profile_identities or len(set(profiles)) != len(profiles) or material["sources"] != sources or material["review"] != _review_policy_payload(self.review_policy) or material["trusted_review_floor"] != _review_policy_payload(self.trusted_review_floor) or material["paths"]["repository_root"] != self.repository_root_identity or material["paths"]["cache_directory"] != self.cache_directory_identity:
                 raise ValueError
+            self.review_policy.enforce_floor(self.trusted_review_floor)
+            if self.review_policy.max_supervisor_attempts_per_round != len(self.supervisor_profile_identities): raise ValueError
+            object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
+            object.__setattr__(self, "supervisor_profile_identities", tuple(self.supervisor_profile_identities))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ConfigurationError("resolved configuration binding is not self-authenticating") from error
 
@@ -244,6 +255,7 @@ class Configuration:
 
     @property
     def resolved_digest(self) -> str:
+        trusted_floor = self.review_policy if self.trusted_review_floor is None else self.trusted_review_floor
         return _digest({
             "schema_version": self.schema_version,
             "worker": _profile_payload(self.worker.value),
@@ -256,18 +268,19 @@ class Configuration:
                 name: value.value.value if isinstance(value.value, Enum) else value.value
                 for name, value in sorted(self.review.items())
             },
-            "trusted_review_floor": _review_policy_payload(self.trusted_review_floor),
+            "trusted_review_floor": _review_policy_payload(trusted_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         })
 
     def pin(self) -> ResolvedConfigurationBinding:
+        trusted_floor = self.review_policy if self.trusted_review_floor is None else self.trusted_review_floor
         material = {
             "schema_version": self.schema_version,
             "worker": _profile_payload(self.worker.value),
             "supervisor_attempt_profiles": [_profile_payload(profile) for profile in self.supervisor_attempt_profiles.value],
             "paths": {"repository_root": None if self.repository_root.value is None else _digest({"path": os.fspath(self.repository_root.value)}), "cache_directory": _digest({"path": os.fspath(self.cache_directory.value)})},
             "review": _review_policy_payload(self.review_policy),
-            "trusted_review_floor": _review_policy_payload(self.trusted_review_floor),
+            "trusted_review_floor": _review_policy_payload(trusted_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         }
         canonical_material = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -278,6 +291,9 @@ class Configuration:
             _digest(_profile_payload(self.worker.value)),
             tuple(_digest(_profile_payload(profile)) for profile in self.supervisor_attempt_profiles.value),
             self.review_policy,
+            material["paths"]["repository_root"],
+            material["paths"]["cache_directory"],
+            trusted_floor,
             canonical_material,
         )
 

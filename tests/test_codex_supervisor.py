@@ -17,7 +17,7 @@ from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorResultKind,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.configuration import FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ReviewMode, ReviewPolicy, load_configuration
+from roundwright.configuration import ConfigurationError, ConfigurationSource, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewMode, ReviewPolicy, load_configuration
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
@@ -357,6 +357,64 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaises(Exception): SupervisorLifecycleChainBinding(*values[:7], 20, 10)
         with self.assertRaises(Exception): SupervisorLifecycleChainBinding("bad", *values[1:])
         with self.assertRaises(Exception): binding.record_identity = digest("replacement")
+
+    def test_resolved_configuration_binding_authenticates_complete_policy_material(self):
+        pinned = self.configuration
+        material = json.loads(pinned.canonical_material)
+        self.assertEqual((pinned.repository_root_identity, pinned.cache_directory_identity), (material["paths"]["repository_root"], material["paths"]["cache_directory"]))
+        self.assertEqual(material["trusted_review_floor"], {"complete_rounds": pinned.trusted_review_floor.complete_rounds, "max_rounds": pinned.trusted_review_floor.max_rounds, "max_supervisor_attempts_per_round": pinned.trusted_review_floor.max_supervisor_attempts_per_round, "on_final_findings": pinned.trusted_review_floor.on_final_findings.value})
+        for key in ("sources", "paths", "review", "trusted_review_floor"):
+            altered = json.loads(pinned.canonical_material); altered.pop(key)
+            with self.assertRaises(ConfigurationError): replace(pinned, canonical_material=json.dumps(altered, sort_keys=True, separators=(",", ":")))
+        with self.assertRaises(ConfigurationError): replace(pinned, supervisor_profile_identities=tuple(reversed(pinned.supervisor_profile_identities)))
+        with self.assertRaises(ConfigurationError): replace(pinned, review_policy=ReviewPolicy(0, pinned.review_policy.max_rounds, pinned.review_policy.max_supervisor_attempts_per_round, pinned.review_policy.on_final_findings))
+        mutable = dict(pinned.sources); stable = pinned.sources
+        mutable["review.max_rounds"] = mutable["roles.worker"]
+        self.assertEqual(pinned.sources, stable)
+
+    def test_resolved_configuration_binding_rejects_internally_digested_adversarial_material(self):
+        pinned = self.configuration; baseline = json.loads(pinned.canonical_material)
+        def canonical(material): return json.dumps(material, sort_keys=True, separators=(",", ":"))
+        def construct(material, **typed):
+            return ResolvedConfigurationBinding(
+                typed.get("schema_version", pinned.schema_version), "sha256:" + hashlib.sha256(canonical(material).encode()).hexdigest(), typed.get("sources", dict(pinned.sources)), typed.get("worker_profile_identity", pinned.worker_profile_identity), typed.get("supervisor_profile_identities", pinned.supervisor_profile_identities), typed.get("review_policy", pinned.review_policy), typed.get("repository_root_identity", pinned.repository_root_identity), typed.get("cache_directory_identity", pinned.cache_directory_identity), typed.get("trusted_review_floor", pinned.trusted_review_floor), canonical(material),
+            )
+        changed = digest("crafted-drift")
+        cases = []
+        for key in tuple(baseline):
+            cases.append((f"missing-{key}", lambda value, key=key: value.pop(key)))
+        cases.append(("extra-top-level", lambda value: value.__setitem__("unexpected", changed)))
+        for key in tuple(baseline["sources"]):
+            cases.append((f"missing-source-{key}", lambda value, key=key: value["sources"].pop(key)))
+        cases.extend((
+            ("extra-source", lambda value: value["sources"].__setitem__("review.unknown", ConfigurationSource.DEFAULT.value)),
+            ("wrong-source-key", lambda value: value["sources"].__setitem__("roles.unknown", value["sources"].pop("roles.worker"))),
+            ("repository-path", lambda value: value["paths"].__setitem__("repository_root", changed)),
+            ("cache-path", lambda value: value["paths"].__setitem__("cache_directory", changed)),
+            ("worker", lambda value: value.__setitem__("worker", {"model": "changed", "reasoning_effort": "high", "name": "changed"})),
+            ("profile-substitution", lambda value: value["supervisor_attempt_profiles"].__setitem__(0, {"model": "changed", "reasoning_effort": "high", "name": "changed"})),
+            ("profile-order", lambda value: value.__setitem__("supervisor_attempt_profiles", list(reversed(value["supervisor_attempt_profiles"])))),
+            ("profile-duplicate", lambda value: value["supervisor_attempt_profiles"].__setitem__(1, value["supervisor_attempt_profiles"][0])),
+            ("complete-rounds", lambda value: value["review"].__setitem__("complete_rounds", value["review"]["complete_rounds"] + 1)),
+            ("max-rounds", lambda value: value["review"].__setitem__("max_rounds", value["review"]["max_rounds"] + 1)),
+            ("budget", lambda value: value["review"].__setitem__("max_supervisor_attempts_per_round", 1)),
+            ("terminal", lambda value: value["review"].__setitem__("on_final_findings", "block")),
+            ("floor-complete", lambda value: value["trusted_review_floor"].__setitem__("complete_rounds", value["trusted_review_floor"]["complete_rounds"] + 1)),
+            ("floor-max", lambda value: value["trusted_review_floor"].__setitem__("max_rounds", value["trusted_review_floor"]["max_rounds"] + 1)),
+            ("floor-budget", lambda value: value["trusted_review_floor"].__setitem__("max_supervisor_attempts_per_round", value["trusted_review_floor"]["max_supervisor_attempts_per_round"] + 1)),
+            ("floor-terminal", lambda value: value["trusted_review_floor"].__setitem__("on_final_findings", "block")),
+            ("schema", lambda value: value.__setitem__("schema_version", "roundwright-runtime/v0")),
+        ))
+        for source in ConfigurationSource:
+            if source.value != baseline["sources"]["roles.worker"]:
+                cases.append((f"source-{source.name}", lambda value, source=source: value["sources"].__setitem__("roles.worker", source.value)))
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                material = json.loads(pinned.canonical_material); mutate(material)
+                with self.assertRaises(ConfigurationError): construct(material)
+        duplicate = list(pinned.supervisor_profile_identities); duplicate[1] = duplicate[0]
+        with self.assertRaises(ConfigurationError): construct(baseline, supervisor_profile_identities=tuple(duplicate))
+        self.assertEqual(tuple(pinned.review_policy.mode_for_round(round_number) for round_number in (1, 2, 3, 4)), (ReviewMode.COMPLETE, ReviewMode.COMPLETE, ReviewMode.COMPLETE, ReviewMode.CONVERGING))
 
 if __name__ == "__main__":
     unittest.main()

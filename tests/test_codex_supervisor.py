@@ -304,6 +304,37 @@ class SupervisorTests(unittest.TestCase):
             with self.assertRaises(SupervisorShadowError): lifecycle.read_plan(receipt.record_identity, evidence_time=9)
             with self.assertRaises(SupervisorShadowError): lifecycle._record_dir("not-a-digest")
 
+    def test_file_lifecycle_rehydrates_complete_append_only_chain(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        expected_type = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle
+        plan = expected_type(binding, policy.policy_digest, policy.configuration_digest, digest("file-runtime-complete"), 10, readiness.observation_identity)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "durable"; source = digest("file-chain-source")
+            prepared = FileSupervisorLifecycle(root, source).prepare(plan, freshness_until=20)
+            with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, source).read(prepared.record_identity, evidence_time=10)
+            prior = prepared
+            for ordinal in range(1, 4):
+                event = SupervisorAttemptEvent(prepared.record_identity, source, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, ordinal, prior.receipt_digest, binding.request_identities[ordinal - 1], binding.profile_identities[ordinal - 1], binding.runtime_fingerprints[ordinal - 1], SupervisorResultKind.AMBIGUOUS.value, digest(f"file-result-{ordinal}"), None, None, 10, 20)
+                prior = FileSupervisorLifecycle(root, source).append(prepared.record_identity, event, evidence_time=10)
+            terminal = SupervisorTerminalRecord(prepared.record_identity, source, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, prior.receipt_digest, 3, "exhausted", None, "attempt-budget-exhausted", "retain-terminal-product-block", 10)
+            terminal_receipt = FileSupervisorLifecycle(root, source).finalize(prepared.record_identity, terminal, evidence_time=10)
+            record = FileSupervisorLifecycle(root, source).read(prepared.record_identity, evidence_time=10)
+            self.assertEqual((record.expected_plan, record.plan_receipt, record.terminal, record.terminal_receipt), (plan, prepared, terminal, terminal_receipt))
+            self.assertEqual(tuple(item.ordinal for item in record.events), (1, 2, 3))
+            self.assertIsNot(record.events[0], event)
+            with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, source).append(prepared.record_identity, event, evidence_time=10)
+            with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, source).finalize(prepared.record_identity, terminal, evidence_time=10)
+            directory = root / ("record-" + prepared.record_identity.removeprefix("sha256:"))
+            (directory / "event-0002.json").unlink()
+            with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, source).read(prepared.record_identity, evidence_time=10)
+            accepted_plan = replace(plan, observation_identity=digest("file-accepted-observation"))
+            accepted = FileSupervisorLifecycle(root, source).prepare(accepted_plan, freshness_until=20)
+            accepted_event = SupervisorAttemptEvent(accepted.record_identity, source, accepted_plan.observation_identity, binding.candidate_sha, accepted_plan.context_identity, accepted_plan.plan_identity, binding.capture_plan_digest, 1, accepted.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.ACCEPTED.value, digest("file-accepted"), digest("file-accepted"), "pass", 10, 20)
+            accepted_event_receipt = FileSupervisorLifecycle(root, source).append(accepted.record_identity, accepted_event, evidence_time=10)
+            accepted_terminal = SupervisorTerminalRecord(accepted.record_identity, source, accepted_plan.observation_identity, binding.candidate_sha, accepted_plan.context_identity, accepted_plan.plan_identity, binding.capture_plan_digest, accepted_event_receipt.receipt_digest, 1, "accepted", accepted_event.result_identity, None, "apply-bound-review-result", 10)
+            FileSupervisorLifecycle(root, source).finalize(accepted.record_identity, accepted_terminal, evidence_time=10)
+            self.assertEqual(FileSupervisorLifecycle(root, source).read(accepted.record_identity, evidence_time=10).terminal, accepted_terminal)
+
     def _fresh_lifecycle_chain(self):
         lifecycle = InMemorySupervisorLifecycle(digest("tamper-lifecycle-source"))
         _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)

@@ -279,12 +279,7 @@ class ExternalSupervisorLifecycle(Protocol):
 
 
 class FileSupervisorLifecycle:
-    """Append-only plan boundary for a durable Supervisor lifecycle record.
-
-    E1A deliberately persists and authenticates the pre-provider plan only.  The
-    event and terminal portions are fail-closed until their append-only protocol
-    is added, so a partial record can never qualify as a completed lifecycle.
-    """
+    """Append-only canonical disk lifecycle with authenticated restart read-back."""
 
     _PLAN_FILE = "plan.json"
     _RECEIPT_FILE = "plan-receipt.json"
@@ -297,7 +292,7 @@ class FileSupervisorLifecycle:
             raise SupervisorShadowError("Supervisor file lifecycle root is invalid")
         candidate.mkdir(parents=True, exist_ok=True)
         resolved = candidate.resolve(strict=True)
-        if candidate.is_symlink() or not resolved.is_dir():
+        if candidate.is_symlink() or candidate.absolute() != resolved or not resolved.is_dir():
             raise SupervisorShadowError("Supervisor file lifecycle root is invalid")
         self._root = resolved
         self._source_identity = source_identity
@@ -334,14 +329,60 @@ class FileSupervisorLifecycle:
             raise SupervisorShadowError("Supervisor file lifecycle record is invalid")
         return path
 
-    def _record_files(self, record_identity: str) -> tuple[Path, Path]:
+    def _record_entries(self, record_identity: str) -> dict[str, Path]:
         directory = self._record_dir(record_identity)
         if not directory.exists() or directory.is_symlink() or not directory.is_dir():
             raise SupervisorShadowError("Supervisor file lifecycle plan is missing")
         entries = {item.name: item for item in directory.iterdir()}
-        if set(entries) != {self._PLAN_FILE, self._RECEIPT_FILE} or any(item.is_symlink() or not item.is_file() for item in entries.values()):
+        if any(item.is_symlink() or not item.is_file() for item in entries.values()):
             raise SupervisorShadowError("Supervisor file lifecycle record is incomplete")
-        return entries[self._PLAN_FILE], entries[self._RECEIPT_FILE]
+        return entries
+
+    def _chain(self, record_identity: str, *, evidence_time: int, require_terminal: bool) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], tuple[LifecycleChainReceipt, ...], SupervisorTerminalRecord | None, LifecycleChainReceipt | None]:
+        entries = self._record_entries(record_identity)
+        names = {self._PLAN_FILE, self._RECEIPT_FILE, "terminal.json", "terminal-receipt.json"}
+        if not {self._PLAN_FILE, self._RECEIPT_FILE} <= set(entries) or any(name not in names and not re.fullmatch(r"event-[0-9]{4}(?:-receipt)?\.json", name) for name in entries):
+            raise SupervisorShadowError("Supervisor file lifecycle record is incomplete")
+        plan = self._plan(self._read_canonical(entries[self._PLAN_FILE]))
+        stored_plan = self._receipt(self._read_canonical(entries[self._RECEIPT_FILE]))
+        binding = self._binding(plan, stored_plan.freshness_until)
+        self._evidence_time(binding, evidence_time)
+        plan_receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
+        if binding.record_identity != record_identity or stored_plan != plan_receipt:
+            raise SupervisorShadowError("Supervisor file lifecycle plan receipt was tampered")
+        event_indexes = sorted(int(name[6:10]) for name in entries if re.fullmatch(r"event-[0-9]{4}\.json", name))
+        if event_indexes != list(range(1, len(event_indexes) + 1)) or any(f"event-{ordinal:04d}-receipt.json" not in entries for ordinal in event_indexes):
+            raise SupervisorShadowError("Supervisor file lifecycle event order is invalid")
+        if any(re.fullmatch(r"event-[0-9]{4}-receipt\.json", name) and int(name[6:10]) not in event_indexes for name in entries):
+            raise SupervisorShadowError("Supervisor file lifecycle event receipt is invalid")
+        events: list[SupervisorAttemptEvent] = []; receipts: list[LifecycleChainReceipt] = []; previous = plan_receipt
+        for ordinal in event_indexes:
+            try:
+                event = SupervisorAttemptEvent(**json.loads(self._read_canonical(entries[f"event-{ordinal:04d}.json"])))
+            except (TypeError, ValueError) as error:
+                raise SupervisorShadowError("Supervisor file lifecycle event material is invalid") from error
+            expected = ordinal - 1
+            if expected >= len(plan.binding.request_identities) or (event.record_identity, event.source_identity, event.observation_identity, event.candidate_sha, event.context_identity, event.plan_identity, event.capture_plan_digest, event.ordinal, event.prior_digest, event.request_identity, event.profile_identity, event.runtime_fingerprint, event.ready_at, event.freshness_until) != (binding.record_identity, binding.source_identity, binding.observation_identity, binding.candidate_sha, binding.context_identity, binding.plan_identity, binding.capture_plan_digest, ordinal, previous.receipt_digest, plan.binding.request_identities[expected], plan.binding.profile_identities[expected], plan.binding.runtime_fingerprints[expected], binding.ready_at, binding.freshness_until):
+                raise SupervisorShadowError("Supervisor file lifecycle event binding is invalid")
+            if events and events[-1].result_kind == SupervisorResultKind.ACCEPTED.value:
+                raise SupervisorShadowError("Supervisor file lifecycle advance is invalid")
+            receipt = LifecycleChainReceipt(binding, event.content_digest, event.prior_digest, ordinal)
+            if self._receipt(self._read_canonical(entries[f"event-{ordinal:04d}-receipt.json"])) != receipt:
+                raise SupervisorShadowError("Supervisor file lifecycle event receipt was tampered")
+            events.append(event); receipts.append(receipt); previous = receipt
+        terminal_names = {"terminal.json", "terminal-receipt.json"} & set(entries)
+        if terminal_names not in (set(), {"terminal.json", "terminal-receipt.json"}) or (require_terminal and not terminal_names):
+            raise SupervisorShadowError("Supervisor file lifecycle record is incomplete")
+        if not terminal_names:
+            return plan, plan_receipt, tuple(events), tuple(receipts), None, None
+        try:
+            terminal = SupervisorTerminalRecord(**json.loads(self._read_canonical(entries["terminal.json"])))
+        except (TypeError, ValueError) as error:
+            raise SupervisorShadowError("Supervisor file lifecycle terminal material is invalid") from error
+        terminal_receipt = LifecycleChainReceipt(binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1)
+        if terminal.prior_digest != previous.receipt_digest or self._receipt(self._read_canonical(entries["terminal-receipt.json"])) != terminal_receipt:
+            raise SupervisorShadowError("Supervisor file lifecycle terminal receipt was tampered")
+        return plan, plan_receipt, tuple(events), tuple(receipts), terminal, terminal_receipt
 
     @staticmethod
     def _read_canonical(path: Path) -> str:
@@ -357,7 +398,7 @@ class FileSupervisorLifecycle:
     @staticmethod
     def _publish(path: Path, material: str) -> None:
         temporary = path.with_name(path.name + ".tmp")
-        if path.exists() or temporary.exists():
+        if path.parent.is_symlink() or path.exists() or temporary.exists():
             raise SupervisorShadowError("Supervisor file lifecycle collision")
         try:
             descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
@@ -390,24 +431,45 @@ class FileSupervisorLifecycle:
         return receipt
 
     def read_plan(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt]:
-        plan_file, receipt_file = self._record_files(record_identity)
-        plan = self._plan(self._read_canonical(plan_file))
-        stored = self._receipt(self._read_canonical(receipt_file))
-        binding = self._binding(plan, stored.freshness_until)
-        self._evidence_time(binding, evidence_time)
-        receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
-        if binding.record_identity != record_identity or stored != receipt:
-            raise SupervisorShadowError("Supervisor file lifecycle plan receipt was tampered")
+        plan, receipt, _events, _event_receipts, _terminal, _terminal_receipt = self._chain(record_identity, evidence_time=evidence_time, require_terminal=False)
         return plan, receipt
 
     def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
-        raise SupervisorShadowError("Supervisor file lifecycle append is not implemented")
+        plan, plan_receipt, events, receipts, terminal, _terminal_receipt = self._chain(record_identity, evidence_time=evidence_time, require_terminal=False)
+        if terminal is not None or type(event) is not SupervisorAttemptEvent or event.record_identity != record_identity:
+            raise SupervisorShadowError("Supervisor file lifecycle append is invalid")
+        expected = event.ordinal - 1
+        if expected >= len(plan.binding.request_identities) or (event.source_identity, event.observation_identity, event.candidate_sha, event.context_identity, event.plan_identity, event.capture_plan_digest, event.request_identity, event.profile_identity, event.runtime_fingerprint, event.ready_at, event.freshness_until) != (plan_receipt.source_identity, plan_receipt.observation_identity, plan_receipt.candidate_sha, plan_receipt.context_identity, plan_receipt.plan_identity, plan_receipt.capture_plan_digest, plan.binding.request_identities[expected], plan.binding.profile_identities[expected], plan.binding.runtime_fingerprints[expected], plan_receipt.ready_at, plan_receipt.freshness_until):
+            raise SupervisorShadowError("Supervisor file lifecycle append is invalid")
+        previous = plan_receipt if not receipts else receipts[-1]
+        if event.ordinal != len(events) + 1 or event.prior_digest != previous.receipt_digest or (events and events[-1].result_kind == SupervisorResultKind.ACCEPTED.value):
+            raise SupervisorShadowError("Supervisor file lifecycle append is invalid")
+        receipt = LifecycleChainReceipt(plan_receipt.binding, event.content_digest, event.prior_digest, event.ordinal)
+        directory = self._record_dir(record_identity)
+        self._publish(directory / f"event-{event.ordinal:04d}.json", self._material(event.payload()))
+        self._publish(directory / f"event-{event.ordinal:04d}-receipt.json", self._material(receipt.payload()))
+        return receipt
 
     def finalize(self, record_identity: str, terminal: SupervisorTerminalRecord, *, evidence_time: int) -> LifecycleChainReceipt:
-        raise SupervisorShadowError("Supervisor file lifecycle finalize is not implemented")
+        plan, plan_receipt, events, receipts, existing, _terminal_receipt = self._chain(record_identity, evidence_time=evidence_time, require_terminal=False)
+        if existing is not None or not events or type(terminal) is not SupervisorTerminalRecord or terminal.record_identity != record_identity or terminal.prior_digest != receipts[-1].receipt_digest or terminal.attempt_count != len(events):
+            raise SupervisorShadowError("Supervisor file lifecycle finalize is invalid")
+        if (terminal.source_identity, terminal.observation_identity, terminal.candidate_sha, terminal.context_identity, terminal.plan_identity, terminal.capture_plan_digest, terminal.ready_at) != (plan_receipt.source_identity, plan_receipt.observation_identity, plan_receipt.candidate_sha, plan_receipt.context_identity, plan_receipt.plan_identity, plan_receipt.capture_plan_digest, plan_receipt.ready_at):
+            raise SupervisorShadowError("Supervisor file lifecycle finalize is invalid")
+        accepted = tuple(item for item in events if item.result_kind == SupervisorResultKind.ACCEPTED.value)
+        if (terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(events) or terminal.accepted_result_identity != accepted[-1].result_identity)) or (terminal.terminal == "exhausted" and accepted):
+            raise SupervisorShadowError("Supervisor file lifecycle finalize is invalid")
+        receipt = LifecycleChainReceipt(plan_receipt.binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1)
+        directory = self._record_dir(record_identity)
+        self._publish(directory / "terminal.json", self._material(terminal.__dict__))
+        self._publish(directory / "terminal-receipt.json", self._material(receipt.payload()))
+        return receipt
 
     def read(self, record_identity: str, *, evidence_time: int) -> CompleteSupervisorLifecycleRecord:
-        raise SupervisorShadowError("Supervisor file lifecycle completion is not implemented")
+        plan, plan_receipt, events, _receipts, terminal, terminal_receipt = self._chain(record_identity, evidence_time=evidence_time, require_terminal=True)
+        if terminal is None or terminal_receipt is None:
+            raise SupervisorShadowError("Supervisor file lifecycle record is incomplete")
+        return CompleteSupervisorLifecycleRecord(plan, plan_receipt, events, terminal, terminal_receipt)
 
 
 class InMemorySupervisorLifecycle:

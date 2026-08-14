@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -277,7 +278,10 @@ class SupervisorTests(unittest.TestCase):
                 with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, FileSupervisorLifecycle(Path(directory) / "qualifier", source), recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
             self.assertEqual((self.events, recorder.calls), ([], []))
 
-    @unittest.skipUnless(hasattr(Path(), "is_junction"), "Windows junction detection is unavailable")
+    @unittest.skipUnless(
+        os.name == "nt" and hasattr(Path(), "is_junction") and shutil.which("cmd.exe"),
+        "Windows cmd.exe junction creation is unavailable",
+    )
     def test_file_lifecycle_rejects_a_real_junction_record_leaf_when_supported(self):
         _adapters, _requests, readiness, binding, policy, _lifecycle, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
         plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)

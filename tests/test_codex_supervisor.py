@@ -231,12 +231,12 @@ class SupervisorTests(unittest.TestCase):
 
     def test_lifecycle_chain_values_are_immutable_and_reject_bad_order(self):
         values = (digest("record"), digest("source"), digest("observation"), "c" * 40, digest("context"), digest("plan"), digest("prior"))
-        event = SupervisorAttemptEvent(*values, 1, "ambiguous", digest("result"), 10, 20)
+        event = SupervisorAttemptEvent(*values[:6], 1, values[6], SupervisorResultKind.AMBIGUOUS.value, digest("result"), 10, 20)
         plan = LifecycleChainReceipt(values[0], values[1], values[2], digest("plan-content"), values[6], 0, 10)
         terminal = SupervisorTerminalRecord(*values[:6], event.content_digest, "exhausted", "attempt-budget-exhausted", "retain-terminal-product-block", 10)
         receipt = LifecycleChainReceipt(values[0], values[1], values[2], digest("terminal-content"), event.content_digest, 2, 10)
         self.assertEqual(CompleteSupervisorLifecycleRecord(plan, (event,), terminal, receipt).events, (event,))
-        with self.assertRaises(Exception): SupervisorAttemptEvent(*values, 0, "ambiguous", digest("result"), 10, 20)
+        with self.assertRaises(Exception): SupervisorAttemptEvent(*values[:6], 0, values[6], SupervisorResultKind.AMBIGUOUS.value, digest("result"), 10, 20)
 
 if __name__ == "__main__":
     unittest.main()

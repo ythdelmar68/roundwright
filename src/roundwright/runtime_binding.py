@@ -14,6 +14,7 @@ from typing import Protocol
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SCHEMA = "roundwright-runtime/v1"
 _RECEIPT_SCHEMA = "roundwright-supervisor-runtime-receipt/v1"
+def _reparse(value: Path) -> bool: return value.is_symlink() or bool(getattr(value, "is_junction", lambda: False)())
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -219,6 +220,15 @@ class FileSupervisorRuntimeStore:
     @property
     def source_identity(self) -> str: return self._source_identity
 
+    def _safe_path(self, path: Path) -> Path:
+        try: relative = path.relative_to(self._root)
+        except ValueError as error: raise RuntimeBindingError("supervisor runtime path escaped root") from error
+        current = self._root
+        for part in relative.parts:
+            current = current / part
+            if current.exists() and _reparse(current): raise RuntimeBindingError("supervisor runtime reparse path is invalid")
+        return path
+
     @staticmethod
     def _digest_material(material: str) -> str: return "sha256:" + hashlib.sha256(material.encode()).hexdigest()
     def _record(self, runtime: RuntimeBinding, *, candidate_sha: str, context_identity: str, ready_at: int, freshness_until: int) -> SupervisorRuntimeBindingReceipt:
@@ -230,12 +240,13 @@ class FileSupervisorRuntimeStore:
         value = self._root / ("record-" + record_identity.removeprefix("sha256:"))
         try: value.resolve(strict=False).relative_to(self._root)
         except ValueError as error: raise RuntimeBindingError("supervisor runtime path escaped root") from error
-        if value.exists() and value.is_symlink(): raise RuntimeBindingError("supervisor runtime record is invalid")
+        self._safe_path(value)
+        if value.exists() and _reparse(value): raise RuntimeBindingError("supervisor runtime record is invalid")
         return value
-    @staticmethod
-    def _publish(path: Path, material: str) -> None:
+    def _publish(self, path: Path, material: str) -> None:
         temporary = path.with_name(path.name + ".tmp")
-        if path.parent.is_symlink() or path.exists() or temporary.exists(): raise RuntimeBindingError("supervisor runtime collision")
+        self._safe_path(path.parent); self._safe_path(path); self._safe_path(temporary)
+        if _reparse(path.parent) or _reparse(path) or _reparse(temporary) or path.exists() or temporary.exists(): raise RuntimeBindingError("supervisor runtime collision")
         try:
             descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             with os.fdopen(descriptor, "wb") as handle: handle.write(material.encode()); handle.flush(); os.fsync(handle.fileno())
@@ -255,14 +266,16 @@ class FileSupervisorRuntimeStore:
         try: directory.mkdir()
         except FileExistsError as error: raise RuntimeBindingError("supervisor runtime collision") from error
         except OSError as error: raise RuntimeBindingError("supervisor runtime publication failed") from error
-        if directory.is_symlink(): raise RuntimeBindingError("supervisor runtime record is invalid")
+        self._safe_path(directory)
+        if _reparse(directory): raise RuntimeBindingError("supervisor runtime record is invalid")
         self._publish(directory / self._RUNTIME_FILE, runtime.canonical_material()); self._publish(directory / self._RECEIPT_FILE, json.dumps(receipt.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)); return receipt
     def read(self, receipt: SupervisorRuntimeBindingReceipt, *, evidence_time: int) -> RuntimeBinding:
         if type(receipt) is not SupervisorRuntimeBindingReceipt or type(evidence_time) is not int or not receipt.ready_at <= evidence_time <= receipt.freshness_until: raise RuntimeBindingError("supervisor runtime evidence time is invalid")
         directory = self._directory(receipt.record_identity)
-        if not directory.exists() or directory.is_symlink(): raise RuntimeBindingError("supervisor runtime record is incomplete")
+        self._safe_path(directory)
+        if not directory.exists() or _reparse(directory): raise RuntimeBindingError("supervisor runtime record is incomplete")
         entries = {item.name: item for item in directory.iterdir()}
-        if set(entries) != {self._RUNTIME_FILE, self._RECEIPT_FILE} or any(item.is_symlink() or not item.is_file() for item in entries.values()): raise RuntimeBindingError("supervisor runtime record is incomplete")
+        if set(entries) != {self._RUNTIME_FILE, self._RECEIPT_FILE} or any(_reparse(item) or not item.is_file() for item in entries.values()): raise RuntimeBindingError("supervisor runtime record is incomplete")
         runtime = RuntimeBinding.from_canonical(self._read(entries[self._RUNTIME_FILE])); stored = SupervisorRuntimeBindingReceipt.from_canonical(self._read(entries[self._RECEIPT_FILE]))
         expected = self._record(runtime, candidate_sha=receipt.candidate_sha, context_identity=receipt.context_identity, ready_at=receipt.ready_at, freshness_until=receipt.freshness_until)
         if stored != receipt or expected != receipt: raise RuntimeBindingError("supervisor runtime receipt drifted")

@@ -31,6 +31,7 @@ class SupervisorShadowDisposition(StrEnum): MATCH = "match"; MISMATCH = "mismatc
 def _hash(value: object) -> str: return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 def _token(value: object) -> bool: return type(value) is str and bool(_TOKEN.fullmatch(value))
 def _digest(value: object) -> bool: return type(value) is str and bool(_DIGEST.fullmatch(value))
+def _reparse(value: Path) -> bool: return value.is_symlink() or bool(getattr(value, "is_junction", lambda: False)())
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,18 @@ class FileSupervisorLifecycle:
         self._root = resolved
         self._source_identity = source_identity
 
+    def _safe_path(self, path: Path) -> Path:
+        try:
+            relative = path.relative_to(self._root)
+        except ValueError as error:
+            raise SupervisorShadowError("Supervisor file lifecycle path escaped root") from error
+        current = self._root
+        for part in relative.parts:
+            current = current / part
+            if current.exists() and _reparse(current):
+                raise SupervisorShadowError("Supervisor file lifecycle reparse path is invalid")
+        return path
+
     @staticmethod
     def _material(value: object) -> str:
         return InMemorySupervisorLifecycle._material(value)
@@ -345,16 +358,18 @@ class FileSupervisorLifecycle:
             path.resolve(strict=False).relative_to(self._root)
         except ValueError as error:
             raise SupervisorShadowError("Supervisor file lifecycle path escaped root") from error
-        if path.exists() and path.is_symlink():
+        self._safe_path(path)
+        if path.exists() and _reparse(path):
             raise SupervisorShadowError("Supervisor file lifecycle record is invalid")
         return path
 
     def _record_entries(self, record_identity: str) -> dict[str, Path]:
         directory = self._record_dir(record_identity)
-        if not directory.exists() or directory.is_symlink() or not directory.is_dir():
+        self._safe_path(directory)
+        if not directory.exists() or _reparse(directory) or not directory.is_dir():
             raise SupervisorShadowError("Supervisor file lifecycle plan is missing")
         entries = {item.name: item for item in directory.iterdir()}
-        if any(item.is_symlink() or not item.is_file() for item in entries.values()):
+        if any(_reparse(item) or not item.is_file() for item in entries.values()):
             raise SupervisorShadowError("Supervisor file lifecycle record is incomplete")
         return entries
 
@@ -415,10 +430,12 @@ class FileSupervisorLifecycle:
             raise SupervisorShadowError("Supervisor file lifecycle material is noncanonical")
         return material
 
-    @staticmethod
-    def _publish(path: Path, material: str) -> None:
+    def _publish(self, path: Path, material: str) -> None:
         temporary = path.with_name(path.name + ".tmp")
-        if path.parent.is_symlink() or path.exists() or temporary.exists():
+        self._safe_path(path.parent)
+        self._safe_path(path)
+        self._safe_path(temporary)
+        if _reparse(path.parent) or _reparse(path) or _reparse(temporary) or path.exists() or temporary.exists():
             raise SupervisorShadowError("Supervisor file lifecycle collision")
         try:
             descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
@@ -443,7 +460,8 @@ class FileSupervisorLifecycle:
             raise SupervisorShadowError("Supervisor file lifecycle collision") from error
         except OSError as error:
             raise SupervisorShadowError("Supervisor file lifecycle publication failed") from error
-        if directory.is_symlink():
+        self._safe_path(directory)
+        if _reparse(directory):
             raise SupervisorShadowError("Supervisor file lifecycle record is invalid")
         receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
         self._publish(directory / self._PLAN_FILE, self._material(plan.payload()))
@@ -684,13 +702,18 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
     if not callable(getattr(runtime_store, "persist", None)) or not callable(getattr(runtime_store, "read", None)):
         raise SupervisorShadowError("Supervisor runtime preflight is invalid")
     try:
-        if type(trusted_policy_receipt) is not TrustedReviewPolicyReceipt or (trusted_policy_receipt.source_identity, trusted_policy_receipt.authority_identity) != (readiness.producer_identity, readiness.exporter_identity) or not trusted_policy_receipt.ready_at <= evidence_time <= trusted_policy_receipt.freshness_until or (trusted_policy_receipt.candidate_sha, trusted_policy_receipt.configuration_digest, trusted_policy_receipt.policy_digest, trusted_policy_receipt.supervisor_profile_identities, trusted_policy_receipt.complete_rounds, trusted_policy_receipt.max_rounds, trusted_policy_receipt.attempt_budget, trusted_policy_receipt.on_final_findings) != (binding.candidate_sha, resolved_policy.configuration_digest, resolved_policy.policy_digest, resolved_policy.profile_identities, resolved_policy.policy.complete_rounds, resolved_policy.policy.max_rounds, resolved_policy.policy.max_supervisor_attempts_per_round, resolved_policy.policy.on_final_findings.value):
+        trusted_source = resolved_policy.configuration.trusted_floor_source_identity
+        trusted_authority = resolved_policy.configuration.trusted_floor_authority_identity
+        runtime_authority = resolved_policy.configuration.runtime_store_authority_identity
+        if not _digest(trusted_source) or not _digest(trusted_authority) or not _digest(runtime_authority):
+            raise SupervisorShadowError("Trusted configuration provenance is unavailable")
+        if type(trusted_policy_receipt) is not TrustedReviewPolicyReceipt or (trusted_policy_receipt.source_identity, trusted_policy_receipt.authority_identity, readiness.producer_identity, readiness.exporter_identity) != (trusted_source, trusted_authority, trusted_source, trusted_authority) or not trusted_policy_receipt.ready_at <= evidence_time <= trusted_policy_receipt.freshness_until or (trusted_policy_receipt.candidate_sha, trusted_policy_receipt.configuration_digest, trusted_policy_receipt.policy_digest, trusted_policy_receipt.supervisor_profile_identities, trusted_policy_receipt.complete_rounds, trusted_policy_receipt.max_rounds, trusted_policy_receipt.attempt_budget, trusted_policy_receipt.on_final_findings) != (binding.candidate_sha, resolved_policy.configuration_digest, resolved_policy.policy_digest, resolved_policy.profile_identities, resolved_policy.policy.complete_rounds, resolved_policy.policy.max_rounds, resolved_policy.policy.max_supervisor_attempts_per_round, resolved_policy.policy.on_final_findings.value):
             raise SupervisorShadowError("Trusted review policy receipt is invalid")
         material = json.dumps(trusted_policy_receipt.payload(), sort_keys=True, separators=(",", ":"))
         if TrustedReviewPolicyReceipt.from_canonical(material) != trusted_policy_receipt:
             raise SupervisorShadowError("Trusted review policy receipt drifted")
         context_identity = _hash({"task_id": binding.task_id, "base_sha": binding.base_sha, "candidate_sha": binding.candidate_sha, "requests": binding.request_identities, "profiles": binding.profile_identities, "runtime": binding.runtime_fingerprints, "epoch": binding.review_epoch, "round": binding.review_round, "mode": binding.review_mode, "capture_plan": binding.capture_plan_digest})
-        if getattr(runtime_store, "source_identity", None) != readiness.comparator_identity:
+        if getattr(runtime_store, "source_identity", None) != runtime_authority or readiness.comparator_identity != runtime_authority:
             raise SupervisorShadowError("Supervisor runtime source pin is invalid")
         runtime_receipt = runtime_store.persist(resolved_policy.runtime, candidate_sha=binding.candidate_sha, context_identity=context_identity, ready_at=readiness.ready_at, freshness_until=freshness_until)
         if type(runtime_receipt) is not SupervisorRuntimeBindingReceipt or runtime_receipt.source_identity != readiness.comparator_identity or (runtime_receipt.candidate_sha, runtime_receipt.context_identity, runtime_receipt.resolved_configuration_digest, runtime_receipt.ready_at, runtime_receipt.freshness_until) != (binding.candidate_sha, context_identity, resolved_policy.configuration_digest, readiness.ready_at, freshness_until):

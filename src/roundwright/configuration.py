@@ -12,7 +12,7 @@ import os
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from importlib import resources
 from pathlib import Path
@@ -146,13 +146,15 @@ class ResolvedConfigurationBinding:
     cache_directory_identity: str
     trusted_review_floor: ReviewPolicy
     canonical_material: str = ""
+    trusted_floor_evidence_required: bool = False
 
     def __post_init__(self) -> None:
         try:
             material = json.loads(self.canonical_material)
             if type(material) is not dict or json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != self.canonical_material or self.digest != _digest(material):
                 raise ValueError
-            if set(material) != {"schema_version", "worker", "supervisor_attempt_profiles", "paths", "review", "trusted_review_floor", "sources"} or set(material["paths"]) != {"repository_root", "cache_directory"}:
+            base_keys = {"schema_version", "worker", "supervisor_attempt_profiles", "paths", "review", "trusted_review_floor", "sources"}
+            if set(material) not in (base_keys, base_keys | {"trusted_floor_evidence"}) or set(material["paths"]) != {"repository_root", "cache_directory"}:
                 raise ValueError
             policy = material["review"]
             profiles = tuple(_digest(item) for item in material["supervisor_attempt_profiles"])
@@ -162,6 +164,8 @@ class ResolvedConfigurationBinding:
                 raise ValueError
             self.review_policy.enforce_floor(self.trusted_review_floor)
             if self.review_policy.max_supervisor_attempts_per_round != len(self.supervisor_profile_identities): raise ValueError
+            has_trusted_evidence = "trusted_floor_evidence" in material
+            if self.trusted_floor_evidence_required != has_trusted_evidence or (has_trusted_evidence and (type(material["trusted_floor_evidence"]) is not dict or set(material["trusted_floor_evidence"]) != {"source_identity", "authority_identity"} or not all(type(material["trusted_floor_evidence"][name]) is str and len(material["trusted_floor_evidence"][name]) == 71 and material["trusted_floor_evidence"][name].startswith("sha256:") and all(character in "0123456789abcdef" for character in material["trusted_floor_evidence"][name][7:]) for name in ("source_identity", "authority_identity")))): raise ValueError
             object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
             object.__setattr__(self, "supervisor_profile_identities", tuple(self.supervisor_profile_identities))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -184,6 +188,22 @@ class ResolvedConfigurationBinding:
             policy.complete_rounds, policy.max_rounds, policy.max_supervisor_attempts_per_round,
             policy.on_final_findings.value, policy_digest,
         )
+
+    @property
+    def trusted_floor_source_identity(self) -> str | None:
+        value = json.loads(self.canonical_material).get("trusted_floor_evidence")
+        return None if value is None else value["source_identity"]
+
+    @property
+    def trusted_floor_authority_identity(self) -> str | None:
+        value = json.loads(self.canonical_material).get("trusted_floor_evidence")
+        return None if value is None else value["authority_identity"]
+
+    @property
+    def runtime_store_authority_identity(self) -> str | None:
+        if self.trusted_floor_source_identity is None or self.trusted_floor_authority_identity is None:
+            return None
+        return _digest({"schema": "roundwright-supervisor-runtime-store-authority/v1", "configuration_digest": self.digest, "trusted_floor_source_identity": self.trusted_floor_source_identity, "trusted_floor_authority_identity": self.trusted_floor_authority_identity})
 
 
 @dataclass(frozen=True)
@@ -228,6 +248,7 @@ class Configuration:
     schema_version: str = _SCHEMA_VERSION
     repository_configuration_root: Path | None = None
     trusted_review_floor: ReviewPolicy | None = None
+    trusted_policy_snapshot: TrustedPolicySnapshot | None = None
 
     @property
     def repository(self) -> RepositoryIdentity | None:
@@ -283,6 +304,13 @@ class Configuration:
             "trusted_review_floor": _review_policy_payload(trusted_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         }
+        if self.trusted_policy_snapshot is not None:
+            if not _is_trusted_review_floor_evidence(self.trusted_policy_snapshot, trusted_floor):
+                raise ConfigurationError("trusted review policy evidence is unavailable")
+            material["trusted_floor_evidence"] = {
+                "source_identity": "sha256:" + self.trusted_policy_snapshot.source.source_fingerprint,
+                "authority_identity": "sha256:" + self.trusted_policy_snapshot.source.revision_fingerprint,
+            }
         canonical_material = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return ResolvedConfigurationBinding(
             self.schema_version,
@@ -295,6 +323,7 @@ class Configuration:
             material["paths"]["cache_directory"],
             trusted_floor,
             canonical_material,
+            self.trusted_policy_snapshot is not None,
         )
 
 
@@ -410,7 +439,7 @@ def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_r
         trusted_policy_snapshot.policy_digest
     except (AttributeError, TypeError, ValueError):
         raise ConfigurationError("trusted review policy evidence is unavailable") from None
-    return load_configuration(
+    return replace(load_configuration(
         cwd=cwd,
         environment=environment,
         cli_values=cli_values,
@@ -421,7 +450,7 @@ def resolve_dispatch_configuration(*, trusted_policy_snapshot: object, trusted_r
         home=home,
         git_binding=git_binding,
         git_entrypoint_control=git_entrypoint_control,
-    )
+    ), trusted_policy_snapshot=trusted_policy_snapshot)
 
 
 def _is_trusted_review_floor_evidence(snapshot: object, floor: object) -> bool:

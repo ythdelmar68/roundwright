@@ -190,7 +190,7 @@ class CodexSupervisorAdapter:
         if response.kind is not SupervisorResultKind.ACCEPTED:
             return CodexSupervisorResult(response.kind, session_identity, turn_identity, diagnostic=response.diagnostic)
         try:
-            verdict, findings = _output(response.structured_output)
+            verdict, findings = _output(response.structured_output, request)
         except CodexSupervisorError:
             return CodexSupervisorResult(SupervisorResultKind.INVALID, session_identity, turn_identity, diagnostic=SupervisorDiagnostic.SHAPE)
         # The native schema intentionally contains no ambient context.  Bind
@@ -235,8 +235,13 @@ def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: st
     return _digest({"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "within_round_attempt": within_round_attempt, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria})
 
 
-def _output(value: object) -> tuple[SupervisorVerdict, tuple[str, ...]]:
-    if type(value) is not dict or set(value) != {"verdict", "findings"} or type(value["verdict"]) is not str or type(value["findings"]) is not list or any(not _token(item) for item in value["findings"]):
+def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dict[str, object]:
+    return {"schema": "roundwright-supervisor-review-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
+
+
+def _output(value: object, request: CodexSupervisorRequest) -> tuple[SupervisorVerdict, tuple[str, ...]]:
+    binding = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
+    if type(value) is not dict or set(value) != {"verdict", "findings", "binding"} or type(value["verdict"]) is not str or type(value["findings"]) is not list or any(not _token(item) for item in value["findings"]) or value["binding"] != binding:
         raise CodexSupervisorError("Supervisor output is malformed")
     try:
         verdict = SupervisorVerdict(value["verdict"])

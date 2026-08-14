@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .codex_supervisor import (
-    CodexSupervisorError, CodexSupervisorRequest, NativeCodexSupervisorBackend,
+    CodexSupervisorError, CodexSupervisorRequest, NativeCodexSupervisorBackend, canonical_supervisor_review_material,
     NativeSupervisorResponse, NativeSupervisorSession, NativeSupervisorTurn,
     SupervisorDiagnostic, SupervisorResultKind,
 )
@@ -25,7 +25,7 @@ from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field,
 
 
 def _schema() -> dict[str, object]:
-    return {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "findings"]}, "findings": {"type": "array", "items": {"type": "string"}, "maxItems": 32}}, "required": ["verdict", "findings"], "additionalProperties": False}
+    return {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "findings"]}, "findings": {"type": "array", "items": {"type": "string"}, "maxItems": 32}, "binding": {"type": "object", "properties": {"input_digest": {"type": "string"}, "candidate_sha": {"type": "string"}, "within_round_attempt": {"type": "integer"}, "profile_identity": {"type": "string"}}, "required": ["input_digest", "candidate_sha", "within_round_attempt", "profile_identity"], "additionalProperties": False}}, "required": ["verdict", "findings", "binding"], "additionalProperties": False}
 
 
 class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
@@ -81,7 +81,7 @@ class _Session(NativeSupervisorSession):
         if self._started or type(request) is not CodexSupervisorRequest:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
-        payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": "Review only this normalized immutable input. Do not use tools, inspect repositories, or request credentials. Return only the schema.", "review_attempt_id": request.review_attempt_id, "provider_attempt_id": request.provider_attempt_id, "profile_identity": request.selected_profile_identity, "within_round_attempt": request.within_round_attempt, "input_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_sha": request.context.base_sha, "candidate_sha": request.context.candidate_sha, "policy_digest": request.context.policy_digest, "configuration_digest": request.context.configuration_digest, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value}, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "tools": []}
+        payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly.", "review_material": canonical_supervisor_review_material(request), "tools": []}
         try:
             handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort(self._profile.reasoning_effort.value), output_schema=_schema(), sandbox=self._sandbox)
             return _Turn(handle, self, self._completion, self._clock)
@@ -150,7 +150,8 @@ def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[],
         if response is None: return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.NON_FINAL if non_final else SupervisorDiagnostic.SHAPE)
         try: parsed = json.loads(response)
         except (TypeError, ValueError): return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)
-        if type(parsed) is not dict or set(parsed) != {"verdict", "findings"} or parsed.get("verdict") not in {"pass", "findings"} or type(parsed.get("findings")) is not list:
+        binding = parsed.get("binding") if type(parsed) is dict else None
+        if type(parsed) is not dict or set(parsed) != {"verdict", "findings", "binding"} or parsed.get("verdict") not in {"pass", "findings"} or type(parsed.get("findings")) is not list or type(binding) is not dict or set(binding) != {"input_digest", "candidate_sha", "within_round_attempt", "profile_identity"} or type(binding["input_digest"]) is not str or type(binding["candidate_sha"]) is not str or type(binding["within_round_attempt"]) is not int or type(binding["profile_identity"]) is not str:
             return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)
         return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, parsed)
     except TimeoutError:

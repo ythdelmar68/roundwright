@@ -16,7 +16,7 @@ from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorResultKind,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.configuration import ProviderProfile, ReasoningEffort, ReviewMode
+from roundwright.configuration import FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ReviewMode, ReviewPolicy
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
@@ -24,7 +24,7 @@ from roundwright.shadow import RecorderBinding
 from roundwright.supervisor_shadow import (
     SUPERVISOR_FAILOVER_PROFILE, SupervisorCapturePlanReceipt,
     SupervisorQualificationBinding, SupervisorRecorderReceipt,
-    SupervisorSequenceBinding, SupervisorSequenceTerminal,
+    ResolvedSupervisorSequencePolicy, SupervisorSequenceBinding, SupervisorSequenceTerminal,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_observation_identity,
 )
@@ -38,14 +38,21 @@ class Turn:
     def __init__(self, identity, response, events): self._identity, self._response, self._events = identity, response, events
     def identity(self): return self._identity
     def abort(self): self._events.append(("abort", self._identity))
-    def read_response(self): self._events.append(("read", self._identity)); return self._response
+    def read_response(self):
+        self._events.append(("read", self._identity))
+        if self._response.kind is SupervisorResultKind.ACCEPTED and "binding" not in self._response.structured_output:
+            request = self._request
+            value = dict(self._response.structured_output)
+            value["binding"] = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
+            return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, value)
+        return self._response
 
 
 class Session:
     def __init__(self, identity, turn, events): self._identity, self._turn, self._events = identity, turn, events
     def identity(self): return self._identity
     def close(self): self._events.append(("close", self._identity))
-    def start_turn(self, request): self._events.append(("start", self._identity, request.within_round_attempt)); return self._turn
+    def start_turn(self, request): self._events.append(("start", self._identity, request.within_round_attempt)); self._turn._request = request; return self._turn
 
 
 class Backend:
@@ -90,14 +97,17 @@ class SupervisorTests(unittest.TestCase):
         events = []
         class Handle:
             id = "turn-native"
+            def __init__(self, binding): self.binding = binding
             def stream(self):
                 return iter((
-                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": '{"verdict":"pass","findings":[]}'}}},
+                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": json.dumps({"verdict": "pass", "findings": [], "binding": self.binding})}}},
                     {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}},
                 ))
         class Thread:
             id = "session-native"
-            def turn(self, _prompt, **kwargs): events.append(kwargs); return Handle()
+            def turn(self, prompt, **kwargs):
+                events.append(kwargs); material = json.loads(prompt)["review_material"]
+                return Handle({key: material[key] for key in ("input_digest", "candidate_sha", "within_round_attempt", "profile_identity")})
         class Codex:
             def __enter__(self): return self
             def __exit__(self, *_args): events.append("closed")
@@ -145,34 +155,35 @@ class SupervisorTests(unittest.TestCase):
                 inner.calls.append("seal"); evidence = "sha256:" + hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(); inner.receipt = SupervisorRecorderReceipt(SUPERVISOR_FAILOVER_PROFILE, "case-44-sequence", self.context.candidate_sha, 101, readiness.capture_plan_digest, evidence, digest("sequence-manifest"), digest("sequence-bundle"), digest(store_identity), digest("sequence-receipt")); return inner.receipt
             def verify(inner, plan, bundle_digest, *, store_identity):
                 inner.calls.append("verify"); return inner.receipt
-        return adapters, requests, readiness, binding, Recorder()
+        policy = ResolvedSupervisorSequencePolicy(ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE), self.context.policy_digest, self.context.configuration_digest, tuple(item.profile_identity for item in adapters))
+        return adapters, requests, readiness, binding, policy, Recorder()
 
     def test_sequence_advances_ambiguous_primary_to_valid_fallback(self):
-        adapters, requests, readiness, binding, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        adapters, requests, readiness, binding, policy, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.comparison.disposition, recorder.calls), (SupervisorSequenceTerminal.ACCEPTED, ("ambiguous", "accepted"), 2, "match", ["prepare", "seal", "verify"]))
         payload = result.envelope.payload()
         self.assertEqual((type(payload["attempts"]), type(payload["request_identities"]), type(payload["profile_identities"]), type(payload["runtime_fingerprints"])), (list, list, list, list))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
-        adapters, requests, readiness, binding, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        adapters, requests, readiness, binding, policy, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
-        adapters, requests, readiness, binding, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS) for _profile in self.profiles))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        adapters, requests, readiness, binding, policy, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS) for _profile in self.profiles))
+        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
 
     def test_sequence_rejects_binding_order_and_profile_drift(self):
-        adapters, requests, readiness, binding, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        adapters, requests, readiness, binding, policy, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         drifted = SupervisorSequenceBinding(binding.case_id, binding.candidate_sha, binding.base_sha, binding.task_id, binding.request_identities, (binding.profile_identities[1], binding.profile_identities[0], binding.profile_identities[2]), binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest)
         with self.assertRaises(Exception):
-            qualify_supervisor_sequence(adapters, requests, readiness, drifted, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, readiness, drifted, policy, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.calls, [])
 
     def test_sequence_candidate_movement_invalidates_armed_plan(self):
-        adapters, requests, readiness, binding, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        adapters, requests, readiness, binding, policy, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         with self.assertRaises(Exception):
             type(readiness)("c" * 40, readiness.ready_at, readiness.case_id, readiness.observation_identity, readiness.producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_identity, readiness.store_identity, readiness.capture_plan_digest)
         self.assertEqual(binding.candidate_sha, self.context.candidate_sha)

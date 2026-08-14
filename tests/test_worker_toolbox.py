@@ -233,7 +233,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual((non_final.kind, non_final.diagnostic), ("invalid", WorkerParserDiagnostic.NON_FINAL))
         multiple = _consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43")), WorkerAction.REPAIR)
         self.assertEqual((multiple.kind, multiple.diagnostic), ("invalid", WorkerParserDiagnostic.SHAPE))
-        self.assertEqual(_consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43", "in_progress")), WorkerAction.REPAIR).kind, "incomplete")
+        self.assertEqual(_consume_public_result(ProtocolHandle(sdk_item("turn-43", '{"status":"complete","action":"repair"}'), sdk_turn("turn-43", "in_progress")), WorkerAction.REPAIR).kind, "ambiguous")
         failed = _consume_public_result(ProtocolHandle(sdk_turn("turn-43", "failed")), WorkerAction.REPAIR)
         self.assertEqual((failed.kind, failed.blocker, failed.outcome_source, failed.sdk_error_category), ("blocked", "provider-failed", WorkerOutcomeSource.SDK_TURN_FAILED, WorkerSdkTurnErrorCategory.MISSING_OR_UNKNOWN))
 
@@ -369,6 +369,49 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual(events.count("interrupt"), 1)
         self.assertEqual(events.count("client-close"), 1)
         self.assertLess(events.index("interrupt"), events.index("client-close"))
+
+    def test_concrete_unverified_terminal_eof_requires_exact_turn_recovery(self):
+        for name, values in (
+            ("eof", ()),
+            ("nonterminal", (sdk_item("turn-43", '{"status":"complete","action":"planning","blocker":null}'), sdk_turn("turn-43", "in_progress"))),
+        ):
+            with self.subTest(name=name):
+                events, provider_calls = [], []
+
+                class Handle:
+                    id = "turn-43"
+                    def stream(self):
+                        class Stream(list):
+                            def close(inner): events.append("stream-close")
+                        return Stream(values)
+                    def interrupt(self): events.append("interrupt")
+
+                class Thread:
+                    id = "thread-43"
+                    def turn(self, *_args, **_kwargs):
+                        provider_calls.append("turn")
+                        return Handle()
+
+                class Codex:
+                    def __enter__(self): return self
+                    def __exit__(self, *_args): events.append("client-close")
+                    def thread_start(self, **_kwargs): return Thread()
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    service = TemporaryReviewedRecorder()
+                    recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, record_document=service.record_document, verify_recording=service.verify_recording)
+                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+
+                self.assertEqual(provider_calls, ["turn"])
+                self.assertEqual((result.result.kind, result.result.session_identity, result.result.turn_identity), ("ambiguous", "thread-43", "turn-43"))
+                self.assertEqual((result.envelope.blocker, result.envelope.next_action, result.record), ("exact-turn-recovery", "blocked-ambiguous-turn", None))
+                self.assertEqual(result.comparison.disposition, "match")
+                self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None, None), events)
+                self.assertEqual(events.count("interrupt"), 1)
+                self.assertEqual(events.count("client-close"), 1)
+                self.assertLess(events.index("interrupt"), events.index("client-close"))
+                self.assertEqual(service.calls, [])
 
     def test_concrete_read_failures_abort_then_close_once_without_evidence(self):
         for name, failure in (("typed", CodexAdapterError(CodexFailure.UNKNOWN)), ("generic", RuntimeError("closed"))):

@@ -339,7 +339,9 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
                         failure, category = _turn_failure(_field(turn, "error"))
                         return NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=failure, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category)
                     if status != "completed":
-                        return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
+                        # A checkpointed exact turn without a verified terminal
+                        # completion may only be reconciled, never recaptured.
+                        return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
                     completed = True
                     continue
                 if method != "item/completed":
@@ -362,7 +364,8 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
             close = getattr(stream, "close", None)
             if callable(close): close()
         if not completed:
-            return NativeWorkerResponse(WorkerResultKind.INCOMPLETE)
+            # EOF supplies no proof that this exact dispatched turn terminated.
+            return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
         if response is None:
             return _invalid(WorkerParserDiagnostic.NON_FINAL if saw_non_final else WorkerParserDiagnostic.SHAPE)
         try:

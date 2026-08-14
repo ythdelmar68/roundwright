@@ -314,11 +314,14 @@ class FileReviewAuthorityStore:
         if not isinstance(root, (str, os.PathLike)) or type(expectation) is not ReviewAuthorityExpectation:
             raise ConfigurationError("review authority store source is invalid")
         candidate = Path(root)
-        if _has_reparse_ancestor(candidate):
+        # Resolve an ordinary spelling first: macOS /var and Windows junction
+        # ancestors may legitimately normalize to a different canonical root.
+        # The requested authority-store leaf itself must never be a reparse.
+        if _reparse(candidate):
             raise ConfigurationError("review authority store root is invalid")
         candidate.mkdir(parents=True, exist_ok=True)
         resolved = candidate.resolve(strict=True)
-        if _has_reparse_ancestor(candidate) or not resolved.is_dir():
+        if _reparse(candidate) or _reparse(resolved) or not resolved.is_dir():
             raise ConfigurationError("review authority store root is invalid")
         self._root = resolved
         self.authority_store_identity = self.identity_for_root(resolved)
@@ -332,7 +335,9 @@ class FileReviewAuthorityStore:
     @staticmethod
     def identity_for_root(root: str | Path) -> str:
         candidate = Path(root)
-        if _has_reparse_ancestor(candidate):
+        # Identity is always of the canonical storage root, not a legitimate
+        # platform spelling that traverses /var or a normalized ancestor.
+        if _reparse(candidate):
             raise ConfigurationError("review authority store root is invalid")
         if candidate.exists():
             if not candidate.is_dir():
@@ -340,7 +345,7 @@ class FileReviewAuthorityStore:
             resolved = candidate.resolve(strict=True)
         else:
             parent = candidate.parent.resolve(strict=True)
-            if _has_reparse_ancestor(parent):
+            if not parent.is_dir():
                 raise ConfigurationError("review authority store root is invalid")
             resolved = parent / candidate.name
         if _reparse(resolved):
@@ -1140,16 +1145,6 @@ def _digest(value: object) -> str:
 def _reparse(path: Path) -> bool:
     """Treat Windows junctions as authority-store traversal, like symlinks."""
     return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
-
-
-def _has_reparse_ancestor(path: Path) -> bool:
-    current = path
-    while True:
-        if current.exists() and _reparse(current):
-            return True
-        if current.parent == current:
-            return False
-        current = current.parent
 
 
 def _is_digest(value: object) -> bool:

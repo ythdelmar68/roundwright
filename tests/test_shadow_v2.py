@@ -1050,9 +1050,12 @@ class ShadowV2Tests(unittest.TestCase):
 
     def test_closed_profile_declares_every_capture_readiness_field(self) -> None:
         profile = shadow_evidence_profile(PROVENANCE_DECISION_PROFILE)
-        self.assertEqual(shadow_evidence_profiles(), (profile,))
+        worker = shadow_evidence_profile("roundwright-shadow-profile/worker-adapter/v1")
+        self.assertEqual(shadow_evidence_profiles(), (profile, worker))
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
+        self.assertEqual(worker.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
+        self.assertEqual(worker.event_kinds, ("worker-request-response-envelope",))
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

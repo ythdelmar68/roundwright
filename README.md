@@ -35,6 +35,25 @@ deadline.  Retry is limited to three qualification attempts and never enters a
 Supervisor review lifecycle.  No Copilot SDK, runtime, or authentication path
 is present.
 
+The Phase 3 Worker seam is `roundwright.codex_worker`.  It accepts an injected
+native Codex SDK backend only after the profile/runtime has been qualified,
+passes the backend immutable path-free context plus an explicit workspace/test
+tool surface, and checkpoints the SDK session and turn identities before it
+consumes a typed structured response.  It cannot receive GitHub, registry,
+policy activation, branch/worktree, review, ready, merge, close, or cleanup
+authority.  Invalid, incomplete, cancelled/denied, or ambiguous turns remain
+typed non-success outcomes for the provider-neutral lifecycle to recover.
+
+`roundwright.worker_shadow` provides the corresponding
+`roundwright-shadow-profile/worker-adapter/v1` evidence boundary. It arms a
+candidate-bound v2 capture before the first selected live Worker attempt, then
+exports only task/thread/attempt, runtime/configuration, deterministic state,
+blocker, next-action, and accepted-result digests. The operational path uses
+the reviewed Harness Recorder and an exact external append-only store identity
+outside product Git, seals and independently verifies its receipt, and never
+claims a recording during pre-dispatch arming. A missing or stale history must
+be recaptured as a fresh bounded attempt.
+
 ### Opt-in live provider-health fixture
 
 Hermetic coverage remains in `tests/test_provider_health.py` and

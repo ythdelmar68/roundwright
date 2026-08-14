@@ -20,7 +20,7 @@ from roundwright.codex_supervisor import (
 )
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewMode, ReviewPolicy, load_configuration
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.runtime_binding import InMemorySupervisorRuntimeStore, RuntimeBindingError
+from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
 from roundwright.shadow import RecorderBinding
@@ -495,6 +495,29 @@ class SupervisorTests(unittest.TestCase):
         store, _runtime, receipt = fresh()
         with self.assertRaises(RuntimeBindingError): store.read(receipt, evidence_time=9)
         with self.assertRaises(RuntimeBindingError): store.read(receipt, evidence_time=21)
+
+    def test_file_runtime_store_rehydrates_canonical_receipts(self):
+        runtime = self.configuration.runtime_binding(); candidate = self.context.candidate_sha; context = digest("file-runtime-context")
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runtime"; source = digest("file-runtime-source")
+            receipt = FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20)
+            value = FileSupervisorRuntimeStore(root, source).read(receipt, evidence_time=10)
+            self.assertEqual(value, runtime); self.assertIsNot(value, runtime)
+            material = json.dumps(receipt.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            self.assertEqual(SupervisorRuntimeBindingReceipt.from_canonical(material), receipt)
+            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20)
+            record = root / ("record-" + receipt.record_identity.removeprefix("sha256:"))
+            for filename, replacement in (("runtime.json", "{}"), ("receipt.json", "{}")):
+                original = (record / filename).read_text(encoding="utf-8")
+                (record / filename).write_text(replacement, encoding="utf-8")
+                with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).read(receipt, evidence_time=10)
+                (record / filename).write_text(original, encoding="utf-8")
+            (record / "runtime.json.tmp").write_text("partial", encoding="utf-8")
+            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).read(receipt, evidence_time=10)
+            (record / "runtime.json.tmp").unlink()
+            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, digest("wrong-file-runtime-source")).read(receipt, evidence_time=10)
+            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).read(receipt, evidence_time=9)
+            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).read(receipt, evidence_time=21)
 
     def test_sequence_runtime_preflight_failures_make_zero_downstream_calls(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))

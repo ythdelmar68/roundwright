@@ -5,12 +5,15 @@ from __future__ import annotations
 import re
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SCHEMA = "roundwright-runtime/v1"
+_RECEIPT_SCHEMA = "roundwright-supervisor-runtime-receipt/v1"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -149,13 +152,25 @@ class RuntimeBinding:
 
 @dataclass(frozen=True)
 class SupervisorRuntimeBindingReceipt:
-    source_identity: str; record_identity: str; candidate_sha: str; context_identity: str; resolved_configuration_digest: str; runtime_content_digest: str; ready_at: int; freshness_until: int
+    source_identity: str; record_identity: str; candidate_sha: str; context_identity: str; resolved_configuration_digest: str; runtime_content_digest: str; ready_at: int; freshness_until: int; schema: str = _RECEIPT_SCHEMA; canonical_material_digest: str = ""
     def __post_init__(self) -> None:
-        if not all(_DIGEST.fullmatch(value) for value in (self.source_identity, self.record_identity, self.context_identity, self.resolved_configuration_digest, self.runtime_content_digest)) or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.ready_at < 0 or self.freshness_until < self.ready_at:
+        if self.schema != _RECEIPT_SCHEMA or not all(_DIGEST.fullmatch(value) for value in (self.source_identity, self.record_identity, self.context_identity, self.resolved_configuration_digest, self.runtime_content_digest)) or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.ready_at < 0 or self.freshness_until < self.ready_at:
             raise RuntimeBindingError("supervisor runtime receipt is invalid")
-    def payload(self) -> dict[str, object]: return self.__dict__.copy()
+        material = self.runtime_content_digest if not self.canonical_material_digest else self.canonical_material_digest
+        if not _DIGEST.fullmatch(material): raise RuntimeBindingError("supervisor runtime receipt is invalid")
+        object.__setattr__(self, "canonical_material_digest", material)
+    def payload(self) -> dict[str, object]: return {"schema": self.schema, "source_identity": self.source_identity, "record_identity": self.record_identity, "candidate_sha": self.candidate_sha, "context_identity": self.context_identity, "resolved_configuration_digest": self.resolved_configuration_digest, "runtime_content_digest": self.runtime_content_digest, "canonical_material_digest": self.canonical_material_digest, "ready_at": self.ready_at, "freshness_until": self.freshness_until}
     @property
     def receipt_digest(self) -> str: return "sha256:" + hashlib.sha256(json.dumps(self.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    @classmethod
+    def from_canonical(cls, material: object) -> "SupervisorRuntimeBindingReceipt":
+        if type(material) is not str: raise RuntimeBindingError("supervisor runtime receipt material is invalid")
+        try:
+            payload = json.loads(material); expected = {"schema", "source_identity", "record_identity", "candidate_sha", "context_identity", "resolved_configuration_digest", "runtime_content_digest", "canonical_material_digest", "ready_at", "freshness_until"}
+            if type(payload) is not dict or set(payload) != expected or json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != material: raise ValueError
+            return cls(payload["source_identity"], payload["record_identity"], payload["candidate_sha"], payload["context_identity"], payload["resolved_configuration_digest"], payload["runtime_content_digest"], payload["ready_at"], payload["freshness_until"], payload["schema"], payload["canonical_material_digest"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeBindingError("supervisor runtime receipt material is invalid") from error
 
 
 class ExternalSupervisorRuntimeStore(Protocol):
@@ -171,8 +186,8 @@ class InMemorySupervisorRuntimeStore:
         if type(runtime) is not RuntimeBinding or not _SHA.fullmatch(candidate_sha) or not _DIGEST.fullmatch(context_identity) or type(ready_at) is not int or type(freshness_until) is not int or freshness_until < ready_at:
             raise RuntimeBindingError("supervisor runtime persist is invalid")
         material = runtime.canonical_material(); content = "sha256:" + hashlib.sha256(material.encode()).hexdigest()
-        record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": self._source_identity, "candidate_sha": candidate_sha, "context_identity": context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": content, "ready_at": ready_at, "freshness_until": freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        receipt = SupervisorRuntimeBindingReceipt(self._source_identity, record, candidate_sha, context_identity, runtime.resolved_digest, content, ready_at, freshness_until)
+        record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": self._source_identity, "candidate_sha": candidate_sha, "context_identity": context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": content, "canonical_material_digest": content, "ready_at": ready_at, "freshness_until": freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        receipt = SupervisorRuntimeBindingReceipt(self._source_identity, record, candidate_sha, context_identity, runtime.resolved_digest, content, ready_at, freshness_until, _RECEIPT_SCHEMA, content)
         if record in self._records: raise RuntimeBindingError("supervisor runtime record already exists")
         self._records[record] = material; return receipt
     def read(self, receipt: SupervisorRuntimeBindingReceipt, *, evidence_time: int) -> RuntimeBinding:
@@ -181,7 +196,70 @@ class InMemorySupervisorRuntimeStore:
         material = self._records.get(receipt.record_identity)
         if material is None: raise RuntimeBindingError("supervisor runtime record is missing")
         runtime = RuntimeBinding.from_canonical(material); content = "sha256:" + hashlib.sha256(runtime.canonical_material().encode()).hexdigest()
-        record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": self._source_identity, "candidate_sha": receipt.candidate_sha, "context_identity": receipt.context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": content, "ready_at": receipt.ready_at, "freshness_until": receipt.freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        expected = SupervisorRuntimeBindingReceipt(self._source_identity, record, receipt.candidate_sha, receipt.context_identity, runtime.resolved_digest, content, receipt.ready_at, receipt.freshness_until)
+        record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": self._source_identity, "candidate_sha": receipt.candidate_sha, "context_identity": receipt.context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": content, "canonical_material_digest": content, "ready_at": receipt.ready_at, "freshness_until": receipt.freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        expected = SupervisorRuntimeBindingReceipt(self._source_identity, record, receipt.candidate_sha, receipt.context_identity, runtime.resolved_digest, content, receipt.ready_at, receipt.freshness_until, _RECEIPT_SCHEMA, content)
         if expected != receipt: raise RuntimeBindingError("supervisor runtime receipt drifted")
+        return runtime
+
+
+class FileSupervisorRuntimeStore:
+    """Append-only canonical RuntimeBinding store with restart-safe receipt checks."""
+
+    _RUNTIME_FILE = "runtime.json"; _RECEIPT_FILE = "receipt.json"
+
+    def __init__(self, root: str | Path, source_identity: str) -> None:
+        if not isinstance(root, (str, os.PathLike)) or not _DIGEST.fullmatch(source_identity): raise RuntimeBindingError("supervisor runtime source is invalid")
+        candidate = Path(root)
+        if candidate.is_symlink(): raise RuntimeBindingError("supervisor runtime root is invalid")
+        candidate.mkdir(parents=True, exist_ok=True); resolved = candidate.resolve(strict=True)
+        if candidate.is_symlink() or candidate.absolute() != resolved or not resolved.is_dir(): raise RuntimeBindingError("supervisor runtime root is invalid")
+        self._root = resolved; self._source_identity = source_identity
+
+    @staticmethod
+    def _digest_material(material: str) -> str: return "sha256:" + hashlib.sha256(material.encode()).hexdigest()
+    def _record(self, runtime: RuntimeBinding, *, candidate_sha: str, context_identity: str, ready_at: int, freshness_until: int) -> SupervisorRuntimeBindingReceipt:
+        material = runtime.canonical_material(); content = self._digest_material(material)
+        record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": self._source_identity, "candidate_sha": candidate_sha, "context_identity": context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": content, "canonical_material_digest": content, "ready_at": ready_at, "freshness_until": freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return SupervisorRuntimeBindingReceipt(self._source_identity, record, candidate_sha, context_identity, runtime.resolved_digest, content, ready_at, freshness_until, _RECEIPT_SCHEMA, content)
+    def _directory(self, record_identity: str) -> Path:
+        if not _DIGEST.fullmatch(record_identity): raise RuntimeBindingError("supervisor runtime record is invalid")
+        value = self._root / ("record-" + record_identity.removeprefix("sha256:"))
+        try: value.resolve(strict=False).relative_to(self._root)
+        except ValueError as error: raise RuntimeBindingError("supervisor runtime path escaped root") from error
+        if value.exists() and value.is_symlink(): raise RuntimeBindingError("supervisor runtime record is invalid")
+        return value
+    @staticmethod
+    def _publish(path: Path, material: str) -> None:
+        temporary = path.with_name(path.name + ".tmp")
+        if path.parent.is_symlink() or path.exists() or temporary.exists(): raise RuntimeBindingError("supervisor runtime collision")
+        try:
+            descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(descriptor, "wb") as handle: handle.write(material.encode()); handle.flush(); os.fsync(handle.fileno())
+            if path.exists(): raise RuntimeBindingError("supervisor runtime collision")
+            os.replace(temporary, path)
+        except RuntimeBindingError: raise
+        except OSError as error: raise RuntimeBindingError("supervisor runtime publication failed") from error
+    @staticmethod
+    def _read(path: Path) -> str:
+        try: material = path.read_bytes().decode(); parsed = json.loads(material)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error: raise RuntimeBindingError("supervisor runtime material is invalid") from error
+        if json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != material: raise RuntimeBindingError("supervisor runtime material is noncanonical")
+        return material
+    def persist(self, runtime: RuntimeBinding, *, candidate_sha: str, context_identity: str, ready_at: int, freshness_until: int) -> SupervisorRuntimeBindingReceipt:
+        if type(runtime) is not RuntimeBinding or not _SHA.fullmatch(candidate_sha) or not _DIGEST.fullmatch(context_identity) or type(ready_at) is not int or type(freshness_until) is not int or freshness_until < ready_at: raise RuntimeBindingError("supervisor runtime persist is invalid")
+        receipt = self._record(runtime, candidate_sha=candidate_sha, context_identity=context_identity, ready_at=ready_at, freshness_until=freshness_until); directory = self._directory(receipt.record_identity)
+        try: directory.mkdir()
+        except FileExistsError as error: raise RuntimeBindingError("supervisor runtime collision") from error
+        except OSError as error: raise RuntimeBindingError("supervisor runtime publication failed") from error
+        if directory.is_symlink(): raise RuntimeBindingError("supervisor runtime record is invalid")
+        self._publish(directory / self._RUNTIME_FILE, runtime.canonical_material()); self._publish(directory / self._RECEIPT_FILE, json.dumps(receipt.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)); return receipt
+    def read(self, receipt: SupervisorRuntimeBindingReceipt, *, evidence_time: int) -> RuntimeBinding:
+        if type(receipt) is not SupervisorRuntimeBindingReceipt or type(evidence_time) is not int or not receipt.ready_at <= evidence_time <= receipt.freshness_until: raise RuntimeBindingError("supervisor runtime evidence time is invalid")
+        directory = self._directory(receipt.record_identity)
+        if not directory.exists() or directory.is_symlink(): raise RuntimeBindingError("supervisor runtime record is incomplete")
+        entries = {item.name: item for item in directory.iterdir()}
+        if set(entries) != {self._RUNTIME_FILE, self._RECEIPT_FILE} or any(item.is_symlink() or not item.is_file() for item in entries.values()): raise RuntimeBindingError("supervisor runtime record is incomplete")
+        runtime = RuntimeBinding.from_canonical(self._read(entries[self._RUNTIME_FILE])); stored = SupervisorRuntimeBindingReceipt.from_canonical(self._read(entries[self._RECEIPT_FILE]))
+        expected = self._record(runtime, candidate_sha=receipt.candidate_sha, context_identity=receipt.context_identity, ready_at=receipt.ready_at, freshness_until=receipt.freshness_until)
+        if stored != receipt or expected != receipt: raise RuntimeBindingError("supervisor runtime receipt drifted")
         return runtime

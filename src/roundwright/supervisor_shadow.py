@@ -14,7 +14,7 @@ from typing import Callable, Mapping, Protocol
 from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorResultKind, dispatch_ordered_supervisor_attempts
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 from .configuration import ResolvedConfigurationBinding, ReviewPolicy
-from .runtime_binding import ExternalSupervisorRuntimeStore, RuntimeBinding
+from .runtime_binding import ExternalSupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -666,7 +666,15 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
     try:
         context_identity = _hash({"task_id": binding.task_id, "base_sha": binding.base_sha, "candidate_sha": binding.candidate_sha, "requests": binding.request_identities, "profiles": binding.profile_identities, "runtime": binding.runtime_fingerprints, "epoch": binding.review_epoch, "round": binding.review_round, "mode": binding.review_mode, "capture_plan": binding.capture_plan_digest})
         runtime_receipt = runtime_store.persist(resolved_policy.runtime, candidate_sha=binding.candidate_sha, context_identity=context_identity, ready_at=readiness.ready_at, freshness_until=freshness_until)
+        if type(runtime_receipt) is not SupervisorRuntimeBindingReceipt or (runtime_receipt.candidate_sha, runtime_receipt.context_identity, runtime_receipt.resolved_configuration_digest, runtime_receipt.ready_at, runtime_receipt.freshness_until) != (binding.candidate_sha, context_identity, resolved_policy.configuration_digest, readiness.ready_at, freshness_until):
+            raise SupervisorShadowError("Supervisor runtime receipt is invalid")
         runtime = runtime_store.read(runtime_receipt, evidence_time=evidence_time)
+        if type(runtime) is not RuntimeBinding or runtime is resolved_policy.runtime:
+            raise SupervisorShadowError("Supervisor runtime read-back is invalid")
+        material_digest = "sha256:" + hashlib.sha256(runtime.canonical_material().encode()).hexdigest()
+        expected_record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": runtime_receipt.source_identity, "candidate_sha": binding.candidate_sha, "context_identity": context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": material_digest, "canonical_material_digest": material_digest, "ready_at": readiness.ready_at, "freshness_until": freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (runtime_receipt.record_identity, runtime_receipt.runtime_content_digest, runtime_receipt.canonical_material_digest) != (expected_record, material_digest, material_digest):
+            raise SupervisorShadowError("Supervisor runtime receipt drifted")
         reconstructed_policy = ResolvedSupervisorSequencePolicy(resolved_policy.configuration, runtime)
     except Exception as error:
         raise SupervisorShadowError("Supervisor runtime preflight failed") from error

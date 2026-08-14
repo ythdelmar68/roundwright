@@ -162,7 +162,7 @@ class SupervisorSequenceEnvelope:
         else:
             raise SupervisorShadowError("Supervisor sequence terminal is invalid")
     def payload(self) -> dict[str, object]:
-        return {"task_id": self.task_id, "base_sha": self.base_sha, "candidate_sha": self.candidate_sha, "request_identities": self.request_identities, "profile_identities": self.profile_identities, "runtime_fingerprints": self.runtime_fingerprints, "review_epoch": self.review_epoch, "review_round": self.review_round, "review_mode": self.review_mode, "capture_plan_digest": self.capture_plan_digest, "terminal": self.terminal.value, "attempts": tuple(item.__dict__ for item in self.attempts), "accepted_ordinal": self.accepted_ordinal, "accepted_result_identity": self.accepted_result_identity, "accepted_verdict": self.accepted_verdict, "blocker": self.blocker, "next_action": self.next_action}
+        return {"task_id": self.task_id, "base_sha": self.base_sha, "candidate_sha": self.candidate_sha, "request_identities": list(self.request_identities), "profile_identities": list(self.profile_identities), "runtime_fingerprints": list(self.runtime_fingerprints), "review_epoch": self.review_epoch, "review_round": self.review_round, "review_mode": self.review_mode, "capture_plan_digest": self.capture_plan_digest, "terminal": self.terminal.value, "attempts": [item.__dict__.copy() for item in self.attempts], "accepted_ordinal": self.accepted_ordinal, "accepted_result_identity": self.accepted_result_identity, "accepted_verdict": self.accepted_verdict, "blocker": self.blocker, "next_action": self.next_action}
     @property
     def envelope_digest(self) -> str: return _hash(self.payload())
 

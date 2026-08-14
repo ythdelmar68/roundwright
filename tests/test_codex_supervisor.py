@@ -283,7 +283,7 @@ class SupervisorTests(unittest.TestCase):
         expected_type = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle
         plan = expected_type(binding, policy.policy_digest, policy.configuration_digest, digest("file-runtime"), 10, readiness.observation_identity)
         with TemporaryDirectory() as temporary:
-            root = Path(temporary) / "durable"
+            root = Path(temporary) / "anchor" / ".." / "durable"
             source = digest("file-lifecycle-source")
             lifecycle = FileSupervisorLifecycle(root, source)
             receipt = lifecycle.prepare(plan, freshness_until=20)
@@ -313,7 +313,7 @@ class SupervisorTests(unittest.TestCase):
         expected_type = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle
         plan = expected_type(binding, policy.policy_digest, policy.configuration_digest, digest("file-runtime-complete"), 10, readiness.observation_identity)
         with TemporaryDirectory() as temporary:
-            root = Path(temporary) / "durable"; source = digest("file-chain-source")
+            root = Path(temporary) / "anchor" / ".." / "durable"; source = digest("file-chain-source")
             prepared = FileSupervisorLifecycle(root, source).prepare(plan, freshness_until=20)
             with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, source).read(prepared.record_identity, evidence_time=10)
             prior = prepared
@@ -503,7 +503,7 @@ class SupervisorTests(unittest.TestCase):
     def test_file_runtime_store_rehydrates_canonical_receipts(self):
         runtime = self.configuration.runtime_binding(); candidate = self.context.candidate_sha; context = digest("file-runtime-context")
         with TemporaryDirectory() as temporary:
-            root = Path(temporary) / "runtime"; source = digest("file-runtime-source")
+            root = Path(temporary) / "anchor" / ".." / "runtime"; source = digest("file-runtime-source")
             receipt = FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20)
             value = FileSupervisorRuntimeStore(root, source).read(receipt, evidence_time=10)
             self.assertEqual(value, runtime); self.assertIsNot(value, runtime)

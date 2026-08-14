@@ -312,7 +312,7 @@ class FileSupervisorLifecycle:
             raise SupervisorShadowError("Supervisor file lifecycle root is invalid")
         candidate.mkdir(parents=True, exist_ok=True)
         resolved = candidate.resolve(strict=True)
-        if candidate.is_symlink() or candidate.absolute() != resolved or not resolved.is_dir():
+        if candidate.is_symlink() or not resolved.is_dir():
             raise SupervisorShadowError("Supervisor file lifecycle root is invalid")
         self._root = resolved
         self._source_identity = source_identity

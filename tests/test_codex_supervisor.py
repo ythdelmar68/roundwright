@@ -25,7 +25,7 @@ from roundwright.shadow import RecorderBinding
 from roundwright.supervisor_shadow import (
     SUPERVISOR_FAILOVER_PROFILE, SupervisorCapturePlanReceipt,
     SupervisorQualificationBinding, SupervisorRecorderReceipt,
-    ResolvedSupervisorSequencePolicy, SupervisorSequenceBinding, SupervisorSequenceTerminal,
+    ResolvedSupervisorSequencePolicy, SupervisorExpectedLifecycleReceipt, SupervisorSequenceBinding, SupervisorSequenceTerminal,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_lifecycle_identity, supervisor_sequence_observation_identity,
 )
@@ -160,7 +160,14 @@ class SupervisorTests(unittest.TestCase):
         configuration = self.configuration
         policy = ResolvedSupervisorSequencePolicy(configuration, configuration.runtime_binding())
         class Lifecycle:
-            def __init__(inner): inner.record = None; inner.drift = False
+            def __init__(inner): inner.record = None; inner.expected = None; inner.drift = False
+            def prepare_expected(inner, expected):
+                inner.expected = expected
+                record = "sha256:" + hashlib.sha256(json.dumps(expected.payload(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                return SupervisorExpectedLifecycleReceipt(record, expected.source_identity, expected.binding.candidate_sha, expected.binding.capture_plan_digest, expected.observation_identity, expected.ready_at)
+            def read_expected(inner, receipt):
+                if inner.expected is None: raise ValueError("expected record missing")
+                return inner.expected
             def persist(inner, record_identity, observation_identity, attempts, result): inner.record = (record_identity, attempts, result)
             def read(inner, record_identity):
                 if inner.record is None or inner.record[0] != record_identity: raise ValueError("lifecycle record missing")
@@ -212,6 +219,14 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "Resolved Supervisor sequence policy"):
             ResolvedSupervisorSequencePolicy(policy.configuration, replace(policy.runtime, supervisor_profile_identities=tuple(reversed(policy.runtime.supervisor_profile_identities))))
         self.assertEqual(recorder.calls, [])
+
+    def test_sequence_rejects_expected_plan_observation_drift_before_provider_dispatch(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        original = lifecycle.read_expected
+        lifecycle.read_expected = lambda receipt: replace(original(receipt), observation_identity=digest("wrong-observation"))
+        with self.assertRaisesRegex(Exception, "pre-dispatch drifted"):
+            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((self.events, recorder.calls), ([], []))
 
 if __name__ == "__main__":
     unittest.main()

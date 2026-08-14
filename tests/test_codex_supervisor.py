@@ -82,8 +82,9 @@ class SupervisorTests(unittest.TestCase):
         snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
         authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
         anchor = load_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_review_floor=floor).resolved_digest
-        self.authority_expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "b" * 40, anchor, 101, 120)
-        self.authority_store = FileReviewAuthorityStore(Path(self.authority_temporary.name), expectation=self.authority_expectation)
+        authority_root = Path(self.authority_temporary.name)
+        self.authority_expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(authority_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "b" * 40, anchor, 101, 120)
+        self.authority_store = FileReviewAuthorityStore(authority_root, expectation=self.authority_expectation)
         self.authority_evidence = self.authority_store.persist(authority, candidate_sha="b" * 40, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
         self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
         self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
@@ -697,12 +698,24 @@ class SupervisorTests(unittest.TestCase):
         snapshot = TrustedPolicySnapshot(TrustedControlSource("c" * 64, "d" * 64), PolicyDocument(1, frozenset()))
         authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, reduced)
         anchor = load_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_review_floor=reduced).resolved_digest
-        expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, authority.receipt_digest, authority.policy_snapshot_digest, reduced, binding.candidate_sha, anchor, 101, 120)
         with TemporaryDirectory() as directory:
-            forged_store = FileReviewAuthorityStore(Path(directory), expectation=expectation)
+            forged_root = Path(directory)
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(forged_root), authority.receipt_digest, authority.policy_snapshot_digest, reduced, binding.candidate_sha, anchor, 101, 120)
+            forged_store = FileReviewAuthorityStore(forged_root, expectation=expectation)
             forged_evidence = forged_store.persist(authority, candidate_sha=binding.candidate_sha, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
             with self.assertRaises(SupervisorShadowError):
                 qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=forged_store, review_authority_evidence=forged_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
+
+    def test_sequence_same_expectation_clone_authority_store_has_zero_downstream_calls(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),) + (NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 2)
+        counts = {name: 0 for name in ("prepare", "read_plan", "append", "finalize", "read")}
+        for name in counts:
+            original = getattr(lifecycle, name)
+            setattr(lifecycle, name, lambda *args, _name=name, _original=original, **kwargs: (counts.__setitem__(_name, counts[_name] + 1), _original(*args, **kwargs))[1])
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(ConfigurationError):
+                FileReviewAuthorityStore(Path(directory) / "candidate-controlled-clone", expectation=self.authority_expectation)
         self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
     def test_sequence_runtime_read_preflight_failure_has_zero_adapter_calls(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))

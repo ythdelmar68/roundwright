@@ -162,8 +162,9 @@ repository = RepositoryIdentity.from_root(root)
 sealed_base = original_run(['git', '-C', str(root), 'rev-parse', 'refs/remotes/origin/main'], check=True, text=True, capture_output=True).stdout.strip()
 local_authority = TrustedReviewAuthorityReceipt.from_snapshot(trusted_policy_snapshot, trusted_review_floor)
 local_anchor = load_configuration(cwd=Path(repository.root.anchor), environment={}, home=repository.root, trusted_review_floor=trusted_review_floor).resolved_digest
-local_expectation = ReviewAuthorityExpectation(local_authority.source_identity, local_authority.authority_identity, local_authority.runtime_store_source_identity, local_authority.receipt_digest, local_authority.policy_snapshot_digest, trusted_review_floor, sealed_base, local_anchor, 1893456000, 1893456060)
-local_authority_store = FileReviewAuthorityStore(root.parent / 'review-authority', expectation=local_expectation)
+local_authority_root = root.parent / 'review-authority'
+local_expectation = ReviewAuthorityExpectation(local_authority.source_identity, local_authority.authority_identity, local_authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(local_authority_root), local_authority.receipt_digest, local_authority.policy_snapshot_digest, trusted_review_floor, sealed_base, local_anchor, 1893456000, 1893456060)
+local_authority_store = FileReviewAuthorityStore(local_authority_root, expectation=local_expectation)
 local_authority_evidence = local_authority_store.persist(local_authority, candidate_sha=sealed_base, configuration_anchor_digest=local_anchor, ready_at=1893456000, freshness_until=1893456060)
 def git_entrypoint_control(value):
     binding = CandidateBinding(value.repository_id, value.task_id, sealed_base)

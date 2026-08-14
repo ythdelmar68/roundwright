@@ -396,8 +396,9 @@ class ConfigurationTests(unittest.TestCase):
             def authority_inputs(floor):
                 authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
                 anchor = load_configuration(cwd=root, environment={}, trusted_review_floor=floor).resolved_digest
-                expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, anchor, 10, 20)
-                store = FileReviewAuthorityStore(root / authority.receipt_digest.removeprefix("sha256:"), expectation=expectation)
+                store_root = root / authority.receipt_digest.removeprefix("sha256:")
+                expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(store_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, anchor, 10, 20)
+                store = FileReviewAuthorityStore(store_root, expectation=expectation)
                 evidence = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest=anchor, ready_at=10, freshness_until=20)
                 return authority, expectation, store, evidence
             authority, expectation, store, evidence = authority_inputs(accepted_floor)
@@ -462,7 +463,7 @@ class ConfigurationTests(unittest.TestCase):
         authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "authority"
-            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
             store = FileReviewAuthorityStore(root, expectation=expectation)
             receipt = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest="sha256:" + "d" * 64, ready_at=10, freshness_until=20)
             self.assertEqual(FileReviewAuthorityStore(root, expectation=expectation).read(receipt, evidence_time=10), receipt)
@@ -471,6 +472,19 @@ class ConfigurationTests(unittest.TestCase):
             path.write_text('{"tampered":true}\n', encoding="utf-8")
             with self.assertRaises(ConfigurationError):
                 store.read(receipt, evidence_time=10)
+
+    def test_file_review_authority_store_rejects_same_expectation_clone_root(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "pinned-authority"
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+            store = FileReviewAuthorityStore(root, expectation=expectation)
+            receipt = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest="sha256:" + "d" * 64, ready_at=10, freshness_until=20)
+            self.assertEqual(store.read(receipt, evidence_time=10), receipt)
+            with self.assertRaises(ConfigurationError):
+                FileReviewAuthorityStore(Path(temporary) / "candidate-clone", expectation=expectation)
 
 
 if __name__ == "__main__":

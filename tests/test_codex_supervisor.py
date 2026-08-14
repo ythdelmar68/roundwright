@@ -17,7 +17,7 @@ from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorResultKind,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.configuration import ConfigurationSource, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewMode, ReviewPolicy
+from roundwright.configuration import FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ReviewMode, ReviewPolicy, load_configuration
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
@@ -66,8 +66,8 @@ class Backend:
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
         self.events = []
-        policy_digest = "sha256:" + hashlib.sha256(json.dumps({"complete_rounds": 3, "max_rounds": 10, "max_supervisor_attempts_per_round": 3, "on_final_findings": "worker-final-repair-then-merge"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, policy_digest, digest("config"), 2, 4, ReviewMode.CONVERGING)
+        self.configuration = load_configuration(cwd=ROOT, environment={}, home=ROOT).pin()
+        self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
         self.profiles = (
             ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH, "primary"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback"),
@@ -157,7 +157,7 @@ class SupervisorTests(unittest.TestCase):
                 inner.calls.append("seal"); evidence = "sha256:" + hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(); inner.receipt = SupervisorRecorderReceipt(SUPERVISOR_FAILOVER_PROFILE, "case-44-sequence", self.context.candidate_sha, 101, readiness.capture_plan_digest, evidence, digest("sequence-manifest"), digest("sequence-bundle"), digest(store_identity), digest("sequence-receipt")); return inner.receipt
             def verify(inner, plan, bundle_digest, *, store_identity):
                 inner.calls.append("verify"); return inner.receipt
-        configuration = ResolvedConfigurationBinding("roundwright-runtime/v1", self.context.configuration_digest, {"roles.supervisor.attempt_profiles": ConfigurationSource.DEFAULT, "roles.worker": ConfigurationSource.DEFAULT, "review.complete_rounds": ConfigurationSource.DEFAULT, "review.max_rounds": ConfigurationSource.DEFAULT, "review.max_supervisor_attempts_per_round": ConfigurationSource.DEFAULT, "review.on_final_findings": ConfigurationSource.DEFAULT}, digest("worker"), tuple(item.profile_identity for item in adapters), ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE))
+        configuration = self.configuration
         policy = ResolvedSupervisorSequencePolicy(configuration, configuration.runtime_binding())
         class Lifecycle:
             def __init__(inner): inner.record = None; inner.drift = False

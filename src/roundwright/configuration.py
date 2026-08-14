@@ -141,6 +141,20 @@ class ResolvedConfigurationBinding:
     worker_profile_identity: str
     supervisor_profile_identities: tuple[str, ...]
     review_policy: ReviewPolicy
+    canonical_material: str = ""
+
+    def __post_init__(self) -> None:
+        try:
+            material = json.loads(self.canonical_material)
+            if type(material) is not dict or json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != self.canonical_material or self.digest != _digest(material):
+                raise ValueError
+            policy = material["review"]
+            profiles = tuple(_digest(item) for item in material["supervisor_attempt_profiles"])
+            sources = {name: value.value for name, value in self.sources.items()}
+            if material["schema_version"] != self.schema_version or _digest(material["worker"]) != self.worker_profile_identity or profiles != self.supervisor_profile_identities or material["sources"] != sources or material["review"] != _review_policy_payload(self.review_policy):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ConfigurationError("resolved configuration binding is not self-authenticating") from error
 
     def require_matches(self, other: "ResolvedConfigurationBinding") -> None:
         if type(other) is not ResolvedConfigurationBinding or self != other:
@@ -247,13 +261,24 @@ class Configuration:
         })
 
     def pin(self) -> ResolvedConfigurationBinding:
+        material = {
+            "schema_version": self.schema_version,
+            "worker": _profile_payload(self.worker.value),
+            "supervisor_attempt_profiles": [_profile_payload(profile) for profile in self.supervisor_attempt_profiles.value],
+            "paths": {"repository_root": None if self.repository_root.value is None else _digest({"path": os.fspath(self.repository_root.value)}), "cache_directory": _digest({"path": os.fspath(self.cache_directory.value)})},
+            "review": _review_policy_payload(self.review_policy),
+            "trusted_review_floor": _review_policy_payload(self.trusted_review_floor),
+            "sources": {name: value.value for name, value in sorted(self.sources.items())},
+        }
+        canonical_material = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return ResolvedConfigurationBinding(
             self.schema_version,
-            self.resolved_digest,
+            _digest(material),
             dict(self.sources),
             _digest(_profile_payload(self.worker.value)),
             tuple(_digest(_profile_payload(profile)) for profile in self.supervisor_attempt_profiles.value),
             self.review_policy,
+            canonical_material,
         )
 
 

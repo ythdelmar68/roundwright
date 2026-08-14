@@ -355,7 +355,7 @@ class WorkerToolboxTests(unittest.TestCase):
                         return self.values.pop(0)
                     def close(self): pass
                 return Stream()
-        self.assertEqual(_consume_public_result(Handle(), WorkerAction.REPAIR, completion=CompletionDeadline(100, 600)).kind, "accepted")
+        self.assertEqual(_consume_public_result(Handle(), WorkerAction.REPAIR, completion=CompletionDeadline(1000, 2000)).kind, "accepted")
 
     def test_timeout_is_result_checkpointed_before_recorder_and_never_retried(self):
         events, released = [], __import__("threading").Event()

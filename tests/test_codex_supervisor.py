@@ -8,6 +8,7 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -28,7 +29,7 @@ from roundwright.supervisor_shadow import (
     SupervisorQualificationBinding, SupervisorRecorderReceipt,
     ResolvedSupervisorSequencePolicy, SupervisorExpectedLifecycleReceipt, SupervisorSequenceBinding, SupervisorSequenceTerminal,
     SupervisorAttemptEvent, SupervisorTerminalRecord, LifecycleChainReceipt, CompleteSupervisorLifecycleRecord,
-    InMemorySupervisorLifecycle,
+    FileSupervisorLifecycle, InMemorySupervisorLifecycle,
     SupervisorLifecycleChainBinding,
     SupervisorShadowError,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
@@ -272,6 +273,36 @@ class SupervisorTests(unittest.TestCase):
         lifecycle.finalize(receipt.record_identity, terminal, evidence_time=10)
         with self.assertRaises(Exception): lifecycle.append(receipt.record_identity, event, evidence_time=10)
         with self.assertRaises(Exception): lifecycle.finalize(receipt.record_identity, terminal, evidence_time=10)
+
+    def test_file_lifecycle_plan_persists_and_fails_closed(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        expected_type = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle
+        plan = expected_type(binding, policy.policy_digest, policy.configuration_digest, digest("file-runtime"), 10, readiness.observation_identity)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "durable"
+            source = digest("file-lifecycle-source")
+            lifecycle = FileSupervisorLifecycle(root, source)
+            receipt = lifecycle.prepare(plan, freshness_until=20)
+            returned_plan, returned_receipt = FileSupervisorLifecycle(root, source).read_plan(receipt.record_identity, evidence_time=10)
+            self.assertEqual((returned_plan, returned_receipt), (plan, receipt))
+            self.assertIsNot(returned_plan, plan)
+            self.assertIsNot(returned_receipt, receipt)
+            with self.assertRaises(SupervisorShadowError): lifecycle.prepare(plan, freshness_until=20)
+            record = root / ("record-" + receipt.record_identity.removeprefix("sha256:"))
+            for filename, replacement in (("plan.json", "{}"), ("plan-receipt.json", "{}")):
+                original = (record / filename).read_text(encoding="utf-8")
+                (record / filename).write_text(replacement, encoding="utf-8")
+                with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, source).read_plan(receipt.record_identity, evidence_time=10)
+                (record / filename).write_text(original, encoding="utf-8")
+            (record / "unexpected").write_text("x", encoding="utf-8")
+            with self.assertRaises(SupervisorShadowError): lifecycle.read_plan(receipt.record_identity, evidence_time=10)
+            (record / "unexpected").unlink()
+            (record / "plan.json.tmp").write_text("partial", encoding="utf-8")
+            with self.assertRaises(SupervisorShadowError): lifecycle.read_plan(receipt.record_identity, evidence_time=10)
+            (record / "plan.json.tmp").unlink()
+            with self.assertRaises(SupervisorShadowError): FileSupervisorLifecycle(root, digest("wrong-source")).read_plan(receipt.record_identity, evidence_time=10)
+            with self.assertRaises(SupervisorShadowError): lifecycle.read_plan(receipt.record_identity, evidence_time=9)
+            with self.assertRaises(SupervisorShadowError): lifecycle._record_dir("not-a-digest")
 
     def _fresh_lifecycle_chain(self):
         lifecycle = InMemorySupervisorLifecycle(digest("tamper-lifecycle-source"))

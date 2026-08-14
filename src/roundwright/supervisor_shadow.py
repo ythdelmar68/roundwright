@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import os
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
 from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorResultKind, dispatch_ordered_supervisor_attempts
@@ -274,6 +276,139 @@ class ExternalSupervisorLifecycle(Protocol):
     def finalize(self, record_identity: str, terminal: SupervisorTerminalRecord, *, evidence_time: int) -> LifecycleChainReceipt: ...
     def read_plan(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt]: ...
     def read(self, record_identity: str, *, evidence_time: int) -> CompleteSupervisorLifecycleRecord: ...
+
+
+class FileSupervisorLifecycle:
+    """Append-only plan boundary for a durable Supervisor lifecycle record.
+
+    E1A deliberately persists and authenticates the pre-provider plan only.  The
+    event and terminal portions are fail-closed until their append-only protocol
+    is added, so a partial record can never qualify as a completed lifecycle.
+    """
+
+    _PLAN_FILE = "plan.json"
+    _RECEIPT_FILE = "plan-receipt.json"
+
+    def __init__(self, root: str | Path, source_identity: str) -> None:
+        if not _digest(source_identity) or not isinstance(root, (str, os.PathLike)):
+            raise SupervisorShadowError("Supervisor file lifecycle source is invalid")
+        candidate = Path(root)
+        if candidate.is_symlink():
+            raise SupervisorShadowError("Supervisor file lifecycle root is invalid")
+        candidate.mkdir(parents=True, exist_ok=True)
+        resolved = candidate.resolve(strict=True)
+        if candidate.is_symlink() or not resolved.is_dir():
+            raise SupervisorShadowError("Supervisor file lifecycle root is invalid")
+        self._root = resolved
+        self._source_identity = source_identity
+
+    @staticmethod
+    def _material(value: object) -> str:
+        return InMemorySupervisorLifecycle._material(value)
+
+    @staticmethod
+    def _receipt(material: object) -> LifecycleChainReceipt:
+        return InMemorySupervisorLifecycle._receipt(material)
+
+    @staticmethod
+    def _plan(material: object) -> SupervisorExpectedLifecycle:
+        return InMemorySupervisorLifecycle._plan(material)
+
+    @staticmethod
+    def _evidence_time(binding: SupervisorLifecycleChainBinding, evidence_time: int) -> None:
+        InMemorySupervisorLifecycle._evidence_time(binding, evidence_time)
+
+    def _binding(self, plan: SupervisorExpectedLifecycle, freshness_until: int) -> SupervisorLifecycleChainBinding:
+        record_identity = _hash({"source_identity": self._source_identity, "plan_identity": plan.plan_identity, "observation_identity": plan.observation_identity, "candidate_sha": plan.binding.candidate_sha, "context_identity": plan.context_identity, "capture_plan_digest": plan.binding.capture_plan_digest})
+        return SupervisorLifecycleChainBinding(record_identity, self._source_identity, plan.observation_identity, plan.binding.candidate_sha, plan.context_identity, plan.plan_identity, plan.binding.capture_plan_digest, plan.ready_at, freshness_until)
+
+    def _record_dir(self, record_identity: str) -> Path:
+        if not _digest(record_identity):
+            raise SupervisorShadowError("Supervisor file lifecycle record is invalid")
+        path = self._root / ("record-" + record_identity.removeprefix("sha256:"))
+        try:
+            path.resolve(strict=False).relative_to(self._root)
+        except ValueError as error:
+            raise SupervisorShadowError("Supervisor file lifecycle path escaped root") from error
+        if path.exists() and path.is_symlink():
+            raise SupervisorShadowError("Supervisor file lifecycle record is invalid")
+        return path
+
+    def _record_files(self, record_identity: str) -> tuple[Path, Path]:
+        directory = self._record_dir(record_identity)
+        if not directory.exists() or directory.is_symlink() or not directory.is_dir():
+            raise SupervisorShadowError("Supervisor file lifecycle plan is missing")
+        entries = {item.name: item for item in directory.iterdir()}
+        if set(entries) != {self._PLAN_FILE, self._RECEIPT_FILE} or any(item.is_symlink() or not item.is_file() for item in entries.values()):
+            raise SupervisorShadowError("Supervisor file lifecycle record is incomplete")
+        return entries[self._PLAN_FILE], entries[self._RECEIPT_FILE]
+
+    @staticmethod
+    def _read_canonical(path: Path) -> str:
+        try:
+            material = path.read_bytes().decode("utf-8")
+            parsed = json.loads(material)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SupervisorShadowError("Supervisor file lifecycle material is invalid") from error
+        if json.dumps(parsed, sort_keys=True, separators=(",", ":")) != material:
+            raise SupervisorShadowError("Supervisor file lifecycle material is noncanonical")
+        return material
+
+    @staticmethod
+    def _publish(path: Path, material: str) -> None:
+        temporary = path.with_name(path.name + ".tmp")
+        if path.exists() or temporary.exists():
+            raise SupervisorShadowError("Supervisor file lifecycle collision")
+        try:
+            descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(material.encode("utf-8")); handle.flush(); os.fsync(handle.fileno())
+            if path.exists():
+                raise SupervisorShadowError("Supervisor file lifecycle collision")
+            os.replace(temporary, path)
+        except SupervisorShadowError:
+            raise
+        except OSError as error:
+            raise SupervisorShadowError("Supervisor file lifecycle publication failed") from error
+
+    def prepare(self, plan: SupervisorExpectedLifecycle, *, freshness_until: int) -> LifecycleChainReceipt:
+        if type(plan) is not SupervisorExpectedLifecycle or type(freshness_until) is not int or freshness_until < plan.ready_at:
+            raise SupervisorShadowError("Supervisor file lifecycle prepare is invalid")
+        binding = self._binding(plan, freshness_until)
+        directory = self._record_dir(binding.record_identity)
+        try:
+            directory.mkdir()
+        except FileExistsError as error:
+            raise SupervisorShadowError("Supervisor file lifecycle collision") from error
+        except OSError as error:
+            raise SupervisorShadowError("Supervisor file lifecycle publication failed") from error
+        if directory.is_symlink():
+            raise SupervisorShadowError("Supervisor file lifecycle record is invalid")
+        receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
+        self._publish(directory / self._PLAN_FILE, self._material(plan.payload()))
+        self._publish(directory / self._RECEIPT_FILE, self._material(receipt.payload()))
+        return receipt
+
+    def read_plan(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt]:
+        plan_file, receipt_file = self._record_files(record_identity)
+        plan = self._plan(self._read_canonical(plan_file))
+        stored = self._receipt(self._read_canonical(receipt_file))
+        binding = self._binding(plan, stored.freshness_until)
+        self._evidence_time(binding, evidence_time)
+        receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
+        if binding.record_identity != record_identity or stored != receipt:
+            raise SupervisorShadowError("Supervisor file lifecycle plan receipt was tampered")
+        return plan, receipt
+
+    def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
+        raise SupervisorShadowError("Supervisor file lifecycle append is not implemented")
+
+    def finalize(self, record_identity: str, terminal: SupervisorTerminalRecord, *, evidence_time: int) -> LifecycleChainReceipt:
+        raise SupervisorShadowError("Supervisor file lifecycle finalize is not implemented")
+
+    def read(self, record_identity: str, *, evidence_time: int) -> CompleteSupervisorLifecycleRecord:
+        raise SupervisorShadowError("Supervisor file lifecycle completion is not implemented")
+
 
 class InMemorySupervisorLifecycle:
     """Provider-free append-only canonical lifecycle chain for qualification tests."""

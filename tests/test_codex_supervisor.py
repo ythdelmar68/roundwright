@@ -20,6 +20,12 @@ from roundwright.configuration import ProviderProfile, ReasoningEffort, ReviewMo
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
+from roundwright.shadow import RecorderBinding
+from roundwright.supervisor_shadow import (
+    SUPERVISOR_FAILOVER_PROFILE, SupervisorCapturePlanReceipt,
+    SupervisorQualificationBinding, SupervisorRecorderReceipt,
+    qualify_supervisor_attempt, require_supervisor_capture_readiness,
+)
 
 
 def digest(value: object) -> str:
@@ -105,6 +111,24 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(events[1]["sandbox"], "read-only")
         self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
         self.assertIn("closed", events)
+
+    def test_armed_capture_uses_one_plan_for_prepare_seal_and_readback(self):
+        adapter = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+        request = self.request(1, adapter)
+        readiness = require_supervisor_capture_readiness(candidate_sha=self.context.candidate_sha, ready_at=101, case_id="case-44", observation_identity=request.input_digest, producer_identity=digest("native"), exporter_identity=digest("export"), comparator_identity=digest("compare"), recorder=RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"), store_identity=digest("store"))
+        binding = SupervisorQualificationBinding("case-44", self.context.candidate_sha, self.context.base_sha, self.context.task_id, request.input_digest, adapter.profile_identity, adapter.runtime_fingerprint, self.context.review_epoch, self.context.review_round, self.context.review_mode.value, readiness.capture_plan_digest)
+        class Recorder:
+            def __init__(self): self.receipt = None; self.plans = []
+            def prepare(inner, plan, *, store_identity):
+                inner.plans.append(("prepare", readiness.capture_plan_digest, store_identity)); return SupervisorCapturePlanReceipt(readiness.capture_plan_digest, SUPERVISOR_FAILOVER_PROFILE, "case-44", self.context.candidate_sha, 101, digest("prepared"))
+            def seal(inner, plan, document, *, store_identity):
+                inner.plans.append(("seal", readiness.capture_plan_digest, store_identity)); inner.receipt = SupervisorRecorderReceipt(SUPERVISOR_FAILOVER_PROFILE, "case-44", self.context.candidate_sha, 101, readiness.capture_plan_digest, "sha256:" + hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(), digest("manifest"), digest("bundle"), digest(store_identity), digest("receipt")); return inner.receipt
+            def verify(inner, plan, bundle_digest, *, store_identity):
+                inner.plans.append(("verify", readiness.capture_plan_digest, store_identity)); return inner.receipt
+        recorder = Recorder()
+        result = qualify_supervisor_attempt(adapter, request, readiness, binding, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((result.receipt.profile, result.comparison.disposition), (SUPERVISOR_FAILOVER_PROFILE, "match"))
+        self.assertEqual([item[1] for item in recorder.plans], [readiness.capture_plan_digest] * 3)
 
 if __name__ == "__main__":
     unittest.main()

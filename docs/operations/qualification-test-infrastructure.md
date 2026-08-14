@@ -18,8 +18,16 @@ by the allowlisted owner.
 
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52`; tree `0c594caa275262164fce1942ebd2142abe0e77bb` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `1bb063d3f8f1fef9a24b3147b8bc99794e4637a7`; tree `632dcc3ecb3b8664de860844af2215ad5ade83e1` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
 | Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
+
+Harness PR #6 added the phase-neutral immutable capture-plan entrypoint and
+binds readiness, dispatch, evidence, Recorder seal, and read-back to content
+`cf669e186a739a8597cfaf9f050ce3bdcadda334`; canonical merge
+`1bb063d3f8f1fef9a24b3147b8bc99794e4637a7` has parents
+`10265c35c9d01d1fd26bd767ca3c1b245e4e9c52` and that content and resolves
+to tree `632dcc3ecb3b8664de860844af2215ad5ade83e1`. Exact-head CI run
+`31777654822` passed.
 
 Harness PR #4 added reviewed Recorder content
 `87094a4e780c692a00135421840c0e6713af5d35`; canonical merge
@@ -69,6 +77,16 @@ target when applicable, operation, evidence time, rollback, and read-back all
 agree with authoritative source. Missing, malformed, stale, conflicting, or
 unverifiable input blocks the action. A read-only leaf remains zero-mutation
 even when the independent mutation Boolean is `true`.
+
+The same authoritative block's `roundlet.enabled: true` covers Roundlet's
+ordinary reversible lifecycle operations, including curated public-safe GitHub
+trace publication and semantic read-back. The read-only external-validation
+Boolean additionally covers a conforming leaf-selected public-safe read-only
+provider observation. Once the exact leaf, candidate, profile, plan, route, and
+policy reconcile, candidate movement alone does not require another owner
+approval: it requires a fresh immutable plan. These standing meanings never
+authorize raw provider output, credentials, hidden reasoning, repository
+mutation outside the enumerated lifecycle, or a route not selected by the leaf.
 
 Phase 3 never mutates the forward-test target. Phase 4-or-later mutation also
 requires the exact leaf to declare mutation and the target repository's own
@@ -152,6 +170,15 @@ profile. Its immutable `ready_at` comparator, public-safe provenance decision,
 reviewed Recorder binding, and retention read-back must all be ready before
 exporting the terminal candidate. Candidate movement requires a fresh capture;
 the missing historical v1 lifecycle bundle is never reconstructed.
+
+The concrete handoff is one closed
+`roundwright-harness-capture-plan/v1` document containing profile, case,
+candidate, `ready_at`, producer, exporter, comparator, Recorder, store, and
+observation identities. The reviewed Harness returns one path-free plan digest.
+Profile readiness, provider dispatch, typed export, comparison, recording, and
+read-back must consume that exact digest. A second projection, an inferred
+default, or any identity movement invalidates readiness before the provider is
+called; recapture starts with a fresh plan rather than rewriting evidence.
 
 ## Owner interaction and recovery
 

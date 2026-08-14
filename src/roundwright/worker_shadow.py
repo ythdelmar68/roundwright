@@ -20,6 +20,7 @@ from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowP
 
 WORKER_ADAPTER_PROFILE = "roundwright-shadow-profile/worker-adapter/v1"
 WORKER_ADAPTER_SCHEMA = "roundwright-shadow-case/v2"
+CAPTURE_PLAN_SCHEMA = "roundwright-harness-capture-plan/v1"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -61,6 +62,7 @@ class WorkerShadowEnvelope:
     blocker: str | None
     next_action: str
     ready_at: int
+    capture_plan_digest: str
     schema: str = WORKER_ADAPTER_SCHEMA
     profile_id: str = WORKER_ADAPTER_PROFILE
     envelope_digest: str = ""
@@ -73,7 +75,7 @@ class WorkerShadowEnvelope:
             or not all(_digest(value) for value in (self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.request_digest))
             or type(self.result_kind) is not WorkerResultKind
             or (self.accepted_result_digest is not None and not _digest(self.accepted_result_digest))
-            or (self.blocker is not None and not _token(self.blocker)) or type(self.ready_at) is not int or self.ready_at < 0
+            or (self.blocker is not None and not _token(self.blocker)) or type(self.ready_at) is not int or self.ready_at < 0 or not _digest(self.capture_plan_digest)
         ): raise WorkerShadowError("Worker Shadow envelope is invalid")
         if (self.result_kind is WorkerResultKind.ACCEPTED) != (self.accepted_result_digest is not None):
             raise WorkerShadowError("Worker Shadow accepted-result binding is invalid")
@@ -82,7 +84,7 @@ class WorkerShadowEnvelope:
         object.__setattr__(self, "envelope_digest", digest)
 
     def payload(self) -> dict[str, object]:
-        return {"schema": self.schema, "profile_id": self.profile_id, "task_id": self.task_id, "worker_thread_identity": self.worker_thread_identity, "provider_attempt_id": self.provider_attempt_id, "external_turn_identity": self.external_turn_identity, "base_sha": self.base_sha, "candidate_sha": self.candidate_sha, "profile_identity": self.profile_identity, "configuration_digest": self.configuration_digest, "runtime_fingerprint": self.runtime_fingerprint, "request_digest": self.request_digest, "result_kind": self.result_kind.value, "accepted_result_digest": self.accepted_result_digest, "deterministic_state": self.deterministic_state, "blocker": self.blocker, "next_action": self.next_action, "ready_at": self.ready_at}
+        return {"schema": self.schema, "profile_id": self.profile_id, "task_id": self.task_id, "worker_thread_identity": self.worker_thread_identity, "provider_attempt_id": self.provider_attempt_id, "external_turn_identity": self.external_turn_identity, "base_sha": self.base_sha, "candidate_sha": self.candidate_sha, "profile_identity": self.profile_identity, "configuration_digest": self.configuration_digest, "runtime_fingerprint": self.runtime_fingerprint, "request_digest": self.request_digest, "result_kind": self.result_kind.value, "accepted_result_digest": self.accepted_result_digest, "deterministic_state": self.deterministic_state, "blocker": self.blocker, "next_action": self.next_action, "ready_at": self.ready_at, "capture_plan_digest": self.capture_plan_digest}
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class ExternalRecorderReceipt:
     case_id: str
     candidate_sha: str
     ready_at: int
+    capture_plan_digest: str
     evidence_digest: str
     manifest_digest: str
     bundle_digest: str
@@ -99,15 +102,32 @@ class ExternalRecorderReceipt:
     receipt_digest: str
 
     def __post_init__(self) -> None:
-        if self.profile != WORKER_ADAPTER_PROFILE or not _token(self.case_id) or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not all(_digest(value) for value in (self.evidence_digest, self.manifest_digest, self.bundle_digest, self.retention_identity, self.receipt_digest)):
+        if self.profile != WORKER_ADAPTER_PROFILE or not _token(self.case_id) or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not all(_digest(value) for value in (self.capture_plan_digest, self.evidence_digest, self.manifest_digest, self.bundle_digest, self.retention_identity, self.receipt_digest)):
             raise WorkerShadowError("external Recorder receipt is invalid")
+
+
+@dataclass(frozen=True)
+class ExternalCapturePlanReceipt:
+    """Path-free proof that the reviewed Harness accepted one exact plan."""
+    plan_digest: str
+    profile: str
+    case_id: str
+    candidate_sha: str
+    ready_at: int
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if self.profile != WORKER_ADAPTER_PROFILE or not _token(self.case_id) or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not _digest(self.plan_digest) or not _digest(self.receipt_digest):
+            raise WorkerShadowError("external capture-plan receipt is invalid")
+        core = {"schema": "roundwright-harness-capture-plan-receipt/v1", "status": "ready", "plan_digest": self.plan_digest, "profile": self.profile, "case_id": self.case_id, "candidate_sha": self.candidate_sha, "ready_at": self.ready_at}
+        if self.receipt_digest != _hash(core): raise WorkerShadowError("external capture-plan receipt digest is invalid")
 
 
 class ExternalWorkerRecorder(Protocol):
     """Harness CLI bridge; store identity is external to product Git."""
-    def prepare(self, *, store_identity: str) -> None: ...
-    def seal(self, document: Mapping[str, object], *, store_identity: str) -> ExternalRecorderReceipt: ...
-    def verify(self, bundle_digest: str, *, store_identity: str) -> ExternalRecorderReceipt: ...
+    def prepare(self, plan: Mapping[str, object], *, store_identity: str) -> ExternalCapturePlanReceipt: ...
+    def seal(self, plan: Mapping[str, object], document: Mapping[str, object], *, store_identity: str) -> ExternalRecorderReceipt: ...
+    def verify(self, plan: Mapping[str, object], bundle_digest: str, *, store_identity: str) -> ExternalRecorderReceipt: ...
 
 
 @dataclass(frozen=True)
@@ -120,6 +140,9 @@ class WorkerShadowCaptureReadiness:
     comparator_identity: str
     recorder_binding_digest: str
     store_identity: str
+    case_id: str
+    observation_identity: str
+    capture_plan_digest: str = ""
     capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value
     schema: str = WORKER_ADAPTER_SCHEMA
     profile_id: str = WORKER_ADAPTER_PROFILE
@@ -128,14 +151,20 @@ class WorkerShadowCaptureReadiness:
     readiness_digest: str = ""
 
     def __post_init__(self) -> None:
-        if self.schema != WORKER_ADAPTER_SCHEMA or self.profile_id != WORKER_ADAPTER_PROFILE or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not all(_digest(value) for value in (self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or self.retention_contract != "append-only-content-addressed-readback" or self.missing_history_action != "fresh-bounded-attempt-recapture":
+        if self.schema != WORKER_ADAPTER_SCHEMA or self.profile_id != WORKER_ADAPTER_PROFILE or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not _token(self.case_id) or not all(_digest(value) for value in (self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity, self.observation_identity)) or self.retention_contract != "append-only-content-addressed-readback" or self.missing_history_action != "fresh-bounded-attempt-recapture":
             raise WorkerShadowError("Worker Shadow capture readiness is invalid")
+        plan_digest = _hash(self.capture_plan())
+        if self.capture_plan_digest and self.capture_plan_digest != plan_digest: raise WorkerShadowError("Worker Shadow capture-plan digest is invalid")
+        object.__setattr__(self, "capture_plan_digest", plan_digest)
         digest = _hash(self.payload())
         if self.readiness_digest and self.readiness_digest != digest: raise WorkerShadowError("Worker Shadow capture readiness digest is invalid")
         object.__setattr__(self, "readiness_digest", digest)
 
     def payload(self) -> dict[str, object]:
-        return {"schema": self.schema, "profile_id": self.profile_id, "candidate_sha": self.candidate_sha, "ready_at": self.ready_at, "native_channel_producer_identity": self.native_channel_producer_identity, "exporter_identity": self.exporter_identity, "comparator_identity": self.comparator_identity, "recorder_binding_digest": self.recorder_binding_digest, "store_identity": self.store_identity, "capability_contract": self.capability_contract, "retention_contract": self.retention_contract, "missing_history_action": self.missing_history_action}
+        return {"schema": self.schema, "profile_id": self.profile_id, "candidate_sha": self.candidate_sha, "ready_at": self.ready_at, "native_channel_producer_identity": self.native_channel_producer_identity, "exporter_identity": self.exporter_identity, "comparator_identity": self.comparator_identity, "recorder_binding_digest": self.recorder_binding_digest, "store_identity": self.store_identity, "case_id": self.case_id, "observation_identity": self.observation_identity, "capture_plan_digest": self.capture_plan_digest, "capability_contract": self.capability_contract, "retention_contract": self.retention_contract, "missing_history_action": self.missing_history_action}
+
+    def capture_plan(self) -> dict[str, object]:
+        return {"schema": CAPTURE_PLAN_SCHEMA, "profile": self.profile_id, "ready_at": self.ready_at, "case_id": self.case_id, "candidate_sha": self.candidate_sha, "producer_identity": self.native_channel_producer_identity, "exporter_identity": self.exporter_identity, "comparator_identity": self.comparator_identity, "recorder_identity": self.recorder_binding_digest, "store_identity": self.store_identity, "observation_identity": self.observation_identity}
 
 
 @dataclass(frozen=True)
@@ -163,13 +192,14 @@ class WorkerQualificationBinding:
     comparator_identity: str
     recorder_binding_digest: str
     store_identity: str
+    capture_plan_digest: str
     deterministic_state: str
     blocker: str | None
     next_action: str
     capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value
 
     def __post_init__(self) -> None:
-        if not _token(self.case_id) or not _token(self.task_id) or not _token(self.attempt_id) or (self.resume_session_identity is not None and not _token(self.resume_session_identity)) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not all(_digest(value) for value in (self.input_digest, self.source_digest, self.repository_fingerprint, self.worktree_fingerprint, self.branch_fingerprint, self.policy_fingerprint, self.base_fingerprint, self.candidate_fingerprint, self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity)) or not _token(self.deterministic_state) or not _token(self.next_action) or (self.blocker is not None and not _token(self.blocker)):
+        if not _token(self.case_id) or not _token(self.task_id) or not _token(self.attempt_id) or (self.resume_session_identity is not None and not _token(self.resume_session_identity)) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or self.capability_contract != WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value or not all(_digest(value) for value in (self.input_digest, self.source_digest, self.repository_fingerprint, self.worktree_fingerprint, self.branch_fingerprint, self.policy_fingerprint, self.base_fingerprint, self.candidate_fingerprint, self.profile_identity, self.configuration_digest, self.runtime_fingerprint, self.native_channel_producer_identity, self.exporter_identity, self.comparator_identity, self.recorder_binding_digest, self.store_identity, self.capture_plan_digest)) or not _token(self.deterministic_state) or not _token(self.next_action) or (self.blocker is not None and not _token(self.blocker)):
             raise WorkerShadowError("Worker qualification binding is invalid")
 
 
@@ -209,11 +239,11 @@ def worker_adapter_shadow_profile() -> ShadowEvidenceProfile:
     return ShadowEvidenceProfile(WORKER_ADAPTER_PROFILE, CaptureMode.LIFECYCLE_GRAPH, ShadowProducer.PROFILE_DEFINED, "v2-native-channel-exporter-comparator-recorder-store-readback-bound", "before-first-selected-live-worker-provider-attempt", "append-only-content-addressed-readback", "fresh-bounded-attempt-recapture", ("worker-request-response-envelope",), 0, 0, False)
 
 
-def require_worker_shadow_capture_readiness(*, candidate_sha: str, ready_at: int, native_channel_producer_identity: str, exporter_identity: str, comparator_identity: str, recorder: RecorderBinding, store_identity: str, capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value) -> WorkerShadowCaptureReadiness:
+def require_worker_shadow_capture_readiness(*, candidate_sha: str, ready_at: int, case_id: str, observation_identity: str, native_channel_producer_identity: str, exporter_identity: str, comparator_identity: str, recorder: RecorderBinding, store_identity: str, capability_contract: str = WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED.value) -> WorkerShadowCaptureReadiness:
     """Bind external retention before dispatch, without creating a recording."""
     if type(recorder) is not RecorderBinding: raise WorkerShadowError("Worker Shadow capture preflight is incomplete")
     recorder_digest = _hash({"harness_merge": recorder.harness_merge, "recorder_content": recorder.recorder_content, "harness_tree": recorder.harness_tree})
-    return WorkerShadowCaptureReadiness(candidate_sha, ready_at, native_channel_producer_identity, exporter_identity, comparator_identity, recorder_digest, store_identity, capability_contract)
+    return WorkerShadowCaptureReadiness(candidate_sha, ready_at, native_channel_producer_identity, exporter_identity, comparator_identity, recorder_digest, store_identity, case_id, observation_identity, "", capability_contract)
 
 
 def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWorkerResult, *, provider_attempt_id: str, external_turn_identity: str, binding: WorkerQualificationBinding, ready_at: int, expected: bool = False) -> WorkerShadowEnvelope:
@@ -224,34 +254,38 @@ def export_worker_shadow_envelope(request: CodexWorkerRequest, result: CodexWork
         state, blocker, next_action = _expected_worker_transition(request.action, result, binding)
     else:
         state, blocker, next_action = _observed_worker_transition(request.action, result)
-    return WorkerShadowEnvelope(request.context.task_id, result.session_identity, provider_attempt_id, external_turn_identity, binding.base_sha, binding.candidate_sha, binding.profile_identity, request.context.configuration_digest, binding.runtime_fingerprint, request.input_digest, result.kind, accepted, state, blocker, next_action, ready_at)
+    return WorkerShadowEnvelope(request.context.task_id, result.session_identity, provider_attempt_id, external_turn_identity, binding.base_sha, binding.candidate_sha, binding.profile_identity, request.context.configuration_digest, binding.runtime_fingerprint, request.input_digest, result.kind, accepted, state, blocker, next_action, ready_at, binding.capture_plan_digest)
 
 
 def record_worker_shadow_envelope(readiness: WorkerShadowCaptureReadiness, envelope: WorkerShadowEnvelope, recorder: ExternalWorkerRecorder, *, case_id: str) -> WorkerShadowRecord:
     """Seal via Harness then independently verify retained bytes/receipt."""
     if type(readiness) is not WorkerShadowCaptureReadiness or type(envelope) is not WorkerShadowEnvelope or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not _token(case_id): raise WorkerShadowError("Worker Shadow capture record is invalid")
     if (readiness.candidate_sha, readiness.ready_at) != (envelope.candidate_sha, envelope.ready_at): raise WorkerShadowError("Worker Shadow capture is unarmed or stale; recapture is required")
-    document = {"schema": WORKER_ADAPTER_SCHEMA, "profile": WORKER_ADAPTER_PROFILE, "ready_at": envelope.ready_at, "case_id": case_id, "candidate_sha": envelope.candidate_sha, "worker_envelope": envelope.payload(), "readiness_digest": readiness.readiness_digest}
+    if case_id != readiness.case_id: raise WorkerShadowError("Worker Shadow capture case has drifted")
+    plan = readiness.capture_plan()
+    document = {"schema": WORKER_ADAPTER_SCHEMA, "profile": WORKER_ADAPTER_PROFILE, "ready_at": envelope.ready_at, "case_id": case_id, "candidate_sha": envelope.candidate_sha, "capture_plan_digest": readiness.capture_plan_digest, "worker_envelope": envelope.payload(), "readiness_digest": readiness.readiness_digest}
     try:
-        sealed = recorder.seal(document, store_identity=readiness.store_identity)
-        verified = recorder.verify(sealed.bundle_digest, store_identity=readiness.store_identity)
+        sealed = recorder.seal(plan, document, store_identity=readiness.store_identity)
+        verified = recorder.verify(plan, sealed.bundle_digest, store_identity=readiness.store_identity)
     except Exception as error:
         raise WorkerShadowError("external Recorder seal or read-back is invalid") from error
-    if sealed != verified or (sealed.profile, sealed.case_id, sealed.candidate_sha, sealed.ready_at, sealed.evidence_digest) != (WORKER_ADAPTER_PROFILE, case_id, envelope.candidate_sha, envelope.ready_at, _hash(document)):
+    if sealed != verified or (sealed.profile, sealed.case_id, sealed.candidate_sha, sealed.ready_at, sealed.capture_plan_digest, sealed.evidence_digest) != (WORKER_ADAPTER_PROFILE, case_id, envelope.candidate_sha, envelope.ready_at, readiness.capture_plan_digest, _hash(document)):
         raise WorkerShadowError("external Recorder retained identity is invalid")
     return WorkerShadowRecord(readiness.readiness_digest, envelope.envelope_digest, sealed)
 
 
 def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """One armed, bounded turn; never retries or starts a second Worker."""
-    if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.ready_at, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity, readiness.capability_contract) != (binding.candidate_sha, readiness.ready_at, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity, binding.capability_contract) or (request.attempt_id, request.input_digest, request.resume_session_identity, request.context.task_id, request.context.source_digest, request.context.repository_fingerprint, request.context.worktree_fingerprint, request.context.branch_fingerprint, request.context.policy_fingerprint, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.attempt_id, binding.input_digest, binding.resume_session_identity, binding.task_id, binding.source_digest, binding.repository_fingerprint, binding.worktree_fingerprint, binding.branch_fingerprint, binding.policy_fingerprint, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest) or adapter.capability_contract.value != readiness.capability_contract: raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
+    if type(adapter) is not CodexWorkerAdapter or type(request) is not CodexWorkerRequest or type(readiness) is not WorkerShadowCaptureReadiness or type(binding) is not WorkerQualificationBinding or not callable(getattr(recorder, "prepare", None)) or (readiness.candidate_sha, readiness.case_id, readiness.observation_identity, readiness.native_channel_producer_identity, readiness.exporter_identity, readiness.comparator_identity, readiness.recorder_binding_digest, readiness.store_identity, readiness.capture_plan_digest, readiness.capability_contract) != (binding.candidate_sha, binding.case_id, request.input_digest, binding.native_channel_producer_identity, binding.exporter_identity, binding.comparator_identity, binding.recorder_binding_digest, binding.store_identity, binding.capture_plan_digest, binding.capability_contract) or (request.attempt_id, request.input_digest, request.resume_session_identity, request.context.task_id, request.context.source_digest, request.context.repository_fingerprint, request.context.worktree_fingerprint, request.context.branch_fingerprint, request.context.policy_fingerprint, request.context.base_fingerprint, request.context.candidate_fingerprint, request.context.configuration_digest) != (binding.attempt_id, binding.input_digest, binding.resume_session_identity, binding.task_id, binding.source_digest, binding.repository_fingerprint, binding.worktree_fingerprint, binding.branch_fingerprint, binding.policy_fingerprint, binding.base_fingerprint, binding.candidate_fingerprint, binding.configuration_digest) or adapter.capability_contract.value != readiness.capability_contract: raise WorkerShadowError("Worker qualification pre-dispatch binding is invalid")
     if (adapter.profile_identity, adapter.runtime_fingerprint) != (binding.profile_identity, binding.runtime_fingerprint): raise WorkerShadowError("Worker qualification runtime identity has drifted")
     if (binding.deterministic_state, binding.blocker, binding.next_action) != expected_lifecycle(request.action):
         raise WorkerShadowError("Worker qualification deterministic lifecycle binding is invalid")
     try:
-        recorder.prepare(store_identity=readiness.store_identity)
+        prepared = recorder.prepare(readiness.capture_plan(), store_identity=readiness.store_identity)
     except Exception as error:
         raise WorkerShadowError("external Recorder pre-dispatch readiness is invalid") from error
+    if (prepared.plan_digest, prepared.profile, prepared.case_id, prepared.candidate_sha, prepared.ready_at) != (readiness.capture_plan_digest, readiness.profile_id, readiness.case_id, readiness.candidate_sha, readiness.ready_at):
+        raise WorkerShadowError("external Recorder capture-plan receipt drifted")
     # The adapter does not receive a clock; every outward artifact consumes the pre-bound ready_at.
     result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
     if result.turn_identity is None: return WorkerQualificationResult(result, None, None, None)

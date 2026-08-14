@@ -37,6 +37,9 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertNotIn("allow_external_validation_", roundwright)
         self.assertTrue(parse_roundlet_authority_state(instructions).enabled)
         self.assertFalse(parse_roundwright_authority_block(instructions).enabled)
+        normalized = " ".join(instructions.split())
+        self.assertIn("curated public-safe GitHub trace publication", normalized)
+        self.assertIn("neither action needs fresh per-candidate owner approval", normalized)
 
     def test_agents_only_routes_execution_to_the_repository_skill(self) -> None:
         instructions = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -60,9 +63,9 @@ class ExternalValidationContractTests(unittest.TestCase):
             "`none`/`none`",
             "`harness`/`toolbox`",
             "`harness+forward-test`/`toolbox+disposable-target`",
-            "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52",
-            "87094a4e780c692a00135421840c0e6713af5d35",
-            "0c594caa275262164fce1942ebd2142abe0e77bb",
+            "1bb063d3f8f1fef9a24b3147b8bc99794e4637a7",
+            "cf669e186a739a8597cfaf9f050ce3bdcadda334",
+            "632dcc3ecb3b8664de860844af2215ad5ade83e1",
             "4f39ef0e4e616eb896950d3756c433b624771a97",
             "allow_external_validation_read_only: true",
             "allow_external_validation_disposable_target_mutation: true",
@@ -70,6 +73,10 @@ class ExternalValidationContractTests(unittest.TestCase):
             "Phase 4-or-later",
             "ready_at",
             "Never pass the replay execution time",
+            "roundwright-harness-capture-plan/v1",
+            "same plan digest",
+            "ordinary curated public-safe GitHub lifecycle trace",
+            "readiness, result, and handoff GitHub trace events",
         ):
             self.assertIn(value, normalized_skill)
         self.assertNotIn("TODO", skill)
@@ -98,10 +105,12 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("Phase 3 never mutates the forward-test target", contract)
         self.assertIn("top-level integer `ready_at`", contract)
         self.assertIn("Harness PR #4", contract)
-        self.assertIn("10265c35c9d01d1fd26bd767ca3c1b245e4e9c52", contract)
-        self.assertIn("87094a4e780c692a00135421840c0e6713af5d35", contract)
-        self.assertIn("0c594caa275262164fce1942ebd2142abe0e77bb", contract)
+        self.assertIn("Harness PR #6", contract)
+        self.assertIn("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", contract)
+        self.assertIn("cf669e186a739a8597cfaf9f050ce3bdcadda334", contract)
+        self.assertIn("632dcc3ecb3b8664de860844af2215ad5ade83e1", contract)
         self.assertNotIn("fresh authenticated owner approval", contract)
+        self.assertIn("Profile readiness, provider dispatch, typed export, comparison, recording, and read-back must consume that exact digest", " ".join(contract.split()))
 
     def test_capture_readiness_contract_is_synchronized_and_root_only_routes(self) -> None:
         paths = (

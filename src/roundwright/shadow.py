@@ -2614,9 +2614,9 @@ class RecorderBinding:
 
     def __post_init__(self) -> None:
         if (
-            self.harness_merge != "10265c35c9d01d1fd26bd767ca3c1b245e4e9c52"
-            or self.recorder_content != "87094a4e780c692a00135421840c0e6713af5d35"
-            or self.harness_tree != "0c594caa275262164fce1942ebd2142abe0e77bb"
+            self.harness_merge != "1bb063d3f8f1fef9a24b3147b8bc99794e4637a7"
+            or self.recorder_content != "cf669e186a739a8597cfaf9f050ce3bdcadda334"
+            or self.harness_tree != "632dcc3ecb3b8664de860844af2215ad5ade83e1"
         ):
             raise ShadowV2Error("reviewed Recorder binding is invalid")
 

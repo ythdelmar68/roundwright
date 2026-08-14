@@ -65,36 +65,16 @@ class LiveProviderHealthFixtureResult:
 
 
 def bind_harness_provider_qualification_control(contract: CodexHealthContract, configuration: Configuration, *, candidate_sha: str, now: int) -> ProviderQualificationControl:
-    """Adapt the pinned Harness three-value factory without ambient authority.
-
-    The Harness owns the native channel and exact runtime contract; the
-    candidate owns the dependency-policy control required by its stricter
-    fixture.  This creates one short-lived, candidate-bound bootstrap receipt
-    from those already-resolved identities, rather than weakening the fixture
-    or asking the immutable Harness to return candidate internals.
-    """
-    if type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(candidate_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", candidate_sha) is None or type(now) is not int or now < 0:
-        raise ProviderHealthError("live provider qualification binding is invalid")
-    binding = CandidateBinding("ythdelmar68/roundwright", "live-provider-health", candidate_sha)
-    digest = lambda value: _digest({"schema": "roundwright-live-provider-health-control/v1", "candidate": candidate_sha, "contract": contract.fingerprint, "configuration": configuration.resolved_digest, "value": value})
-    components = (
-        ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "candidate-roundwright", digest("package-artifact"), digest("package-executable")),
-        ComponentPolicy(DependencyComponent.PROVIDER_RUNTIME, "codex-sdk", VersionRange("0.0.0", "1.0.0"), "harness-codex-sdk", digest("runtime-artifact"), digest("runtime-executable")),
-    )
-    policy = DependencyPolicy(binding, digest("policy"), now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
-    receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("reviewer"), authority_digest=digest("authority"))
-    policy = DependencyPolicy(binding, policy.policy_digest, now, 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
-    observations = tuple(ObservedDependency(binding, item.component, item.identifier, item.versions.minimum, item.source_identity, item.artifact_digest, item.executable_digest, now, policy.policy_digest) for item in components)
-    admission = TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("reviewer"), digest("authority"))
-    return ProviderQualificationControl(binding, DependencyExecutionControl(policy, observations, admission), now)
+    """Fail closed: a three-value Harness factory cannot prove candidate trust."""
+    raise ProviderHealthError("live provider qualification control is unavailable")
 
 
 def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, qualification_control: ProviderQualificationControl, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:
     """Run one forced content-free qualification pass only when explicitly enabled."""
     valid_commit = type(contract_commit) is str and re.fullmatch(r"[0-9a-f]{40}", contract_commit)
-    valid_candidate = candidate_sha is None or (type(candidate_sha) is str and re.fullmatch(r"[0-9a-f]{40}", candidate_sha))
+    valid_candidate = type(candidate_sha) is str and re.fullmatch(r"[0-9a-f]{40}", candidate_sha)
     valid_case = type(case_id) is str and 0 < len(case_id) <= 128 and all(item.isalnum() or item in "._-" for item in case_id)
-    if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(qualification_control) is not ProviderQualificationControl or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit:
+    if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(qualification_control) is not ProviderQualificationControl or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit or qualification_control.binding.candidate_sha != candidate_sha:
         raise ProviderHealthError("live provider health fixture is disabled or invalid")
     try:
         health = CodexProviderHealth(store, contract)

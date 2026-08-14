@@ -206,14 +206,14 @@ class SupervisorFailoverResult:
     exhausted: bool
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorFailoverResult:
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
     """Try each configured profile once; invalid output consumes no review round.
 
     The caller retains the review state.  This function intentionally reports
     only availability: it cannot convert a malformed, cancelled, or ambiguous
     result into PASS/FINDINGS, and it never parses provider display prose.
     """
-    if type(requests) is not tuple or type(adapters) is not tuple or not requests or len(requests) != len(adapters) or not callable(checkpoint_session) or not callable(checkpoint_turn):
+    if type(requests) is not tuple or type(adapters) is not tuple or not requests or len(requests) != len(adapters) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     seen: set[str] = set()
     attempted: list[str] = []
@@ -224,6 +224,8 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         seen.add(request.selected_profile_identity)
         attempted.append(request.selected_profile_identity)
         result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+        if checkpoint_result is not None:
+            checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:
             return SupervisorFailoverResult(result, tuple(attempted), False)
     return SupervisorFailoverResult(None, tuple(attempted), True)

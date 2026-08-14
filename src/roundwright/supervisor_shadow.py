@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Callable, Mapping, Protocol
 
-from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorResultKind
+from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorResultKind, dispatch_ordered_supervisor_attempts
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 
 
@@ -122,3 +122,117 @@ def qualify_supervisor_attempt(adapter: CodexSupervisorAdapter, request: CodexSu
     except Exception as error: raise SupervisorShadowError("Supervisor Recorder seal/read-back failed") from error
     if sealed != verified or (sealed.profile, sealed.case_id, sealed.candidate_sha, sealed.ready_at, sealed.capture_plan_digest, sealed.evidence_digest) != (SUPERVISOR_FAILOVER_PROFILE, binding.case_id, binding.candidate_sha, readiness.ready_at, readiness.capture_plan_digest, _hash(document)): raise SupervisorShadowError("Supervisor Recorder read-back is invalid")
     return SupervisorQualificationResult(result, observed, sealed, comparison)
+
+
+class SupervisorSequenceTerminal(StrEnum):
+    ACCEPTED = "accepted"
+    EXHAUSTED = "exhausted"
+
+
+@dataclass(frozen=True)
+class SupervisorSequenceAttempt:
+    ordinal: int; profile_identity: str; request_identity: str; result_kind: str; result_identity: str; verdict: str | None
+    def __post_init__(self) -> None:
+        if type(self.ordinal) is not int or self.ordinal < 1 or not _digest(self.profile_identity) or not _digest(self.request_identity) or self.result_kind not in {item.value for item in SupervisorResultKind} or not _digest(self.result_identity) or self.verdict not in {None, "pass", "findings"} or ((self.result_kind == SupervisorResultKind.ACCEPTED.value) != (self.verdict is not None)):
+            raise SupervisorShadowError("Supervisor sequence attempt is invalid")
+
+
+@dataclass(frozen=True)
+class SupervisorSequenceBinding:
+    case_id: str; candidate_sha: str; base_sha: str; task_id: str; request_identities: tuple[str, ...]; profile_identities: tuple[str, ...]; runtime_fingerprints: tuple[str, ...]; review_epoch: int; review_round: int; review_mode: str; capture_plan_digest: str
+    def __post_init__(self) -> None:
+        if not _token(self.case_id) or not _SHA.fullmatch(self.candidate_sha) or not _SHA.fullmatch(self.base_sha) or not _token(self.task_id) or type(self.request_identities) is not tuple or type(self.profile_identities) is not tuple or type(self.runtime_fingerprints) is not tuple or not self.request_identities or len(self.request_identities) != len(self.profile_identities) or len(self.profile_identities) != len(self.runtime_fingerprints) or any(not _digest(value) for value in (*self.request_identities, *self.profile_identities, *self.runtime_fingerprints, self.capture_plan_digest)) or len(set(self.profile_identities)) != len(self.profile_identities) or type(self.review_epoch) is not int or self.review_epoch < 0 or type(self.review_round) is not int or self.review_round < 1 or self.review_mode not in {"COMPLETE", "CONVERGING"}:
+            raise SupervisorShadowError("Supervisor sequence binding is invalid")
+
+
+@dataclass(frozen=True)
+class SupervisorSequenceEnvelope:
+    task_id: str; base_sha: str; candidate_sha: str; request_identities: tuple[str, ...]; profile_identities: tuple[str, ...]; runtime_fingerprints: tuple[str, ...]; review_epoch: int; review_round: int; review_mode: str; capture_plan_digest: str; terminal: SupervisorSequenceTerminal; attempts: tuple[SupervisorSequenceAttempt, ...]; accepted_ordinal: int | None; accepted_result_identity: str | None; accepted_verdict: str | None; blocker: str | None; next_action: str
+    def __post_init__(self) -> None:
+        accepted = self.terminal is SupervisorSequenceTerminal.ACCEPTED
+        if not _token(self.task_id) or not _SHA.fullmatch(self.base_sha) or not _SHA.fullmatch(self.candidate_sha) or type(self.request_identities) is not tuple or type(self.profile_identities) is not tuple or type(self.runtime_fingerprints) is not tuple or not self.request_identities or len(self.request_identities) != len(self.profile_identities) or len(self.profile_identities) != len(self.runtime_fingerprints) or any(not _digest(value) for value in (*self.request_identities, *self.profile_identities, *self.runtime_fingerprints, self.capture_plan_digest)) or type(self.review_epoch) is not int or self.review_epoch < 0 or type(self.review_round) is not int or self.review_round < 1 or self.review_mode not in {"COMPLETE", "CONVERGING"} or type(self.terminal) is not SupervisorSequenceTerminal or type(self.attempts) is not tuple or not self.attempts or any(type(item) is not SupervisorSequenceAttempt for item in self.attempts) or tuple(item.ordinal for item in self.attempts) != tuple(range(1, len(self.attempts) + 1)) or tuple(item.profile_identity for item in self.attempts) != self.profile_identities[:len(self.attempts)] or tuple(item.request_identity for item in self.attempts) != self.request_identities[:len(self.attempts)] or not _token(self.next_action):
+            raise SupervisorShadowError("Supervisor sequence envelope is invalid")
+        accepted_attempts = tuple(item for item in self.attempts if item.result_kind == SupervisorResultKind.ACCEPTED.value)
+        if accepted:
+            if len(accepted_attempts) != 1 or self.accepted_ordinal != accepted_attempts[0].ordinal or self.accepted_result_identity != accepted_attempts[0].result_identity or self.accepted_verdict != accepted_attempts[0].verdict or self.blocker is not None or self.attempts[-1] != accepted_attempts[0]:
+                raise SupervisorShadowError("Supervisor accepted sequence is invalid")
+        elif self.terminal is SupervisorSequenceTerminal.EXHAUSTED:
+            if len(self.attempts) != len(self.profile_identities) or accepted_attempts or self.accepted_ordinal is not None or self.accepted_result_identity is not None or self.accepted_verdict is not None or self.blocker != "attempt-budget-exhausted":
+                raise SupervisorShadowError("Supervisor exhausted sequence is invalid")
+        else:
+            raise SupervisorShadowError("Supervisor sequence terminal is invalid")
+    def payload(self) -> dict[str, object]:
+        return {"task_id": self.task_id, "base_sha": self.base_sha, "candidate_sha": self.candidate_sha, "request_identities": self.request_identities, "profile_identities": self.profile_identities, "runtime_fingerprints": self.runtime_fingerprints, "review_epoch": self.review_epoch, "review_round": self.review_round, "review_mode": self.review_mode, "capture_plan_digest": self.capture_plan_digest, "terminal": self.terminal.value, "attempts": tuple(item.__dict__ for item in self.attempts), "accepted_ordinal": self.accepted_ordinal, "accepted_result_identity": self.accepted_result_identity, "accepted_verdict": self.accepted_verdict, "blocker": self.blocker, "next_action": self.next_action}
+    @property
+    def envelope_digest(self) -> str: return _hash(self.payload())
+
+
+@dataclass(frozen=True)
+class SupervisorSequenceQualificationResult:
+    failover: SupervisorFailoverResult; envelope: SupervisorSequenceEnvelope; receipt: SupervisorRecorderReceipt | None; comparison: SupervisorShadowComparison | None
+
+
+def supervisor_sequence_observation_identity(requests: tuple[CodexSupervisorRequest, ...]) -> str:
+    if type(requests) is not tuple or not requests or any(type(item) is not CodexSupervisorRequest for item in requests):
+        raise SupervisorShadowError("Supervisor sequence requests are invalid")
+    return _hash({"schema": "roundwright-supervisor-sequence-observation/v1", "requests": tuple({"ordinal": item.within_round_attempt, "profile_identity": item.selected_profile_identity, "request_identity": item.input_digest} for item in requests)})
+
+
+def _sequence_attempt(ordinal: int, request: CodexSupervisorRequest, result: CodexSupervisorResult) -> SupervisorSequenceAttempt:
+    if type(ordinal) is not int or type(request) is not CodexSupervisorRequest or type(result) is not CodexSupervisorResult:
+        raise SupervisorShadowError("Supervisor sequence result is invalid")
+    identity = _hash({"ordinal": ordinal, "profile_identity": request.selected_profile_identity, "request_identity": request.input_digest, "result_kind": result.kind.value, "output_fingerprint": result.output_fingerprint, "diagnostic": None if result.diagnostic is None else result.diagnostic.value, "session_identity": result.session_identity, "turn_identity": result.turn_identity})
+    return SupervisorSequenceAttempt(ordinal, request.selected_profile_identity, request.input_digest, result.kind.value, identity, None if result.verdict is None else result.verdict.value)
+
+
+def export_supervisor_sequence(binding: SupervisorSequenceBinding, attempts: tuple[SupervisorSequenceAttempt, ...], failover: SupervisorFailoverResult) -> SupervisorSequenceEnvelope:
+    if type(binding) is not SupervisorSequenceBinding or type(attempts) is not tuple or not attempts or any(type(item) is not SupervisorSequenceAttempt for item in attempts) or type(failover) is not SupervisorFailoverResult or tuple(item.profile_identity for item in attempts) != failover.attempted_profile_identities:
+        raise SupervisorShadowError("Supervisor sequence exporter binding is invalid")
+    if failover.result is None:
+        return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
+    result = failover.result
+    if result.kind is not SupervisorResultKind.ACCEPTED or result.verdict is None or len(attempts) > len(binding.profile_identities) or attempts[-1].result_kind != SupervisorResultKind.ACCEPTED.value or attempts[-1].verdict != result.verdict.value:
+        raise SupervisorShadowError("Supervisor sequence accepted result is invalid")
+    accepted = attempts[-1]
+    return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.ACCEPTED, attempts, accepted.ordinal, accepted.result_identity, accepted.verdict, None, "apply-bound-review-result")
+
+
+def compare_supervisor_sequences(expected: SupervisorSequenceEnvelope, observed: SupervisorSequenceEnvelope) -> SupervisorShadowComparison:
+    if type(expected) is not SupervisorSequenceEnvelope or type(observed) is not SupervisorSequenceEnvelope:
+        raise SupervisorShadowError("Supervisor sequence comparison input is invalid")
+    fields = tuple(key for key, value in expected.payload().items() if observed.payload()[key] != value)
+    return SupervisorShadowComparison(SupervisorShadowDisposition.MATCH if not fields else SupervisorShadowDisposition.MISMATCH, expected.envelope_digest, observed.envelope_digest, fields)
+
+
+def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, recorder: ExternalSupervisorRecorder, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
+    """Capture exactly one terminal product failover sequence under one plan."""
+    if type(adapters) is not tuple or type(requests) is not tuple or not adapters or len(adapters) != len(requests) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn):
+        raise SupervisorShadowError("Supervisor sequence pre-dispatch binding is invalid")
+    context = requests[0].context
+    if any(request.context != context or request.within_round_attempt != ordinal for ordinal, request in enumerate(requests, start=1)) or (context.task_id, context.base_sha, context.candidate_sha, context.review_epoch, context.review_round, context.review_mode.value) != (binding.task_id, binding.base_sha, binding.candidate_sha, binding.review_epoch, binding.review_round, binding.review_mode) or tuple(request.input_digest for request in requests) != binding.request_identities or tuple(request.selected_profile_identity for request in requests) != binding.profile_identities or tuple(adapter.profile_identity for adapter in adapters) != binding.profile_identities or tuple(adapter.runtime_fingerprint for adapter in adapters) != binding.runtime_fingerprints or (readiness.candidate_sha, readiness.case_id, readiness.capture_plan_digest, readiness.observation_identity) != (binding.candidate_sha, binding.case_id, binding.capture_plan_digest, supervisor_sequence_observation_identity(requests)):
+        raise SupervisorShadowError("Supervisor sequence context has drifted")
+    try:
+        prepared = recorder.prepare(readiness.capture_plan(), store_identity=readiness.store_identity)
+    except Exception as error:
+        raise SupervisorShadowError("Supervisor sequence Recorder pre-dispatch readiness is invalid") from error
+    if (prepared.plan_digest, prepared.profile, prepared.case_id, prepared.candidate_sha, prepared.ready_at) != (readiness.capture_plan_digest, SUPERVISOR_FAILOVER_PROFILE, readiness.case_id, readiness.candidate_sha, readiness.ready_at):
+        raise SupervisorShadowError("Supervisor sequence capture-plan receipt drifted")
+    observed_attempts: list[SupervisorSequenceAttempt] = []
+    failover = dispatch_ordered_supervisor_attempts(requests, adapters, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=lambda ordinal, request, result: observed_attempts.append(_sequence_attempt(ordinal, request, result)))
+    attempts = tuple(observed_attempts)
+    expected = export_supervisor_sequence(binding, attempts, failover)
+    observed = export_supervisor_sequence(binding, attempts, failover)
+    comparison = compare_supervisor_sequences(expected, observed)
+    if comparison.disposition is not SupervisorShadowDisposition.MATCH:
+        raise SupervisorShadowError("Supervisor sequence comparison mismatch")
+    if expected.terminal is SupervisorSequenceTerminal.EXHAUSTED:
+        return SupervisorSequenceQualificationResult(failover, observed, None, comparison)
+    document = {"schema": "roundwright-shadow-case/v2", "profile": SUPERVISOR_FAILOVER_PROFILE, "case_id": binding.case_id, "candidate_sha": binding.candidate_sha, "ready_at": readiness.ready_at, "capture_plan_digest": readiness.capture_plan_digest, "supervisor_sequence": observed.payload(), "readiness_digest": readiness.readiness_digest}
+    try:
+        sealed = recorder.seal(readiness.capture_plan(), document, store_identity=readiness.store_identity)
+        verified = recorder.verify(readiness.capture_plan(), sealed.bundle_digest, store_identity=readiness.store_identity)
+    except Exception as error:
+        raise SupervisorShadowError("Supervisor sequence Recorder seal/read-back failed") from error
+    if sealed != verified or (sealed.profile, sealed.case_id, sealed.candidate_sha, sealed.ready_at, sealed.capture_plan_digest, sealed.evidence_digest) != (SUPERVISOR_FAILOVER_PROFILE, binding.case_id, binding.candidate_sha, readiness.ready_at, readiness.capture_plan_digest, _hash(document)):
+        raise SupervisorShadowError("Supervisor sequence Recorder read-back is invalid")
+    return SupervisorSequenceQualificationResult(failover, observed, sealed, comparison)

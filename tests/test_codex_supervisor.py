@@ -27,6 +27,9 @@ from roundwright.supervisor_shadow import (
     SupervisorQualificationBinding, SupervisorRecorderReceipt,
     ResolvedSupervisorSequencePolicy, SupervisorExpectedLifecycleReceipt, SupervisorSequenceBinding, SupervisorSequenceTerminal,
     SupervisorAttemptEvent, SupervisorTerminalRecord, LifecycleChainReceipt, CompleteSupervisorLifecycleRecord,
+    InMemorySupervisorLifecycle,
+    SupervisorLifecycleChainBinding,
+    SupervisorShadowError,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_lifecycle_identity, supervisor_sequence_observation_identity,
 )
@@ -230,13 +233,136 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((self.events, recorder.calls), ([], []))
 
     def test_lifecycle_chain_values_are_immutable_and_reject_bad_order(self):
-        values = (digest("record"), digest("source"), digest("observation"), "c" * 40, digest("context"), digest("plan"), digest("prior"))
-        event = SupervisorAttemptEvent(*values[:6], 1, values[6], SupervisorResultKind.AMBIGUOUS.value, digest("result"), 10, 20)
-        plan = LifecycleChainReceipt(values[0], values[1], values[2], digest("plan-content"), values[6], 0, 10)
-        terminal = SupervisorTerminalRecord(*values[:6], event.content_digest, "exhausted", "attempt-budget-exhausted", "retain-terminal-product-block", 10)
-        receipt = LifecycleChainReceipt(values[0], values[1], values[2], digest("terminal-content"), event.content_digest, 2, 10)
-        self.assertEqual(CompleteSupervisorLifecycleRecord(plan, (event,), terminal, receipt).events, (event,))
-        with self.assertRaises(Exception): SupervisorAttemptEvent(*values[:6], 0, values[6], SupervisorResultKind.AMBIGUOUS.value, digest("result"), 10, 20)
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        expected = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        chain = SupervisorLifecycleChainBinding(digest("record"), digest("source"), readiness.observation_identity, binding.candidate_sha, expected.context_identity, expected.plan_identity, binding.capture_plan_digest, 10, 20)
+        plan = LifecycleChainReceipt(chain, digest("plan-content"), digest("genesis"), 0)
+        event = SupervisorAttemptEvent(chain.record_identity, chain.source_identity, chain.observation_identity, chain.candidate_sha, chain.context_identity, chain.plan_identity, chain.capture_plan_digest, 1, plan.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.AMBIGUOUS.value, digest("result"), None, None, 10, 20)
+        event_receipt = LifecycleChainReceipt(chain, event.content_digest, event.prior_digest, 1)
+        terminal = SupervisorTerminalRecord(chain.record_identity, chain.source_identity, chain.observation_identity, chain.candidate_sha, chain.context_identity, chain.plan_identity, chain.capture_plan_digest, event_receipt.receipt_digest, 1, "exhausted", None, "attempt-budget-exhausted", "retain-terminal-product-block", 10)
+        receipt = LifecycleChainReceipt(chain, digest("terminal-content"), terminal.prior_digest, 2)
+        self.assertEqual(CompleteSupervisorLifecycleRecord(expected, plan, (event,), terminal, receipt).events, (event,))
+        with self.assertRaises(Exception): SupervisorAttemptEvent(chain.record_identity, chain.source_identity, chain.observation_identity, chain.candidate_sha, chain.context_identity, chain.plan_identity, chain.capture_plan_digest, 0, plan.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.AMBIGUOUS.value, digest("result"), None, None, 10, 20)
+
+    def test_lifecycle_store_rejects_read_before_terminal(self):
+        lifecycle = InMemorySupervisorLifecycle(digest("lifecycle-source"))
+        adapters, requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        plan = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        receipt = lifecycle.prepare(plan, freshness_until=20)
+        with self.assertRaises(Exception): lifecycle.read(receipt.record_identity, evidence_time=10)
+
+    def test_lifecycle_store_valid_round_trip_returns_fresh_record(self):
+        lifecycle = InMemorySupervisorLifecycle(digest("lifecycle-source")); adapters, requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        plan = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        prepared = lifecycle.prepare(plan, freshness_until=20)
+        event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, 1, prepared.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.ACCEPTED.value, digest("accepted"), digest("accepted"), "pass", 10, 20)
+        event_receipt = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+        terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, event_receipt.receipt_digest, 1, "accepted", digest("accepted"), None, "apply-bound-review-result", 10)
+        lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+        value = lifecycle.read(prepared.record_identity, evidence_time=10)
+        self.assertEqual((value.expected_plan, value.plan_receipt, value.events, value.terminal), (plan, prepared, (event,), terminal))
+        self.assertIsNot(value.expected_plan, plan)
+        self.assertIsNot(value.events[0], event)
+        self.assertIsNot(value.terminal, terminal)
+
+    def test_lifecycle_store_state_guards(self):
+        lifecycle = InMemorySupervisorLifecycle(digest("lifecycle-source")); adapters, requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        plan = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        event = SupervisorAttemptEvent(digest("missing"), digest("source"), readiness.observation_identity, binding.candidate_sha, digest("context"), digest("plan"), binding.capture_plan_digest, 1, digest("prior"), binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.ACCEPTED.value, digest("accepted"), digest("accepted"), "pass", 10, 20)
+        with self.assertRaises(Exception): lifecycle.append(event.record_identity, event, evidence_time=10)
+        receipt = lifecycle.prepare(plan, freshness_until=20)
+        event = SupervisorAttemptEvent(receipt.record_identity, receipt.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, 1, receipt.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.ACCEPTED.value, digest("accepted"), digest("accepted"), "pass", 10, 20)
+        event_receipt = lifecycle.append(receipt.record_identity, event, evidence_time=10)
+        terminal = SupervisorTerminalRecord(receipt.record_identity, receipt.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, event_receipt.receipt_digest, 1, "accepted", digest("accepted"), None, "apply-bound-review-result", 10)
+        lifecycle.finalize(receipt.record_identity, terminal, evidence_time=10)
+        with self.assertRaises(Exception): lifecycle.append(receipt.record_identity, event, evidence_time=10)
+        with self.assertRaises(Exception): lifecycle.finalize(receipt.record_identity, terminal, evidence_time=10)
+
+    def _fresh_lifecycle_chain(self):
+        lifecycle = InMemorySupervisorLifecycle(digest("tamper-lifecycle-source"))
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        cls = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle
+        plan = cls(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        prepared = lifecycle.prepare(plan, freshness_until=20)
+        first = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, prepared.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, 1, prepared.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.AMBIGUOUS.value, digest("ambiguous"), None, None, 10, 20)
+        first_receipt = lifecycle.append(prepared.record_identity, first, evidence_time=10)
+        second = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, prepared.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, 2, first_receipt.receipt_digest, binding.request_identities[1], binding.profile_identities[1], binding.runtime_fingerprints[1], SupervisorResultKind.ACCEPTED.value, digest("accepted-two"), digest("accepted-two"), "pass", 10, 20)
+        second_receipt = lifecycle.append(prepared.record_identity, second, evidence_time=10)
+        terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, prepared.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, second_receipt.receipt_digest, 2, "accepted", digest("accepted-two"), None, "apply-bound-review-result", 10)
+        lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+        return lifecycle, prepared.record_identity
+
+    def test_lifecycle_authenticated_read_rejects_canonical_tampering(self):
+        def rewrite(material, mutate):
+            value = json.loads(material); mutate(value)
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        def plan(path, value):
+            return lambda record: record.__setitem__("plan", rewrite(record["plan"], lambda item: item.__setitem__(path, value)))
+        def plan_binding(path, value):
+            return lambda record: record.__setitem__("plan", rewrite(record["plan"], lambda item: item["binding"].__setitem__(path, value)))
+        def plan_receipt(path, value):
+            return lambda record: record.__setitem__("receipt", rewrite(record["receipt"], lambda item: item["binding"].__setitem__(path, value)))
+        def event(path, value):
+            return lambda record: record["events"].__setitem__(0, (rewrite(record["events"][0][0], lambda item: item.__setitem__(path, value)), record["events"][0][1]))
+        def accepted_event(path, value):
+            return lambda record: record["events"].__setitem__(1, (rewrite(record["events"][1][0], lambda item: item.__setitem__(path, value)), record["events"][1][1]))
+        def event_receipt(path, value):
+            return lambda record: record["events"].__setitem__(0, (record["events"][0][0], rewrite(record["events"][0][1], lambda item: item.__setitem__(path, value))))
+        def terminal(path, value):
+            return lambda record: record.__setitem__("terminal", (rewrite(record["terminal"][0], lambda item: item.__setitem__(path, value)), record["terminal"][1]))
+        def terminal_receipt(path, value):
+            return lambda record: record.__setitem__("terminal", (record["terminal"][0], rewrite(record["terminal"][1], lambda item: item.__setitem__(path, value))))
+        changed = digest("changed")
+        cases = [
+            ("plan-candidate", plan_binding("candidate_sha", "d" * 40)), ("plan-request-order", plan_binding("request_identities", [changed] * 3)), ("plan-profile-order", plan_binding("profile_identities", [changed] * 3)), ("plan-runtime-order", plan_binding("runtime_fingerprints", [changed] * 3)),
+            ("plan-policy", plan("policy_digest", changed)), ("plan-configuration", plan("configuration_digest", changed)), ("plan-runtime", plan("runtime_identity", changed)), ("plan-observation", plan("observation_identity", changed)), ("plan-ready", plan("ready_at", 11)),
+            ("receipt-source", plan_receipt("source_identity", changed)), ("receipt-record", plan_receipt("record_identity", changed)), ("receipt-candidate", plan_receipt("candidate_sha", "d" * 40)), ("receipt-context", plan_receipt("context_identity", changed)), ("receipt-plan", plan_receipt("plan_identity", changed)), ("receipt-capture", plan_receipt("capture_plan_digest", changed)), ("receipt-observation", plan_receipt("observation_identity", changed)), ("receipt-ready", plan_receipt("ready_at", 11)), ("receipt-freshness", plan_receipt("freshness_until", 21)),
+            ("missing-event", lambda record: record.__setitem__("events", [])), ("duplicate-event", lambda record: record["events"].append(record["events"][0])), ("reordered-events", lambda record: record["events"].reverse()),
+            ("event-ordinal", event("ordinal", 3)), ("event-prior", event("prior_digest", changed)), ("event-request", event("request_identity", changed)), ("event-profile", event("profile_identity", changed)), ("event-runtime", event("runtime_fingerprint", changed)), ("event-result", event("result_identity", changed)), ("event-verdict", event("verdict", "findings")), ("event-accepted-presence", event("accepted_result_identity", changed)), ("event-accepted-absence", accepted_event("accepted_result_identity", None)), ("event-freshness", event("freshness_until", 19)),
+            ("event-receipt-content", event_receipt("content_digest", changed)), ("event-receipt-prior", event_receipt("prior_digest", changed)), ("event-receipt-ordinal", event_receipt("ordinal", 3)),
+            ("terminal-prior", terminal("prior_digest", changed)), ("terminal-count", terminal("attempt_count", 1)), ("terminal-accepted", terminal("accepted_result_identity", changed)), ("terminal-state", terminal("terminal", "exhausted")), ("terminal-blocker", terminal("blocker", "attempt-budget-exhausted")), ("terminal-action", terminal("next_action", "retain-terminal-product-block")), ("terminal-binding", terminal("plan_identity", changed)),
+            ("terminal-receipt-content", terminal_receipt("content_digest", changed)), ("terminal-receipt-prior", terminal_receipt("prior_digest", changed)), ("terminal-receipt-ordinal", terminal_receipt("ordinal", 9)),
+        ]
+        binding_fields = ("record_identity", "source_identity", "observation_identity", "candidate_sha", "context_identity", "plan_identity", "capture_plan_digest", "ready_at", "freshness_until")
+        for field in binding_fields:
+            value = "d" * 40 if field == "candidate_sha" else (11 if field == "ready_at" else (21 if field == "freshness_until" else changed))
+            def receipt_binding(field=field, value=value):
+                return lambda record: record["events"].__setitem__(0, (record["events"][0][0], rewrite(record["events"][0][1], lambda item: item["binding"].__setitem__(field, value))))
+            def final_binding(field=field, value=value):
+                return lambda record: record.__setitem__("terminal", (record["terminal"][0], rewrite(record["terminal"][1], lambda item: item["binding"].__setitem__(field, value))))
+            cases.extend(((f"event-receipt-binding-{field}", receipt_binding()), (f"terminal-receipt-binding-{field}", final_binding())))
+        for field in ("record_identity", "source_identity", "observation_identity", "candidate_sha", "context_identity", "plan_identity", "capture_plan_digest"):
+            value = "d" * 40 if field == "candidate_sha" else changed
+            cases.append((f"terminal-binding-{field}", terminal(field, value)))
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                lifecycle, identity = self._fresh_lifecycle_chain(); mutate(lifecycle._records[identity])
+                with self.assertRaises(SupervisorShadowError): lifecycle.read(identity, evidence_time=10)
+                self.assertEqual(self.events, [])
+        lifecycle, identity = self._fresh_lifecycle_chain()
+        with self.assertRaises(SupervisorShadowError): lifecycle.read(identity, evidence_time=9)
+        with self.assertRaises(SupervisorShadowError): lifecycle.read(identity, evidence_time=21)
+
+    def test_expected_lifecycle_identities_are_stable_and_context_bound(self):
+        adapters, requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        cls = __import__("roundwright.supervisor_shadow", fromlist=["SupervisorExpectedLifecycle"]).SupervisorExpectedLifecycle
+        one = cls(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        two = cls(binding, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        self.assertEqual((one.context_identity, one.plan_identity), (two.context_identity, two.plan_identity))
+        moved = replace(binding, candidate_sha="d" * 40)
+        changed = cls(moved, policy.policy_digest, policy.configuration_digest, digest("runtime"), 10, readiness.observation_identity)
+        self.assertNotEqual(one.context_identity, changed.context_identity)
+
+    def test_lifecycle_chain_binding_is_canonical_and_fail_closed(self):
+        values = [digest("record"), digest("source"), digest("observation"), "c" * 40, digest("context"), digest("plan"), digest("capture"), 10, 20]
+        binding = SupervisorLifecycleChainBinding(*values)
+        self.assertEqual((binding.payload(), binding.binding_digest), (SupervisorLifecycleChainBinding(*values).payload(), SupervisorLifecycleChainBinding(*values).binding_digest))
+        for index, value in enumerate(values):
+            changed = list(values); changed[index] = ("d" * 40 if index == 3 else (11 if index == 7 else (21 if index == 8 else digest(f"drift-{index}"))))
+            self.assertNotEqual(binding.binding_digest, SupervisorLifecycleChainBinding(*changed).binding_digest)
+        with self.assertRaises(Exception): SupervisorLifecycleChainBinding(*values[:7], 20, 10)
+        with self.assertRaises(Exception): SupervisorLifecycleChainBinding("bad", *values[1:])
+        with self.assertRaises(Exception): binding.record_identity = digest("replacement")
 
 if __name__ == "__main__":
     unittest.main()

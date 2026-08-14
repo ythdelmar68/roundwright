@@ -183,6 +183,10 @@ class SupervisorExpectedLifecycle:
     def payload(self) -> dict[str, object]:
         return {"schema": "roundwright-supervisor-expected-lifecycle/v1", "binding": self.binding.__dict__.copy(), "policy_digest": self.policy_digest, "configuration_digest": self.configuration_digest, "runtime_identity": self.runtime_identity, "ready_at": self.ready_at, "observation_identity": self.observation_identity, "allowed_terminal": ("accepted", "exhausted"), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "exhausted_next_action": "retain-terminal-product-block"}
     @property
+    def context_identity(self) -> str: return _hash({"task_id": self.binding.task_id, "base_sha": self.binding.base_sha, "candidate_sha": self.binding.candidate_sha, "requests": self.binding.request_identities, "profiles": self.binding.profile_identities, "runtime": self.binding.runtime_fingerprints, "epoch": self.binding.review_epoch, "round": self.binding.review_round, "mode": self.binding.review_mode, "capture_plan": self.binding.capture_plan_digest})
+    @property
+    def plan_identity(self) -> str: return _hash({**self.payload(), "context_identity": self.context_identity, "allowed_result_kinds": tuple(item.value for item in SupervisorResultKind), "attempt_budget": len(self.binding.profile_identities)})
+    @property
     def source_identity(self) -> str: return _hash(self.payload())
 
 
@@ -195,30 +199,71 @@ class SupervisorExpectedLifecycleReceipt:
 
 @dataclass(frozen=True)
 class SupervisorAttemptEvent:
-    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; capture_plan_digest: str; ordinal: int; prior_digest: str; result_kind: str; result_identity: str; ready_at: int; freshness_until: int
+    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; plan_identity: str; capture_plan_digest: str; ordinal: int; prior_digest: str; request_identity: str; profile_identity: str; runtime_fingerprint: str; result_kind: str; result_identity: str; accepted_result_identity: str | None; verdict: str | None; ready_at: int; freshness_until: int
     def __post_init__(self) -> None:
-        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.capture_plan_digest, self.prior_digest, self.result_identity)) or not _SHA.fullmatch(self.candidate_sha) or type(self.ordinal) is not int or self.ordinal < 1 or self.result_kind not in {item.value for item in SupervisorResultKind} or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.freshness_until < self.ready_at: raise SupervisorShadowError("Supervisor attempt event is invalid")
+        accepted = self.result_kind == SupervisorResultKind.ACCEPTED.value
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest, self.prior_digest, self.request_identity, self.profile_identity, self.runtime_fingerprint, self.result_identity)) or not _SHA.fullmatch(self.candidate_sha) or type(self.ordinal) is not int or self.ordinal < 1 or self.result_kind not in {item.value for item in SupervisorResultKind} or self.verdict not in {None, "pass", "findings"} or (accepted != (self.verdict is not None)) or (accepted != (self.accepted_result_identity == self.result_identity)) or (not accepted and self.accepted_result_identity is not None) or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.freshness_until < self.ready_at: raise SupervisorShadowError("Supervisor attempt event is invalid")
     def payload(self) -> dict[str, object]: return self.__dict__.copy()
     @property
     def content_digest(self) -> str: return _hash(self.payload())
 
 @dataclass(frozen=True)
 class SupervisorTerminalRecord:
-    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; capture_plan_digest: str; prior_digest: str; terminal: str; blocker: str | None; next_action: str; ready_at: int
+    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; plan_identity: str; capture_plan_digest: str; prior_digest: str; attempt_count: int; terminal: str; accepted_result_identity: str | None; blocker: str | None; next_action: str; ready_at: int
     def __post_init__(self) -> None:
-        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted"} or not _token(self.next_action) or type(self.ready_at) is not int or self.ready_at < 0 or (self.terminal == "exhausted") != (self.blocker == "attempt-budget-exhausted"): raise SupervisorShadowError("Supervisor terminal record is invalid")
+        accepted = self.terminal == "accepted"
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted"} or type(self.attempt_count) is not int or self.attempt_count < 1 or type(self.ready_at) is not int or self.ready_at < 0 or (accepted and (not _digest(self.accepted_result_identity) or self.blocker is not None or self.next_action != "apply-bound-review-result")) or (not accepted and (self.accepted_result_identity is not None or self.blocker != "attempt-budget-exhausted" or self.next_action != "retain-terminal-product-block")): raise SupervisorShadowError("Supervisor terminal record is invalid")
 
 @dataclass(frozen=True)
 class LifecycleChainReceipt:
-    record_identity: str; source_identity: str; observation_identity: str; content_digest: str; prior_digest: str; ordinal: int; ready_at: int
+    binding: SupervisorLifecycleChainBinding; content_digest: str; prior_digest: str; ordinal: int
     def __post_init__(self) -> None:
-        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.content_digest, self.prior_digest)) or type(self.ordinal) is not int or self.ordinal < 0 or type(self.ready_at) is not int or self.ready_at < 0: raise SupervisorShadowError("Supervisor lifecycle receipt is invalid")
+        if type(self.binding) is not SupervisorLifecycleChainBinding or not all(_digest(value) for value in (self.content_digest, self.prior_digest)) or type(self.ordinal) is not int or self.ordinal < 0: raise SupervisorShadowError("Supervisor lifecycle receipt is invalid")
+    def payload(self) -> dict[str, object]: return {"binding": self.binding.payload(), "content_digest": self.content_digest, "prior_digest": self.prior_digest, "ordinal": self.ordinal}
+    @property
+    def receipt_digest(self) -> str: return _hash(self.payload())
+    @property
+    def record_identity(self) -> str: return self.binding.record_identity
+    @property
+    def source_identity(self) -> str: return self.binding.source_identity
+    @property
+    def observation_identity(self) -> str: return self.binding.observation_identity
+    @property
+    def candidate_sha(self) -> str: return self.binding.candidate_sha
+    @property
+    def context_identity(self) -> str: return self.binding.context_identity
+    @property
+    def plan_identity(self) -> str: return self.binding.plan_identity
+    @property
+    def capture_plan_digest(self) -> str: return self.binding.capture_plan_digest
+    @property
+    def ready_at(self) -> int: return self.binding.ready_at
+    @property
+    def freshness_until(self) -> int: return self.binding.freshness_until
+
+@dataclass(frozen=True)
+class SupervisorLifecycleChainBinding:
+    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; plan_identity: str; capture_plan_digest: str; ready_at: int; freshness_until: int
+    def __post_init__(self) -> None:
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest)) or not _SHA.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.ready_at < 0 or self.freshness_until < self.ready_at: raise SupervisorShadowError("Supervisor lifecycle chain binding is invalid")
+    def payload(self) -> dict[str, object]: return self.__dict__.copy()
+    @property
+    def binding_digest(self) -> str: return _hash(self.payload())
 
 @dataclass(frozen=True)
 class CompleteSupervisorLifecycleRecord:
-    plan_receipt: LifecycleChainReceipt; events: tuple[SupervisorAttemptEvent, ...]; terminal: SupervisorTerminalRecord; terminal_receipt: LifecycleChainReceipt
+    expected_plan: SupervisorExpectedLifecycle; plan_receipt: LifecycleChainReceipt; events: tuple[SupervisorAttemptEvent, ...]; terminal: SupervisorTerminalRecord; terminal_receipt: LifecycleChainReceipt
     def __post_init__(self) -> None:
-        if type(self.plan_receipt) is not LifecycleChainReceipt or type(self.events) is not tuple or any(type(item) is not SupervisorAttemptEvent for item in self.events) or type(self.terminal) is not SupervisorTerminalRecord or type(self.terminal_receipt) is not LifecycleChainReceipt or tuple(item.ordinal for item in self.events) != tuple(range(1, len(self.events) + 1)): raise SupervisorShadowError("Complete supervisor lifecycle record is invalid")
+        if type(self.expected_plan) is not SupervisorExpectedLifecycle or type(self.plan_receipt) is not LifecycleChainReceipt or type(self.events) is not tuple or not self.events or any(type(item) is not SupervisorAttemptEvent for item in self.events) or type(self.terminal) is not SupervisorTerminalRecord or type(self.terminal_receipt) is not LifecycleChainReceipt or tuple(item.ordinal for item in self.events) != tuple(range(1, len(self.events) + 1)): raise SupervisorShadowError("Complete supervisor lifecycle record is invalid")
+        binding = self.plan_receipt.binding
+        if any(receipt.binding != binding for receipt in (*(), self.terminal_receipt)) or any((event.record_identity, event.source_identity, event.observation_identity, event.candidate_sha, event.context_identity, event.plan_identity, event.capture_plan_digest) != (binding.record_identity, binding.source_identity, binding.observation_identity, binding.candidate_sha, binding.context_identity, binding.plan_identity, binding.capture_plan_digest) for event in self.events) or (self.expected_plan.context_identity, self.expected_plan.plan_identity, self.expected_plan.observation_identity, self.expected_plan.binding.candidate_sha, self.expected_plan.binding.capture_plan_digest) != (binding.context_identity, binding.plan_identity, binding.observation_identity, binding.candidate_sha, binding.capture_plan_digest) or (self.terminal.record_identity, self.terminal.source_identity, self.terminal.observation_identity, self.terminal.candidate_sha, self.terminal.context_identity, self.terminal.plan_identity, self.terminal.capture_plan_digest, self.terminal.attempt_count) != (binding.record_identity, binding.source_identity, binding.observation_identity, binding.candidate_sha, binding.context_identity, binding.plan_identity, binding.capture_plan_digest, len(self.events)):
+            raise SupervisorShadowError("Complete supervisor lifecycle binding is invalid")
+        receipts = (self.plan_receipt, *tuple(LifecycleChainReceipt(binding, event.content_digest, event.prior_digest, event.ordinal) for event in self.events), self.terminal_receipt)
+        if tuple(receipt.ordinal for receipt in receipts) != tuple(range(len(receipts))) or any(receipt.prior_digest != previous.receipt_digest for previous, receipt in zip(receipts, receipts[1:])) or self.terminal.prior_digest != receipts[-2].receipt_digest:
+            raise SupervisorShadowError("Complete supervisor lifecycle chain is invalid")
+        accepted = tuple(event for event in self.events if event.result_kind == SupervisorResultKind.ACCEPTED.value)
+        if (self.terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(self.events) or self.terminal.accepted_result_identity != accepted[-1].result_identity)) or (self.terminal.terminal == "exhausted" and accepted):
+            raise SupervisorShadowError("Complete supervisor lifecycle terminal is invalid")
 
 
 class ExternalSupervisorLifecycle(Protocol):
@@ -228,6 +273,94 @@ class ExternalSupervisorLifecycle(Protocol):
     def read_expected(self, receipt: SupervisorExpectedLifecycleReceipt) -> SupervisorExpectedLifecycle: ...
     def persist(self, record_identity: str, observation_identity: str, attempts: tuple["SupervisorSequenceAttempt", ...], result: SupervisorFailoverResult) -> None: ...
     def read(self, record_identity: str) -> tuple[str, tuple["SupervisorSequenceAttempt", ...], SupervisorFailoverResult]: ...
+
+class InMemorySupervisorLifecycle:
+    """Provider-free append-only canonical lifecycle chain for qualification tests."""
+    def __init__(self, source_identity: str) -> None:
+        if not _digest(source_identity): raise SupervisorShadowError("Supervisor lifecycle source is invalid")
+        self._source_identity = source_identity; self._records: dict[str, dict[str, object]] = {}
+    @staticmethod
+    def _evidence_time(binding: SupervisorLifecycleChainBinding, evidence_time: int) -> None:
+        if type(evidence_time) is not int or not binding.ready_at <= evidence_time <= binding.freshness_until: raise SupervisorShadowError("Supervisor lifecycle evidence time is invalid")
+    @staticmethod
+    def _material(value: object) -> str: return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    @staticmethod
+    def _receipt(material: object) -> LifecycleChainReceipt:
+        if type(material) is not str: raise SupervisorShadowError("Supervisor lifecycle receipt material is invalid")
+        try:
+            payload = json.loads(material); binding = SupervisorLifecycleChainBinding(**payload["binding"])
+            return LifecycleChainReceipt(binding, payload["content_digest"], payload["prior_digest"], payload["ordinal"])
+        except (KeyError, TypeError, ValueError) as error: raise SupervisorShadowError("Supervisor lifecycle receipt material is invalid") from error
+    @staticmethod
+    def _plan(material: object) -> SupervisorExpectedLifecycle:
+        if type(material) is not str: raise SupervisorShadowError("Supervisor lifecycle plan material is invalid")
+        try:
+            payload = json.loads(material); raw_binding = payload["binding"]
+            binding = SupervisorSequenceBinding(raw_binding["case_id"], raw_binding["candidate_sha"], raw_binding["base_sha"], raw_binding["task_id"], tuple(raw_binding["request_identities"]), tuple(raw_binding["profile_identities"]), tuple(raw_binding["runtime_fingerprints"]), raw_binding["review_epoch"], raw_binding["review_round"], raw_binding["review_mode"], raw_binding["capture_plan_digest"])
+            return SupervisorExpectedLifecycle(binding, payload["policy_digest"], payload["configuration_digest"], payload["runtime_identity"], payload["ready_at"], payload["observation_identity"])
+        except (KeyError, TypeError, ValueError) as error: raise SupervisorShadowError("Supervisor lifecycle plan material is invalid") from error
+    def _binding(self, plan: SupervisorExpectedLifecycle, freshness_until: int) -> SupervisorLifecycleChainBinding:
+        record_identity = _hash({"source_identity": self._source_identity, "plan_identity": plan.plan_identity, "observation_identity": plan.observation_identity, "candidate_sha": plan.binding.candidate_sha, "context_identity": plan.context_identity, "capture_plan_digest": plan.binding.capture_plan_digest})
+        return SupervisorLifecycleChainBinding(record_identity, self._source_identity, plan.observation_identity, plan.binding.candidate_sha, plan.context_identity, plan.plan_identity, plan.binding.capture_plan_digest, plan.ready_at, freshness_until)
+    def prepare(self, plan: SupervisorExpectedLifecycle, *, freshness_until: int) -> LifecycleChainReceipt:
+        if type(plan) is not SupervisorExpectedLifecycle or type(freshness_until) is not int or freshness_until < plan.ready_at: raise SupervisorShadowError("Supervisor lifecycle prepare is invalid")
+        record_identity = self._binding(plan, freshness_until).record_identity
+        if record_identity in self._records: raise SupervisorShadowError("Supervisor lifecycle prepare is invalid")
+        binding = self._binding(plan, freshness_until)
+        content = _hash(plan.payload()); receipt = LifecycleChainReceipt(binding, content, _hash({"genesis": binding.binding_digest}), 0)
+        self._records[record_identity] = {"plan": self._material(plan.payload()), "receipt": self._material(receipt.payload()), "events": [], "terminal": None}
+        return receipt
+    def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
+        record = self._records.get(record_identity)
+        if record is None or record["terminal"] is not None or type(event) is not SupervisorAttemptEvent or event.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle append is invalid")
+        receipt = self._receipt(record["receipt"])
+        self._evidence_time(receipt.binding, evidence_time)
+        plan = self._plan(record["plan"]); binding = plan.binding.__dict__.copy()
+        expected_ordinal = event.ordinal - 1
+        if expected_ordinal >= len(binding["request_identities"]) or (event.source_identity, event.observation_identity, event.candidate_sha, event.context_identity, event.plan_identity, event.capture_plan_digest, event.request_identity, event.profile_identity, event.runtime_fingerprint, event.ready_at, event.freshness_until) != (receipt.source_identity, receipt.observation_identity, receipt.candidate_sha, receipt.context_identity, receipt.plan_identity, receipt.capture_plan_digest, binding["request_identities"][expected_ordinal], binding["profile_identities"][expected_ordinal], binding["runtime_fingerprints"][expected_ordinal], receipt.ready_at, receipt.freshness_until): raise SupervisorShadowError("Supervisor lifecycle append is invalid")
+        events = record["events"]
+        assert type(events) is list
+        prior = receipt if not events else self._receipt(events[-1][1])
+        if event.ordinal != len(events) + 1 or event.prior_digest != prior.receipt_digest: raise SupervisorShadowError("Supervisor lifecycle append is invalid")
+        event_receipt = LifecycleChainReceipt(receipt.binding, event.content_digest, event.prior_digest, event.ordinal)
+        events.append((self._material(event.payload()), self._material(event_receipt.payload()))); return event_receipt
+    def finalize(self, record_identity: str, terminal: SupervisorTerminalRecord, *, evidence_time: int) -> LifecycleChainReceipt:
+        record = self._records.get(record_identity); events = None if record is None else record["events"]
+        plan_receipt = None if record is None else self._receipt(record["receipt"])
+        if record is None or record["terminal"] is not None or type(events) is not list or not events or type(terminal) is not SupervisorTerminalRecord or terminal.record_identity != record_identity or terminal.prior_digest != self._receipt(events[-1][1]).receipt_digest or terminal.source_identity != plan_receipt.source_identity or terminal.attempt_count != len(events): raise SupervisorShadowError("Supervisor lifecycle finalize is invalid")
+        self._evidence_time(plan_receipt.binding, evidence_time)
+        if (terminal.observation_identity, terminal.candidate_sha, terminal.context_identity, terminal.plan_identity, terminal.capture_plan_digest, terminal.ready_at) != (plan_receipt.observation_identity, plan_receipt.candidate_sha, plan_receipt.context_identity, plan_receipt.plan_identity, plan_receipt.capture_plan_digest, plan_receipt.ready_at): raise SupervisorShadowError("Supervisor lifecycle finalize is invalid")
+        accepted = tuple(event for material, _receipt in events for event in (SupervisorAttemptEvent(**json.loads(material)),) if event.result_kind == SupervisorResultKind.ACCEPTED.value)
+        if (terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(events) or terminal.accepted_result_identity != accepted[-1].result_identity)) or (terminal.terminal == "exhausted" and accepted): raise SupervisorShadowError("Supervisor lifecycle finalize is invalid")
+        terminal_receipt = LifecycleChainReceipt(plan_receipt.binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1); record["terminal"] = (self._material(terminal.__dict__), self._material(terminal_receipt.payload())); return terminal_receipt
+    def read_chain(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], SupervisorTerminalRecord, LifecycleChainReceipt]:
+        record = self._records.get(record_identity)
+        if record is None or record["terminal"] is None: raise SupervisorShadowError("Supervisor lifecycle read is incomplete")
+        plan = self._plan(record["plan"]); stored_plan_receipt = self._receipt(record["receipt"])
+        binding = self._binding(plan, stored_plan_receipt.freshness_until); self._evidence_time(binding, evidence_time)
+        plan_receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
+        if stored_plan_receipt != plan_receipt or binding.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle plan receipt was tampered")
+        events = record["events"]; terminal = record["terminal"]
+        if type(events) is not list or type(terminal) is not tuple or len(terminal) != 2: raise SupervisorShadowError("Supervisor lifecycle read is invalid")
+        rebuilt: list[SupervisorAttemptEvent] = []; previous = plan_receipt
+        for ordinal, entry in enumerate(events, start=1):
+            if type(entry) is not tuple or len(entry) != 2: raise SupervisorShadowError("Supervisor lifecycle read is invalid")
+            try: event = SupervisorAttemptEvent(**json.loads(entry[0]))
+            except (TypeError, ValueError) as error: raise SupervisorShadowError("Supervisor lifecycle event material is invalid") from error
+            expected = ordinal - 1
+            if expected >= len(plan.binding.request_identities) or (event.record_identity, event.source_identity, event.observation_identity, event.candidate_sha, event.context_identity, event.plan_identity, event.capture_plan_digest, event.ordinal, event.prior_digest, event.request_identity, event.profile_identity, event.runtime_fingerprint, event.ready_at, event.freshness_until) != (binding.record_identity, binding.source_identity, binding.observation_identity, binding.candidate_sha, binding.context_identity, binding.plan_identity, binding.capture_plan_digest, ordinal, previous.receipt_digest, plan.binding.request_identities[expected], plan.binding.profile_identities[expected], plan.binding.runtime_fingerprints[expected], binding.ready_at, binding.freshness_until): raise SupervisorShadowError("Supervisor lifecycle event binding is invalid")
+            if rebuilt and rebuilt[-1].result_kind == SupervisorResultKind.ACCEPTED.value: raise SupervisorShadowError("Supervisor lifecycle advance is invalid")
+            receipt = LifecycleChainReceipt(binding, event.content_digest, event.prior_digest, ordinal)
+            if self._receipt(entry[1]) != receipt: raise SupervisorShadowError("Supervisor lifecycle event receipt was tampered")
+            rebuilt.append(event); previous = receipt
+        try: final = SupervisorTerminalRecord(**json.loads(terminal[0]))
+        except (TypeError, ValueError) as error: raise SupervisorShadowError("Supervisor lifecycle terminal material is invalid") from error
+        terminal_receipt = LifecycleChainReceipt(binding, _hash(final.__dict__), final.prior_digest, len(rebuilt) + 1)
+        if final.prior_digest != previous.receipt_digest or self._receipt(terminal[1]) != terminal_receipt: raise SupervisorShadowError("Supervisor lifecycle terminal receipt was tampered")
+        return plan, plan_receipt, tuple(rebuilt), final, terminal_receipt
+    def read(self, record_identity: str, *, evidence_time: int) -> CompleteSupervisorLifecycleRecord:
+        plan, plan_receipt, events, terminal, terminal_receipt = self.read_chain(record_identity, evidence_time=evidence_time)
+        return CompleteSupervisorLifecycleRecord(plan, plan_receipt, events, terminal, terminal_receipt)
 
 
 @dataclass(frozen=True)

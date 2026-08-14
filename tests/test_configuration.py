@@ -498,10 +498,12 @@ class ConfigurationTests(unittest.TestCase):
             canonical_root.mkdir(parents=True)
             original_resolve = Path.resolve
             def normalized_resolve(path: Path, strict: bool = False) -> Path:
-                if path == raw_root:
-                    return canonical_root
-                if path == raw_root.parent:
-                    return canonical_root.parent
+                try:
+                    relative = path.relative_to(raw_root.parent)
+                except ValueError:
+                    relative = None
+                if relative is not None:
+                    return canonical_root.parent / relative
                 return original_resolve(path, strict=strict)
             with mock.patch.object(Path, "resolve", autospec=True, side_effect=normalized_resolve):
                 identity = FileReviewAuthorityStore.identity_for_root(raw_root)

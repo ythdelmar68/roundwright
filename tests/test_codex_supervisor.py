@@ -19,6 +19,7 @@ from roundwright.codex_supervisor import (
 )
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewMode, ReviewPolicy, load_configuration
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.runtime_binding import InMemorySupervisorRuntimeStore, RuntimeBindingError
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
 from roundwright.shadow import RecorderBinding
@@ -166,26 +167,26 @@ class SupervisorTests(unittest.TestCase):
 
     def test_sequence_advances_ambiguous_primary_to_valid_fallback(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.comparison.disposition, recorder.calls), (SupervisorSequenceTerminal.ACCEPTED, ("ambiguous", "accepted"), 2, "match", ["prepare", "seal", "verify"]))
         payload = result.envelope.payload()
         self.assertEqual((type(payload["attempts"]), type(payload["request_identities"]), type(payload["profile_identities"]), type(payload["runtime_fingerprints"])), (list, list, list, list))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS) for _profile in self.profiles))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
 
     def test_sequence_rejects_binding_order_and_profile_drift(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         drifted = SupervisorSequenceBinding(binding.case_id, binding.candidate_sha, binding.base_sha, binding.task_id, binding.request_identities, (binding.profile_identities[1], binding.profile_identities[0], binding.profile_identities[2]), binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest)
         with self.assertRaises(Exception):
-            qualify_supervisor_sequence(adapters, requests, readiness, drifted, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, readiness, drifted, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.calls, [])
 
     def test_sequence_candidate_movement_invalidates_armed_plan(self):
@@ -198,7 +199,7 @@ class SupervisorTests(unittest.TestCase):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         lifecycle.read = lambda *_args, **_kwargs: (_ for _ in ()).throw(SupervisorShadowError("durable drift"))
         with self.assertRaisesRegex(Exception, "read-back failed"):
-            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.calls, ["prepare"])
 
     def test_sequence_rejects_complete_runtime_binding_drift_before_provider_dispatch(self):
@@ -212,7 +213,7 @@ class SupervisorTests(unittest.TestCase):
         original = lifecycle.read_plan
         lifecycle.read_plan = lambda *args, **kwargs: (replace(original(*args, **kwargs)[0], observation_identity=digest("wrong-observation")), original(*args, **kwargs)[1])
         with self.assertRaisesRegex(Exception, "pre-dispatch drifted"):
-            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((self.events, recorder.calls), ([], []))
 
     def test_sequence_lifecycle_failures_prevent_recorder_sealing(self):
@@ -222,7 +223,7 @@ class SupervisorTests(unittest.TestCase):
                 adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)
                 setattr(lifecycle, seam, lambda *_args, **_kwargs: (_ for _ in ()).throw(SupervisorShadowError(f"{seam} drift")))
                 with self.assertRaises(SupervisorShadowError):
-                    qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                    qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertNotIn("seal", recorder.calls)
                 if seam == "read_plan": self.assertEqual((self.events, recorder.calls), ([], []))
 
@@ -415,6 +416,75 @@ class SupervisorTests(unittest.TestCase):
         duplicate = list(pinned.supervisor_profile_identities); duplicate[1] = duplicate[0]
         with self.assertRaises(ConfigurationError): construct(baseline, supervisor_profile_identities=tuple(duplicate))
         self.assertEqual(tuple(pinned.review_policy.mode_for_round(round_number) for round_number in (1, 2, 3, 4)), (ReviewMode.COMPLETE, ReviewMode.COMPLETE, ReviewMode.COMPLETE, ReviewMode.CONVERGING))
+
+    def test_runtime_store_round_trip_and_tamper_fail_closed(self):
+        def fresh():
+            store = InMemorySupervisorRuntimeStore(digest("runtime-source")); runtime = self.configuration.runtime_binding()
+            receipt = store.persist(runtime, candidate_sha=self.context.candidate_sha, context_identity=digest("runtime-context"), ready_at=10, freshness_until=20)
+            return store, runtime, receipt
+        store, runtime, receipt = fresh(); value = store.read(receipt, evidence_time=10)
+        self.assertEqual(value, runtime); self.assertIsNot(value, runtime)
+        for field, replacement in (("source_identity", digest("wrong-source")), ("record_identity", digest("wrong-record")), ("candidate_sha", "d" * 40), ("context_identity", digest("wrong-context")), ("resolved_configuration_digest", digest("wrong-configuration")), ("runtime_content_digest", digest("wrong-content")), ("ready_at", 11), ("freshness_until", 21)):
+            with self.subTest(field=field):
+                store, _runtime, receipt = fresh()
+                with self.assertRaises(RuntimeBindingError): store.read(replace(receipt, **{field: replacement}), evidence_time=10)
+        store, _runtime, receipt = fresh(); store._records[receipt.record_identity] = "{}"
+        with self.assertRaises(RuntimeBindingError): store.read(receipt, evidence_time=10)
+        store, _runtime, receipt = fresh()
+        with self.assertRaises(RuntimeBindingError): store.read(receipt, evidence_time=9)
+        with self.assertRaises(RuntimeBindingError): store.read(receipt, evidence_time=21)
+
+    def test_sequence_runtime_preflight_failures_make_zero_downstream_calls(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        counts = {name: 0 for name in ("prepare", "read_plan", "append", "finalize", "read", "recorder_prepare", "seal", "verify")}
+        for name in ("prepare", "read_plan", "append", "finalize", "read"):
+            original = getattr(lifecycle, name)
+            setattr(lifecycle, name, lambda *args, _name=name, _original=original, **kwargs: (counts.__setitem__(_name, counts[_name] + 1), _original(*args, **kwargs))[1])
+        for name, key in (("prepare", "recorder_prepare"), ("seal", "seal"), ("verify", "verify")):
+            original = getattr(recorder, name)
+            setattr(recorder, name, lambda *args, _key=key, _original=original, **kwargs: (counts.__setitem__(_key, counts[_key] + 1), _original(*args, **kwargs))[1])
+        class FailingStore:
+            def persist(self, *_args, **_kwargs): raise RuntimeBindingError("runtime preflight failure")
+            def read(self, *_args, **_kwargs): raise RuntimeBindingError("runtime preflight failure")
+        for store in (None, object(), FailingStore()):
+            with self.subTest(store=type(store).__name__):
+                with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=store, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual(tuple(counts.values()), (0,) * len(counts))
+
+    def test_sequence_runtime_read_preflight_failure_has_zero_adapter_calls(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        class ReadFailingStore:
+            def persist(self, runtime, **kwargs): return InMemorySupervisorRuntimeStore(digest("unused")).persist(runtime, **kwargs)
+            def read(self, *_args, **_kwargs): raise RuntimeBindingError("read failure")
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=ReadFailingStore(), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((recorder.calls, self.events), ([], []))
+
+    def test_sequence_runtime_read_wrong_type_has_zero_downstream_calls(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        class WrongTypeStore:
+            def persist(self, runtime, **kwargs): return InMemorySupervisorRuntimeStore(digest("wrong-type")).persist(runtime, **kwargs)
+            def read(self, *_args, **_kwargs): return object()
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=WrongTypeStore(), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((recorder.calls, self.events), ([], []))
+
+    def test_sequence_runtime_candidate_receipt_drift_has_zero_downstream_calls(self):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
+        class CandidateDriftStore:
+            def __init__(self): self.store = InMemorySupervisorRuntimeStore(digest("candidate-drift"))
+            def persist(self, runtime, **kwargs): return replace(self.store.persist(runtime, **kwargs), candidate_sha="d" * 40)
+            def read(self, receipt, **kwargs): return self.store.read(receipt, **kwargs)
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=CandidateDriftStore(), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((recorder.calls, self.events), ([], []))
+
+    def test_runtime_binding_canonical_parser_rejects_adversarial_material(self):
+        runtime = self.configuration.runtime_binding(); material = json.loads(runtime.canonical_material())
+        def encode(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        cases = [("missing", lambda value: value.pop("resolved_digest")), ("extra", lambda value: value.__setitem__("unknown", "x")), ("duplicate", lambda value: value["supervisor_profile_identities"].__setitem__(1, value["supervisor_profile_identities"][0])), ("budget", lambda value: value.__setitem__("review_max_supervisor_attempts_per_round", 1)), ("complete", lambda value: value.__setitem__("review_complete_rounds", value["review_complete_rounds"] + 1)), ("max", lambda value: value.__setitem__("review_max_rounds", value["review_max_rounds"] + 1)), ("terminal", lambda value: value.__setitem__("review_on_final_findings", "block")), ("policy", lambda value: value.__setitem__("review_policy_digest", "0" * 64))]
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                value = json.loads(runtime.canonical_material()); mutate(value)
+                with self.assertRaises(RuntimeBindingError): type(runtime).from_canonical(encode(value))
+        with self.assertRaises(RuntimeBindingError): type(runtime).from_canonical(json.dumps(material, sort_keys=True))
 
 if __name__ == "__main__":
     unittest.main()

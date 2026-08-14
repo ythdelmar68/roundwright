@@ -12,7 +12,7 @@ from typing import Callable, Mapping, Protocol
 from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorResultKind, dispatch_ordered_supervisor_attempts
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 from .configuration import ResolvedConfigurationBinding, ReviewPolicy
-from .runtime_binding import RuntimeBinding
+from .runtime_binding import ExternalSupervisorRuntimeStore, RuntimeBinding
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -457,13 +457,25 @@ def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> Sup
     return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
 
 
-def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, evidence_time: int, freshness_until: int, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
+def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, evidence_time: int, freshness_until: int, runtime_store: ExternalSupervisorRuntimeStore, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> SupervisorSequenceQualificationResult:
     """Capture exactly one terminal product failover sequence under one plan."""
     if type(adapters) is not tuple or type(requests) is not tuple or not adapters or len(adapters) != len(requests) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or not all(callable(getattr(lifecycle, name, None)) for name in ("prepare", "append", "finalize", "read_plan", "read")) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn) or type(evidence_time) is not int or type(freshness_until) is not int or freshness_until < evidence_time:
         raise SupervisorShadowError("Supervisor sequence pre-dispatch binding is invalid")
     context = requests[0].context
     if any(request.context != context or request.within_round_attempt != ordinal for ordinal, request in enumerate(requests, start=1)) or (context.task_id, context.base_sha, context.candidate_sha, context.review_epoch, context.review_round, context.review_mode.value) != (binding.task_id, binding.base_sha, binding.candidate_sha, binding.review_epoch, binding.review_round, binding.review_mode) or tuple(request.input_digest for request in requests) != binding.request_identities or tuple(request.selected_profile_identity for request in requests) != binding.profile_identities or tuple(adapter.profile_identity for adapter in adapters) != binding.profile_identities or tuple(adapter.runtime_fingerprint for adapter in adapters) != binding.runtime_fingerprints or (context.policy_digest, context.configuration_digest, binding.profile_identities, len(requests), context.review_mode) != (resolved_policy.policy_digest, resolved_policy.configuration_digest, resolved_policy.profile_identities, resolved_policy.policy.max_supervisor_attempts_per_round, resolved_policy.policy.mode_for_round(context.review_round)) or (readiness.candidate_sha, readiness.case_id, readiness.capture_plan_digest, readiness.observation_identity) != (binding.candidate_sha, binding.case_id, binding.capture_plan_digest, supervisor_sequence_observation_identity(requests)):
         raise SupervisorShadowError("Supervisor sequence context has drifted")
+    if not callable(getattr(runtime_store, "persist", None)) or not callable(getattr(runtime_store, "read", None)):
+        raise SupervisorShadowError("Supervisor runtime preflight is invalid")
+    try:
+        context_identity = _hash({"task_id": binding.task_id, "base_sha": binding.base_sha, "candidate_sha": binding.candidate_sha, "requests": binding.request_identities, "profiles": binding.profile_identities, "runtime": binding.runtime_fingerprints, "epoch": binding.review_epoch, "round": binding.review_round, "mode": binding.review_mode, "capture_plan": binding.capture_plan_digest})
+        runtime_receipt = runtime_store.persist(resolved_policy.runtime, candidate_sha=binding.candidate_sha, context_identity=context_identity, ready_at=readiness.ready_at, freshness_until=freshness_until)
+        runtime = runtime_store.read(runtime_receipt, evidence_time=evidence_time)
+        reconstructed_policy = ResolvedSupervisorSequencePolicy(resolved_policy.configuration, runtime)
+    except Exception as error:
+        raise SupervisorShadowError("Supervisor runtime preflight failed") from error
+    if reconstructed_policy != resolved_policy:
+        raise SupervisorShadowError("Supervisor runtime preflight drifted")
+    resolved_policy = reconstructed_policy
     expected_plan = SupervisorExpectedLifecycle(binding, resolved_policy.policy_digest, resolved_policy.configuration_digest, _hash(resolved_policy.runtime.complete_columns()), readiness.ready_at, readiness.observation_identity)
     try:
         expected_receipt = lifecycle.prepare(expected_plan, freshness_until=freshness_until)

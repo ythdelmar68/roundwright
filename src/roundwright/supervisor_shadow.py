@@ -193,6 +193,33 @@ class SupervisorExpectedLifecycleReceipt:
         if not all(_digest(value) for value in (self.record_digest, self.source_identity, self.observation_identity)) or not _SHA.fullmatch(self.candidate_sha) or not _digest(self.capture_plan_digest) or type(self.ready_at) is not int or self.ready_at < 0:
             raise SupervisorShadowError("Supervisor expected lifecycle receipt is invalid")
 
+@dataclass(frozen=True)
+class SupervisorAttemptEvent:
+    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; capture_plan_digest: str; ordinal: int; prior_digest: str; result_kind: str; result_identity: str; ready_at: int; freshness_until: int
+    def __post_init__(self) -> None:
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.capture_plan_digest, self.prior_digest, self.result_identity)) or not _SHA.fullmatch(self.candidate_sha) or type(self.ordinal) is not int or self.ordinal < 1 or self.result_kind not in {item.value for item in SupervisorResultKind} or type(self.ready_at) is not int or type(self.freshness_until) is not int or self.freshness_until < self.ready_at: raise SupervisorShadowError("Supervisor attempt event is invalid")
+    def payload(self) -> dict[str, object]: return self.__dict__.copy()
+    @property
+    def content_digest(self) -> str: return _hash(self.payload())
+
+@dataclass(frozen=True)
+class SupervisorTerminalRecord:
+    record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; capture_plan_digest: str; prior_digest: str; terminal: str; blocker: str | None; next_action: str; ready_at: int
+    def __post_init__(self) -> None:
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted"} or not _token(self.next_action) or type(self.ready_at) is not int or self.ready_at < 0 or (self.terminal == "exhausted") != (self.blocker == "attempt-budget-exhausted"): raise SupervisorShadowError("Supervisor terminal record is invalid")
+
+@dataclass(frozen=True)
+class LifecycleChainReceipt:
+    record_identity: str; source_identity: str; observation_identity: str; content_digest: str; prior_digest: str; ordinal: int; ready_at: int
+    def __post_init__(self) -> None:
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.content_digest, self.prior_digest)) or type(self.ordinal) is not int or self.ordinal < 0 or type(self.ready_at) is not int or self.ready_at < 0: raise SupervisorShadowError("Supervisor lifecycle receipt is invalid")
+
+@dataclass(frozen=True)
+class CompleteSupervisorLifecycleRecord:
+    plan_receipt: LifecycleChainReceipt; events: tuple[SupervisorAttemptEvent, ...]; terminal: SupervisorTerminalRecord; terminal_receipt: LifecycleChainReceipt
+    def __post_init__(self) -> None:
+        if type(self.plan_receipt) is not LifecycleChainReceipt or type(self.events) is not tuple or any(type(item) is not SupervisorAttemptEvent for item in self.events) or type(self.terminal) is not SupervisorTerminalRecord or type(self.terminal_receipt) is not LifecycleChainReceipt or tuple(item.ordinal for item in self.events) != tuple(range(1, len(self.events) + 1)): raise SupervisorShadowError("Complete supervisor lifecycle record is invalid")
+
 
 class ExternalSupervisorLifecycle(Protocol):
     """Append/read an immutable expected contract before provider events."""

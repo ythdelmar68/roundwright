@@ -26,6 +26,7 @@ from roundwright.supervisor_shadow import (
     SUPERVISOR_FAILOVER_PROFILE, SupervisorCapturePlanReceipt,
     SupervisorQualificationBinding, SupervisorRecorderReceipt,
     ResolvedSupervisorSequencePolicy, SupervisorExpectedLifecycleReceipt, SupervisorSequenceBinding, SupervisorSequenceTerminal,
+    SupervisorAttemptEvent, SupervisorTerminalRecord, LifecycleChainReceipt, CompleteSupervisorLifecycleRecord,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_lifecycle_identity, supervisor_sequence_observation_identity,
 )
@@ -227,6 +228,15 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "pre-dispatch drifted"):
             qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((self.events, recorder.calls), ([], []))
+
+    def test_lifecycle_chain_values_are_immutable_and_reject_bad_order(self):
+        values = (digest("record"), digest("source"), digest("observation"), "c" * 40, digest("context"), digest("plan"), digest("prior"))
+        event = SupervisorAttemptEvent(*values, 1, "ambiguous", digest("result"), 10, 20)
+        plan = LifecycleChainReceipt(values[0], values[1], values[2], digest("plan-content"), values[6], 0, 10)
+        terminal = SupervisorTerminalRecord(*values[:6], event.content_digest, "exhausted", "attempt-budget-exhausted", "retain-terminal-product-block", 10)
+        receipt = LifecycleChainReceipt(values[0], values[1], values[2], digest("terminal-content"), event.content_digest, 2, 10)
+        self.assertEqual(CompleteSupervisorLifecycleRecord(plan, (event,), terminal, receipt).events, (event,))
+        with self.assertRaises(Exception): SupervisorAttemptEvent(*values, 0, "ambiguous", digest("result"), 10, 20)
 
 if __name__ == "__main__":
     unittest.main()

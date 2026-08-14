@@ -39,9 +39,14 @@ from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database
 
 class ProviderRecoveryTests(unittest.TestCase):
     def runtime_binding(self) -> RuntimeBinding:
-        profile = profile_fingerprint(ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH))
+        worker = profile_fingerprint(ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH))
+        supervisors = (
+            profile_fingerprint(ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH, "primary")),
+            profile_fingerprint(ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback")),
+            profile_fingerprint(ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback-retry")),
+        )
         return RuntimeBinding(
-            "roundwright-runtime/v1", "sha256:" + "a" * 64, profile, (profile, profile, profile),
+            "roundwright-runtime/v1", "sha256:" + "a" * 64, worker, supervisors,
             1, 3, 3, "worker-final-repair-then-merge", "b" * 64,
         )
 
@@ -62,7 +67,7 @@ class ProviderRecoveryTests(unittest.TestCase):
 
     def context(self, identity: TaskIdentity, *, candidate: str | None = None, role: ProviderRole = ProviderRole.WORKER) -> RecoveryContext:
         binding = self.runtime_binding()
-        selected = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
+        selected = ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH, "primary") if role is ProviderRole.SUPERVISOR else ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         profile = profile_fingerprint(selected)
         audit = CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(selected.model, selected.reasoning_effort.value),))
         observation = ProviderHealthObservation(role, profile, CodexHealthContract(audit.sdk_version, audit.runtime_version, identity.base_sha).fingerprint, audit.fingerprint, HealthState.READY, None, 0, 2_000_000_000, 1)

@@ -16,7 +16,7 @@ from enum import StrEnum
 from typing import Callable, Mapping, Protocol
 
 from .configuration import ProviderProfile, ReviewMode
-from .provider_health import CodexAdapterError, ProviderHealthAuditIdentity
+from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 
 
 class CodexSupervisorError(ValueError):
@@ -62,6 +62,7 @@ class SupervisorVerdict(StrEnum):
 
 class SupervisorResultKind(StrEnum):
     ACCEPTED = "accepted"
+    BLOCKED = "blocked"
     INVALID = "invalid"
     INCOMPLETE = "incomplete"
     AMBIGUOUS = "ambiguous"
@@ -73,6 +74,21 @@ class SupervisorDiagnostic(StrEnum):
     CONTEXT = "context"
     CANDIDATE = "candidate"
     NON_FINAL = "non-final"
+
+
+class SupervisorOutcomeSource(StrEnum):
+    SDK_TURN_FAILED = "sdk-turn-failed"
+
+
+class SupervisorSdkTurnErrorCategory(StrEnum):
+    BAD_REQUEST = "bad-request"
+    UNAUTHORIZED = "unauthorized"
+    SANDBOX = "sandbox"
+    OVERLOAD = "overload"
+    HTTP = "http"
+    STREAM = "stream"
+    CONNECTION = "connection"
+    MISSING_OR_UNKNOWN = "missing-or-unknown"
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -135,10 +151,14 @@ class NativeSupervisorResponse:
     kind: SupervisorResultKind
     structured_output: Mapping[str, object] | None = None
     diagnostic: SupervisorDiagnostic | None = None
+    failure: CodexFailure | None = None
+    outcome_source: SupervisorOutcomeSource | None = None
+    sdk_error_category: SupervisorSdkTurnErrorCategory | None = None
 
     def __post_init__(self) -> None:
         accepted = self.kind is SupervisorResultKind.ACCEPTED
-        if type(self.kind) is not SupervisorResultKind or (self.structured_output is not None and type(self.structured_output) is not dict) or (self.diagnostic is not None and type(self.diagnostic) is not SupervisorDiagnostic) or (accepted and (self.structured_output is None or self.diagnostic is not None)) or (not accepted and (self.structured_output is not None or (self.kind is SupervisorResultKind.INVALID and self.diagnostic is None) or (self.kind is not SupervisorResultKind.INVALID and self.diagnostic is not None))):
+        blocked = self.kind is SupervisorResultKind.BLOCKED
+        if type(self.kind) is not SupervisorResultKind or (self.structured_output is not None and type(self.structured_output) is not dict) or (self.diagnostic is not None and type(self.diagnostic) is not SupervisorDiagnostic) or (self.failure is not None and type(self.failure) is not CodexFailure) or (self.outcome_source is not None and type(self.outcome_source) is not SupervisorOutcomeSource) or (self.sdk_error_category is not None and type(self.sdk_error_category) is not SupervisorSdkTurnErrorCategory) or (accepted and (self.structured_output is None or self.diagnostic is not None or self.failure is not None)) or (blocked and (self.structured_output is not None or self.diagnostic is not None or self.failure is None or self.outcome_source is None or self.sdk_error_category is None)) or (not accepted and not blocked and (self.structured_output is not None or self.failure is not None or self.outcome_source is not None or self.sdk_error_category is not None or (self.kind is SupervisorResultKind.INVALID and self.diagnostic is None) or (self.kind is not SupervisorResultKind.INVALID and self.diagnostic is not None))):
             raise CodexSupervisorError("native Supervisor response is invalid")
 
 
@@ -151,14 +171,21 @@ class CodexSupervisorResult:
     findings: tuple[str, ...] = ()
     output_fingerprint: str | None = None
     diagnostic: SupervisorDiagnostic | None = None
+    failure: CodexFailure | None = None
+    outcome_source: SupervisorOutcomeSource | None = None
+    sdk_error_category: SupervisorSdkTurnErrorCategory | None = None
 
     def __post_init__(self) -> None:
-        if type(self.kind) is not SupervisorResultKind or (self.session_identity is not None and not _token(self.session_identity)) or (self.turn_identity is not None and not _token(self.turn_identity)) or (self.verdict is not None and type(self.verdict) is not SupervisorVerdict) or any(not _token(item) for item in self.findings) or (self.output_fingerprint is not None and not _DIGEST.fullmatch(self.output_fingerprint)) or (self.diagnostic is not None and type(self.diagnostic) is not SupervisorDiagnostic):
+        blocked = self.kind is SupervisorResultKind.BLOCKED
+        if type(self.kind) is not SupervisorResultKind or (self.session_identity is not None and not _token(self.session_identity)) or (self.turn_identity is not None and not _token(self.turn_identity)) or (self.verdict is not None and type(self.verdict) is not SupervisorVerdict) or any(not _token(item) for item in self.findings) or (self.output_fingerprint is not None and not _DIGEST.fullmatch(self.output_fingerprint)) or (self.diagnostic is not None and type(self.diagnostic) is not SupervisorDiagnostic) or (self.failure is not None and type(self.failure) is not CodexFailure) or (self.outcome_source is not None and type(self.outcome_source) is not SupervisorOutcomeSource) or (self.sdk_error_category is not None and type(self.sdk_error_category) is not SupervisorSdkTurnErrorCategory):
             raise CodexSupervisorError("Supervisor result is invalid")
         if self.kind is SupervisorResultKind.ACCEPTED:
             if self.session_identity is None or self.turn_identity is None or self.verdict is None or self.output_fingerprint is None or self.diagnostic is not None or (self.verdict is SupervisorVerdict.PASS and self.findings) or (self.verdict is SupervisorVerdict.FINDINGS and not self.findings):
                 raise CodexSupervisorError("Supervisor result is invalid")
-        elif self.verdict is not None or self.findings or self.output_fingerprint is not None or (self.kind is SupervisorResultKind.INVALID and self.diagnostic is None) or (self.kind is not SupervisorResultKind.INVALID and self.diagnostic is not None):
+        elif blocked:
+            if self.session_identity is None or self.turn_identity is None or self.verdict is not None or self.findings or self.output_fingerprint is not None or self.diagnostic is not None or self.failure is None or self.outcome_source is None or self.sdk_error_category is None:
+                raise CodexSupervisorError("Supervisor result is invalid")
+        elif self.verdict is not None or self.findings or self.output_fingerprint is not None or self.failure is not None or self.outcome_source is not None or self.sdk_error_category is not None or (self.kind is SupervisorResultKind.INVALID and self.diagnostic is None) or (self.kind is not SupervisorResultKind.INVALID and self.diagnostic is not None):
             raise CodexSupervisorError("Supervisor result is invalid")
 
 
@@ -230,7 +257,7 @@ class CodexSupervisorAdapter:
         if type(response) is not NativeSupervisorResponse:
             return CodexSupervisorResult(SupervisorResultKind.INVALID, session_identity, turn_identity, diagnostic=SupervisorDiagnostic.SHAPE)
         if response.kind is not SupervisorResultKind.ACCEPTED:
-            return CodexSupervisorResult(response.kind, session_identity, turn_identity, diagnostic=response.diagnostic)
+            return CodexSupervisorResult(response.kind, session_identity, turn_identity, diagnostic=response.diagnostic, failure=response.failure, outcome_source=response.outcome_source, sdk_error_category=response.sdk_error_category)
         try:
             verdict, findings = _output(response.structured_output, request)
         except _CandidateBindingDrift:

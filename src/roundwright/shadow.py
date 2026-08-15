@@ -1048,6 +1048,7 @@ _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = ShadowEvidenceProfile(
     (
         "provider-attempt",
         "invalid-output",
+        "provider-terminal-failure",
         "recovery-attempt",
         "formal-review-accepted",
         "lifecycle-state",

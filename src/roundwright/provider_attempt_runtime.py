@@ -31,6 +31,7 @@ from .provider_health import ProviderHealthAuditIdentity
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
+    read_supervisor_terminal_failure, record_supervisor_terminal_failure,
     read_attempt, record_invalid_output, recover_attempt,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
@@ -426,6 +427,24 @@ class DurableDiffReviewRunner:
             # This is an observed typed adapter outcome, not caller-supplied
             # provider text.  Ambiguity is durable and terminal for this
             # bounded sequence; only an explicit INVALID result may advance.
+            if result.kind is SupervisorResultKind.BLOCKED:
+                if result.failure is None or result.outcome_source is None or result.sdk_error_category is None:
+                    raise ProviderAttemptRuntimeError("Supervisor terminal failure projection is invalid")
+                record_supervisor_terminal_failure(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                    failure_class=result.failure.value,
+                    outcome_source=result.outcome_source.value,
+                    sdk_error_category=result.sdk_error_category.value,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                recover_attempt(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                    max_attempts=runtime.review_max_supervisor_attempts_per_round,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                return (selection.provider_attempt_id, False)
             if result.kind is not SupervisorResultKind.INVALID:
                 recover_attempt(
                     self.repository, self.identity, recovery,
@@ -701,6 +720,9 @@ class MaterializedProviderAttemptContext:
         """Project durable rows only; no descriptor value prescribes an outcome."""
 
         attempts = self.read_back(attempt_ids)
+        terminal_failures = {item.attempt_id: read_supervisor_terminal_failure(
+            self.resources.repository, self.resources.identity, item.attempt_id,
+        ) for item in attempts}
         projection = task_projection(self.resources.repository, self.resources.identity)
         accepted = tuple(item for item in attempts if item.state is AttemptState.ACCEPTED)
         graph: ShadowV2EventGraph | None = None
@@ -747,7 +769,13 @@ class MaterializedProviderAttemptContext:
                 if item.state is AttemptState.AMBIGUOUS:
                     events.append(ShadowV2Event("invalid-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "invalid-output", None, False, review_id))
                     ordinal += 1
-                if item.state is AttemptState.INVALIDATED:
+                terminal_failure = terminal_failures[item.attempt_id]
+                if terminal_failure is not None:
+                    events.append(ShadowV2Event("terminal-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "provider-terminal-failure", None, False, review_id))
+                    ordinal += 1
+                    events.append(ShadowV2Event("recovery-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "recovery-attempt", None, False, review_id))
+                    ordinal += 1
+                elif item.state is AttemptState.INVALIDATED:
                     events.append(ShadowV2Event("invalid-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "invalid-output", None, False, review_id))
                     ordinal += 1
                     events.append(ShadowV2Event("recovery-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "recovery-attempt", None, False, review_id))

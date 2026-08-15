@@ -154,6 +154,15 @@ class RecoveryProjection:
 
 
 @dataclass(frozen=True)
+class SupervisorTerminalFailure:
+    """Durable public-safe SDK terminal failure, never provider prose."""
+
+    failure_class: str
+    outcome_source: str
+    sdk_error_category: str
+
+
+@dataclass(frozen=True)
 class _PersistedRecoveryOutcome:
     action: RecoveryAction
     blocker: str | None
@@ -595,6 +604,92 @@ def invalidate_supervisor_attempt(
     finally:
         connection.close()
     return row
+
+
+def record_supervisor_terminal_failure(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    failure_class: str,
+    outcome_source: str,
+    sdk_error_category: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Durably invalidate one failed Supervisor SDK turn for failover.
+
+    This intentionally does not create ``provider_invalid_outputs``: the
+    terminal failure is an operational turn result, not rejected provider text.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    for value, name in ((failure_class, "failure class"), (outcome_source, "outcome source"), (sdk_error_category, "SDK error category")):
+        _require_token(value, name)
+    observed = _clock(now)
+    blocker = f"terminal-failure:{outcome_source}:{failure_class}:{sdk_error_category}"
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if row.role is not ProviderRole.SUPERVISOR or row.external_turn_identity is None:
+            raise ProviderRecoveryError("terminal failure requires a dispatched Supervisor turn")
+        if row.state is AttemptState.INVALIDATED:
+            outcome = _read_recovery_outcome(connection, attempt_id)
+            if outcome != _PersistedRecoveryOutcome(RecoveryAction.FRESH_SUPERVISOR_SESSION, blocker):
+                raise ProviderRecoveryError("terminal failure conflicts with committed state")
+            connection.commit()
+            return row
+        if row.state is not AttemptState.DISPATCHED:
+            raise ProviderRecoveryError("terminal failure requires an unsettled Supervisor turn")
+        if connection.execute("SELECT 1 FROM provider_invalid_outputs WHERE attempt_id = ?", (attempt_id,)).fetchone() is not None:
+            raise ProviderRecoveryError("terminal failure conflicts with invalid output")
+        connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.INVALIDATED.value, attempt_id))
+        row = replace(row, state=AttemptState.INVALIDATED)
+        _persist_recovery_outcome(connection, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION, blocker, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return row
+
+
+def read_supervisor_terminal_failure(
+    repository: RepositoryIdentity, identity: TaskIdentity, attempt_id: str,
+) -> SupervisorTerminalFailure | None:
+    """Read only the fixed public-safe failure projection for one attempt."""
+
+    _validate_task(identity)
+    _require_token(attempt_id, "attempt identity")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        outcome = _read_recovery_outcome(connection, attempt_id)
+        if row.state is not AttemptState.INVALIDATED or outcome is None or outcome.action is not RecoveryAction.FRESH_SUPERVISOR_SESSION or outcome.blocker is None:
+            return None
+        parts = outcome.blocker.split(":")
+        if len(parts) != 4 or parts[0] != "terminal-failure":
+            return None
+        _, source, failure, category = parts
+        for value in (source, failure, category):
+            _require_token(value, "terminal failure projection")
+        return SupervisorTerminalFailure(failure, source, category)
+    finally:
+        connection.close()
 
 
 def block_session_without_turn(

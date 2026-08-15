@@ -19,14 +19,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
-    NativeSupervisorResponse, SupervisorDiagnostic, SupervisorResultKind,
+    NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
+    SupervisorResultKind, SupervisorSdkTurnErrorCategory,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
-from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
+from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend, _consume
 from roundwright.worker_toolbox import CompletionDeadline
 from roundwright.shadow import RecorderBinding
 from roundwright.supervisor_shadow import (
@@ -160,6 +161,24 @@ class SupervisorTests(unittest.TestCase):
             backend.open_fresh_session(profile)
         self.assertIs(raised.exception.failure, CodexFailure.UNKNOWN)
         self.assertNotIn("private", str(raised.exception))
+
+    def test_exact_failed_turn_projects_only_safe_terminal_failure_metadata(self):
+        class Handle:
+            id = "turn-terminal-failure"
+            def stream(self):
+                return iter(({
+                    "method": "turn/completed",
+                    "payload": {"turn": {
+                        "id": self.id, "status": "failed",
+                        "error": {"codexErrorInfo": "serverOverloaded", "message": "private failure"},
+                    }},
+                },))
+        response = _consume(Handle(), CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
+        self.assertEqual(
+            (response.kind, response.failure, response.outcome_source, response.sdk_error_category),
+            (SupervisorResultKind.BLOCKED, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+             SupervisorOutcomeSource.SDK_TURN_FAILED, SupervisorSdkTurnErrorCategory.OVERLOAD),
+        )
 
     def test_native_stream_rejections_advance_only_the_attempt_position(self):
         """Native stream/parser failures are typed, bounded, and never sealed."""

@@ -17,11 +17,11 @@ from typing import Callable, Mapping
 from .codex_supervisor import (
     CodexSupervisorError, CodexSupervisorRequest, NativeCodexSupervisorBackend, canonical_supervisor_review_material,
     NativeSupervisorResponse, NativeSupervisorSession, NativeSupervisorTurn,
-    SupervisorDiagnostic, SupervisorResultKind,
+    SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
-from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _value
+from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
 def _schema() -> dict[str, object]:
@@ -149,7 +149,15 @@ def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[],
                     turn = _field(payload, "turn")
                     if turn is None or _field(turn, "id") != _field(handle, "id"):
                         return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.CONTEXT)
-                    if _value(_field(turn, "status")) != "completed":
+                    status = _value(_field(turn, "status"))
+                    if status == "failed":
+                        failure, category = _turn_failure(_field(turn, "error"))
+                        return NativeSupervisorResponse(
+                            SupervisorResultKind.BLOCKED, failure=failure,
+                            outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                            sdk_error_category=SupervisorSdkTurnErrorCategory(category.value),
+                        )
+                    if status != "completed":
                         return NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)
                     completed = True
                     continue

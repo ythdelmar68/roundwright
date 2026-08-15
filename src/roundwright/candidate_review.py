@@ -598,6 +598,7 @@ def dispatch_diff_review(
         if existing != expected:
             raise CandidateReviewError("diff review dispatch replay conflicts with committed state")
         return existing
+    _require_unconsumed_formal_round(repository, identity, policy_projection.review_round)
     provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.SUPERVISOR,
                                process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
                                input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity, lease=lease, now=now)
@@ -1134,6 +1135,12 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
         artifact = connection.execute("SELECT verdict, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
         if artifact is None or artifact[0] != DiffReviewVerdict.PASS.value:
             raise CandidateReviewError("only a recorded PASS can be accepted")
+        consumed = connection.execute(
+            "SELECT diff_review_attempt_id FROM diff_review_attempts WHERE task_id = ? AND review_round = ? AND state = 'accepted' AND diff_review_attempt_id != ?",
+            (identity.task_id, dispatch.review_policy.review_round, dispatch.diff_review_attempt_id),
+        ).fetchone()
+        if consumed is not None:
+            raise CandidateReviewError("formal review round already has an accepted result")
         provider = connection.execute("SELECT provider_role, state, accepted_review_identity, output_pointer, completion_evidence_fingerprint, selected_profile_identity, input_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (dispatch.provider_attempt_id,)).fetchone()
         if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[4] is None or provider[5] != dispatch.selected_profile_identity or provider[6] != dispatch.input_digest:
@@ -1164,6 +1171,24 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now):
         raise
     finally:
         connection.close()
+
+
+def _require_unconsumed_formal_round(repository, identity: TaskIdentity, review_round: int) -> None:
+    """Keep retries/failover separate from the one accepted result per round."""
+
+    try:
+        connection = sqlite3.connect(f"{database_path(repository).as_uri()}?mode=ro", uri=True)
+        try:
+            accepted = connection.execute(
+                "SELECT 1 FROM diff_review_attempts WHERE task_id = ? AND review_round = ? AND state = 'accepted' LIMIT 1",
+                (identity.task_id, review_round),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise CandidateReviewError("formal review accounting is unavailable") from error
+    if accepted is not None:
+        raise CandidateReviewError("formal review round already has an accepted result")
 
 
 def _require_diff_review_context(repository, identity, context, seal, implementation_attempt_id):

@@ -27,12 +27,14 @@ from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .provider_recovery import (
-    AttemptState, RecoveryContext, read_attempt, record_invalid_output,
+    AttemptState, ProviderRecoveryError, RecoveryContext, read_attempt, record_invalid_output,
     recover_attempt,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import TaskIdentity, check_database, require_runtime_binding, task_projection
 from .worker_planning import ProviderDispatchControl
+from .supervisor_toolbox import HarnessNativeCodexSupervisorBackend
+from .worker_toolbox import CompletionDeadline
 from .shadow import (
     AcceptedResultReference, EvidenceRole, FormalReviewRoundReference,
     LifecycleAttempt, LifecycleAttemptKind, ProviderAttemptManifest,
@@ -54,6 +56,12 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     ).hexdigest()
+
+
+def _public_provider_identity(profile_identity: str) -> str:
+    """Use a path-free token while retaining the exact digest in context."""
+
+    return "profile-" + hashlib.sha256(profile_identity.encode("ascii")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -127,12 +135,6 @@ class ProviderAttemptRuntimeDescriptor:
         }
 
 
-class ProviderAttemptRunner(Protocol):
-    """One bounded product operation; implementations must persist via APIs."""
-
-    def execute(self) -> tuple[str, ...]: ...
-
-
 @dataclass(frozen=True)
 class DiffReviewSelection:
     """Non-outcome identifiers selected before the first provider dispatch."""
@@ -192,13 +194,23 @@ class DurableDiffReviewRunner:
         runtime = self.recovery.runtime_binding
         if (
             self.dependency_binding != CandidateBinding(self.identity.repository_id, self.identity.task_id, self.seal.candidate_sha)
-            or self.audit.profile_identity not in runtime.supervisor_profile_identities
-            or self.selection.within_round_attempt != 1
+            or not 1 <= self.selection.within_round_attempt <= runtime.review_max_supervisor_attempts_per_round
+            or self.audit.profile_identity != runtime.supervisor_profile_identities[self.selection.within_round_attempt - 1]
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
+        try:
+            existing = read_attempt(
+                self.repository, self.identity, self.selection.provider_attempt_id,
+                context=self.recovery, now=self.dispatch_control.now,
+            )
+            if existing.state is AttemptState.ACCEPTED:
+                return (existing.attempt_id,)
+            raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
+        except ProviderRecoveryError:
+            pass
         context = CodexSupervisorContext(
-            self.identity.task_id, self.source_digest, self.recovery.repository_fingerprint,
-            self.recovery.worktree_fingerprint, self.recovery.branch_fingerprint,
+            self.identity.task_id, self.source_digest, "sha256:" + self.recovery.repository_fingerprint,
+            "sha256:" + self.recovery.worktree_fingerprint, "sha256:" + self.recovery.branch_fingerprint,
             self.identity.base_sha, self.seal.candidate_sha,
             "sha256:" + self.recovery.policy_fingerprint, runtime.resolved_digest,
             self.review_epoch, self.review_round,
@@ -300,7 +312,7 @@ class ProviderAttemptRuntimeResources:
     provider_profile_identity: str
     review_epoch: int
     review_round: int
-    runner: ProviderAttemptRunner
+    runner: DurableDiffReviewRunner
 
     def validate(self, descriptor: ProviderAttemptRuntimeDescriptor) -> None:
         if (
@@ -322,7 +334,17 @@ class ProviderAttemptRuntimeResources:
             or self.worktree.state_identity != self.lease.state_identity
             or self.recovery.runtime_binding.canonical_material() != descriptor.runtime_binding
             or self.recovery.runtime_binding.resolved_digest != descriptor.provider_profile_identity and descriptor.provider_profile_identity not in self.recovery.runtime_binding.supervisor_profile_identities
-            or not callable(getattr(self.runner, "execute", None))
+            or type(self.runner) is not DurableDiffReviewRunner
+            or self.runner.repository != self.repository
+            or self.runner.identity != self.identity
+            or self.runner.recovery != self.recovery
+            or self.runner.binding != self.worktree
+            or self.runner.seal != self.seal
+            or self.runner.lease != self.lease
+            or self.runner.source_digest != self.source_digest
+            or self.runner.review_epoch != self.review_epoch
+            or self.runner.review_round != self.review_round
+            or self.runner.audit.profile_identity != descriptor.provider_profile_identity
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
         # Provider-free preflight confirms the local durable identity and the
@@ -354,6 +376,120 @@ class ProviderAttemptRuntimeRegistry:
 
 
 RUNTIME_REGISTRY = ProviderAttemptRuntimeRegistry()
+
+
+@dataclass(frozen=True)
+class ProviderAttemptHostInputs:
+    """Trusted local objects supplied by the Roundwright host, never Harness."""
+
+    repository: RepositoryIdentity
+    identity: TaskIdentity
+    recovery: RecoveryContext
+    lease: TransitionLease
+    seal: CandidateSeal
+    worktree: WorktreeBinding
+    dependency_binding: CandidateBinding
+    dispatch_control: ProviderDispatchControl
+    audits: tuple[ProviderHealthAuditIdentity, ...]
+    selection: DiffReviewSelection
+    backend: NativeCodexSupervisorBackend | None = None
+
+
+def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInputs) -> MaterializedProviderAttemptContext:
+    """Build and install V2 resources in the same process as the adapter.
+
+    Roundlet and Harness provide neither product internals nor an outcome.  The
+    product host supplies already trusted state/control objects; this boundary
+    selects the closed native Supervisor backend unless a test injects the
+    existing backend protocol seam.
+    """
+
+    if type(host) is not ProviderAttemptHostInputs:
+        raise ProviderAttemptRuntimeError("provider attempt host inputs are invalid")
+    descriptor = ProviderAttemptRuntimeDescriptor.parse(descriptor_value)
+    if (
+        host.identity.repository_id != descriptor.repository_id
+        or host.worktree.repository_id != descriptor.repository_id
+        or host.identity.task_id != descriptor.task_id
+        or host.identity.base_sha != descriptor.base_sha
+        or host.recovery.candidate_sha != descriptor.candidate_sha
+        or host.seal != CandidateSeal(
+            descriptor.task_id,
+            descriptor.base_sha,
+            descriptor.candidate_sha,
+            host.lease.state_identity,
+        )
+        or host.worktree.task_id != descriptor.task_id
+        or host.worktree.base_sha != descriptor.base_sha
+        or host.worktree.state_identity != host.lease.state_identity
+        or host.recovery.runtime_binding.canonical_material() != descriptor.runtime_binding
+    ):
+        raise ProviderAttemptRuntimeError("provider attempt host binding has drifted")
+    audit = next((item for item in host.audits if item.profile_identity == descriptor.provider_profile_identity), None)
+    if audit is None:
+        raise ProviderAttemptRuntimeError("provider attempt host profile is unavailable")
+    backend = host.backend
+    if backend is None:
+        backend = HarnessNativeCodexSupervisorBackend(
+            cwd=host.repository.root,
+            completion=CompletionDeadline(100, 600),
+            approval_mode=None, sandbox=None,
+        )
+    install_durable_diff_review_runtime(
+        descriptor.resource_id, repository=host.repository, identity=host.identity,
+        recovery=host.recovery, lease=host.lease, seal=host.seal, worktree=host.worktree,
+        source_digest=descriptor.source_digest, case_id=descriptor.case_id, ready_at=descriptor.ready_at,
+        capture_plan_digest=descriptor.capture_plan_digest,
+        provider_profile_identity=descriptor.provider_profile_identity,
+        review_epoch=descriptor.review_epoch, review_round=descriptor.review_round,
+        dependency_binding=host.dependency_binding, dispatch_control=host.dispatch_control,
+        audit=audit, backend=backend, selection=host.selection,
+    )
+    return prepare_context(
+        descriptor.payload(), plan_digest=descriptor.capture_plan_digest,
+        candidate_sha=descriptor.candidate_sha, case_id=descriptor.case_id, ready_at=descriptor.ready_at,
+    )
+
+
+def install_durable_diff_review_runtime(
+    resource_id: str,
+    *,
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    recovery: RecoveryContext,
+    lease: TransitionLease,
+    seal: CandidateSeal,
+    worktree: WorktreeBinding,
+    source_digest: str,
+    case_id: str,
+    ready_at: int,
+    capture_plan_digest: str,
+    provider_profile_identity: str,
+    review_epoch: int,
+    review_round: int,
+    dependency_binding: CandidateBinding,
+    dispatch_control: ProviderDispatchControl,
+    audit: ProviderHealthAuditIdentity,
+    backend: NativeCodexSupervisorBackend,
+    selection: DiffReviewSelection,
+) -> None:
+    """Install the one closed native product runner consumed by Harness V2.
+
+    The caller provides already-resolved local authority/store objects and a
+    native supervisor backend.  This function neither discovers credentials nor
+    accepts provider outcomes; test doubles can replace only ``backend``.
+    """
+
+    runner = DurableDiffReviewRunner(
+        repository, identity, recovery, worktree, seal, lease, dependency_binding,
+        dispatch_control, audit, backend, source_digest, review_epoch, review_round,
+        selection,
+    )
+    RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
+        repository, identity, recovery, lease, seal, worktree, source_digest,
+        case_id, ready_at, capture_plan_digest, provider_profile_identity,
+        review_epoch, review_round, runner,
+    ))
 
 
 @dataclass(frozen=True)
@@ -393,7 +529,7 @@ class MaterializedProviderAttemptContext:
             )
             manifests = tuple(
                 ProviderAttemptManifest(
-                    item.attempt_id, item.attempt_id, ordinal, item.selected_profile_identity,
+                    item.attempt_id, item.attempt_id, ordinal, _public_provider_identity(item.selected_profile_identity),
                     "accepted" if item.state is AttemptState.ACCEPTED else item.state.value,
                 )
                 for ordinal, item in enumerate(attempts, start=1)
@@ -436,7 +572,7 @@ class MaterializedProviderAttemptContext:
             "max_supervisor_attempts": self.resources.recovery.runtime_binding.review_max_supervisor_attempts_per_round,
             "review_policy_digest": "sha256:" + self.resources.recovery.runtime_binding.review_policy_digest,
             "configuration_digest": self.resources.recovery.runtime_binding.resolved_digest,
-            "provider_identity": self.descriptor.provider_profile_identity,
+            "provider_identity": _public_provider_identity(self.descriptor.provider_profile_identity),
             "provider_context_digest": self.identity,
             "lifecycle_state": projection.state,
             "blocker": None if graph is not None else "provider-attempt-history-incomplete",

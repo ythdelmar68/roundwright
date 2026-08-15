@@ -26,6 +26,12 @@ class ProfileExecution:
 
 
 @dataclass(frozen=True)
+class ProfileExecutionContext:
+    identity: str
+    value: object
+
+
+@dataclass(frozen=True)
 class ProfileComparison:
     status: str
     result_identity: str
@@ -72,6 +78,7 @@ def fake_harness() -> tuple[object | None, object | None]:
     module = ModuleType("roundwright_harness.executor")
     module.ProfileComponentIdentities = ProfileComponentIdentities  # type: ignore[attr-defined]
     module.ProfileExecution = ProfileExecution  # type: ignore[attr-defined]
+    module.ProfileExecutionContext = ProfileExecutionContext  # type: ignore[attr-defined]
     module.ProfileComparison = ProfileComparison  # type: ignore[attr-defined]
     sys.modules["roundwright_harness"] = package
     sys.modules["roundwright_harness.executor"] = module

@@ -7,7 +7,8 @@ import importlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Mapping
+from pathlib import Path
+from typing import Any, Literal, Mapping
 
 from .shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
@@ -18,7 +19,9 @@ from .shadow import (
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
+    ProviderAttemptHostInputs,
     ProviderAttemptRuntimeError,
+    install_host_runtime,
     prepare_context as prepare_provider_attempt_context,
 )
 
@@ -321,29 +324,29 @@ class ProviderAttemptAccountingSnapshot:
 def _graph_payload(graph: ShadowV2EventGraph) -> dict[str, object]:
     return {
         "attempts": [
-            (item.attempt_id, item.ordinal, item.kind.value, item.role.value, item.parent_attempt_id, item.review_round_id)
+            [item.attempt_id, item.ordinal, item.kind.value, item.role.value, item.parent_attempt_id, item.review_round_id]
             for item in graph.attempts
         ],
         "provider_attempts": [
-            (item.provider_attempt_id, item.lifecycle_attempt_id, item.ordinal, item.provider_identity, item.outcome)
+            [item.provider_attempt_id, item.lifecycle_attempt_id, item.ordinal, item.provider_identity, item.outcome]
             for item in graph.provider_attempts
         ],
         "review_rounds": [
-            (item.review_round_id, item.ordinal, item.candidate_sha, item.accepted_result_id)
+            [item.review_round_id, item.ordinal, item.candidate_sha, item.accepted_result_id]
             for item in graph.review_rounds
         ],
-        "commits": [(item.commit_sha, item.commit_identity) for item in graph.commits],
+        "commits": [[item.commit_sha, item.commit_identity] for item in graph.commits],
         "attempt_commit_references": [
-            (item.lifecycle_attempt_id, item.commit_sha) for item in graph.attempt_commit_references
+            [item.lifecycle_attempt_id, item.commit_sha] for item in graph.attempt_commit_references
         ],
         "accepted_results": [
-            (item.result_id, item.review_round_id, item.event_id, item.candidate_sha)
+            [item.result_id, item.review_round_id, item.event_id, item.candidate_sha]
             for item in graph.accepted_results
         ],
         "events": [
-            (item.event_id, item.ordinal, item.lifecycle_attempt_id, item.event_kind,
+            [item.event_id, item.ordinal, item.lifecycle_attempt_id, item.event_kind,
              item.provider_attempt_id, item.provider_call_made, item.review_round_id,
-             item.commit_sha, item.accepted_result_id)
+             item.commit_sha, item.accepted_result_id]
             for item in graph.events
         ],
     }
@@ -464,7 +467,7 @@ class ProviderAttemptAccountingAdapter:
 
         try:
             context = prepare_provider_attempt_context(
-                preparation.descriptor,
+                dict(preparation.descriptor),
                 plan_digest=preparation.plan.plan_digest,
                 candidate_sha=preparation.plan.candidate_sha,
                 case_id=preparation.plan.case_id,
@@ -522,7 +525,7 @@ class ProviderAttemptAccountingAdapter:
         # Re-read durable state after execution; a restart, plan, candidate, or
         # context change cannot reuse a previously projected graph.
         try:
-            refreshed = ProviderAttemptAccountingSnapshot(**context.snapshot(tuple(item.attempt_id for item in value["snapshot"].event_graph.provider_attempts)))
+            refreshed = ProviderAttemptAccountingSnapshot(**context.snapshot(tuple(item.provider_attempt_id for item in value["snapshot"].event_graph.provider_attempts)))
         except (AttributeError, ProviderAttemptRuntimeError, ValueError) as error:
             raise ExternalValidationAdapterError("durable provider attempt read-back has drifted") from error
         if refreshed != value["snapshot"]:
@@ -559,3 +562,47 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
     if profile_id == PROVIDER_ATTEMPT_ACCOUNTING_PROFILE:
         return ProviderAttemptAccountingAdapter(profile_id)
     raise ExternalValidationAdapterError("executor profile is unsupported")
+
+
+def run_provider_attempt_accounting_profile(
+    mode: Literal["validate", "execute"],
+    request_value: Mapping[str, Any],
+    store_root: Path,
+    host_inputs: ProviderAttemptHostInputs,
+    *,
+    expected_readiness_digest: str | None = None,
+) -> object:
+    """Run the V2 live profile through one hosted product/Harness process.
+
+    Context-free profiles may use the generic Harness CLI/factory.  This
+    profile requires product-owned host inputs, so this entrypoint installs the
+    exact opaque runtime before delegating exactly once to Harness's reviewed
+    ``run_profile_executor`` library API.
+    """
+
+    harness = _harness_executor()
+    try:
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+            or request.execution_context is None
+            or not isinstance(store_root, Path)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        context = install_host_runtime(dict(request.execution_context), host_inputs)
+        if (
+            context.descriptor.capture_plan_digest != plan.plan_digest
+            or context.descriptor.candidate_sha != plan.candidate_sha
+            or context.descriptor.case_id != plan.case_id
+            or context.descriptor.ready_at != plan.ready_at
+        ):
+            raise ValueError
+        adapter = ProviderAttemptAccountingAdapter()
+        return harness.run_profile_executor(
+            mode, request_value, adapter, store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, ProviderAttemptRuntimeError) as error:
+        raise ExternalValidationAdapterError("provider attempt hosted entrypoint binding is invalid") from error

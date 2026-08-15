@@ -72,14 +72,26 @@ Construct exactly one closed `roundwright-harness-profile-executor-request/v2`
 containing one `roundwright-harness-capture-plan/v1` document before dispatch.
 The plan binds the profile, case, exact candidate, immutable `ready_at`,
 producer, exporter, comparator, Recorder, store, and observation identities.
-Run the reviewed Harness `run-profile --mode validate` command with the exact
-public Roundwright adapter factory and retain its path-free readiness receipt.
-Then invoke that same command, request, parser, factory, plan, and store with
-`--mode execute` and the exact readiness receipt digest. Prepare, validation,
-dispatch, typed projection/comparison, sealing, and verification must consume
-that same plan. Never rebuild a second runner, command, factory, or plan between
-stages. The older discrete capture commands remain historical compatibility
-surfaces and are not the entrypoint for a newly declared executor profile.
+For context-free profiles, run the reviewed Harness `run-profile --mode
+validate` command with the exact public Roundwright adapter factory and retain
+its path-free readiness receipt. Then invoke that same command, request,
+parser, factory, plan, and store with `--mode execute` and the exact readiness
+receipt digest.
+
+`roundwright-shadow-profile/provider-attempt-accounting/v1` instead requires
+the public product-hosted library entrypoint
+`roundwright.external_validation:run_provider_attempt_accounting_profile`.
+Pass it the exact V2 request, Recorder/store root, trusted typed
+`ProviderAttemptHostInputs`, mode, and (for execute) readiness digest. It
+installs the closed Roundwright runtime in the same process and directly calls
+the reviewed `roundwright_harness.executor.run_profile_executor`; the generic
+Harness CLI/factory alone cannot initialize that product host. Validate and
+execute consume the same request, descriptor, store, plan, opaque context, and
+readiness digest. Prepare, validation, dispatch, typed projection/comparison,
+sealing, and verification must consume that one binding. Never rebuild a
+second runner, command, factory, or plan between stages. The older discrete
+capture commands remain historical compatibility surfaces and are not the
+entrypoint for a newly declared executor profile.
 Any candidate, case, time, component, observation, or digest movement invalidates
 the plan before provider dispatch and requires a fresh bounded capture.
 Project that exact plan digest in curated public-safe readiness, result, and

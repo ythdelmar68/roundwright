@@ -205,14 +205,28 @@ The concrete handoff is one closed
 `roundwright-harness-profile-executor-request/v2` containing one
 `roundwright-harness-capture-plan/v1` document with profile, case, candidate,
 `ready_at`, producer, exporter, comparator, Recorder, store, and observation
-identities. The reviewed Harness returns one path-free readiness receipt from
-`run-profile --mode validate`. The exact same command, request, public
-Roundwright adapter factory, plan, and store are then consumed once by
-`--mode execute` using that readiness receipt digest. Profile readiness,
-dispatch, typed export/comparison, recording, and read-back therefore use one
-entrypoint and one plan. A second runner/projection, an inferred default, or any
-identity movement invalidates readiness before external action; recapture
-starts with a fresh request rather than rewriting evidence.
+identities. For context-free profiles, the reviewed Harness returns one
+path-free readiness receipt from `run-profile --mode validate`; the exact same
+command, request, public Roundwright adapter factory, plan, and store are then
+consumed once by `--mode execute` using that readiness receipt digest.
+
+The provider-attempt-accounting profile is context-bearing and must instead
+use `roundwright.external_validation:run_provider_attempt_accounting_profile`.
+That public product-owned hosted entrypoint accepts the exact V2 request,
+Recorder/store root, typed trusted `ProviderAttemptHostInputs`, mode, and the
+execute readiness digest. In the same process it reconciles the closed
+descriptor against trusted Roundwright state, installs the opaque durable
+runtime, creates the public adapter, and calls the reviewed
+`roundwright_harness.executor.run_profile_executor` directly. The generic
+Harness CLI and adapter factory alone do not initialize this host. Validate and
+execute must use the same request, descriptor identities, store, plan, hosted
+entrypoint, opaque context, and readiness digest.
+
+Profile readiness, dispatch, typed export/comparison, recording, and read-back
+therefore use one entrypoint and one plan. A second runner/projection, an
+inferred default, or any identity movement invalidates readiness before
+external action; recapture starts with a fresh request rather than rewriting
+evidence.
 
 The public Roundwright factory is
 `roundwright.external_validation:roundwright_profile_adapter_factory`. The

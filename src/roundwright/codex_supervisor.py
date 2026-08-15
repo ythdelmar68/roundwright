@@ -90,7 +90,7 @@ class SupervisorAccountingDecisionSemantic(StrEnum):
 
 ACCOUNTING_TRANSITION_OBJECTIVE = "Decide only whether this sealed accounting transition is eligible to record this one response."
 ACCOUNTING_TRANSITION_CRITERIA = (
-    "Treat the current unclaimed PREPARED attempt and its absent session, turn, completion, invalid, recovery, and acceptance fields as expected pre-dispatch facts.",
+    "Require the current PREPARED attempt's one-shot dispatch claim to be consumed; its absent session, turn, completion, invalid, recovery, and acceptance fields remain expected pre-turn facts.",
     "Require accepted formal-review count zero before this response; complete authorizes this response to create exactly one completion and one accepted formal review after binding validation.",
     "Return blocked only when immutable eligibility facts are missing, contradictory, drifted, or insufficient; do not inspect a repository or assess broad candidate correctness.",
 )

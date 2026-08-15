@@ -24,7 +24,7 @@ from roundwright.codex_supervisor import (
     SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot
+from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
@@ -182,7 +182,7 @@ class SupervisorTests(unittest.TestCase):
         snapshot = SupervisorAccountingSnapshot(
             "repo-44", "task-44", digest("source"), "a" * 40, "b" * 40, "case-44", 101,
             "state-44", ("a" * 64,), (("test", "pass"),), digest("configuration"), "b" * 64,
-            1, 4, 2, 2, 4, "CONVERGING", 0, 0,
+            1, 4, 2, 2, 4, "CONVERGING", 0, 0, SupervisorDispatchClaimState.CLAIMED,
             SupervisorAccountingAttemptSnapshot("provider-accounting", 1, audit.profile_identity, AttemptState.PREPARED, False, False, False, False, None, None, False), (),
         )
         values = dict(review_attempt_id="review-accounting", provider_attempt_id="provider-accounting", selected_profile_identity=audit.profile_identity, within_round_attempt=1, context=self.context, objective=ACCOUNTING_TRANSITION_OBJECTIVE, acceptance_criteria=ACCOUNTING_TRANSITION_CRITERIA, response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material=snapshot, decision_semantic=SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2)

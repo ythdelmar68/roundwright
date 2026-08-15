@@ -539,6 +539,8 @@ class DurableDiffReviewRunner:
             )
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from None
+        if decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED:
+            raise ProviderAttemptRuntimeError("provider accounting dispatch claim has drifted")
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
             selection.within_round_attempt,

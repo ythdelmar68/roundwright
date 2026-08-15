@@ -528,7 +528,9 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             assert request is not None
             self.assertIs(type(request.decision_material), SupervisorAccountingSnapshot)
             material = request.decision_material.canonical_material()
-            self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "formal_review", "current_attempt", "prior_attempts"})
+            self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "formal_review", "dispatch_claim", "current_attempt", "prior_attempts"})
+            self.assertEqual(material["schema"], "roundwright-provider-attempt-accounting-decision/v2")
+            self.assertEqual(material["dispatch_claim"], "claimed")
             self.assertEqual(material["binding"]["case_id"], runner.case_id)
             self.assertEqual(material["binding"]["ready_at"], runner.ready_at)
             self.assertEqual(material["current_attempt"]["state"], "prepared")
@@ -620,6 +622,18 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProviderAttemptRuntimeError, "dispatch claim is unavailable") as raised:
                     runner.execute()
             self.assertNotIn("private", str(raised.exception))
+            self.assertEqual(backend.calls, 0)
+
+    def test_unclaimed_dispatch_snapshot_cannot_open_a_native_turn(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, _, _, _, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            unclaimed = runner.materialize_prepared_snapshot()
+            with patch("roundwright.provider_attempt_runtime.read_supervisor_accounting_snapshot", return_value=unclaimed):
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "dispatch claim has drifted"):
+                    runner.execute()
             self.assertEqual(backend.calls, 0)
 
     def test_missing_session_identity_retains_a_prepared_attempt_without_redispatch(self) -> None:

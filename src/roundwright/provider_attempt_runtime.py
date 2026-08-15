@@ -14,7 +14,6 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Protocol
 
 from .configuration import RepositoryIdentity, ReviewMode
 from .candidate_review import DiffReviewOutput, DiffReviewVerdict, dispatch_diff_review, record_diff_review
@@ -27,8 +26,8 @@ from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .provider_recovery import (
-    AttemptState, ProviderRecoveryError, RecoveryContext, read_attempt, record_invalid_output,
-    recover_attempt,
+    AttemptState, ProviderRecoveryError, RecoveryContext, invalidate_supervisor_attempt,
+    read_attempt, record_invalid_output, recover_attempt,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import TaskIdentity, check_database, require_runtime_binding, task_projection
@@ -165,6 +164,25 @@ class DiffReviewSelection:
 
 
 @dataclass(frozen=True)
+class DiffReviewSequenceEntry:
+    """One closed, pre-authorized Supervisor position in a bounded round."""
+
+    selection: DiffReviewSelection
+    recovery: RecoveryContext
+    audit: ProviderHealthAuditIdentity
+    backend: NativeCodexSupervisorBackend
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.selection) is not DiffReviewSelection
+            or type(self.recovery) is not RecoveryContext
+            or type(self.audit) is not ProviderHealthAuditIdentity
+            or not callable(getattr(self.backend, "open_fresh_session", None))
+        ):
+            raise ProviderAttemptRuntimeError("provider attempt sequence entry is invalid")
+
+
+@dataclass(frozen=True)
 class DurableDiffReviewRunner:
     """One real read-only Supervisor attempt through the durable product APIs.
 
@@ -189,48 +207,101 @@ class DurableDiffReviewRunner:
     review_epoch: int
     review_round: int
     selection: DiffReviewSelection
+    sequence: tuple[DiffReviewSequenceEntry, ...] = ()
 
-    def execute(self) -> tuple[str, ...]:
+    def _sequence_entries(self) -> tuple[DiffReviewSequenceEntry, ...]:
+        return self.sequence or (DiffReviewSequenceEntry(self.selection, self.recovery, self.audit, self.backend),)
+
+    def validate_sequence(self) -> tuple[DiffReviewSequenceEntry, ...]:
+        """Validate every bounded position without provider or store effects."""
+
         runtime = self.recovery.runtime_binding
+        entries = self._sequence_entries()
         if (
             self.dependency_binding != CandidateBinding(self.identity.repository_id, self.identity.task_id, self.seal.candidate_sha)
-            or not 1 <= self.selection.within_round_attempt <= runtime.review_max_supervisor_attempts_per_round
-            or self.audit.profile_identity != runtime.supervisor_profile_identities[self.selection.within_round_attempt - 1]
+            or type(entries) is not tuple
+            or not entries
+            or any(type(item) is not DiffReviewSequenceEntry for item in entries)
+            or len(entries) > runtime.review_max_supervisor_attempts_per_round
+            or tuple(item.selection.within_round_attempt for item in entries) != tuple(range(1, len(entries) + 1))
+            or tuple(item.audit.profile_identity for item in entries) != runtime.supervisor_profile_identities[:len(entries)]
+            or len({item.selection.provider_attempt_id for item in entries}) != len(entries)
+            or any(
+                item.recovery.task_id != self.recovery.task_id
+                or item.recovery.candidate_sha != self.recovery.candidate_sha
+                or item.recovery.runtime_binding != runtime
+                or not callable(getattr(item.backend, "open_fresh_session", None))
+                for item in entries
+            )
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
+        return entries
+
+    def execute(self) -> tuple[str, ...]:
+        """Dispatch one bounded sequence and return only durable attempt IDs."""
+
+        entries = self.validate_sequence()
+        attempt_ids: list[str] = []
+        for entry in entries:
+            attempt_id, accepted = self._execute_selection(entry.selection, entry.recovery, entry.audit, entry.backend)
+            attempt_ids.append(attempt_id)
+            if accepted:
+                return tuple(attempt_ids)
+            # An AMBIGUOUS durable record cannot be retried; INVALIDATED is
+            # the only persisted fresh-session/failover transition that may
+            # advance to the next pre-bound Supervisor position.
+            stored = read_attempt(self.repository, self.identity, attempt_id, context=self.recovery)
+            if stored.state is AttemptState.AMBIGUOUS:
+                raise ProviderAttemptRuntimeError("ambiguous provider attempt blocks the bounded sequence")
+            if stored.state is not AttemptState.INVALIDATED:
+                raise ProviderAttemptRuntimeError("provider attempt recovery is incomplete")
+        return tuple(attempt_ids)
+
+    def _execute_selection(
+        self,
+        selection: DiffReviewSelection,
+        recovery: RecoveryContext,
+        audit: ProviderHealthAuditIdentity,
+        backend: NativeCodexSupervisorBackend,
+    ) -> tuple[str, bool]:
+        """Use public durable APIs for exactly one observed native outcome."""
+
+        runtime = recovery.runtime_binding
         try:
             existing = read_attempt(
-                self.repository, self.identity, self.selection.provider_attempt_id,
-                context=self.recovery, now=self.dispatch_control.now,
+                self.repository, self.identity, selection.provider_attempt_id,
+                context=recovery, now=self.dispatch_control.now,
             )
             if existing.state is AttemptState.ACCEPTED:
-                return (existing.attempt_id,)
+                return (existing.attempt_id, True)
+            if existing.state is AttemptState.INVALIDATED:
+                return (existing.attempt_id, False)
             raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
         except ProviderRecoveryError:
             pass
         context = CodexSupervisorContext(
-            self.identity.task_id, self.source_digest, "sha256:" + self.recovery.repository_fingerprint,
-            "sha256:" + self.recovery.worktree_fingerprint, "sha256:" + self.recovery.branch_fingerprint,
+            self.identity.task_id, self.source_digest, "sha256:" + recovery.repository_fingerprint,
+            "sha256:" + recovery.worktree_fingerprint, "sha256:" + recovery.branch_fingerprint,
             self.identity.base_sha, self.seal.candidate_sha,
-            "sha256:" + self.recovery.policy_fingerprint, runtime.resolved_digest,
+            "sha256:" + recovery.policy_fingerprint, runtime.resolved_digest,
             self.review_epoch, self.review_round,
             ReviewMode.COMPLETE
             if self.review_round <= runtime.review_complete_rounds
             else ReviewMode.CONVERGING,
         )
-        selected = self.audit.profile_identity
+        selected = audit.profile_identity
         request = CodexSupervisorRequest(
-            self.selection.diff_review_attempt_id, self.selection.provider_attempt_id, selected,
-            self.selection.within_round_attempt,
+            selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
+            selection.within_round_attempt,
             supervisor_request_digest(
-                review_attempt_id=self.selection.diff_review_attempt_id,
-                provider_attempt_id=self.selection.provider_attempt_id,
+                review_attempt_id=selection.diff_review_attempt_id,
+                provider_attempt_id=selection.provider_attempt_id,
                 selected_profile_identity=selected,
-                within_round_attempt=self.selection.within_round_attempt,
-                context=context, objective=self.selection.objective,
-                acceptance_criteria=self.selection.acceptance_criteria,
+                within_round_attempt=selection.within_round_attempt,
+                context=context, objective=selection.objective,
+                acceptance_criteria=selection.acceptance_criteria,
             ),
-            context, self.selection.objective, self.selection.acceptance_criteria,
+            context, selection.objective, selection.acceptance_criteria,
         )
         dispatched = False
 
@@ -240,59 +311,73 @@ class DurableDiffReviewRunner:
         def checkpoint_turn(session_identity: str, turn_identity: str) -> None:
             nonlocal dispatched
             dispatch_diff_review(
-                self.repository, self.identity, self.recovery, self.binding, self.seal,
+                self.repository, self.identity, recovery, self.binding, self.seal,
                 dependency_binding=self.dependency_binding, control=self.dispatch_control,
-                diff_review_attempt_id=self.selection.diff_review_attempt_id,
-                implementation_attempt_id=self.selection.implementation_attempt_id,
-                provider_attempt_id=self.selection.provider_attempt_id,
+                diff_review_attempt_id=selection.diff_review_attempt_id,
+                implementation_attempt_id=selection.implementation_attempt_id,
+                provider_attempt_id=selection.provider_attempt_id,
                 supervisor_session_identity=session_identity, external_turn_identity=turn_identity,
-                message_identity=self.selection.message_identity,
-                process_lease_id=self.selection.process_lease_id,
-                process_lease_expires_at=self.selection.process_lease_expires_at,
-                selected_profile_identity=selected, within_round_attempt=self.selection.within_round_attempt,
+                message_identity=selection.message_identity,
+                process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at,
+                selected_profile_identity=selected, within_round_attempt=selection.within_round_attempt,
                 review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
             )
             dispatched = True
 
-        result = CodexSupervisorAdapter(self.backend, self.audit.profile, self.audit).dispatch(
+        result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
             request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
         )
         if not dispatched:
             raise ProviderAttemptRuntimeError("native Supervisor did not reach a durable dispatch checkpoint")
         if result.kind is not SupervisorResultKind.ACCEPTED:
             # This is an observed typed adapter outcome, not caller-supplied
-            # provider text.  It preserves the durable invalid/recovery path.
+            # provider text.  Ambiguity is durable and terminal for this
+            # bounded sequence; only an explicit INVALID result may advance.
+            if result.kind is not SupervisorResultKind.INVALID:
+                recover_attempt(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                    max_attempts=runtime.review_max_supervisor_attempts_per_round,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                raise ProviderAttemptRuntimeError("ambiguous provider attempt blocks the bounded sequence")
             marker = hashlib.sha256((result.kind.value + ":" + (result.diagnostic.value if result.diagnostic else "none")).encode()).hexdigest()
             record_invalid_output(
-                self.repository, self.identity, self.recovery,
-                attempt_id=self.selection.provider_attempt_id,
-                output_pointer="supervisor-invalid-" + self.selection.provider_attempt_id,
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                output_pointer="supervisor-invalid-" + selection.provider_attempt_id,
                 output_fingerprint=marker, reason_fingerprint=marker,
                 lease=self.lease, now=self.dispatch_control.now,
             )
+            invalidate_supervisor_attempt(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
             recover_attempt(
-                self.repository, self.identity, self.recovery,
-                attempt_id=self.selection.provider_attempt_id,
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
                 max_attempts=runtime.review_max_supervisor_attempts_per_round,
                 lease=self.lease, now=self.dispatch_control.now,
             )
-            return (self.selection.provider_attempt_id,)
+            return (selection.provider_attempt_id, False)
         if result.session_identity is None or result.turn_identity is None or result.output_fingerprint is None or result.verdict is None:
             raise ProviderAttemptRuntimeError("native Supervisor result is incomplete")
         output = DiffReviewOutput(
-            self.selection.diff_review_attempt_id, self.selection.provider_attempt_id,
-            result.session_identity, result.turn_identity, self.selection.message_identity,
+            selection.diff_review_attempt_id, selection.provider_attempt_id,
+            result.session_identity, result.turn_identity, selection.message_identity,
             self.identity.base_sha, self.seal.candidate_sha,
             DiffReviewVerdict.PASS if result.verdict is SupervisorVerdict.PASS else DiffReviewVerdict.FINDINGS,
             result.findings,
         )
         record_diff_review(
-            self.repository, self.identity, self.recovery, self.binding, self.seal,
-            diff_review_attempt_id=self.selection.diff_review_attempt_id, output=output,
+            self.repository, self.identity, recovery, self.binding, self.seal,
+            diff_review_attempt_id=selection.diff_review_attempt_id, output=output,
             completion_evidence_fingerprint=result.output_fingerprint.removeprefix("sha256:"),
             lease=self.lease, now=self.dispatch_control.now,
         )
-        return (self.selection.provider_attempt_id,)
+        return (selection.provider_attempt_id, True)
 
 
 @dataclass(frozen=True)
@@ -347,6 +432,7 @@ class ProviderAttemptRuntimeResources:
             or self.runner.audit.profile_identity != descriptor.provider_profile_identity
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
+        self.runner.validate_sequence()
         # Provider-free preflight confirms the local durable identity and the
         # exact binding without calling a provider or creating a lifecycle row.
         check_database(self.repository)
@@ -393,6 +479,7 @@ class ProviderAttemptHostInputs:
     audits: tuple[ProviderHealthAuditIdentity, ...]
     selection: DiffReviewSelection
     backend: NativeCodexSupervisorBackend | None = None
+    sequence: tuple[DiffReviewSequenceEntry, ...] = ()
 
 
 def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInputs) -> MaterializedProviderAttemptContext:
@@ -428,6 +515,12 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     audit = next((item for item in host.audits if item.profile_identity == descriptor.provider_profile_identity), None)
     if audit is None:
         raise ProviderAttemptRuntimeError("provider attempt host profile is unavailable")
+    if host.sequence and (
+        type(host.sequence) is not tuple
+        or host.sequence[0].audit != audit
+        or host.sequence[0].selection != host.selection
+    ):
+        raise ProviderAttemptRuntimeError("provider attempt host sequence has drifted")
     backend = host.backend
     if backend is None:
         backend = HarnessNativeCodexSupervisorBackend(
@@ -443,7 +536,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         provider_profile_identity=descriptor.provider_profile_identity,
         review_epoch=descriptor.review_epoch, review_round=descriptor.review_round,
         dependency_binding=host.dependency_binding, dispatch_control=host.dispatch_control,
-        audit=audit, backend=backend, selection=host.selection,
+        audit=audit, backend=backend, selection=host.selection, sequence=host.sequence,
     )
     return prepare_context(
         descriptor.payload(), plan_digest=descriptor.capture_plan_digest,
@@ -472,6 +565,7 @@ def install_durable_diff_review_runtime(
     audit: ProviderHealthAuditIdentity,
     backend: NativeCodexSupervisorBackend,
     selection: DiffReviewSelection,
+    sequence: tuple[DiffReviewSequenceEntry, ...] = (),
 ) -> None:
     """Install the one closed native product runner consumed by Harness V2.
 
@@ -483,7 +577,7 @@ def install_durable_diff_review_runtime(
     runner = DurableDiffReviewRunner(
         repository, identity, recovery, worktree, seal, lease, dependency_binding,
         dispatch_control, audit, backend, source_digest, review_epoch, review_round,
-        selection,
+        selection, sequence,
     )
     RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
         repository, identity, recovery, lease, seal, worktree, source_digest,
@@ -522,9 +616,25 @@ class MaterializedProviderAttemptContext:
         # Other persisted states remain visible as a typed non-qualifying
         # read-back, never as inferred recovery or acceptance facts.
         if len(accepted) == 1:
-            review_id = "formal-" + accepted[0].accepted_review_identity
+            # The graph may contain only the selected formal round, so its
+            # graph ordinal remains local.  Every graph reference still binds
+            # the actual epoch/round; it must never silently describe round 1.
+            round_prefix = f"e{self.descriptor.review_epoch}-r{self.descriptor.review_round}-"
+            result_id = "accepted-" + round_prefix + hashlib.sha256(
+                accepted[0].accepted_review_identity.encode("ascii")
+            ).hexdigest()[:32]
+            review_id = "formal-" + round_prefix + hashlib.sha256(
+                accepted[0].accepted_review_identity.encode("ascii")
+            ).hexdigest()[:32]
             records = tuple(
-                LifecycleAttempt(item.attempt_id, ordinal, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, review_round_id=review_id if item is accepted[0] else None)
+                LifecycleAttempt(
+                    item.attempt_id,
+                    ordinal,
+                    LifecycleAttemptKind.SUPERVISOR if ordinal == 1 else LifecycleAttemptKind.FAILOVER,
+                    EvidenceRole.SUPERVISOR,
+                    None if ordinal == 1 else attempts[ordinal - 2].attempt_id,
+                    review_id,
+                )
                 for ordinal, item in enumerate(attempts, start=1)
             )
             manifests = tuple(
@@ -539,21 +649,23 @@ class MaterializedProviderAttemptContext:
             for item in attempts:
                 events.append(ShadowV2Event(
                     "provider-" + item.attempt_id, ordinal, item.attempt_id, "provider-attempt", item.attempt_id, True,
-                    review_id if item is accepted[0] else None,
+                    review_id,
                 ))
                 ordinal += 1
                 if item.state is AttemptState.AMBIGUOUS:
-                    events.append(ShadowV2Event("invalid-" + item.attempt_id, ordinal, item.attempt_id, "invalid-output", None, False))
+                    events.append(ShadowV2Event("invalid-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "invalid-output", None, False, review_id))
                     ordinal += 1
                 if item.state is AttemptState.INVALIDATED:
-                    events.append(ShadowV2Event("recovery-" + item.attempt_id, ordinal, item.attempt_id, "recovery-attempt", None, False))
+                    events.append(ShadowV2Event("invalid-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "invalid-output", None, False, review_id))
                     ordinal += 1
-            result_id = accepted[0].accepted_review_identity
-            events.append(ShadowV2Event("accepted-" + result_id, ordinal, accepted[0].attempt_id, "formal-review-accepted", None, False, review_id, accepted_result_id=result_id))
+                    events.append(ShadowV2Event("recovery-" + round_prefix + item.attempt_id, ordinal, item.attempt_id, "recovery-attempt", None, False, review_id))
+                    ordinal += 1
+            accepted_event_id = "accepted-" + round_prefix + result_id
+            events.append(ShadowV2Event(accepted_event_id, ordinal, accepted[0].attempt_id, "formal-review-accepted", None, False, review_id, accepted_result_id=result_id))
             graph = ShadowV2EventGraph(
                 records, manifests,
                 (FormalReviewRoundReference(review_id, 1, self.descriptor.candidate_sha, result_id),),
-                (), (AcceptedResultReference(result_id, review_id, "accepted-" + result_id, self.descriptor.candidate_sha),),
+                (), (AcceptedResultReference(result_id, review_id, accepted_event_id, self.descriptor.candidate_sha),),
                 tuple(events),
             )
             graph.validate(shadow_evidence_profile("roundwright-shadow-profile/provider-attempt-accounting/v1"), self.descriptor.candidate_sha)
@@ -572,7 +684,9 @@ class MaterializedProviderAttemptContext:
             "max_supervisor_attempts": self.resources.recovery.runtime_binding.review_max_supervisor_attempts_per_round,
             "review_policy_digest": "sha256:" + self.resources.recovery.runtime_binding.review_policy_digest,
             "configuration_digest": self.resources.recovery.runtime_binding.resolved_digest,
-            "provider_identity": _public_provider_identity(self.descriptor.provider_profile_identity),
+            "provider_identity": _public_provider_identity(
+                accepted[0].selected_profile_identity if accepted else self.descriptor.provider_profile_identity
+            ),
             "provider_context_digest": self.identity,
             "lifecycle_state": projection.state,
             "blocker": None if graph is not None else "provider-attempt-history-incomplete",

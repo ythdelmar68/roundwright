@@ -604,5 +604,7 @@ def run_provider_attempt_accounting_profile(
             mode, request_value, adapter, store_root,
             expected_readiness_digest=expected_readiness_digest,
         )
+    except ExternalValidationAdapterError:
+        raise
     except (AttributeError, KeyError, TypeError, ValueError, ProviderAttemptRuntimeError) as error:
         raise ExternalValidationAdapterError("provider attempt hosted entrypoint binding is invalid") from error

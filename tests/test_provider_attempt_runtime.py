@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 import os
+import sqlite3
 import sys
 import unittest
 from pathlib import Path
@@ -22,13 +23,13 @@ from roundwright.codex_supervisor import NativeSupervisorResponse, SupervisorDia
 from roundwright.dependency_policy import CandidateBinding
 from roundwright.git_identity import CandidateSeal, TransitionLease, WorktreeBinding
 from roundwright.provider_attempt_runtime import (
-    DiffReviewSelection, DurableDiffReviewRunner, MaterializedProviderAttemptContext,
+    DiffReviewSelection, DiffReviewSequenceEntry, DurableDiffReviewRunner, MaterializedProviderAttemptContext,
     ProviderAttemptHostInputs, ProviderAttemptRuntimeDescriptor, ProviderAttemptRuntimeError,
     ProviderAttemptRuntimeResources, install_host_runtime,
 )
 from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, read_attempt
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.state import TaskIdentity
+from roundwright.state import TaskIdentity, database_path
 from tests.provider_health_fixture import provider_context
 import tests.test_candidate_review as _candidate_test_module
 from tests.test_codex_supervisor import Backend
@@ -189,22 +190,21 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             # Reuse the same actual repository lifecycle with a fresh selected
             # provider identity; the accepted result is created only by its
             # observed typed native response.
-            accepted = replace(
-                runner,
-                recovery=provider_context(
-                    recovery, identity, ProviderRole.SUPERVISOR,
-                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
-                ),
-                backend=Backend("runtime-two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), []),
-                selection=DiffReviewSelection(
-                    "runtime-review-two", runner.selection.implementation_attempt_id,
-                    "runtime-provider-two", "runtime-message-two", "runtime-lease-two",
-                    runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
-                ),
+            second_recovery = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
             )
-            dependency_binding, control = _candidate_test_module._dispatch_control(identity, accepted.recovery, runner.dispatch_control.now, accepted.seal.candidate_sha)
-            accepted = replace(accepted, dependency_binding=dependency_binding, dispatch_control=control, audit=accepted.recovery.health_receipt.audit_identity)
-            self.assertEqual(accepted.execute(), ("runtime-provider-two",))
+            second_backend = Backend("runtime-two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
+            second_selection = DiffReviewSelection(
+                "runtime-review-two", runner.selection.implementation_attempt_id,
+                "runtime-provider-two", "runtime-message-two", "runtime-lease-two",
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+            )
+            accepted = replace(runner, sequence=(
+                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, runner.backend),
+                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+            ))
+            self.assertEqual(accepted.execute(), ("runtime-provider-one", "runtime-provider-two"))
             self.assertEqual(read_attempt(repository, identity, "runtime-provider-two", context=recovery).state, AttemptState.ACCEPTED)
 
     def test_runner_context_drift_blocks_before_the_native_backend(self) -> None:
@@ -217,6 +217,39 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
                 drifted.execute()
             self.assertEqual(backend.calls, 0)
+
+    def test_projection_binds_non_first_epoch_and_formal_round(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            runner = replace(runner, review_epoch=2, review_round=4)
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            descriptor = ProviderAttemptRuntimeDescriptor.parse({
+                "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-round-45",
+                "repository_id": identity.repository_id, "task_id": identity.task_id,
+                "source_digest": runner.source_digest, "base_sha": identity.base_sha,
+                "candidate_sha": seal.candidate_sha, "case_id": "runtime-round-case-45", "ready_at": 17,
+                "capture_plan_digest": digest("b"), "runtime_binding": recovery.runtime_binding.canonical_material(),
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 2, "review_round": 4,
+            })
+            resources = ProviderAttemptRuntimeResources(
+                repository, identity, recovery, runner.lease, seal, runner.binding,
+                runner.source_digest, descriptor.case_id, descriptor.ready_at, descriptor.capture_plan_digest,
+                descriptor.provider_profile_identity, 2, 4, runner,
+            )
+            snapshot = MaterializedProviderAttemptContext(descriptor, resources).snapshot((runner.selection.provider_attempt_id,))
+            graph = snapshot["event_graph"]
+            self.assertEqual((snapshot["review_epoch"], snapshot["review_round"], snapshot["review_mode"]), (2, 4, "CONVERGING"))
+            assert graph is not None
+            self.assertEqual(graph.review_rounds[0].ordinal, 1)  # graph-local ordinal
+            self.assertTrue(all("e2-r4-" in value for value in (
+                graph.review_rounds[0].review_round_id,
+                graph.accepted_results[0].result_id,
+                graph.accepted_results[0].event_id,
+            )))
+            self.assertTrue(all(item.review_round_id == graph.review_rounds[0].review_round_id for item in graph.attempts))
 
     def test_host_materializer_runs_the_same_v2_adapter_flow_with_only_a_native_backend_fake(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -287,9 +320,24 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
         try:
             harness = importlib.import_module("roundwright_harness.executor")
             with TemporaryDirectory() as temporary:
-                runner, backend, repository, identity, recovery, seal = self.durable_runner(
+                runner, first_backend, repository, identity, recovery, seal = self.durable_runner(
                     Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+                )
+                second_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                second_backend = Backend(
+                    "runtime-hosted-two",
                     NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                second_selection = DiffReviewSelection(
+                    "runtime-hosted-review-two", runner.selection.implementation_attempt_id,
+                    "runtime-hosted-provider-two", "runtime-hosted-message-two", "runtime-hosted-lease-two",
+                    runner.selection.process_lease_expires_at, "Review the immutable candidate.",
+                    ("Return a strict verdict.",), 2,
                 )
                 producer, exporter, comparator = external_validation.provider_attempt_accounting_component_identities()
                 plan = {
@@ -319,9 +367,14 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "capture_plan": plan,
                     "execution_context": descriptor,
                 }
+                sequence = (
+                    DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
+                    DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                )
                 host = ProviderAttemptHostInputs(
                     repository, identity, recovery, runner.lease, seal, runner.binding,
-                    runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
+                    runner.dependency_binding, runner.dispatch_control,
+                    (runner.audit, second_recovery.health_receipt.audit_identity), runner.selection, first_backend, sequence,
                 )
                 store = Path(temporary) / "recorder"
                 parsed = harness.ExecutorRequest.parse(request)
@@ -332,23 +385,146 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "validate", request, store, host,
                 )
                 self.assertEqual(readiness.as_dict()["dispatch_count"], 0)
-                self.assertEqual(backend.calls, 0)
+                self.assertEqual((first_backend.calls, second_backend.calls), (0, 0))
                 result = external_validation.run_provider_attempt_accounting_profile(
                     "execute", request, store, host,
                     expected_readiness_digest=str(readiness.as_dict()["receipt_digest"]),
                 )
                 receipt = result.as_dict()
                 self.assertEqual((receipt["status"], receipt["mutation_count"]), ("pass", 0))
-                self.assertEqual(backend.calls, 1)
-                self.assertEqual(read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery).state, AttemptState.ACCEPTED)
-                # A separate hosted invocation reads the same durable accepted
-                # record; it cannot dispatch or accept a second formal result.
+                self.assertEqual((first_backend.calls, second_backend.calls), (1, 1))
+                self.assertEqual(read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery).state, AttemptState.INVALIDATED)
+                self.assertEqual(read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery).state, AttemptState.ACCEPTED)
+                context = install_host_runtime(descriptor, host)
+                snapshot = context.snapshot((runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+                self.assertEqual((snapshot["review_epoch"], snapshot["review_round"], snapshot["review_mode"]), (1, 1, "COMPLETE"))
+                graph = snapshot["event_graph"]
+                self.assertIsNotNone(graph)
+                assert graph is not None
+                self.assertEqual(len(graph.provider_attempts), 2)
+                self.assertEqual(len(graph.review_rounds), 1)
+                self.assertEqual((graph.attempts[0].kind.value, graph.attempts[1].kind.value), ("supervisor", "failover"))
+                self.assertEqual(graph.attempts[1].parent_attempt_id, graph.attempts[0].attempt_id)
+                self.assertEqual(snapshot["provider_identity"], graph.provider_attempts[1].provider_identity)
+                self.assertIn("invalid-output", tuple(item.event_kind for item in graph.events))
+                self.assertIn("recovery-attempt", tuple(item.event_kind for item in graph.events))
+                self.assertEqual(sum(item.accepted_result_id is not None for item in graph.events), 1)
+                # A separate hosted invocation reads the persisted bounded
+                # sequence; it cannot dispatch or accept a second formal result.
                 repeated = external_validation.run_provider_attempt_accounting_profile(
                     "execute", request, store, host,
                     expected_readiness_digest=str(readiness.as_dict()["receipt_digest"]),
                 )
                 self.assertEqual(repeated.as_dict()["bundle_digest"], receipt["bundle_digest"])
-                self.assertEqual(backend.calls, 1)
+                self.assertEqual((first_backend.calls, second_backend.calls), (1, 1))
+        finally:
+            sys.path.remove(str(source))
+            for name in tuple(sys.modules):
+                if name == "roundwright_harness" or name.startswith("roundwright_harness."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(prior_modules)
+
+    def test_hosted_ambiguous_attempt_blocks_before_failover_dispatch(self) -> None:
+        harness_source = os.environ.get("ROUNDWRIGHT_HARNESS_SOURCE")
+        if harness_source is None:
+            self.skipTest("reviewed Harness source is not supplied")
+        source = Path(harness_source)
+        if not (source / "roundwright_harness" / "executor.py").is_file():
+            self.fail("reviewed Harness source is invalid")
+        prior_modules = {
+            name: value for name, value in sys.modules.items()
+            if name == "roundwright_harness" or name.startswith("roundwright_harness.")
+        }
+        sys.path.insert(0, str(source))
+        for name in tuple(prior_modules):
+            sys.modules.pop(name, None)
+        try:
+            harness = importlib.import_module("roundwright_harness.executor")
+            with TemporaryDirectory() as temporary:
+                runner, first_backend, repository, identity, recovery, seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                )
+                second_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                second_backend = Backend(
+                    "runtime-hosted-ambiguous-two",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [],
+                )
+                second_selection = DiffReviewSelection(
+                    "runtime-hosted-ambiguous-review-two", runner.selection.implementation_attempt_id,
+                    "runtime-hosted-ambiguous-provider-two", "runtime-hosted-ambiguous-message-two", "runtime-hosted-ambiguous-lease-two",
+                    runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                )
+                producer, exporter, comparator = external_validation.provider_attempt_accounting_component_identities()
+                plan = {
+                    "schema": "roundwright-harness-capture-plan/v1", "profile": external_validation.PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+                    "ready_at": 17, "case_id": "runtime-hosted-ambiguous-case-45", "candidate_sha": seal.candidate_sha,
+                    "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+                    "recorder_identity": digest("8"), "store_identity": digest("9"), "observation_identity": digest("a"),
+                }
+                descriptor = {
+                    "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-hosted-ambiguous-45",
+                    "repository_id": identity.repository_id, "task_id": identity.task_id, "source_digest": runner.source_digest,
+                    "base_sha": identity.base_sha, "candidate_sha": seal.candidate_sha, "case_id": plan["case_id"], "ready_at": 17,
+                    "capture_plan_digest": harness.prepare_capture(plan).plan_digest,
+                    "runtime_binding": recovery.runtime_binding.canonical_material(),
+                    "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                }
+                request = {"schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan, "execution_context": descriptor}
+                host = ProviderAttemptHostInputs(
+                    repository, identity, recovery, runner.lease, seal, runner.binding,
+                    runner.dependency_binding, runner.dispatch_control,
+                    (runner.audit, second_recovery.health_receipt.audit_identity), runner.selection, first_backend,
+                    (
+                        DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
+                        DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                    ),
+                )
+                preflight_descriptor = dict(descriptor, resource_id="runtime-hosted-ambiguous-preflight-45")
+                preflight_request = dict(request, execution_context=preflight_descriptor)
+                duplicate_selection = replace(second_selection, provider_attempt_id=runner.selection.provider_attempt_id)
+                preflight_host = replace(host, sequence=(
+                    DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
+                    DiffReviewSequenceEntry(duplicate_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                ))
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_provider_attempt_accounting_profile(
+                        "validate", preflight_request, Path(temporary) / "preflight-recorder", preflight_host,
+                    )
+                self.assertEqual((first_backend.calls, second_backend.calls), (0, 0))
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM provider_attempts WHERE attempt_id IN (?, ?)",
+                            (runner.selection.provider_attempt_id, duplicate_selection.provider_attempt_id),
+                        ).fetchone()[0],
+                        0,
+                    )
+                finally:
+                    connection.close()
+                readiness = external_validation.run_provider_attempt_accounting_profile("validate", request, Path(temporary) / "recorder", host)
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "ambiguous"):
+                    external_validation.run_provider_attempt_accounting_profile(
+                        "execute", request, Path(temporary) / "recorder", host,
+                        expected_readiness_digest=str(readiness.as_dict()["receipt_digest"]),
+                    )
+                self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
+                self.assertEqual(read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery).state, AttemptState.AMBIGUOUS)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM provider_invalid_outputs WHERE attempt_id = ?",
+                            (runner.selection.provider_attempt_id,),
+                        ).fetchone()[0],
+                        0,
+                    )
+                finally:
+                    connection.close()
         finally:
             sys.path.remove(str(source))
             for name in tuple(sys.modules):

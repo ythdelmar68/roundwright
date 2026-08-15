@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 from tempfile import TemporaryDirectory
+from types import MappingProxyType
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -174,6 +175,35 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             payload = self.descriptor_payload()
             payload["completion_policy"] = policy
             with self.subTest(policy=policy), self.assertRaisesRegex(ProviderAttemptRuntimeError, "completion policy"):
+                ProviderAttemptRuntimeDescriptor.parse(payload)
+
+    def test_frozen_completion_policy_has_owned_plain_descriptor_identity_parity(self) -> None:
+        plain_payload = self.descriptor_payload()
+        frozen_payload = dict(plain_payload)
+        source_receipt = dict(PRODUCTION_COMPLETION_POLICY.receipt())
+        frozen_payload["completion_policy"] = MappingProxyType(source_receipt)
+        plain = ProviderAttemptRuntimeDescriptor.parse(plain_payload)
+        frozen = ProviderAttemptRuntimeDescriptor.parse(frozen_payload)
+        self.assertEqual(frozen.payload(), plain.payload())
+        self.assertIs(type(frozen.completion_policy), dict)
+        source_receipt["application_timeout_ms"] = 100
+        self.assertEqual(
+            frozen.payload()["completion_policy"],
+            PRODUCTION_COMPLETION_POLICY.receipt(),
+        )
+        self.assertEqual(
+            MaterializedProviderAttemptContext(plain, self.resources(plain)).identity,
+            MaterializedProviderAttemptContext(frozen, self.resources(frozen)).identity,
+        )
+        for value in (
+            MappingProxyType({"schema": "roundwright-provider-attempt-completion-policy/v1", "application_timeout_ms": 100, "host_timeout_ms": 600}),
+            MappingProxyType({"schema": "roundwright-provider-attempt-completion-policy/v1", "application_timeout_ms": True, "host_timeout_ms": 600_000}),
+            MappingProxyType({"schema": "roundwright-provider-attempt-completion-policy/v1", "application_timeout_ms": 100_000, "host_timeout_ms": 600_000, "path": "C:/private"}),
+            "not-a-json-mapping",
+        ):
+            payload = self.descriptor_payload()
+            payload["completion_policy"] = value
+            with self.subTest(value=repr(value)), self.assertRaises(ProviderAttemptRuntimeError):
                 ProviderAttemptRuntimeDescriptor.parse(payload)
 
     def test_host_rejects_a_test_scale_native_deadline_before_lifecycle_access(self) -> None:
@@ -755,6 +785,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.assertEqual(parsed.schema, "roundwright-harness-profile-executor-request/v2")
                 self.assertEqual(parsed.capture_plan["profile"], external_validation.PROVIDER_ATTEMPT_ACCOUNTING_PROFILE)
                 self.assertIsNotNone(parsed.execution_context)
+                assert parsed.execution_context is not None
+                self.assertIs(type(parsed.execution_context["completion_policy"]), MappingProxyType)
                 readiness = external_validation.run_provider_attempt_accounting_profile(
                     "validate", request, store, host,
                 )

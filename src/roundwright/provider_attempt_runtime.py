@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from .configuration import RepositoryIdentity, ReviewMode
 from .candidate_review import (
@@ -91,6 +92,20 @@ def _public_provider_identity(profile_identity: str) -> str:
     return "profile-" + hashlib.sha256(profile_identity.encode("ascii")).hexdigest()[:32]
 
 
+def _owned_completion_policy_receipt(value: object) -> dict[str, object]:
+    """Copy the one reviewed immutable JSON boundary into product ownership.
+
+    Harness recursively freezes request JSON with ``MappingProxyType``.  Only
+    that exact mapping representation (or a plain JSON dict) is accepted here;
+    the closed parser below still rejects every unknown key and non-canonical
+    value before a lifecycle resource can be opened.
+    """
+
+    if type(value) not in (dict, MappingProxyType):
+        raise ProviderAttemptRuntimeError("provider attempt completion policy is invalid")
+    return dict(value)
+
+
 @dataclass(frozen=True)
 class ProviderAttemptCompletionPolicy:
     """Closed production deadline policy, separate from test-scale fixtures."""
@@ -159,7 +174,9 @@ class ProviderAttemptRuntimeDescriptor:
         if type(value) is not dict or set(value) != required or value.get("schema") != SCHEMA:
             raise ProviderAttemptRuntimeError("provider attempt runtime descriptor is invalid")
         try:
-            parsed = cls(**{name: value[name] for name in required if name != "schema"})
+            fields = {name: value[name] for name in required if name != "schema"}
+            fields["completion_policy"] = _owned_completion_policy_receipt(fields["completion_policy"])
+            parsed = cls(**fields)
         except TypeError as error:
             raise ProviderAttemptRuntimeError("provider attempt runtime descriptor is invalid") from error
         parsed._validate()
@@ -195,7 +212,7 @@ class ProviderAttemptRuntimeDescriptor:
             "candidate_sha": self.candidate_sha, "case_id": self.case_id, "ready_at": self.ready_at,
             "capture_plan_digest": self.capture_plan_digest, "runtime_binding": self.runtime_binding,
             "provider_profile_identity": self.provider_profile_identity, "review_epoch": self.review_epoch,
-            "review_round": self.review_round, "completion_policy": self.completion_policy,
+            "review_round": self.review_round, "completion_policy": dict(self.completion_policy),
         }
 
 

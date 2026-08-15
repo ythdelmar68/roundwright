@@ -17,7 +17,7 @@ from typing import Callable, Mapping, Protocol
 
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .provider_recovery import SupervisorAccountingSnapshot
+from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
 
 
 class CodexSupervisorError(ValueError):
@@ -171,7 +171,7 @@ class CodexSupervisorRequest:
     decision_semantic: SupervisorAccountingDecisionSemantic | None = None
 
     def __post_init__(self) -> None:
-        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and (self.decision_material is not None or self.decision_semantic is not None)) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and (not _accounting_material(self.decision_material) or self.decision_semantic is not SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2 or self.objective != ACCOUNTING_TRANSITION_OBJECTIVE or self.acceptance_criteria != ACCOUNTING_TRANSITION_CRITERIA)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material, decision_semantic=self.decision_semantic):
+        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and (self.decision_material is not None or self.decision_semantic is not None)) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and (not _accounting_material(self.decision_material) or self.decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED or self.decision_semantic is not SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2 or self.objective != ACCOUNTING_TRANSITION_OBJECTIVE or self.acceptance_criteria != ACCOUNTING_TRANSITION_CRITERIA)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material, decision_semantic=self.decision_semantic):
             raise CodexSupervisorError("Supervisor request is invalid")
 
 

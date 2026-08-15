@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.codex_supervisor import (
-    CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
+    CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorError, CodexSupervisorRequest,
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
     ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, SupervisorAccountingDecisionSemantic,
     SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
@@ -205,6 +205,10 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(prompt["review_material"]["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
         self.assertNotIn("PASS", json.dumps(prompt, sort_keys=True))
         self.assertNotIn("FINDINGS", json.dumps(prompt, sort_keys=True))
+        unclaimed = replace(snapshot, dispatch_claim=SupervisorDispatchClaimState.UNCLAIMED)
+        values["decision_material"] = unclaimed
+        with self.assertRaises(CodexSupervisorError):
+            CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
 
     def test_native_factory_failure_is_classified_before_any_session_identity(self):
         profile = self.profiles[0]

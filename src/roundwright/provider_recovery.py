@@ -286,8 +286,8 @@ def read_supervisor_accounting_snapshot(
         current = attempt(current_attempt_id,current_within_round_attempt,current_profile_identity)
         prior = tuple(attempt(*item) for item in prior_attempts)
         binding = context.runtime_binding
-        claim = connection.execute("SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=? AND task_id=?", (current_attempt_id, identity.task_id)).fetchone()
-        return SupervisorAccountingSnapshot(identity.repository_id,identity.task_id,source_digest,base_sha,candidate_sha,case_id,ready_at,seal_state_identity,evidence,verifications,binding.resolved_digest,binding.review_policy_digest,binding.review_complete_rounds,binding.review_max_rounds,binding.review_max_supervisor_attempts_per_round,review_epoch,review_round,review_mode,formal[0],0 if formal[1] is None else formal[1],SupervisorDispatchClaimState.CLAIMED if claim is not None else SupervisorDispatchClaimState.UNCLAIMED,current,prior)
+        claim = _dispatch_claim_state(connection, identity, _attempt_row(connection, identity.task_id, current_attempt_id))
+        return SupervisorAccountingSnapshot(identity.repository_id,identity.task_id,source_digest,base_sha,candidate_sha,case_id,ready_at,seal_state_identity,evidence,verifications,binding.resolved_digest,binding.review_policy_digest,binding.review_complete_rounds,binding.review_max_rounds,binding.review_max_supervisor_attempts_per_round,review_epoch,review_round,review_mode,formal[0],0 if formal[1] is None else formal[1],claim,current,prior)
     finally:
         connection.close()
 
@@ -466,10 +466,18 @@ def read_supervisor_dispatch_claim(
         row = _attempt_row(connection, identity.task_id, attempt_id)
         if row.role is not ProviderRole.SUPERVISOR:
             raise ProviderRecoveryError("Supervisor dispatch claim has drifted")
-        claimed = connection.execute("SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=? AND task_id=?", (attempt_id, identity.task_id)).fetchone()
-        return SupervisorDispatchClaimState.CLAIMED if claimed is not None else SupervisorDispatchClaimState.UNCLAIMED
+        return _dispatch_claim_state(connection, identity, row)
     finally:
         connection.close()
+
+
+def _dispatch_claim_state(connection, identity: TaskIdentity, row: ProviderAttempt) -> SupervisorDispatchClaimState:
+    claim = connection.execute("SELECT task_id,claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?", (row.attempt_id,)).fetchone()
+    if claim is None:
+        return SupervisorDispatchClaimState.UNCLAIMED
+    if tuple(claim) != (identity.task_id, row.input_fingerprint):
+        raise ProviderRecoveryError("Supervisor dispatch claim has drifted")
+    return SupervisorDispatchClaimState.CLAIMED
 
 
 def record_external_turn(

@@ -36,7 +36,7 @@ from roundwright.provider_attempt_runtime import (
 from roundwright.provider_health import CodexFailure
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
-    SupervisorTerminalFailure, read_attempt, read_supervisor_terminal_failure,
+    SupervisorTerminalFailure, claim_supervisor_dispatch, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
     record_supervisor_terminal_failure,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
 )
@@ -634,6 +634,27 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with patch("roundwright.provider_attempt_runtime.read_supervisor_accounting_snapshot", return_value=unclaimed):
                 with self.assertRaisesRegex(ProviderAttemptRuntimeError, "dispatch claim has drifted"):
                     runner.execute()
+            self.assertEqual(backend.calls, 0)
+
+    def test_claim_fingerprint_drift_fails_closed_before_native_dispatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            runner.materialize_prepared_snapshot()
+            claim_supervisor_dispatch(repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id, lease=runner.lease, now=runner.dispatch_control.now)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_dispatch_claims SET claim_fingerprint=? WHERE attempt_id=?", (digest("f"), runner.selection.provider_attempt_id))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(ProviderRecoveryError) as raised:
+                read_supervisor_dispatch_claim(repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id)
+            self.assertNotIn("f" * 64, str(raised.exception))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "dispatch claim is unavailable"):
+                runner.execute()
             self.assertEqual(backend.calls, 0)
 
     def test_missing_session_identity_retains_a_prepared_attempt_without_redispatch(self) -> None:

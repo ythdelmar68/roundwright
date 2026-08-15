@@ -35,7 +35,7 @@ from roundwright.provider_attempt_runtime import (
 )
 from roundwright.provider_health import CodexFailure
 from roundwright.provider_recovery import (
-    AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext,
+    AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
     SupervisorTerminalFailure, read_attempt, read_supervisor_terminal_failure,
     record_supervisor_terminal_failure,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
@@ -133,6 +133,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 f"runtime-provider-{suffix}", f"runtime-message-{suffix}", f"runtime-lease-{suffix}",
                 now + 60, "Review the immutable candidate.", ("Return a strict verdict.",),
             ),
+            case_id=f"runtime-case-{suffix}", ready_at=now,
         )
         return runner, backend, repository, identity, recovery, seal
 
@@ -522,14 +523,26 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             request = second_backend.request
             self.assertIsNotNone(request)
             assert request is not None
+            self.assertIs(type(request.decision_material), SupervisorAccountingSnapshot)
             material = request.decision_material.canonical_material()
             self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "formal_review", "current_attempt", "prior_attempts"})
+            self.assertEqual(material["binding"]["case_id"], runner.case_id)
+            self.assertEqual(material["binding"]["ready_at"], runner.ready_at)
+            self.assertEqual(material["current_attempt"]["state"], "prepared")
+            self.assertFalse(material["current_attempt"]["session_present"])
+            self.assertEqual(material["formal_review"]["accepted_count"], 0)
             self.assertEqual(material["prior_attempts"][0]["state"], "invalidated")
             self.assertEqual(material["prior_attempts"][0]["recovery_action"], "fresh-supervisor-session")
             self.assertTrue(material["prior_attempts"][0]["session_present"])
             self.assertTrue(material["prior_attempts"][0]["turn_present"])
             self.assertNotIn("C:/", json.dumps(material, sort_keys=True))
             self.assertNotIn("findings", json.dumps(material, sort_keys=True))
+
+    def test_accounting_runtime_has_no_direct_sql_dependency(self) -> None:
+        source = (ROOT / "src" / "roundwright" / "provider_attempt_runtime.py").read_text(encoding="utf-8")
+        self.assertNotIn("import sqlite3", source)
+        self.assertNotIn("database_path", source)
+        self.assertNotIn("provider_attempts WHERE", source)
 
     def test_terminal_failure_projection_is_closed_and_rejects_untrusted_strings_before_mutation(self) -> None:
         self.assertEqual(tuple(item.value for item in SupervisorTerminalFailureClass), tuple(item.value for item in CodexFailure))

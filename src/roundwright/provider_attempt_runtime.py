@@ -23,7 +23,7 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    NativeCodexSupervisorBackend, SupervisorAccountingDecisionMaterial, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    NativeCodexSupervisorBackend, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
@@ -292,6 +292,8 @@ class DurableDiffReviewRunner:
     selection: DiffReviewSelection
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
+    case_id: str | None = None
+    ready_at: int | None = None
 
     def _sequence_entries(self) -> tuple[DiffReviewSequenceEntry, ...]:
         return self.sequence or (DiffReviewSequenceEntry(self.selection, self.recovery, self.audit, self.backend),)
@@ -302,7 +304,11 @@ class DurableDiffReviewRunner:
         runtime = self.recovery.runtime_binding
         entries = self._sequence_entries()
         if (
-            type(self.completion_policy) is not ProviderAttemptCompletionPolicy
+            type(self.case_id) is not str
+            or not _TOKEN.fullmatch(self.case_id)
+            or type(self.ready_at) is not int
+            or self.ready_at < 0
+            or type(self.completion_policy) is not ProviderAttemptCompletionPolicy
             or self.completion_policy != PRODUCTION_COMPLETION_POLICY
             or self.dependency_binding != CandidateBinding(self.identity.repository_id, self.identity.task_id, self.seal.candidate_sha)
             or type(entries) is not tuple
@@ -436,13 +442,13 @@ class DurableDiffReviewRunner:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
         entries = self.validate_sequence()
         prior = tuple((item.selection.provider_attempt_id, item.selection.within_round_attempt, item.audit.profile_identity) for item in entries if item.selection.within_round_attempt < selection.within_round_attempt)
-        decision_material = SupervisorAccountingDecisionMaterial(read_supervisor_accounting_snapshot(
+        decision_material = read_supervisor_accounting_snapshot(
             self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
-            candidate_sha=self.seal.candidate_sha, case_id=selection.diff_review_attempt_id, ready_at=0,
+            candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
             review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
             current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.within_round_attempt,
             current_profile_identity=selected, prior_attempts=prior, seal_state_identity=self.lease.state_identity,
-        ).canonical_material())
+        )
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
             selection.within_round_attempt,
@@ -647,6 +653,8 @@ class ProviderAttemptRuntimeResources:
             or self.runner.review_epoch != self.review_epoch
             or self.runner.review_round != self.review_round
             or self.runner.audit.profile_identity != descriptor.provider_profile_identity
+            or self.runner.case_id != self.case_id
+            or self.runner.ready_at != self.ready_at
             or self.runner.completion_policy != self.completion_policy
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
@@ -807,7 +815,7 @@ def install_durable_diff_review_runtime(
     runner = DurableDiffReviewRunner(
         repository, identity, recovery, worktree, seal, lease, dependency_binding,
         dispatch_control, audit, backend, source_digest, review_epoch, review_round,
-        selection, sequence, completion_policy,
+        selection, sequence, completion_policy, case_id, ready_at,
     )
     RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
         repository, identity, recovery, lease, seal, worktree, source_digest,

@@ -18,7 +18,7 @@ from enum import StrEnum
 from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
 from .runtime_binding import RuntimeBinding
-from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, record_runtime_binding, require_runtime_binding
+from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_runtime_binding, require_runtime_binding
 
 
 class ProviderRecoveryError(StateError):
@@ -95,7 +95,18 @@ class SupervisorAccountingAttemptSnapshot:
     session_present: bool; turn_present: bool; completion_present: bool; invalid_output_present: bool
     recovery_action: RecoveryAction | None; accepted: bool
     def __post_init__(self) -> None:
-        if not _TOKEN.fullmatch(self.attempt_id) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.profile_identity) or type(self.state) is not AttemptState or any(type(value) is not bool for value in (self.session_present, self.turn_present, self.completion_present, self.invalid_output_present, self.accepted)) or (self.recovery_action is not None and type(self.recovery_action) is not RecoveryAction) or (self.accepted and self.state is not AttemptState.ACCEPTED): raise ProviderRecoveryError("accounting attempt snapshot is invalid")
+        if not _TOKEN.fullmatch(self.attempt_id) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.profile_identity) or type(self.state) is not AttemptState or any(type(value) is not bool for value in (self.session_present, self.turn_present, self.completion_present, self.invalid_output_present, self.accepted)) or (self.recovery_action is not None and type(self.recovery_action) is not RecoveryAction):
+            raise ProviderRecoveryError("accounting attempt snapshot is invalid")
+        if self.accepted != (self.state is AttemptState.ACCEPTED) or self.accepted and (not self.session_present or not self.turn_present or not self.completion_present or self.invalid_output_present):
+            raise ProviderRecoveryError("accounting attempt snapshot is inconsistent")
+        if self.state is AttemptState.PREPARED and (self.session_present or self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not None or self.accepted):
+            raise ProviderRecoveryError("accounting prepared snapshot is inconsistent")
+        if self.turn_present and not self.session_present:
+            raise ProviderRecoveryError("accounting turn snapshot is inconsistent")
+        if self.invalid_output_present and self.state is not AttemptState.INVALIDATED:
+            raise ProviderRecoveryError("accounting invalid snapshot is inconsistent")
+        if self.state is AttemptState.INVALIDATED and (not self.invalid_output_present or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
+            raise ProviderRecoveryError("accounting recovery snapshot is inconsistent")
     def canonical_material(self) -> dict[str, object]: return {"attempt_id":self.attempt_id,"within_round_attempt":self.within_round_attempt,"profile_identity":self.profile_identity,"state":self.state.value,"session_present":self.session_present,"turn_present":self.turn_present,"completion_present":self.completion_present,"invalid_output_present":self.invalid_output_present,"recovery_action":None if self.recovery_action is None else self.recovery_action.value,"accepted":self.accepted}
 
 
@@ -106,7 +117,12 @@ class SupervisorAccountingSnapshot:
     configuration_digest: str; policy_digest: str; complete_rounds: int; max_rounds: int; max_attempts: int; review_epoch: int; review_round: int; review_mode: str
     formal_record_count: int; formal_accepted_count: int; current: SupervisorAccountingAttemptSnapshot; prior: tuple[SupervisorAccountingAttemptSnapshot, ...]
     def __post_init__(self) -> None:
-        if not _TOKEN.fullmatch(self.repository_id) or not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.case_id) or not _DIGEST.fullmatch(self.source_digest) or not _COMMIT.fullmatch(self.base_sha) or not _COMMIT.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not _TOKEN.fullmatch(self.seal_state_identity) or any(not _FINGERPRINT.fullmatch(item) for item in self.evidence) or any(kind not in {"test","build"} or outcome not in {"pass","not-applicable"} for kind,outcome in self.verifications) or any(type(value) is not int or value < 0 for value in (self.complete_rounds,self.max_rounds,self.max_attempts,self.review_epoch,self.formal_record_count,self.formal_accepted_count)) or self.review_round < 1 or self.formal_accepted_count > self.formal_record_count or self.current.within_round_attempt != len(self.prior)+1 or tuple(item.within_round_attempt for item in self.prior) != tuple(range(1,len(self.prior)+1)): raise ProviderRecoveryError("accounting snapshot is invalid")
+        if not _TOKEN.fullmatch(self.repository_id) or not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.case_id) or not _DIGEST.fullmatch(self.source_digest) or not _COMMIT.fullmatch(self.base_sha) or not _COMMIT.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not _TOKEN.fullmatch(self.seal_state_identity) or type(self.evidence) is not tuple or type(self.verifications) is not tuple or any(type(item) is not str or not _FINGERPRINT.fullmatch(item) for item in self.evidence) or len(set(self.evidence)) != len(self.evidence) or any(type(item) is not tuple or len(item) != 2 or type(item[0]) is not str or type(item[1]) is not str or item[0] not in {"test","build"} or item[1] not in {"pass","not-applicable"} for item in self.verifications) or len(set(self.verifications)) != len(self.verifications):
+            raise ProviderRecoveryError("accounting snapshot is invalid")
+        if not _DIGEST.fullmatch(self.configuration_digest) or not _FINGERPRINT.fullmatch(self.policy_digest) or self.review_mode not in {"COMPLETE", "CONVERGING"} or any(type(value) is not int or value < 0 for value in (self.complete_rounds,self.max_rounds,self.max_attempts,self.review_epoch,self.formal_record_count,self.formal_accepted_count)) or type(self.review_round) is not int or self.review_round < 1 or self.complete_rounds < 1 or self.max_rounds < self.complete_rounds or self.max_attempts < 1 or self.review_round > self.max_rounds or self.formal_accepted_count not in {0,1} or self.formal_accepted_count > self.formal_record_count or type(self.current) is not SupervisorAccountingAttemptSnapshot or type(self.prior) is not tuple or any(type(item) is not SupervisorAccountingAttemptSnapshot for item in self.prior):
+            raise ProviderRecoveryError("accounting snapshot is invalid")
+        if self.current.state is not AttemptState.PREPARED or self.current.within_round_attempt != len(self.prior)+1 or any((self.current.session_present,self.current.turn_present,self.current.completion_present,self.current.invalid_output_present,self.current.accepted)) or self.current.recovery_action is not None or tuple(item.within_round_attempt for item in self.prior) != tuple(range(1,len(self.prior)+1)) or len({item.attempt_id for item in self.prior + (self.current,)}) != len(self.prior) + 1 or len({item.profile_identity for item in self.prior + (self.current,)}) != len(self.prior) + 1:
+            raise ProviderRecoveryError("accounting snapshot attempt ordering is invalid")
     def canonical_material(self) -> dict[str, object]: return {"schema":"roundwright-provider-attempt-accounting-decision/v1","binding":{"repository_id":self.repository_id,"task_id":self.task_id,"source_digest":self.source_digest,"base_sha":self.base_sha,"candidate_sha":self.candidate_sha,"case_id":self.case_id,"ready_at":self.ready_at},"candidate":{"seal_state_identity":self.seal_state_identity,"evidence_count":len(self.evidence),"evidence_digest":"sha256:"+hashlib.sha256("|".join(self.evidence).encode()).hexdigest(),"verification_count":len(self.verifications),"verification_kinds":[{"kind":a,"outcome":b} for a,b in self.verifications]},"review_policy":{"configuration_digest":self.configuration_digest,"policy_digest":self.policy_digest,"complete_rounds":self.complete_rounds,"max_rounds":self.max_rounds,"max_supervisor_attempts_per_round":self.max_attempts,"review_epoch":self.review_epoch,"review_round":self.review_round,"review_mode":self.review_mode},"formal_review":{"review_round":self.review_round,"record_count":self.formal_record_count,"accepted_count":self.formal_accepted_count,"accepted_result_present":bool(self.formal_accepted_count)},"current_attempt":self.current.canonical_material(),"prior_attempts":[item.canonical_material() for item in self.prior]}
 
 
@@ -240,7 +256,13 @@ def read_supervisor_accounting_snapshot(
     _validate_task(identity); _validate_context(identity, context)
     if not _DIGEST.fullmatch(source_digest) or base_sha != identity.base_sha or candidate_sha != context.candidate_sha or not _TOKEN.fullmatch(case_id) or type(ready_at) is not int or ready_at < 0 or type(review_epoch) is not int or review_epoch < 0 or type(review_round) is not int or review_round < 1 or review_mode not in {"COMPLETE", "CONVERGING"} or not _TOKEN.fullmatch(current_attempt_id) or current_within_round_attempt < 1 or not _DIGEST.fullmatch(current_profile_identity) or tuple(item[1] for item in prior_attempts) != tuple(range(1, len(prior_attempts)+1)):
         raise ProviderRecoveryError("accounting snapshot inputs are invalid")
-    connection = _open_writable_connection(repository)
+    path = database_path(repository)
+    if not path.exists():
+        raise ProviderRecoveryError("accounting snapshot state is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ProviderRecoveryError("accounting snapshot state is unavailable") from error
     try:
         _require_matching_task(connection, identity)
         seal = connection.execute("SELECT base_sha,candidate_sha,state_identity FROM candidate_seals WHERE task_id=?", (identity.task_id,)).fetchone()

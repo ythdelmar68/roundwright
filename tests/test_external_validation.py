@@ -188,63 +188,51 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(comparison.status, "fail")
         self.assertTrue(comparison.result_identity.startswith("sha256:"))
 
-    def test_provider_attempt_profile_executes_a_complete_public_bound_sequence(self) -> None:
+    def test_provider_attempt_profile_bare_public_binding_blocks_before_dispatch(self) -> None:
         adapter = external_validation.roundwright_profile_adapter_factory(
             PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
         )
         exact = provider_binding()
-        adapter.validate(exact)
-
-        evidence = adapter.project(exact, adapter.execute(exact))
-        comparison = adapter.compare(exact, evidence)
-
-        accounting = evidence["provider_attempt_accounting"]
         self.assertEqual(
             adapter.component_identities,
             ProfileComponentIdentities(*external_validation.provider_attempt_accounting_component_identities()),
         )
-        self.assertEqual(accounting["capture_mode"], "armed-live-events")
-        self.assertEqual(accounting["history"], "complete")
-        self.assertEqual(accounting["snapshot"]["candidate_sha"], exact.candidate_sha)
-        self.assertEqual(accounting["snapshot"]["capture_plan_digest"], exact.plan.plan_digest)
-        self.assertEqual(accounting["snapshot"]["ready_at"], exact.ready_at)
-        self.assertEqual(accounting["snapshot"]["review_mode"], "COMPLETE")
-        self.assertEqual(accounting["snapshot"]["complete_rounds"], 3)
-        self.assertEqual(accounting["snapshot"]["lifecycle_state"], "accepted-review")
-        self.assertEqual(accounting["snapshot"]["next_action"], "candidate-gates")
-        graph = accounting["snapshot"]["event_graph"]
-        self.assertEqual(len(graph["provider_attempts"]), 3)
-        self.assertEqual(
-            [attempt[4] for attempt in graph["provider_attempts"]],
-            ["invalid", "completed", "accepted"],
-        )
-        self.assertEqual(len(graph["review_rounds"]), 1)
-        self.assertEqual(len(graph["accepted_results"]), 1)
-        self.assertEqual(accounting["mutation_count"], 0)
-        self.assertEqual(comparison.status, "pass")
+        with self.assertRaisesRegex(
+            external_validation.ExternalValidationAdapterError,
+            external_validation.PROVIDER_ATTEMPT_HISTORY_BLOCKER,
+        ):
+            adapter.validate(exact)
 
-    def test_provider_attempt_profile_fails_closed_for_missing_history_or_drift(self) -> None:
+        # The reviewed Harness never calls execute after validate blocks.  If a
+        # caller attempts to bypass that boundary, the projection is explicit
+        # non-qualifying evidence rather than an inferred event sequence.
+        evidence = adapter.project(exact, adapter.execute(exact))
+        accounting = evidence["provider_attempt_accounting"]
+        self.assertEqual(accounting["capture_mode"], "armed-live-events")
+        self.assertEqual(accounting["history"], "unavailable-public-binding")
+        self.assertIsNone(accounting["snapshot"])
+        self.assertEqual(
+            accounting["blocker"]["code"],
+            external_validation.PROVIDER_ATTEMPT_HISTORY_BLOCKER,
+        )
+        self.assertEqual(accounting["mutation_count"], 0)
+        self.assertEqual(adapter.compare(exact, evidence).status, "fail")
+
+    def test_provider_attempt_profile_rejects_fabricated_history_and_context_drift(self) -> None:
         adapter = external_validation.roundwright_profile_adapter_factory(
             PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
         )
         exact = provider_binding()
-        adapter.validate(exact)
         evidence = adapter.project(exact, adapter.execute(exact))
-        self.assertEqual(adapter.compare(exact, evidence).status, "pass")
 
-        missing_history = deepcopy(evidence)
-        missing_history["provider_attempt_accounting"]["history"] = "missing-recapture-required"
-        missing_history["provider_attempt_accounting"]["snapshot"] = None
-        self.assertEqual(adapter.compare(exact, missing_history).status, "fail")
-
-        incomplete_history = deepcopy(evidence)
-        incomplete_history["provider_attempt_accounting"]["snapshot"] = None
-        self.assertEqual(adapter.compare(exact, incomplete_history).status, "fail")
-
-        duplicate_acceptance = deepcopy(evidence)
-        accepted = duplicate_acceptance["provider_attempt_accounting"]["snapshot"]["event_graph"]["accepted_results"]
-        accepted.append(accepted[0])
-        self.assertEqual(adapter.compare(exact, duplicate_acceptance).status, "fail")
+        fabricated = deepcopy(evidence)
+        fabricated["provider_attempt_accounting"]["history"] = "complete"
+        fabricated["provider_attempt_accounting"]["snapshot"] = {
+            "review_round": 1,
+            "lifecycle_state": "accepted-review",
+            "event_graph": {"provider_attempts": ["invented"]},
+        }
+        self.assertEqual(adapter.compare(exact, fabricated).status, "fail")
 
         self.assertEqual(adapter.compare(provider_binding(candidate_sha="c" * 40), evidence).status, "fail")
         self.assertEqual(adapter.compare(provider_binding(ready_at=18), evidence).status, "fail")
@@ -257,3 +245,13 @@ class ExternalValidationTests(unittest.TestCase):
                 external_validation.PROVIDER_ATTEMPT_EXPORTER_IDENTITY,
                 external_validation.PROVIDER_ATTEMPT_COMPARATOR_IDENTITY,
             )))
+
+    def test_durable_snapshot_requires_base_and_context_bindings(self) -> None:
+        candidate = "a" * 40
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.ProviderAttemptAccountingSnapshot(
+                "task-45", "sha256:" + "2" * 64, "not-a-sha", candidate, "sha256:" + "3" * 64, 17,
+                1, 1, "COMPLETE", 1, 10, 1, "sha256:" + "4" * 64,
+                "sha256:" + "5" * 64, "selected-provider", "sha256:" + "6" * 64,
+                "accepted-review", None, "candidate-gates", False,
+            )

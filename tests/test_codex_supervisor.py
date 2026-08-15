@@ -20,9 +20,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, SupervisorAccountingDecisionSemantic,
     SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
+from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
@@ -172,6 +174,37 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(events[1]["sandbox"], "read-only")
         self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
         self.assertIn("closed", events)
+
+    def test_concrete_native_accounting_prompt_is_prospective_and_bound(self):
+        captured = []
+        profile = self.profiles[0]
+        audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
+        snapshot = SupervisorAccountingSnapshot(
+            "repo-44", "task-44", digest("source"), "a" * 40, "b" * 40, "case-44", 101,
+            "state-44", ("a" * 64,), (("test", "pass"),), digest("configuration"), "b" * 64,
+            1, 4, 2, 2, 4, "CONVERGING", 0, 0,
+            SupervisorAccountingAttemptSnapshot("provider-accounting", 1, audit.profile_identity, AttemptState.PREPARED, False, False, False, False, None, None, False), (),
+        )
+        values = dict(review_attempt_id="review-accounting", provider_attempt_id="provider-accounting", selected_profile_identity=audit.profile_identity, within_round_attempt=1, context=self.context, objective=ACCOUNTING_TRANSITION_OBJECTIVE, acceptance_criteria=ACCOUNTING_TRANSITION_CRITERIA, response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material=snapshot, decision_semantic=SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2)
+        request = CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
+        class Handle:
+            id = "turn-accounting"
+            def stream(self): return iter(({"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": json.dumps({"status": "complete", "action": "accept-formal-review", "blocker": None})}}}, {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}}))
+        class Thread:
+            id = "session-accounting"
+            def turn(self, prompt, **_kwargs): captured.append(json.loads(prompt)); return Handle()
+        class Codex:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def thread_start(self): return Thread()
+        adapter = CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+        self.assertEqual(adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None).kind, SupervisorResultKind.ACCEPTED)
+        prompt = captured[0]
+        self.assertIn("prospective pre-dispatch", prompt["instruction"])
+        self.assertIn("not that either already exists", prompt["instruction"])
+        self.assertEqual(prompt["review_material"]["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
+        self.assertNotIn("PASS", json.dumps(prompt, sort_keys=True))
+        self.assertNotIn("FINDINGS", json.dumps(prompt, sort_keys=True))
 
     def test_native_factory_failure_is_classified_before_any_session_identity(self):
         profile = self.profiles[0]

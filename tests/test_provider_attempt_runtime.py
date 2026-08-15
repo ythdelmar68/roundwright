@@ -23,7 +23,7 @@ from roundwright import external_validation
 from roundwright.candidate_review import CandidateVerification, VerificationKind, VerificationOutcome
 from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
-    SupervisorResultKind, SupervisorSdkTurnErrorCategory,
+    SupervisorResultKind, SupervisorSdkTurnErrorCategory, canonical_supervisor_review_material, supervisor_request_digest,
 )
 from roundwright.dependency_policy import CandidateBinding
 from roundwright.git_identity import CandidateSeal, TransitionLease, WorktreeBinding
@@ -540,6 +540,21 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertTrue(material["prior_attempts"][0]["turn_present"])
             self.assertNotIn("C:/", json.dumps(material, sort_keys=True))
             self.assertNotIn("findings", json.dumps(material, sort_keys=True))
+            native = canonical_supervisor_review_material(request)
+            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v2")
+            self.assertEqual(native["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
+            self.assertIn("pre-dispatch eligibility", native["decision_rule"])
+            self.assertIn("does not assert", native["decision_rule"])
+            self.assertNotIn("PASS", json.dumps(native, sort_keys=True))
+            self.assertNotIn("FINDINGS", json.dumps(native, sort_keys=True))
+            self.assertNotEqual(request.input_digest, supervisor_request_digest(
+                review_attempt_id=request.review_attempt_id, provider_attempt_id=request.provider_attempt_id,
+                selected_profile_identity=request.selected_profile_identity,
+                within_round_attempt=request.within_round_attempt, context=request.context,
+                objective=request.objective, acceptance_criteria=request.acceptance_criteria,
+                response_contract=request.response_contract, decision_material=request.decision_material,
+                decision_semantic=None,
+            ))
 
     def test_accounting_runtime_has_no_direct_sql_dependency(self) -> None:
         source = (ROOT / "src" / "roundwright" / "provider_attempt_runtime.py").read_text(encoding="utf-8")

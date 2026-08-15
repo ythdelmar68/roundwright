@@ -82,6 +82,20 @@ class SupervisorAccountingBlocker(StrEnum):
     INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
 
 
+class SupervisorAccountingDecisionSemantic(StrEnum):
+    """Versioned prospective transition meaning for accounting responses."""
+
+    PRE_DISPATCH_ELIGIBILITY_V2 = "pre-dispatch-transition-eligibility/v2"
+
+
+ACCOUNTING_TRANSITION_OBJECTIVE = "Decide only whether this sealed accounting transition is eligible to record this one response."
+ACCOUNTING_TRANSITION_CRITERIA = (
+    "Treat the current unclaimed PREPARED attempt and its absent session, turn, completion, invalid, recovery, and acceptance fields as expected pre-dispatch facts.",
+    "Require accepted formal-review count zero before this response; complete authorizes this response to create exactly one completion and one accepted formal review after binding validation.",
+    "Return blocked only when immutable eligibility facts are missing, contradictory, drifted, or insufficient; do not inspect a repository or assess broad candidate correctness.",
+)
+
+
 class SupervisorDiagnostic(StrEnum):
     SYNTAX = "syntax"
     SHAPE = "shape"
@@ -154,9 +168,10 @@ class CodexSupervisorRequest:
     acceptance_criteria: tuple[str, ...]
     response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT
     decision_material: SupervisorAccountingSnapshot | None = None
+    decision_semantic: SupervisorAccountingDecisionSemantic | None = None
 
     def __post_init__(self) -> None:
-        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and self.decision_material is not None) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and not _accounting_material(self.decision_material)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material):
+        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and (self.decision_material is not None or self.decision_semantic is not None)) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and (not _accounting_material(self.decision_material) or self.decision_semantic is not SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2 or self.objective != ACCOUNTING_TRANSITION_OBJECTIVE or self.acceptance_criteria != ACCOUNTING_TRANSITION_CRITERIA)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material, decision_semantic=self.decision_semantic):
             raise CodexSupervisorError("Supervisor request is invalid")
 
 
@@ -331,17 +346,18 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     return SupervisorFailoverResult(None, tuple(attempted), True)
 
 
-def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: str, selected_profile_identity: str, within_round_attempt: int, context: CodexSupervisorContext, objective: str, acceptance_criteria: tuple[str, ...], response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT, decision_material: SupervisorAccountingSnapshot | None = None) -> str:
+def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: str, selected_profile_identity: str, within_round_attempt: int, context: CodexSupervisorContext, objective: str, acceptance_criteria: tuple[str, ...], response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT, decision_material: SupervisorAccountingSnapshot | None = None, decision_semantic: SupervisorAccountingDecisionSemantic | None = None) -> str:
     value: dict[str, object] = {"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "within_round_attempt": within_round_attempt, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria}
     if response_contract is not SupervisorResponseContract.VERDICT:
         value["response_contract"] = response_contract.value
         value["decision_material"] = decision_material.canonical_material() if type(decision_material) is SupervisorAccountingSnapshot else decision_material
+        value["decision_semantic"] = None if decision_semantic is None else decision_semantic.value
     return _digest(value)
 
 
 def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dict[str, object]:
     if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
-        return {"schema": "roundwright-provider-attempt-accounting-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_rule": "accept-only-when-sealed-verifications-and-formal-accounting-are-complete", "decision_material": request.decision_material.canonical_material()}
+        return {"schema": "roundwright-provider-attempt-accounting-material/v2", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_semantic": request.decision_semantic.value, "decision_rule": "pre-dispatch eligibility: complete authorizes this exact response to create one completion and accepted formal review; it does not assert either already exists", "decision_material": request.decision_material.canonical_material()}
     return {"schema": "roundwright-supervisor-review-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
 
 

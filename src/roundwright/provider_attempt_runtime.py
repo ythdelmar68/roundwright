@@ -23,7 +23,7 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    NativeCodexSupervisorBackend, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
@@ -547,13 +547,15 @@ class DurableDiffReviewRunner:
                 provider_attempt_id=selection.provider_attempt_id,
                 selected_profile_identity=selected,
                 within_round_attempt=selection.within_round_attempt,
-                context=context, objective=selection.objective,
-                acceptance_criteria=selection.acceptance_criteria,
+                context=context, objective=ACCOUNTING_TRANSITION_OBJECTIVE,
+                acceptance_criteria=ACCOUNTING_TRANSITION_CRITERIA,
                 response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING,
                 decision_material=decision_material,
+                decision_semantic=SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2,
             ),
-            context, selection.objective, selection.acceptance_criteria,
+            context, ACCOUNTING_TRANSITION_OBJECTIVE, ACCOUNTING_TRANSITION_CRITERIA,
             SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material,
+            SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2,
         )
         session_checkpointed = False
         turn_checkpointed = False

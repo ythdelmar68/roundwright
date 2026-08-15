@@ -109,7 +109,10 @@ class _Session(NativeSupervisorSession):
         if self._started or type(request) is not CodexSupervisorRequest:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
-        payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly.", "review_material": canonical_supervisor_review_material(request), "tools": []}
+        instruction = "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly."
+        if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+            instruction = "Decide only prospective pre-dispatch accounting-transition eligibility from the sealed material. The current PREPARED attempt has no session, turn, completion, invalidation, recovery, or acceptance by design; complete means this exact response may create one completion and one accepted formal review after binding validation, not that either already exists. Return blocked only for missing, contradictory, drifted, or insufficient immutable eligibility facts. Do not inspect repositories or assess broad candidate correctness. Return only the strict accounting schema."
+        payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": instruction, "review_material": canonical_supervisor_review_material(request), "tools": []}
         try:
             handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort(self._profile.reasoning_effort.value), output_schema=_schema(request.response_contract), sandbox=self._sandbox)
             return _Turn(handle, self, self._completion, self._clock, request.response_contract)

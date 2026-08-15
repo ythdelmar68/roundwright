@@ -140,6 +140,13 @@ skill applies its exact toolbox/target pins and standing Roundlet Booleans to a
 selected leaf. Neither the route nor the skill activates Roundwright or grants
 authority outside the reviewed root policy.
 
+New external profiles enter through the reviewed Harness `run-profile`
+executor and public factory
+`roundwright.external_validation:roundwright_profile_adapter_factory`.
+Roundwright owns typed profile/exporter/comparator semantics; Harness owns the
+single immutable execution/record/read-back path; generic Roundlet treats both
+as an opaque repository contract.
+
 ## Development check
 
 The packaging gate uses the tracked, receipt-bound toolchain described in

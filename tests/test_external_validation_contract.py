@@ -63,9 +63,12 @@ class ExternalValidationContractTests(unittest.TestCase):
             "`none`/`none`",
             "`harness`/`toolbox`",
             "`harness+forward-test`/`toolbox+disposable-target`",
-            "1bb063d3f8f1fef9a24b3147b8bc99794e4637a7",
+            "96772438b251e56d483733179939245565b1374a",
+            "cdfaec6fbcb521edb96a65a88ed4eed62a84f07a",
+            "369d964c44a7ef4653e13255d7c3e6a9ae87eeeb",
+            "0235427e02ea5b512a5fd5d81300f8b49ed4643c",
             "cf669e186a739a8597cfaf9f050ce3bdcadda334",
-            "632dcc3ecb3b8664de860844af2215ad5ade83e1",
+            "2756131387ab70c9511e8156fd4c595cc3996fd3",
             "4f39ef0e4e616eb896950d3756c433b624771a97",
             "allow_external_validation_read_only: true",
             "allow_external_validation_disposable_target_mutation: true",
@@ -73,8 +76,11 @@ class ExternalValidationContractTests(unittest.TestCase):
             "Phase 4-or-later",
             "ready_at",
             "Never pass the replay execution time",
+            "roundwright-harness-profile-executor-request/v1",
             "roundwright-harness-capture-plan/v1",
-            "same plan digest",
+            "run-profile --mode validate",
+            "--mode execute",
+            "roundwright.external_validation:roundwright_profile_adapter_factory",
             "ordinary curated public-safe GitHub lifecycle trace",
             "readiness, result, and handoff GitHub trace events",
         ):
@@ -106,11 +112,17 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("top-level integer `ready_at`", contract)
         self.assertIn("Harness PR #4", contract)
         self.assertIn("Harness PR #6", contract)
+        self.assertIn("Harness PR #8", contract)
+        self.assertIn("Roundlet PR #80", contract)
+        self.assertIn("96772438b251e56d483733179939245565b1374a", contract)
+        self.assertIn("369d964c44a7ef4653e13255d7c3e6a9ae87eeeb", contract)
         self.assertIn("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", contract)
         self.assertIn("cf669e186a739a8597cfaf9f050ce3bdcadda334", contract)
         self.assertIn("632dcc3ecb3b8664de860844af2215ad5ade83e1", contract)
         self.assertNotIn("fresh authenticated owner approval", contract)
-        self.assertIn("Profile readiness, provider dispatch, typed export, comparison, recording, and read-back must consume that exact digest", " ".join(contract.split()))
+        normalized = " ".join(contract.split())
+        self.assertIn("Profile readiness, dispatch, typed export/comparison, recording, and read-back therefore use one entrypoint and one plan", normalized)
+        self.assertIn("Validate and execute use the same request, parser, adapter factory, plan, store, and entrypoint", normalized)
 
     def test_capture_readiness_contract_is_synchronized_and_root_only_routes(self) -> None:
         paths = (

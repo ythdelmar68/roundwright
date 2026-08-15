@@ -26,7 +26,7 @@ from .codex_supervisor import (
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
-from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding
+from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
@@ -288,7 +288,11 @@ class DurableDiffReviewRunner:
                     selected_profile_identity=entry.audit.profile_identity,
                     now=self.dispatch_control.now,
                 )
-            except (CandidateReviewError, ProviderRecoveryError):
+            # Every provider-free eligibility dependency is normalized here.
+            # No raw Git/state/provider error may cross the hosted readiness
+            # boundary, while execute-time checkpoint failures retain their
+            # separate typed classification below.
+            except (CandidateReviewError, GitIdentityError, ProviderRecoveryError):
                 raise ProviderAttemptRuntimeError("provider attempt checkpoint preflight blocked") from None
         return entries
 

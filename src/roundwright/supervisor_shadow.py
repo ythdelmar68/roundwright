@@ -194,7 +194,11 @@ class SupervisorExpectedLifecycle:
     @property
     def context_identity(self) -> str: return _hash({"task_id": self.binding.task_id, "base_sha": self.binding.base_sha, "candidate_sha": self.binding.candidate_sha, "requests": self.binding.request_identities, "profiles": self.binding.profile_identities, "runtime": self.binding.runtime_fingerprints, "epoch": self.binding.review_epoch, "round": self.binding.review_round, "mode": self.binding.review_mode, "capture_plan": self.binding.capture_plan_digest})
     @property
-    def plan_identity(self) -> str: return _hash({**self.payload(), "context_identity": self.context_identity, "allowed_result_kinds": tuple(item.value for item in SupervisorResultKind), "attempt_budget": len(self.binding.profile_identities)})
+    def plan_identity(self) -> str:
+        # V1 record identity is immutable historical evidence.  It predates
+        # BLOCKED, so its result vocabulary must remain byte-for-byte stable.
+        kinds = ("accepted", "invalid", "incomplete", "ambiguous") if self.schema.endswith("/v1") else tuple(item.value for item in SupervisorResultKind)
+        return _hash({**self.payload(), "context_identity": self.context_identity, "allowed_result_kinds": kinds, "attempt_budget": len(self.binding.profile_identities)})
     @property
     def source_identity(self) -> str: return _hash(self.payload())
 

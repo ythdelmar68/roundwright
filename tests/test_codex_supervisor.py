@@ -530,6 +530,29 @@ class SupervisorTests(unittest.TestCase):
                 read = lifecycle.read(prepared.record_identity, evidence_time=10)
                 self.assertEqual((read.expected_plan.payload(), read.expected_plan.source_identity, read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan.payload(), plan.source_identity, plan.plan_identity, prepared, terminal_receipt))
 
+    def test_legacy_v1_plan_identity_matches_literal_pre_blocked_compatibility_vector(self):
+        binding = SupervisorSequenceBinding(
+            "legacy-case", "b" * 40, "a" * 40, "task-legacy",
+            ("sha256:e8a251387e54f7f70d4c4294378b3bcacda3ff10b8d872a9b050d32b0ce142ff", "sha256:c3833b1998943ac5635c4d37800813a7ba8c971442481cde2fb531e025c77256"),
+            ("sha256:c6655fb15fcbdcbb36513c28889afadaa3f55d2efea183e244a770e0bab3b63c", "sha256:2852219181564429832c3e28502adbc22475c266bdb6f2ca238914fac6f7cc47"),
+            ("sha256:1bd3233d6da7420c090d11fd663357b5b16106540debc5c88c7f53d74fa8d696", "sha256:a826abecdadb70c429e71a3c3032d9282838eb22bdfd9ef1230069ec915e5bc6"),
+            2, 4, "CONVERGING", "sha256:f19f1897f8abd7f59b420a51a42aff1b67cc632a9a7f2ac3152d29792f789e47",
+        )
+        plan = SupervisorExpectedLifecycle(binding, "sha256:17ad92e63c962393c0329c658937d16eccaea13036412a3d1d0a5b6b8f29d738", "sha256:0e57ae90f420d845c9bc973dea8fcbab9baa3809be286830eaca40dc94266a2c", "sha256:2d52cd9073053426a522ce4fb85745902ca2f9482e61774b7c1fa6c44a68931d", 17, "sha256:6bdb95cbfd647dc56d6b1d241787c6a3aafffe36896105fbb416fa8c1e6711ff", "roundwright-supervisor-expected-lifecycle/v1")
+        expected_payload = {"schema": "roundwright-supervisor-expected-lifecycle/v1", "binding": {"case_id": "legacy-case", "candidate_sha": "b" * 40, "base_sha": "a" * 40, "task_id": "task-legacy", "request_identities": ["sha256:e8a251387e54f7f70d4c4294378b3bcacda3ff10b8d872a9b050d32b0ce142ff", "sha256:c3833b1998943ac5635c4d37800813a7ba8c971442481cde2fb531e025c77256"], "profile_identities": ["sha256:c6655fb15fcbdcbb36513c28889afadaa3f55d2efea183e244a770e0bab3b63c", "sha256:2852219181564429832c3e28502adbc22475c266bdb6f2ca238914fac6f7cc47"], "runtime_fingerprints": ["sha256:1bd3233d6da7420c090d11fd663357b5b16106540debc5c88c7f53d74fa8d696", "sha256:a826abecdadb70c429e71a3c3032d9282838eb22bdfd9ef1230069ec915e5bc6"], "review_epoch": 2, "review_round": 4, "review_mode": "CONVERGING", "capture_plan_digest": "sha256:f19f1897f8abd7f59b420a51a42aff1b67cc632a9a7f2ac3152d29792f789e47"}, "policy_digest": "sha256:17ad92e63c962393c0329c658937d16eccaea13036412a3d1d0a5b6b8f29d738", "configuration_digest": "sha256:0e57ae90f420d845c9bc973dea8fcbab9baa3809be286830eaca40dc94266a2c", "runtime_identity": "sha256:2d52cd9073053426a522ce4fb85745902ca2f9482e61774b7c1fa6c44a68931d", "ready_at": 17, "observation_identity": "sha256:6bdb95cbfd647dc56d6b1d241787c6a3aafffe36896105fbb416fa8c1e6711ff", "allowed_terminal": ["accepted", "exhausted"], "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "exhausted_next_action": "retain-terminal-product-block"}
+        self.assertEqual(json.loads(json.dumps(plan.payload())), expected_payload)
+        self.assertEqual((plan.context_identity, plan.plan_identity, plan.source_identity), ("sha256:155b232c92cb3aee7b57551fe59444545ef78efb95cc8c2044392cec958e0f9d", "sha256:1a3715e444896e33016a2f8914b7c1a7828cb390880fb4a96ce920279bd4ac43", "sha256:a3b62fdae8fa96198f92467430c488e1ff1c55bbd2a6700de15438931e2662cf"))
+        source = "sha256:dddb9d06056750e136eff66f10f8a25484b2db32811d8c72935a6a9d391839e1"
+        memory = InMemorySupervisorLifecycle(source)
+        memory_receipt = memory.prepare(plan, freshness_until=29)
+        self.assertEqual((memory_receipt.record_identity, memory_receipt.receipt_digest), ("sha256:1879df50838884831786253f593d6c49d771b982b8ec3d3ec9d45207d6773c62", "sha256:d8d3497add0f87cb93231aceca3e05163d9610b90690d8adb24cd4989cb2737d"))
+        self.assertEqual(memory.read_plan(memory_receipt.record_identity, evidence_time=17), (plan, memory_receipt))
+        with TemporaryDirectory() as temporary:
+            file = FileSupervisorLifecycle(Path(temporary) / "legacy", source)
+            file_receipt = file.prepare(plan, freshness_until=29)
+            self.assertEqual(file_receipt, memory_receipt)
+            self.assertEqual(FileSupervisorLifecycle(Path(temporary) / "legacy", source).read_plan(file_receipt.record_identity, evidence_time=17), (plan, file_receipt))
+
     def test_v1_rejects_new_terminal_kinds_while_v2_allows_them(self):
         _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
         for schema, allowed in (("roundwright-supervisor-expected-lifecycle/v1", False), ("roundwright-supervisor-expected-lifecycle/v2", True)):

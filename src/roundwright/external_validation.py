@@ -56,7 +56,7 @@ PROVIDER_ATTEMPT_EXPORTER_IDENTITY = _digest(
 PROVIDER_ATTEMPT_COMPARATOR_IDENTITY = _digest(
     {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "component": "capture-time-v2-comparator"}
 )
-PROVIDER_ATTEMPT_HISTORY_BLOCKER = "durable-provider-attempt-history-unavailable"
+PROVIDER_ATTEMPT_HISTORY_BLOCKER = "provider-attempt-runtime-unavailable"
 
 
 def synthetic_component_identities() -> tuple[str, str, str]:
@@ -374,11 +374,17 @@ def _provider_attempt_history_blocker(binding: object) -> dict[str, object]:
     return {
         "code": PROVIDER_ATTEMPT_HISTORY_BLOCKER,
         "binding_identity": _provider_attempt_binding_identity(binding),
-        "required_public_contract": "plan-bound-durable-profile-event-source/v1",
+        "required_public_contract": "plan-bound-product-execution-context/v1",
         "required_records": [
             "base-candidate-policy-configuration-provider-context",
             "provider-attempt-invalid-recovery-acceptance-events",
             "review-policy-mode-round-and-lifecycle-state",
+        ],
+        "missing_runtime_capabilities": [
+            "repository-and-task-identity",
+            "transition-lease-and-candidate-seal",
+            "pinned-runtime-policy-and-provider-profile",
+            "bounded-provider-backend-and-durable-lifecycle-store",
         ],
     }
 
@@ -389,7 +395,7 @@ def _require_provider_attempt_history(binding: object) -> None:
     _provider_attempt_history_blocker(binding)
     raise ExternalValidationAdapterError(
         f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: reviewed ExecutorBinding lacks "
-        "a plan-bound durable profile event source"
+        "a plan-bound product execution context"
     )
 
 

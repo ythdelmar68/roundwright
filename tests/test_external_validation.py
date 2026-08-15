@@ -215,6 +215,14 @@ class ExternalValidationTests(unittest.TestCase):
             accounting["blocker"]["code"],
             external_validation.PROVIDER_ATTEMPT_HISTORY_BLOCKER,
         )
+        self.assertEqual(
+            accounting["blocker"]["required_public_contract"],
+            "plan-bound-product-execution-context/v1",
+        )
+        self.assertIn(
+            "bounded-provider-backend-and-durable-lifecycle-store",
+            accounting["blocker"]["missing_runtime_capabilities"],
+        )
         self.assertEqual(accounting["mutation_count"], 0)
         self.assertEqual(adapter.compare(exact, evidence).status, "fail")
 

@@ -33,6 +33,7 @@ from .provider_recovery import (
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
     read_supervisor_terminal_failure, record_supervisor_terminal_failure,
     read_attempt, record_invalid_output, recover_attempt,
+    SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import TaskIdentity, check_database, require_runtime_binding, task_projection
@@ -433,9 +434,9 @@ class DurableDiffReviewRunner:
                 record_supervisor_terminal_failure(
                     self.repository, self.identity, recovery,
                     attempt_id=selection.provider_attempt_id,
-                    failure_class=result.failure.value,
-                    outcome_source=result.outcome_source.value,
-                    sdk_error_category=result.sdk_error_category.value,
+                    failure_class=SupervisorTerminalFailureClass(result.failure.value),
+                    outcome_source=SupervisorTerminalFailureSource(result.outcome_source.value),
+                    sdk_error_category=SupervisorTerminalFailureSdkCategory(result.sdk_error_category.value),
                     lease=self.lease, now=self.dispatch_control.now,
                 )
                 recover_attempt(

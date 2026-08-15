@@ -54,6 +54,33 @@ class RecoveryAction(StrEnum):
     BLOCKED_IDENTITY_DRIFT = "blocked-identity-drift"
 
 
+class SupervisorTerminalFailureClass(StrEnum):
+    AUTH_MISSING = "auth-missing"
+    AUTH_EXPIRED = "auth-expired"
+    QUOTA_OR_RATE_LIMIT = "quota-or-rate-limit"
+    MODEL_UNAVAILABLE = "model-unavailable"
+    SDK_INCOMPATIBLE = "sdk-incompatible"
+    SANDBOX_OR_APPROVAL_DENIED = "sandbox-or-approval-denied"
+    TRANSPORT_OR_PROVIDER_OUTAGE = "transport-or-provider-outage"
+    MALFORMED_RESPONSE = "malformed-response"
+    UNKNOWN = "unknown"
+
+
+class SupervisorTerminalFailureSource(StrEnum):
+    SDK_TURN_FAILED = "sdk-turn-failed"
+
+
+class SupervisorTerminalFailureSdkCategory(StrEnum):
+    BAD_REQUEST = "bad-request"
+    UNAUTHORIZED = "unauthorized"
+    SANDBOX = "sandbox"
+    OVERLOAD = "overload"
+    HTTP = "http"
+    STREAM = "stream"
+    CONNECTION = "connection"
+    MISSING_OR_UNKNOWN = "missing-or-unknown"
+
+
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -157,9 +184,13 @@ class RecoveryProjection:
 class SupervisorTerminalFailure:
     """Durable public-safe SDK terminal failure, never provider prose."""
 
-    failure_class: str
-    outcome_source: str
-    sdk_error_category: str
+    failure_class: SupervisorTerminalFailureClass
+    outcome_source: SupervisorTerminalFailureSource
+    sdk_error_category: SupervisorTerminalFailureSdkCategory
+
+    def __post_init__(self) -> None:
+        if type(self.failure_class) is not SupervisorTerminalFailureClass or self.outcome_source is not SupervisorTerminalFailureSource.SDK_TURN_FAILED or type(self.sdk_error_category) is not SupervisorTerminalFailureSdkCategory:
+            raise ProviderRecoveryError("terminal failure projection is invalid")
 
 
 @dataclass(frozen=True)
@@ -612,9 +643,9 @@ def record_supervisor_terminal_failure(
     context: RecoveryContext,
     *,
     attempt_id: str,
-    failure_class: str,
-    outcome_source: str,
-    sdk_error_category: str,
+    failure_class: SupervisorTerminalFailureClass,
+    outcome_source: SupervisorTerminalFailureSource,
+    sdk_error_category: SupervisorTerminalFailureSdkCategory,
     lease: TransitionLease | None = None,
     now: int | None = None,
 ) -> ProviderAttempt:
@@ -627,10 +658,10 @@ def record_supervisor_terminal_failure(
     _validate_task(identity)
     _validate_context(identity, context)
     _require_token(attempt_id, "attempt identity")
-    for value, name in ((failure_class, "failure class"), (outcome_source, "outcome source"), (sdk_error_category, "SDK error category")):
-        _require_token(value, name)
+    if type(failure_class) is not SupervisorTerminalFailureClass or outcome_source is not SupervisorTerminalFailureSource.SDK_TURN_FAILED or type(sdk_error_category) is not SupervisorTerminalFailureSdkCategory:
+        raise ProviderRecoveryError("terminal failure projection is invalid")
     observed = _clock(now)
-    blocker = f"terminal-failure:{outcome_source}:{failure_class}:{sdk_error_category}"
+    blocker = f"terminal-failure:{outcome_source.value}:{failure_class.value}:{sdk_error_category.value}"
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -685,9 +716,9 @@ def read_supervisor_terminal_failure(
         if len(parts) != 4 or parts[0] != "terminal-failure":
             return None
         _, source, failure, category = parts
-        for value in (source, failure, category):
-            _require_token(value, "terminal failure projection")
-        return SupervisorTerminalFailure(failure, source, category)
+        return SupervisorTerminalFailure(SupervisorTerminalFailureClass(failure), SupervisorTerminalFailureSource(source), SupervisorTerminalFailureSdkCategory(category))
+    except ValueError:
+        raise ProviderRecoveryError("terminal failure projection is invalid") from None
     finally:
         connection.close()
 

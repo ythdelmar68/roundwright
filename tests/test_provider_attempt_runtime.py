@@ -34,7 +34,9 @@ from roundwright.provider_attempt_runtime import (
 from roundwright.provider_health import CodexFailure
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext,
-    read_attempt, read_supervisor_terminal_failure,
+    SupervisorTerminalFailure, read_attempt, read_supervisor_terminal_failure,
+    record_supervisor_terminal_failure,
+    SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
 )
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.state import TaskIdentity, database_path
@@ -264,7 +266,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             assert terminal is not None
             self.assertEqual(
                 (terminal.failure_class, terminal.outcome_source, terminal.sdk_error_category),
-                ("transport-or-provider-outage", "sdk-turn-failed", "overload"),
+                (SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorTerminalFailureSource.SDK_TURN_FAILED, SupervisorTerminalFailureSdkCategory.OVERLOAD),
             )
             self.assertEqual(read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery).state, AttemptState.ACCEPTED)
             connection = sqlite3.connect(database_path(repository))
@@ -295,6 +297,37 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             assert graph is not None
             self.assertIn("provider-terminal-failure", tuple(item.event_kind for item in graph.events))
             self.assertNotIn("invalid-output", tuple(item.event_kind for item in graph.events))
+
+    def test_terminal_failure_projection_is_closed_and_rejects_untrusted_strings_before_mutation(self) -> None:
+        self.assertEqual(tuple(item.value for item in SupervisorTerminalFailureClass), tuple(item.value for item in CodexFailure))
+        self.assertEqual(tuple(item.value for item in SupervisorTerminalFailureSdkCategory), tuple(item.value for item in SupervisorSdkTurnErrorCategory))
+        self.assertEqual(tuple(item.value for item in SupervisorTerminalFailureSource), tuple(item.value for item in SupervisorOutcomeSource))
+        for failure in SupervisorTerminalFailureClass:
+            for category in SupervisorTerminalFailureSdkCategory:
+                value = SupervisorTerminalFailure(failure, SupervisorTerminalFailureSource.SDK_TURN_FAILED, category)
+                self.assertEqual((value.failure_class, value.outcome_source, value.sdk_error_category), (failure, SupervisorTerminalFailureSource.SDK_TURN_FAILED, category))
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                before = connection.execute("SELECT COUNT(*) FROM provider_recovery_outcomes").fetchone()[0]
+            finally:
+                connection.close()
+            for raw in ("C:/private/path", "private:error", "raw provider error", "C:\\private\\error"):
+                with self.subTest(raw=raw):
+                    with self.assertRaises(ProviderRecoveryError) as raised:
+                        record_supervisor_terminal_failure(
+                            repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id,
+                            failure_class=raw, outcome_source=raw, sdk_error_category=raw, lease=runner.lease,
+                        )  # type: ignore[arg-type]
+                    self.assertNotIn("private", str(raised.exception))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_recovery_outcomes").fetchone()[0], before)
+            finally:
+                connection.close()
 
     def test_runner_context_drift_blocks_before_the_native_backend(self) -> None:
         with TemporaryDirectory() as temporary:

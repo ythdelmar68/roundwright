@@ -40,6 +40,7 @@ from roundwright.supervisor_shadow import (
     SupervisorShadowError, TrustedReviewPolicyReceipt,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_lifecycle_identity, supervisor_sequence_observation_identity,
+    _sequence_attempt,
 )
 
 
@@ -218,6 +219,18 @@ class SupervisorTests(unittest.TestCase):
                 response = _consume(Handle(), CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
                 self.assertEqual((response.kind, response.failure, response.outcome_source, response.sdk_error_category), (SupervisorResultKind.BLOCKED, failure, SupervisorOutcomeSource.SDK_TURN_FAILED, category))
                 self.assertNotIn("private", repr(response))
+
+    def test_terminal_failure_category_is_bound_into_the_public_result_identity(self):
+        identities = []
+        for category in (SupervisorSdkTurnErrorCategory.OVERLOAD, SupervisorSdkTurnErrorCategory.CONNECTION):
+            adapter = self.adapter(self.profiles[0], category.value, NativeSupervisorResponse(
+                SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category,
+            ))
+            request = self.request(1, adapter)
+            result = adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            identities.append(_sequence_attempt(1, request, result).result_identity)
+        self.assertNotEqual(*identities)
 
     def test_eof_timeout_and_stream_failures_stop_before_fallback(self):
         class EofHandle:
@@ -494,6 +507,65 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNot(value.expected_plan, plan)
         self.assertIsNot(value.events[0], event)
         self.assertIsNot(value.terminal, terminal)
+
+    def test_legacy_v1_accepted_and_exhausted_records_retain_original_identities(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        for terminal_kind in ("accepted", "exhausted"):
+            with self.subTest(terminal=terminal_kind):
+                lifecycle = InMemorySupervisorLifecycle(digest("legacy-" + terminal_kind))
+                plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("legacy-runtime-" + terminal_kind), 10, readiness.observation_identity, "roundwright-supervisor-expected-lifecycle/v1")
+                self.assertEqual(plan.payload()["schema"], "roundwright-supervisor-expected-lifecycle/v1")
+                self.assertEqual(plan.payload()["allowed_terminal"], ("accepted", "exhausted"))
+                prepared = lifecycle.prepare(plan, freshness_until=20)
+                prior = prepared
+                count = 1 if terminal_kind == "accepted" else len(binding.profile_identities)
+                for ordinal in range(1, count + 1):
+                    accepted = terminal_kind == "accepted"
+                    event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, ordinal, prior.receipt_digest, binding.request_identities[ordinal - 1], binding.profile_identities[ordinal - 1], binding.runtime_fingerprints[ordinal - 1], SupervisorResultKind.ACCEPTED.value if accepted else SupervisorResultKind.INVALID.value, digest(f"legacy-{terminal_kind}-{ordinal}"), digest(f"legacy-{terminal_kind}-{ordinal}") if accepted else None, "pass" if accepted else None, 10, 20)
+                    prior = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+                terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, prior.receipt_digest, count, terminal_kind, digest("legacy-accepted-1") if terminal_kind == "accepted" else None, None if terminal_kind == "accepted" else "attempt-budget-exhausted", "apply-bound-review-result" if terminal_kind == "accepted" else "retain-terminal-product-block", 10)
+                if terminal_kind == "accepted":
+                    terminal = replace(terminal, accepted_result_identity=digest("legacy-accepted-1"))
+                terminal_receipt = lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+                read = lifecycle.read(prepared.record_identity, evidence_time=10)
+                self.assertEqual((read.expected_plan.payload(), read.expected_plan.source_identity, read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan.payload(), plan.source_identity, plan.plan_identity, prepared, terminal_receipt))
+
+    def test_v1_rejects_new_terminal_kinds_while_v2_allows_them(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        for schema, allowed in (("roundwright-supervisor-expected-lifecycle/v1", False), ("roundwright-supervisor-expected-lifecycle/v2", True)):
+            with self.subTest(schema=schema):
+                lifecycle = InMemorySupervisorLifecycle(digest("schema-" + schema[-2:]))
+                plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("schema-runtime-" + schema[-2:]), 10, readiness.observation_identity, schema)
+                prepared = lifecycle.prepare(plan, freshness_until=20)
+                event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, 1, prepared.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.AMBIGUOUS.value, digest("schema-ambiguous"), None, None, 10, 20)
+                receipt = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+                terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, receipt.receipt_digest, 1, "ambiguous", None, "provider-outcome-ambiguous", "retain-terminal-product-block", 10)
+                if allowed:
+                    lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+                    self.assertEqual(lifecycle.read(prepared.record_identity, evidence_time=10).terminal, terminal)
+                else:
+                    with self.assertRaises(SupervisorShadowError):
+                        lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+
+    def test_file_lifecycle_reads_canonical_legacy_v1_terminal_records_unchanged(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        with TemporaryDirectory() as temporary:
+            for terminal_kind in ("accepted", "exhausted"):
+                with self.subTest(terminal=terminal_kind):
+                    plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("legacy-file-runtime-" + terminal_kind), 10, readiness.observation_identity, "roundwright-supervisor-expected-lifecycle/v1")
+                    lifecycle = FileSupervisorLifecycle(Path(temporary) / terminal_kind, digest("legacy-file-" + terminal_kind))
+                    prepared = lifecycle.prepare(plan, freshness_until=20)
+                    prior = prepared
+                    count = 1 if terminal_kind == "accepted" else len(binding.profile_identities)
+                    for ordinal in range(1, count + 1):
+                        accepted = terminal_kind == "accepted"
+                        result_identity = digest(f"legacy-file-{terminal_kind}-{ordinal}")
+                        event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, ordinal, prior.receipt_digest, binding.request_identities[ordinal - 1], binding.profile_identities[ordinal - 1], binding.runtime_fingerprints[ordinal - 1], SupervisorResultKind.ACCEPTED.value if accepted else SupervisorResultKind.INVALID.value, result_identity, result_identity if accepted else None, "pass" if accepted else None, 10, 20)
+                        prior = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+                    terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, prior.receipt_digest, count, terminal_kind, digest("legacy-file-accepted-1") if terminal_kind == "accepted" else None, None if terminal_kind == "accepted" else "attempt-budget-exhausted", "apply-bound-review-result" if terminal_kind == "accepted" else "retain-terminal-product-block", 10)
+                    terminal_receipt = lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+                    read = FileSupervisorLifecycle(Path(temporary) / terminal_kind, digest("legacy-file-" + terminal_kind)).read(prepared.record_identity, evidence_time=10)
+                    self.assertEqual((read.expected_plan.payload(), read.expected_plan.source_identity, read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan.payload(), plan.source_identity, plan.plan_identity, prepared, terminal_receipt))
 
     def test_lifecycle_store_state_guards(self):
         lifecycle = InMemorySupervisorLifecycle(digest("lifecycle-source")); adapters, requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)

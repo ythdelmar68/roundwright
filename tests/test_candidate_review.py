@@ -532,12 +532,32 @@ class CandidateReviewTests(unittest.TestCase):
                     output=DiffReviewOutput(review.diff_review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity, review.external_turn_identity, review.message_identity, seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS),
                     completion_evidence_fingerprint=evidence, lease=lease, now=now,
                 ).accepted)
+            # Public read-back reopens state and remains epoch-scoped.
+            self.assertTrue(read_diff_review(repository, identity, first.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
+            self.assertTrue(read_diff_review(repository, identity, second.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
             with self.assertRaisesRegex(CandidateReviewError, "formal review round"):
                 dispatch(2, "duplicate")
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT review_epoch, review_round FROM diff_review_attempts WHERE state='accepted' ORDER BY review_epoch").fetchall(), [(1, 1), (2, 1)])
                 self.assertEqual(connection.execute("SELECT review_epoch FROM accepted_provider_reviews ORDER BY review_epoch").fetchall(), [(1,), (2,)])
+                before = connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=?", (identity.task_id,)).fetchone()[0]
+            finally:
+                connection.close()
+            # Reusing a persisted epoch-2 identity under another epoch is drift,
+            # not a new dispatch; no provider/lifecycle row may be created.
+            with self.assertRaisesRegex(CandidateReviewError, "replay conflicts"):
+                dispatch_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id=second.diff_review_attempt_id, implementation_attempt_id=implementation.implementation_attempt_id,
+                    provider_attempt_id="epoch-drift-provider", supervisor_session_identity="epoch-drift-session",
+                    external_turn_identity="epoch-drift-turn", message_identity="epoch-drift-message",
+                    process_lease_id="epoch-drift-lease", process_lease_expires_at=now + 60,
+                    review_epoch=3, review_round=1, lease=lease, now=now,
+                )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=?", (identity.task_id,)).fetchone()[0], before)
             finally:
                 connection.close()
 

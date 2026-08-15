@@ -586,7 +586,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 drifted.execute()
             self.assertEqual(backend.calls, 0)
 
-    def test_missing_session_identity_creates_no_provider_attempt(self) -> None:
+    def test_missing_session_identity_retains_a_prepared_attempt_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, _, repository, identity, recovery, _ = self.durable_runner(
                 Path(temporary) / "repository",
@@ -604,8 +604,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "session checkpoint"):
                 runner.execute()
             self.assertEqual(backend.calls, 1)
-            with self.assertRaises(ProviderRecoveryError):
-                read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual(stored.state, AttemptState.PREPARED)
+            self.assertIsNone(stored.session_identity)
+            self.assertIsNone(stored.external_turn_identity)
+            self.assertIsNone(stored.output_pointer)
+            self.assertIsNone(stored.accepted_review_identity)
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                runner.execute()
+            self.assertEqual(backend.calls, 1)
 
     def test_local_session_checkpoint_failure_is_not_a_native_provider_outcome(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -640,8 +647,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertNotIn("private", str(failure))
             self.assertEqual((first.calls, second.calls), (1, 0))
             self.assertTrue(any(item[0] == "close" for item in events))
-            with self.assertRaises(ProviderRecoveryError):
-                read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual(stored.state, AttemptState.PREPARED)
+            self.assertIsNone(stored.session_identity)
+            self.assertIsNone(stored.external_turn_identity)
+            self.assertIsNone(stored.output_pointer)
+            self.assertIsNone(stored.accepted_review_identity)
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                runner.execute()
+            self.assertEqual((first.calls, second.calls), (1, 0))
 
     def test_local_turn_checkpoint_failure_preserves_only_the_session_checkpoint(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -679,6 +693,11 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(stored.state, AttemptState.PREPARED)
             self.assertIsNotNone(stored.session_identity)
             self.assertIsNone(stored.external_turn_identity)
+            self.assertIsNone(stored.output_pointer)
+            self.assertIsNone(stored.accepted_review_identity)
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                runner.execute()
+            self.assertEqual((first.calls, second.calls), (1, 0))
 
     def test_projection_binds_non_first_epoch_and_formal_round(self) -> None:
         with TemporaryDirectory() as temporary:

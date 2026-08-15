@@ -93,21 +93,23 @@ class SupervisorAccountingBlocker(StrEnum):
 class SupervisorAccountingAttemptSnapshot:
     attempt_id: str; within_round_attempt: int; profile_identity: str; state: AttemptState
     session_present: bool; turn_present: bool; completion_present: bool; invalid_output_present: bool
-    recovery_action: RecoveryAction | None; accepted: bool
+    recovery_action: RecoveryAction | None; terminal_failure: SupervisorTerminalFailure | None; accepted: bool
     def __post_init__(self) -> None:
-        if not _TOKEN.fullmatch(self.attempt_id) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.profile_identity) or type(self.state) is not AttemptState or any(type(value) is not bool for value in (self.session_present, self.turn_present, self.completion_present, self.invalid_output_present, self.accepted)) or (self.recovery_action is not None and type(self.recovery_action) is not RecoveryAction):
+        if not _TOKEN.fullmatch(self.attempt_id) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.profile_identity) or type(self.state) is not AttemptState or any(type(value) is not bool for value in (self.session_present, self.turn_present, self.completion_present, self.invalid_output_present, self.accepted)) or (self.recovery_action is not None and type(self.recovery_action) is not RecoveryAction) or (self.terminal_failure is not None and type(self.terminal_failure) is not SupervisorTerminalFailure):
             raise ProviderRecoveryError("accounting attempt snapshot is invalid")
         if self.accepted != (self.state is AttemptState.ACCEPTED) or self.accepted and (not self.session_present or not self.turn_present or not self.completion_present or self.invalid_output_present):
             raise ProviderRecoveryError("accounting attempt snapshot is inconsistent")
-        if self.state is AttemptState.PREPARED and (self.session_present or self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not None or self.accepted):
+        if self.state is AttemptState.PREPARED and (self.session_present or self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not None or self.terminal_failure is not None or self.accepted):
             raise ProviderRecoveryError("accounting prepared snapshot is inconsistent")
         if self.turn_present and not self.session_present:
             raise ProviderRecoveryError("accounting turn snapshot is inconsistent")
         if self.invalid_output_present and self.state is not AttemptState.INVALIDATED:
             raise ProviderRecoveryError("accounting invalid snapshot is inconsistent")
-        if self.state is AttemptState.INVALIDATED and (not self.invalid_output_present or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
+        if self.terminal_failure is not None and (self.state is not AttemptState.INVALIDATED or not self.session_present or not self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
+            raise ProviderRecoveryError("accounting terminal failure snapshot is inconsistent")
+        if self.state is AttemptState.INVALIDATED and ((self.invalid_output_present == (self.terminal_failure is not None)) or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
             raise ProviderRecoveryError("accounting recovery snapshot is inconsistent")
-    def canonical_material(self) -> dict[str, object]: return {"attempt_id":self.attempt_id,"within_round_attempt":self.within_round_attempt,"profile_identity":self.profile_identity,"state":self.state.value,"session_present":self.session_present,"turn_present":self.turn_present,"completion_present":self.completion_present,"invalid_output_present":self.invalid_output_present,"recovery_action":None if self.recovery_action is None else self.recovery_action.value,"accepted":self.accepted}
+    def canonical_material(self) -> dict[str, object]: return {"attempt_id":self.attempt_id,"within_round_attempt":self.within_round_attempt,"profile_identity":self.profile_identity,"state":self.state.value,"session_present":self.session_present,"turn_present":self.turn_present,"completion_present":self.completion_present,"invalid_output_present":self.invalid_output_present,"recovery_action":None if self.recovery_action is None else self.recovery_action.value,"terminal_failure":None if self.terminal_failure is None else {"failure_class":self.terminal_failure.failure_class.value,"outcome_source":self.terminal_failure.outcome_source.value,"sdk_error_category":self.terminal_failure.sdk_error_category.value},"accepted":self.accepted}
 
 
 @dataclass(frozen=True)
@@ -272,9 +274,10 @@ def read_supervisor_accounting_snapshot(
         formal = connection.execute("SELECT COUNT(*),SUM(CASE WHEN state='accepted' THEN 1 ELSE 0 END) FROM diff_review_attempts WHERE task_id=? AND review_round=?", (identity.task_id,review_round)).fetchone()
         def attempt(attempt_id: str, ordinal: int, profile: str) -> SupervisorAccountingAttemptSnapshot:
             row = connection.execute("SELECT state,session_identity,external_turn_identity,output_pointer,completion_evidence_fingerprint,accepted_review_identity,selected_profile_identity FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id,attempt_id)).fetchone()
-            outcome = connection.execute("SELECT recovery_action FROM provider_recovery_outcomes WHERE attempt_id=?", (attempt_id,)).fetchone()
+            outcome = connection.execute("SELECT recovery_action,blocker FROM provider_recovery_outcomes WHERE attempt_id=?", (attempt_id,)).fetchone()
             if row is None or row[6] != profile: raise ProviderRecoveryError("accounting snapshot attempt is unavailable")
-            return SupervisorAccountingAttemptSnapshot(attempt_id,ordinal,profile,AttemptState(row[0]),row[1] is not None,row[2] is not None,row[4] is not None,(row[3] or "").startswith("supervisor-invalid-"),None if outcome is None else RecoveryAction(outcome[0]),row[5] is not None)
+            persisted = None if outcome is None else _PersistedRecoveryOutcome(RecoveryAction(outcome[0]), outcome[1])
+            return SupervisorAccountingAttemptSnapshot(attempt_id,ordinal,profile,AttemptState(row[0]),row[1] is not None,row[2] is not None,row[4] is not None,(row[3] or "").startswith("supervisor-invalid-"),None if outcome is None else RecoveryAction(outcome[0]),_terminal_failure_from_outcome(AttemptState(row[0]), persisted),row[5] is not None)
         current = attempt(current_attempt_id,current_within_round_attempt,current_profile_identity)
         prior = tuple(attempt(*item) for item in prior_attempts)
         binding = context.runtime_binding
@@ -794,17 +797,32 @@ def read_supervisor_terminal_failure(
         _require_matching_task(connection, identity)
         row = _attempt_row(connection, identity.task_id, attempt_id)
         outcome = _read_recovery_outcome(connection, attempt_id)
-        if row.state is not AttemptState.INVALIDATED or outcome is None or outcome.action is not RecoveryAction.FRESH_SUPERVISOR_SESSION or outcome.blocker is None:
-            return None
-        parts = outcome.blocker.split(":")
-        if len(parts) != 4 or parts[0] != "terminal-failure":
-            return None
-        _, source, failure, category = parts
-        return SupervisorTerminalFailure(SupervisorTerminalFailureClass(failure), SupervisorTerminalFailureSource(source), SupervisorTerminalFailureSdkCategory(category))
+        return _terminal_failure_from_outcome(row.state, outcome)
     except ValueError:
         raise ProviderRecoveryError("terminal failure projection is invalid") from None
     finally:
         connection.close()
+
+
+def _terminal_failure_from_outcome(
+    state: AttemptState, outcome: _PersistedRecoveryOutcome | None,
+) -> SupervisorTerminalFailure | None:
+    """Decode only the fixed, durable terminal-failure projection."""
+
+    if state is not AttemptState.INVALIDATED or outcome is None or outcome.action is not RecoveryAction.FRESH_SUPERVISOR_SESSION or outcome.blocker is None:
+        return None
+    parts = outcome.blocker.split(":")
+    if len(parts) != 4 or parts[0] != "terminal-failure":
+        return None
+    _, source, failure, category = parts
+    try:
+        return SupervisorTerminalFailure(
+            SupervisorTerminalFailureClass(failure),
+            SupervisorTerminalFailureSource(source),
+            SupervisorTerminalFailureSdkCategory(category),
+        )
+    except ValueError:
+        raise ProviderRecoveryError("terminal failure projection is invalid") from None
 
 
 def record_supervisor_accounting_blocker(

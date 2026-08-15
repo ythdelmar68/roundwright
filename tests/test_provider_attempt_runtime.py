@@ -522,7 +522,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             request = second_backend.request
             self.assertIsNotNone(request)
             assert request is not None
-            material = request.decision_material
+            material = request.decision_material.canonical_material()
             self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "formal_review", "current_attempt", "prior_attempts"})
             self.assertEqual(material["prior_attempts"][0]["state"], "invalidated")
             self.assertEqual(material["prior_attempts"][0]["recovery_action"], "fresh-supervisor-session")

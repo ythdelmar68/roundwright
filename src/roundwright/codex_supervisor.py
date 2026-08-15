@@ -81,6 +81,21 @@ class SupervisorAccountingBlocker(StrEnum):
     INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
 
 
+@dataclass(frozen=True)
+class SupervisorAccountingDecisionMaterial:
+    """Closed immutable accounting input; callers cannot supply open JSON."""
+
+    value: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if not _accounting_material_dict(self.value):
+            raise CodexSupervisorError("Supervisor accounting material is invalid")
+        object.__setattr__(self, "value", json.loads(json.dumps(self.value, sort_keys=True, separators=(",", ":"))))
+
+    def canonical_material(self) -> dict[str, object]:
+        return json.loads(json.dumps(self.value, sort_keys=True, separators=(",", ":")))
+
+
 class SupervisorDiagnostic(StrEnum):
     SYNTAX = "syntax"
     SHAPE = "shape"
@@ -152,7 +167,7 @@ class CodexSupervisorRequest:
     objective: str
     acceptance_criteria: tuple[str, ...]
     response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT
-    decision_material: dict[str, object] | None = None
+    decision_material: SupervisorAccountingDecisionMaterial | None = None
 
     def __post_init__(self) -> None:
         if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and self.decision_material is not None) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and not _accounting_material(self.decision_material)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material):
@@ -334,17 +349,21 @@ def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: st
     value: dict[str, object] = {"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "within_round_attempt": within_round_attempt, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria}
     if response_contract is not SupervisorResponseContract.VERDICT:
         value["response_contract"] = response_contract.value
-        value["decision_material"] = decision_material
+        value["decision_material"] = decision_material.canonical_material() if type(decision_material) is SupervisorAccountingDecisionMaterial else decision_material
     return _digest(value)
 
 
 def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dict[str, object]:
     if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
-        return {"schema": "roundwright-provider-attempt-accounting-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_rule": "accept-only-when-sealed-verifications-and-formal-accounting-are-complete", "decision_material": request.decision_material}
+        return {"schema": "roundwright-provider-attempt-accounting-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_rule": "accept-only-when-sealed-verifications-and-formal-accounting-are-complete", "decision_material": request.decision_material.canonical_material()}
     return {"schema": "roundwright-supervisor-review-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
 
 
 def _accounting_material(value: object) -> bool:
+    return type(value) is SupervisorAccountingDecisionMaterial and _accounting_material_dict(value.canonical_material())
+
+
+def _accounting_material_dict(value: object) -> bool:
     if type(value) is not dict or set(value) != {"schema", "binding", "candidate", "review_policy", "formal_review", "current_attempt", "prior_attempts"} or value.get("schema") != "roundwright-provider-attempt-accounting-decision/v1" or not all(type(value.get(name)) is dict for name in ("binding", "candidate", "review_policy", "formal_review", "current_attempt")) or type(value.get("prior_attempts")) is not list:
         return False
     def closed(item: object) -> bool:

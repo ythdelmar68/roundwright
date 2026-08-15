@@ -24,7 +24,7 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    NativeCodexSupervisorBackend, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    NativeCodexSupervisorBackend, SupervisorAccountingDecisionMaterial, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
@@ -522,7 +522,9 @@ class DurableDiffReviewRunner:
             else ReviewMode.CONVERGING,
         )
         selected = audit.profile_identity
-        decision_material = self._accounting_decision_material(selection, recovery, audit, context)
+        decision_material = SupervisorAccountingDecisionMaterial(
+            self._accounting_decision_material(selection, recovery, audit, context)
+        )
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
             selection.within_round_attempt,

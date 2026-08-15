@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import io
 import os
+import shutil
 import subprocess
 import contextlib
 from pathlib import Path
@@ -21,6 +22,11 @@ from roundwright.configuration import (
     ReviewDisposition,
     ReviewMode,
     ReviewOutcome,
+    ReviewPolicy,
+    FileReviewAuthorityStore,
+    ReviewAuthorityEvidenceReceipt,
+    ReviewAuthorityExpectation,
+    TrustedReviewAuthorityReceipt,
     load_configuration,
     parse_cli_overrides,
     resolve_dispatch_configuration,
@@ -388,33 +394,163 @@ class ConfigurationTests(unittest.TestCase):
             root = Path(temporary)
             baseline = load_configuration(cwd=root, environment={}).review_policy
             accepted_floor = baseline.__class__(2, 9, 2, baseline.on_final_findings)
+            def authority_inputs(floor):
+                authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+                anchor = load_configuration(cwd=root, environment={}, trusted_review_floor=floor).resolved_digest
+                store_root = root / authority.receipt_digest.removeprefix("sha256:")
+                expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(store_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, anchor, 10, 20)
+                store = FileReviewAuthorityStore(store_root, expectation=expectation)
+                evidence = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest=anchor, ready_at=10, freshness_until=20)
+                return authority, expectation, store, evidence
+            authority, expectation, store, evidence = authority_inputs(accepted_floor)
             resolved = resolve_dispatch_configuration(
                 cwd=root,
                 environment={},
                 trusted_policy_snapshot=snapshot,
                 trusted_review_floor=accepted_floor,
+                trusted_review_authority_receipt=authority,
+                review_authority_expectation=expectation,
+                review_authority_store=store,
+                review_authority_evidence=evidence,
+                candidate_sha="c" * 40,
+                evidence_time=10,
             )
             self.assertEqual(resolved.trusted_review_floor, accepted_floor)
             self.assertNotEqual(resolved.resolved_digest, load_configuration(cwd=root, environment={}).resolved_digest)
             changed_floor = baseline.__class__(1, 8, 1, baseline.on_final_findings)
+            changed_authority, changed_expectation, changed_store, changed_evidence = authority_inputs(changed_floor)
             drifted = resolve_dispatch_configuration(
                 cwd=root,
                 environment={},
                 trusted_policy_snapshot=snapshot,
                 trusted_review_floor=changed_floor,
+                trusted_review_authority_receipt=changed_authority,
+                review_authority_expectation=changed_expectation,
+                review_authority_store=changed_store,
+                review_authority_evidence=changed_evidence,
+                candidate_sha="c" * 40,
+                evidence_time=10,
             )
             self.assertNotEqual(resolved.pin().digest, drifted.pin().digest)
+            with self.assertRaisesRegex(ConfigurationError, "authority receipt"):
+                resolve_dispatch_configuration(
+                    cwd=root,
+                    environment={},
+                    trusted_policy_snapshot=snapshot,
+                    trusted_review_floor=accepted_floor,
+                    trusted_review_authority_receipt=changed_authority,
+                    review_authority_expectation=expectation,
+                    review_authority_store=store,
+                    review_authority_evidence=evidence,
+                    candidate_sha="c" * 40,
+                    evidence_time=10,
+                )
             with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
-                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=None, trusted_review_floor=accepted_floor)
+                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=None, trusted_review_floor=accepted_floor, trusted_review_authority_receipt=None)
             with self.assertRaisesRegex(ConfigurationError, "trusted review policy evidence"):
-                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=snapshot, trusted_review_floor=None)
-            with self.assertRaisesRegex(ConfigurationError, "trusted policy floor"):
+                resolve_dispatch_configuration(cwd=root, environment={}, trusted_policy_snapshot=snapshot, trusted_review_floor=None, trusted_review_authority_receipt=None)
+            with self.assertRaisesRegex(ConfigurationError, "independent review authority evidence"):
                 resolve_dispatch_configuration(
                     cwd=root,
                     environment={},
                     trusted_policy_snapshot=snapshot,
                     trusted_review_floor=baseline.__class__(4, 10, 3, baseline.on_final_findings),
+                    trusted_review_authority_receipt=TrustedReviewAuthorityReceipt.from_snapshot(snapshot, baseline.__class__(4, 10, 3, baseline.on_final_findings)),
                 )
+
+    def test_file_review_authority_store_rehydrates_and_rejects_tamper(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "authority"
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+            store = FileReviewAuthorityStore(root, expectation=expectation)
+            receipt = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest="sha256:" + "d" * 64, ready_at=10, freshness_until=20)
+            self.assertEqual(FileReviewAuthorityStore(root, expectation=expectation).read(receipt, evidence_time=10), receipt)
+            self.assertIsNot(FileReviewAuthorityStore(root, expectation=expectation).read(receipt, evidence_time=11), receipt)
+            path = store._path(receipt.record_identity)
+            path.write_text('{"tampered":true}\n', encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                store.read(receipt, evidence_time=10)
+
+    def test_file_review_authority_store_rejects_same_expectation_clone_root(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "pinned-authority"
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+            store = FileReviewAuthorityStore(root, expectation=expectation)
+            receipt = store.persist(authority, candidate_sha="c" * 40, configuration_anchor_digest="sha256:" + "d" * 64, ready_at=10, freshness_until=20)
+            self.assertEqual(store.read(receipt, evidence_time=10), receipt)
+            with self.assertRaises(ConfigurationError):
+                FileReviewAuthorityStore(Path(temporary) / "candidate-clone", expectation=expectation)
+
+    def test_file_review_authority_store_uses_canonical_root_after_platform_normalization(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_root = Path(temporary) / "var-spelling" / "authority"
+            # Build the canonical spelling from the host-resolved temporary
+            # root.  On macOS, re-resolving a lexical /var spelling yields
+            # /private/var; the mock must therefore return that same real
+            # canonical object both for the raw spelling and a later
+            # identity_for_root(canonical_root) call.
+            resolved_temporary = Path(temporary).resolve(strict=True)
+            canonical_root = resolved_temporary / "private-var" / "authority"
+            raw_root.parent.mkdir()
+            canonical_root.mkdir(parents=True)
+            original_resolve = Path.resolve
+            def normalized_resolve(path: Path, strict: bool = False) -> Path:
+                try:
+                    relative = path.relative_to(raw_root.parent)
+                except ValueError:
+                    relative = None
+                if relative is not None:
+                    return original_resolve(canonical_root.parent / relative, strict=strict)
+                return original_resolve(path, strict=strict)
+            with mock.patch.object(Path, "resolve", autospec=True, side_effect=normalized_resolve):
+                identity = FileReviewAuthorityStore.identity_for_root(raw_root)
+                expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+                store = FileReviewAuthorityStore(raw_root, expectation=expectation)
+                self.assertEqual(store._root, canonical_root)
+                self.assertEqual(store.authority_store_identity, FileReviewAuthorityStore.identity_for_root(canonical_root))
+
+    def test_file_review_authority_store_rejects_reparse_leaf_but_not_normalized_ancestor(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            ancestor = Path(temporary) / "normalized-ancestor"; ancestor.mkdir()
+            root = ancestor / "authority"
+            with mock.patch.object(configuration_module, "_reparse", side_effect=lambda path: path == ancestor):
+                identity = FileReviewAuthorityStore.identity_for_root(root)
+                expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+                self.assertEqual(FileReviewAuthorityStore(root, expectation=expectation).authority_store_identity, identity)
+            with mock.patch.object(configuration_module, "_reparse", side_effect=lambda path: path == root):
+                with self.assertRaises(ConfigurationError):
+                    FileReviewAuthorityStore.identity_for_root(root)
+
+    @unittest.skipUnless(os.name == "nt" and hasattr(Path(), "is_junction") and shutil.which("cmd.exe"), "Windows cmd.exe junction creation is unavailable")
+    def test_file_review_authority_store_accepts_junction_ancestor_but_rejects_junction_leaf(self) -> None:
+        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); target = root / "target"; target.mkdir(); ancestor = root / "junction-ancestor"
+            if subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(ancestor), str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode != 0:
+                self.skipTest("host cannot create a Windows junction")
+            ordinary_leaf = ancestor / "authority"
+            identity = FileReviewAuthorityStore.identity_for_root(ordinary_leaf)
+            expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, identity, authority.receipt_digest, authority.policy_snapshot_digest, floor, "c" * 40, "sha256:" + "d" * 64, 10, 20)
+            self.assertEqual(FileReviewAuthorityStore(ordinary_leaf, expectation=expectation).authority_store_identity, identity)
+            leaf_target = root / "leaf-target"; leaf_target.mkdir(); leaf = root / "junction-leaf"
+            if subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(leaf), str(leaf_target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode != 0:
+                self.skipTest("host cannot create a Windows leaf junction")
+            with self.assertRaises(ConfigurationError):
+                FileReviewAuthorityStore.identity_for_root(leaf)
 
 
 if __name__ == "__main__":

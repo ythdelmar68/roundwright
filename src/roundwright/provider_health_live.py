@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 from .configuration import Configuration
+from .dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from .provider_health import CodexHealthContract, CodexProviderHealth, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthError, ProviderHealthReceipt, ProviderQualificationControl, ProviderQualificationReport, RoleBoundCodexCredentialStore, required_provider_selections
 from .provider_recovery import ProviderRole
 
@@ -63,12 +64,17 @@ class LiveProviderHealthFixtureResult:
         return {**payload, "manifest": {**manifest, "bundle_digest": _digest({"payload": payload, "manifest": manifest})}}
 
 
+def bind_harness_provider_qualification_control(contract: CodexHealthContract, configuration: Configuration, *, candidate_sha: str, now: int) -> ProviderQualificationControl:
+    """Fail closed: a three-value Harness factory cannot prove candidate trust."""
+    raise ProviderHealthError("live provider qualification control is unavailable")
+
+
 def run_bounded_live_provider_health_fixture(store: RoleBoundCodexCredentialStore, contract: CodexHealthContract, configuration: Configuration, qualification_control: ProviderQualificationControl, *, enabled: bool, contract_commit: str, candidate_sha: str | None, case_id: str, now: int, freshness_seconds: int) -> LiveProviderHealthFixtureResult:
     """Run one forced content-free qualification pass only when explicitly enabled."""
     valid_commit = type(contract_commit) is str and re.fullmatch(r"[0-9a-f]{40}", contract_commit)
-    valid_candidate = candidate_sha is None or (type(candidate_sha) is str and re.fullmatch(r"[0-9a-f]{40}", candidate_sha))
+    valid_candidate = type(candidate_sha) is str and re.fullmatch(r"[0-9a-f]{40}", candidate_sha)
     valid_case = type(case_id) is str and 0 < len(case_id) <= 128 and all(item.isalnum() or item in "._-" for item in case_id)
-    if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(qualification_control) is not ProviderQualificationControl or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit:
+    if enabled is not True or type(store) is not RoleBoundCodexCredentialStore or type(contract) is not CodexHealthContract or type(configuration) is not Configuration or type(qualification_control) is not ProviderQualificationControl or type(now) is not int or type(freshness_seconds) is not int or freshness_seconds <= 0 or not valid_commit or not valid_candidate or not valid_case or contract.contract_commit != contract_commit or qualification_control.binding.candidate_sha != candidate_sha:
         raise ProviderHealthError("live provider health fixture is disabled or invalid")
     try:
         health = CodexProviderHealth(store, contract)

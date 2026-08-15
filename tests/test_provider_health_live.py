@@ -32,6 +32,10 @@ def live_provider_factory():
     test = LiveFixtureTests(); store, configuration, _ = test.fixture()
     return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration, qualification_control()
 
+def three_value_live_provider_factory():
+    test = LiveFixtureTests(); store, configuration, _ = test.fixture()
+    return store, CodexHealthContract("1.2.3", "4.5.6", "b" * 40), configuration
+
 def blocked_live_provider_factory():
     test = LiveFixtureTests(); store, configuration, channels = test.fixture()
     channels[ProviderRole.WORKER][1].outcome = ProbeOutcome(False, CodexFailure.AUTH_EXPIRED)
@@ -76,7 +80,7 @@ class LiveFixtureTests(unittest.TestCase):
         store, config, channels = self.fixture()
         channels[ProviderRole.WORKER][1].outcome = ProbeOutcome(False, CodexFailure.AUTH_EXPIRED)
         contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
-        result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
+        result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
         self.assertFalse(result.report.ready_at(100))
         self.assertEqual(len(result.receipts), len(result.report.observations) - 1)
         self.assertEqual(result.report.observations[1].failure, CodexFailure.AUTH_EXPIRED)
@@ -92,7 +96,7 @@ class LiveFixtureTests(unittest.TestCase):
         for failure in CodexFailure:
             with self.subTest(failure=failure):
                 store, config, _ = self.fixture(ProbeOutcome(False, failure))
-                result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
+                result = run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
                 evidence = result.owner_safe_evidence()
                 self.assertEqual((evidence["status"], evidence["ready"], result.receipts), ("blocked", False, ()))
                 self.assertEqual({item.failure for item in result.report.observations}, {failure})
@@ -104,7 +108,7 @@ class LiveFixtureTests(unittest.TestCase):
         store, config, _ = self.fixture(); contract = CodexHealthContract("1.2.3", "4.5.6", "b" * 40)
         with mock.patch("roundwright.provider_health_live.CodexProviderHealth.qualify_configuration", side_effect=RuntimeError("secret-token C:/private/path")):
             with self.assertRaisesRegex(ProviderHealthError, "^live provider health fixture is blocked$") as error:
-                run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha=None, case_id="case", now=100, freshness_seconds=30)
+                run_bounded_live_provider_health_fixture(store, contract, config, qualification_control(), enabled=True, contract_commit="b" * 40, candidate_sha="c" * 40, case_id="case", now=100, freshness_seconds=30)
         self.assertNotIn("secret-token", str(error.exception).lower())
 
     def test_harness_disabled_blocked_and_success_contract(self):
@@ -116,7 +120,7 @@ class LiveFixtureTests(unittest.TestCase):
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(output): self.assertEqual(live_harness.main(), 1)
         self.assertEqual(output.getvalue(), '{"schema":"roundwright-live-provider-health/v1","status":"blocked"}\n')
         output, errors = io.StringIO(), io.StringIO()
-        env = {"ROUNDWRIGHT_RUN_LIVE_PROVIDER_HEALTH":"1", "ROUNDWRIGHT_LIVE_PROVIDER_FACTORY":"tests.test_provider_health_live:blocked_live_provider_factory", "ROUNDWRIGHT_CONTRACT_COMMIT":"b" * 40, "ROUNDWRIGHT_SHADOW_CASE_ID":"case-42-blocked"}
+        env = {"ROUNDWRIGHT_RUN_LIVE_PROVIDER_HEALTH":"1", "ROUNDWRIGHT_LIVE_PROVIDER_FACTORY":"tests.test_provider_health_live:blocked_live_provider_factory", "ROUNDWRIGHT_CONTRACT_COMMIT":"b" * 40, "ROUNDWRIGHT_CANDIDATE_SHA":"c" * 40, "ROUNDWRIGHT_SHADOW_CASE_ID":"case-42-blocked"}
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors), mock.patch.object(live_harness.time, "time", return_value=100): self.assertEqual(live_harness.main(), 1)
         self.assertEqual(errors.getvalue(), "")
         blocked = json.loads(output.getvalue())
@@ -144,3 +148,7 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=capture_time).outcome, ComparisonOutcome.MATCH)
         self.assertEqual(compare_provider_health_receipt(replayed[0].evidence(), replayed[0].evidence(), now=capture_time + 10_000).outcome, ComparisonOutcome.INVALID)
         self.assertFalse(any(marker in lines[0].lower() for marker in ("secret-token", "c:/private", "payload", "_backend", "0x")))
+        output = io.StringIO()
+        env = {"ROUNDWRIGHT_RUN_LIVE_PROVIDER_HEALTH":"1", "ROUNDWRIGHT_LIVE_PROVIDER_FACTORY":"tests.test_provider_health_live:three_value_live_provider_factory", "ROUNDWRIGHT_CONTRACT_COMMIT":"b" * 40, "ROUNDWRIGHT_CANDIDATE_SHA":"c" * 40, "ROUNDWRIGHT_SHADOW_CASE_ID":"case-42-harness-three"}
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(output), mock.patch.object(live_harness.time, "time", return_value=100): self.assertEqual(live_harness.main(), 1)
+        self.assertEqual(json.loads(output.getvalue())["status"], "blocked")

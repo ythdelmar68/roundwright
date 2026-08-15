@@ -159,6 +159,31 @@ class _PersistedRecoveryOutcome:
     blocker: str | None
 
 
+def preflight_attempt_preparation(
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    role: ProviderRole,
+    process_lease_id: str,
+    process_lease_expires_at: int,
+    input_fingerprint: str,
+    selected_profile_identity: str | None = None,
+    now: int | None = None,
+) -> None:
+    """Validate a future attempt's identity and health without durable writes."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    _require_role(role)
+    _require_token(process_lease_id, "process lease identity")
+    _require_future_time(process_lease_expires_at, now)
+    _require_fingerprint(input_fingerprint, "input fingerprint")
+    selected = _selected_profile_identity(context, role, selected_profile_identity)
+    _require_health_authorization(context, role, selected, _clock(now))
+
+
 def prepare_attempt(
     repository: RepositoryIdentity,
     identity: TaskIdentity,

@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -24,7 +25,7 @@ from roundwright.dependency_policy import CandidateBinding
 from roundwright.git_identity import CandidateSeal, TransitionLease, WorktreeBinding
 from roundwright.provider_attempt_runtime import (
     DiffReviewSelection, DiffReviewSequenceEntry, DurableDiffReviewRunner, MaterializedProviderAttemptContext,
-    ProviderAttemptHostInputs, ProviderAttemptRuntimeDescriptor, ProviderAttemptRuntimeError,
+    ProviderAttemptCheckpointFailure, ProviderAttemptHostInputs, ProviderAttemptRuntimeDescriptor, ProviderAttemptRuntimeError,
     ProviderAttemptRuntimeResources, install_host_runtime,
 )
 from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, read_attempt
@@ -41,6 +42,9 @@ def digest(character: str) -> str:
 
 
 class _Runner:
+    def preflight_checkpoint_prerequisites(self) -> tuple[object, ...]:
+        return ()
+
     def execute(self) -> tuple[str, ...]:
         return ("attempt-1",)
 
@@ -239,6 +243,79 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with self.assertRaises(ProviderRecoveryError):
                 read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
 
+    def test_local_session_checkpoint_failure_is_not_a_native_provider_outcome(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            events: list[object] = []
+            first = Backend("runtime-local-session", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), events)
+            second_recovery = provider_context(recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1])
+            second = Backend("runtime-local-session-two", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), events)
+            second_selection = replace(runner.selection,
+                diff_review_attempt_id="runtime-local-session-review-two",
+                provider_attempt_id="runtime-local-session-provider-two",
+                message_identity="runtime-local-session-message-two",
+                process_lease_id="runtime-local-session-lease-two", within_round_attempt=2)
+            runner = replace(runner, backend=first, sequence=(
+                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first),
+                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second),
+            ))
+            with patch("roundwright.provider_attempt_runtime.checkpoint_diff_review_session", side_effect=RuntimeError("private callback detail")):
+                with self.assertRaises(ProviderAttemptCheckpointFailure) as raised:
+                    runner.execute()
+            failure = raised.exception
+            self.assertEqual((failure.stage, failure.session_present, failure.turn_present), ("session-checkpoint", True, False))
+            self.assertIn("session-present=true; turn-present=false", str(failure))
+            self.assertNotIn("private", str(failure))
+            self.assertEqual((first.calls, second.calls), (1, 0))
+            self.assertTrue(any(item[0] == "close" for item in events))
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+
+    def test_local_turn_checkpoint_failure_preserves_only_the_session_checkpoint(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            events: list[object] = []
+            first = Backend("runtime-local-turn", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), events)
+            second_recovery = provider_context(recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1])
+            second = Backend("runtime-local-turn-two", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), events)
+            second_selection = replace(runner.selection,
+                diff_review_attempt_id="runtime-local-turn-review-two",
+                provider_attempt_id="runtime-local-turn-provider-two",
+                message_identity="runtime-local-turn-message-two",
+                process_lease_id="runtime-local-turn-lease-two", within_round_attempt=2)
+            runner = replace(runner, backend=first, sequence=(
+                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first),
+                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second),
+            ))
+            with patch("roundwright.provider_attempt_runtime.dispatch_diff_review", side_effect=RuntimeError("private callback detail")):
+                with self.assertRaises(ProviderAttemptCheckpointFailure) as raised:
+                    runner.execute()
+            failure = raised.exception
+            self.assertEqual((failure.stage, failure.session_present, failure.turn_present), ("turn-checkpoint", True, True))
+            self.assertIn("session-present=true; turn-present=true", str(failure))
+            self.assertNotIn("private", str(failure))
+            self.assertEqual((first.calls, second.calls), (1, 0))
+            stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual(stored.state, AttemptState.PREPARED)
+            self.assertIsNotNone(stored.session_identity)
+            self.assertIsNone(stored.external_turn_identity)
+
     def test_projection_binds_non_first_epoch_and_formal_round(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, _, repository, identity, recovery, seal = self.durable_runner(
@@ -314,6 +391,84 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                         sys.modules.pop(name, None)
                     else:
                         sys.modules[name] = value
+
+    def test_hosted_validate_blocks_checkpoint_prerequisite_drift_without_dispatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            descriptor = {
+                "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-preflight-45",
+                "repository_id": identity.repository_id, "task_id": identity.task_id,
+                "source_digest": runner.source_digest, "base_sha": identity.base_sha,
+                "candidate_sha": seal.candidate_sha, "case_id": "runtime-preflight-case-45", "ready_at": 17,
+                "capture_plan_digest": digest("e"), "runtime_binding": recovery.runtime_binding.canonical_material(),
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+            }
+            context = install_host_runtime(descriptor, ProviderAttemptHostInputs(
+                repository, identity, recovery, runner.lease, seal, runner.binding,
+                runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
+            ))
+            drifted_runner = replace(context.resources.runner, selection=replace(
+                runner.selection, implementation_attempt_id="runtime-preflight-missing-implementation",
+            ))
+            context = MaterializedProviderAttemptContext(context.descriptor, replace(context.resources, runner=drifted_runner))
+            prior_package, prior_module = fake_harness()
+            try:
+                adapter = external_validation.ProviderAttemptAccountingAdapter()
+                producer, exporter, comparator = external_validation.provider_attempt_accounting_component_identities()
+                binding = type("Binding", (), {
+                    "profile": external_validation.PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+                    "case_id": descriptor["case_id"], "candidate_sha": seal.candidate_sha, "ready_at": 17,
+                    "plan": type("Plan", (), {"plan_digest": descriptor["capture_plan_digest"]})(),
+                    "components": type("Components", (), {"producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator})(),
+                    "execution_context": type("Context", (), {"value": context})(),
+                    "execution_context_input_digest": digest("f"),
+                })()
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "checkpoint preflight"):
+                    adapter.validate(binding)
+                dirty = runner.binding.worktree / "readiness-drift.txt"
+                dirty.write_text("untracked", encoding="utf-8")
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    before = connection.execute(
+                        "SELECT (SELECT COUNT(*) FROM candidate_seals WHERE task_id = ?), "
+                        "(SELECT COUNT(*) FROM candidate_evidence WHERE task_id = ?)",
+                        (identity.task_id, identity.task_id),
+                    ).fetchone()
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "checkpoint preflight"):
+                    adapter.validate(binding)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    after = connection.execute(
+                        "SELECT (SELECT COUNT(*) FROM candidate_seals WHERE task_id = ?), "
+                        "(SELECT COUNT(*) FROM candidate_evidence WHERE task_id = ?)",
+                        (identity.task_id, identity.task_id),
+                    ).fetchone()
+                finally:
+                    connection.close()
+                self.assertEqual(after, before)
+            finally:
+                for name, value in (("roundwright_harness", prior_package), ("roundwright_harness.executor", prior_module)):
+                    if value is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = value
+            self.assertEqual(backend.calls, 0)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM provider_attempts WHERE attempt_id = ?",
+                        (runner.selection.provider_attempt_id,),
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
 
     def test_hosted_entrypoint_runs_reviewed_harness_validate_then_execute(self) -> None:
         """Exercise the documented V2 host shape against the reviewed library.

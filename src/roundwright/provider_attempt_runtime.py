@@ -17,11 +17,11 @@ from dataclasses import dataclass
 
 from .configuration import RepositoryIdentity, ReviewMode
 from .candidate_review import (
-    DiffReviewOutput, DiffReviewVerdict, checkpoint_diff_review_session,
-    dispatch_diff_review, record_diff_review,
+    CandidateReviewError, DiffReviewOutput, DiffReviewVerdict, checkpoint_diff_review_session,
+    dispatch_diff_review, preflight_diff_review_session_checkpoint, record_diff_review,
 )
 from .codex_supervisor import (
-    CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
+    CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
     NativeCodexSupervisorBackend, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
@@ -30,7 +30,7 @@ from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
-    invalidate_supervisor_attempt,
+    invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
     read_attempt, record_invalid_output, recover_attempt,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
@@ -53,6 +53,25 @@ SCHEMA = "roundwright-provider-attempt-runtime/v2"
 
 class ProviderAttemptRuntimeError(ValueError):
     """The descriptor or its opaque product resource is unavailable."""
+
+
+class ProviderAttemptCheckpointFailure(ProviderAttemptRuntimeError):
+    """Public-safe local checkpoint failure; never a native provider outcome."""
+
+    def __init__(self, stage: str, *, session_present: bool, turn_present: bool) -> None:
+        if (
+            stage not in {"session-checkpoint", "turn-checkpoint"}
+            or type(session_present) is not bool
+            or type(turn_present) is not bool
+        ):
+            raise ProviderAttemptRuntimeError("provider attempt checkpoint classification is invalid")
+        self.stage = stage
+        self.session_present = session_present
+        self.turn_present = turn_present
+        super().__init__(
+            f"local {stage} failed; session-present={str(session_present).lower()}; "
+            f"turn-present={str(turn_present).lower()}"
+        )
 
 
 def _digest(value: object) -> str:
@@ -241,10 +260,42 @@ class DurableDiffReviewRunner:
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
         return entries
 
+    def preflight_checkpoint_prerequisites(self) -> tuple[DiffReviewSequenceEntry, ...]:
+        """Validate every future durable session checkpoint without dispatch."""
+
+        entries = self.validate_sequence()
+        for entry in entries:
+            selection = entry.selection
+            try:
+                input_digest = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, entry.recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=entry.audit.profile_identity,
+                    within_round_attempt=selection.within_round_attempt,
+                    review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
+                )
+                preflight_attempt_preparation(
+                    self.identity, entry.recovery,
+                    attempt_id=selection.provider_attempt_id, role=ProviderRole.SUPERVISOR,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    input_fingerprint=input_digest,
+                    selected_profile_identity=entry.audit.profile_identity,
+                    now=self.dispatch_control.now,
+                )
+            except (CandidateReviewError, ProviderRecoveryError):
+                raise ProviderAttemptRuntimeError("provider attempt checkpoint preflight blocked") from None
+        return entries
+
     def execute(self) -> tuple[str, ...]:
         """Dispatch one bounded sequence and return only durable attempt IDs."""
 
-        entries = self.validate_sequence()
+        entries = self.preflight_checkpoint_prerequisites()
         attempt_ids: list[str] = []
         for entry in entries:
             attempt_id, accepted = self._execute_selection(entry.selection, entry.recovery, entry.audit, entry.backend)
@@ -346,9 +397,16 @@ class DurableDiffReviewRunner:
             )
             turn_checkpointed = True
 
-        result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
-            request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
-        )
+        try:
+            result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
+                request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+            )
+        except CodexSupervisorCheckpointError as error:
+            raise ProviderAttemptCheckpointFailure(
+                error.stage.value,
+                session_present=error.session_present,
+                turn_present=error.turn_present,
+            ) from None
         if not session_checkpointed:
             raise ProviderAttemptRuntimeError("native Supervisor did not provide a durable session checkpoint")
         if not turn_checkpointed:
@@ -462,7 +520,7 @@ class ProviderAttemptRuntimeResources:
             or self.runner.audit.profile_identity != descriptor.provider_profile_identity
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
-        self.runner.validate_sequence()
+        self.runner.preflight_checkpoint_prerequisites()
         # Provider-free preflight confirms the local durable identity and the
         # exact binding without calling a provider or creating a lifecycle row.
         check_database(self.repository)

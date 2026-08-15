@@ -22,7 +22,7 @@ from typing import Iterable
 
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
-from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, seal_candidate
+from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, preflight_candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
@@ -536,6 +536,74 @@ def record_candidate_verification(
     bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=value.evidence_fingerprint, lease=lease)
 
 
+def preflight_diff_review_session_checkpoint(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    dependency_binding: CandidateBinding,
+    control: ProviderDispatchControl,
+    implementation_attempt_id: str,
+    provider_attempt_id: str,
+    message_identity: str,
+    process_lease_id: str,
+    process_lease_expires_at: int,
+    selected_profile_identity: str,
+    within_round_attempt: int,
+    review_round: int,
+    lease: TransitionLease | None,
+    now: int,
+) -> str:
+    """Read-only eligibility check for a future diff-review session checkpoint.
+
+    This is deliberately shared by hosted readiness and the later durable
+    checkpoint.  It validates every candidate, dependency, policy, recovery,
+    verification, and input-digest prerequisite without creating provider or
+    lifecycle rows.
+    """
+
+    if (
+        type(dependency_binding) is not CandidateBinding
+        or type(control) is not ProviderDispatchControl
+        or control.binding != dependency_binding
+        or control.now != now
+        or dependency_binding.repository != identity.repository_id
+        or dependency_binding.task_id != identity.task_id
+        or dependency_binding.candidate_sha != seal.candidate_sha
+        or type(process_lease_expires_at) is not int
+        or process_lease_expires_at <= now
+    ):
+        raise CandidateReviewError("diff review session preflight is invalid")
+    try:
+        control.dependency_control.require(dependency_binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("diff review session preflight blocked execution") from error
+    for value, name in (
+        (implementation_attempt_id, "implementation attempt identity"),
+        (provider_attempt_id, "provider attempt identity"),
+        (message_identity, "review message identity"),
+        (process_lease_id, "process lease identity"),
+    ):
+        _token(value, name)
+    _require_candidate_binding(identity, binding, seal)
+    # Readiness must use the non-mutating live seal/worktree/lease check.
+    # Checkpoint execution retains ``candidate_evidence`` and its established
+    # invalidation semantics after readiness has been consumed.
+    preflight_candidate_evidence(repository, binding, seal, lease=lease)
+    _require_current_candidate(repository, identity, seal, implementation_attempt_id)
+    _require_diff_review_context(repository, identity, context, seal, implementation_attempt_id)
+    verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
+    policy_projection = _project_review_policy(review_round, context.runtime_binding)
+    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity)
+    return _diff_review_input_digest(
+        identity, implementation_attempt_id, seal.base_sha, seal.candidate_sha,
+        message_identity, verification_digest, within_round_attempt,
+        selected_profile_identity, policy_projection,
+    )
+
+
 def checkpoint_diff_review_session(
     repository: RepositoryIdentity,
     identity: TaskIdentity,
@@ -563,42 +631,22 @@ def checkpoint_diff_review_session(
     real turn consumes this exact prepared attempt through ``dispatch_diff_review``.
     """
 
-    if (
-        type(dependency_binding) is not CandidateBinding
-        or type(control) is not ProviderDispatchControl
-        or control.binding != dependency_binding
-        or control.now != now
-        or dependency_binding.repository != identity.repository_id
-        or dependency_binding.task_id != identity.task_id
-        or dependency_binding.candidate_sha != seal.candidate_sha
-    ):
-        raise CandidateReviewError("diff review dispatch control is invalid")
-    try:
-        control.dependency_control.require(dependency_binding, DependencyStage.DISPATCH, now=now)
-    except DependencyPolicyError as error:
-        raise CandidateReviewError("diff review dispatch preflight blocked execution") from error
-    for value, name in (
-        (implementation_attempt_id, "implementation attempt identity"),
-        (provider_attempt_id, "provider attempt identity"),
-        (supervisor_session_identity, "Supervisor session identity"),
-        (message_identity, "review message identity"),
-        (process_lease_id, "process lease identity"),
-    ):
-        _token(value, name)
-    _require_candidate_binding(identity, binding, seal)
+    input_digest = preflight_diff_review_session_checkpoint(
+        repository, identity, context, binding, seal,
+        dependency_binding=dependency_binding, control=control,
+        implementation_attempt_id=implementation_attempt_id,
+        provider_attempt_id=provider_attempt_id, message_identity=message_identity,
+        process_lease_id=process_lease_id,
+        process_lease_expires_at=process_lease_expires_at,
+        selected_profile_identity=selected_profile_identity,
+        within_round_attempt=within_round_attempt, review_round=review_round,
+        lease=lease,
+        now=now,
+    )
+    _token(supervisor_session_identity, "Supervisor session identity")
     candidate_evidence(repository, binding, seal, lease=lease)
-    _require_current_candidate(repository, identity, seal, implementation_attempt_id)
-    _require_diff_review_context(repository, identity, context, seal, implementation_attempt_id)
-    verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
-    policy_projection = _project_review_policy(review_round, context.runtime_binding)
-    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity)
     if _session_is_plan_review(repository, identity, supervisor_session_identity):
         raise CandidateReviewError("diff review must use a session distinct from plan review")
-    input_digest = _diff_review_input_digest(
-        identity, implementation_attempt_id, seal.base_sha, seal.candidate_sha,
-        message_identity, verification_digest, within_round_attempt,
-        selected_profile_identity, policy_projection,
-    )
     provider = prepare_attempt(
         repository, identity, context, attempt_id=provider_attempt_id,
         role=ProviderRole.SUPERVISOR, process_lease_id=process_lease_id,

@@ -34,33 +34,53 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
     def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise CodexSupervisorError("native Supervisor working directory is invalid")
-        if codex_factory is None:
-            try:
-                sdk = importlib.import_module("openai_codex")
-                generated = importlib.import_module("openai_codex.generated.v2_all")
-                codex_factory, approval_mode, sandbox, effort_factory = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
-            except Exception as error:
-                raise CodexSupervisorError("reviewed native Supervisor SDK is unavailable") from error
-        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock):
+        if (
+            type(completion) is not CompletionDeadline
+            or not callable(clock)
+            or (
+                codex_factory is not None
+                and (not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory))
+            )
+            or (
+                codex_factory is None
+                and any(item is not None for item in (approval_mode, sandbox, effort_factory))
+            )
+        ):
             raise CodexSupervisorError("reviewed native Supervisor SDK binding is invalid")
         self._cwd, self._completion, self._factory, self._approval, self._sandbox, self._effort, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
 
     def open_fresh_session(self, profile: ProviderProfile) -> NativeSupervisorSession:
         if type(profile) is not ProviderProfile:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-        codex = self._factory()
         try:
+            factory, approval, sandbox, effort = self._native_binding()
+            codex = factory()
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
             thread = client.thread_start()
             if not isinstance(getattr(thread, "id", None), str):
                 raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
-            return _Session(thread, codex, self._cwd, profile, self._approval, self._sandbox, self._effort, self._completion, self._clock)
+            return _Session(thread, codex, self._cwd, profile, approval, sandbox, effort, self._completion, self._clock)
         except CodexAdapterError:
-            _close(codex)
+            _close(locals().get("codex"))
             raise
-        except Exception as error:
-            _close(codex)
-            raise CodexAdapterError(CodexFailure.UNKNOWN) from error
+        except Exception:
+            _close(locals().get("codex"))
+            raise CodexAdapterError(CodexFailure.UNKNOWN) from None
+
+    def _native_binding(self) -> tuple[Callable[[], object], object, object, Callable[[str], object]]:
+        """Resolve the SDK only while its failures are classified at dispatch."""
+
+        if self._factory is not None:
+            return self._factory, self._approval, self._sandbox, self._effort  # type: ignore[return-value]
+        try:
+            sdk = importlib.import_module("openai_codex")
+            generated = importlib.import_module("openai_codex.generated.v2_all")
+            factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
+        except Exception:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from None
+        if not callable(factory) or approval is None or sandbox is None or not callable(effort):
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+        return factory, approval, sandbox, effort
 
 
 class _Session(NativeSupervisorSession):

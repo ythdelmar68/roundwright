@@ -23,6 +23,34 @@ class CodexSupervisorError(ValueError):
     """Raised when a Supervisor boundary would lose identity or authority."""
 
 
+class SupervisorCheckpointStage(StrEnum):
+    """Public-safe local checkpoint stages, never provider outcome states."""
+
+    SESSION = "session-checkpoint"
+    TURN = "turn-checkpoint"
+
+
+class CodexSupervisorCheckpointError(CodexSupervisorError):
+    """A local durable callback failed after the indicated native identities."""
+
+    def __init__(self, stage: SupervisorCheckpointStage, *, session_present: bool, turn_present: bool) -> None:
+        if (
+            type(stage) is not SupervisorCheckpointStage
+            or type(session_present) is not bool
+            or type(turn_present) is not bool
+            or (stage is SupervisorCheckpointStage.SESSION and (not session_present or turn_present))
+            or (stage is SupervisorCheckpointStage.TURN and (not session_present or not turn_present))
+        ):
+            raise CodexSupervisorError("Supervisor checkpoint classification is invalid")
+        self.stage = stage
+        self.session_present = session_present
+        self.turn_present = turn_present
+        super().__init__(
+            f"local {stage.value} failed; session-present={str(session_present).lower()}; "
+            f"turn-present={str(turn_present).lower()}"
+        )
+
+
 class _CandidateBindingDrift(CodexSupervisorError):
     """A schema-valid native result is bound to a different candidate."""
 
@@ -176,10 +204,20 @@ class CodexSupervisorAdapter:
         try:
             session = self._backend.open_fresh_session(self._profile)
             session_identity = _identity(session, "session")
-            checkpoint_session(session_identity)
+            try:
+                checkpoint_session(session_identity)
+            except Exception:
+                raise CodexSupervisorCheckpointError(
+                    SupervisorCheckpointStage.SESSION, session_present=True, turn_present=False,
+                ) from None
             turn = session.start_turn(request)
             turn_identity = _identity(turn, "turn")
-            checkpoint_turn(session_identity, turn_identity)
+            try:
+                checkpoint_turn(session_identity, turn_identity)
+            except Exception:
+                raise CodexSupervisorCheckpointError(
+                    SupervisorCheckpointStage.TURN, session_present=True, turn_present=True,
+                ) from None
             response = turn.read_response()
         except CodexSupervisorError:
             _abort(turn); _close(session)

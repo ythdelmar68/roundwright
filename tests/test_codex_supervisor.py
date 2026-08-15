@@ -24,7 +24,7 @@ from roundwright.codex_supervisor import (
 )
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
-from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from roundwright.worker_toolbox import CompletionDeadline
@@ -148,6 +148,18 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(events[1]["sandbox"], "read-only")
         self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
         self.assertIn("closed", events)
+
+    def test_native_factory_failure_is_classified_before_any_session_identity(self):
+        profile = self.profiles[0]
+        backend = HarnessNativeCodexSupervisorBackend(
+            cwd=ROOT, completion=CompletionDeadline(100, 600),
+            codex_factory=lambda: (_ for _ in ()).throw(RuntimeError("private factory detail")),
+            approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+        )
+        with self.assertRaises(CodexAdapterError) as raised:
+            backend.open_fresh_session(profile)
+        self.assertIs(raised.exception.failure, CodexFailure.UNKNOWN)
+        self.assertNotIn("private", str(raised.exception))
 
     def test_native_stream_rejections_advance_only_the_attempt_position(self):
         """Native stream/parser failures are typed, bounded, and never sealed."""

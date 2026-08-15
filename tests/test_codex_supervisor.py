@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
-    SupervisorResultKind, SupervisorSdkTurnErrorCategory,
+    SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
@@ -54,6 +54,10 @@ class Turn:
     def abort(self): self._events.append(("abort", self._identity))
     def read_response(self):
         self._events.append(("read", self._identity))
+        if self._request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and self._response.kind is SupervisorResultKind.ACCEPTED:
+            # Runtime tests inject only the native backend seam.  Mirror the
+            # selected product schema rather than caller-prescribing a result.
+            return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"status": "complete", "action": "accept-formal-review", "blocker": None})
         if self._response.kind is SupervisorResultKind.ACCEPTED and "binding" not in self._response.structured_output:
             request = self._request
             value = dict(self._response.structured_output)

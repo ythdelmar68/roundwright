@@ -408,6 +408,129 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertIn("provider-terminal-failure", tuple(item.event_kind for item in graph.events))
             self.assertNotIn("invalid-output", tuple(item.event_kind for item in graph.events))
 
+    def test_accounting_terminal_blocker_is_durable_and_never_fails_over(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+
+            class Turn:
+                def identity(self) -> str: return "turn-accounting-blocked"
+                def abort(self) -> None: return None
+                def read_response(self) -> NativeSupervisorResponse:
+                    return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {
+                        "status": "blocked", "action": "retain-terminal-product-block",
+                        "blocker": "provider-accounting-incomplete",
+                    })
+
+            class Session:
+                def identity(self) -> str: return "session-accounting-blocked"
+                def close(self) -> None: return None
+                def start_turn(self, _request: object) -> Turn: return Turn()
+
+            class BlockedBackend:
+                def __init__(self) -> None: self.calls = 0
+                def open_fresh_session(self, _profile: object) -> Session:
+                    self.calls += 1
+                    return Session()
+
+            blocked = BlockedBackend()
+            second_recovery = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            fallback = Backend("runtime-accounting-fallback", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), [])
+            second = DiffReviewSelection(
+                "runtime-accounting-review-two", runner.selection.implementation_attempt_id,
+                "runtime-accounting-provider-two", "runtime-accounting-message-two", "runtime-accounting-lease-two",
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+            )
+            runner = replace(runner, backend=blocked, sequence=(
+                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, blocked),
+                DiffReviewSequenceEntry(second, second_recovery, second_recovery.health_receipt.audit_identity, fallback),
+            ))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "accounting decision is terminal"):
+                runner.execute()
+            stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual(stored.state, AttemptState.BLOCKED)
+            self.assertEqual((blocked.calls, fallback.calls), (1, 0))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM provider_invalid_outputs WHERE attempt_id = ?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone()[0], 0)
+                self.assertEqual(connection.execute(
+                    "SELECT recovery_action, blocker FROM provider_recovery_outcomes WHERE attempt_id = ?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), ("blocked-ambiguous-turn", "provider-accounting-incomplete"))
+            finally:
+                connection.close()
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                runner.execute()
+            self.assertEqual((blocked.calls, fallback.calls), (1, 0))
+
+    def test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, first, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+
+            class Turn:
+                def __init__(self, request: object) -> None: self._request = request
+                def identity(self) -> str: return "turn-accounting-later"
+                def abort(self) -> None: return None
+                def read_response(self) -> NativeSupervisorResponse:
+                    return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {
+                        "status": "complete", "action": "accept-formal-review", "blocker": None,
+                    })
+
+            class Session:
+                def __init__(self, backend: object) -> None: self._backend = backend
+                def identity(self) -> str: return "session-accounting-later"
+                def close(self) -> None: return None
+                def start_turn(self, request: object) -> Turn:
+                    self._backend.request = request
+                    return Turn(request)
+
+            class Backend:
+                def __init__(self) -> None: self.calls, self.request = 0, None
+                def open_fresh_session(self, _profile: object) -> Session:
+                    self.calls += 1
+                    return Session(self)
+
+            second_backend = Backend()
+            second_recovery = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            second = DiffReviewSelection(
+                "runtime-material-review-two", runner.selection.implementation_attempt_id,
+                "runtime-material-provider-two", "runtime-material-message-two", "runtime-material-lease-two",
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+            )
+            runner = replace(runner, sequence=(
+                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first),
+                DiffReviewSequenceEntry(second, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+            ))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
+            request = second_backend.request
+            self.assertIsNotNone(request)
+            assert request is not None
+            material = request.decision_material
+            self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "current_attempt", "prior_attempts"})
+            self.assertEqual(material["prior_attempts"][0]["state"], "invalidated")
+            self.assertEqual(material["prior_attempts"][0]["recovery_action"], "fresh-supervisor-session")
+            self.assertTrue(material["prior_attempts"][0]["session_present"])
+            self.assertTrue(material["prior_attempts"][0]["turn_present"])
+            self.assertNotIn("C:/", json.dumps(material, sort_keys=True))
+            self.assertNotIn("findings", json.dumps(material, sort_keys=True))
+
     def test_terminal_failure_projection_is_closed_and_rejects_untrusted_strings_before_mutation(self) -> None:
         self.assertEqual(tuple(item.value for item in SupervisorTerminalFailureClass), tuple(item.value for item in CodexFailure))
         self.assertEqual(tuple(item.value for item in SupervisorTerminalFailureSdkCategory), tuple(item.value for item in SupervisorSdkTurnErrorCategory))

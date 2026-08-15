@@ -52,6 +52,10 @@ class RecoveryAction(StrEnum):
     FRESH_SUPERVISOR_SESSION = "fresh-supervisor-session"
     BLOCKED_RETRY_LIMIT = "blocked-retry-limit"
     BLOCKED_IDENTITY_DRIFT = "blocked-identity-drift"
+    # Existing durable storage already reserves this no-followup action.  The
+    # closed blocker below distinguishes a schema-valid accounting conclusion
+    # from an uncertain external turn without changing historical rows.
+    BLOCKED_PROVIDER_ACCOUNTING = "blocked-ambiguous-turn"
 
 
 class SupervisorTerminalFailureClass(StrEnum):
@@ -79,6 +83,10 @@ class SupervisorTerminalFailureSdkCategory(StrEnum):
     STREAM = "stream"
     CONNECTION = "connection"
     MISSING_OR_UNKNOWN = "missing-or-unknown"
+
+
+class SupervisorAccountingBlocker(StrEnum):
+    INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -721,6 +729,61 @@ def read_supervisor_terminal_failure(
         raise ProviderRecoveryError("terminal failure projection is invalid") from None
     finally:
         connection.close()
+
+
+def record_supervisor_accounting_blocker(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    blocker: SupervisorAccountingBlocker,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> RecoveryProjection:
+    """Terminally retain a schema-valid accounting decision without failover."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    if type(blocker) is not SupervisorAccountingBlocker:
+        raise ProviderRecoveryError("accounting blocker is invalid")
+    observed = _clock(now)
+    action = RecoveryAction.BLOCKED_PROVIDER_ACCOUNTING
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if row.role is not ProviderRole.SUPERVISOR or row.external_turn_identity is None:
+            raise ProviderRecoveryError("accounting blocker requires a dispatched Supervisor turn")
+        if row.state is AttemptState.BLOCKED:
+            outcome = _read_recovery_outcome(connection, attempt_id)
+            if outcome != _PersistedRecoveryOutcome(action, blocker.value):
+                raise ProviderRecoveryError("accounting blocker conflicts with committed state")
+            connection.commit()
+            return _projection(row, action, blocker.value)
+        if row.state is not AttemptState.DISPATCHED:
+            raise ProviderRecoveryError("accounting blocker requires an unsettled Supervisor turn")
+        if connection.execute("SELECT 1 FROM provider_invalid_outputs WHERE attempt_id = ?", (attempt_id,)).fetchone() is not None:
+            raise ProviderRecoveryError("accounting blocker conflicts with invalid output")
+        connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.BLOCKED.value, attempt_id))
+        row = replace(row, state=AttemptState.BLOCKED)
+        _persist_recovery_outcome(connection, attempt_id, action, blocker.value, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, action.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return _projection(row, action, blocker.value)
 
 
 def block_session_without_turn(

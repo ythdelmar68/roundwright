@@ -68,6 +68,19 @@ class SupervisorResultKind(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
+class SupervisorResponseContract(StrEnum):
+    """Closed output contracts selected by the product-owned request."""
+
+    VERDICT = "verdict-findings/v1"
+    PROVIDER_ATTEMPT_ACCOUNTING = "provider-attempt-accounting/v1"
+
+
+class SupervisorAccountingBlocker(StrEnum):
+    """Public-safe terminal conclusion for the accounting-only contract."""
+
+    INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
+
+
 class SupervisorDiagnostic(StrEnum):
     SYNTAX = "syntax"
     SHAPE = "shape"
@@ -138,9 +151,11 @@ class CodexSupervisorRequest:
     context: CodexSupervisorContext
     objective: str
     acceptance_criteria: tuple[str, ...]
+    response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT
+    decision_material: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
-        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria):
+        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and self.decision_material is not None) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and not _accounting_material(self.decision_material)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material):
             raise CodexSupervisorError("Supervisor request is invalid")
 
 
@@ -174,10 +189,11 @@ class CodexSupervisorResult:
     failure: CodexFailure | None = None
     outcome_source: SupervisorOutcomeSource | None = None
     sdk_error_category: SupervisorSdkTurnErrorCategory | None = None
+    terminal_blocker: SupervisorAccountingBlocker | None = None
 
     def __post_init__(self) -> None:
         blocked = self.kind is SupervisorResultKind.BLOCKED
-        if type(self.kind) is not SupervisorResultKind or (self.session_identity is not None and not _token(self.session_identity)) or (self.turn_identity is not None and not _token(self.turn_identity)) or (self.verdict is not None and type(self.verdict) is not SupervisorVerdict) or any(not _token(item) for item in self.findings) or (self.output_fingerprint is not None and not _DIGEST.fullmatch(self.output_fingerprint)) or (self.diagnostic is not None and type(self.diagnostic) is not SupervisorDiagnostic) or (self.failure is not None and type(self.failure) is not CodexFailure) or (self.outcome_source is not None and type(self.outcome_source) is not SupervisorOutcomeSource) or (self.sdk_error_category is not None and type(self.sdk_error_category) is not SupervisorSdkTurnErrorCategory):
+        if type(self.kind) is not SupervisorResultKind or (self.session_identity is not None and not _token(self.session_identity)) or (self.turn_identity is not None and not _token(self.turn_identity)) or (self.verdict is not None and type(self.verdict) is not SupervisorVerdict) or any(not _token(item) for item in self.findings) or (self.output_fingerprint is not None and not _DIGEST.fullmatch(self.output_fingerprint)) or (self.diagnostic is not None and type(self.diagnostic) is not SupervisorDiagnostic) or (self.failure is not None and type(self.failure) is not CodexFailure) or (self.outcome_source is not None and type(self.outcome_source) is not SupervisorOutcomeSource) or (self.sdk_error_category is not None and type(self.sdk_error_category) is not SupervisorSdkTurnErrorCategory) or (self.terminal_blocker is not None and type(self.terminal_blocker) is not SupervisorAccountingBlocker):
             raise CodexSupervisorError("Supervisor result is invalid")
         if self.kind is SupervisorResultKind.ACCEPTED:
             if self.session_identity is None or self.turn_identity is None or self.verdict is None or self.output_fingerprint is None or self.diagnostic is not None or (self.verdict is SupervisorVerdict.PASS and self.findings) or (self.verdict is SupervisorVerdict.FINDINGS and not self.findings):
@@ -185,7 +201,10 @@ class CodexSupervisorResult:
         elif blocked:
             if self.session_identity is None or self.turn_identity is None or self.verdict is not None or self.findings or self.output_fingerprint is not None or self.diagnostic is not None or self.failure is None or self.outcome_source is None or self.sdk_error_category is None:
                 raise CodexSupervisorError("Supervisor result is invalid")
-        elif self.verdict is not None or self.findings or self.output_fingerprint is not None or self.failure is not None or self.outcome_source is not None or self.sdk_error_category is not None or (self.kind is SupervisorResultKind.INVALID and self.diagnostic is None) or (self.kind is not SupervisorResultKind.INVALID and self.diagnostic is not None):
+        elif self.kind is SupervisorResultKind.INCOMPLETE:
+            if self.session_identity is None or self.turn_identity is None or self.terminal_blocker is None or self.verdict is not None or self.findings or self.output_fingerprint is not None or self.failure is not None or self.outcome_source is not None or self.sdk_error_category is not None or self.diagnostic is not None:
+                raise CodexSupervisorError("Supervisor result is invalid")
+        elif self.verdict is not None or self.findings or self.output_fingerprint is not None or self.failure is not None or self.outcome_source is not None or self.sdk_error_category is not None or self.terminal_blocker is not None or (self.kind is SupervisorResultKind.INVALID and self.diagnostic is None) or (self.kind is not SupervisorResultKind.INVALID and self.diagnostic is not None):
             raise CodexSupervisorError("Supervisor result is invalid")
 
 
@@ -259,7 +278,13 @@ class CodexSupervisorAdapter:
         if response.kind is not SupervisorResultKind.ACCEPTED:
             return CodexSupervisorResult(response.kind, session_identity, turn_identity, diagnostic=response.diagnostic, failure=response.failure, outcome_source=response.outcome_source, sdk_error_category=response.sdk_error_category)
         try:
-            verdict, findings = _output(response.structured_output, request)
+            if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+                complete, blocker = _accounting_output(response.structured_output)
+                if not complete:
+                    return CodexSupervisorResult(SupervisorResultKind.INCOMPLETE, session_identity, turn_identity, terminal_blocker=blocker)
+                verdict, findings = SupervisorVerdict.PASS, ()
+            else:
+                verdict, findings = _output(response.structured_output, request)
         except _CandidateBindingDrift:
             return CodexSupervisorResult(SupervisorResultKind.INVALID, session_identity, turn_identity, diagnostic=SupervisorDiagnostic.CANDIDATE)
         except CodexSupervisorError:
@@ -305,12 +330,32 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     return SupervisorFailoverResult(None, tuple(attempted), True)
 
 
-def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: str, selected_profile_identity: str, within_round_attempt: int, context: CodexSupervisorContext, objective: str, acceptance_criteria: tuple[str, ...]) -> str:
-    return _digest({"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "within_round_attempt": within_round_attempt, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria})
+def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: str, selected_profile_identity: str, within_round_attempt: int, context: CodexSupervisorContext, objective: str, acceptance_criteria: tuple[str, ...], response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT, decision_material: dict[str, object] | None = None) -> str:
+    value: dict[str, object] = {"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "within_round_attempt": within_round_attempt, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria}
+    if response_contract is not SupervisorResponseContract.VERDICT:
+        value["response_contract"] = response_contract.value
+        value["decision_material"] = decision_material
+    return _digest(value)
 
 
 def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dict[str, object]:
+    if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+        return {"schema": "roundwright-provider-attempt-accounting-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "decision_material": request.decision_material}
     return {"schema": "roundwright-supervisor-review-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
+
+
+def _accounting_material(value: object) -> bool:
+    return type(value) is dict and set(value) == {"schema", "binding", "candidate", "review_policy", "current_attempt", "prior_attempts"} and value.get("schema") == "roundwright-provider-attempt-accounting-decision/v1" and all(type(value.get(name)) is dict for name in ("binding", "candidate", "review_policy", "current_attempt")) and type(value.get("prior_attempts")) is list
+
+
+def _accounting_output(value: object) -> tuple[bool, SupervisorAccountingBlocker | None]:
+    if type(value) is not dict or set(value) != {"status", "action", "blocker"}:
+        raise CodexSupervisorError("Supervisor accounting output is malformed")
+    if value == {"status": "complete", "action": "accept-formal-review", "blocker": None}:
+        return True, None
+    if value == {"status": "blocked", "action": "retain-terminal-product-block", "blocker": SupervisorAccountingBlocker.INCOMPLETE_ACCOUNTING.value}:
+        return False, SupervisorAccountingBlocker.INCOMPLETE_ACCOUNTING
+    raise CodexSupervisorError("Supervisor accounting output is malformed")
 
 
 def _output(value: object, request: CodexSupervisorRequest) -> tuple[SupervisorVerdict, tuple[str, ...]]:

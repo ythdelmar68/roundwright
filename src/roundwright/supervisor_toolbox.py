@@ -17,14 +17,16 @@ from typing import Callable, Mapping
 from .codex_supervisor import (
     CodexSupervisorError, CodexSupervisorRequest, NativeCodexSupervisorBackend, canonical_supervisor_review_material,
     NativeSupervisorResponse, NativeSupervisorSession, NativeSupervisorTurn,
-    SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
+    SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
-def _schema() -> dict[str, object]:
+def _schema(contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT) -> dict[str, object]:
+    if contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+        return {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "blocked"]}, "action": {"type": "string", "enum": ["accept-formal-review", "retain-terminal-product-block"]}, "blocker": {"type": ["string", "null"], "enum": ["provider-accounting-incomplete", None]}}, "required": ["status", "action", "blocker"], "additionalProperties": False}
     return {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "findings"]}, "findings": {"type": "array", "items": {"type": "string"}, "maxItems": 32}, "binding": {"type": "object", "properties": {"input_digest": {"type": "string"}, "candidate_sha": {"type": "string"}, "within_round_attempt": {"type": "integer"}, "profile_identity": {"type": "string"}}, "required": ["input_digest", "candidate_sha", "within_round_attempt", "profile_identity"], "additionalProperties": False}}, "required": ["verdict", "findings", "binding"], "additionalProperties": False}
 
 
@@ -109,16 +111,16 @@ class _Session(NativeSupervisorSession):
         self._started = True
         payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly.", "review_material": canonical_supervisor_review_material(request), "tools": []}
         try:
-            handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort(self._profile.reasoning_effort.value), output_schema=_schema(), sandbox=self._sandbox)
-            return _Turn(handle, self, self._completion, self._clock)
+            handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort(self._profile.reasoning_effort.value), output_schema=_schema(request.response_contract), sandbox=self._sandbox)
+            return _Turn(handle, self, self._completion, self._clock, request.response_contract)
         except Exception as error:
             self.close()
             raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 class _Turn(NativeSupervisorTurn):
-    def __init__(self, handle: object, session: _Session, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._handle, self._session, self._completion, self._clock, self._read, self._aborted = handle, session, completion, clock, False, False
+    def __init__(self, handle: object, session: _Session, completion: CompletionDeadline, clock: Callable[[], float], contract: SupervisorResponseContract) -> None:
+        self._handle, self._session, self._completion, self._clock, self._contract, self._read, self._aborted = handle, session, completion, clock, contract, False, False
 
     def identity(self) -> str:
         value = getattr(self._handle, "id", None)
@@ -137,12 +139,12 @@ class _Turn(NativeSupervisorTurn):
         if self._read: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._read = True
         try:
-            return _consume(self._handle, self._completion, self._clock, self.abort)
+            return _consume(self._handle, self._completion, self._clock, self.abort, self._contract)
         finally:
             self._session.close()
 
 
-def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None]) -> NativeSupervisorResponse:
+def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None], contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT) -> NativeSupervisorResponse:
     try:
         response: str | None = None
         completed = False
@@ -184,6 +186,13 @@ def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[],
         if response is None: return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.NON_FINAL if non_final else SupervisorDiagnostic.SHAPE)
         try: parsed = json.loads(response)
         except (TypeError, ValueError): return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)
+        if contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+            if type(parsed) is not dict or set(parsed) != {"status", "action", "blocker"} or parsed not in (
+                {"status": "complete", "action": "accept-formal-review", "blocker": None},
+                {"status": "blocked", "action": "retain-terminal-product-block", "blocker": "provider-accounting-incomplete"},
+            ):
+                return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)
+            return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, parsed)
         binding = parsed.get("binding") if type(parsed) is dict else None
         if type(parsed) is not dict or set(parsed) != {"verdict", "findings", "binding"} or parsed.get("verdict") not in {"pass", "findings"} or type(parsed.get("findings")) is not list or type(binding) is not dict or set(binding) != {"input_digest", "candidate_sha", "within_round_attempt", "profile_identity"} or type(binding["input_digest"]) is not str or type(binding["candidate_sha"]) is not str or type(binding["within_round_attempt"]) is not int or type(binding["profile_identity"]) is not str:
             return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -23,7 +24,7 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    NativeCodexSupervisorBackend, SupervisorResultKind, SupervisorVerdict,
+    NativeCodexSupervisorBackend, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
@@ -35,9 +36,10 @@ from .provider_recovery import (
     read_supervisor_terminal_failure, record_supervisor_terminal_failure,
     read_attempt, record_invalid_output, recover_attempt,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
+    SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
-from .state import TaskIdentity, check_database, require_runtime_binding, task_projection
+from .state import TaskIdentity, check_database, database_path, require_runtime_binding, task_projection
 from .worker_planning import ProviderDispatchControl
 from .supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from .worker_toolbox import CompletionDeadline
@@ -381,6 +383,98 @@ class DurableDiffReviewRunner:
                 raise ProviderAttemptRuntimeError("provider attempt recovery is incomplete")
         return tuple(attempt_ids)
 
+    def _accounting_decision_material(
+        self,
+        selection: DiffReviewSelection,
+        recovery: RecoveryContext,
+        audit: ProviderHealthAuditIdentity,
+        context: CodexSupervisorContext,
+    ) -> dict[str, object]:
+        """Read the sealed, provider-safe accounting facts for this turn.
+
+        The native no-tools decision never receives caller outcomes, provider
+        prose, local paths, or a synthetic event graph.  Earlier positions are
+        represented only by records already durably committed by product APIs.
+        """
+
+        entries = self.validate_sequence()
+        prior = tuple(item for item in entries if item.selection.within_round_attempt < selection.within_round_attempt)
+        if not any(item.selection == selection and item.recovery == recovery and item.audit == audit for item in entries):
+            raise ProviderAttemptRuntimeError("provider attempt decision material has drifted")
+        try:
+            connection = sqlite3.connect(f"{database_path(self.repository).as_uri()}?mode=ro", uri=True)
+            try:
+                seal = connection.execute(
+                    "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?",
+                    (self.identity.task_id,),
+                ).fetchone()
+                evidence = tuple(row[0] for row in connection.execute(
+                    "SELECT evidence_fingerprint FROM candidate_evidence WHERE task_id = ? AND candidate_sha = ? ORDER BY evidence_fingerprint",
+                    (self.identity.task_id, self.seal.candidate_sha),
+                ))
+                verifications = tuple((row[0], row[1], row[2]) for row in connection.execute(
+                    "SELECT verification_kind, outcome, evidence_fingerprint FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? ORDER BY verification_kind, verification_id",
+                    (self.identity.task_id, self.seal.candidate_sha),
+                ))
+                rows: list[dict[str, object]] = []
+                for item in prior:
+                    row = connection.execute(
+                        "SELECT state, session_identity, external_turn_identity, output_pointer, completion_evidence_fingerprint, accepted_review_identity, selected_profile_identity FROM provider_attempts WHERE task_id = ? AND attempt_id = ?",
+                        (self.identity.task_id, item.selection.provider_attempt_id),
+                    ).fetchone()
+                    outcome = connection.execute(
+                        "SELECT recovery_action FROM provider_recovery_outcomes WHERE attempt_id = ?",
+                        (item.selection.provider_attempt_id,),
+                    ).fetchone()
+                    if row is None or row[6] != item.audit.profile_identity:
+                        raise ProviderAttemptRuntimeError("provider attempt decision material is unavailable")
+                    rows.append({
+                        "attempt_id": item.selection.provider_attempt_id,
+                        "within_round_attempt": item.selection.within_round_attempt,
+                        "profile_identity": item.audit.profile_identity,
+                        "state": row[0],
+                        "session_present": row[1] is not None,
+                        "turn_present": row[2] is not None,
+                        "completion_present": row[4] is not None,
+                        "invalid_output_present": row[3] is not None and str(row[3]).startswith("supervisor-invalid-"),
+                        "recovery_action": None if outcome is None else outcome[0],
+                        "accepted": row[5] is not None,
+                    })
+            finally:
+                connection.close()
+        except (sqlite3.Error, TypeError, ValueError):
+            raise ProviderAttemptRuntimeError("provider attempt decision material is unavailable") from None
+        if seal != (self.seal.base_sha, self.seal.candidate_sha, self.lease.state_identity):
+            raise ProviderAttemptRuntimeError("provider attempt decision material has drifted")
+        return {
+            "schema": "roundwright-provider-attempt-accounting-decision/v1",
+            "binding": {
+                "repository_id": self.identity.repository_id, "task_id": self.identity.task_id,
+                "source_digest": self.source_digest, "base_sha": self.identity.base_sha,
+                "candidate_sha": self.seal.candidate_sha,
+            },
+            "candidate": {
+                "seal_state_identity": self.lease.state_identity,
+                "evidence_count": len(evidence), "evidence_digest": _digest(evidence),
+                "verification_count": len(verifications), "verification_digest": _digest(verifications),
+            },
+            "review_policy": {
+                "configuration_digest": recovery.runtime_binding.resolved_digest,
+                "policy_digest": recovery.runtime_binding.review_policy_digest,
+                "complete_rounds": recovery.runtime_binding.review_complete_rounds,
+                "max_rounds": recovery.runtime_binding.review_max_rounds,
+                "max_supervisor_attempts_per_round": recovery.runtime_binding.review_max_supervisor_attempts_per_round,
+                "review_epoch": context.review_epoch, "review_round": context.review_round,
+                "review_mode": context.review_mode.value,
+            },
+            "current_attempt": {
+                "attempt_id": selection.provider_attempt_id,
+                "within_round_attempt": selection.within_round_attempt,
+                "profile_identity": audit.profile_identity,
+            },
+            "prior_attempts": rows,
+        }
+
     def _execute_selection(
         self,
         selection: DiffReviewSelection,
@@ -416,6 +510,7 @@ class DurableDiffReviewRunner:
             else ReviewMode.CONVERGING,
         )
         selected = audit.profile_identity
+        decision_material = self._accounting_decision_material(selection, recovery, audit, context)
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
             selection.within_round_attempt,
@@ -426,8 +521,11 @@ class DurableDiffReviewRunner:
                 within_round_attempt=selection.within_round_attempt,
                 context=context, objective=selection.objective,
                 acceptance_criteria=selection.acceptance_criteria,
+                response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING,
+                decision_material=decision_material,
             ),
             context, selection.objective, selection.acceptance_criteria,
+            SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material,
         )
         session_checkpointed = False
         turn_checkpointed = False
@@ -509,6 +607,16 @@ class DurableDiffReviewRunner:
                     lease=self.lease, now=self.dispatch_control.now,
                 )
                 return (selection.provider_attempt_id, False)
+            if result.kind is SupervisorResultKind.INCOMPLETE:
+                if result.terminal_blocker is None:
+                    raise ProviderAttemptRuntimeError("provider accounting terminal decision is invalid")
+                record_supervisor_accounting_blocker(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                    blocker=SupervisorAccountingBlocker(result.terminal_blocker.value),
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                raise ProviderAttemptRuntimeError("provider accounting decision is terminal")
             if result.kind is not SupervisorResultKind.INVALID:
                 recover_attempt(
                     self.repository, self.identity, recovery,

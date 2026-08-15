@@ -390,6 +390,55 @@ def prepare_attempt(
     return read_attempt(repository, identity, attempt_id)
 
 
+def claim_supervisor_dispatch(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Atomically consume one prepared Supervisor dispatch authorization.
+
+    A claim deliberately precedes native session construction.  It makes a
+    prepared attempt one-shot even when a provider cannot return a session or
+    a local checkpoint callback fails before a durable turn exists.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    observed = _clock(now)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.PREPARED or row.session_identity is not None or row.external_turn_identity is not None or row.output_pointer is not None or row.accepted_review_identity is not None:
+            raise ProviderRecoveryError("Supervisor dispatch claim requires an unclaimed prepared attempt")
+        existing = connection.execute("SELECT task_id,claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if existing is not None:
+            raise ProviderRecoveryError("Supervisor dispatch claim is already consumed")
+        connection.execute(
+            "INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)",
+            (attempt_id, identity.task_id, row.input_fingerprint, observed),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise ProviderRecoveryError("Supervisor dispatch claim is already consumed") from error
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return read_attempt(repository, identity, attempt_id, context=context, now=now)
+
+
 def record_external_turn(
     repository: RepositoryIdentity,
     identity: TaskIdentity,

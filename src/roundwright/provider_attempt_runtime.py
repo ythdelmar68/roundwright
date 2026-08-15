@@ -33,7 +33,7 @@ from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
     read_supervisor_terminal_failure, record_supervisor_terminal_failure,
-    read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
+    claim_supervisor_dispatch, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
     SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
 )
@@ -372,6 +372,17 @@ class DurableDiffReviewRunner:
         """Dispatch one bounded sequence and return only durable attempt IDs."""
 
         entries = self.preflight_checkpoint_prerequisites()
+        first = entries[0]
+        try:
+            initial = read_attempt(
+                self.repository, self.identity, first.selection.provider_attempt_id,
+                context=first.recovery, now=self.dispatch_control.now,
+            )
+        except ProviderRecoveryError:
+            self.materialize_prepared_snapshot(entries)
+        else:
+            if initial.state is AttemptState.PREPARED:
+                self.materialize_prepared_snapshot(entries)
         attempt_ids: list[str] = []
         for entry in entries:
             attempt_id, accepted = self._execute_selection(entry.selection, entry.recovery, entry.audit, entry.backend)
@@ -387,6 +398,60 @@ class DurableDiffReviewRunner:
             if stored.state is not AttemptState.INVALIDATED:
                 raise ProviderAttemptRuntimeError("provider attempt recovery is incomplete")
         return tuple(attempt_ids)
+
+    def materialize_prepared_snapshot(
+        self, entries: tuple[DiffReviewSequenceEntry, ...] | None = None,
+    ) -> object:
+        """Persist and read back the exact first V2 accounting checkpoint.
+
+        This is intentionally provider-free.  It is the single durable
+        readiness boundary shared by hosted validate and execute; it never
+        claims dispatch or opens a native session.
+        """
+
+        entries = self.preflight_checkpoint_prerequisites() if entries is None else entries
+        entry = entries[0]
+        selection = entry.selection
+        runtime = entry.recovery.runtime_binding
+        context = CodexSupervisorContext(
+            self.identity.task_id, self.source_digest, "sha256:" + entry.recovery.repository_fingerprint,
+            "sha256:" + entry.recovery.worktree_fingerprint, "sha256:" + entry.recovery.branch_fingerprint,
+            self.identity.base_sha, self.seal.candidate_sha,
+            "sha256:" + entry.recovery.policy_fingerprint, runtime.resolved_digest,
+            self.review_epoch, self.review_round,
+            ReviewMode.COMPLETE if self.review_round <= runtime.review_complete_rounds else ReviewMode.CONVERGING,
+        )
+        input_fingerprint = preflight_diff_review_session_checkpoint(
+            self.repository, self.identity, entry.recovery, self.binding, self.seal,
+            dependency_binding=self.dependency_binding, control=self.dispatch_control,
+            implementation_attempt_id=selection.implementation_attempt_id,
+            provider_attempt_id=selection.provider_attempt_id,
+            message_identity=selection.message_identity,
+            process_lease_id=selection.process_lease_id,
+            process_lease_expires_at=selection.process_lease_expires_at,
+            selected_profile_identity=entry.audit.profile_identity,
+            within_round_attempt=selection.within_round_attempt, review_round=self.review_round,
+            lease=self.lease, now=self.dispatch_control.now,
+        )
+        prepared = prepare_attempt(
+            self.repository, self.identity, entry.recovery, attempt_id=selection.provider_attempt_id,
+            role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
+            process_lease_expires_at=selection.process_lease_expires_at,
+            input_fingerprint=input_fingerprint, selected_profile_identity=entry.audit.profile_identity,
+            lease=self.lease, now=self.dispatch_control.now,
+        )
+        if prepared.state is not AttemptState.PREPARED:
+            raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+        return read_supervisor_accounting_snapshot(
+            self.repository, self.identity, entry.recovery, source_digest=self.source_digest,
+            base_sha=self.identity.base_sha, candidate_sha=self.seal.candidate_sha,
+            case_id=self.case_id, ready_at=self.ready_at, review_epoch=self.review_epoch,
+            review_round=self.review_round, review_mode=context.review_mode.value,
+            current_attempt_id=selection.provider_attempt_id,
+            current_within_round_attempt=selection.within_round_attempt,
+            current_profile_identity=entry.audit.profile_identity, prior_attempts=(),
+            seal_state_identity=self.lease.state_identity,
+        )
 
     def _execute_selection(
         self,
@@ -409,7 +474,8 @@ class DurableDiffReviewRunner:
                 return (existing.attempt_id, False)
             if existing.state is AttemptState.BLOCKED:
                 raise ProviderAttemptRuntimeError("provider attempt session ended before a durable turn checkpoint")
-            raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
+            if existing.state is not AttemptState.PREPARED:
+                raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
         except ProviderRecoveryError:
             pass
         context = CodexSupervisorContext(
@@ -440,6 +506,14 @@ class DurableDiffReviewRunner:
         )
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+        try:
+            claim_supervisor_dispatch(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id, lease=self.lease,
+                now=self.dispatch_control.now,
+            )
+        except ProviderRecoveryError:
+            raise ProviderAttemptRuntimeError("provider attempt dispatch claim is unavailable") from None
         entries = self.validate_sequence()
         prior = tuple((item.selection.provider_attempt_id, item.selection.within_round_attempt, item.audit.profile_identity) for item in entries if item.selection.within_round_attempt < selection.within_round_attempt)
         decision_material = read_supervisor_accounting_snapshot(
@@ -658,7 +732,8 @@ class ProviderAttemptRuntimeResources:
             or self.runner.completion_policy != self.completion_policy
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
-        self.runner.preflight_checkpoint_prerequisites()
+        entries = self.runner.preflight_checkpoint_prerequisites()
+        self.runner.materialize_prepared_snapshot(entries)
         # Provider-free preflight confirms the local durable identity and the
         # exact binding without calling a provider or creating a lifecycle row.
         check_database(self.repository)

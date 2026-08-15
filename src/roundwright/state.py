@@ -619,6 +619,15 @@ MIGRATIONS = (
             ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
         ),
     ),
+    Migration(
+        48,
+        (
+            "CREATE TABLE provider_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), claim_fingerprint TEXT NOT NULL, claimed_at INTEGER NOT NULL)",
+        ),
+        (
+            ("provider_dispatch_claims", "CREATE TABLE provider_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), claim_fingerprint TEXT NOT NULL, claimed_at INTEGER NOT NULL)"),
+        ),
+    ),
 )
 
 

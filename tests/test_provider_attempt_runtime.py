@@ -61,6 +61,9 @@ class _Runner:
     def execute(self) -> tuple[str, ...]:
         return ("attempt-1",)
 
+    def materialize_prepared_snapshot(self, _entries: tuple[object, ...]) -> object:
+        return object()
+
 
 class ProviderAttemptRuntimeTests(unittest.TestCase):
     def descriptor_payload(self) -> dict[str, object]:
@@ -764,6 +767,16 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "execution_context_input_digest": digest("d"),
                 })()
                 adapter.validate(binding)
+                prepared = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+                self.assertEqual(prepared.state, AttemptState.PREPARED)
+                self.assertEqual((prepared.session_identity, prepared.external_turn_identity, prepared.output_pointer, prepared.accepted_review_identity), (None, None, None, None))
+                self.assertEqual(backend.calls, 0)
+                adapter.validate(binding)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=?", (identity.task_id,)).fetchone()[0], 1)
+                finally:
+                    connection.close()
                 execution = adapter.execute(binding)
                 evidence = adapter.project(binding, execution)
                 self.assertEqual(adapter.compare(binding, evidence).status, "pass")

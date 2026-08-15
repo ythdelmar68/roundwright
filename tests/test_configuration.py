@@ -493,7 +493,13 @@ class ConfigurationTests(unittest.TestCase):
         authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
         with tempfile.TemporaryDirectory() as temporary:
             raw_root = Path(temporary) / "var-spelling" / "authority"
-            canonical_root = Path(temporary) / "private-var" / "authority"
+            # Build the canonical spelling from the host-resolved temporary
+            # root.  On macOS, re-resolving a lexical /var spelling yields
+            # /private/var; the mock must therefore return that same real
+            # canonical object both for the raw spelling and a later
+            # identity_for_root(canonical_root) call.
+            resolved_temporary = Path(temporary).resolve(strict=True)
+            canonical_root = resolved_temporary / "private-var" / "authority"
             raw_root.parent.mkdir()
             canonical_root.mkdir(parents=True)
             original_resolve = Path.resolve
@@ -503,7 +509,7 @@ class ConfigurationTests(unittest.TestCase):
                 except ValueError:
                     relative = None
                 if relative is not None:
-                    return canonical_root.parent / relative
+                    return original_resolve(canonical_root.parent / relative, strict=strict)
                 return original_resolve(path, strict=strict)
             with mock.patch.object(Path, "resolve", autospec=True, side_effect=normalized_resolve):
                 identity = FileReviewAuthorityStore.identity_for_root(raw_root)

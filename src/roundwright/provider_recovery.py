@@ -572,6 +572,73 @@ def invalidate_supervisor_attempt(
     return row
 
 
+def block_session_without_turn(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> RecoveryProjection:
+    """Terminally reconcile a real session that never reached a turn.
+
+    A persisted session proves that an external boundary was entered, but it
+    must not make the bounded sequence resumable when no external turn was
+    ever checkpointed.  The terminal record deliberately retains the real
+    session identity while retaining a null turn identity and no output.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    observed = _clock(now)
+    action = RecoveryAction.BLOCKED_AMBIGUOUS_TURN
+    blocker = "session-without-turn"
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        authorization_fingerprint = _require_persisted_health_authorization(
+            connection, attempt_id, context, row.role, row.selected_profile_identity, observed,
+        )
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("only a Supervisor session can be blocked before a turn")
+        if row.session_identity is None or row.external_turn_identity is not None:
+            raise ProviderRecoveryError("session-without-turn reconciliation requires exactly one session checkpoint")
+        _require_session_checkpoint(
+            connection, identity.task_id, attempt_id, row.session_identity, context, authorization_fingerprint,
+        )
+        if row.state is AttemptState.BLOCKED:
+            outcome = _read_recovery_outcome(connection, attempt_id)
+            if outcome != _PersistedRecoveryOutcome(action, blocker):
+                raise ProviderRecoveryError("session-without-turn reconciliation conflicts with committed state")
+            connection.commit()
+            return _projection(row, action, blocker)
+        if row.state is not AttemptState.PREPARED:
+            raise ProviderRecoveryError("session-without-turn reconciliation requires a prepared attempt")
+        connection.execute(
+            "UPDATE provider_attempts SET state = ? WHERE attempt_id = ?",
+            (AttemptState.BLOCKED.value, attempt_id),
+        )
+        row = replace(row, state=AttemptState.BLOCKED)
+        _persist_recovery_outcome(connection, attempt_id, action, blocker, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, action.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return _projection(row, action, blocker)
+
+
 def recover_attempt(
     repository: RepositoryIdentity,
     identity: TaskIdentity,

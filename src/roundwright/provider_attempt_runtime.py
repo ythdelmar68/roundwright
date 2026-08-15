@@ -16,7 +16,10 @@ import re
 from dataclasses import dataclass
 
 from .configuration import RepositoryIdentity, ReviewMode
-from .candidate_review import DiffReviewOutput, DiffReviewVerdict, dispatch_diff_review, record_diff_review
+from .candidate_review import (
+    DiffReviewOutput, DiffReviewVerdict, checkpoint_diff_review_session,
+    dispatch_diff_review, record_diff_review,
+)
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
     NativeCodexSupervisorBackend, SupervisorResultKind, SupervisorVerdict,
@@ -26,7 +29,8 @@ from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .provider_recovery import (
-    AttemptState, ProviderRecoveryError, RecoveryContext, invalidate_supervisor_attempt,
+    AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
+    invalidate_supervisor_attempt,
     read_attempt, record_invalid_output, recover_attempt,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
@@ -276,6 +280,8 @@ class DurableDiffReviewRunner:
                 return (existing.attempt_id, True)
             if existing.state is AttemptState.INVALIDATED:
                 return (existing.attempt_id, False)
+            if existing.state is AttemptState.BLOCKED:
+                raise ProviderAttemptRuntimeError("provider attempt session ended before a durable turn checkpoint")
             raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
         except ProviderRecoveryError:
             pass
@@ -303,13 +309,28 @@ class DurableDiffReviewRunner:
             ),
             context, selection.objective, selection.acceptance_criteria,
         )
-        dispatched = False
+        session_checkpointed = False
+        turn_checkpointed = False
 
-        def checkpoint_session(_: str) -> None:
-            return None
+        def checkpoint_session(session_identity: str) -> None:
+            nonlocal session_checkpointed
+            checkpoint_diff_review_session(
+                self.repository, self.identity, recovery, self.binding, self.seal,
+                dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                implementation_attempt_id=selection.implementation_attempt_id,
+                provider_attempt_id=selection.provider_attempt_id,
+                supervisor_session_identity=session_identity,
+                message_identity=selection.message_identity,
+                process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at,
+                selected_profile_identity=selected,
+                within_round_attempt=selection.within_round_attempt,
+                review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
+            )
+            session_checkpointed = True
 
         def checkpoint_turn(session_identity: str, turn_identity: str) -> None:
-            nonlocal dispatched
+            nonlocal turn_checkpointed
             dispatch_diff_review(
                 self.repository, self.identity, recovery, self.binding, self.seal,
                 dependency_binding=self.dependency_binding, control=self.dispatch_control,
@@ -323,13 +344,22 @@ class DurableDiffReviewRunner:
                 selected_profile_identity=selected, within_round_attempt=selection.within_round_attempt,
                 review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
             )
-            dispatched = True
+            turn_checkpointed = True
 
         result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
             request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
         )
-        if not dispatched:
-            raise ProviderAttemptRuntimeError("native Supervisor did not reach a durable dispatch checkpoint")
+        if not session_checkpointed:
+            raise ProviderAttemptRuntimeError("native Supervisor did not provide a durable session checkpoint")
+        if not turn_checkpointed:
+            terminal = block_session_without_turn(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            if terminal.next_action is not RecoveryAction.BLOCKED_AMBIGUOUS_TURN:
+                raise ProviderAttemptRuntimeError("native Supervisor session terminal disposition is invalid")
+            raise ProviderAttemptRuntimeError("native Supervisor session ended before a durable turn checkpoint")
         if result.kind is not SupervisorResultKind.ACCEPTED:
             # This is an observed typed adapter outcome, not caller-supplied
             # provider text.  Ambiguity is durable and terminal for this

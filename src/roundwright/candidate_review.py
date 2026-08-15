@@ -536,6 +536,87 @@ def record_candidate_verification(
     bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=value.evidence_fingerprint, lease=lease)
 
 
+def checkpoint_diff_review_session(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    binding: WorktreeBinding,
+    seal: CandidateSeal,
+    *,
+    dependency_binding: CandidateBinding,
+    control: ProviderDispatchControl,
+    implementation_attempt_id: str,
+    provider_attempt_id: str,
+    supervisor_session_identity: str,
+    message_identity: str,
+    process_lease_id: str,
+    process_lease_expires_at: int,
+    selected_profile_identity: str,
+    within_round_attempt: int,
+    review_round: int,
+    lease: TransitionLease | None,
+    now: int | None = None,
+) -> None:
+    """Durably checkpoint one real Supervisor session before its first turn.
+
+    This intentionally does not create a diff-review dispatch.  A subsequent
+    real turn consumes this exact prepared attempt through ``dispatch_diff_review``.
+    """
+
+    if (
+        type(dependency_binding) is not CandidateBinding
+        or type(control) is not ProviderDispatchControl
+        or control.binding != dependency_binding
+        or control.now != now
+        or dependency_binding.repository != identity.repository_id
+        or dependency_binding.task_id != identity.task_id
+        or dependency_binding.candidate_sha != seal.candidate_sha
+    ):
+        raise CandidateReviewError("diff review dispatch control is invalid")
+    try:
+        control.dependency_control.require(dependency_binding, DependencyStage.DISPATCH, now=now)
+    except DependencyPolicyError as error:
+        raise CandidateReviewError("diff review dispatch preflight blocked execution") from error
+    for value, name in (
+        (implementation_attempt_id, "implementation attempt identity"),
+        (provider_attempt_id, "provider attempt identity"),
+        (supervisor_session_identity, "Supervisor session identity"),
+        (message_identity, "review message identity"),
+        (process_lease_id, "process lease identity"),
+    ):
+        _token(value, name)
+    _require_candidate_binding(identity, binding, seal)
+    candidate_evidence(repository, binding, seal, lease=lease)
+    _require_current_candidate(repository, identity, seal, implementation_attempt_id)
+    _require_diff_review_context(repository, identity, context, seal, implementation_attempt_id)
+    verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
+    policy_projection = _project_review_policy(review_round, context.runtime_binding)
+    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity)
+    if _session_is_plan_review(repository, identity, supervisor_session_identity):
+        raise CandidateReviewError("diff review must use a session distinct from plan review")
+    input_digest = _diff_review_input_digest(
+        identity, implementation_attempt_id, seal.base_sha, seal.candidate_sha,
+        message_identity, verification_digest, within_round_attempt,
+        selected_profile_identity, policy_projection,
+    )
+    provider = prepare_attempt(
+        repository, identity, context, attempt_id=provider_attempt_id,
+        role=ProviderRole.SUPERVISOR, process_lease_id=process_lease_id,
+        process_lease_expires_at=process_lease_expires_at,
+        input_fingerprint=input_digest,
+        selected_profile_identity=selected_profile_identity, lease=lease, now=now,
+    )
+    if provider.state is AttemptState.PREPARED:
+        record_session_identity(
+            repository, identity, context, attempt_id=provider_attempt_id,
+            session_identity=supervisor_session_identity, lease=lease, now=now,
+        )
+        return
+    if provider.state is AttemptState.DISPATCHED and provider.session_identity == supervisor_session_identity:
+        return
+    raise CandidateReviewError("diff review session checkpoint conflicts with committed state")
+
+
 def dispatch_diff_review(
     repository: RepositoryIdentity,
     identity: TaskIdentity,

@@ -27,7 +27,7 @@ from roundwright.provider_attempt_runtime import (
     ProviderAttemptHostInputs, ProviderAttemptRuntimeDescriptor, ProviderAttemptRuntimeError,
     ProviderAttemptRuntimeResources, install_host_runtime,
 )
-from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, read_attempt
+from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, read_attempt
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.state import TaskIdentity, database_path
 from tests.provider_health_fixture import provider_context
@@ -217,6 +217,27 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
                 drifted.execute()
             self.assertEqual(backend.calls, 0)
+
+    def test_missing_session_identity_creates_no_provider_attempt(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            class NoSessionBackend:
+                def __init__(self) -> None:
+                    self.calls = 0
+                def open_fresh_session(self, _profile: object) -> object:
+                    self.calls += 1
+                    raise RuntimeError("session unavailable")
+
+            backend = NoSessionBackend()
+            runner = replace(runner, backend=backend)
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "session checkpoint"):
+                runner.execute()
+            self.assertEqual(backend.calls, 1)
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
 
     def test_projection_binds_non_first_epoch_and_formal_round(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -441,10 +462,26 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
         try:
             harness = importlib.import_module("roundwright_harness.executor")
             with TemporaryDirectory() as temporary:
-                runner, first_backend, repository, identity, recovery, seal = self.durable_runner(
+                runner, _, repository, identity, recovery, seal = self.durable_runner(
                     Path(temporary) / "repository",
-                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
                 )
+                class SessionWithoutTurn:
+                    def identity(self) -> str:
+                        return "runtime-hosted-preturn-session"
+                    def close(self) -> None:
+                        return None
+                    def start_turn(self, _request: object) -> object:
+                        raise RuntimeError("turn identity is unavailable")
+
+                class SessionOnlyBackend:
+                    def __init__(self) -> None:
+                        self.calls = 0
+                    def open_fresh_session(self, _profile: object) -> SessionWithoutTurn:
+                        self.calls += 1
+                        return SessionWithoutTurn()
+
+                first_backend = SessionOnlyBackend()
                 second_recovery = provider_context(
                     recovery, identity, ProviderRole.SUPERVISOR,
                     selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
@@ -507,13 +544,17 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 finally:
                     connection.close()
                 readiness = external_validation.run_provider_attempt_accounting_profile("validate", request, Path(temporary) / "recorder", host)
-                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "ambiguous"):
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "durable turn checkpoint"):
                     external_validation.run_provider_attempt_accounting_profile(
                         "execute", request, Path(temporary) / "recorder", host,
                         expected_readiness_digest=str(readiness.as_dict()["receipt_digest"]),
                     )
                 self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
-                self.assertEqual(read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery).state, AttemptState.AMBIGUOUS)
+                stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+                self.assertEqual(stored.state, AttemptState.BLOCKED)
+                self.assertEqual(stored.session_identity, "runtime-hosted-preturn-session")
+                self.assertIsNone(stored.external_turn_identity)
+                self.assertIsNone(stored.accepted_review_identity)
                 connection = sqlite3.connect(database_path(repository))
                 try:
                     self.assertEqual(
@@ -523,8 +564,28 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                         ).fetchone()[0],
                         0,
                     )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM diff_review_attempts WHERE provider_attempt_id = ?",
+                            (runner.selection.provider_attempt_id,),
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM accepted_provider_reviews WHERE attempt_id = ?",
+                            (runner.selection.provider_attempt_id,),
+                        ).fetchone()[0],
+                        0,
+                    )
                 finally:
                     connection.close()
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "durable turn checkpoint"):
+                    external_validation.run_provider_attempt_accounting_profile(
+                        "execute", request, Path(temporary) / "recorder", host,
+                        expected_readiness_digest=str(readiness.as_dict()["receipt_digest"]),
+                    )
+                self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
         finally:
             sys.path.remove(str(source))
             for name in tuple(sys.modules):

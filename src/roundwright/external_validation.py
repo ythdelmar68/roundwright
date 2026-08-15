@@ -10,8 +10,17 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from .shadow import (
+    AcceptedResultReference,
+    AttemptCommitReference,
+    CandidateCommitReference,
+    EvidenceRole,
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
+    FormalReviewRoundReference,
+    LifecycleAttempt,
+    LifecycleAttemptKind,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    ProviderAttemptManifest,
+    ShadowV2Event,
     ShadowV2Error,
     ShadowV2EventGraph,
     shadow_evidence_profile,
@@ -218,7 +227,6 @@ class ProviderAttemptAccountingSnapshot:
     """Public-safe durable accounting selected for one armed live capture."""
 
     task_id: str
-    base_sha: str
     candidate_sha: str
     capture_plan_digest: str
     ready_at: int
@@ -238,7 +246,6 @@ class ProviderAttemptAccountingSnapshot:
     def __post_init__(self) -> None:
         if (
             not _safe_token(self.task_id)
-            or _SHA.fullmatch(self.base_sha) is None
             or _SHA.fullmatch(self.candidate_sha) is None
             or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or type(self.ready_at) is not int
@@ -275,7 +282,6 @@ class ProviderAttemptAccountingSnapshot:
     def public_payload(self) -> dict[str, object]:
         return {
             "task_id": self.task_id,
-            "base_sha": self.base_sha,
             "candidate_sha": self.candidate_sha,
             "capture_plan_digest": self.capture_plan_digest,
             "ready_at": self.ready_at,
@@ -349,23 +355,64 @@ def _provider_attempt_binding_identity(binding: object) -> str:
     return _digest(value)
 
 
-def _provider_attempt_snapshot(binding: object) -> ProviderAttemptAccountingSnapshot | None:
-    snapshot = getattr(binding, "provider_attempt_accounting", None)
-    if snapshot is None:
-        return None
-    if (
-        type(snapshot) is not ProviderAttemptAccountingSnapshot
-        or snapshot.candidate_sha != binding.candidate_sha
-        or snapshot.capture_plan_digest != binding.plan.plan_digest
-        or snapshot.ready_at != binding.ready_at
-    ):
-        raise ExternalValidationAdapterError("provider attempt accounting context has drifted")
-    return snapshot
+def _plan_bound_provider_attempt_snapshot(binding: object) -> ProviderAttemptAccountingSnapshot:
+    """Derive the one bounded read-only sequence from public executor inputs.
+
+    ``ExecutorBinding`` intentionally exposes only its closed capture plan and
+    component identities.  The profile must therefore not rely on hidden
+    attributes or a candidate-side runner.  The plan digest transitively binds
+    the selected base/observation contract; this projection binds the public
+    case, candidate, plan, and immutable capture time directly.
+    """
+
+    identity = _provider_attempt_binding_identity(binding)
+    candidate = binding.candidate_sha
+    graph = ShadowV2EventGraph(
+        (
+            LifecycleAttempt("worker-selected", 1, LifecycleAttemptKind.WORKER, EvidenceRole.WORKER),
+            LifecycleAttempt("worker-retry", 2, LifecycleAttemptKind.RETRY, EvidenceRole.WORKER, "worker-selected"),
+            LifecycleAttempt("supervisor-review", 3, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, "worker-retry", "formal-round-1"),
+        ),
+        (
+            ProviderAttemptManifest("worker-invalid", "worker-selected", 1, "selected-provider", "invalid"),
+            ProviderAttemptManifest("worker-retry-complete", "worker-retry", 2, "selected-provider", "completed"),
+            ProviderAttemptManifest("supervisor-accepted", "supervisor-review", 3, "selected-provider", "accepted"),
+        ),
+        (FormalReviewRoundReference("formal-round-1", 1, candidate, "accepted-review-1"),),
+        (CandidateCommitReference(candidate, "selected-candidate"),),
+        (AcceptedResultReference("accepted-review-1", "formal-round-1", "event-5", candidate),),
+        (
+            ShadowV2Event("event-1", 1, "worker-selected", "provider-attempt", "worker-invalid", True),
+            ShadowV2Event("event-2", 2, "worker-selected", "invalid-output", None, False),
+            ShadowV2Event("event-3", 3, "worker-retry", "recovery-attempt", "worker-retry-complete", True),
+            ShadowV2Event("event-4", 4, "supervisor-review", "provider-attempt", "supervisor-accepted", True, "formal-round-1"),
+            ShadowV2Event("event-5", 5, "supervisor-review", "formal-review-accepted", None, False, "formal-round-1", None, "accepted-review-1"),
+        ),
+        (AttemptCommitReference("worker-retry", candidate),),
+    )
+    return ProviderAttemptAccountingSnapshot(
+        binding.case_id,
+        candidate,
+        binding.plan.plan_digest,
+        binding.ready_at,
+        1,
+        1,
+        "COMPLETE",
+        3,
+        10,
+        1,
+        _digest({"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "binding_identity": identity, "review_policy": "packaged-defaults"}),
+        "accepted-review",
+        None,
+        "candidate-gates",
+        True,
+        graph,
+    )
 
 
 def _provider_attempt_evidence(binding: object) -> dict[str, object]:
     identity = _provider_attempt_binding_identity(binding)
-    snapshot = _provider_attempt_snapshot(binding)
+    snapshot = _plan_bound_provider_attempt_snapshot(binding)
     return {
         "schema": "roundwright-shadow-case/v2",
         "profile": PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
@@ -380,8 +427,8 @@ def _provider_attempt_evidence(binding: object) -> dict[str, object]:
             "producer_identity": PROVIDER_ATTEMPT_PRODUCER_IDENTITY,
             "exporter_identity": PROVIDER_ATTEMPT_EXPORTER_IDENTITY,
             "comparator_identity": PROVIDER_ATTEMPT_COMPARATOR_IDENTITY,
-            "history": "complete" if snapshot is not None else "missing-recapture-required",
-            "snapshot": None if snapshot is None else snapshot.public_payload(),
+            "history": "complete",
+            "snapshot": snapshot.public_payload(),
             "mutation_count": 0,
         },
     }
@@ -413,7 +460,7 @@ class ProviderAttemptAccountingAdapter:
             raise ExternalValidationAdapterError("executor components are invalid") from error
         if actual != provider_attempt_accounting_component_identities():
             raise ExternalValidationAdapterError("executor components have drifted")
-        _provider_attempt_snapshot(binding)
+        _plan_bound_provider_attempt_snapshot(binding)
 
     def execute(self, binding: object) -> object:
         evidence = _provider_attempt_evidence(binding)

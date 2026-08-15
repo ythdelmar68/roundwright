@@ -18,11 +18,31 @@ by the allowlisted owner.
 
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `1bb063d3f8f1fef9a24b3147b8bc99794e4637a7`; tree `632dcc3ecb3b8664de860844af2215ad5ade83e1` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
+| Generic Orchestrator | `ythdelmar68/roundlet` | canonical merge `96772438b251e56d483733179939245565b1374a`; skill content `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a`; tree `d2aa36b492210dc411b5c1a5c927dc7d286ff21f` | Consume one exact repository-owned executor and track only generic readiness/execution/verification state | Roundwright profile logic, Recorder, provider adapter, evidence store, or a second runner |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb`; executor content `0235427e02ea5b512a5fd5d81300f8b49ed4643c`; tree `2756131387ab70c9511e8156fd4c595cc3996fd3` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
 | Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
 
-Harness PR #6 added the phase-neutral immutable capture-plan entrypoint and
-binds readiness, dispatch, evidence, Recorder seal, and read-back to content
+Roundlet PR #80 added generic consumption of repository-owned validation
+executors. Canonical merge `96772438b251e56d483733179939245565b1374a`
+has parents `8ba2813e8aac869cf1f3ebbe78104d03a9134c4a` and
+`6e48b50bce06383845a92f1b403e3d461cde33e1`, resolves to tree
+`d2aa36b492210dc411b5c1a5c927dc7d286ff21f`, and binds installed skill
+content `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a`. The official skill
+validator and repository structure checks passed.
+
+Harness PR #8 added one phase-neutral versioned profile executor. Canonical
+merge `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb` has parents
+`1bb063d3f8f1fef9a24b3147b8bc99794e4637a7` and
+`9680543fc5aa64b18d0c6a5f7a09c4e40697b6ae`, binds executor content
+`0235427e02ea5b512a5fd5d81300f8b49ed4643c`, capture content
+`cf669e186a739a8597cfaf9f050ce3bdcadda334`, and lock content
+`809cd786f9776d134512b5478a5e1e48b13a4ef1`, and resolves to tree
+`2756131387ab70c9511e8156fd4c595cc3996fd3`. Exact-head CI run
+`31864128240` passed 68 hermetic tests. Validate and execute use the same
+request, parser, adapter factory, plan, store, and entrypoint.
+
+Harness PR #6 added the historical phase-neutral immutable capture-plan
+entrypoint and binds readiness, dispatch, evidence, Recorder seal, and read-back to content
 `cf669e186a739a8597cfaf9f050ce3bdcadda334`; canonical merge
 `1bb063d3f8f1fef9a24b3147b8bc99794e4637a7` has parents
 `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52` and that content and resolves
@@ -172,13 +192,24 @@ exporting the terminal candidate. Candidate movement requires a fresh capture;
 the missing historical v1 lifecycle bundle is never reconstructed.
 
 The concrete handoff is one closed
-`roundwright-harness-capture-plan/v1` document containing profile, case,
-candidate, `ready_at`, producer, exporter, comparator, Recorder, store, and
-observation identities. The reviewed Harness returns one path-free plan digest.
-Profile readiness, provider dispatch, typed export, comparison, recording, and
-read-back must consume that exact digest. A second projection, an inferred
-default, or any identity movement invalidates readiness before the provider is
-called; recapture starts with a fresh plan rather than rewriting evidence.
+`roundwright-harness-profile-executor-request/v1` containing one
+`roundwright-harness-capture-plan/v1` document with profile, case, candidate,
+`ready_at`, producer, exporter, comparator, Recorder, store, and observation
+identities. The reviewed Harness returns one path-free readiness receipt from
+`run-profile --mode validate`. The exact same command, request, public
+Roundwright adapter factory, plan, and store are then consumed once by
+`--mode execute` using that readiness receipt digest. Profile readiness,
+dispatch, typed export/comparison, recording, and read-back therefore use one
+entrypoint and one plan. A second runner/projection, an inferred default, or any
+identity movement invalidates readiness before external action; recapture
+starts with a fresh request rather than rewriting evidence.
+
+The public Roundwright factory is
+`roundwright.external_validation:roundwright_profile_adapter_factory`. The
+synthetic correction profile
+`roundwright-shadow-profile/executor-contract-synthetic/v1` proves the contract
+with deterministic zero-action, zero-mutation evidence. It does not satisfy or
+replace a downstream leaf's live profile-specific evidence.
 
 ## Owner interaction and recovery
 

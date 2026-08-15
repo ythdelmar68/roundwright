@@ -58,7 +58,8 @@ repository boundaries below.
 
 The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
 then #40, #41, #42, #59, #46, planning correction #65, external-validation
-correction #67, #47, capture-plan correction #72, then #44, #45, and #48–#51.
+correction #67, #47, capture-plan correction #72, #44, executor correction
+#75, then #45 and #48–#51.
 Issue #59
 completes the canonical schema v2 mutation vocabulary and authority-block
 isolation before the live broker can continue. Issue #65 installs the
@@ -67,8 +68,11 @@ leaves before dispatch resumes. Issue #67 adopts reviewed generic Roundlet
 routing, standing repository authority, repo-owned execution mechanics, and
 capture-time replay. Issue #72 binds profile readiness, dispatch, export,
 comparison, Recorder sealing, and read-back to one immutable Harness capture
-plan before the remaining live gates run. The Phase 3 qualification result may produce
-`PROMOTION_READY` only; it cannot start a Canary by itself.
+plan before the remaining live gates run. Issue #75 makes generic Roundlet
+consume one reviewed Harness executor while Roundwright supplies the public
+typed profile adapter; a hermetic synthetic activation qualifies that boundary
+before live provider-attempt accounting resumes. The Phase 3 qualification
+result may produce `PROMOTION_READY` only; it cannot start a Canary by itself.
 
 Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for
 canary and cross-environment work; Phase 5 for operations, migration, and

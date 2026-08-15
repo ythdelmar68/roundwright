@@ -871,6 +871,7 @@ def _public_identifier(value: str) -> str:
 # that older shape.
 SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
+EXECUTOR_CONTRACT_SYNTHETIC_PROFILE = "roundwright-shadow-profile/executor-contract-synthetic/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -945,6 +946,7 @@ class ShadowV2Error(ShadowError):
 class CaptureMode(StrEnum):
     TERMINAL_SNAPSHOT = "terminal-snapshot"
     LIFECYCLE_GRAPH = "lifecycle-graph"
+    SYNTHETIC_ONE_SHOT = "synthetic-one-shot"
 
 
 class ShadowProducer(StrEnum):
@@ -1023,16 +1025,29 @@ _WORKER_ADAPTER_PROFILE = ShadowEvidenceProfile(
     ("worker-request-response-envelope",),
 )
 
+_EXECUTOR_CONTRACT_PROFILE = ShadowEvidenceProfile(
+    EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
+    CaptureMode.SYNTHETIC_ONE_SHOT,
+    ShadowProducer.PROFILE_DEFINED,
+    "public-factory-executor-recorder-readback-bound",
+    "before-synthetic-one-shot-consumption",
+    "append-only-content-addressed-readback",
+    "identity-movement-requires-fresh-synthetic-run",
+    ("executor-contract-result",),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
 
-    return (_PROVENANCE_PROFILE, _WORKER_ADAPTER_PROFILE)
+    return (_PROVENANCE_PROFILE, _WORKER_ADAPTER_PROFILE, _EXECUTOR_CONTRACT_PROFILE)
 
 
 def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
     if profile_id == "roundwright-shadow-profile/worker-adapter/v1":
         return _WORKER_ADAPTER_PROFILE
+    if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
+        return _EXECUTOR_CONTRACT_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

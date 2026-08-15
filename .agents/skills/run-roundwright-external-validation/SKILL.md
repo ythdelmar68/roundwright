@@ -27,19 +27,26 @@ Before provisioning, invocation, replay, or mutation:
 4. Bind the exact Roundwright base and candidate, leaf, route, gate/evidence
    class, mutation mode, case/contract/configuration identity, this skill's Git
    blob, qualification-contract blob, and public-safe evidence projection.
-5. For an external route, bind the reviewed public toolbox repository
+5. Bind reviewed generic Roundlet orchestration merge
+   `96772438b251e56d483733179939245565b1374a`, tree
+   `d2aa36b492210dc411b5c1a5c927dc7d286ff21f`, and installed skill content
+   `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a` from Roundlet PR #80. It
+   consumes the repository-owned executor as an opaque exact contract; it does
+   not construct a Roundwright runner or profile adapter.
+6. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
-   `1bb063d3f8f1fef9a24b3147b8bc99794e4637a7`. That canonical merge binds
-   capture-plan/Recorder content `cf669e186a739a8597cfaf9f050ce3bdcadda334`
-   and tree `632dcc3ecb3b8664de860844af2215ad5ade83e1` from reviewed
-   Harness PR #6.
+   `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb`. That canonical merge binds
+   profile-executor content `0235427e02ea5b512a5fd5d81300f8b49ed4643c`,
+   capture-plan/Recorder content `cf669e186a739a8597cfaf9f050ce3bdcadda334`,
+   lock content `809cd786f9776d134512b5478a5e1e48b13a4ef1`, and tree
+   `2756131387ab70c9511e8156fd4c595cc3996fd3` from reviewed Harness PR #8.
    Use its repo-local locked uv environment and exact instructions from that
    commit. Never use floating `main`, install packages into global Python, or
    treat the toolbox as an authority source or credential store. The prior
    Recorder merge `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52` and toolbox
    merge `42830db90acbba499989cd434cdc46b4627042e2` are historical and
-   cannot substitute for a capture-plan-selected gate.
-6. When the route names a disposable target, bind
+   cannot substitute for an executor-selected gate.
+7. When the route names a disposable target, bind
    `ythdelmar68/roundlet-forward-test` at baseline
    `4f39ef0e4e616eb896950d3756c433b624771a97`, its exact root instructions, the
    selected observation window or action, and the required semantic read-back.
@@ -61,13 +68,18 @@ identity, append-only content-addressed store identity, and immutable capture
 time. The preflight must pass before the arm-before boundary; an unarmed
 ephemeral observation is prohibited.
 
-Construct exactly one closed `roundwright-harness-capture-plan/v1` document
-before dispatch. It binds the profile, case, exact candidate, immutable
-`ready_at`, producer, exporter, comparator, Recorder, store, and observation
-identities. Run the reviewed Harness `prepare-capture` operation and retain its
-path-free plan receipt. The readiness receipt, live dispatch, typed exporter,
-comparison, `record-capture`, and `verify-capture` operations must consume that
-same plan digest. Never rebuild or project a second ad hoc plan between stages.
+Construct exactly one closed `roundwright-harness-profile-executor-request/v1`
+containing one `roundwright-harness-capture-plan/v1` document before dispatch.
+The plan binds the profile, case, exact candidate, immutable `ready_at`,
+producer, exporter, comparator, Recorder, store, and observation identities.
+Run the reviewed Harness `run-profile --mode validate` command with the exact
+public Roundwright adapter factory and retain its path-free readiness receipt.
+Then invoke that same command, request, parser, factory, plan, and store with
+`--mode execute` and the exact readiness receipt digest. Prepare, validation,
+dispatch, typed projection/comparison, sealing, and verification must consume
+that same plan. Never rebuild a second runner, command, factory, or plan between
+stages. The older discrete capture commands remain historical compatibility
+surfaces and are not the entrypoint for a newly declared executor profile.
 Any candidate, case, time, component, observation, or digest movement invalidates
 the plan before provider dispatch and requires a fresh bounded capture.
 Project that exact plan digest in curated public-safe readiness, result, and
@@ -81,6 +93,12 @@ the v2 schema/profile, typed provenance exporter, immutable `ready_at`
 comparator, Recorder binding, retention store, and read-back path are ready.
 Candidate movement requires fresh capture. Never reconstruct missing historical
 v1 lifecycle evidence.
+
+For `roundwright-shadow-profile/executor-contract-synthetic/v1`, capture mode
+is `synthetic-one-shot`. Use public factory
+`roundwright.external_validation:roundwright_profile_adapter_factory`. It is a
+deterministic provider-free, zero-mutation contract check and never substitutes
+for a later leaf's live profile evidence.
 
 ## Route the selected gate
 

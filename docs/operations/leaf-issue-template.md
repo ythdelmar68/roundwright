@@ -52,6 +52,12 @@ Recorder, append-only content-addressed store, and immutable capture time. The
 preflight must pass before the arm-before boundary. Candidate movement requires
 fresh capture; never reconstruct missing historical evidence.
 
+For a newly declared external executor profile, the same preflight also binds
+the exact repository-owned public adapter factory and one reviewed Harness
+`run-profile` entrypoint. Validate-only and execute modes must consume the same
+request, parser, plan, component identities, store, and readiness receipt; a
+leaf never supplies a candidate-specific wrapper or second runner.
+
 The external-validation declaration is a routing and evidence record. The
 standing Booleans in authoritative root policy remove repetitive approval only
 for a mechanically conforming selected route; the declaration alone never

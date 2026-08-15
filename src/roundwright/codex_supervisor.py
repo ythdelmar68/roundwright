@@ -278,11 +278,12 @@ class SupervisorFailoverResult:
 
 
 def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
-    """Try each configured profile once; invalid output consumes no review round.
+    """Run a bounded configured sequence without retrying uncertain outcomes.
 
-    The caller retains the review state.  This function intentionally reports
-    only availability: it cannot convert a malformed, cancelled, or ambiguous
-    result into PASS/FINDINGS, and it never parses provider display prose.
+    Only a typed invalid result or a verified terminal provider failure can
+    advance to the next pre-bound profile.  Ambiguous and incomplete outcomes
+    remain terminal: dispatching a fallback would turn an uncertain external
+    result into an unbounded second provider action.
     """
     if type(requests) is not tuple or type(adapters) is not tuple or not requests or len(requests) != len(adapters) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
@@ -298,6 +299,8 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         if checkpoint_result is not None:
             checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:
+            return SupervisorFailoverResult(result, tuple(attempted), False)
+        if result.kind not in (SupervisorResultKind.INVALID, SupervisorResultKind.BLOCKED):
             return SupervisorFailoverResult(result, tuple(attempted), False)
     return SupervisorFailoverResult(None, tuple(attempted), True)
 

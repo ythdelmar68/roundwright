@@ -246,6 +246,16 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
                 DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
             ))
+            first_only = replace(runner, sequence=(runner.sequence[0],))
+            self.assertEqual(first_only.execute(), (runner.selection.provider_attempt_id,))
+            first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual(first.state, AttemptState.INVALIDATED)
+            checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
+            self.assertIsNotNone(checkpoint_failure)
+            self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
+            # Restart from the durable terminal-failure checkpoint may dispatch
+            # only the still-unseen configured secondary; it must not replay
+            # the first turn, failure record, or failover transition.
             self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)

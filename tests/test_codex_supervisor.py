@@ -114,10 +114,28 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((result.attempted_profile_identities, result.result.verdict, result.result.findings), ((primary.profile_identity, fallback.profile_identity), "findings", ("missing-evidence",)))
         self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start", "start"])
 
-    def test_exhaustion_is_availability_only_and_never_fabricates_a_verdict(self):
-        adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)) for index, profile in enumerate(self.profiles, start=1))
+    def test_exact_terminal_failure_advances_to_the_next_prebound_profile(self):
+        primary = self.adapter(self.profiles[0], "failed-primary", NativeSupervisorResponse(
+            SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+            outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+            sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+        ))
+        fallback = self.adapter(self.profiles[1], "failed-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+        result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.ACCEPTED, (primary.profile_identity, fallback.profile_identity), 1, 1))
+
+    def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
+        adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index, profile in enumerate(self.profiles, start=1))
         result = dispatch_ordered_supervisor_attempts(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result, result.exhausted, len(result.attempted_profile_identities)), (None, True, 3))
+
+    def test_ambiguous_and_incomplete_results_stop_before_fallback(self):
+        for kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE):
+            with self.subTest(kind=kind.value):
+                primary = self.adapter(self.profiles[0], f"{kind.value}-primary", NativeSupervisorResponse(kind))
+                fallback = self.adapter(self.profiles[1], f"{kind.value}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+                result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((result.result.kind, result.exhausted, result.attempted_profile_identities, fallback._backend.calls), (kind, False, (primary.profile_identity,), 0))
 
     def test_concrete_sdk_bridge_uses_fresh_deny_all_read_only_turn(self):
         events = []
@@ -180,7 +198,51 @@ class SupervisorTests(unittest.TestCase):
              SupervisorOutcomeSource.SDK_TURN_FAILED, SupervisorSdkTurnErrorCategory.OVERLOAD),
         )
 
-    def test_native_stream_rejections_advance_only_the_attempt_position(self):
+    def test_failed_turn_category_projection_matches_the_closed_worker_categories(self):
+        cases = (
+            ("badRequest", CodexFailure.UNKNOWN, SupervisorSdkTurnErrorCategory.BAD_REQUEST),
+            ("unauthorized", CodexFailure.UNKNOWN, SupervisorSdkTurnErrorCategory.UNAUTHORIZED),
+            ("sandboxError", CodexFailure.SANDBOX_OR_APPROVAL_DENIED, SupervisorSdkTurnErrorCategory.SANDBOX),
+            ("serverOverloaded", CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.OVERLOAD),
+            ({"httpConnectionFailed": {}}, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.HTTP),
+            ({"responseStreamConnectionFailed": {}}, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.CONNECTION),
+            ({"responseStreamDisconnected": {}}, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.STREAM),
+            ({}, CodexFailure.UNKNOWN, SupervisorSdkTurnErrorCategory.MISSING_OR_UNKNOWN),
+        )
+        for detail, failure, category in cases:
+            with self.subTest(category=category.value):
+                class Handle:
+                    id = "turn-safe-category"
+                    def stream(self):
+                        return iter(({"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "failed", "error": {"codexErrorInfo": detail, "message": "C:/private/provider-detail"}}}},))
+                response = _consume(Handle(), CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
+                self.assertEqual((response.kind, response.failure, response.outcome_source, response.sdk_error_category), (SupervisorResultKind.BLOCKED, failure, SupervisorOutcomeSource.SDK_TURN_FAILED, category))
+                self.assertNotIn("private", repr(response))
+
+    def test_eof_timeout_and_stream_failures_stop_before_fallback(self):
+        class EofHandle:
+            id = "turn-eof"
+            def stream(self): return iter(())
+        class TimeoutHandle:
+            id = "turn-timeout"
+            def stream(self): raise TimeoutError("C:/private/timeout")
+        class StreamHandle:
+            id = "turn-stream"
+            def stream(self):
+                def broken():
+                    raise RuntimeError("C:/private/stream")
+                    yield None
+                return broken()
+        for handle in (EofHandle(), TimeoutHandle(), StreamHandle()):
+            with self.subTest(handle=type(handle).__name__):
+                native = _consume(handle, CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
+                self.assertIs(native.kind, SupervisorResultKind.AMBIGUOUS)
+                primary = self.adapter(self.profiles[0], type(handle).__name__, native)
+                fallback = self.adapter(self.profiles[1], f"{type(handle).__name__}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+                result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.AMBIGUOUS, (primary.profile_identity,), 0))
+
+    def test_native_stream_rejections_only_advance_typed_invalid_output(self):
         """Native stream/parser failures are typed, bounded, and never sealed."""
         def native_adapter(events, *, completed="completed", binding=None, text=None):
             class Handle:
@@ -209,13 +271,16 @@ class SupervisorTests(unittest.TestCase):
             return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
 
         cases = (
-            ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None),
+            ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None, 0),
+            ("interrupted", {"completed": "interrupted"}, SupervisorResultKind.AMBIGUOUS, None, 0),
+            ("unknown", {"completed": "unknown"}, SupervisorResultKind.AMBIGUOUS, None, 0),
             ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT),
             ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE),
             ("malformed-output", {"text": "not-json"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SYNTAX),
             ("missing-result", {}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SHAPE),
         )
-        for name, values, kind, diagnostic in cases:
+        cases = tuple(item if len(item) == 5 else (*item, 1) for item in cases)
+        for name, values, kind, diagnostic, fallback_calls in cases:
             with self.subTest(name=name):
                 events = []
                 primary = native_adapter(events, **values)
@@ -224,7 +289,9 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual((rejected.kind, rejected.diagnostic), (kind, diagnostic))
                 fallback = self.adapter(self.profiles[1], "native-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
                 ordered = dispatch_ordered_supervisor_attempts((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-                self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, first.context.review_epoch, first.context.review_round, first.context.review_mode), ((primary.profile_identity, fallback.profile_identity), SupervisorResultKind.ACCEPTED, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
+                expected_profiles = (primary.profile_identity, fallback.profile_identity) if fallback_calls else (primary.profile_identity,)
+                expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else SupervisorResultKind.AMBIGUOUS
+                self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, fallback._backend.calls, first.context.review_epoch, first.context.review_round, first.context.review_mode), (expected_profiles, expected_kind, fallback_calls, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
 
     def test_armed_capture_uses_one_plan_for_prepare_seal_and_readback(self):
         adapter = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
@@ -267,12 +334,25 @@ class SupervisorTests(unittest.TestCase):
     def runtime_store(self):
         return InMemorySupervisorRuntimeStore(self.configuration.runtime_store_authority_identity)
 
-    def test_sequence_advances_ambiguous_primary_to_valid_fallback(self):
+    def test_sequence_ambiguous_primary_is_terminal_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-        self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.comparison.disposition, recorder.calls), (SupervisorSequenceTerminal.ACCEPTED, ("ambiguous", "accepted"), 2, "match", ["prepare", "seal", "verify"]))
+        self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.envelope.blocker, result.comparison.disposition, recorder.calls, adapters[1]._backend.calls), (SupervisorSequenceTerminal.AMBIGUOUS, ("ambiguous",), None, "provider-outcome-ambiguous", "match", ["prepare"], 0))
         payload = result.envelope.payload()
         self.assertEqual((type(payload["attempts"]), type(payload["request_identities"]), type(payload["profile_identities"]), type(payload["runtime_fingerprints"])), (list, list, list, list))
+
+    def test_sequence_terminal_outcome_on_final_configured_profile_round_trips_unsealed(self):
+        for kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE):
+            with self.subTest(kind=kind.value):
+                responses = (
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+                    NativeSupervisorResponse(SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD),
+                    NativeSupervisorResponse(kind),
+                )
+                adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)
+                result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                durable = lifecycle.read(next(iter(lifecycle._records)), evidence_time=101)
+                self.assertEqual((result.envelope.terminal, len(result.envelope.attempts), result.envelope.blocker, result.receipt, recorder.calls, durable.terminal.terminal, durable.terminal.blocker), (SupervisorSequenceTerminal(kind.value), 3, f"provider-outcome-{kind.value}", None, ["prepare"], kind.value, f"provider-outcome-{kind.value}"))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
@@ -280,7 +360,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
-        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS) for _profile in self.profiles))
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX) for _profile in self.profiles))
         result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
 

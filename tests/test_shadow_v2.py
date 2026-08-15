@@ -1053,13 +1053,16 @@ class ShadowV2Tests(unittest.TestCase):
         profile = shadow_evidence_profile(PROVENANCE_DECISION_PROFILE)
         worker = shadow_evidence_profile("roundwright-shadow-profile/worker-adapter/v1")
         synthetic = shadow_evidence_profile(EXECUTOR_CONTRACT_SYNTHETIC_PROFILE)
-        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic))
+        provider_attempts = shadow_evidence_profile("roundwright-shadow-profile/provider-attempt-accounting/v1")
+        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic, provider_attempts))
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
         self.assertEqual(worker.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
         self.assertEqual(worker.event_kinds, ("worker-request-response-envelope",))
         self.assertEqual(synthetic.capture_mode, CaptureMode.SYNTHETIC_ONE_SHOT)
         self.assertEqual(synthetic.event_kinds, ("executor-contract-result",))
+        self.assertEqual(provider_attempts.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
+        self.assertEqual(provider_attempts.arm_before, "before-first-selected-provider-attempt")
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

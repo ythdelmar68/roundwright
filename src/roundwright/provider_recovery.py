@@ -89,6 +89,27 @@ class SupervisorAccountingBlocker(StrEnum):
     INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
 
 
+@dataclass(frozen=True)
+class SupervisorAccountingAttemptSnapshot:
+    attempt_id: str; within_round_attempt: int; profile_identity: str; state: AttemptState
+    session_present: bool; turn_present: bool; completion_present: bool; invalid_output_present: bool
+    recovery_action: RecoveryAction | None; accepted: bool
+    def __post_init__(self) -> None:
+        if not _TOKEN.fullmatch(self.attempt_id) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.profile_identity) or type(self.state) is not AttemptState or any(type(value) is not bool for value in (self.session_present, self.turn_present, self.completion_present, self.invalid_output_present, self.accepted)) or (self.recovery_action is not None and type(self.recovery_action) is not RecoveryAction) or (self.accepted and self.state is not AttemptState.ACCEPTED): raise ProviderRecoveryError("accounting attempt snapshot is invalid")
+    def canonical_material(self) -> dict[str, object]: return {"attempt_id":self.attempt_id,"within_round_attempt":self.within_round_attempt,"profile_identity":self.profile_identity,"state":self.state.value,"session_present":self.session_present,"turn_present":self.turn_present,"completion_present":self.completion_present,"invalid_output_present":self.invalid_output_present,"recovery_action":None if self.recovery_action is None else self.recovery_action.value,"accepted":self.accepted}
+
+
+@dataclass(frozen=True)
+class SupervisorAccountingSnapshot:
+    repository_id: str; task_id: str; source_digest: str; base_sha: str; candidate_sha: str; case_id: str; ready_at: int
+    seal_state_identity: str; evidence: tuple[str, ...]; verifications: tuple[tuple[str, str], ...]
+    configuration_digest: str; policy_digest: str; complete_rounds: int; max_rounds: int; max_attempts: int; review_epoch: int; review_round: int; review_mode: str
+    formal_record_count: int; formal_accepted_count: int; current: SupervisorAccountingAttemptSnapshot; prior: tuple[SupervisorAccountingAttemptSnapshot, ...]
+    def __post_init__(self) -> None:
+        if not _TOKEN.fullmatch(self.repository_id) or not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.case_id) or not _DIGEST.fullmatch(self.source_digest) or not _COMMIT.fullmatch(self.base_sha) or not _COMMIT.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not _TOKEN.fullmatch(self.seal_state_identity) or any(not _FINGERPRINT.fullmatch(item) for item in self.evidence) or any(kind not in {"test","build"} or outcome not in {"pass","not-applicable"} for kind,outcome in self.verifications) or any(type(value) is not int or value < 0 for value in (self.complete_rounds,self.max_rounds,self.max_attempts,self.review_epoch,self.formal_record_count,self.formal_accepted_count)) or self.review_round < 1 or self.formal_accepted_count > self.formal_record_count or self.current.within_round_attempt != len(self.prior)+1 or tuple(item.within_round_attempt for item in self.prior) != tuple(range(1,len(self.prior)+1)): raise ProviderRecoveryError("accounting snapshot is invalid")
+    def canonical_material(self) -> dict[str, object]: return {"schema":"roundwright-provider-attempt-accounting-decision/v1","binding":{"repository_id":self.repository_id,"task_id":self.task_id,"source_digest":self.source_digest,"base_sha":self.base_sha,"candidate_sha":self.candidate_sha,"case_id":self.case_id,"ready_at":self.ready_at},"candidate":{"seal_state_identity":self.seal_state_identity,"evidence_count":len(self.evidence),"evidence_digest":"sha256:"+hashlib.sha256("|".join(self.evidence).encode()).hexdigest(),"verification_count":len(self.verifications),"verification_kinds":[{"kind":a,"outcome":b} for a,b in self.verifications]},"review_policy":{"configuration_digest":self.configuration_digest,"policy_digest":self.policy_digest,"complete_rounds":self.complete_rounds,"max_rounds":self.max_rounds,"max_supervisor_attempts_per_round":self.max_attempts,"review_epoch":self.review_epoch,"review_round":self.review_round,"review_mode":self.review_mode},"formal_review":{"review_round":self.review_round,"record_count":self.formal_record_count,"accepted_count":self.formal_accepted_count,"accepted_result_present":bool(self.formal_accepted_count)},"current_attempt":self.current.canonical_material(),"prior_attempts":[item.canonical_material() for item in self.prior]}
+
+
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -205,6 +226,39 @@ class SupervisorTerminalFailure:
 class _PersistedRecoveryOutcome:
     action: RecoveryAction
     blocker: str | None
+
+
+def read_supervisor_accounting_snapshot(
+    repository: RepositoryIdentity, identity: TaskIdentity, context: RecoveryContext, *,
+    source_digest: str, base_sha: str, candidate_sha: str, case_id: str, ready_at: int,
+    review_epoch: int, review_round: int, review_mode: str,
+    current_attempt_id: str, current_within_round_attempt: int, current_profile_identity: str,
+    prior_attempts: tuple[tuple[str, int, str], ...],
+    seal_state_identity: str,
+) -> SupervisorAccountingSnapshot:
+    """Read the closed accounting decision input from durable product state."""
+    _validate_task(identity); _validate_context(identity, context)
+    if not _DIGEST.fullmatch(source_digest) or base_sha != identity.base_sha or candidate_sha != context.candidate_sha or not _TOKEN.fullmatch(case_id) or type(ready_at) is not int or ready_at < 0 or type(review_epoch) is not int or review_epoch < 0 or type(review_round) is not int or review_round < 1 or review_mode not in {"COMPLETE", "CONVERGING"} or not _TOKEN.fullmatch(current_attempt_id) or current_within_round_attempt < 1 or not _DIGEST.fullmatch(current_profile_identity) or tuple(item[1] for item in prior_attempts) != tuple(range(1, len(prior_attempts)+1)):
+        raise ProviderRecoveryError("accounting snapshot inputs are invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        seal = connection.execute("SELECT base_sha,candidate_sha,state_identity FROM candidate_seals WHERE task_id=?", (identity.task_id,)).fetchone()
+        if seal != (base_sha, candidate_sha, seal_state_identity): raise ProviderRecoveryError("accounting snapshot seal has drifted")
+        evidence = tuple(row[0] for row in connection.execute("SELECT evidence_fingerprint FROM candidate_evidence WHERE task_id=? AND candidate_sha=? ORDER BY evidence_fingerprint", (identity.task_id,candidate_sha)))
+        verifications = tuple((row[0],row[1]) for row in connection.execute("SELECT verification_kind,outcome FROM candidate_verifications WHERE task_id=? AND candidate_sha=? ORDER BY verification_kind,verification_id", (identity.task_id,candidate_sha)))
+        formal = connection.execute("SELECT COUNT(*),SUM(CASE WHEN state='accepted' THEN 1 ELSE 0 END) FROM diff_review_attempts WHERE task_id=? AND review_round=?", (identity.task_id,review_round)).fetchone()
+        def attempt(attempt_id: str, ordinal: int, profile: str) -> SupervisorAccountingAttemptSnapshot:
+            row = connection.execute("SELECT state,session_identity,external_turn_identity,output_pointer,completion_evidence_fingerprint,accepted_review_identity,selected_profile_identity FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id,attempt_id)).fetchone()
+            outcome = connection.execute("SELECT recovery_action FROM provider_recovery_outcomes WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if row is None or row[6] != profile: raise ProviderRecoveryError("accounting snapshot attempt is unavailable")
+            return SupervisorAccountingAttemptSnapshot(attempt_id,ordinal,profile,AttemptState(row[0]),row[1] is not None,row[2] is not None,row[4] is not None,(row[3] or "").startswith("supervisor-invalid-"),None if outcome is None else RecoveryAction(outcome[0]),row[5] is not None)
+        current = attempt(current_attempt_id,current_within_round_attempt,current_profile_identity)
+        prior = tuple(attempt(*item) for item in prior_attempts)
+        binding = context.runtime_binding
+        return SupervisorAccountingSnapshot(identity.repository_id,identity.task_id,source_digest,base_sha,candidate_sha,case_id,ready_at,seal_state_identity,evidence,verifications,binding.resolved_digest,binding.review_policy_digest,binding.review_complete_rounds,binding.review_max_rounds,binding.review_max_supervisor_attempts_per_round,review_epoch,review_round,review_mode,formal[0],0 if formal[1] is None else formal[1],current,prior)
+    finally:
+        connection.close()
 
 
 def preflight_attempt_preparation(

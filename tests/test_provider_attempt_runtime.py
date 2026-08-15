@@ -29,7 +29,8 @@ from roundwright.git_identity import CandidateSeal, TransitionLease, WorktreeBin
 from roundwright.provider_attempt_runtime import (
     DiffReviewSelection, DiffReviewSequenceEntry, DurableDiffReviewRunner, MaterializedProviderAttemptContext,
     ProviderAttemptCheckpointFailure, ProviderAttemptHostInputs, ProviderAttemptRuntimeDescriptor, ProviderAttemptRuntimeError,
-    ProviderAttemptRuntimeResources, install_host_runtime,
+    ProviderAttemptRuntimeResources, ProviderAttemptCompletionPolicy, PRODUCTION_COMPLETION_POLICY,
+    install_host_runtime,
 )
 from roundwright.provider_health import CodexFailure
 from roundwright.provider_recovery import (
@@ -40,6 +41,8 @@ from roundwright.provider_recovery import (
 )
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.state import TaskIdentity, database_path
+from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
+from roundwright.worker_toolbox import CompletionDeadline
 from tests.provider_health_fixture import provider_context
 import tests.test_candidate_review as _candidate_test_module
 from tests.test_codex_supervisor import Backend
@@ -86,6 +89,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             "provider_profile_identity": digest("3"),
             "review_epoch": 1,
             "review_round": 1,
+            "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
         }
 
     def resources(self, descriptor: ProviderAttemptRuntimeDescriptor) -> ProviderAttemptRuntimeResources:
@@ -145,6 +149,82 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             payload[forbidden] = "not-allowed"
             with self.subTest(forbidden=forbidden), self.assertRaises(ProviderAttemptRuntimeError):
                 ProviderAttemptRuntimeDescriptor.parse(payload)
+
+    def test_completion_policy_is_closed_production_identity_material(self) -> None:
+        """Test-scale deadlines cannot become armed product host inputs."""
+
+        self.assertEqual(
+            PRODUCTION_COMPLETION_POLICY.receipt(),
+            {
+                "schema": "roundwright-provider-attempt-completion-policy/v1",
+                "application_timeout_ms": 100_000,
+                "host_timeout_ms": 600_000,
+            },
+        )
+        self.assertEqual(
+            PRODUCTION_COMPLETION_POLICY.deadline(),
+            CompletionDeadline(100_000, 600_000),
+        )
+        for policy in (
+            None,
+            {"schema": "roundwright-provider-attempt-completion-policy/v1", "application_timeout_ms": 100, "host_timeout_ms": 600},
+            {"schema": "roundwright-provider-attempt-completion-policy/v1", "application_timeout_ms": 100_000, "host_timeout_ms": 600},
+            {"schema": "roundwright-provider-attempt-completion-policy/v0", "application_timeout_ms": 100_000, "host_timeout_ms": 600_000},
+        ):
+            payload = self.descriptor_payload()
+            payload["completion_policy"] = policy
+            with self.subTest(policy=policy), self.assertRaisesRegex(ProviderAttemptRuntimeError, "completion policy"):
+                ProviderAttemptRuntimeDescriptor.parse(payload)
+
+    def test_host_rejects_a_test_scale_native_deadline_before_lifecycle_access(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            descriptor = {
+                "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-short-deadline-45",
+                "repository_id": identity.repository_id, "task_id": identity.task_id,
+                "source_digest": runner.source_digest, "base_sha": identity.base_sha,
+                "candidate_sha": seal.candidate_sha, "case_id": "runtime-short-deadline-case-45", "ready_at": 17,
+                "capture_plan_digest": digest("f"), "runtime_binding": recovery.runtime_binding.canonical_material(),
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
+            }
+            short_native = HarnessNativeCodexSupervisorBackend(
+                cwd=repository.root, completion=CompletionDeadline(100, 600),
+            )
+            host = ProviderAttemptHostInputs(
+                repository, identity, recovery, runner.lease, seal, runner.binding,
+                runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection,
+                short_native,
+            )
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "completion policy"):
+                install_host_runtime(descriptor, host)
+            self.assertEqual(backend.calls, 0)
+            # The production host chooses its closed native backend with the
+            # descriptor-bound production deadline; it cannot retain the old
+            # test-scale fallback when no test seam is supplied.
+            materialized = install_host_runtime(
+                dict(descriptor, resource_id="runtime-production-deadline-45"),
+                replace(host, backend=None),
+            )
+            self.assertIsInstance(materialized.resources.runner.backend, HarnessNativeCodexSupervisorBackend)
+            self.assertEqual(
+                materialized.resources.runner.backend.completion,
+                CompletionDeadline(100_000, 600_000),
+            )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM provider_attempts WHERE attempt_id = ?",
+                        (runner.selection.provider_attempt_id,),
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
 
     def test_every_descriptor_and_resource_binding_drifts_before_store_access(self) -> None:
         descriptor = ProviderAttemptRuntimeDescriptor.parse(self.descriptor_payload())
@@ -284,7 +364,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 "source_digest": runner.source_digest, "base_sha": identity.base_sha,
                 "candidate_sha": seal.candidate_sha, "case_id": "runtime-terminal-case-45", "ready_at": 17,
                 "capture_plan_digest": digest("c"), "runtime_binding": recovery.runtime_binding.canonical_material(),
-                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1, "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
             })
             resources = ProviderAttemptRuntimeResources(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
@@ -448,7 +528,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 "source_digest": runner.source_digest, "base_sha": identity.base_sha,
                 "candidate_sha": seal.candidate_sha, "case_id": "runtime-round-case-45", "ready_at": 17,
                 "capture_plan_digest": digest("b"), "runtime_binding": recovery.runtime_binding.canonical_material(),
-                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 2, "review_round": 4,
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 2, "review_round": 4, "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
             })
             resources = ProviderAttemptRuntimeResources(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
@@ -480,7 +560,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 "source_digest": runner.source_digest, "base_sha": identity.base_sha,
                 "candidate_sha": seal.candidate_sha, "case_id": case_id, "ready_at": 17,
                 "capture_plan_digest": plan_digest, "runtime_binding": recovery.runtime_binding.canonical_material(),
-                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1, "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
             }
             context = install_host_runtime(descriptor, ProviderAttemptHostInputs(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
@@ -522,7 +602,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 "source_digest": runner.source_digest, "base_sha": identity.base_sha,
                 "candidate_sha": seal.candidate_sha, "case_id": "runtime-preflight-case-45", "ready_at": 17,
                 "capture_plan_digest": digest("e"), "runtime_binding": recovery.runtime_binding.canonical_material(),
-                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1, "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
             }
             context = install_host_runtime(descriptor, ProviderAttemptHostInputs(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
@@ -654,7 +734,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "source_digest": runner.source_digest, "base_sha": identity.base_sha,
                     "candidate_sha": seal.candidate_sha, "case_id": plan["case_id"], "ready_at": plan["ready_at"],
                     "capture_plan_digest": plan_digest, "runtime_binding": recovery.runtime_binding.canonical_material(),
-                    "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                    "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1, "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
                 }
                 request = {
                     "schema": "roundwright-harness-profile-executor-request/v2",
@@ -781,7 +861,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "base_sha": identity.base_sha, "candidate_sha": seal.candidate_sha, "case_id": plan["case_id"], "ready_at": 17,
                     "capture_plan_digest": harness.prepare_capture(plan).plan_digest,
                     "runtime_binding": recovery.runtime_binding.canonical_material(),
-                    "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1,
+                    "provider_profile_identity": runner.audit.profile_identity, "review_epoch": 1, "review_round": 1, "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
                 }
                 request = {"schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan, "execution_context": descriptor}
                 host = ProviderAttemptHostInputs(

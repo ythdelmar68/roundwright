@@ -82,6 +82,12 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         return factory, approval, sandbox, effort
 
+    @property
+    def completion(self) -> CompletionDeadline:
+        """Typed deadline supplied by the product host; never provider data."""
+
+        return self._completion
+
 
 class _Session(NativeSupervisorSession):
     def __init__(self, thread: object, codex: object, cwd: Path, profile: ProviderProfile, approval: object, sandbox: object, effort: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float]) -> None:

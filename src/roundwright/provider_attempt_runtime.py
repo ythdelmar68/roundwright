@@ -51,6 +51,9 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 SCHEMA = "roundwright-provider-attempt-runtime/v2"
+COMPLETION_POLICY_SCHEMA = "roundwright-provider-attempt-completion-policy/v1"
+PRODUCTION_APPLICATION_TIMEOUT_MS = 100_000
+PRODUCTION_HOST_TIMEOUT_MS = 600_000
 
 
 class ProviderAttemptRuntimeError(ValueError):
@@ -89,6 +92,41 @@ def _public_provider_identity(profile_identity: str) -> str:
 
 
 @dataclass(frozen=True)
+class ProviderAttemptCompletionPolicy:
+    """Closed production deadline policy, separate from test-scale fixtures."""
+
+    application_timeout_ms: int = PRODUCTION_APPLICATION_TIMEOUT_MS
+    host_timeout_ms: int = PRODUCTION_HOST_TIMEOUT_MS
+
+    def __post_init__(self) -> None:
+        if (self.application_timeout_ms, self.host_timeout_ms) != (PRODUCTION_APPLICATION_TIMEOUT_MS, PRODUCTION_HOST_TIMEOUT_MS):
+            raise ProviderAttemptRuntimeError("provider attempt completion policy is invalid")
+        CompletionDeadline(self.application_timeout_ms, self.host_timeout_ms)
+
+    def receipt(self) -> dict[str, object]:
+        return {"schema": COMPLETION_POLICY_SCHEMA, "application_timeout_ms": self.application_timeout_ms, "host_timeout_ms": self.host_timeout_ms}
+
+    @property
+    def identity(self) -> str:
+        return _digest(self.receipt())
+
+    def deadline(self) -> CompletionDeadline:
+        return CompletionDeadline(self.application_timeout_ms, self.host_timeout_ms)
+
+    @classmethod
+    def parse(cls, value: object) -> "ProviderAttemptCompletionPolicy":
+        if type(value) is not dict or set(value) != {"schema", "application_timeout_ms", "host_timeout_ms"} or value.get("schema") != COMPLETION_POLICY_SCHEMA:
+            raise ProviderAttemptRuntimeError("provider attempt completion policy is invalid")
+        try:
+            return cls(value["application_timeout_ms"], value["host_timeout_ms"])
+        except (TypeError, ValueError) as error:
+            raise ProviderAttemptRuntimeError("provider attempt completion policy is invalid") from error
+
+
+PRODUCTION_COMPLETION_POLICY = ProviderAttemptCompletionPolicy()
+
+
+@dataclass(frozen=True)
 class ProviderAttemptRuntimeDescriptor:
     """Public JSON-safe identity material accepted from the V2 executor.
 
@@ -109,13 +147,14 @@ class ProviderAttemptRuntimeDescriptor:
     provider_profile_identity: str
     review_epoch: int
     review_round: int
+    completion_policy: dict[str, object]
 
     @classmethod
     def parse(cls, value: object) -> "ProviderAttemptRuntimeDescriptor":
         required = {
             "schema", "resource_id", "repository_id", "task_id", "source_digest", "base_sha",
             "candidate_sha", "case_id", "ready_at", "capture_plan_digest", "runtime_binding",
-            "provider_profile_identity", "review_epoch", "review_round",
+            "provider_profile_identity", "review_epoch", "review_round", "completion_policy",
         }
         if type(value) is not dict or set(value) != required or value.get("schema") != SCHEMA:
             raise ProviderAttemptRuntimeError("provider attempt runtime descriptor is invalid")
@@ -147,6 +186,7 @@ class ProviderAttemptRuntimeDescriptor:
             raise ProviderAttemptRuntimeError("provider attempt runtime binding is invalid") from error
         if self.provider_profile_identity not in binding.supervisor_profile_identities:
             raise ProviderAttemptRuntimeError("provider attempt runtime profile is invalid")
+        ProviderAttemptCompletionPolicy.parse(self.completion_policy)
 
     def payload(self) -> dict[str, object]:
         return {
@@ -155,7 +195,7 @@ class ProviderAttemptRuntimeDescriptor:
             "candidate_sha": self.candidate_sha, "case_id": self.case_id, "ready_at": self.ready_at,
             "capture_plan_digest": self.capture_plan_digest, "runtime_binding": self.runtime_binding,
             "provider_profile_identity": self.provider_profile_identity, "review_epoch": self.review_epoch,
-            "review_round": self.review_round,
+            "review_round": self.review_round, "completion_policy": self.completion_policy,
         }
 
 
@@ -233,6 +273,7 @@ class DurableDiffReviewRunner:
     review_round: int
     selection: DiffReviewSelection
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
+    completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
 
     def _sequence_entries(self) -> tuple[DiffReviewSequenceEntry, ...]:
         return self.sequence or (DiffReviewSequenceEntry(self.selection, self.recovery, self.audit, self.backend),)
@@ -243,7 +284,9 @@ class DurableDiffReviewRunner:
         runtime = self.recovery.runtime_binding
         entries = self._sequence_entries()
         if (
-            self.dependency_binding != CandidateBinding(self.identity.repository_id, self.identity.task_id, self.seal.candidate_sha)
+            type(self.completion_policy) is not ProviderAttemptCompletionPolicy
+            or self.completion_policy != PRODUCTION_COMPLETION_POLICY
+            or self.dependency_binding != CandidateBinding(self.identity.repository_id, self.identity.task_id, self.seal.candidate_sha)
             or type(entries) is not tuple
             or not entries
             or any(type(item) is not DiffReviewSequenceEntry for item in entries)
@@ -260,6 +303,9 @@ class DurableDiffReviewRunner:
             )
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
+        deadline = self.completion_policy.deadline()
+        if any(isinstance(item.backend, HarnessNativeCodexSupervisorBackend) and item.backend.completion != deadline for item in entries):
+            raise ProviderAttemptRuntimeError("provider attempt completion policy has drifted")
         return entries
 
     def preflight_checkpoint_prerequisites(self) -> tuple[DiffReviewSequenceEntry, ...]:
@@ -510,6 +556,7 @@ class ProviderAttemptRuntimeResources:
     review_epoch: int
     review_round: int
     runner: DurableDiffReviewRunner
+    completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
 
     def validate(self, descriptor: ProviderAttemptRuntimeDescriptor) -> None:
         if (
@@ -525,6 +572,7 @@ class ProviderAttemptRuntimeResources:
             or self.provider_profile_identity != descriptor.provider_profile_identity
             or self.review_epoch != descriptor.review_epoch
             or self.review_round != descriptor.review_round
+            or self.completion_policy != ProviderAttemptCompletionPolicy.parse(descriptor.completion_policy)
             or self.seal != CandidateSeal(descriptor.task_id, descriptor.base_sha, descriptor.candidate_sha, self.lease.state_identity)
             or self.worktree.task_id != descriptor.task_id
             or self.worktree.base_sha != descriptor.base_sha
@@ -542,6 +590,7 @@ class ProviderAttemptRuntimeResources:
             or self.runner.review_epoch != self.review_epoch
             or self.runner.review_round != self.review_round
             or self.runner.audit.profile_identity != descriptor.provider_profile_identity
+            or self.runner.completion_policy != self.completion_policy
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
         self.runner.preflight_checkpoint_prerequisites()
@@ -592,6 +641,7 @@ class ProviderAttemptHostInputs:
     selection: DiffReviewSelection
     backend: NativeCodexSupervisorBackend | None = None
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
+    completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
 
 
 def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInputs) -> MaterializedProviderAttemptContext:
@@ -606,6 +656,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     if type(host) is not ProviderAttemptHostInputs:
         raise ProviderAttemptRuntimeError("provider attempt host inputs are invalid")
     descriptor = ProviderAttemptRuntimeDescriptor.parse(descriptor_value)
+    completion_policy = ProviderAttemptCompletionPolicy.parse(descriptor.completion_policy)
     if (
         host.identity.repository_id != descriptor.repository_id
         or host.worktree.repository_id != descriptor.repository_id
@@ -622,6 +673,9 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         or host.worktree.base_sha != descriptor.base_sha
         or host.worktree.state_identity != host.lease.state_identity
         or host.recovery.runtime_binding.canonical_material() != descriptor.runtime_binding
+        or type(host.completion_policy) is not ProviderAttemptCompletionPolicy
+        or host.completion_policy != PRODUCTION_COMPLETION_POLICY
+        or host.completion_policy != completion_policy
     ):
         raise ProviderAttemptRuntimeError("provider attempt host binding has drifted")
     audit = next((item for item in host.audits if item.profile_identity == descriptor.provider_profile_identity), None)
@@ -634,10 +688,15 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     ):
         raise ProviderAttemptRuntimeError("provider attempt host sequence has drifted")
     backend = host.backend
+    deadline = completion_policy.deadline()
+    if backend is not None and isinstance(backend, HarnessNativeCodexSupervisorBackend) and backend.completion != deadline:
+        raise ProviderAttemptRuntimeError("provider attempt host completion policy has drifted")
+    if any(isinstance(item.backend, HarnessNativeCodexSupervisorBackend) and item.backend.completion != deadline for item in host.sequence):
+        raise ProviderAttemptRuntimeError("provider attempt host completion policy has drifted")
     if backend is None:
         backend = HarnessNativeCodexSupervisorBackend(
             cwd=host.repository.root,
-            completion=CompletionDeadline(100, 600),
+            completion=deadline,
             approval_mode=None, sandbox=None,
         )
     install_durable_diff_review_runtime(
@@ -649,6 +708,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         review_epoch=descriptor.review_epoch, review_round=descriptor.review_round,
         dependency_binding=host.dependency_binding, dispatch_control=host.dispatch_control,
         audit=audit, backend=backend, selection=host.selection, sequence=host.sequence,
+        completion_policy=completion_policy,
     )
     return prepare_context(
         descriptor.payload(), plan_digest=descriptor.capture_plan_digest,
@@ -678,6 +738,7 @@ def install_durable_diff_review_runtime(
     backend: NativeCodexSupervisorBackend,
     selection: DiffReviewSelection,
     sequence: tuple[DiffReviewSequenceEntry, ...] = (),
+    completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY,
 ) -> None:
     """Install the one closed native product runner consumed by Harness V2.
 
@@ -689,12 +750,12 @@ def install_durable_diff_review_runtime(
     runner = DurableDiffReviewRunner(
         repository, identity, recovery, worktree, seal, lease, dependency_binding,
         dispatch_control, audit, backend, source_digest, review_epoch, review_round,
-        selection, sequence,
+        selection, sequence, completion_policy,
     )
     RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
         repository, identity, recovery, lease, seal, worktree, source_digest,
         case_id, ready_at, capture_plan_digest, provider_profile_identity,
-        review_epoch, review_round, runner,
+        review_epoch, review_round, runner, completion_policy,
     ))
 
 

@@ -382,10 +382,13 @@ class DurableDiffReviewRunner:
             self.materialize_prepared_snapshot(entries)
         else:
             if initial.state is AttemptState.PREPARED:
-                claim = read_supervisor_dispatch_claim(
-                    self.repository, self.identity, first.recovery,
-                    attempt_id=first.selection.provider_attempt_id,
-                )
+                try:
+                    claim = read_supervisor_dispatch_claim(
+                        self.repository, self.identity, first.recovery,
+                        attempt_id=first.selection.provider_attempt_id,
+                    )
+                except ProviderRecoveryError:
+                    raise ProviderAttemptRuntimeError("provider attempt dispatch claim is unavailable") from None
                 if claim is SupervisorDispatchClaimState.UNCLAIMED:
                     self.materialize_prepared_snapshot(entries)
                 else:
@@ -440,25 +443,28 @@ class DurableDiffReviewRunner:
             within_round_attempt=selection.within_round_attempt, review_round=self.review_round,
             lease=self.lease, now=self.dispatch_control.now,
         )
-        prepared = prepare_attempt(
-            self.repository, self.identity, entry.recovery, attempt_id=selection.provider_attempt_id,
-            role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
-            process_lease_expires_at=selection.process_lease_expires_at,
-            input_fingerprint=input_fingerprint, selected_profile_identity=entry.audit.profile_identity,
-            lease=self.lease, now=self.dispatch_control.now,
-        )
-        if prepared.state is not AttemptState.PREPARED:
-            raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
-        return read_supervisor_accounting_snapshot(
-            self.repository, self.identity, entry.recovery, source_digest=self.source_digest,
-            base_sha=self.identity.base_sha, candidate_sha=self.seal.candidate_sha,
-            case_id=self.case_id, ready_at=self.ready_at, review_epoch=self.review_epoch,
-            review_round=self.review_round, review_mode=context.review_mode.value,
-            current_attempt_id=selection.provider_attempt_id,
-            current_within_round_attempt=selection.within_round_attempt,
-            current_profile_identity=entry.audit.profile_identity, prior_attempts=(),
-            seal_state_identity=self.lease.state_identity,
-        )
+        try:
+            prepared = prepare_attempt(
+                self.repository, self.identity, entry.recovery, attempt_id=selection.provider_attempt_id,
+                role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at,
+                input_fingerprint=input_fingerprint, selected_profile_identity=entry.audit.profile_identity,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            if prepared.state is not AttemptState.PREPARED:
+                raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+            return read_supervisor_accounting_snapshot(
+                self.repository, self.identity, entry.recovery, source_digest=self.source_digest,
+                base_sha=self.identity.base_sha, candidate_sha=self.seal.candidate_sha,
+                case_id=self.case_id, ready_at=self.ready_at, review_epoch=self.review_epoch,
+                review_round=self.review_round, review_mode=context.review_mode.value,
+                current_attempt_id=selection.provider_attempt_id,
+                current_within_round_attempt=selection.within_round_attempt,
+                current_profile_identity=entry.audit.profile_identity, prior_attempts=(),
+                seal_state_identity=self.lease.state_identity,
+            )
+        except ProviderRecoveryError:
+            raise ProviderAttemptRuntimeError("provider attempt prepared checkpoint is unavailable") from None
 
     def _execute_selection(
         self,
@@ -523,13 +529,16 @@ class DurableDiffReviewRunner:
             raise ProviderAttemptRuntimeError("provider attempt dispatch claim is unavailable") from None
         entries = self.validate_sequence()
         prior = tuple((item.selection.provider_attempt_id, item.selection.within_round_attempt, item.audit.profile_identity) for item in entries if item.selection.within_round_attempt < selection.within_round_attempt)
-        decision_material = read_supervisor_accounting_snapshot(
-            self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
-            candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
-            review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
-            current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.within_round_attempt,
-            current_profile_identity=selected, prior_attempts=prior, seal_state_identity=self.lease.state_identity,
-        )
+        try:
+            decision_material = read_supervisor_accounting_snapshot(
+                self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
+                candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
+                review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
+                current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.within_round_attempt,
+                current_profile_identity=selected, prior_attempts=prior, seal_state_identity=self.lease.state_identity,
+            )
+        except ProviderRecoveryError:
+            raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from None
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
             selection.within_round_attempt,

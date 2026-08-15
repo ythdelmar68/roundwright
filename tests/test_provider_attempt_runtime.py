@@ -589,6 +589,24 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 drifted.execute()
             self.assertEqual(backend.calls, 0)
 
+    def test_prepared_snapshot_and_claim_failures_are_public_safe(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, _, _, _, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            with patch("roundwright.provider_attempt_runtime.prepare_attempt", side_effect=ProviderRecoveryError("C:/private/checkpoint")):
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "prepared checkpoint is unavailable") as raised:
+                    runner.materialize_prepared_snapshot()
+            self.assertNotIn("private", str(raised.exception))
+            self.assertEqual(backend.calls, 0)
+            runner.materialize_prepared_snapshot()
+            with patch("roundwright.provider_attempt_runtime.read_supervisor_dispatch_claim", side_effect=ProviderRecoveryError("C:/private/claim")):
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "dispatch claim is unavailable") as raised:
+                    runner.execute()
+            self.assertNotIn("private", str(raised.exception))
+            self.assertEqual(backend.calls, 0)
+
     def test_missing_session_identity_retains_a_prepared_attempt_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, _, repository, identity, recovery, _ = self.durable_runner(

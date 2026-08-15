@@ -492,6 +492,10 @@ class ProviderAttemptAccountingAdapter:
         context = _provider_attempt_context(binding)
         try:
             context.resources.validate(context.descriptor)
+            # Host construction is intentionally non-mutating.  Only this
+            # fully reconciled Harness validate boundary persists the one
+            # unclaimed PREPARED checkpoint and immediately reads it back.
+            context.resources.runner.materialize_prepared_snapshot()
         except ProviderAttemptRuntimeError as error:
             raise ExternalValidationAdapterError(f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: {error}") from error
 

@@ -89,6 +89,11 @@ class SupervisorAccountingBlocker(StrEnum):
     INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
 
 
+class SupervisorDispatchClaimState(StrEnum):
+    UNCLAIMED = "unclaimed"
+    CLAIMED = "claimed"
+
+
 @dataclass(frozen=True)
 class SupervisorAccountingAttemptSnapshot:
     attempt_id: str; within_round_attempt: int; profile_identity: str; state: AttemptState
@@ -437,6 +442,33 @@ def claim_supervisor_dispatch(
     finally:
         connection.close()
     return read_attempt(repository, identity, attempt_id, context=context, now=now)
+
+
+def read_supervisor_dispatch_claim(
+    repository: RepositoryIdentity, identity: TaskIdentity, context: RecoveryContext, *, attempt_id: str,
+) -> SupervisorDispatchClaimState:
+    """Read the closed one-shot dispatch disposition without state mutation."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    path = database_path(repository)
+    if not path.exists():
+        raise ProviderRecoveryError("Supervisor dispatch claim is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ProviderRecoveryError("Supervisor dispatch claim is unavailable") from error
+    try:
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("Supervisor dispatch claim has drifted")
+        claimed = connection.execute("SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=? AND task_id=?", (attempt_id, identity.task_id)).fetchone()
+        return SupervisorDispatchClaimState.CLAIMED if claimed is not None else SupervisorDispatchClaimState.UNCLAIMED
+    finally:
+        connection.close()
 
 
 def record_external_turn(

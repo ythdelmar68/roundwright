@@ -33,7 +33,7 @@ from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
     read_supervisor_terminal_failure, record_supervisor_terminal_failure,
-    claim_supervisor_dispatch, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
+    claim_supervisor_dispatch, read_supervisor_dispatch_claim, SupervisorDispatchClaimState, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
     SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
 )
@@ -382,7 +382,14 @@ class DurableDiffReviewRunner:
             self.materialize_prepared_snapshot(entries)
         else:
             if initial.state is AttemptState.PREPARED:
-                self.materialize_prepared_snapshot(entries)
+                claim = read_supervisor_dispatch_claim(
+                    self.repository, self.identity, first.recovery,
+                    attempt_id=first.selection.provider_attempt_id,
+                )
+                if claim is SupervisorDispatchClaimState.UNCLAIMED:
+                    self.materialize_prepared_snapshot(entries)
+                else:
+                    raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
         attempt_ids: list[str] = []
         for entry in entries:
             attempt_id, accepted = self._execute_selection(entry.selection, entry.recovery, entry.audit, entry.backend)
@@ -732,8 +739,7 @@ class ProviderAttemptRuntimeResources:
             or self.runner.completion_policy != self.completion_policy
         ):
             raise ProviderAttemptRuntimeError("provider attempt runtime context has drifted")
-        entries = self.runner.preflight_checkpoint_prerequisites()
-        self.runner.materialize_prepared_snapshot(entries)
+        self.runner.preflight_checkpoint_prerequisites()
         # Provider-free preflight confirms the local durable identity and the
         # exact binding without calling a provider or creating a lifecycle row.
         check_database(self.repository)

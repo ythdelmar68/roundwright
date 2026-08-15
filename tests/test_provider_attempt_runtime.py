@@ -754,6 +754,11 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 repository, identity, recovery, runner.lease, seal, runner.binding,
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
             ))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id, runner.selection.provider_attempt_id)).fetchone()[0], 0)
+            finally:
+                connection.close()
             prior_package, prior_module = fake_harness()
             try:
                 adapter = external_validation.ProviderAttemptAccountingAdapter()
@@ -774,7 +779,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 adapter.validate(binding)
                 connection = sqlite3.connect(database_path(repository))
                 try:
-                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=?", (identity.task_id,)).fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id, runner.selection.provider_attempt_id)).fetchone()[0], 1)
                 finally:
                     connection.close()
                 execution = adapter.execute(binding)

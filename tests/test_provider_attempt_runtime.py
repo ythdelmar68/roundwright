@@ -523,7 +523,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(request)
             assert request is not None
             material = request.decision_material
-            self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "current_attempt", "prior_attempts"})
+            self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "formal_review", "current_attempt", "prior_attempts"})
             self.assertEqual(material["prior_attempts"][0]["state"], "invalidated")
             self.assertEqual(material["prior_attempts"][0]["recovery_action"], "fresh-supervisor-session")
             self.assertTrue(material["prior_attempts"][0]["session_present"])

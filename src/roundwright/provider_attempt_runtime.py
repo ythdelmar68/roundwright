@@ -416,6 +416,10 @@ class DurableDiffReviewRunner:
                     "SELECT verification_kind, outcome, evidence_fingerprint FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? ORDER BY verification_kind, verification_id",
                     (self.identity.task_id, self.seal.candidate_sha),
                 ))
+                formal = connection.execute(
+                    "SELECT COUNT(*), SUM(CASE WHEN state = 'accepted' THEN 1 ELSE 0 END) FROM diff_review_attempts WHERE task_id = ? AND review_round = ?",
+                    (self.identity.task_id, self.review_round),
+                ).fetchone()
                 rows: list[dict[str, object]] = []
                 for item in prior:
                     row = connection.execute(
@@ -457,6 +461,7 @@ class DurableDiffReviewRunner:
                 "seal_state_identity": self.lease.state_identity,
                 "evidence_count": len(evidence), "evidence_digest": _digest(evidence),
                 "verification_count": len(verifications), "verification_digest": _digest(verifications),
+                "verification_kinds": [{"kind": item[0], "outcome": item[1]} for item in verifications],
             },
             "review_policy": {
                 "configuration_digest": recovery.runtime_binding.resolved_digest,
@@ -467,10 +472,17 @@ class DurableDiffReviewRunner:
                 "review_epoch": context.review_epoch, "review_round": context.review_round,
                 "review_mode": context.review_mode.value,
             },
+            "formal_review": {
+                "review_round": self.review_round,
+                "record_count": formal[0], "accepted_count": 0 if formal[1] is None else formal[1],
+                "accepted_result_present": bool(formal[1]),
+            },
             "current_attempt": {
                 "attempt_id": selection.provider_attempt_id,
                 "within_round_attempt": selection.within_round_attempt,
                 "profile_identity": audit.profile_identity,
+                "state": "not-dispatched", "session_present": False, "turn_present": False,
+                "completion_present": False, "accepted": False,
             },
             "prior_attempts": rows,
         }

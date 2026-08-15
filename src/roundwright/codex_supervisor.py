@@ -340,12 +340,19 @@ def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: st
 
 def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dict[str, object]:
     if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
-        return {"schema": "roundwright-provider-attempt-accounting-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "decision_material": request.decision_material}
+        return {"schema": "roundwright-provider-attempt-accounting-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_rule": "accept-only-when-sealed-verifications-and-formal-accounting-are-complete", "decision_material": request.decision_material}
     return {"schema": "roundwright-supervisor-review-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
 
 
 def _accounting_material(value: object) -> bool:
-    return type(value) is dict and set(value) == {"schema", "binding", "candidate", "review_policy", "current_attempt", "prior_attempts"} and value.get("schema") == "roundwright-provider-attempt-accounting-decision/v1" and all(type(value.get(name)) is dict for name in ("binding", "candidate", "review_policy", "current_attempt")) and type(value.get("prior_attempts")) is list
+    if type(value) is not dict or set(value) != {"schema", "binding", "candidate", "review_policy", "formal_review", "current_attempt", "prior_attempts"} or value.get("schema") != "roundwright-provider-attempt-accounting-decision/v1" or not all(type(value.get(name)) is dict for name in ("binding", "candidate", "review_policy", "formal_review", "current_attempt")) or type(value.get("prior_attempts")) is not list:
+        return False
+    def closed(item: object) -> bool:
+        if item is None or type(item) in (bool, int): return True
+        if type(item) is str: return len(item) <= 128 and "\\" not in item and "\n" not in item
+        if type(item) is list: return all(closed(value) for value in item)
+        return type(item) is dict and all(type(key) is str and key.replace("_", "").isalnum() and closed(value) for key, value in item.items())
+    return closed(value)
 
 
 def _accounting_output(value: object) -> tuple[bool, SupervisorAccountingBlocker | None]:

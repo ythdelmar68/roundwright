@@ -529,7 +529,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertIs(type(request.decision_material), SupervisorAccountingSnapshot)
             material = request.decision_material.canonical_material()
             self.assertEqual(set(material), {"schema", "binding", "candidate", "review_policy", "formal_review", "dispatch_claim", "current_attempt", "prior_attempts"})
-            self.assertEqual(material["schema"], "roundwright-provider-attempt-accounting-decision/v2")
+            self.assertEqual(material["schema"], "roundwright-provider-attempt-accounting-decision/v3")
             self.assertEqual(material["dispatch_claim"], "claimed")
             self.assertEqual(material["binding"]["case_id"], runner.case_id)
             self.assertEqual(material["binding"]["ready_at"], runner.ready_at)

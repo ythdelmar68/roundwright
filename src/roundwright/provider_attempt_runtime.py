@@ -349,7 +349,7 @@ class DurableDiffReviewRunner:
                     process_lease_expires_at=selection.process_lease_expires_at,
                     selected_profile_identity=entry.audit.profile_identity,
                     within_round_attempt=selection.within_round_attempt,
-                    review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
+                    review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
                 )
                 preflight_attempt_preparation(
                     self.identity, entry.recovery,
@@ -440,7 +440,7 @@ class DurableDiffReviewRunner:
             process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at,
             selected_profile_identity=entry.audit.profile_identity,
-            within_round_attempt=selection.within_round_attempt, review_round=self.review_round,
+            within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
             lease=self.lease, now=self.dispatch_control.now,
         )
         try:
@@ -554,7 +554,7 @@ class DurableDiffReviewRunner:
             implementation_attempt_id=selection.implementation_attempt_id, provider_attempt_id=selection.provider_attempt_id,
             message_identity=selection.message_identity, process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at, selected_profile_identity=selected,
-            within_round_attempt=selection.within_round_attempt, review_round=self.review_round,
+            within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
             lease=self.lease, now=self.dispatch_control.now,
         )
         prepared = prepare_attempt(
@@ -621,7 +621,7 @@ class DurableDiffReviewRunner:
                 process_lease_expires_at=selection.process_lease_expires_at,
                 selected_profile_identity=selected,
                 within_round_attempt=selection.within_round_attempt,
-                review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
+                review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
             )
             session_checkpointed = True
 
@@ -638,7 +638,7 @@ class DurableDiffReviewRunner:
                 process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
                 selected_profile_identity=selected, within_round_attempt=selection.within_round_attempt,
-                review_round=self.review_round, lease=self.lease, now=self.dispatch_control.now,
+                review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
             )
             turn_checkpointed = True
 

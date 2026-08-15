@@ -130,7 +130,7 @@ class SupervisorAccountingSnapshot:
             raise ProviderRecoveryError("accounting snapshot is invalid")
         if self.current.state is not AttemptState.PREPARED or self.current.within_round_attempt != len(self.prior)+1 or any((self.current.session_present,self.current.turn_present,self.current.completion_present,self.current.invalid_output_present,self.current.accepted)) or self.current.recovery_action is not None or tuple(item.within_round_attempt for item in self.prior) != tuple(range(1,len(self.prior)+1)) or len({item.attempt_id for item in self.prior + (self.current,)}) != len(self.prior) + 1 or len({item.profile_identity for item in self.prior + (self.current,)}) != len(self.prior) + 1:
             raise ProviderRecoveryError("accounting snapshot attempt ordering is invalid")
-    def canonical_material(self) -> dict[str, object]: return {"schema":"roundwright-provider-attempt-accounting-decision/v2","binding":{"repository_id":self.repository_id,"task_id":self.task_id,"source_digest":self.source_digest,"base_sha":self.base_sha,"candidate_sha":self.candidate_sha,"case_id":self.case_id,"ready_at":self.ready_at},"candidate":{"seal_state_identity":self.seal_state_identity,"evidence_count":len(self.evidence),"evidence_digest":"sha256:"+hashlib.sha256("|".join(self.evidence).encode()).hexdigest(),"verification_count":len(self.verifications),"verification_kinds":[{"kind":a,"outcome":b} for a,b in self.verifications]},"review_policy":{"configuration_digest":self.configuration_digest,"policy_digest":self.policy_digest,"complete_rounds":self.complete_rounds,"max_rounds":self.max_rounds,"max_supervisor_attempts_per_round":self.max_attempts,"review_epoch":self.review_epoch,"review_round":self.review_round,"review_mode":self.review_mode},"formal_review":{"review_round":self.review_round,"record_count":self.formal_record_count,"accepted_count":self.formal_accepted_count,"accepted_result_present":bool(self.formal_accepted_count)},"dispatch_claim":self.dispatch_claim.value,"current_attempt":self.current.canonical_material(),"prior_attempts":[item.canonical_material() for item in self.prior]}
+    def canonical_material(self) -> dict[str, object]: return {"schema":"roundwright-provider-attempt-accounting-decision/v3","binding":{"repository_id":self.repository_id,"task_id":self.task_id,"source_digest":self.source_digest,"base_sha":self.base_sha,"candidate_sha":self.candidate_sha,"case_id":self.case_id,"ready_at":self.ready_at},"candidate":{"seal_state_identity":self.seal_state_identity,"evidence_count":len(self.evidence),"evidence_digest":"sha256:"+hashlib.sha256("|".join(self.evidence).encode()).hexdigest(),"verification_count":len(self.verifications),"verification_kinds":[{"kind":a,"outcome":b} for a,b in self.verifications]},"review_policy":{"configuration_digest":self.configuration_digest,"policy_digest":self.policy_digest,"complete_rounds":self.complete_rounds,"max_rounds":self.max_rounds,"max_supervisor_attempts_per_round":self.max_attempts,"review_epoch":self.review_epoch,"review_round":self.review_round,"review_mode":self.review_mode},"formal_review":{"review_epoch":self.review_epoch,"review_round":self.review_round,"record_count":self.formal_record_count,"accepted_count":self.formal_accepted_count,"accepted_result_present":bool(self.formal_accepted_count)},"dispatch_claim":self.dispatch_claim.value,"current_attempt":self.current.canonical_material(),"prior_attempts":[item.canonical_material() for item in self.prior]}
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -276,7 +276,7 @@ def read_supervisor_accounting_snapshot(
         if seal != (base_sha, candidate_sha, seal_state_identity): raise ProviderRecoveryError("accounting snapshot seal has drifted")
         evidence = tuple(row[0] for row in connection.execute("SELECT evidence_fingerprint FROM candidate_evidence WHERE task_id=? AND candidate_sha=? ORDER BY evidence_fingerprint", (identity.task_id,candidate_sha)))
         verifications = tuple((row[0],row[1]) for row in connection.execute("SELECT verification_kind,outcome FROM candidate_verifications WHERE task_id=? AND candidate_sha=? ORDER BY verification_kind,verification_id", (identity.task_id,candidate_sha)))
-        formal = connection.execute("SELECT COUNT(*),SUM(CASE WHEN state='accepted' THEN 1 ELSE 0 END) FROM diff_review_attempts WHERE task_id=? AND review_round=?", (identity.task_id,review_round)).fetchone()
+        formal = connection.execute("SELECT COUNT(*),SUM(CASE WHEN state='accepted' THEN 1 ELSE 0 END) FROM diff_review_attempts WHERE task_id=? AND review_epoch=? AND review_round=?", (identity.task_id,review_epoch,review_round)).fetchone()
         def attempt(attempt_id: str, ordinal: int, profile: str) -> SupervisorAccountingAttemptSnapshot:
             row = connection.execute("SELECT state,session_identity,external_turn_identity,output_pointer,completion_evidence_fingerprint,accepted_review_identity,selected_profile_identity FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id,attempt_id)).fetchone()
             outcome = connection.execute("SELECT recovery_action,blocker FROM provider_recovery_outcomes WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -754,7 +754,7 @@ def accept_supervisor_review(
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
         )
         connection.execute(
-            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (accepted_review_identity, *_accepted_supervisor_review_values(identity, row, context)),
         )
         connection.commit()
@@ -1157,6 +1157,7 @@ def _accepted_supervisor_review_values(
         row.selected_profile_identity,
         0,
         *context.runtime_binding.complete_columns()[4:],
+        0,
     )
 
 
@@ -1208,7 +1209,7 @@ def _require_accepted_supervisor_review(
     ):
         raise ProviderRecoveryError("accepted supervisor review is invalid")
     persisted = connection.execute(
-        "SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity = ?",
+        "SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?",
         (row.accepted_review_identity,),
     ).fetchone()
     if persisted != _accepted_supervisor_review_values(identity, row, context):

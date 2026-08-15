@@ -504,6 +504,43 @@ class CandidateReviewTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_same_formal_round_is_independent_across_durable_epochs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("epoch-tests", VerificationKind.TEST, VerificationOutcome.PASS, "a" * 64),
+                CandidateVerification("epoch-build", VerificationKind.BUILD, VerificationOutcome.PASS, "b" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease, now=now)
+            def dispatch(epoch: int, suffix: str):
+                return dispatch_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id=f"epoch-{suffix}-review", implementation_attempt_id=implementation.implementation_attempt_id,
+                    provider_attempt_id=f"epoch-{suffix}-provider", supervisor_session_identity=f"epoch-{suffix}-session",
+                    external_turn_identity=f"epoch-{suffix}-turn", message_identity=f"epoch-{suffix}-message",
+                    process_lease_id=f"epoch-{suffix}-lease", process_lease_expires_at=now + 60,
+                    review_epoch=epoch, review_round=1, lease=lease, now=now,
+                )
+            first, second = dispatch(1, "one"), dispatch(2, "two")
+            for review, evidence in ((first, "c" * 64), (second, "d" * 64)):
+                self.assertTrue(record_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id=review.diff_review_attempt_id,
+                    output=DiffReviewOutput(review.diff_review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity, review.external_turn_identity, review.message_identity, seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS),
+                    completion_evidence_fingerprint=evidence, lease=lease, now=now,
+                ).accepted)
+            with self.assertRaisesRegex(CandidateReviewError, "formal review round"):
+                dispatch(2, "duplicate")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT review_epoch, review_round FROM diff_review_attempts WHERE state='accepted' ORDER BY review_epoch").fetchall(), [(1, 1), (2, 1)])
+                self.assertEqual(connection.execute("SELECT review_epoch FROM accepted_provider_reviews ORDER BY review_epoch").fetchall(), [(1,), (2,)])
+            finally:
+                connection.close()
+
     def test_public_diff_lifecycle_requires_sealed_authorization_and_complete_policy(self):
         def recorded_review(root):
             values = self.ready_task(root)

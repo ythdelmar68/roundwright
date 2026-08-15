@@ -466,6 +466,47 @@ class DurableDiffReviewRunner:
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt prepared checkpoint is unavailable") from None
 
+    def validate_accounting_checkpoint(self) -> object:
+        """Validate initial readiness or exact durable restart history.
+
+        Harness calls validate before every execute.  A fresh request creates
+        one unclaimed PREPARED checkpoint; a persisted accepted, recovered, or
+        terminal sequence is only read and reconciled, never prepared again.
+        """
+
+        entries = self.preflight_checkpoint_prerequisites()
+        first = entries[0]
+        try:
+            current = read_attempt(
+                self.repository, self.identity, first.selection.provider_attempt_id,
+                context=first.recovery, now=self.dispatch_control.now,
+            )
+        except ProviderRecoveryError:
+            return self.materialize_prepared_snapshot(entries)
+        try:
+            if current.state is AttemptState.PREPARED:
+                claim = read_supervisor_dispatch_claim(
+                    self.repository, self.identity, first.recovery,
+                    attempt_id=first.selection.provider_attempt_id,
+                )
+                if claim is SupervisorDispatchClaimState.UNCLAIMED:
+                    return self.materialize_prepared_snapshot(entries)
+            for entry in entries:
+                try:
+                    stored = read_attempt(
+                        self.repository, self.identity, entry.selection.provider_attempt_id,
+                        context=entry.recovery, now=self.dispatch_control.now,
+                    )
+                except ProviderRecoveryError:
+                    # A later selection may correctly be absent after a
+                    # terminal first attempt, but no existing row may drift.
+                    continue
+                if stored.role is not ProviderRole.SUPERVISOR or stored.selected_profile_identity != entry.audit.profile_identity or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}:
+                    raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
+            return current
+        except ProviderRecoveryError:
+            raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None
+
     def _execute_selection(
         self,
         selection: DiffReviewSelection,

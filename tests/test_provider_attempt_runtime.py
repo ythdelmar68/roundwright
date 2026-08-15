@@ -854,6 +854,10 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 evidence = adapter.project(binding, execution)
                 self.assertEqual(adapter.compare(binding, evidence).status, "pass")
                 self.assertEqual(backend.calls, 1)
+                adapter.validate(binding)
+                restarted = adapter.execute(binding)
+                self.assertEqual(adapter.project(binding, restarted), evidence)
+                self.assertEqual(backend.calls, 1)
             finally:
                 for name, value in (("roundwright_harness", prior_package), ("roundwright_harness.executor", prior_module)):
                     if value is None:

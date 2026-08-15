@@ -503,6 +503,11 @@ class DurableDiffReviewRunner:
                     continue
                 if stored.role is not ProviderRole.SUPERVISOR or stored.selected_profile_identity != entry.audit.profile_identity or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}:
                     raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
+                if read_supervisor_dispatch_claim(
+                    self.repository, self.identity, entry.recovery,
+                    attempt_id=entry.selection.provider_attempt_id,
+                ) is not SupervisorDispatchClaimState.CLAIMED:
+                    raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
             return current
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None

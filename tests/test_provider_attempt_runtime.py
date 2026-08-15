@@ -858,6 +858,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 restarted = adapter.execute(binding)
                 self.assertEqual(adapter.project(binding, restarted), evidence)
                 self.assertEqual(backend.calls, 1)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    connection.execute("UPDATE provider_dispatch_claims SET claim_fingerprint=? WHERE attempt_id=?", (digest("e"), runner.selection.provider_attempt_id))
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    adapter.validate(binding)
+                self.assertEqual(backend.calls, 1)
             finally:
                 for name, value in (("roundwright_harness", prior_package), ("roundwright_harness.executor", prior_module)):
                     if value is None:

@@ -19,7 +19,7 @@ by the allowlisted owner.
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
 | Generic Orchestrator | `ythdelmar68/roundlet` | canonical merge `96772438b251e56d483733179939245565b1374a`; skill content `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a`; tree `d2aa36b492210dc411b5c1a5c927dc7d286ff21f` | Consume one exact repository-owned executor and track only generic readiness/execution/verification state | Roundwright profile logic, Recorder, provider adapter, evidence store, or a second runner |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb`; executor content `0235427e02ea5b512a5fd5d81300f8b49ed4643c`; tree `2756131387ab70c9511e8156fd4c595cc3996fd3` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `0154817a6fba345b78af25017eb312a1b2349cd6`; executor content `0f980f75a05ec616395b2cbfed9724417d00d335`; tree `d9fba0facfe561850c0dbff913e8021541b98ca5` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
 | Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
 
 Roundlet PR #80 added generic consumption of repository-owned validation
@@ -30,7 +30,17 @@ has parents `8ba2813e8aac869cf1f3ebbe78104d03a9134c4a` and
 content `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a`. The official skill
 validator and repository structure checks passed.
 
-Harness PR #8 added one phase-neutral versioned profile executor. Canonical
+Harness PR #10 added V2 execution-context materialization to the one
+phase-neutral versioned profile executor. Canonical merge
+`0154817a6fba345b78af25017eb312a1b2349cd6` has first parent
+`369d964c44a7ef4653e13255d7c3e6a9ae87eeeb`, content parent
+`0f980f75a05ec616395b2cbfed9724417d00d335`, and tree
+`d9fba0facfe561850c0dbff913e8021541b98ca5`. PR #10 is merged and its
+hermetic CI succeeded. The V2 request materializes one product-owned opaque
+context before validation and binds that identity through execution, projection,
+comparison, Recorder sealing, and read-back.
+
+Harness PR #8 added the historical V1 phase-neutral versioned profile executor. Canonical
 merge `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb` has parents
 `1bb063d3f8f1fef9a24b3147b8bc99794e4637a7` and
 `9680543fc5aa64b18d0c6a5f7a09c4e40697b6ae`, binds executor content
@@ -192,7 +202,7 @@ exporting the terminal candidate. Candidate movement requires a fresh capture;
 the missing historical v1 lifecycle bundle is never reconstructed.
 
 The concrete handoff is one closed
-`roundwright-harness-profile-executor-request/v1` containing one
+`roundwright-harness-profile-executor-request/v2` containing one
 `roundwright-harness-capture-plan/v1` document with profile, case, candidate,
 `ready_at`, producer, exporter, comparator, Recorder, store, and observation
 identities. The reviewed Harness returns one path-free readiness receipt from

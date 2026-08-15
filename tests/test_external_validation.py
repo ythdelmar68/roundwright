@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -203,48 +202,28 @@ class ExternalValidationTests(unittest.TestCase):
         ):
             adapter.validate(exact)
 
-        # The reviewed Harness never calls execute after validate blocks.  If a
-        # caller attempts to bypass that boundary, the projection is explicit
-        # non-qualifying evidence rather than an inferred event sequence.
-        evidence = adapter.project(exact, adapter.execute(exact))
-        accounting = evidence["provider_attempt_accounting"]
-        self.assertEqual(accounting["capture_mode"], "armed-live-events")
-        self.assertEqual(accounting["history"], "unavailable-public-binding")
-        self.assertIsNone(accounting["snapshot"])
-        self.assertEqual(
-            accounting["blocker"]["code"],
-            external_validation.PROVIDER_ATTEMPT_HISTORY_BLOCKER,
-        )
-        self.assertEqual(
-            accounting["blocker"]["required_public_contract"],
-            "plan-bound-product-execution-context/v1",
-        )
-        self.assertIn(
-            "bounded-provider-backend-and-durable-lifecycle-store",
-            accounting["blocker"]["missing_runtime_capabilities"],
-        )
-        self.assertEqual(accounting["mutation_count"], 0)
-        self.assertEqual(adapter.compare(exact, evidence).status, "fail")
+        # V2 never lets a caller bypass provider-free readiness.  A bare V1
+        # binding cannot fabricate an execution envelope or history.
+        with self.assertRaisesRegex(
+            external_validation.ExternalValidationAdapterError,
+            "V2 execution context",
+        ):
+            adapter.execute(exact)
 
     def test_provider_attempt_profile_rejects_fabricated_history_and_context_drift(self) -> None:
         adapter = external_validation.roundwright_profile_adapter_factory(
             PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
         )
         exact = provider_binding()
-        evidence = adapter.project(exact, adapter.execute(exact))
-
-        fabricated = deepcopy(evidence)
-        fabricated["provider_attempt_accounting"]["history"] = "complete"
-        fabricated["provider_attempt_accounting"]["snapshot"] = {
-            "review_round": 1,
-            "lifecycle_state": "accepted-review",
-            "event_graph": {"provider_attempts": ["invented"]},
+        fabricated = {
+            "provider_attempt_accounting": {
+                "history": "complete",
+                "snapshot": {"event_graph": {"provider_attempts": ["invented"]}},
+            }
         }
+        # No JSON payload can supply a qualifying result without the opaque
+        # V2 context and a fresh durable read-back.
         self.assertEqual(adapter.compare(exact, fabricated).status, "fail")
-
-        self.assertEqual(adapter.compare(provider_binding(candidate_sha="c" * 40), evidence).status, "fail")
-        self.assertEqual(adapter.compare(provider_binding(ready_at=18), evidence).status, "fail")
-        self.assertEqual(adapter.compare(provider_binding(plan_digest="sha256:" + "f" * 64), evidence).status, "fail")
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
             adapter.validate(provider_binding(ready_at=True))
         with self.assertRaises(external_validation.ExternalValidationAdapterError):

@@ -16,9 +16,14 @@ from .shadow import (
     ShadowV2EventGraph,
     shadow_evidence_profile,
 )
+from .provider_attempt_runtime import (
+    MaterializedProviderAttemptContext,
+    ProviderAttemptRuntimeError,
+    prepare_context as prepare_provider_attempt_context,
+)
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
-PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v1"
+PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
 _SHA = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -374,7 +379,7 @@ def _provider_attempt_history_blocker(binding: object) -> dict[str, object]:
     return {
         "code": PROVIDER_ATTEMPT_HISTORY_BLOCKER,
         "binding_identity": _provider_attempt_binding_identity(binding),
-        "required_public_contract": "plan-bound-product-execution-context/v1",
+        "required_public_contract": "roundwright-harness-profile-executor-request/v2",
         "required_records": [
             "base-candidate-policy-configuration-provider-context",
             "provider-attempt-invalid-recovery-acceptance-events",
@@ -394,12 +399,29 @@ def _require_provider_attempt_history(binding: object) -> None:
 
     _provider_attempt_history_blocker(binding)
     raise ExternalValidationAdapterError(
-        f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: reviewed ExecutorBinding lacks "
-        "a plan-bound product execution context"
+        f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: execution context is unavailable"
     )
 
 
-def _provider_attempt_evidence(binding: object) -> dict[str, object]:
+def _provider_attempt_context(binding: object) -> MaterializedProviderAttemptContext:
+    try:
+        context = binding.execution_context
+        descriptor_digest = binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError(
+            f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: reviewed ExecutorBinding lacks a V2 execution context"
+        ) from error
+    if (
+        type(value) is not MaterializedProviderAttemptContext
+        or type(descriptor_digest) is not str
+        or not descriptor_digest.startswith("sha256:")
+    ):
+        raise ExternalValidationAdapterError(f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: execution context has drifted")
+    return value
+
+
+def _provider_attempt_evidence(binding: object, snapshot: ProviderAttemptAccountingSnapshot | None = None) -> dict[str, object]:
     identity = _provider_attempt_binding_identity(binding)
     return {
         "schema": "roundwright-shadow-case/v2",
@@ -415,9 +437,9 @@ def _provider_attempt_evidence(binding: object) -> dict[str, object]:
             "producer_identity": PROVIDER_ATTEMPT_PRODUCER_IDENTITY,
             "exporter_identity": PROVIDER_ATTEMPT_EXPORTER_IDENTITY,
             "comparator_identity": PROVIDER_ATTEMPT_COMPARATOR_IDENTITY,
-            "history": "unavailable-public-binding",
-            "snapshot": None,
-            "blocker": _provider_attempt_history_blocker(binding),
+            "history": "complete" if snapshot is not None else "unavailable-public-binding",
+            "snapshot": None if snapshot is None else snapshot.public_payload(),
+            "blocker": _provider_attempt_history_blocker(binding) if snapshot is None else None,
             "mutation_count": 0,
         },
     }
@@ -437,6 +459,21 @@ class ProviderAttemptAccountingAdapter:
     def component_identities(self) -> object:
         return _harness_executor().ProfileComponentIdentities(*provider_attempt_accounting_component_identities())
 
+    def prepare_execution_context(self, preparation: object) -> object:
+        """Materialize the V2 descriptor into one opaque product context."""
+
+        try:
+            context = prepare_provider_attempt_context(
+                preparation.descriptor,
+                plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha,
+                case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ProviderAttemptRuntimeError) as error:
+            raise ExternalValidationAdapterError(f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: {error}") from error
+
     def validate(self, binding: object) -> None:
         _provider_attempt_binding_identity(binding)
         try:
@@ -449,32 +486,61 @@ class ProviderAttemptAccountingAdapter:
             raise ExternalValidationAdapterError("executor components are invalid") from error
         if actual != provider_attempt_accounting_component_identities():
             raise ExternalValidationAdapterError("executor components have drifted")
-        _require_provider_attempt_history(binding)
+        context = _provider_attempt_context(binding)
+        try:
+            context.resources.validate(context.descriptor)
+        except ProviderAttemptRuntimeError as error:
+            raise ExternalValidationAdapterError(f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: {error}") from error
 
     def execute(self, binding: object) -> object:
-        evidence = _provider_attempt_evidence(binding)
+        context = _provider_attempt_context(binding)
+        try:
+            attempt_ids = context.resources.runner.execute()
+            snapshot = ProviderAttemptAccountingSnapshot(**context.snapshot(attempt_ids))
+        except (ProviderAttemptRuntimeError, ValueError) as error:
+            raise ExternalValidationAdapterError(f"{PROVIDER_ATTEMPT_HISTORY_BLOCKER}: {error}") from error
+        if not snapshot.history_complete:
+            raise ExternalValidationAdapterError("provider-attempt-history-incomplete")
+        evidence = _provider_attempt_evidence(binding, snapshot)
         return _harness_executor().ProfileExecution(
-            {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "evidence_identity": _digest(evidence)},
+            {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "evidence_identity": _digest(evidence), "snapshot": snapshot},
             mutation_count=0,
         )
 
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
-        expected = _provider_attempt_evidence(binding)
+        context = _provider_attempt_context(binding)
         try:
             value = execution.value
             mutation_count = execution.mutation_count
         except AttributeError as error:
             raise ExternalValidationAdapterError("executor result is invalid") from error
-        if value != {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "evidence_identity": _digest(expected)} or mutation_count != 0:
+        if type(value) is not dict or set(value) != {"schema", "evidence_identity", "snapshot"} or type(value.get("snapshot")) is not ProviderAttemptAccountingSnapshot or mutation_count != 0:
             raise ExternalValidationAdapterError("executor result has drifted")
+        expected = _provider_attempt_evidence(binding, value["snapshot"])
+        if value != {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "evidence_identity": _digest(expected), "snapshot": value["snapshot"]}:
+            raise ExternalValidationAdapterError("executor result has drifted")
+        # Re-read durable state after execution; a restart, plan, candidate, or
+        # context change cannot reuse a previously projected graph.
+        try:
+            refreshed = ProviderAttemptAccountingSnapshot(**context.snapshot(tuple(item.attempt_id for item in value["snapshot"].event_graph.provider_attempts)))
+        except (AttributeError, ProviderAttemptRuntimeError, ValueError) as error:
+            raise ExternalValidationAdapterError("durable provider attempt read-back has drifted") from error
+        if refreshed != value["snapshot"]:
+            raise ExternalValidationAdapterError("durable provider attempt read-back has drifted")
         return expected
 
     def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
-        expected = _provider_attempt_evidence(binding)
-        # A caller that bypasses preflight can only produce this explicit
-        # blocking envelope.  It is recordable for diagnosis but never
-        # qualifying evidence.
         status = "fail"
+        try:
+            snapshot = evidence["provider_attempt_accounting"]["snapshot"]
+            # Public evidence is JSON, so compare the canonical projection,
+            # rather than accepting an opaque execution object.
+            context = _provider_attempt_context(binding)
+            current = ProviderAttemptAccountingSnapshot(**context.snapshot(tuple(item[0] for item in snapshot["event_graph"]["provider_attempts"])))
+            expected = _provider_attempt_evidence(binding, current)
+            status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        except (KeyError, TypeError, ProviderAttemptRuntimeError, ExternalValidationAdapterError, ValueError):
+            expected = _provider_attempt_evidence(binding)
         result_identity = _digest({
             "schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA,
             "status": status,

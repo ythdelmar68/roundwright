@@ -35,11 +35,11 @@ Before provisioning, invocation, replay, or mutation:
    not construct a Roundwright runner or profile adapter.
 6. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
-   `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb`. That canonical merge binds
-   profile-executor content `0235427e02ea5b512a5fd5d81300f8b49ed4643c`,
+   `0154817a6fba345b78af25017eb312a1b2349cd6`. That canonical merge binds
+   profile-executor content `0f980f75a05ec616395b2cbfed9724417d00d335`,
    capture-plan/Recorder content `cf669e186a739a8597cfaf9f050ce3bdcadda334`,
    lock content `809cd786f9776d134512b5478a5e1e48b13a4ef1`, and tree
-   `2756131387ab70c9511e8156fd4c595cc3996fd3` from reviewed Harness PR #8.
+   `d9fba0facfe561850c0dbff913e8021541b98ca5` from reviewed Harness PR #10.
    Use its repo-local locked uv environment and exact instructions from that
    commit. Never use floating `main`, install packages into global Python, or
    treat the toolbox as an authority source or credential store. The prior
@@ -68,7 +68,7 @@ identity, append-only content-addressed store identity, and immutable capture
 time. The preflight must pass before the arm-before boundary; an unarmed
 ephemeral observation is prohibited.
 
-Construct exactly one closed `roundwright-harness-profile-executor-request/v1`
+Construct exactly one closed `roundwright-harness-profile-executor-request/v2`
 containing one `roundwright-harness-capture-plan/v1` document before dispatch.
 The plan binds the profile, case, exact candidate, immutable `ready_at`,
 producer, exporter, comparator, Recorder, store, and observation identities.

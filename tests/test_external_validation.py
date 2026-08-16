@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright import external_validation
-from roundwright.shadow import EXECUTOR_CONTRACT_SYNTHETIC_PROFILE
+from roundwright.shadow import EXECUTOR_CONTRACT_SYNTHETIC_PROFILE, PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
 
 
 @dataclass(frozen=True)
@@ -26,9 +26,48 @@ class ProfileExecution:
 
 
 @dataclass(frozen=True)
+class ProfileExecutionContext:
+    identity: str
+    value: object
+
+
+@dataclass(frozen=True)
 class ProfileComparison:
     status: str
     result_identity: str
+
+
+@dataclass(frozen=True)
+class CapturePlanReceipt:
+    plan_digest: str
+    profile: str
+    case_id: str
+    candidate_sha: str
+    ready_at: int
+
+
+@dataclass(frozen=True)
+class ExecutorBinding:
+    """The public reviewed Harness binding shape, without candidate extensions."""
+
+    plan: CapturePlanReceipt
+    components: ProfileComponentIdentities
+
+    @property
+    def profile(self) -> str:
+        return self.plan.profile
+
+    @property
+    def case_id(self) -> str:
+        return self.plan.case_id
+
+    @property
+    def candidate_sha(self) -> str:
+        return self.plan.candidate_sha
+
+    @property
+    def ready_at(self) -> int:
+        return self.plan.ready_at
 
 
 def fake_harness() -> tuple[object | None, object | None]:
@@ -39,6 +78,7 @@ def fake_harness() -> tuple[object | None, object | None]:
     module = ModuleType("roundwright_harness.executor")
     module.ProfileComponentIdentities = ProfileComponentIdentities  # type: ignore[attr-defined]
     module.ProfileExecution = ProfileExecution  # type: ignore[attr-defined]
+    module.ProfileExecutionContext = ProfileExecutionContext  # type: ignore[attr-defined]
     module.ProfileComparison = ProfileComparison  # type: ignore[attr-defined]
     sys.modules["roundwright_harness"] = package
     sys.modules["roundwright_harness.executor"] = module
@@ -61,6 +101,30 @@ def binding(**updates: object) -> SimpleNamespace:
     }
     values.update(updates)
     return SimpleNamespace(**values)
+
+
+def provider_binding(**updates: object) -> ExecutorBinding:
+    producer, exporter, comparator = external_validation.provider_attempt_accounting_component_identities()
+    values: dict[str, object] = {
+        "profile": PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+        "case_id": "provider-attempt-case",
+        "candidate_sha": "a" * 40,
+        "ready_at": 17,
+        "plan_digest": "sha256:" + "3" * 64,
+        "components": ProfileComponentIdentities(
+            producer_identity=producer,
+            exporter_identity=exporter,
+            comparator_identity=comparator,
+        ),
+    }
+    values.update(updates)
+    return ExecutorBinding(
+        CapturePlanReceipt(
+            values["plan_digest"], values["profile"], values["case_id"],
+            values["candidate_sha"], values["ready_at"],
+        ),
+        values["components"],
+    )
 
 
 class ExternalValidationTests(unittest.TestCase):
@@ -129,3 +193,59 @@ class ExternalValidationTests(unittest.TestCase):
 
         self.assertEqual(comparison.status, "fail")
         self.assertTrue(comparison.result_identity.startswith("sha256:"))
+
+    def test_provider_attempt_profile_bare_public_binding_blocks_before_dispatch(self) -> None:
+        adapter = external_validation.roundwright_profile_adapter_factory(
+            PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+        )
+        exact = provider_binding()
+        self.assertEqual(
+            adapter.component_identities,
+            ProfileComponentIdentities(*external_validation.provider_attempt_accounting_component_identities()),
+        )
+        with self.assertRaisesRegex(
+            external_validation.ExternalValidationAdapterError,
+            external_validation.PROVIDER_ATTEMPT_HISTORY_BLOCKER,
+        ):
+            adapter.validate(exact)
+
+        # V2 never lets a caller bypass provider-free readiness.  A bare V1
+        # binding cannot fabricate an execution envelope or history.
+        with self.assertRaisesRegex(
+            external_validation.ExternalValidationAdapterError,
+            "V2 execution context",
+        ):
+            adapter.execute(exact)
+
+    def test_provider_attempt_profile_rejects_fabricated_history_and_context_drift(self) -> None:
+        adapter = external_validation.roundwright_profile_adapter_factory(
+            PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+        )
+        exact = provider_binding()
+        fabricated = {
+            "provider_attempt_accounting": {
+                "history": "complete",
+                "snapshot": {"event_graph": {"provider_attempts": ["invented"]}},
+            }
+        }
+        # No JSON payload can supply a qualifying result without the opaque
+        # V2 context and a fresh durable read-back.
+        self.assertEqual(adapter.compare(exact, fabricated).status, "fail")
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            adapter.validate(provider_binding(ready_at=True))
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            adapter.validate(provider_binding(components=ProfileComponentIdentities(
+                "sha256:" + "f" * 64,
+                external_validation.PROVIDER_ATTEMPT_EXPORTER_IDENTITY,
+                external_validation.PROVIDER_ATTEMPT_COMPARATOR_IDENTITY,
+            )))
+
+    def test_durable_snapshot_requires_base_and_context_bindings(self) -> None:
+        candidate = "a" * 40
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.ProviderAttemptAccountingSnapshot(
+                "task-45", "sha256:" + "2" * 64, "not-a-sha", candidate, "sha256:" + "3" * 64, 17,
+                1, 1, "COMPLETE", 1, 10, 1, "sha256:" + "4" * 64,
+                "sha256:" + "5" * 64, "selected-provider", "sha256:" + "6" * 64,
+                "accepted-review", None, "candidate-gates", False,
+            )

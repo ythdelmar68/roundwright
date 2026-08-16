@@ -35,11 +35,11 @@ Before provisioning, invocation, replay, or mutation:
    not construct a Roundwright runner or profile adapter.
 6. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
-   `369d964c44a7ef4653e13255d7c3e6a9ae87eeeb`. That canonical merge binds
-   profile-executor content `0235427e02ea5b512a5fd5d81300f8b49ed4643c`,
+   `0154817a6fba345b78af25017eb312a1b2349cd6`. That canonical merge binds
+   profile-executor content `0f980f75a05ec616395b2cbfed9724417d00d335`,
    capture-plan/Recorder content `cf669e186a739a8597cfaf9f050ce3bdcadda334`,
    lock content `809cd786f9776d134512b5478a5e1e48b13a4ef1`, and tree
-   `2756131387ab70c9511e8156fd4c595cc3996fd3` from reviewed Harness PR #8.
+   `d9fba0facfe561850c0dbff913e8021541b98ca5` from reviewed Harness PR #10.
    Use its repo-local locked uv environment and exact instructions from that
    commit. Never use floating `main`, install packages into global Python, or
    treat the toolbox as an authority source or credential store. The prior
@@ -68,18 +68,30 @@ identity, append-only content-addressed store identity, and immutable capture
 time. The preflight must pass before the arm-before boundary; an unarmed
 ephemeral observation is prohibited.
 
-Construct exactly one closed `roundwright-harness-profile-executor-request/v1`
+Construct exactly one closed `roundwright-harness-profile-executor-request/v2`
 containing one `roundwright-harness-capture-plan/v1` document before dispatch.
 The plan binds the profile, case, exact candidate, immutable `ready_at`,
 producer, exporter, comparator, Recorder, store, and observation identities.
-Run the reviewed Harness `run-profile --mode validate` command with the exact
-public Roundwright adapter factory and retain its path-free readiness receipt.
-Then invoke that same command, request, parser, factory, plan, and store with
-`--mode execute` and the exact readiness receipt digest. Prepare, validation,
-dispatch, typed projection/comparison, sealing, and verification must consume
-that same plan. Never rebuild a second runner, command, factory, or plan between
-stages. The older discrete capture commands remain historical compatibility
-surfaces and are not the entrypoint for a newly declared executor profile.
+For context-free profiles, run the reviewed Harness `run-profile --mode
+validate` command with the exact public Roundwright adapter factory and retain
+its path-free readiness receipt. Then invoke that same command, request,
+parser, factory, plan, and store with `--mode execute` and the exact readiness
+receipt digest.
+
+`roundwright-shadow-profile/provider-attempt-accounting/v1` instead requires
+the public product-hosted library entrypoint
+`roundwright.external_validation:run_provider_attempt_accounting_profile`.
+Pass it the exact V2 request, Recorder/store root, trusted typed
+`ProviderAttemptHostInputs`, mode, and (for execute) readiness digest. It
+installs the closed Roundwright runtime in the same process and directly calls
+the reviewed `roundwright_harness.executor.run_profile_executor`; the generic
+Harness CLI/factory alone cannot initialize that product host. Validate and
+execute consume the same request, descriptor, store, plan, opaque context, and
+readiness digest. Prepare, validation, dispatch, typed projection/comparison,
+sealing, and verification must consume that one binding. Never rebuild a
+second runner, command, factory, or plan between stages. The older discrete
+capture commands remain historical compatibility surfaces and are not the
+entrypoint for a newly declared executor profile.
 Any candidate, case, time, component, observation, or digest movement invalidates
 the plan before provider dispatch and requires a fresh bounded capture.
 Project that exact plan digest in curated public-safe readiness, result, and

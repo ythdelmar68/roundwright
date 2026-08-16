@@ -17,14 +17,16 @@ from typing import Callable, Mapping
 from .codex_supervisor import (
     CodexSupervisorError, CodexSupervisorRequest, NativeCodexSupervisorBackend, canonical_supervisor_review_material,
     NativeSupervisorResponse, NativeSupervisorSession, NativeSupervisorTurn,
-    SupervisorDiagnostic, SupervisorResultKind,
+    SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
-from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _value
+from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
-def _schema() -> dict[str, object]:
+def _schema(contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT) -> dict[str, object]:
+    if contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+        return {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "blocked"]}, "action": {"type": "string", "enum": ["accept-formal-review", "retain-terminal-product-block"]}, "blocker": {"type": ["string", "null"], "enum": ["provider-accounting-incomplete", None]}}, "required": ["status", "action", "blocker"], "additionalProperties": False}
     return {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "findings"]}, "findings": {"type": "array", "items": {"type": "string"}, "maxItems": 32}, "binding": {"type": "object", "properties": {"input_digest": {"type": "string"}, "candidate_sha": {"type": "string"}, "within_round_attempt": {"type": "integer"}, "profile_identity": {"type": "string"}}, "required": ["input_digest", "candidate_sha", "within_round_attempt", "profile_identity"], "additionalProperties": False}}, "required": ["verdict", "findings", "binding"], "additionalProperties": False}
 
 
@@ -34,33 +36,59 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
     def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise CodexSupervisorError("native Supervisor working directory is invalid")
-        if codex_factory is None:
-            try:
-                sdk = importlib.import_module("openai_codex")
-                generated = importlib.import_module("openai_codex.generated.v2_all")
-                codex_factory, approval_mode, sandbox, effort_factory = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
-            except Exception as error:
-                raise CodexSupervisorError("reviewed native Supervisor SDK is unavailable") from error
-        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock):
+        if (
+            type(completion) is not CompletionDeadline
+            or not callable(clock)
+            or (
+                codex_factory is not None
+                and (not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory))
+            )
+            or (
+                codex_factory is None
+                and any(item is not None for item in (approval_mode, sandbox, effort_factory))
+            )
+        ):
             raise CodexSupervisorError("reviewed native Supervisor SDK binding is invalid")
         self._cwd, self._completion, self._factory, self._approval, self._sandbox, self._effort, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
 
     def open_fresh_session(self, profile: ProviderProfile) -> NativeSupervisorSession:
         if type(profile) is not ProviderProfile:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-        codex = self._factory()
         try:
+            factory, approval, sandbox, effort = self._native_binding()
+            codex = factory()
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
             thread = client.thread_start()
             if not isinstance(getattr(thread, "id", None), str):
                 raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
-            return _Session(thread, codex, self._cwd, profile, self._approval, self._sandbox, self._effort, self._completion, self._clock)
+            return _Session(thread, codex, self._cwd, profile, approval, sandbox, effort, self._completion, self._clock)
         except CodexAdapterError:
-            _close(codex)
+            _close(locals().get("codex"))
             raise
-        except Exception as error:
-            _close(codex)
-            raise CodexAdapterError(CodexFailure.UNKNOWN) from error
+        except Exception:
+            _close(locals().get("codex"))
+            raise CodexAdapterError(CodexFailure.UNKNOWN) from None
+
+    def _native_binding(self) -> tuple[Callable[[], object], object, object, Callable[[str], object]]:
+        """Resolve the SDK only while its failures are classified at dispatch."""
+
+        if self._factory is not None:
+            return self._factory, self._approval, self._sandbox, self._effort  # type: ignore[return-value]
+        try:
+            sdk = importlib.import_module("openai_codex")
+            generated = importlib.import_module("openai_codex.generated.v2_all")
+            factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
+        except Exception:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from None
+        if not callable(factory) or approval is None or sandbox is None or not callable(effort):
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+        return factory, approval, sandbox, effort
+
+    @property
+    def completion(self) -> CompletionDeadline:
+        """Typed deadline supplied by the product host; never provider data."""
+
+        return self._completion
 
 
 class _Session(NativeSupervisorSession):
@@ -81,18 +109,21 @@ class _Session(NativeSupervisorSession):
         if self._started or type(request) is not CodexSupervisorRequest:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
-        payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly.", "review_material": canonical_supervisor_review_material(request), "tools": []}
+        instruction = "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly."
+        if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+            instruction = "Decide only prospective pre-dispatch accounting-transition eligibility from the sealed material. The current PREPARED attempt has a consumed one-shot dispatch claim and no session, turn, completion, invalidation, recovery, or acceptance by design; complete means this exact response may create one completion and one accepted formal review after binding validation, not that either already exists. Return blocked only for missing, contradictory, drifted, or insufficient immutable eligibility facts. Do not inspect repositories or assess broad candidate correctness. Return only the strict accounting schema."
+        payload = {"schema": "roundwright-supervisor-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": instruction, "review_material": canonical_supervisor_review_material(request), "tools": []}
         try:
-            handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort(self._profile.reasoning_effort.value), output_schema=_schema(), sandbox=self._sandbox)
-            return _Turn(handle, self, self._completion, self._clock)
+            handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort(self._profile.reasoning_effort.value), output_schema=_schema(request.response_contract), sandbox=self._sandbox)
+            return _Turn(handle, self, self._completion, self._clock, request.response_contract)
         except Exception as error:
             self.close()
             raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 class _Turn(NativeSupervisorTurn):
-    def __init__(self, handle: object, session: _Session, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._handle, self._session, self._completion, self._clock, self._read, self._aborted = handle, session, completion, clock, False, False
+    def __init__(self, handle: object, session: _Session, completion: CompletionDeadline, clock: Callable[[], float], contract: SupervisorResponseContract) -> None:
+        self._handle, self._session, self._completion, self._clock, self._contract, self._read, self._aborted = handle, session, completion, clock, contract, False, False
 
     def identity(self) -> str:
         value = getattr(self._handle, "id", None)
@@ -111,12 +142,12 @@ class _Turn(NativeSupervisorTurn):
         if self._read: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._read = True
         try:
-            return _consume(self._handle, self._completion, self._clock, self.abort)
+            return _consume(self._handle, self._completion, self._clock, self.abort, self._contract)
         finally:
             self._session.close()
 
 
-def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None]) -> NativeSupervisorResponse:
+def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None], contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT) -> NativeSupervisorResponse:
     try:
         response: str | None = None
         completed = False
@@ -129,7 +160,15 @@ def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[],
                     turn = _field(payload, "turn")
                     if turn is None or _field(turn, "id") != _field(handle, "id"):
                         return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.CONTEXT)
-                    if _value(_field(turn, "status")) != "completed":
+                    status = _value(_field(turn, "status"))
+                    if status == "failed":
+                        failure, category = _turn_failure(_field(turn, "error"))
+                        return NativeSupervisorResponse(
+                            SupervisorResultKind.BLOCKED, failure=failure,
+                            outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                            sdk_error_category=SupervisorSdkTurnErrorCategory(category.value),
+                        )
+                    if status != "completed":
                         return NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)
                     completed = True
                     continue
@@ -150,6 +189,13 @@ def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[],
         if response is None: return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.NON_FINAL if non_final else SupervisorDiagnostic.SHAPE)
         try: parsed = json.loads(response)
         except (TypeError, ValueError): return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)
+        if contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
+            if type(parsed) is not dict or set(parsed) != {"status", "action", "blocker"} or parsed not in (
+                {"status": "complete", "action": "accept-formal-review", "blocker": None},
+                {"status": "blocked", "action": "retain-terminal-product-block", "blocker": "provider-accounting-incomplete"},
+            ):
+                return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)
+            return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, parsed)
         binding = parsed.get("binding") if type(parsed) is dict else None
         if type(parsed) is not dict or set(parsed) != {"verdict", "findings", "binding"} or parsed.get("verdict") not in {"pass", "findings"} or type(parsed.get("findings")) is not list or type(binding) is not dict or set(binding) != {"input_digest", "candidate_sha", "within_round_attempt", "profile_identity"} or type(binding["input_digest"]) is not str or type(binding["candidate_sha"]) is not str or type(binding["within_round_attempt"]) is not int or type(binding["profile_identity"]) is not str:
             return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)

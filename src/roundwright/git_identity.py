@@ -375,6 +375,49 @@ def candidate_evidence(repository: RepositoryIdentity, binding: WorktreeBinding,
         connection.close()
 
 
+def preflight_candidate_evidence(
+    repository: RepositoryIdentity, binding: WorktreeBinding, seal: CandidateSeal, *, lease: TransitionLease | None = None,
+) -> tuple[str, ...]:
+    """Read-only live candidate/seal eligibility for provider-free readiness.
+
+    Unlike :func:`candidate_evidence`, this deliberately never invalidates a
+    seal or deletes evidence when Git state has drifted.  It is safe to call
+    before an external plan is armed and performs only fail-closed read-back.
+    """
+
+    _verify_lease(repository, lease, binding.repository_id)
+    root = repository.root.resolve(strict=True)
+    worktree = _validated_worktree_path(root, binding.worktree)
+    _require_task_binding(repository, binding, worktree)
+    if not isinstance(lease, TransitionLease) or binding.state_identity != lease.state_identity:
+        raise GitIdentityError("candidate state identity has drifted")
+    control = binding.git_entrypoint_control
+    if type(control) is not GitEntrypointControl:
+        raise GitIdentityError("candidate worktree Git entrypoint control is unavailable")
+    verified = revalidate_worktree(repository, binding, control=control)
+    if verified.task_id != seal.task_id or verified.base_sha != seal.base_sha or verified.state_identity != seal.state_identity:
+        raise GitIdentityError("candidate seal identity has drifted")
+    if _git(verified.worktree, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise GitIdentityError("candidate worktree is dirty")
+    if _git_commit(verified.worktree, "rev-parse", "--verify", "HEAD^{commit}") != seal.candidate_sha:
+        raise GitIdentityError("candidate head moved and candidate sealing is required")
+    connection = _open_writable_connection(repository)
+    try:
+        row = connection.execute(
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (seal.task_id,)
+        ).fetchone()
+        if row != (seal.base_sha, seal.candidate_sha, seal.state_identity):
+            raise GitIdentityError("candidate seal is no longer current")
+        return tuple(
+            entry[0] for entry in connection.execute(
+                "SELECT evidence_fingerprint FROM candidate_evidence WHERE task_id = ? AND candidate_sha = ? ORDER BY evidence_fingerprint",
+                (seal.task_id, seal.candidate_sha),
+            )
+        )
+    finally:
+        connection.close()
+
+
 def _state_identity(connection: sqlite3.Connection) -> str:
     row = connection.execute("SELECT value FROM state_metadata WHERE key = 'state_id'").fetchone()
     if row is None or not isinstance(row[0], str):

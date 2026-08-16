@@ -65,10 +65,10 @@ class ExternalValidationContractTests(unittest.TestCase):
             "`harness+forward-test`/`toolbox+disposable-target`",
             "96772438b251e56d483733179939245565b1374a",
             "cdfaec6fbcb521edb96a65a88ed4eed62a84f07a",
-            "369d964c44a7ef4653e13255d7c3e6a9ae87eeeb",
-            "0235427e02ea5b512a5fd5d81300f8b49ed4643c",
+            "0154817a6fba345b78af25017eb312a1b2349cd6",
+            "0f980f75a05ec616395b2cbfed9724417d00d335",
             "cf669e186a739a8597cfaf9f050ce3bdcadda334",
-            "2756131387ab70c9511e8156fd4c595cc3996fd3",
+            "d9fba0facfe561850c0dbff913e8021541b98ca5",
             "4f39ef0e4e616eb896950d3756c433b624771a97",
             "allow_external_validation_read_only: true",
             "allow_external_validation_disposable_target_mutation: true",
@@ -76,7 +76,7 @@ class ExternalValidationContractTests(unittest.TestCase):
             "Phase 4-or-later",
             "ready_at",
             "Never pass the replay execution time",
-            "roundwright-harness-profile-executor-request/v1",
+            "roundwright-harness-profile-executor-request/v2",
             "roundwright-harness-capture-plan/v1",
             "run-profile --mode validate",
             "--mode execute",
@@ -112,10 +112,10 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("top-level integer `ready_at`", contract)
         self.assertIn("Harness PR #4", contract)
         self.assertIn("Harness PR #6", contract)
-        self.assertIn("Harness PR #8", contract)
+        self.assertIn("Harness PR #10", contract)
         self.assertIn("Roundlet PR #80", contract)
         self.assertIn("96772438b251e56d483733179939245565b1374a", contract)
-        self.assertIn("369d964c44a7ef4653e13255d7c3e6a9ae87eeeb", contract)
+        self.assertIn("0154817a6fba345b78af25017eb312a1b2349cd6", contract)
         self.assertIn("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", contract)
         self.assertIn("cf669e186a739a8597cfaf9f050ce3bdcadda334", contract)
         self.assertIn("632dcc3ecb3b8664de860844af2215ad5ade83e1", contract)

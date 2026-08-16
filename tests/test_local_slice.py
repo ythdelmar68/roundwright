@@ -296,7 +296,8 @@ try:
     attempts = connection.execute('SELECT provider_role, session_identity, state, accepted_review_identity FROM provider_attempts WHERE task_id = ? ORDER BY provider_role, attempt_id', ('local-task',)).fetchall()
     accepted = connection.execute('SELECT accepted_review_identity FROM accepted_provider_reviews WHERE task_id = ? ORDER BY accepted_review_identity', ('local-task',)).fetchall()
     plan_review = connection.execute('SELECT supervisor_session_identity, state FROM plan_review_attempts WHERE review_attempt_id = ?', ('local-plan-review',)).fetchone()
-    diff_review = connection.execute('SELECT supervisor_session_identity, state, base_sha, candidate_sha, accepted_review_identity FROM diff_review_attempts WHERE diff_review_attempt_id = ?', ('local-diff-review',)).fetchone()
+    diff_review = connection.execute('SELECT supervisor_session_identity, state, base_sha, candidate_sha, accepted_review_identity, review_epoch FROM diff_review_attempts WHERE diff_review_attempt_id = ?', ('local-diff-review',)).fetchone()
+    diff_acceptance_epoch = connection.execute('SELECT review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?', ('local-diff-review',)).fetchone()
     gate_context = connection.execute('SELECT source_count, isolated_local_task FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?', ('local-task', first.candidate.candidate_sha)).fetchone()
     gate_rows = connection.execute('SELECT gate_key, outcome, changed_boundary, reason, follow_ups FROM gate_evidence WHERE task_id = ? AND candidate_sha = ? ORDER BY gate_key', ('local-task', first.candidate.candidate_sha)).fetchall()
     verifications = connection.execute('SELECT verification_kind, outcome FROM candidate_verifications WHERE task_id = ? AND candidate_sha = ? ORDER BY verification_kind', ('local-task', first.candidate.candidate_sha)).fetchall()
@@ -362,6 +363,7 @@ print(json.dumps({
     'accepted': accepted,
     'plan_review': plan_review,
     'diff_review': diff_review,
+    'diff_acceptance_epoch': diff_acceptance_epoch,
     'gate_context': gate_context,
     'gates': gate_rows,
     'verifications': verifications,
@@ -413,7 +415,8 @@ print(json.dumps({
             ])
             self.assertEqual(result["accepted"], [["local-diff-review"], ["local-plan-review"]])
             self.assertEqual(result["plan_review"], ["local-plan-supervisor-session", "recorded"])
-            self.assertEqual(result["diff_review"], ["local-diff-supervisor-session", "accepted", result["base"], result["candidate"], "local-diff-review"])
+            self.assertEqual(result["diff_review"], ["local-diff-supervisor-session", "accepted", result["base"], result["candidate"], "local-diff-review", 1])
+            self.assertEqual(result["diff_acceptance_epoch"], [1])
             self.assertEqual(result["gate_context"], [1, 1])
             self.assertEqual(result["verifications"], [["build", "pass"], ["test", "pass"]])
             self.assertTrue(result["source_matches"])

@@ -18,15 +18,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.codex_supervisor import (
-    CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorRequest,
-    NativeSupervisorResponse, SupervisorDiagnostic, SupervisorResultKind,
+    CodexSupervisorAdapter, CodexSupervisorContext, CodexSupervisorError, CodexSupervisorRequest,
+    NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, SupervisorAccountingDecisionSemantic,
+    SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
     dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
+from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
-from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
-from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend
+from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend, _consume
 from roundwright.worker_toolbox import CompletionDeadline
 from roundwright.shadow import RecorderBinding
 from roundwright.supervisor_shadow import (
@@ -39,6 +42,7 @@ from roundwright.supervisor_shadow import (
     SupervisorShadowError, TrustedReviewPolicyReceipt,
     qualify_supervisor_attempt, qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_lifecycle_identity, supervisor_sequence_observation_identity,
+    _sequence_attempt,
 )
 
 
@@ -52,6 +56,10 @@ class Turn:
     def abort(self): self._events.append(("abort", self._identity))
     def read_response(self):
         self._events.append(("read", self._identity))
+        if self._request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and self._response.kind is SupervisorResultKind.ACCEPTED:
+            # Runtime tests inject only the native backend seam.  Mirror the
+            # selected product schema rather than caller-prescribing a result.
+            return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"status": "complete", "action": "accept-formal-review", "blocker": None})
         if self._response.kind is SupervisorResultKind.ACCEPTED and "binding" not in self._response.structured_output:
             request = self._request
             value = dict(self._response.structured_output)
@@ -113,10 +121,28 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((result.attempted_profile_identities, result.result.verdict, result.result.findings), ((primary.profile_identity, fallback.profile_identity), "findings", ("missing-evidence",)))
         self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start", "start"])
 
-    def test_exhaustion_is_availability_only_and_never_fabricates_a_verdict(self):
-        adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)) for index, profile in enumerate(self.profiles, start=1))
+    def test_exact_terminal_failure_advances_to_the_next_prebound_profile(self):
+        primary = self.adapter(self.profiles[0], "failed-primary", NativeSupervisorResponse(
+            SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+            outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+            sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+        ))
+        fallback = self.adapter(self.profiles[1], "failed-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+        result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.ACCEPTED, (primary.profile_identity, fallback.profile_identity), 1, 1))
+
+    def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
+        adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index, profile in enumerate(self.profiles, start=1))
         result = dispatch_ordered_supervisor_attempts(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result, result.exhausted, len(result.attempted_profile_identities)), (None, True, 3))
+
+    def test_ambiguous_and_incomplete_results_stop_before_fallback(self):
+        for kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE):
+            with self.subTest(kind=kind.value):
+                primary = self.adapter(self.profiles[0], f"{kind.value}-primary", NativeSupervisorResponse(kind))
+                fallback = self.adapter(self.profiles[1], f"{kind.value}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+                result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((result.result.kind, result.exhausted, result.attempted_profile_identities, fallback._backend.calls), (kind, False, (primary.profile_identity,), 0))
 
     def test_concrete_sdk_bridge_uses_fresh_deny_all_read_only_turn(self):
         events = []
@@ -149,7 +175,128 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
         self.assertIn("closed", events)
 
-    def test_native_stream_rejections_advance_only_the_attempt_position(self):
+    def test_concrete_native_accounting_prompt_is_prospective_and_bound(self):
+        captured = []
+        profile = self.profiles[0]
+        audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
+        snapshot = SupervisorAccountingSnapshot(
+            "repo-44", "task-44", digest("source"), "a" * 40, "b" * 40, "case-44", 101,
+            "state-44", ("a" * 64,), (("test", "pass"),), digest("configuration"), "b" * 64,
+            1, 4, 2, 2, 4, "CONVERGING", 0, 0, SupervisorDispatchClaimState.CLAIMED,
+            SupervisorAccountingAttemptSnapshot("provider-accounting", 1, audit.profile_identity, AttemptState.PREPARED, False, False, False, False, None, None, False), (),
+        )
+        values = dict(review_attempt_id="review-accounting", provider_attempt_id="provider-accounting", selected_profile_identity=audit.profile_identity, within_round_attempt=1, context=self.context, objective=ACCOUNTING_TRANSITION_OBJECTIVE, acceptance_criteria=ACCOUNTING_TRANSITION_CRITERIA, response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material=snapshot, decision_semantic=SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2)
+        request = CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
+        class Handle:
+            id = "turn-accounting"
+            def stream(self): return iter(({"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": json.dumps({"status": "complete", "action": "accept-formal-review", "blocker": None})}}}, {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}}))
+        class Thread:
+            id = "session-accounting"
+            def turn(self, prompt, **_kwargs): captured.append(json.loads(prompt)); return Handle()
+        class Codex:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def thread_start(self): return Thread()
+        adapter = CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+        self.assertEqual(adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None).kind, SupervisorResultKind.ACCEPTED)
+        prompt = captured[0]
+        self.assertIn("prospective pre-dispatch", prompt["instruction"])
+        self.assertIn("not that either already exists", prompt["instruction"])
+        self.assertEqual(prompt["review_material"]["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
+        self.assertNotIn("PASS", json.dumps(prompt, sort_keys=True))
+        self.assertNotIn("FINDINGS", json.dumps(prompt, sort_keys=True))
+        unclaimed = replace(snapshot, dispatch_claim=SupervisorDispatchClaimState.UNCLAIMED)
+        values["decision_material"] = unclaimed
+        with self.assertRaises(CodexSupervisorError):
+            CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
+
+    def test_native_factory_failure_is_classified_before_any_session_identity(self):
+        profile = self.profiles[0]
+        backend = HarnessNativeCodexSupervisorBackend(
+            cwd=ROOT, completion=CompletionDeadline(100, 600),
+            codex_factory=lambda: (_ for _ in ()).throw(RuntimeError("private factory detail")),
+            approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+        )
+        with self.assertRaises(CodexAdapterError) as raised:
+            backend.open_fresh_session(profile)
+        self.assertIs(raised.exception.failure, CodexFailure.UNKNOWN)
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_exact_failed_turn_projects_only_safe_terminal_failure_metadata(self):
+        class Handle:
+            id = "turn-terminal-failure"
+            def stream(self):
+                return iter(({
+                    "method": "turn/completed",
+                    "payload": {"turn": {
+                        "id": self.id, "status": "failed",
+                        "error": {"codexErrorInfo": "serverOverloaded", "message": "private failure"},
+                    }},
+                },))
+        response = _consume(Handle(), CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
+        self.assertEqual(
+            (response.kind, response.failure, response.outcome_source, response.sdk_error_category),
+            (SupervisorResultKind.BLOCKED, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+             SupervisorOutcomeSource.SDK_TURN_FAILED, SupervisorSdkTurnErrorCategory.OVERLOAD),
+        )
+
+    def test_failed_turn_category_projection_matches_the_closed_worker_categories(self):
+        cases = (
+            ("badRequest", CodexFailure.UNKNOWN, SupervisorSdkTurnErrorCategory.BAD_REQUEST),
+            ("unauthorized", CodexFailure.UNKNOWN, SupervisorSdkTurnErrorCategory.UNAUTHORIZED),
+            ("sandboxError", CodexFailure.SANDBOX_OR_APPROVAL_DENIED, SupervisorSdkTurnErrorCategory.SANDBOX),
+            ("serverOverloaded", CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.OVERLOAD),
+            ({"httpConnectionFailed": {}}, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.HTTP),
+            ({"responseStreamConnectionFailed": {}}, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.CONNECTION),
+            ({"responseStreamDisconnected": {}}, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorSdkTurnErrorCategory.STREAM),
+            ({}, CodexFailure.UNKNOWN, SupervisorSdkTurnErrorCategory.MISSING_OR_UNKNOWN),
+        )
+        for detail, failure, category in cases:
+            with self.subTest(category=category.value):
+                class Handle:
+                    id = "turn-safe-category"
+                    def stream(self):
+                        return iter(({"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "failed", "error": {"codexErrorInfo": detail, "message": "C:/private/provider-detail"}}}},))
+                response = _consume(Handle(), CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
+                self.assertEqual((response.kind, response.failure, response.outcome_source, response.sdk_error_category), (SupervisorResultKind.BLOCKED, failure, SupervisorOutcomeSource.SDK_TURN_FAILED, category))
+                self.assertNotIn("private", repr(response))
+
+    def test_terminal_failure_category_is_bound_into_the_public_result_identity(self):
+        identities = []
+        for category in (SupervisorSdkTurnErrorCategory.OVERLOAD, SupervisorSdkTurnErrorCategory.CONNECTION):
+            adapter = self.adapter(self.profiles[0], category.value, NativeSupervisorResponse(
+                SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category,
+            ))
+            request = self.request(1, adapter)
+            result = adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            identities.append(_sequence_attempt(1, request, result).result_identity)
+        self.assertNotEqual(*identities)
+
+    def test_eof_timeout_and_stream_failures_stop_before_fallback(self):
+        class EofHandle:
+            id = "turn-eof"
+            def stream(self): return iter(())
+        class TimeoutHandle:
+            id = "turn-timeout"
+            def stream(self): raise TimeoutError("C:/private/timeout")
+        class StreamHandle:
+            id = "turn-stream"
+            def stream(self):
+                def broken():
+                    raise RuntimeError("C:/private/stream")
+                    yield None
+                return broken()
+        for handle in (EofHandle(), TimeoutHandle(), StreamHandle()):
+            with self.subTest(handle=type(handle).__name__):
+                native = _consume(handle, CompletionDeadline(100, 600), __import__("time").monotonic, lambda: None)
+                self.assertIs(native.kind, SupervisorResultKind.AMBIGUOUS)
+                primary = self.adapter(self.profiles[0], type(handle).__name__, native)
+                fallback = self.adapter(self.profiles[1], f"{type(handle).__name__}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+                result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.AMBIGUOUS, (primary.profile_identity,), 0))
+
+    def test_native_stream_rejections_only_advance_typed_invalid_output(self):
         """Native stream/parser failures are typed, bounded, and never sealed."""
         def native_adapter(events, *, completed="completed", binding=None, text=None):
             class Handle:
@@ -178,13 +325,16 @@ class SupervisorTests(unittest.TestCase):
             return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
 
         cases = (
-            ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None),
+            ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None, 0),
+            ("interrupted", {"completed": "interrupted"}, SupervisorResultKind.AMBIGUOUS, None, 0),
+            ("unknown", {"completed": "unknown"}, SupervisorResultKind.AMBIGUOUS, None, 0),
             ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT),
             ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE),
             ("malformed-output", {"text": "not-json"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SYNTAX),
             ("missing-result", {}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SHAPE),
         )
-        for name, values, kind, diagnostic in cases:
+        cases = tuple(item if len(item) == 5 else (*item, 1) for item in cases)
+        for name, values, kind, diagnostic, fallback_calls in cases:
             with self.subTest(name=name):
                 events = []
                 primary = native_adapter(events, **values)
@@ -193,7 +343,9 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual((rejected.kind, rejected.diagnostic), (kind, diagnostic))
                 fallback = self.adapter(self.profiles[1], "native-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
                 ordered = dispatch_ordered_supervisor_attempts((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-                self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, first.context.review_epoch, first.context.review_round, first.context.review_mode), ((primary.profile_identity, fallback.profile_identity), SupervisorResultKind.ACCEPTED, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
+                expected_profiles = (primary.profile_identity, fallback.profile_identity) if fallback_calls else (primary.profile_identity,)
+                expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else SupervisorResultKind.AMBIGUOUS
+                self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, fallback._backend.calls, first.context.review_epoch, first.context.review_round, first.context.review_mode), (expected_profiles, expected_kind, fallback_calls, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
 
     def test_armed_capture_uses_one_plan_for_prepare_seal_and_readback(self):
         adapter = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
@@ -236,12 +388,25 @@ class SupervisorTests(unittest.TestCase):
     def runtime_store(self):
         return InMemorySupervisorRuntimeStore(self.configuration.runtime_store_authority_identity)
 
-    def test_sequence_advances_ambiguous_primary_to_valid_fallback(self):
+    def test_sequence_ambiguous_primary_is_terminal_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-        self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.comparison.disposition, recorder.calls), (SupervisorSequenceTerminal.ACCEPTED, ("ambiguous", "accepted"), 2, "match", ["prepare", "seal", "verify"]))
+        self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.envelope.blocker, result.comparison.disposition, recorder.calls, adapters[1]._backend.calls), (SupervisorSequenceTerminal.AMBIGUOUS, ("ambiguous",), None, "provider-outcome-ambiguous", "match", ["prepare"], 0))
         payload = result.envelope.payload()
         self.assertEqual((type(payload["attempts"]), type(payload["request_identities"]), type(payload["profile_identities"]), type(payload["runtime_fingerprints"])), (list, list, list, list))
+
+    def test_sequence_terminal_outcome_on_final_configured_profile_round_trips_unsealed(self):
+        for kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE):
+            with self.subTest(kind=kind.value):
+                responses = (
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+                    NativeSupervisorResponse(SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD),
+                    NativeSupervisorResponse(kind),
+                )
+                adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)
+                result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                durable = lifecycle.read(next(iter(lifecycle._records)), evidence_time=101)
+                self.assertEqual((result.envelope.terminal, len(result.envelope.attempts), result.envelope.blocker, result.receipt, recorder.calls, durable.terminal.terminal, durable.terminal.blocker), (SupervisorSequenceTerminal(kind.value), 3, f"provider-outcome-{kind.value}", None, ["prepare"], kind.value, f"provider-outcome-{kind.value}"))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
@@ -249,7 +414,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
-        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS) for _profile in self.profiles))
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX) for _profile in self.profiles))
         result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
 
@@ -383,6 +548,88 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNot(value.expected_plan, plan)
         self.assertIsNot(value.events[0], event)
         self.assertIsNot(value.terminal, terminal)
+
+    def test_legacy_v1_accepted_and_exhausted_records_retain_original_identities(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        for terminal_kind in ("accepted", "exhausted"):
+            with self.subTest(terminal=terminal_kind):
+                lifecycle = InMemorySupervisorLifecycle(digest("legacy-" + terminal_kind))
+                plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("legacy-runtime-" + terminal_kind), 10, readiness.observation_identity, "roundwright-supervisor-expected-lifecycle/v1")
+                self.assertEqual(plan.payload()["schema"], "roundwright-supervisor-expected-lifecycle/v1")
+                self.assertEqual(plan.payload()["allowed_terminal"], ("accepted", "exhausted"))
+                prepared = lifecycle.prepare(plan, freshness_until=20)
+                prior = prepared
+                count = 1 if terminal_kind == "accepted" else len(binding.profile_identities)
+                for ordinal in range(1, count + 1):
+                    accepted = terminal_kind == "accepted"
+                    event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, ordinal, prior.receipt_digest, binding.request_identities[ordinal - 1], binding.profile_identities[ordinal - 1], binding.runtime_fingerprints[ordinal - 1], SupervisorResultKind.ACCEPTED.value if accepted else SupervisorResultKind.INVALID.value, digest(f"legacy-{terminal_kind}-{ordinal}"), digest(f"legacy-{terminal_kind}-{ordinal}") if accepted else None, "pass" if accepted else None, 10, 20)
+                    prior = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+                terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, prior.receipt_digest, count, terminal_kind, digest("legacy-accepted-1") if terminal_kind == "accepted" else None, None if terminal_kind == "accepted" else "attempt-budget-exhausted", "apply-bound-review-result" if terminal_kind == "accepted" else "retain-terminal-product-block", 10)
+                if terminal_kind == "accepted":
+                    terminal = replace(terminal, accepted_result_identity=digest("legacy-accepted-1"))
+                terminal_receipt = lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+                read = lifecycle.read(prepared.record_identity, evidence_time=10)
+                self.assertEqual((read.expected_plan.payload(), read.expected_plan.source_identity, read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan.payload(), plan.source_identity, plan.plan_identity, prepared, terminal_receipt))
+
+    def test_legacy_v1_plan_identity_matches_literal_pre_blocked_compatibility_vector(self):
+        binding = SupervisorSequenceBinding(
+            "legacy-case", "b" * 40, "a" * 40, "task-legacy",
+            ("sha256:e8a251387e54f7f70d4c4294378b3bcacda3ff10b8d872a9b050d32b0ce142ff", "sha256:c3833b1998943ac5635c4d37800813a7ba8c971442481cde2fb531e025c77256"),
+            ("sha256:c6655fb15fcbdcbb36513c28889afadaa3f55d2efea183e244a770e0bab3b63c", "sha256:2852219181564429832c3e28502adbc22475c266bdb6f2ca238914fac6f7cc47"),
+            ("sha256:1bd3233d6da7420c090d11fd663357b5b16106540debc5c88c7f53d74fa8d696", "sha256:a826abecdadb70c429e71a3c3032d9282838eb22bdfd9ef1230069ec915e5bc6"),
+            2, 4, "CONVERGING", "sha256:f19f1897f8abd7f59b420a51a42aff1b67cc632a9a7f2ac3152d29792f789e47",
+        )
+        plan = SupervisorExpectedLifecycle(binding, "sha256:17ad92e63c962393c0329c658937d16eccaea13036412a3d1d0a5b6b8f29d738", "sha256:0e57ae90f420d845c9bc973dea8fcbab9baa3809be286830eaca40dc94266a2c", "sha256:2d52cd9073053426a522ce4fb85745902ca2f9482e61774b7c1fa6c44a68931d", 17, "sha256:6bdb95cbfd647dc56d6b1d241787c6a3aafffe36896105fbb416fa8c1e6711ff", "roundwright-supervisor-expected-lifecycle/v1")
+        expected_payload = {"schema": "roundwright-supervisor-expected-lifecycle/v1", "binding": {"case_id": "legacy-case", "candidate_sha": "b" * 40, "base_sha": "a" * 40, "task_id": "task-legacy", "request_identities": ["sha256:e8a251387e54f7f70d4c4294378b3bcacda3ff10b8d872a9b050d32b0ce142ff", "sha256:c3833b1998943ac5635c4d37800813a7ba8c971442481cde2fb531e025c77256"], "profile_identities": ["sha256:c6655fb15fcbdcbb36513c28889afadaa3f55d2efea183e244a770e0bab3b63c", "sha256:2852219181564429832c3e28502adbc22475c266bdb6f2ca238914fac6f7cc47"], "runtime_fingerprints": ["sha256:1bd3233d6da7420c090d11fd663357b5b16106540debc5c88c7f53d74fa8d696", "sha256:a826abecdadb70c429e71a3c3032d9282838eb22bdfd9ef1230069ec915e5bc6"], "review_epoch": 2, "review_round": 4, "review_mode": "CONVERGING", "capture_plan_digest": "sha256:f19f1897f8abd7f59b420a51a42aff1b67cc632a9a7f2ac3152d29792f789e47"}, "policy_digest": "sha256:17ad92e63c962393c0329c658937d16eccaea13036412a3d1d0a5b6b8f29d738", "configuration_digest": "sha256:0e57ae90f420d845c9bc973dea8fcbab9baa3809be286830eaca40dc94266a2c", "runtime_identity": "sha256:2d52cd9073053426a522ce4fb85745902ca2f9482e61774b7c1fa6c44a68931d", "ready_at": 17, "observation_identity": "sha256:6bdb95cbfd647dc56d6b1d241787c6a3aafffe36896105fbb416fa8c1e6711ff", "allowed_terminal": ["accepted", "exhausted"], "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "exhausted_next_action": "retain-terminal-product-block"}
+        self.assertEqual(json.loads(json.dumps(plan.payload())), expected_payload)
+        self.assertEqual((plan.context_identity, plan.plan_identity, plan.source_identity), ("sha256:155b232c92cb3aee7b57551fe59444545ef78efb95cc8c2044392cec958e0f9d", "sha256:1a3715e444896e33016a2f8914b7c1a7828cb390880fb4a96ce920279bd4ac43", "sha256:a3b62fdae8fa96198f92467430c488e1ff1c55bbd2a6700de15438931e2662cf"))
+        source = "sha256:dddb9d06056750e136eff66f10f8a25484b2db32811d8c72935a6a9d391839e1"
+        memory = InMemorySupervisorLifecycle(source)
+        memory_receipt = memory.prepare(plan, freshness_until=29)
+        self.assertEqual((memory_receipt.record_identity, memory_receipt.receipt_digest), ("sha256:1879df50838884831786253f593d6c49d771b982b8ec3d3ec9d45207d6773c62", "sha256:d8d3497add0f87cb93231aceca3e05163d9610b90690d8adb24cd4989cb2737d"))
+        self.assertEqual(memory.read_plan(memory_receipt.record_identity, evidence_time=17), (plan, memory_receipt))
+        with TemporaryDirectory() as temporary:
+            file = FileSupervisorLifecycle(Path(temporary) / "legacy", source)
+            file_receipt = file.prepare(plan, freshness_until=29)
+            self.assertEqual(file_receipt, memory_receipt)
+            self.assertEqual(FileSupervisorLifecycle(Path(temporary) / "legacy", source).read_plan(file_receipt.record_identity, evidence_time=17), (plan, file_receipt))
+
+    def test_v1_rejects_new_terminal_kinds_while_v2_allows_them(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        for schema, allowed in (("roundwright-supervisor-expected-lifecycle/v1", False), ("roundwright-supervisor-expected-lifecycle/v2", True)):
+            with self.subTest(schema=schema):
+                lifecycle = InMemorySupervisorLifecycle(digest("schema-" + schema[-2:]))
+                plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("schema-runtime-" + schema[-2:]), 10, readiness.observation_identity, schema)
+                prepared = lifecycle.prepare(plan, freshness_until=20)
+                event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, 1, prepared.receipt_digest, binding.request_identities[0], binding.profile_identities[0], binding.runtime_fingerprints[0], SupervisorResultKind.AMBIGUOUS.value, digest("schema-ambiguous"), None, None, 10, 20)
+                receipt = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+                terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, receipt.receipt_digest, 1, "ambiguous", None, "provider-outcome-ambiguous", "retain-terminal-product-block", 10)
+                if allowed:
+                    lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+                    self.assertEqual(lifecycle.read(prepared.record_identity, evidence_time=10).terminal, terminal)
+                else:
+                    with self.assertRaises(SupervisorShadowError):
+                        lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+
+    def test_file_lifecycle_reads_canonical_legacy_v1_terminal_records_unchanged(self):
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        with TemporaryDirectory() as temporary:
+            for terminal_kind in ("accepted", "exhausted"):
+                with self.subTest(terminal=terminal_kind):
+                    plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("legacy-file-runtime-" + terminal_kind), 10, readiness.observation_identity, "roundwright-supervisor-expected-lifecycle/v1")
+                    lifecycle = FileSupervisorLifecycle(Path(temporary) / terminal_kind, digest("legacy-file-" + terminal_kind))
+                    prepared = lifecycle.prepare(plan, freshness_until=20)
+                    prior = prepared
+                    count = 1 if terminal_kind == "accepted" else len(binding.profile_identities)
+                    for ordinal in range(1, count + 1):
+                        accepted = terminal_kind == "accepted"
+                        result_identity = digest(f"legacy-file-{terminal_kind}-{ordinal}")
+                        event = SupervisorAttemptEvent(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, ordinal, prior.receipt_digest, binding.request_identities[ordinal - 1], binding.profile_identities[ordinal - 1], binding.runtime_fingerprints[ordinal - 1], SupervisorResultKind.ACCEPTED.value if accepted else SupervisorResultKind.INVALID.value, result_identity, result_identity if accepted else None, "pass" if accepted else None, 10, 20)
+                        prior = lifecycle.append(prepared.record_identity, event, evidence_time=10)
+                    terminal = SupervisorTerminalRecord(prepared.record_identity, prepared.source_identity, readiness.observation_identity, binding.candidate_sha, plan.context_identity, plan.plan_identity, binding.capture_plan_digest, prior.receipt_digest, count, terminal_kind, digest("legacy-file-accepted-1") if terminal_kind == "accepted" else None, None if terminal_kind == "accepted" else "attempt-budget-exhausted", "apply-bound-review-result" if terminal_kind == "accepted" else "retain-terminal-product-block", 10)
+                    terminal_receipt = lifecycle.finalize(prepared.record_identity, terminal, evidence_time=10)
+                    read = FileSupervisorLifecycle(Path(temporary) / terminal_kind, digest("legacy-file-" + terminal_kind)).read(prepared.record_identity, evidence_time=10)
+                    self.assertEqual((read.expected_plan.payload(), read.expected_plan.source_identity, read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan.payload(), plan.source_identity, plan.plan_identity, prepared, terminal_receipt))
 
     def test_lifecycle_store_state_guards(self):
         lifecycle = InMemorySupervisorLifecycle(digest("lifecycle-source")); adapters, requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)

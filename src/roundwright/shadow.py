@@ -872,6 +872,7 @@ def _public_identifier(value: str) -> str:
 SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
 EXECUTOR_CONTRACT_SYNTHETIC_PROFILE = "roundwright-shadow-profile/executor-contract-synthetic/v1"
+PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = "roundwright-shadow-profile/provider-attempt-accounting/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1036,11 +1037,36 @@ _EXECUTOR_CONTRACT_PROFILE = ShadowEvidenceProfile(
     ("executor-contract-result",),
 )
 
+_PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = ShadowEvidenceProfile(
+    PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    CaptureMode.LIFECYCLE_GRAPH,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-provider-attempt-exporter-comparator-recorder-store-readback-bound",
+    "before-first-selected-provider-attempt",
+    "append-only-content-addressed-readback",
+    "missing-history-requires-fresh-bounded-recapture",
+    (
+        "provider-attempt",
+        "invalid-output",
+        "provider-terminal-failure",
+        "recovery-attempt",
+        "formal-review-accepted",
+        "lifecycle-state",
+    ),
+    0,
+    64,
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
 
-    return (_PROVENANCE_PROFILE, _WORKER_ADAPTER_PROFILE, _EXECUTOR_CONTRACT_PROFILE)
+    return (
+        _PROVENANCE_PROFILE,
+        _WORKER_ADAPTER_PROFILE,
+        _EXECUTOR_CONTRACT_PROFILE,
+        _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    )
 
 
 def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
@@ -1048,6 +1074,8 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _WORKER_ADAPTER_PROFILE
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
         return _EXECUTOR_CONTRACT_PROFILE
+    if profile_id == PROVIDER_ATTEMPT_ACCOUNTING_PROFILE:
+        return _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

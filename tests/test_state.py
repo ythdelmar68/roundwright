@@ -415,6 +415,48 @@ class StateTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(initialize(repository), check_database(repository))
 
+    def test_v48_formal_review_rows_upgrade_to_explicit_legacy_epoch_zero(self) -> None:
+        """Migration 49 extends populated history without rewriting its identity."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            legacy_diff = (
+                "legacy-diff", "legacy-task", "legacy-implementation", "legacy-provider",
+                "legacy-session", "legacy-turn", "legacy-message", "a" * 40, "b" * 40,
+                "c" * 64, "accepted", 1, "d" * 64, 1, "e" * 64, 1, "COMPLETE", 3,
+                "worker-final-repair-then-merge", "f" * 64, 3, 3,
+            )
+            legacy_accepted = (
+                "legacy-diff", "legacy-task", "legacy-provider", "1" * 64, "v1", "2" * 64,
+                "worker", "profiles", "profile", 1, 3, 3, 3,
+                "worker-final-repair-then-merge", "3" * 64,
+            )
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, MIGRATIONS[:48])
+                connection.execute(
+                    "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    legacy_diff,
+                )
+                connection.execute(
+                    "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    legacy_accepted,
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute("SELECT diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, review_round, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round FROM diff_review_attempts WHERE diff_review_attempt_id='legacy-diff'").fetchone(), legacy_diff)
+                self.assertEqual(connection.execute("SELECT review_epoch FROM diff_review_attempts WHERE diff_review_attempt_id='legacy-diff'").fetchone(), (0,))
+                self.assertEqual(connection.execute("SELECT accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity='legacy-diff'").fetchone(), legacy_accepted)
+                self.assertEqual(connection.execute("SELECT review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity='legacy-diff'").fetchone(), (0,))
+            finally:
+                connection.close()
+
     def test_version_three_lease_handles_cannot_reappear_after_upgrade(self) -> None:
         for active in (False, True):
             with self.subTest(active=active), tempfile.TemporaryDirectory() as temporary:

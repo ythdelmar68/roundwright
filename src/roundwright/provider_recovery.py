@@ -18,7 +18,7 @@ from enum import StrEnum
 from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
 from .runtime_binding import RuntimeBinding
-from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, record_runtime_binding, require_runtime_binding
+from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_runtime_binding, require_runtime_binding
 
 
 class ProviderRecoveryError(StateError):
@@ -52,6 +52,85 @@ class RecoveryAction(StrEnum):
     FRESH_SUPERVISOR_SESSION = "fresh-supervisor-session"
     BLOCKED_RETRY_LIMIT = "blocked-retry-limit"
     BLOCKED_IDENTITY_DRIFT = "blocked-identity-drift"
+    # Existing durable storage already reserves this no-followup action.  The
+    # closed blocker below distinguishes a schema-valid accounting conclusion
+    # from an uncertain external turn without changing historical rows.
+    BLOCKED_PROVIDER_ACCOUNTING = "blocked-ambiguous-turn"
+
+
+class SupervisorTerminalFailureClass(StrEnum):
+    AUTH_MISSING = "auth-missing"
+    AUTH_EXPIRED = "auth-expired"
+    QUOTA_OR_RATE_LIMIT = "quota-or-rate-limit"
+    MODEL_UNAVAILABLE = "model-unavailable"
+    SDK_INCOMPATIBLE = "sdk-incompatible"
+    SANDBOX_OR_APPROVAL_DENIED = "sandbox-or-approval-denied"
+    TRANSPORT_OR_PROVIDER_OUTAGE = "transport-or-provider-outage"
+    MALFORMED_RESPONSE = "malformed-response"
+    UNKNOWN = "unknown"
+
+
+class SupervisorTerminalFailureSource(StrEnum):
+    SDK_TURN_FAILED = "sdk-turn-failed"
+
+
+class SupervisorTerminalFailureSdkCategory(StrEnum):
+    BAD_REQUEST = "bad-request"
+    UNAUTHORIZED = "unauthorized"
+    SANDBOX = "sandbox"
+    OVERLOAD = "overload"
+    HTTP = "http"
+    STREAM = "stream"
+    CONNECTION = "connection"
+    MISSING_OR_UNKNOWN = "missing-or-unknown"
+
+
+class SupervisorAccountingBlocker(StrEnum):
+    INCOMPLETE_ACCOUNTING = "provider-accounting-incomplete"
+
+
+class SupervisorDispatchClaimState(StrEnum):
+    UNCLAIMED = "unclaimed"
+    CLAIMED = "claimed"
+
+
+@dataclass(frozen=True)
+class SupervisorAccountingAttemptSnapshot:
+    attempt_id: str; within_round_attempt: int; profile_identity: str; state: AttemptState
+    session_present: bool; turn_present: bool; completion_present: bool; invalid_output_present: bool
+    recovery_action: RecoveryAction | None; terminal_failure: SupervisorTerminalFailure | None; accepted: bool
+    def __post_init__(self) -> None:
+        if not _TOKEN.fullmatch(self.attempt_id) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.profile_identity) or type(self.state) is not AttemptState or any(type(value) is not bool for value in (self.session_present, self.turn_present, self.completion_present, self.invalid_output_present, self.accepted)) or (self.recovery_action is not None and type(self.recovery_action) is not RecoveryAction) or (self.terminal_failure is not None and type(self.terminal_failure) is not SupervisorTerminalFailure):
+            raise ProviderRecoveryError("accounting attempt snapshot is invalid")
+        if self.accepted != (self.state is AttemptState.ACCEPTED) or self.accepted and (not self.session_present or not self.turn_present or not self.completion_present or self.invalid_output_present):
+            raise ProviderRecoveryError("accounting attempt snapshot is inconsistent")
+        if self.state is AttemptState.PREPARED and (self.session_present or self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not None or self.terminal_failure is not None or self.accepted):
+            raise ProviderRecoveryError("accounting prepared snapshot is inconsistent")
+        if self.turn_present and not self.session_present:
+            raise ProviderRecoveryError("accounting turn snapshot is inconsistent")
+        if self.invalid_output_present and self.state is not AttemptState.INVALIDATED:
+            raise ProviderRecoveryError("accounting invalid snapshot is inconsistent")
+        if self.terminal_failure is not None and (self.state is not AttemptState.INVALIDATED or not self.session_present or not self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
+            raise ProviderRecoveryError("accounting terminal failure snapshot is inconsistent")
+        if self.state is AttemptState.INVALIDATED and ((self.invalid_output_present == (self.terminal_failure is not None)) or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
+            raise ProviderRecoveryError("accounting recovery snapshot is inconsistent")
+    def canonical_material(self) -> dict[str, object]: return {"attempt_id":self.attempt_id,"within_round_attempt":self.within_round_attempt,"profile_identity":self.profile_identity,"state":self.state.value,"session_present":self.session_present,"turn_present":self.turn_present,"completion_present":self.completion_present,"invalid_output_present":self.invalid_output_present,"recovery_action":None if self.recovery_action is None else self.recovery_action.value,"terminal_failure":None if self.terminal_failure is None else {"failure_class":self.terminal_failure.failure_class.value,"outcome_source":self.terminal_failure.outcome_source.value,"sdk_error_category":self.terminal_failure.sdk_error_category.value},"accepted":self.accepted}
+
+
+@dataclass(frozen=True)
+class SupervisorAccountingSnapshot:
+    repository_id: str; task_id: str; source_digest: str; base_sha: str; candidate_sha: str; case_id: str; ready_at: int
+    seal_state_identity: str; evidence: tuple[str, ...]; verifications: tuple[tuple[str, str], ...]
+    configuration_digest: str; policy_digest: str; complete_rounds: int; max_rounds: int; max_attempts: int; review_epoch: int; review_round: int; review_mode: str
+    formal_record_count: int; formal_accepted_count: int; dispatch_claim: SupervisorDispatchClaimState; current: SupervisorAccountingAttemptSnapshot; prior: tuple[SupervisorAccountingAttemptSnapshot, ...]
+    def __post_init__(self) -> None:
+        if not _TOKEN.fullmatch(self.repository_id) or not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.case_id) or not _DIGEST.fullmatch(self.source_digest) or not _COMMIT.fullmatch(self.base_sha) or not _COMMIT.fullmatch(self.candidate_sha) or type(self.ready_at) is not int or self.ready_at < 0 or not _TOKEN.fullmatch(self.seal_state_identity) or type(self.evidence) is not tuple or type(self.verifications) is not tuple or any(type(item) is not str or not _FINGERPRINT.fullmatch(item) for item in self.evidence) or len(set(self.evidence)) != len(self.evidence) or any(type(item) is not tuple or len(item) != 2 or type(item[0]) is not str or type(item[1]) is not str or item[0] not in {"test","build"} or item[1] not in {"pass","not-applicable"} for item in self.verifications) or len(set(self.verifications)) != len(self.verifications):
+            raise ProviderRecoveryError("accounting snapshot is invalid")
+        if not _DIGEST.fullmatch(self.configuration_digest) or not _FINGERPRINT.fullmatch(self.policy_digest) or self.review_mode not in {"COMPLETE", "CONVERGING"} or any(type(value) is not int or value < 0 for value in (self.complete_rounds,self.max_rounds,self.max_attempts,self.review_epoch,self.formal_record_count,self.formal_accepted_count)) or type(self.review_round) is not int or self.review_round < 1 or self.complete_rounds < 1 or self.max_rounds < self.complete_rounds or self.max_attempts < 1 or self.review_round > self.max_rounds or self.formal_accepted_count not in {0,1} or self.formal_accepted_count > self.formal_record_count or type(self.dispatch_claim) is not SupervisorDispatchClaimState or type(self.current) is not SupervisorAccountingAttemptSnapshot or type(self.prior) is not tuple or any(type(item) is not SupervisorAccountingAttemptSnapshot for item in self.prior):
+            raise ProviderRecoveryError("accounting snapshot is invalid")
+        if self.current.state is not AttemptState.PREPARED or self.current.within_round_attempt != len(self.prior)+1 or any((self.current.session_present,self.current.turn_present,self.current.completion_present,self.current.invalid_output_present,self.current.accepted)) or self.current.recovery_action is not None or tuple(item.within_round_attempt for item in self.prior) != tuple(range(1,len(self.prior)+1)) or len({item.attempt_id for item in self.prior + (self.current,)}) != len(self.prior) + 1 or len({item.profile_identity for item in self.prior + (self.current,)}) != len(self.prior) + 1:
+            raise ProviderRecoveryError("accounting snapshot attempt ordering is invalid")
+    def canonical_material(self) -> dict[str, object]: return {"schema":"roundwright-provider-attempt-accounting-decision/v3","binding":{"repository_id":self.repository_id,"task_id":self.task_id,"source_digest":self.source_digest,"base_sha":self.base_sha,"candidate_sha":self.candidate_sha,"case_id":self.case_id,"ready_at":self.ready_at},"candidate":{"seal_state_identity":self.seal_state_identity,"evidence_count":len(self.evidence),"evidence_digest":"sha256:"+hashlib.sha256("|".join(self.evidence).encode()).hexdigest(),"verification_count":len(self.verifications),"verification_kinds":[{"kind":a,"outcome":b} for a,b in self.verifications]},"review_policy":{"configuration_digest":self.configuration_digest,"policy_digest":self.policy_digest,"complete_rounds":self.complete_rounds,"max_rounds":self.max_rounds,"max_supervisor_attempts_per_round":self.max_attempts,"review_epoch":self.review_epoch,"review_round":self.review_round,"review_mode":self.review_mode},"formal_review":{"review_epoch":self.review_epoch,"review_round":self.review_round,"record_count":self.formal_record_count,"accepted_count":self.formal_accepted_count,"accepted_result_present":bool(self.formal_accepted_count)},"dispatch_claim":self.dispatch_claim.value,"current_attempt":self.current.canonical_material(),"prior_attempts":[item.canonical_material() for item in self.prior]}
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -154,9 +233,88 @@ class RecoveryProjection:
 
 
 @dataclass(frozen=True)
+class SupervisorTerminalFailure:
+    """Durable public-safe SDK terminal failure, never provider prose."""
+
+    failure_class: SupervisorTerminalFailureClass
+    outcome_source: SupervisorTerminalFailureSource
+    sdk_error_category: SupervisorTerminalFailureSdkCategory
+
+    def __post_init__(self) -> None:
+        if type(self.failure_class) is not SupervisorTerminalFailureClass or self.outcome_source is not SupervisorTerminalFailureSource.SDK_TURN_FAILED or type(self.sdk_error_category) is not SupervisorTerminalFailureSdkCategory:
+            raise ProviderRecoveryError("terminal failure projection is invalid")
+
+
+@dataclass(frozen=True)
 class _PersistedRecoveryOutcome:
     action: RecoveryAction
     blocker: str | None
+
+
+def read_supervisor_accounting_snapshot(
+    repository: RepositoryIdentity, identity: TaskIdentity, context: RecoveryContext, *,
+    source_digest: str, base_sha: str, candidate_sha: str, case_id: str, ready_at: int,
+    review_epoch: int, review_round: int, review_mode: str,
+    current_attempt_id: str, current_within_round_attempt: int, current_profile_identity: str,
+    prior_attempts: tuple[tuple[str, int, str], ...],
+    seal_state_identity: str,
+) -> SupervisorAccountingSnapshot:
+    """Read the closed accounting decision input from durable product state."""
+    _validate_task(identity); _validate_context(identity, context)
+    if not _DIGEST.fullmatch(source_digest) or base_sha != identity.base_sha or candidate_sha != context.candidate_sha or not _TOKEN.fullmatch(case_id) or type(ready_at) is not int or ready_at < 0 or type(review_epoch) is not int or review_epoch < 0 or type(review_round) is not int or review_round < 1 or review_mode not in {"COMPLETE", "CONVERGING"} or not _TOKEN.fullmatch(current_attempt_id) or current_within_round_attempt < 1 or not _DIGEST.fullmatch(current_profile_identity) or tuple(item[1] for item in prior_attempts) != tuple(range(1, len(prior_attempts)+1)):
+        raise ProviderRecoveryError("accounting snapshot inputs are invalid")
+    path = database_path(repository)
+    if not path.exists():
+        raise ProviderRecoveryError("accounting snapshot state is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ProviderRecoveryError("accounting snapshot state is unavailable") from error
+    try:
+        _require_matching_task(connection, identity)
+        seal = connection.execute("SELECT base_sha,candidate_sha,state_identity FROM candidate_seals WHERE task_id=?", (identity.task_id,)).fetchone()
+        if seal != (base_sha, candidate_sha, seal_state_identity): raise ProviderRecoveryError("accounting snapshot seal has drifted")
+        evidence = tuple(row[0] for row in connection.execute("SELECT evidence_fingerprint FROM candidate_evidence WHERE task_id=? AND candidate_sha=? ORDER BY evidence_fingerprint", (identity.task_id,candidate_sha)))
+        verifications = tuple((row[0],row[1]) for row in connection.execute("SELECT verification_kind,outcome FROM candidate_verifications WHERE task_id=? AND candidate_sha=? ORDER BY verification_kind,verification_id", (identity.task_id,candidate_sha)))
+        formal = connection.execute("SELECT COUNT(*),SUM(CASE WHEN state='accepted' THEN 1 ELSE 0 END) FROM diff_review_attempts WHERE task_id=? AND review_epoch=? AND review_round=?", (identity.task_id,review_epoch,review_round)).fetchone()
+        def attempt(attempt_id: str, ordinal: int, profile: str) -> SupervisorAccountingAttemptSnapshot:
+            row = connection.execute("SELECT state,session_identity,external_turn_identity,output_pointer,completion_evidence_fingerprint,accepted_review_identity,selected_profile_identity FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id,attempt_id)).fetchone()
+            outcome = connection.execute("SELECT recovery_action,blocker FROM provider_recovery_outcomes WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if row is None or row[6] != profile: raise ProviderRecoveryError("accounting snapshot attempt is unavailable")
+            persisted = None if outcome is None else _PersistedRecoveryOutcome(RecoveryAction(outcome[0]), outcome[1])
+            return SupervisorAccountingAttemptSnapshot(attempt_id,ordinal,profile,AttemptState(row[0]),row[1] is not None,row[2] is not None,row[4] is not None,(row[3] or "").startswith("supervisor-invalid-"),None if outcome is None else RecoveryAction(outcome[0]),_terminal_failure_from_outcome(AttemptState(row[0]), persisted),row[5] is not None)
+        current = attempt(current_attempt_id,current_within_round_attempt,current_profile_identity)
+        prior = tuple(attempt(*item) for item in prior_attempts)
+        binding = context.runtime_binding
+        claim = _dispatch_claim_state(connection, identity, _attempt_row(connection, identity.task_id, current_attempt_id))
+        return SupervisorAccountingSnapshot(identity.repository_id,identity.task_id,source_digest,base_sha,candidate_sha,case_id,ready_at,seal_state_identity,evidence,verifications,binding.resolved_digest,binding.review_policy_digest,binding.review_complete_rounds,binding.review_max_rounds,binding.review_max_supervisor_attempts_per_round,review_epoch,review_round,review_mode,formal[0],0 if formal[1] is None else formal[1],claim,current,prior)
+    finally:
+        connection.close()
+
+
+def preflight_attempt_preparation(
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    role: ProviderRole,
+    process_lease_id: str,
+    process_lease_expires_at: int,
+    input_fingerprint: str,
+    selected_profile_identity: str | None = None,
+    now: int | None = None,
+) -> None:
+    """Validate a future attempt's identity and health without durable writes."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    _require_role(role)
+    _require_token(process_lease_id, "process lease identity")
+    _require_future_time(process_lease_expires_at, now)
+    _require_fingerprint(input_fingerprint, "input fingerprint")
+    selected = _selected_profile_identity(context, role, selected_profile_identity)
+    _require_health_authorization(context, role, selected, _clock(now))
 
 
 def prepare_attempt(
@@ -236,6 +394,90 @@ def prepare_attempt(
     finally:
         connection.close()
     return read_attempt(repository, identity, attempt_id)
+
+
+def claim_supervisor_dispatch(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Atomically consume one prepared Supervisor dispatch authorization.
+
+    A claim deliberately precedes native session construction.  It makes a
+    prepared attempt one-shot even when a provider cannot return a session or
+    a local checkpoint callback fails before a durable turn exists.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    observed = _clock(now)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.PREPARED or row.session_identity is not None or row.external_turn_identity is not None or row.output_pointer is not None or row.accepted_review_identity is not None:
+            raise ProviderRecoveryError("Supervisor dispatch claim requires an unclaimed prepared attempt")
+        existing = connection.execute("SELECT task_id,claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if existing is not None:
+            raise ProviderRecoveryError("Supervisor dispatch claim is already consumed")
+        connection.execute(
+            "INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)",
+            (attempt_id, identity.task_id, row.input_fingerprint, observed),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise ProviderRecoveryError("Supervisor dispatch claim is already consumed") from error
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return read_attempt(repository, identity, attempt_id, context=context, now=now)
+
+
+def read_supervisor_dispatch_claim(
+    repository: RepositoryIdentity, identity: TaskIdentity, context: RecoveryContext, *, attempt_id: str,
+) -> SupervisorDispatchClaimState:
+    """Read the closed one-shot dispatch disposition without state mutation."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    path = database_path(repository)
+    if not path.exists():
+        raise ProviderRecoveryError("Supervisor dispatch claim is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ProviderRecoveryError("Supervisor dispatch claim is unavailable") from error
+    try:
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("Supervisor dispatch claim has drifted")
+        return _dispatch_claim_state(connection, identity, row)
+    finally:
+        connection.close()
+
+
+def _dispatch_claim_state(connection, identity: TaskIdentity, row: ProviderAttempt) -> SupervisorDispatchClaimState:
+    claim = connection.execute("SELECT task_id,claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?", (row.attempt_id,)).fetchone()
+    if claim is None:
+        return SupervisorDispatchClaimState.UNCLAIMED
+    if tuple(claim) != (identity.task_id, row.input_fingerprint):
+        raise ProviderRecoveryError("Supervisor dispatch claim has drifted")
+    return SupervisorDispatchClaimState.CLAIMED
 
 
 def record_external_turn(
@@ -512,7 +754,7 @@ def accept_supervisor_review(
             (accepted_review_identity, AttemptState.ACCEPTED.value, attempt_id),
         )
         connection.execute(
-            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (accepted_review_identity, *_accepted_supervisor_review_values(identity, row, context)),
         )
         connection.commit()
@@ -570,6 +812,229 @@ def invalidate_supervisor_attempt(
     finally:
         connection.close()
     return row
+
+
+def record_supervisor_terminal_failure(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    failure_class: SupervisorTerminalFailureClass,
+    outcome_source: SupervisorTerminalFailureSource,
+    sdk_error_category: SupervisorTerminalFailureSdkCategory,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Durably invalidate one failed Supervisor SDK turn for failover.
+
+    This intentionally does not create ``provider_invalid_outputs``: the
+    terminal failure is an operational turn result, not rejected provider text.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    if type(failure_class) is not SupervisorTerminalFailureClass or outcome_source is not SupervisorTerminalFailureSource.SDK_TURN_FAILED or type(sdk_error_category) is not SupervisorTerminalFailureSdkCategory:
+        raise ProviderRecoveryError("terminal failure projection is invalid")
+    observed = _clock(now)
+    blocker = f"terminal-failure:{outcome_source.value}:{failure_class.value}:{sdk_error_category.value}"
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if row.role is not ProviderRole.SUPERVISOR or row.external_turn_identity is None:
+            raise ProviderRecoveryError("terminal failure requires a dispatched Supervisor turn")
+        if row.state is AttemptState.INVALIDATED:
+            outcome = _read_recovery_outcome(connection, attempt_id)
+            if outcome != _PersistedRecoveryOutcome(RecoveryAction.FRESH_SUPERVISOR_SESSION, blocker):
+                raise ProviderRecoveryError("terminal failure conflicts with committed state")
+            connection.commit()
+            return row
+        if row.state is not AttemptState.DISPATCHED:
+            raise ProviderRecoveryError("terminal failure requires an unsettled Supervisor turn")
+        if connection.execute("SELECT 1 FROM provider_invalid_outputs WHERE attempt_id = ?", (attempt_id,)).fetchone() is not None:
+            raise ProviderRecoveryError("terminal failure conflicts with invalid output")
+        connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.INVALIDATED.value, attempt_id))
+        row = replace(row, state=AttemptState.INVALIDATED)
+        _persist_recovery_outcome(connection, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION, blocker, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return row
+
+
+def read_supervisor_terminal_failure(
+    repository: RepositoryIdentity, identity: TaskIdentity, attempt_id: str,
+) -> SupervisorTerminalFailure | None:
+    """Read only the fixed public-safe failure projection for one attempt."""
+
+    _validate_task(identity)
+    _require_token(attempt_id, "attempt identity")
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        outcome = _read_recovery_outcome(connection, attempt_id)
+        return _terminal_failure_from_outcome(row.state, outcome)
+    except ValueError:
+        raise ProviderRecoveryError("terminal failure projection is invalid") from None
+    finally:
+        connection.close()
+
+
+def _terminal_failure_from_outcome(
+    state: AttemptState, outcome: _PersistedRecoveryOutcome | None,
+) -> SupervisorTerminalFailure | None:
+    """Decode only the fixed, durable terminal-failure projection."""
+
+    if state is not AttemptState.INVALIDATED or outcome is None or outcome.action is not RecoveryAction.FRESH_SUPERVISOR_SESSION or outcome.blocker is None:
+        return None
+    parts = outcome.blocker.split(":")
+    if len(parts) != 4 or parts[0] != "terminal-failure":
+        return None
+    _, source, failure, category = parts
+    try:
+        return SupervisorTerminalFailure(
+            SupervisorTerminalFailureClass(failure),
+            SupervisorTerminalFailureSource(source),
+            SupervisorTerminalFailureSdkCategory(category),
+        )
+    except ValueError:
+        raise ProviderRecoveryError("terminal failure projection is invalid") from None
+
+
+def record_supervisor_accounting_blocker(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    blocker: SupervisorAccountingBlocker,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> RecoveryProjection:
+    """Terminally retain a schema-valid accounting decision without failover."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    if type(blocker) is not SupervisorAccountingBlocker:
+        raise ProviderRecoveryError("accounting blocker is invalid")
+    observed = _clock(now)
+    action = RecoveryAction.BLOCKED_PROVIDER_ACCOUNTING
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if row.role is not ProviderRole.SUPERVISOR or row.external_turn_identity is None:
+            raise ProviderRecoveryError("accounting blocker requires a dispatched Supervisor turn")
+        if row.state is AttemptState.BLOCKED:
+            outcome = _read_recovery_outcome(connection, attempt_id)
+            if outcome != _PersistedRecoveryOutcome(action, blocker.value):
+                raise ProviderRecoveryError("accounting blocker conflicts with committed state")
+            connection.commit()
+            return _projection(row, action, blocker.value)
+        if row.state is not AttemptState.DISPATCHED:
+            raise ProviderRecoveryError("accounting blocker requires an unsettled Supervisor turn")
+        if connection.execute("SELECT 1 FROM provider_invalid_outputs WHERE attempt_id = ?", (attempt_id,)).fetchone() is not None:
+            raise ProviderRecoveryError("accounting blocker conflicts with invalid output")
+        connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.BLOCKED.value, attempt_id))
+        row = replace(row, state=AttemptState.BLOCKED)
+        _persist_recovery_outcome(connection, attempt_id, action, blocker.value, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, action.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return _projection(row, action, blocker.value)
+
+
+def block_session_without_turn(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> RecoveryProjection:
+    """Terminally reconcile a real session that never reached a turn.
+
+    A persisted session proves that an external boundary was entered, but it
+    must not make the bounded sequence resumable when no external turn was
+    ever checkpointed.  The terminal record deliberately retains the real
+    session identity while retaining a null turn identity and no output.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    observed = _clock(now)
+    action = RecoveryAction.BLOCKED_AMBIGUOUS_TURN
+    blocker = "session-without-turn"
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        authorization_fingerprint = _require_persisted_health_authorization(
+            connection, attempt_id, context, row.role, row.selected_profile_identity, observed,
+        )
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("only a Supervisor session can be blocked before a turn")
+        if row.session_identity is None or row.external_turn_identity is not None:
+            raise ProviderRecoveryError("session-without-turn reconciliation requires exactly one session checkpoint")
+        _require_session_checkpoint(
+            connection, identity.task_id, attempt_id, row.session_identity, context, authorization_fingerprint,
+        )
+        if row.state is AttemptState.BLOCKED:
+            outcome = _read_recovery_outcome(connection, attempt_id)
+            if outcome != _PersistedRecoveryOutcome(action, blocker):
+                raise ProviderRecoveryError("session-without-turn reconciliation conflicts with committed state")
+            connection.commit()
+            return _projection(row, action, blocker)
+        if row.state is not AttemptState.PREPARED:
+            raise ProviderRecoveryError("session-without-turn reconciliation requires a prepared attempt")
+        connection.execute(
+            "UPDATE provider_attempts SET state = ? WHERE attempt_id = ?",
+            (AttemptState.BLOCKED.value, attempt_id),
+        )
+        row = replace(row, state=AttemptState.BLOCKED)
+        _persist_recovery_outcome(connection, attempt_id, action, blocker, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, action.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return _projection(row, action, blocker)
 
 
 def recover_attempt(
@@ -692,6 +1157,7 @@ def _accepted_supervisor_review_values(
         row.selected_profile_identity,
         0,
         *context.runtime_binding.complete_columns()[4:],
+        0,
     )
 
 
@@ -743,7 +1209,7 @@ def _require_accepted_supervisor_review(
     ):
         raise ProviderRecoveryError("accepted supervisor review is invalid")
     persisted = connection.execute(
-        "SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest FROM accepted_provider_reviews WHERE accepted_review_identity = ?",
+        "SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?",
         (row.accepted_review_identity,),
     ).fetchone()
     if persisted != _accepted_supervisor_review_values(identity, row, context):

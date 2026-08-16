@@ -619,6 +619,29 @@ MIGRATIONS = (
             ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '')"),
         ),
     ),
+    Migration(
+        48,
+        (
+            "CREATE TABLE provider_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), claim_fingerprint TEXT NOT NULL, claimed_at INTEGER NOT NULL)",
+        ),
+        (
+            ("provider_dispatch_claims", "CREATE TABLE provider_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), claim_fingerprint TEXT NOT NULL, claimed_at INTEGER NOT NULL)"),
+        ),
+    ),
+    Migration(
+        49,
+        (
+            # Epoch zero denotes rows written before formal review epochs were
+            # durable.  It is deliberately not inferred from a later runtime:
+            # legacy evidence remains byte-for-byte its original history.
+            "ALTER TABLE diff_review_attempts ADD COLUMN review_epoch INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN review_epoch INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '', review_round INTEGER NOT NULL DEFAULT 0, review_mode TEXT NOT NULL DEFAULT '', review_max_rounds INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_epoch INTEGER NOT NULL DEFAULT 0)"),
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_epoch INTEGER NOT NULL DEFAULT 0)"),
+        ),
+    ),
 )
 
 

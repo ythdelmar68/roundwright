@@ -540,7 +540,15 @@ class CandidateReviewTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT review_epoch, review_round FROM diff_review_attempts WHERE state='accepted' ORDER BY review_epoch").fetchall(), [(1, 1), (2, 1)])
-                self.assertEqual(connection.execute("SELECT review_epoch FROM accepted_provider_reviews ORDER BY review_epoch").fetchall(), [(1,), (2,)])
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT review_epoch FROM accepted_provider_reviews "
+                        "WHERE accepted_review_identity IN (?, ?) ORDER BY review_epoch",
+                        (first.diff_review_attempt_id, second.diff_review_attempt_id),
+                    ).fetchall(),
+                    [(1,), (2,)],
+                )
+                self.assertEqual(connection.execute("SELECT review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity='plan-review-25'").fetchone(), (0,))
                 before = connection.execute("SELECT COUNT(*) FROM provider_attempts WHERE task_id=?", (identity.task_id,)).fetchone()[0]
             finally:
                 connection.close()

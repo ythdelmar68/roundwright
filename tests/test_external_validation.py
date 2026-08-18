@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,6 +180,10 @@ class ExternalValidationTests(unittest.TestCase):
         comparison = adapter.compare(exact, evidence)
         self.assertEqual(execution.mutation_count, 0)
         self.assertEqual(evidence["hosted_check"]["snapshot"]["workflow"], "CI")
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["check_suite_ids"], ["suite-48"])
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["job_ids"], ["job-48"])
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["artifact_digests"], ["sha256:" + "b" * 64])
+        self.assertIsInstance(json.loads(json.dumps(evidence)), dict)
         self.assertEqual(comparison.status, "pass")
 
     def hosted_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:

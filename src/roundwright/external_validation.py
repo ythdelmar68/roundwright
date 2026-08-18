@@ -632,8 +632,10 @@ class HostedCheckSnapshot:
             "repository": self.repository, "workflow": self.workflow,
             "ref": self.ref, "branch": self.branch,
             "candidate_sha": self.candidate_sha,
-            "check_suite_ids": self.check_suite_ids, "job_ids": self.job_ids,
-            "artifact_digests": self.artifact_digests,
+            # Internal tuples make the typed snapshot immutable.  The
+            # Recorder boundary is strict JSON, so project canonical arrays.
+            "check_suite_ids": list(self.check_suite_ids), "job_ids": list(self.job_ids),
+            "artifact_digests": list(self.artifact_digests),
             "freshness_seconds": self.freshness_seconds, "outcome": self.outcome,
         }
 

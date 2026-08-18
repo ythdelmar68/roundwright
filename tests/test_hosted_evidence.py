@@ -157,10 +157,12 @@ class HostedCheckEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(HostedEvidenceError, "malformed"):
             self.evaluate(self.evidence(workflow_runs=(bad_run,)))
 
-    def test_duplicate_suites_runs_jobs_and_artifacts_fail_closed(self) -> None:
+    def test_shared_suites_are_allowed_but_duplicate_runs_names_jobs_and_artifacts_fail_closed(self) -> None:
         duplicate_suite = HostedCheck("check-2", "suite-1", "lint", HostedCheckState.SUCCESS, self.candidate, self.candidate)
+        self.assertEqual(self.evaluate(self.evidence(checks=(self.evidence().checks[0], duplicate_suite)), policy=self.policy(required_checks=("lint", "unit"))).outcome, HostedEvidenceOutcome.PASS)
+        duplicate_name = HostedCheck("check-3", "suite-1", "unit", HostedCheckState.SUCCESS, self.candidate, self.candidate)
         with self.assertRaisesRegex(HostedEvidenceError, "duplicate"):
-            self.evaluate(self.evidence(checks=(self.evidence().checks[0], duplicate_suite)))
+            self.evaluate(self.evidence(checks=(self.evidence().checks[0], duplicate_name)))
         duplicate_run = self.evidence().workflow_runs[0]
         with self.assertRaisesRegex(HostedEvidenceError, "duplicate"):
             self.evaluate(self.evidence(workflow_runs=(duplicate_run, duplicate_run)))
@@ -170,6 +172,24 @@ class HostedCheckEvidenceTests(unittest.TestCase):
             self.evaluate(self.evidence(workflow_runs=(duplicate_job_run,)))
         with self.assertRaisesRegex(HostedEvidenceError, "duplicate"):
             self.evaluate(self.evidence(artifacts=(("build-manifest", "b" * 64), ("build-manifest", "c" * 64))))
+
+    def test_every_non_success_job_state_prevents_pass_and_terminal_conflicts_fail_closed(self) -> None:
+        outcomes = {
+            HostedCheckState.QUEUED: HostedEvidenceOutcome.QUEUED,
+            HostedCheckState.IN_PROGRESS: HostedEvidenceOutcome.IN_PROGRESS,
+            HostedCheckState.FAILURE: HostedEvidenceOutcome.FAILURE,
+            HostedCheckState.CANCELLED: HostedEvidenceOutcome.CANCELLED,
+            HostedCheckState.SKIPPED: HostedEvidenceOutcome.SKIPPED,
+            HostedCheckState.NEUTRAL: HostedEvidenceOutcome.NEUTRAL,
+        }
+        for state, expected in outcomes.items():
+            with self.subTest(state=state):
+                job = HostedWorkflowJob("job-1", "unit", state, self.candidate)
+                run = HostedWorkflowRun("run-1", self.workflow, state, self.candidate, f"refs/heads/{self.branch}", (job,))
+                self.assertEqual(self.evaluate(self.evidence(workflow_runs=(run,))).outcome, expected)
+        conflicting = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (HostedWorkflowJob("job-1", "unit", HostedCheckState.FAILURE, self.candidate),))
+        with self.assertRaisesRegex(HostedEvidenceError, "conflict"):
+            self.evaluate(self.evidence(workflow_runs=(conflicting,)))
 
     def test_fake_adapter_is_deterministic_and_real_adapter_is_disabled_by_default(self) -> None:
         evidence = self.evidence()

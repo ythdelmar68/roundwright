@@ -10,6 +10,14 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright import external_validation
+from roundwright.hosted_evidence import (
+    HostedCheck,
+    HostedCheckEvidence,
+    HostedCheckPolicy,
+    HostedCheckState,
+    HostedWorkflowJob,
+    HostedWorkflowRun,
+)
 from roundwright.shadow import EXECUTOR_CONTRACT_SYNTHETIC_PROFILE, HOSTED_CHECK_PROFILE, PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
 
 
@@ -166,11 +174,7 @@ class ExternalValidationTests(unittest.TestCase):
             adapter.execute(exact)
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
-        snapshot = external_validation.HostedCheckSnapshot(
-            "ythdelmar68/roundwright", "CI", "refs/heads/codex/issue-48",
-            "codex/issue-48", "a" * 40, ("suite-48",), ("job-48",),
-            ("sha256:" + "b" * 64,), 12, "pass",
-        )
+        snapshot = self.hosted_snapshot()
         adapter = external_validation.HostedCheckProfileAdapter(snapshot)
         producer, exporter, comparator = external_validation.hosted_check_component_identities()
         exact = self.hosted_binding(adapter, producer, exporter, comparator)
@@ -180,11 +184,35 @@ class ExternalValidationTests(unittest.TestCase):
         comparison = adapter.compare(exact, evidence)
         self.assertEqual(execution.mutation_count, 0)
         self.assertEqual(evidence["hosted_check"]["snapshot"]["workflow"], "CI")
-        self.assertEqual(evidence["hosted_check"]["snapshot"]["check_suite_ids"], ["suite-48"])
-        self.assertEqual(evidence["hosted_check"]["snapshot"]["job_ids"], ["job-48"])
-        self.assertEqual(evidence["hosted_check"]["snapshot"]["artifact_digests"], ["sha256:" + "b" * 64])
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["checks"][0]["checked_out_sha"], "a" * 40)
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["workflow_runs"][0]["jobs"][0]["state"], "success")
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["artifacts"][0]["digest"], "b" * 64)
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["evaluation"]["outcome"], "pass")
         self.assertIsInstance(json.loads(json.dumps(evidence)), dict)
         self.assertEqual(comparison.status, "pass")
+
+    def test_hosted_snapshot_rejects_a_non_passing_typed_evaluation(self) -> None:
+        evidence = self.hosted_snapshot().evidence
+        failed = HostedCheckEvidence(
+            evidence.repository, evidence.workflow, evidence.candidate_sha, evidence.branch,
+            evidence.observed_at,
+            (HostedCheck("check-48", "suite-48", "unit", HostedCheckState.FAILURE, "a" * 40, "a" * 40),),
+            evidence.workflow_runs, evidence.artifacts,
+        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "not a passing"):
+            external_validation.HostedCheckSnapshot(failed, self.hosted_snapshot().policy, "refs/heads/codex/issue-48", 17)
+
+    def hosted_snapshot(self) -> external_validation.HostedCheckSnapshot:
+        evidence = HostedCheckEvidence(
+            "ythdelmar68/roundwright", "CI", "a" * 40, "codex/issue-48", 12,
+            (HostedCheck("check-48", "suite-48", "unit", HostedCheckState.SUCCESS, "a" * 40, "a" * 40),),
+            (HostedWorkflowRun("run-48", "CI", HostedCheckState.SUCCESS, "a" * 40, "refs/heads/codex/issue-48", (HostedWorkflowJob("job-48", "unit", HostedCheckState.SUCCESS, "a" * 40),)),),
+            (("build-manifest", "b" * 64),),
+        )
+        return external_validation.HostedCheckSnapshot(
+            evidence, HostedCheckPolicy(("unit",), ("build-manifest",), 60),
+            "refs/heads/codex/issue-48", 17,
+        )
 
     def hosted_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:
         plan = SimpleNamespace(

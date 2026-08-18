@@ -6,7 +6,7 @@ import hashlib
 import importlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -93,6 +93,13 @@ def provider_attempt_accounting_component_identities() -> tuple[str, str, str]:
 
 HOSTED_CHECK_PRODUCER_IDENTITY = _digest(
     {"schema": HOSTED_CHECK_SCHEMA, "component": "typed-hosted-check-reader"}
+)
+from .hosted_evidence import (
+    HostedCheckEvidence,
+    HostedCheckEvaluation,
+    HostedCheckPolicy,
+    HostedEvidenceOutcome,
+    evaluate_hosted_check_evidence,
 )
 HOSTED_CHECK_EXPORTER_IDENTITY = _digest(
     {"schema": HOSTED_CHECK_SCHEMA, "component": "public-terminal-case-exporter"}
@@ -585,58 +592,62 @@ class ProviderAttemptAccountingAdapter:
 
 @dataclass(frozen=True)
 class HostedCheckSnapshot:
-    """One public-safe, already-normalized terminal hosted observation.
+    """A successful typed hosted evaluation retained for one exact capture."""
 
-    The Worker never constructs this from a provider response.  A credentialed
-    owner-side reader must supply this typed value after the exact plan is
-    armed; tests use it directly as a deterministic fake.
-    """
-
-    repository: str
-    workflow: str
+    evidence: HostedCheckEvidence
+    policy: HostedCheckPolicy
     ref: str
-    branch: str
-    candidate_sha: str
-    check_suite_ids: tuple[str, ...]
-    job_ids: tuple[str, ...]
-    artifact_digests: tuple[str, ...]
-    freshness_seconds: int
-    outcome: str
+    evaluated_at: int
+    evaluation: HostedCheckEvaluation = field(init=False)
 
     def __post_init__(self) -> None:
+        if type(self.evidence) is not HostedCheckEvidence or type(self.policy) is not HostedCheckPolicy:
+            raise ExternalValidationAdapterError("hosted check snapshot is invalid")
         if (
-            not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}", self.repository)
-            or not _safe_token(self.workflow)
-            or not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", self.ref)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", self.branch)
-            or self.ref != f"refs/heads/{self.branch}"
-            or _SHA.fullmatch(self.candidate_sha) is None
-            or type(self.check_suite_ids) is not tuple
-            or type(self.job_ids) is not tuple
-            or type(self.artifact_digests) is not tuple
-            or not self.check_suite_ids
-            or not self.job_ids
-            or any(not _safe_token(value) for value in (*self.check_suite_ids, *self.job_ids))
-            or len(set(self.check_suite_ids)) != len(self.check_suite_ids)
-            or len(set(self.job_ids)) != len(self.job_ids)
-            or any(_DIGEST.fullmatch(value) is None for value in self.artifact_digests)
-            or len(set(self.artifact_digests)) != len(self.artifact_digests)
-            or type(self.freshness_seconds) is not int
-            or not 0 <= self.freshness_seconds <= 86_400
-            or self.outcome not in {"pass", "queued", "in-progress", "failure", "cancelled", "skipped", "neutral"}
+            not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", self.ref)
+            or self.ref != f"refs/heads/{self.evidence.branch}"
+            or type(self.evaluated_at) is not int or self.evaluated_at < 0
         ):
             raise ExternalValidationAdapterError("hosted check snapshot is invalid")
+        try:
+            evaluation = evaluate_hosted_check_evidence(
+                self.evidence, repository=self.evidence.repository, workflow=self.evidence.workflow,
+                candidate_sha=self.evidence.candidate_sha, branch=self.evidence.branch,
+                policy=self.policy, now=self.evaluated_at,
+            )
+        except ValueError as error:
+            raise ExternalValidationAdapterError("hosted check snapshot is invalid") from error
+        if evaluation.outcome is not HostedEvidenceOutcome.PASS:
+            raise ExternalValidationAdapterError("hosted check snapshot is not a passing evaluation")
+        object.__setattr__(self, "evaluation", evaluation)
 
     def public_payload(self) -> dict[str, object]:
+        evidence = self.evidence
         return {
-            "repository": self.repository, "workflow": self.workflow,
-            "ref": self.ref, "branch": self.branch,
-            "candidate_sha": self.candidate_sha,
-            # Internal tuples make the typed snapshot immutable.  The
-            # Recorder boundary is strict JSON, so project canonical arrays.
-            "check_suite_ids": list(self.check_suite_ids), "job_ids": list(self.job_ids),
-            "artifact_digests": list(self.artifact_digests),
-            "freshness_seconds": self.freshness_seconds, "outcome": self.outcome,
+            "repository": evidence.repository, "workflow": evidence.workflow,
+            "ref": self.ref, "branch": evidence.branch,
+            "candidate_sha": evidence.candidate_sha, "observed_at": evidence.observed_at,
+            "checks": [
+                {"check_id": item.check_id, "suite_id": item.suite_id, "name": item.name,
+                 "state": item.state.value, "head_sha": item.head_sha, "checked_out_sha": item.checked_out_sha}
+                for item in evidence.checks
+            ],
+            "workflow_runs": [
+                {"run_id": run.run_id, "workflow": run.workflow, "state": run.state.value,
+                 "head_sha": run.head_sha, "ref": run.ref,
+                 "jobs": [{"job_id": job.job_id, "name": job.name, "state": job.state.value,
+                           "checked_out_sha": job.checked_out_sha} for job in run.jobs]}
+                for run in evidence.workflow_runs
+            ],
+            "artifacts": [{"name": name, "digest": digest} for name, digest in evidence.artifacts],
+            "policy": {"required_checks": list(self.policy.required_checks),
+                       "required_artifacts": list(self.policy.required_artifacts),
+                       "max_age_seconds": self.policy.max_age_seconds},
+            "evaluation": {"outcome": self.evaluation.outcome.value,
+                           "candidate_sha": self.evaluation.candidate_sha,
+                           "required_checks": list(self.evaluation.required_checks),
+                           "observed_checks": list(self.evaluation.observed_checks),
+                           "evidence_digest": self.evaluation.evidence_digest},
         }
 
 
@@ -815,8 +826,8 @@ class HostedCheckProfileAdapter:
         if snapshot is None:
             raise ExternalValidationAdapterError(HOSTED_CHECK_OBSERVATION_BLOCKER)
         if (
-            snapshot.candidate_sha != binding.candidate_sha
-            or (snapshot.repository, snapshot.workflow, snapshot.ref, snapshot.branch)
+            snapshot.evidence.candidate_sha != binding.candidate_sha
+            or (snapshot.evidence.repository, snapshot.evidence.workflow, snapshot.ref, snapshot.evidence.branch)
             != (context.descriptor.repository, context.descriptor.workflow, context.descriptor.ref, context.descriptor.branch)
         ):
             raise ExternalValidationAdapterError("hosted check snapshot candidate has drifted")
@@ -836,7 +847,7 @@ class HostedCheckProfileAdapter:
         if (
             type(value) is not dict or value.get("schema") != HOSTED_CHECK_SCHEMA
             or value.get("binding_identity") != identity or type(snapshot) is not HostedCheckSnapshot
-            or mutation_count != 0 or snapshot.candidate_sha != binding.candidate_sha
+            or mutation_count != 0 or snapshot.evidence.candidate_sha != binding.candidate_sha
         ):
             raise ExternalValidationAdapterError("hosted check result has drifted")
         return {
@@ -862,7 +873,7 @@ class HostedCheckProfileAdapter:
             {"schema": HOSTED_CHECK_SCHEMA, "binding_identity": _hosted_check_binding_identity(binding), "snapshot": snapshot},
             mutation_count=0,
         ))
-        status = "pass" if type(evidence) is dict and evidence == expected and snapshot.outcome == "pass" else "fail"
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
         return _harness_executor().ProfileComparison(status, _digest({
             "schema": HOSTED_CHECK_SCHEMA, "status": status,
             "ready_at": binding.ready_at, "expected_identity": _digest(expected),

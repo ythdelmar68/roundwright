@@ -246,7 +246,11 @@ def evaluate_hosted_check_evidence(
     if missing:
         return HostedCheckEvaluation(HostedEvidenceOutcome.MISSING, candidate_sha, required_checks, observed, digest)
     required = tuple(check for check in checks if check.name in required_checks)
-    outcome = _combined_outcome((*(check.state for check in required), *(run.state for run in runs)))
+    outcome = _combined_outcome((
+        *(check.state for check in required),
+        *(run.state for run in runs),
+        *(job.state for run in runs for job in run.jobs),
+    ))
     return HostedCheckEvaluation(outcome, candidate_sha, required_checks, observed, digest)
 
 
@@ -294,7 +298,6 @@ def _validate_checks(checks: object, candidate_sha: str) -> tuple[HostedCheck, .
     if type(checks) is not tuple or not checks:
         raise HostedEvidenceError("hosted checks are missing")
     seen_ids: set[str] = set()
-    seen_suites: set[str] = set()
     names: set[str] = set()
     for check in checks:
         if (
@@ -307,10 +310,9 @@ def _validate_checks(checks: object, candidate_sha: str) -> tuple[HostedCheck, .
             or check.checked_out_sha != candidate_sha
         ):
             raise HostedEvidenceError("hosted check evidence is malformed")
-        if check.check_id in seen_ids or check.suite_id in seen_suites or check.name in names:
+        if check.check_id in seen_ids or check.name in names:
             raise HostedEvidenceError("hosted check evidence is duplicate")
         seen_ids.add(check.check_id)
-        seen_suites.add(check.suite_id)
         names.add(check.name)
     return checks
 
@@ -347,6 +349,10 @@ def _validate_workflows(
             raise HostedEvidenceError("hosted workflow job evidence is duplicate")
         jobs.add(job.job_id)
         names.add(job.name)
+    if run.state is HostedCheckState.SUCCESS and any(job.state is not HostedCheckState.SUCCESS for job in run.jobs):
+        raise HostedEvidenceError("hosted workflow and job states conflict")
+    if run.state not in {HostedCheckState.QUEUED, HostedCheckState.IN_PROGRESS, HostedCheckState.SUCCESS} and all(job.state is HostedCheckState.SUCCESS for job in run.jobs):
+        raise HostedEvidenceError("hosted workflow and job states conflict")
     return runs
 
 

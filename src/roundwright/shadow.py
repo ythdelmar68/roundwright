@@ -873,6 +873,7 @@ SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
 EXECUTOR_CONTRACT_SYNTHETIC_PROFILE = "roundwright-shadow-profile/executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = "roundwright-shadow-profile/provider-attempt-accounting/v1"
+HOSTED_CHECK_PROFILE = "roundwright-shadow-profile/hosted-check/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1057,6 +1058,17 @@ _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = ShadowEvidenceProfile(
     64,
 )
 
+_HOSTED_CHECK_PROFILE = ShadowEvidenceProfile(
+    HOSTED_CHECK_PROFILE,
+    CaptureMode.TERMINAL_SNAPSHOT,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-hosted-check-reader-sha-workflow-suite-comparator-recorder-store-readback-bound",
+    "before-terminal-hosted-check-observation-export",
+    "append-only-content-addressed-readback",
+    "reread-exact-hosted-run-or-recapture-exact-candidate",
+    ("hosted-check-observation",),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
@@ -1066,6 +1078,7 @@ def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
         _WORKER_ADAPTER_PROFILE,
         _EXECUTOR_CONTRACT_PROFILE,
         _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+        _HOSTED_CHECK_PROFILE,
     )
 
 
@@ -1076,6 +1089,8 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _EXECUTOR_CONTRACT_PROFILE
     if profile_id == PROVIDER_ATTEMPT_ACCOUNTING_PROFILE:
         return _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+    if profile_id == HOSTED_CHECK_PROFILE:
+        return _HOSTED_CHECK_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

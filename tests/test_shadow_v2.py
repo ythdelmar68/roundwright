@@ -44,6 +44,7 @@ from roundwright.shadow import (
     LifecycleAttempt,
     LifecycleAttemptKind,
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
+    HOSTED_CHECK_PROFILE,
     PROVENANCE_DECISION_PROFILE,
     ProviderAttemptManifest,
     RecorderBinding,
@@ -1054,7 +1055,9 @@ class ShadowV2Tests(unittest.TestCase):
         worker = shadow_evidence_profile("roundwright-shadow-profile/worker-adapter/v1")
         synthetic = shadow_evidence_profile(EXECUTOR_CONTRACT_SYNTHETIC_PROFILE)
         provider_attempts = shadow_evidence_profile("roundwright-shadow-profile/provider-attempt-accounting/v1")
-        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic, provider_attempts))
+        hosted_checks = shadow_evidence_profile(HOSTED_CHECK_PROFILE)
+        self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
+        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic, provider_attempts, hosted_checks))
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
         self.assertEqual(worker.capture_mode, CaptureMode.LIFECYCLE_GRAPH)

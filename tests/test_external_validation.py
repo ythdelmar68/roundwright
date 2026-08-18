@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright import external_validation
-from roundwright.shadow import EXECUTOR_CONTRACT_SYNTHETIC_PROFILE, PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+from roundwright.shadow import EXECUTOR_CONTRACT_SYNTHETIC_PROFILE, HOSTED_CHECK_PROFILE, PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,42 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.roundwright_profile_adapter_factory(
                 "roundwright-shadow-profile/unknown/v1"
             )
+
+    def test_hosted_check_profile_is_context_free_and_disabled_without_a_typed_snapshot(self) -> None:
+        adapter = external_validation.roundwright_profile_adapter_factory(HOSTED_CHECK_PROFILE)
+        producer, exporter, comparator = external_validation.hosted_check_component_identities()
+        exact = binding(
+            profile=HOSTED_CHECK_PROFILE,
+            components=SimpleNamespace(
+                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
+            ),
+        )
+        self.assertEqual(adapter.component_identities, ProfileComponentIdentities(producer, exporter, comparator))
+        adapter.validate(exact)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "observation-unavailable"):
+            adapter.execute(exact)
+
+    def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
+        snapshot = external_validation.HostedCheckSnapshot(
+            "ythdelmar68/roundwright", "CI", "refs/heads/codex/issue-48",
+            "codex/issue-48", "a" * 40, ("suite-48",), ("job-48",),
+            ("sha256:" + "b" * 64,), 12, "pass",
+        )
+        adapter = external_validation.HostedCheckProfileAdapter(snapshot)
+        producer, exporter, comparator = external_validation.hosted_check_component_identities()
+        exact = binding(
+            profile=HOSTED_CHECK_PROFILE,
+            components=SimpleNamespace(
+                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
+            ),
+        )
+        adapter.validate(exact)
+        execution = adapter.execute(exact)
+        evidence = adapter.project(exact, execution)
+        comparison = adapter.compare(exact, evidence)
+        self.assertEqual(execution.mutation_count, 0)
+        self.assertEqual(evidence["hosted_check"]["snapshot"]["workflow"], "CI")
+        self.assertEqual(comparison.status, "pass")
 
     def test_synthetic_adapter_executes_projects_and_compares_at_capture_time(self) -> None:
         adapter = external_validation.SyntheticExecutorAdapter()

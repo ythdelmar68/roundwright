@@ -63,8 +63,9 @@ class ExternalValidationContractTests(unittest.TestCase):
             "`none`/`none`",
             "`harness`/`toolbox`",
             "`harness+forward-test`/`toolbox+disposable-target`",
-            "96772438b251e56d483733179939245565b1374a",
-            "cdfaec6fbcb521edb96a65a88ed4eed62a84f07a",
+            "1004cf0143aef9a777a64a3a0703b10a5680e959",
+            "985b49fade4be8dec1355d183ad824cf9d67a354",
+            "8df4fd5e58dd41de54aeae53ce66a5c49ab0f040",
             "0154817a6fba345b78af25017eb312a1b2349cd6",
             "0f980f75a05ec616395b2cbfed9724417d00d335",
             "cf669e186a739a8597cfaf9f050ce3bdcadda334",
@@ -83,8 +84,11 @@ class ExternalValidationContractTests(unittest.TestCase):
             "roundwright.external_validation:roundwright_profile_adapter_factory",
             "ordinary curated public-safe GitHub lifecycle trace",
             "readiness, result, and handoff GitHub trace events",
+            "blocks before `ARMED` with zero external action",
         ):
             self.assertIn(value, normalized_skill)
+        self.assertIn("Roundlet PR #80", skill)
+        self.assertIn("historical predecessor", normalized_skill)
         self.assertNotIn("TODO", skill)
         self.assertIn(f"${SKILL_NAME}", metadata)
 
@@ -113,16 +117,44 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("Harness PR #4", contract)
         self.assertIn("Harness PR #6", contract)
         self.assertIn("Harness PR #10", contract)
+        self.assertIn("Roundlet PR #82", contract)
         self.assertIn("Roundlet PR #80", contract)
-        self.assertIn("96772438b251e56d483733179939245565b1374a", contract)
+        active_row = next(
+            line for line in contract.splitlines() if "| Generic Orchestrator |" in line
+        )
+        self.assertIn("1004cf0143aef9a777a64a3a0703b10a5680e959", active_row)
+        self.assertIn("985b49fade4be8dec1355d183ad824cf9d67a354", active_row)
+        self.assertIn("8df4fd5e58dd41de54aeae53ce66a5c49ab0f040", active_row)
+        self.assertNotIn("96772438b251e56d483733179939245565b1374a", active_row)
+        normalized = " ".join(contract.split())
+        self.assertIn("historical predecessor", normalized)
         self.assertIn("0154817a6fba345b78af25017eb312a1b2349cd6", contract)
         self.assertIn("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", contract)
         self.assertIn("cf669e186a739a8597cfaf9f050ce3bdcadda334", contract)
         self.assertIn("632dcc3ecb3b8664de860844af2215ad5ade83e1", contract)
         self.assertNotIn("fresh authenticated owner approval", contract)
-        normalized = " ".join(contract.split())
-        self.assertIn("Profile readiness, dispatch, typed export/comparison, recording, and read-back therefore use one entrypoint and one plan", normalized)
-        self.assertIn("Validate and execute use the same request, parser, adapter factory, plan, store, and entrypoint", normalized)
+        self.assertIn(
+            "Profile readiness, dispatch, typed export/comparison, recording, and "
+            "read-back therefore use one entrypoint and one plan",
+            normalized,
+        )
+        self.assertIn(
+            "Validate and execute use the same request, parser, adapter factory, "
+            "plan, store, and entrypoint",
+            normalized,
+        )
+
+    def test_dogfood_order_places_reviewed_roundlet_binding_before_p2(self) -> None:
+        roadmap = (
+            ROOT / "docs" / "operations" / "dogfood-promotion-roadmap.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(roadmap.split())
+        self.assertIn(
+            "#75, #45, reviewed-Runlet binding correction #78, then #48–#51",
+            normalized,
+        )
+        self.assertIn("1004cf0143aef9a777a64a3a0703b10a5680e959", roadmap)
+        self.assertIn("fresh post-merge provider-free synthetic receipt", normalized)
 
     def test_capture_readiness_contract_is_synchronized_and_root_only_routes(self) -> None:
         paths = (

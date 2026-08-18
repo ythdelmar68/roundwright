@@ -18,17 +18,30 @@ by the allowlisted owner.
 
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Generic Orchestrator | `ythdelmar68/roundlet` | canonical merge `96772438b251e56d483733179939245565b1374a`; skill content `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a`; tree `d2aa36b492210dc411b5c1a5c927dc7d286ff21f` | Consume one exact repository-owned executor and track only generic readiness/execution/verification state | Roundwright profile logic, Recorder, provider adapter, evidence store, or a second runner |
+| Generic Orchestrator | `ythdelmar68/roundlet` | canonical merge `1004cf0143aef9a777a64a3a0703b10a5680e959`; skill content `8df4fd5e58dd41de54aeae53ce66a5c49ab0f040`; tree `985b49fade4be8dec1355d183ad824cf9d67a354` | Consume one exact repository-owned executor, derive typed schemas from that binding, keep validation/review sequences independent, and retain unique auxiliary evidence before cleanup | Roundwright profile logic, Recorder, provider adapter, evidence store, accounting-domain discriminator, or a second runner |
 | Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `0154817a6fba345b78af25017eb312a1b2349cd6`; executor content `0f980f75a05ec616395b2cbfed9724417d00d335`; tree `d9fba0facfe561850c0dbff913e8021541b98ca5` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
 | Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
 
-Roundlet PR #80 added generic consumption of repository-owned validation
-executors. Canonical merge `96772438b251e56d483733179939245565b1374a`
-has parents `8ba2813e8aac869cf1f3ebbe78104d03a9134c4a` and
-`6e48b50bce06383845a92f1b403e3d461cde33e1`, resolves to tree
-`d2aa36b492210dc411b5c1a5c927dc7d286ff21f`, and binds installed skill
-content `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a`. The official skill
-validator and repository structure checks passed.
+Roundlet PR #82 corrected generic executor-schema derivation, separated the
+opaque external-validation sequence from the formal Supervisor tuple, refreshed
+exact refs before cleanup ancestry proof, and retained unique auxiliary evidence
+before removal. Canonical merge
+`1004cf0143aef9a777a64a3a0703b10a5680e959` has parents
+`96772438b251e56d483733179939245565b1374a` and
+`607c13ca673f7ca7539372c12ff6f4f8756091ad`, resolves to tree
+`985b49fade4be8dec1355d183ad824cf9d67a354`, and binds installed skill
+content `8df4fd5e58dd41de54aeae53ce66a5c49ab0f040`. The official skill
+validator, focused transition/retention replays, and fresh configured review
+passed. The exact reviewed blobs were installed and read back before this
+Roundwright correction.
+
+Roundlet PR #80 / merge
+`96772438b251e56d483733179939245565b1374a`, tree
+`d2aa36b492210dc411b5c1a5c927dc7d286ff21f`, and skill content
+`cdfaec6fbcb521edb96a65a88ed4eed62a84f07a` remain the historical
+predecessor. They cannot satisfy a newly selected gate. An old/new identity
+conflict blocks before `ARMED` with zero external action and requires one
+wholly fresh binding from the active PR #82 identity.
 
 Harness PR #10 added V2 execution-context materialization to the one
 phase-neutral versioned profile executor. Canonical merge

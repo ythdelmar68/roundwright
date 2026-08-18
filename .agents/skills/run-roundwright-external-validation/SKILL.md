@@ -28,11 +28,15 @@ Before provisioning, invocation, replay, or mutation:
    class, mutation mode, case/contract/configuration identity, this skill's Git
    blob, qualification-contract blob, and public-safe evidence projection.
 5. Bind reviewed generic Roundlet orchestration merge
-   `96772438b251e56d483733179939245565b1374a`, tree
-   `d2aa36b492210dc411b5c1a5c927dc7d286ff21f`, and installed skill content
-   `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a` from Roundlet PR #80. It
+   `1004cf0143aef9a777a64a3a0703b10a5680e959`, tree
+   `985b49fade4be8dec1355d183ad824cf9d67a354`, and installed skill content
+   `8df4fd5e58dd41de54aeae53ce66a5c49ab0f040` from Roundlet PR #82. It
    consumes the repository-owned executor as an opaque exact contract; it does
-   not construct a Roundwright runner or profile adapter.
+   not construct a Roundwright runner or profile adapter. Roundlet PR #80 and
+   merge `96772438b251e56d483733179939245565b1374a` are the historical
+   predecessor only. Selecting that old binding for a new gate is an identity
+   conflict that blocks before `ARMED` with zero external action; it never
+   silently substitutes for PR #82.
 6. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
    `0154817a6fba345b78af25017eb312a1b2349cd6`. That canonical merge binds

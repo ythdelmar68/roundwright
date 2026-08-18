@@ -158,12 +158,7 @@ class ExternalValidationTests(unittest.TestCase):
     def test_hosted_check_profile_is_context_free_and_disabled_without_a_typed_snapshot(self) -> None:
         adapter = external_validation.roundwright_profile_adapter_factory(HOSTED_CHECK_PROFILE)
         producer, exporter, comparator = external_validation.hosted_check_component_identities()
-        exact = binding(
-            profile=HOSTED_CHECK_PROFILE,
-            components=SimpleNamespace(
-                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
-            ),
-        )
+        exact = self.hosted_binding(adapter, producer, exporter, comparator)
         self.assertEqual(adapter.component_identities, ProfileComponentIdentities(producer, exporter, comparator))
         adapter.validate(exact)
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "observation-unavailable"):
@@ -177,12 +172,7 @@ class ExternalValidationTests(unittest.TestCase):
         )
         adapter = external_validation.HostedCheckProfileAdapter(snapshot)
         producer, exporter, comparator = external_validation.hosted_check_component_identities()
-        exact = binding(
-            profile=HOSTED_CHECK_PROFILE,
-            components=SimpleNamespace(
-                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
-            ),
-        )
+        exact = self.hosted_binding(adapter, producer, exporter, comparator)
         adapter.validate(exact)
         execution = adapter.execute(exact)
         evidence = adapter.project(exact, execution)
@@ -190,6 +180,29 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(execution.mutation_count, 0)
         self.assertEqual(evidence["hosted_check"]["snapshot"]["workflow"], "CI")
         self.assertEqual(comparison.status, "pass")
+
+    def hosted_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:
+        plan = SimpleNamespace(
+            plan_digest="sha256:" + "1" * 64, profile=HOSTED_CHECK_PROFILE,
+            case_id="hosted-check-case", candidate_sha="a" * 40, ready_at=17,
+        )
+        descriptor = {
+            "schema": "roundwright-hosted-check-runtime/v1",
+            "repository": "ythdelmar68/roundwright", "workflow": "CI",
+            "ref": "refs/heads/codex/issue-48", "branch": "codex/issue-48",
+            "base_sha": "b" * 40, "candidate_sha": "a" * 40,
+            "capture_plan_digest": plan.plan_digest, "case_id": plan.case_id,
+            "ready_at": plan.ready_at, "pull_request": 80,
+        }
+        context = adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=plan))  # type: ignore[attr-defined]
+        return SimpleNamespace(
+            profile=HOSTED_CHECK_PROFILE, case_id=plan.case_id,
+            candidate_sha=plan.candidate_sha, ready_at=plan.ready_at, plan=plan,
+            components=SimpleNamespace(
+                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
+            ),
+            execution_context=context, execution_context_input_digest="sha256:" + "2" * 64,
+        )
 
     def test_synthetic_adapter_executes_projects_and_compares_at_capture_time(self) -> None:
         adapter = external_validation.SyntheticExecutorAdapter()

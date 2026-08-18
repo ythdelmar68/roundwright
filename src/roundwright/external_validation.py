@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
 from .shadow import (
@@ -637,6 +638,87 @@ class HostedCheckSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class HostedCheckRuntimeDescriptor:
+    """Closed V2 public context; it carries identities, never provider output."""
+
+    repository: str
+    workflow: str
+    ref: str
+    branch: str
+    base_sha: str
+    candidate_sha: str
+    capture_plan_digest: str
+    case_id: str
+    ready_at: int
+    pull_request: int
+    schema: str = "roundwright-hosted-check-runtime/v1"
+
+    @classmethod
+    def parse(cls, value: object) -> "HostedCheckRuntimeDescriptor":
+        if type(value) not in (dict, MappingProxyType):
+            raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid")
+        raw = dict(value)
+        expected = {
+            "schema", "repository", "workflow", "ref", "branch", "base_sha",
+            "candidate_sha", "capture_plan_digest", "case_id", "ready_at", "pull_request",
+        }
+        if set(raw) != expected:
+            raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid")
+        try:
+            return cls(**raw)
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid") from error
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema != "roundwright-hosted-check-runtime/v1"
+            or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}", self.repository)
+            or not _safe_token(self.workflow)
+            or not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", self.ref)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", self.branch)
+            or self.ref != f"refs/heads/{self.branch}"
+            or _SHA.fullmatch(self.base_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or not _safe_token(self.case_id)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.pull_request) is not int or self.pull_request <= 0
+        ):
+            raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema, "repository": self.repository, "workflow": self.workflow,
+            "ref": self.ref, "branch": self.branch, "base_sha": self.base_sha,
+            "candidate_sha": self.candidate_sha,
+            "capture_plan_digest": self.capture_plan_digest, "case_id": self.case_id,
+            "ready_at": self.ready_at, "pull_request": self.pull_request,
+        }
+
+
+@dataclass(frozen=True)
+class MaterializedHostedCheckContext:
+    """Opaque V2 value retained unchanged across validate, execute, and replay."""
+
+    descriptor: HostedCheckRuntimeDescriptor
+
+    @property
+    def identity(self) -> str:
+        return _digest({"schema": "roundwright-hosted-check-context/v1", "descriptor": self.descriptor.payload()})
+
+
+def prepare_hosted_check_context(
+    descriptor_value: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
+) -> MaterializedHostedCheckContext:
+    descriptor = HostedCheckRuntimeDescriptor.parse(descriptor_value)
+    if (
+        descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at,
+    ) != (plan_digest, candidate_sha, case_id, ready_at):
+        raise ExternalValidationAdapterError("hosted check runtime descriptor does not match capture plan")
+    return MaterializedHostedCheckContext(descriptor)
+
+
 def _hosted_check_binding_identity(binding: object) -> str:
     try:
         value = {
@@ -657,6 +739,26 @@ def _hosted_check_binding_identity(binding: object) -> str:
     return _digest(value)
 
 
+def _hosted_check_context(binding: object) -> MaterializedHostedCheckContext:
+    try:
+        context = binding.execution_context
+        descriptor_digest = binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("hosted check V2 execution context is unavailable") from error
+    if type(value) is not MaterializedHostedCheckContext or type(descriptor_digest) is not str or _DIGEST.fullmatch(descriptor_digest) is None:
+        raise ExternalValidationAdapterError("hosted check V2 execution context has drifted")
+    descriptor = value.descriptor
+    if (
+        descriptor.candidate_sha != binding.candidate_sha
+        or descriptor.capture_plan_digest != binding.plan.plan_digest
+        or descriptor.case_id != binding.case_id
+        or descriptor.ready_at != binding.ready_at
+    ):
+        raise ExternalValidationAdapterError("hosted check V2 execution context has drifted")
+    return value
+
+
 @dataclass(frozen=True)
 class HostedCheckProfileAdapter:
     """Context-free hosted-check profile with no default provider capability."""
@@ -672,8 +774,22 @@ class HostedCheckProfileAdapter:
     def component_identities(self) -> object:
         return _harness_executor().ProfileComponentIdentities(*hosted_check_component_identities())
 
+    def prepare_execution_context(self, preparation: object) -> object:
+        """Materialize the one closed public V2 descriptor without provider access."""
+
+        try:
+            context = prepare_hosted_check_context(
+                preparation.descriptor, plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha, case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("hosted check V2 execution context is invalid") from error
+
     def validate(self, binding: object) -> None:
         _hosted_check_binding_identity(binding)
+        _hosted_check_context(binding)
         try:
             actual = (
                 binding.components.producer_identity, binding.components.exporter_identity,
@@ -692,10 +808,15 @@ class HostedCheckProfileAdapter:
 
     def execute(self, binding: object) -> object:
         identity = _hosted_check_binding_identity(binding)
+        context = _hosted_check_context(binding)
         snapshot = self.snapshot
         if snapshot is None:
             raise ExternalValidationAdapterError(HOSTED_CHECK_OBSERVATION_BLOCKER)
-        if snapshot.candidate_sha != binding.candidate_sha:
+        if (
+            snapshot.candidate_sha != binding.candidate_sha
+            or (snapshot.repository, snapshot.workflow, snapshot.ref, snapshot.branch)
+            != (context.descriptor.repository, context.descriptor.workflow, context.descriptor.ref, context.descriptor.branch)
+        ):
             raise ExternalValidationAdapterError("hosted check snapshot candidate has drifted")
         return _harness_executor().ProfileExecution(
             {"schema": HOSTED_CHECK_SCHEMA, "binding_identity": identity, "snapshot": snapshot},
@@ -704,6 +825,7 @@ class HostedCheckProfileAdapter:
 
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
         identity = _hosted_check_binding_identity(binding)
+        _hosted_check_context(binding)
         try:
             value, mutation_count = execution.value, execution.mutation_count
             snapshot = value["snapshot"]
@@ -730,8 +852,15 @@ class HostedCheckProfileAdapter:
         }
 
     def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
-        expected = self.project(binding, self.execute(binding))
-        status = "pass" if type(evidence) is dict and evidence == expected and self.snapshot is not None and self.snapshot.outcome == "pass" else "fail"
+        _hosted_check_context(binding)
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise ExternalValidationAdapterError(HOSTED_CHECK_OBSERVATION_BLOCKER)
+        expected = self.project(binding, _harness_executor().ProfileExecution(
+            {"schema": HOSTED_CHECK_SCHEMA, "binding_identity": _hosted_check_binding_identity(binding), "snapshot": snapshot},
+            mutation_count=0,
+        ))
+        status = "pass" if type(evidence) is dict and evidence == expected and snapshot.outcome == "pass" else "fail"
         return _harness_executor().ProfileComparison(status, _digest({
             "schema": HOSTED_CHECK_SCHEMA, "status": status,
             "ready_at": binding.ready_at, "expected_identity": _digest(expected),
@@ -749,6 +878,44 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
     if profile_id == HOSTED_CHECK_PROFILE:
         return HostedCheckProfileAdapter(profile_id=profile_id)
     raise ExternalValidationAdapterError("executor profile is unsupported")
+
+
+def run_hosted_check_profile(
+    mode: Literal["validate", "execute"], request_value: Mapping[str, Any], store_root: Path,
+    snapshot: HostedCheckSnapshot | None = None, *, expected_readiness_digest: str | None = None,
+) -> object:
+    """Run the one V2 hosted-check flow with an explicit typed observation.
+
+    Validate has no provider capability.  Execute requires a caller-supplied
+    normalized snapshot bound to the same request/context; it never receives
+    credentials, raw provider output, paths, or an inferred latest run.
+    """
+
+    harness = _harness_executor()
+    try:
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != HOSTED_CHECK_PROFILE
+            or request.execution_context is None
+            or not isinstance(store_root, Path)
+            or (mode == "execute" and type(snapshot) is not HostedCheckSnapshot)
+            or (mode == "validate" and snapshot is not None)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        prepare_hosted_check_context(
+            request.execution_context, plan_digest=plan.plan_digest, candidate_sha=plan.candidate_sha,
+            case_id=plan.case_id, ready_at=plan.ready_at,
+        )
+        return harness.run_profile_executor(
+            mode, request_value, HostedCheckProfileAdapter(snapshot), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except ExternalValidationAdapterError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("hosted check hosted entrypoint binding is invalid") from error
 
 
 def run_provider_attempt_accounting_profile(

@@ -599,6 +599,7 @@ class HostedCheckSnapshot:
     ref: str
     evaluated_at: int
     evaluation: HostedCheckEvaluation = field(init=False)
+    evaluation_identity: str = field(init=False)
 
     def __post_init__(self) -> None:
         if type(self.evidence) is not HostedCheckEvidence or type(self.policy) is not HostedCheckPolicy:
@@ -620,6 +621,10 @@ class HostedCheckSnapshot:
         if evaluation.outcome is not HostedEvidenceOutcome.PASS:
             raise ExternalValidationAdapterError("hosted check snapshot is not a passing evaluation")
         object.__setattr__(self, "evaluation", evaluation)
+        object.__setattr__(
+            self, "evaluation_identity",
+            _hosted_check_evaluation_identity(self.policy, evaluation, self.evaluated_at),
+        )
 
     def public_payload(self) -> dict[str, object]:
         evidence = self.evidence
@@ -627,6 +632,7 @@ class HostedCheckSnapshot:
             "repository": evidence.repository, "workflow": evidence.workflow,
             "ref": self.ref, "branch": evidence.branch,
             "candidate_sha": evidence.candidate_sha, "observed_at": evidence.observed_at,
+            "evaluated_at": self.evaluated_at,
             "checks": [
                 {"check_id": item.check_id, "suite_id": item.suite_id, "name": item.name,
                  "state": item.state.value, "head_sha": item.head_sha, "checked_out_sha": item.checked_out_sha}
@@ -640,15 +646,37 @@ class HostedCheckSnapshot:
                 for run in evidence.workflow_runs
             ],
             "artifacts": [{"name": name, "digest": digest} for name, digest in evidence.artifacts],
-            "policy": {"required_checks": list(self.policy.required_checks),
-                       "required_artifacts": list(self.policy.required_artifacts),
-                       "max_age_seconds": self.policy.max_age_seconds},
+            "policy": _hosted_check_policy_payload(self.policy),
             "evaluation": {"outcome": self.evaluation.outcome.value,
                            "candidate_sha": self.evaluation.candidate_sha,
                            "required_checks": list(self.evaluation.required_checks),
                            "observed_checks": list(self.evaluation.observed_checks),
-                           "evidence_digest": self.evaluation.evidence_digest},
+                           "evidence_digest": self.evaluation.evidence_digest,
+                           "evaluation_identity": self.evaluation_identity},
         }
+
+
+def _hosted_check_policy_payload(policy: HostedCheckPolicy) -> dict[str, object]:
+    return {"required_checks": list(policy.required_checks),
+            "required_artifacts": list(policy.required_artifacts),
+            "max_age_seconds": policy.max_age_seconds}
+
+
+def _safe_hosted_name(value: object) -> bool:
+    """Match the public hosted-policy name grammar without accepting controls."""
+
+    return type(value) is str and bool(re.fullmatch(r"[^\x00-\x1f\x7f]{1,256}", value))
+
+
+def _hosted_check_evaluation_identity(
+    policy: HostedCheckPolicy, evaluation: HostedCheckEvaluation, evaluated_at: int,
+) -> str:
+    return _digest({
+        "schema": "roundwright-hosted-check-evaluation/v1",
+        "policy": _hosted_check_policy_payload(policy),
+        "evidence_digest": evaluation.evidence_digest,
+        "evaluated_at": evaluated_at,
+    })
 
 
 @dataclass(frozen=True)
@@ -665,6 +693,10 @@ class HostedCheckRuntimeDescriptor:
     case_id: str
     ready_at: int
     pull_request: int
+    required_checks: tuple[str, ...]
+    required_artifacts: tuple[str, ...]
+    max_age_seconds: int
+    evaluated_at: int
     schema: str = "roundwright-hosted-check-runtime/v1"
 
     @classmethod
@@ -675,10 +707,13 @@ class HostedCheckRuntimeDescriptor:
         expected = {
             "schema", "repository", "workflow", "ref", "branch", "base_sha",
             "candidate_sha", "capture_plan_digest", "case_id", "ready_at", "pull_request",
+            "required_checks", "required_artifacts", "max_age_seconds", "evaluated_at",
         }
         if set(raw) != expected:
             raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid")
         try:
+            raw["required_checks"] = tuple(raw["required_checks"])
+            raw["required_artifacts"] = tuple(raw["required_artifacts"])
             return cls(**raw)
         except (TypeError, ValueError) as error:
             raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid") from error
@@ -697,6 +732,16 @@ class HostedCheckRuntimeDescriptor:
             or not _safe_token(self.case_id)
             or type(self.ready_at) is not int or self.ready_at < 0
             or type(self.pull_request) is not int or self.pull_request <= 0
+            or type(self.required_checks) is not tuple or not self.required_checks
+            or any(not _safe_hosted_name(value) for value in self.required_checks)
+            or tuple(sorted(self.required_checks)) != self.required_checks
+            or len(set(self.required_checks)) != len(self.required_checks)
+            or type(self.required_artifacts) is not tuple
+            or any(not _safe_token(value) for value in self.required_artifacts)
+            or tuple(sorted(self.required_artifacts)) != self.required_artifacts
+            or len(set(self.required_artifacts)) != len(self.required_artifacts)
+            or type(self.max_age_seconds) is not int or not 0 <= self.max_age_seconds <= 86_400
+            or type(self.evaluated_at) is not int or self.evaluated_at != self.ready_at
         ):
             raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid")
 
@@ -707,7 +752,13 @@ class HostedCheckRuntimeDescriptor:
             "candidate_sha": self.candidate_sha,
             "capture_plan_digest": self.capture_plan_digest, "case_id": self.case_id,
             "ready_at": self.ready_at, "pull_request": self.pull_request,
+            "required_checks": list(self.required_checks), "required_artifacts": list(self.required_artifacts),
+            "max_age_seconds": self.max_age_seconds, "evaluated_at": self.evaluated_at,
         }
+
+    @property
+    def policy(self) -> HostedCheckPolicy:
+        return HostedCheckPolicy(self.required_checks, self.required_artifacts, self.max_age_seconds)
 
 
 @dataclass(frozen=True)
@@ -772,6 +823,42 @@ def _hosted_check_context(binding: object) -> MaterializedHostedCheckContext:
     return value
 
 
+def _bound_hosted_check_evaluation(
+    binding: object,
+    snapshot: HostedCheckSnapshot,
+    context: MaterializedHostedCheckContext,
+) -> HostedCheckEvaluation:
+    """Re-evaluate a typed observation against the immutable V2 context."""
+
+    descriptor = context.descriptor
+    if (
+        snapshot.evidence.candidate_sha != binding.candidate_sha
+        or (snapshot.evidence.repository, snapshot.evidence.workflow, snapshot.ref, snapshot.evidence.branch)
+        != (descriptor.repository, descriptor.workflow, descriptor.ref, descriptor.branch)
+    ):
+        raise ExternalValidationAdapterError("hosted check snapshot candidate has drifted")
+    if snapshot.policy != descriptor.policy:
+        raise ExternalValidationAdapterError("hosted check snapshot policy has drifted")
+    if snapshot.evaluated_at != descriptor.evaluated_at:
+        raise ExternalValidationAdapterError("hosted check snapshot evaluation time has drifted")
+    try:
+        evaluation = evaluate_hosted_check_evidence(
+            snapshot.evidence, repository=descriptor.repository, workflow=descriptor.workflow,
+            candidate_sha=binding.candidate_sha, branch=descriptor.branch,
+            policy=descriptor.policy, now=descriptor.evaluated_at,
+        )
+    except ValueError as error:
+        raise ExternalValidationAdapterError("hosted check snapshot evaluation is invalid") from error
+    if (
+        evaluation.outcome is not HostedEvidenceOutcome.PASS
+        or evaluation != snapshot.evaluation
+        or snapshot.evaluation_identity
+        != _hosted_check_evaluation_identity(descriptor.policy, evaluation, descriptor.evaluated_at)
+    ):
+        raise ExternalValidationAdapterError("hosted check snapshot evaluation has drifted")
+    return evaluation
+
+
 @dataclass(frozen=True)
 class HostedCheckProfileAdapter:
     """Context-free hosted-check profile with no default provider capability."""
@@ -825,12 +912,7 @@ class HostedCheckProfileAdapter:
         snapshot = self.snapshot
         if snapshot is None:
             raise ExternalValidationAdapterError(HOSTED_CHECK_OBSERVATION_BLOCKER)
-        if (
-            snapshot.evidence.candidate_sha != binding.candidate_sha
-            or (snapshot.evidence.repository, snapshot.evidence.workflow, snapshot.ref, snapshot.evidence.branch)
-            != (context.descriptor.repository, context.descriptor.workflow, context.descriptor.ref, context.descriptor.branch)
-        ):
-            raise ExternalValidationAdapterError("hosted check snapshot candidate has drifted")
+        _bound_hosted_check_evaluation(binding, snapshot, context)
         return _harness_executor().ProfileExecution(
             {"schema": HOSTED_CHECK_SCHEMA, "binding_identity": identity, "snapshot": snapshot},
             mutation_count=0,
@@ -838,7 +920,7 @@ class HostedCheckProfileAdapter:
 
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
         identity = _hosted_check_binding_identity(binding)
-        _hosted_check_context(binding)
+        context = _hosted_check_context(binding)
         try:
             value, mutation_count = execution.value, execution.mutation_count
             snapshot = value["snapshot"]
@@ -850,6 +932,7 @@ class HostedCheckProfileAdapter:
             or mutation_count != 0 or snapshot.evidence.candidate_sha != binding.candidate_sha
         ):
             raise ExternalValidationAdapterError("hosted check result has drifted")
+        _bound_hosted_check_evaluation(binding, snapshot, context)
         return {
             "schema": "roundwright-shadow-case/v2", "profile": HOSTED_CHECK_PROFILE,
             "ready_at": binding.ready_at, "case_id": binding.case_id,

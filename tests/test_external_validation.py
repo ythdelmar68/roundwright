@@ -202,6 +202,46 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "not a passing"):
             external_validation.HostedCheckSnapshot(failed, self.hosted_snapshot().policy, "refs/heads/codex/issue-48", 17)
 
+    def test_hosted_check_execution_rejects_a_substituted_or_omitted_policy(self) -> None:
+        snapshot = self.hosted_snapshot()
+        substituted = external_validation.HostedCheckSnapshot(
+            snapshot.evidence, HostedCheckPolicy(("unit",), (), 60), snapshot.ref, snapshot.evaluated_at,
+        )
+        adapter = external_validation.HostedCheckProfileAdapter(substituted)
+        producer, exporter, comparator = external_validation.hosted_check_component_identities()
+        exact = self.hosted_binding(adapter, producer, exporter, comparator)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "policy has drifted"):
+            adapter.execute(exact)
+
+        descriptor = exact.execution_context.value.descriptor.payload()
+        descriptor.pop("required_artifacts")
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "execution context is invalid"):
+            adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=exact.plan))
+
+    def test_hosted_check_execution_rejects_a_mismatched_evaluation_time(self) -> None:
+        snapshot = self.hosted_snapshot()
+        historical = external_validation.HostedCheckSnapshot(
+            snapshot.evidence, snapshot.policy, snapshot.ref, 16,
+        )
+        adapter = external_validation.HostedCheckProfileAdapter(historical)
+        producer, exporter, comparator = external_validation.hosted_check_component_identities()
+        exact = self.hosted_binding(adapter, producer, exporter, comparator)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "evaluation time has drifted"):
+            adapter.execute(exact)
+
+    def test_hosted_runtime_descriptor_accepts_public_matrix_check_names(self) -> None:
+        adapter = external_validation.HostedCheckProfileAdapter()
+        producer, exporter, comparator = external_validation.hosted_check_component_identities()
+        exact = self.hosted_binding(adapter, producer, exporter, comparator)
+        descriptor = exact.execution_context.value.descriptor.payload()
+        names = (
+            "build-package (windows-latest, 3.12)",
+            "verify-package (windows-latest, 3.12)",
+        )
+        descriptor["required_checks"] = list(names)
+        context = adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=exact.plan))
+        self.assertEqual(context.value.descriptor.required_checks, names)
+
     def hosted_snapshot(self) -> external_validation.HostedCheckSnapshot:
         evidence = HostedCheckEvidence(
             "ythdelmar68/roundwright", "CI", "a" * 40, "codex/issue-48", 12,
@@ -226,6 +266,8 @@ class ExternalValidationTests(unittest.TestCase):
             "base_sha": "b" * 40, "candidate_sha": "a" * 40,
             "capture_plan_digest": plan.plan_digest, "case_id": plan.case_id,
             "ready_at": plan.ready_at, "pull_request": 80,
+            "required_checks": ["unit"], "required_artifacts": ["build-manifest"],
+            "max_age_seconds": 60, "evaluated_at": plan.ready_at,
         }
         context = adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=plan))  # type: ignore[attr-defined]
         return SimpleNamespace(

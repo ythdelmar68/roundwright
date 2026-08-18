@@ -200,12 +200,16 @@ class ExternalValidationTests(unittest.TestCase):
             evidence.workflow_runs, evidence.artifacts,
         )
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "not a passing"):
-            external_validation.HostedCheckSnapshot(failed, self.hosted_snapshot().policy, "refs/heads/codex/issue-48", 17)
+            external_validation.HostedCheckSnapshot(
+                failed, self.hosted_snapshot().policy, "refs/heads/codex/issue-48", 17,
+                "run-48", "suite-48",
+            )
 
     def test_hosted_check_execution_rejects_a_substituted_or_omitted_policy(self) -> None:
         snapshot = self.hosted_snapshot()
         substituted = external_validation.HostedCheckSnapshot(
             snapshot.evidence, HostedCheckPolicy(("unit",), (), 60), snapshot.ref, snapshot.evaluated_at,
+            snapshot.workflow_run_id, snapshot.check_suite_id,
         )
         adapter = external_validation.HostedCheckProfileAdapter(substituted)
         producer, exporter, comparator = external_validation.hosted_check_component_identities()
@@ -222,6 +226,7 @@ class ExternalValidationTests(unittest.TestCase):
         snapshot = self.hosted_snapshot()
         historical = external_validation.HostedCheckSnapshot(
             snapshot.evidence, snapshot.policy, snapshot.ref, 16,
+            snapshot.workflow_run_id, snapshot.check_suite_id,
         )
         adapter = external_validation.HostedCheckProfileAdapter(historical)
         producer, exporter, comparator = external_validation.hosted_check_component_identities()
@@ -242,16 +247,27 @@ class ExternalValidationTests(unittest.TestCase):
         context = adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=exact.plan))
         self.assertEqual(context.value.descriptor.required_checks, names)
 
+    def test_hosted_runtime_descriptor_rejects_non_array_policy_collections(self) -> None:
+        adapter = external_validation.HostedCheckProfileAdapter()
+        producer, exporter, comparator = external_validation.hosted_check_component_identities()
+        exact = self.hosted_binding(adapter, producer, exporter, comparator)
+        for field in ("required_checks", "required_artifacts"):
+            with self.subTest(field=field):
+                descriptor = exact.execution_context.value.descriptor.payload()
+                descriptor[field] = "unit"
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "execution context is invalid"):
+                    adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=exact.plan))
+
     def hosted_snapshot(self) -> external_validation.HostedCheckSnapshot:
         evidence = HostedCheckEvidence(
             "ythdelmar68/roundwright", "CI", "a" * 40, "codex/issue-48", 12,
             (HostedCheck("check-48", "suite-48", "unit", HostedCheckState.SUCCESS, "a" * 40, "a" * 40),),
-            (HostedWorkflowRun("run-48", "CI", HostedCheckState.SUCCESS, "a" * 40, "refs/heads/codex/issue-48", (HostedWorkflowJob("job-48", "unit", HostedCheckState.SUCCESS, "a" * 40),)),),
+            (HostedWorkflowRun("run-48", "CI", HostedCheckState.SUCCESS, "a" * 40, "refs/heads/codex/issue-48", (HostedWorkflowJob("job-48", "unit", HostedCheckState.SUCCESS, "a" * 40),), "suite-48"),),
             (("build-manifest", "b" * 64),),
         )
         return external_validation.HostedCheckSnapshot(
             evidence, HostedCheckPolicy(("unit",), ("build-manifest",), 60),
-            "refs/heads/codex/issue-48", 17,
+            "refs/heads/codex/issue-48", 17, "run-48", "suite-48",
         )
 
     def hosted_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:
@@ -266,6 +282,7 @@ class ExternalValidationTests(unittest.TestCase):
             "base_sha": "b" * 40, "candidate_sha": "a" * 40,
             "capture_plan_digest": plan.plan_digest, "case_id": plan.case_id,
             "ready_at": plan.ready_at, "pull_request": 80,
+            "workflow_run_id": "run-48", "check_suite_id": "suite-48",
             "required_checks": ["unit"], "required_artifacts": ["build-manifest"],
             "max_age_seconds": 60, "evaluated_at": plan.ready_at,
         }

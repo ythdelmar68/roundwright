@@ -598,6 +598,8 @@ class HostedCheckSnapshot:
     policy: HostedCheckPolicy
     ref: str
     evaluated_at: int
+    workflow_run_id: str
+    check_suite_id: str
     evaluation: HostedCheckEvaluation = field(init=False)
     evaluation_identity: str = field(init=False)
 
@@ -608,6 +610,7 @@ class HostedCheckSnapshot:
             not re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", self.ref)
             or self.ref != f"refs/heads/{self.evidence.branch}"
             or type(self.evaluated_at) is not int or self.evaluated_at < 0
+            or not _safe_token(self.workflow_run_id) or not _safe_token(self.check_suite_id)
         ):
             raise ExternalValidationAdapterError("hosted check snapshot is invalid")
         try:
@@ -615,6 +618,7 @@ class HostedCheckSnapshot:
                 self.evidence, repository=self.evidence.repository, workflow=self.evidence.workflow,
                 candidate_sha=self.evidence.candidate_sha, branch=self.evidence.branch,
                 policy=self.policy, now=self.evaluated_at,
+                workflow_run_id=self.workflow_run_id, check_suite_id=self.check_suite_id,
             )
         except ValueError as error:
             raise ExternalValidationAdapterError("hosted check snapshot is invalid") from error
@@ -633,6 +637,7 @@ class HostedCheckSnapshot:
             "ref": self.ref, "branch": evidence.branch,
             "candidate_sha": evidence.candidate_sha, "observed_at": evidence.observed_at,
             "evaluated_at": self.evaluated_at,
+            "workflow_run_id": self.workflow_run_id, "check_suite_id": self.check_suite_id,
             "checks": [
                 {"check_id": item.check_id, "suite_id": item.suite_id, "name": item.name,
                  "state": item.state.value, "head_sha": item.head_sha, "checked_out_sha": item.checked_out_sha}
@@ -652,6 +657,8 @@ class HostedCheckSnapshot:
                            "required_checks": list(self.evaluation.required_checks),
                            "observed_checks": list(self.evaluation.observed_checks),
                            "evidence_digest": self.evaluation.evidence_digest,
+                           "workflow_run_id": self.evaluation.workflow_run_id,
+                           "check_suite_id": self.evaluation.check_suite_id,
                            "evaluation_identity": self.evaluation_identity},
         }
 
@@ -693,6 +700,8 @@ class HostedCheckRuntimeDescriptor:
     case_id: str
     ready_at: int
     pull_request: int
+    workflow_run_id: str
+    check_suite_id: str
     required_checks: tuple[str, ...]
     required_artifacts: tuple[str, ...]
     max_age_seconds: int
@@ -707,11 +716,14 @@ class HostedCheckRuntimeDescriptor:
         expected = {
             "schema", "repository", "workflow", "ref", "branch", "base_sha",
             "candidate_sha", "capture_plan_digest", "case_id", "ready_at", "pull_request",
+            "workflow_run_id", "check_suite_id",
             "required_checks", "required_artifacts", "max_age_seconds", "evaluated_at",
         }
         if set(raw) != expected:
             raise ExternalValidationAdapterError("hosted check runtime descriptor is invalid")
         try:
+            if type(raw["required_checks"]) not in (list, tuple) or type(raw["required_artifacts"]) not in (list, tuple):
+                raise TypeError("hosted check policy collections must be arrays or frozen tuples")
             raw["required_checks"] = tuple(raw["required_checks"])
             raw["required_artifacts"] = tuple(raw["required_artifacts"])
             return cls(**raw)
@@ -732,6 +744,7 @@ class HostedCheckRuntimeDescriptor:
             or not _safe_token(self.case_id)
             or type(self.ready_at) is not int or self.ready_at < 0
             or type(self.pull_request) is not int or self.pull_request <= 0
+            or not _safe_token(self.workflow_run_id) or not _safe_token(self.check_suite_id)
             or type(self.required_checks) is not tuple or not self.required_checks
             or any(not _safe_hosted_name(value) for value in self.required_checks)
             or tuple(sorted(self.required_checks)) != self.required_checks
@@ -752,6 +765,7 @@ class HostedCheckRuntimeDescriptor:
             "candidate_sha": self.candidate_sha,
             "capture_plan_digest": self.capture_plan_digest, "case_id": self.case_id,
             "ready_at": self.ready_at, "pull_request": self.pull_request,
+            "workflow_run_id": self.workflow_run_id, "check_suite_id": self.check_suite_id,
             "required_checks": list(self.required_checks), "required_artifacts": list(self.required_artifacts),
             "max_age_seconds": self.max_age_seconds, "evaluated_at": self.evaluated_at,
         }
@@ -835,6 +849,8 @@ def _bound_hosted_check_evaluation(
         snapshot.evidence.candidate_sha != binding.candidate_sha
         or (snapshot.evidence.repository, snapshot.evidence.workflow, snapshot.ref, snapshot.evidence.branch)
         != (descriptor.repository, descriptor.workflow, descriptor.ref, descriptor.branch)
+        or (snapshot.workflow_run_id, snapshot.check_suite_id)
+        != (descriptor.workflow_run_id, descriptor.check_suite_id)
     ):
         raise ExternalValidationAdapterError("hosted check snapshot candidate has drifted")
     if snapshot.policy != descriptor.policy:
@@ -846,6 +862,7 @@ def _bound_hosted_check_evaluation(
             snapshot.evidence, repository=descriptor.repository, workflow=descriptor.workflow,
             candidate_sha=binding.candidate_sha, branch=descriptor.branch,
             policy=descriptor.policy, now=descriptor.evaluated_at,
+            workflow_run_id=descriptor.workflow_run_id, check_suite_id=descriptor.check_suite_id,
         )
     except ValueError as error:
         raise ExternalValidationAdapterError("hosted check snapshot evaluation is invalid") from error

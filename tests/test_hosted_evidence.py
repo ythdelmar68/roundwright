@@ -96,7 +96,7 @@ class HostedCheckEvidenceTests(unittest.TestCase):
             "branch": self.branch,
             "observed_at": self.now,
             "checks": (HostedCheck("check-1", "suite-1", "unit", HostedCheckState.SUCCESS, self.candidate, self.candidate),),
-            "workflow_runs": (HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (HostedWorkflowJob("job-1", "unit", HostedCheckState.SUCCESS, self.candidate),)),),
+            "workflow_runs": (HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (HostedWorkflowJob("job-1", "unit", HostedCheckState.SUCCESS, self.candidate),), "suite-1"),),
             "artifacts": (("build-manifest", "b" * 64),),
         }
         values.update(changes)
@@ -110,7 +110,12 @@ class HostedCheckEvidenceTests(unittest.TestCase):
         return HostedCheckPolicy(**values)  # type: ignore[arg-type]
 
     def evaluate(self, evidence: HostedCheckEvidence, **changes: object):
-        values: dict[str, object] = {"repository": self.repository, "workflow": self.workflow, "candidate_sha": self.candidate, "branch": self.branch, "policy": self.policy(), "now": self.now}
+        values: dict[str, object] = {
+            "repository": self.repository, "workflow": self.workflow,
+            "candidate_sha": self.candidate, "branch": self.branch,
+            "policy": self.policy(), "now": self.now,
+            "workflow_run_id": "run-1", "check_suite_id": "suite-1",
+        }
         values.update(changes)
         return evaluate_hosted_check_evidence(evidence, **values)  # type: ignore[arg-type]
 
@@ -153,7 +158,7 @@ class HostedCheckEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(HostedEvidenceError, "malformed"):
             self.evaluate(self.evidence(checks=(bad_check,)))
         bad_job = HostedWorkflowJob("job-1", "unit", HostedCheckState.SUCCESS, "b" * 40)
-        bad_run = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (bad_job,))
+        bad_run = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (bad_job,), "suite-1")
         with self.assertRaisesRegex(HostedEvidenceError, "malformed"):
             self.evaluate(self.evidence(workflow_runs=(bad_run,)))
 
@@ -167,11 +172,26 @@ class HostedCheckEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(HostedEvidenceError, "duplicate"):
             self.evaluate(self.evidence(workflow_runs=(duplicate_run, duplicate_run)))
         duplicate_job = HostedWorkflowJob("job-2", "unit", HostedCheckState.SUCCESS, self.candidate)
-        duplicate_job_run = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (self.evidence().workflow_runs[0].jobs[0], duplicate_job))
+        duplicate_job_run = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (self.evidence().workflow_runs[0].jobs[0], duplicate_job), "suite-1")
         with self.assertRaisesRegex(HostedEvidenceError, "duplicate"):
             self.evaluate(self.evidence(workflow_runs=(duplicate_job_run,)))
         with self.assertRaisesRegex(HostedEvidenceError, "duplicate"):
             self.evaluate(self.evidence(artifacts=(("build-manifest", "b" * 64), ("build-manifest", "c" * 64))))
+
+    def test_mixed_suite_and_same_candidate_rerun_substitution_fail_closed(self) -> None:
+        mixed_suite = HostedCheck(
+            "check-2", "suite-2", "unit", HostedCheckState.SUCCESS,
+            self.candidate, self.candidate,
+        )
+        with self.assertRaisesRegex(HostedEvidenceError, "malformed"):
+            self.evaluate(self.evidence(checks=(mixed_suite,)))
+
+        later_run = HostedWorkflowRun(
+            "run-2", self.workflow, HostedCheckState.SUCCESS, self.candidate,
+            f"refs/heads/{self.branch}", self.evidence().workflow_runs[0].jobs, "suite-1",
+        )
+        with self.assertRaisesRegex(HostedEvidenceError, "malformed"):
+            self.evaluate(self.evidence(workflow_runs=(later_run,)))
 
     def test_every_non_success_job_state_prevents_pass_and_terminal_conflicts_fail_closed(self) -> None:
         outcomes = {
@@ -185,9 +205,9 @@ class HostedCheckEvidenceTests(unittest.TestCase):
         for state, expected in outcomes.items():
             with self.subTest(state=state):
                 job = HostedWorkflowJob("job-1", "unit", state, self.candidate)
-                run = HostedWorkflowRun("run-1", self.workflow, state, self.candidate, f"refs/heads/{self.branch}", (job,))
+                run = HostedWorkflowRun("run-1", self.workflow, state, self.candidate, f"refs/heads/{self.branch}", (job,), "suite-1")
                 self.assertEqual(self.evaluate(self.evidence(workflow_runs=(run,))).outcome, expected)
-        conflicting = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (HostedWorkflowJob("job-1", "unit", HostedCheckState.FAILURE, self.candidate),))
+        conflicting = HostedWorkflowRun("run-1", self.workflow, HostedCheckState.SUCCESS, self.candidate, f"refs/heads/{self.branch}", (HostedWorkflowJob("job-1", "unit", HostedCheckState.FAILURE, self.candidate),), "suite-1")
         with self.assertRaisesRegex(HostedEvidenceError, "conflict"):
             self.evaluate(self.evidence(workflow_runs=(conflicting,)))
 

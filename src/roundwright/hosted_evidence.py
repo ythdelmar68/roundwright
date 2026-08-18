@@ -83,6 +83,7 @@ class HostedWorkflowRun:
     head_sha: str
     ref: str
     jobs: tuple[HostedWorkflowJob, ...]
+    suite_id: str
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,8 @@ class HostedCheckEvaluation:
     required_checks: tuple[str, ...]
     observed_checks: tuple[str, ...]
     evidence_digest: str
+    workflow_run_id: str
+    check_suite_id: str
 
 
 class HostedCheckSource(Protocol):
@@ -220,6 +223,8 @@ def evaluate_hosted_check_evidence(
     branch: str,
     policy: HostedCheckPolicy,
     now: int,
+    workflow_run_id: str,
+    check_suite_id: str,
 ) -> HostedCheckEvaluation:
     """Evaluate one complete hosted observation without inferring policy.
 
@@ -235,23 +240,32 @@ def evaluate_hosted_check_evidence(
         raise HostedEvidenceError("hosted evidence is malformed")
     if type(now) is not int or now < 0:
         raise HostedEvidenceError("hosted observation time is invalid")
+    if not _valid_token(workflow_run_id) or not _valid_token(check_suite_id):
+        raise HostedEvidenceError("hosted run and suite identity is invalid")
     required_checks = _validate_policy(policy)
     _validate_identity(evidence, repository, workflow, candidate_sha, branch, now, policy.max_age_seconds)
     _validate_artifacts(evidence.artifacts, required=policy.required_artifacts)
-    checks = _validate_checks(evidence.checks, candidate_sha)
-    runs = _validate_workflows(evidence.workflow_runs, workflow, candidate_sha, branch)
+    checks = _validate_checks(evidence.checks, candidate_sha, check_suite_id)
+    runs = _validate_workflows(
+        evidence.workflow_runs, workflow, candidate_sha, branch, workflow_run_id, check_suite_id,
+    )
     observed = tuple(sorted(check.name for check in checks))
     missing = tuple(name for name in required_checks if name not in observed)
     digest = _evidence_digest(evidence)
     if missing:
-        return HostedCheckEvaluation(HostedEvidenceOutcome.MISSING, candidate_sha, required_checks, observed, digest)
+        return HostedCheckEvaluation(
+            HostedEvidenceOutcome.MISSING, candidate_sha, required_checks, observed, digest,
+            workflow_run_id, check_suite_id,
+        )
     required = tuple(check for check in checks if check.name in required_checks)
     outcome = _combined_outcome((
         *(check.state for check in required),
         *(run.state for run in runs),
         *(job.state for run in runs for job in run.jobs),
     ))
-    return HostedCheckEvaluation(outcome, candidate_sha, required_checks, observed, digest)
+    return HostedCheckEvaluation(
+        outcome, candidate_sha, required_checks, observed, digest, workflow_run_id, check_suite_id,
+    )
 
 
 def _validate_policy(policy: HostedCheckPolicy) -> tuple[str, ...]:
@@ -294,7 +308,9 @@ def _validate_identity(
         raise HostedEvidenceError("hosted evidence is stale")
 
 
-def _validate_checks(checks: object, candidate_sha: str) -> tuple[HostedCheck, ...]:
+def _validate_checks(
+    checks: object, candidate_sha: str, check_suite_id: str,
+) -> tuple[HostedCheck, ...]:
     if type(checks) is not tuple or not checks:
         raise HostedEvidenceError("hosted checks are missing")
     seen_ids: set[str] = set()
@@ -308,6 +324,7 @@ def _validate_checks(checks: object, candidate_sha: str) -> tuple[HostedCheck, .
             or type(check.state) is not HostedCheckState
             or check.head_sha != candidate_sha
             or check.checked_out_sha != candidate_sha
+            or check.suite_id != check_suite_id
         ):
             raise HostedEvidenceError("hosted check evidence is malformed")
         if check.check_id in seen_ids or check.name in names:
@@ -319,13 +336,16 @@ def _validate_checks(checks: object, candidate_sha: str) -> tuple[HostedCheck, .
 
 def _validate_workflows(
     runs: object, workflow: str, candidate_sha: str, branch: str,
+    workflow_run_id: str, check_suite_id: str,
 ) -> tuple[HostedWorkflowRun, ...]:
     if type(runs) is not tuple or len(runs) != 1:
         raise HostedEvidenceError("hosted workflow evidence is duplicate" if type(runs) is tuple and len(runs) > 1 else "hosted workflow evidence is missing")
     run = runs[0]
     if (
         type(run) is not HostedWorkflowRun
-        or not _valid_token(run.run_id)
+        or run.run_id != workflow_run_id
+        or not _valid_token(run.suite_id)
+        or run.suite_id != check_suite_id
         or run.workflow != workflow
         or type(run.state) is not HostedCheckState
         or run.head_sha != candidate_sha
@@ -402,7 +422,7 @@ def _evidence_digest(evidence: HostedCheckEvidence) -> str:
         "candidate_sha": evidence.candidate_sha, "branch": evidence.branch,
         "observed_at": evidence.observed_at,
         "checks": [(item.check_id, item.suite_id, item.name, item.state.value, item.head_sha, item.checked_out_sha) for item in evidence.checks],
-        "runs": [(item.run_id, item.workflow, item.state.value, item.head_sha, item.ref, [(job.job_id, job.name, job.state.value, job.checked_out_sha) for job in item.jobs]) for item in evidence.workflow_runs],
+        "runs": [(item.run_id, item.suite_id, item.workflow, item.state.value, item.head_sha, item.ref, [(job.job_id, job.name, job.state.value, job.checked_out_sha) for job in item.jobs]) for item in evidence.workflow_runs],
         "artifacts": evidence.artifacts,
     }
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()

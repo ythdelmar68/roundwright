@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import MappingProxyType, ModuleType, SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -89,6 +90,22 @@ class ExecutorBinding:
         return self.plan.ready_at
 
 
+@dataclass(frozen=True)
+class ExecutorRequest:
+    schema: str
+    capture_plan: dict[str, object]
+    execution_context: dict[str, object] | None
+
+    @classmethod
+    def parse(cls, value: object) -> "ExecutorRequest":
+        if type(value) not in (dict, MappingProxyType):
+            raise ValueError("request is invalid")
+        raw = dict(value)
+        if set(raw) != {"schema", "capture_plan", "execution_context"}:
+            raise ValueError("request is invalid")
+        return cls(raw["schema"], raw["capture_plan"], raw["execution_context"])
+
+
 def fake_harness() -> tuple[object | None, object | None]:
     prior_package = sys.modules.get("roundwright_harness")
     prior_module = sys.modules.get("roundwright_harness.executor")
@@ -99,6 +116,20 @@ def fake_harness() -> tuple[object | None, object | None]:
     module.ProfileExecution = ProfileExecution  # type: ignore[attr-defined]
     module.ProfileExecutionContext = ProfileExecutionContext  # type: ignore[attr-defined]
     module.ProfileComparison = ProfileComparison  # type: ignore[attr-defined]
+    module.ExecutorRequest = ExecutorRequest  # type: ignore[attr-defined]
+    module.prepare_calls = []  # type: ignore[attr-defined]
+    module.run_calls = []  # type: ignore[attr-defined]
+    def prepare_capture(plan: dict[str, object]) -> CapturePlanReceipt:
+        module.prepare_calls.append(plan)  # type: ignore[attr-defined]
+        return CapturePlanReceipt(
+            external_validation._digest(plan), plan["profile"], plan["case_id"],
+            plan["candidate_sha"], plan["ready_at"],
+        )
+    def run_profile_executor(*arguments: object, **keywords: object) -> object:
+        module.run_calls.append((arguments, keywords))  # type: ignore[attr-defined]
+        return {"status": "fake"}
+    module.prepare_capture = prepare_capture  # type: ignore[attr-defined]
+    module.run_profile_executor = run_profile_executor  # type: ignore[attr-defined]
     sys.modules["roundwright_harness"] = package
     sys.modules["roundwright_harness.executor"] = module
     return prior_package, prior_module
@@ -209,6 +240,52 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertNotIn("raw", json.dumps(evidence).lower())
         self.assertEqual(comparison.status, "pass")
 
+    def test_live_lifecycle_request_factory_owns_the_closed_v2_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prepared = external_validation.prepare_live_lifecycle_shadow_request(
+                self.live_lifecycle_request_inputs(), Path(temporary).resolve(),
+            )
+        harness = sys.modules["roundwright_harness.executor"]
+        self.assertEqual(len(harness.prepare_calls), 1)
+        self.assertEqual(harness.run_calls, [])
+        plan = harness.prepare_calls[0]
+        self.assertEqual(plan["schema"], "roundwright-harness-capture-plan/v1")
+        self.assertEqual(plan["profile"], LIVE_LIFECYCLE_SHADOW_PROFILE)
+        self.assertEqual(prepared.public_receipt()["capture_plan_digest"], prepared.capture_plan_digest)
+        self.assertNotIn("store_root", json.dumps(prepared.public_receipt()))
+        self.assertEqual(prepared._request_value["schema"], "roundwright-harness-profile-executor-request/v2")
+
+    def test_live_lifecycle_request_factory_rejects_moved_inputs_and_changes_every_binding(self) -> None:
+        inputs = self.live_lifecycle_request_inputs()
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            prepared = external_validation.prepare_live_lifecycle_shadow_request(inputs, Path(first).resolve())
+            moved = external_validation.prepare_live_lifecycle_shadow_request(
+                replace(inputs, candidate_sha="c" * 40, observation_window="window-49-fresh"),
+                Path(second).resolve(),
+            )
+        self.assertNotEqual(prepared.capture_plan_digest, moved.capture_plan_digest)
+        self.assertNotEqual(prepared.request_digest, moved.request_digest)
+        self.assertNotEqual(prepared.observation_identity, moved.observation_identity)
+        self.assertNotEqual(prepared.store_identity, moved.store_identity)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.LiveLifecycleRequestInputs(
+                inputs.base_sha, "not-a-sha", inputs.target_repository, inputs.target_baseline_sha,
+                inputs.case_id, inputs.observation_window, inputs.ready_at, inputs.recorder_commit,
+                inputs.recorder_content, inputs.recorder_tree, inputs.retention_namespace,
+            )
+
+    def test_live_lifecycle_run_accepts_only_the_prepared_request_and_delegates_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            prepared = external_validation.prepare_live_lifecycle_shadow_request(
+                self.live_lifecycle_request_inputs(), root,
+            )
+            external_validation.run_live_lifecycle_shadow_profile("validate", prepared, root)
+            with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation.run_live_lifecycle_shadow_profile("validate", prepared, root.parent)
+        harness = sys.modules["roundwright_harness.executor"]
+        self.assertEqual(len(harness.run_calls), 1)
+
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()
         adapter = external_validation.HostedCheckProfileAdapter(snapshot)
@@ -318,6 +395,13 @@ class ExternalValidationTests(unittest.TestCase):
             "sha256:" + "1" * 64, "live-lifecycle-case", "window-49", 17, "event-49", graph,
             {name: "sha256:" + (f"{index:x}" * 64) for index, name in enumerate(external_validation._LIVE_LIFECYCLE_SNAPSHOTS, start=1)},
             external_validation._LIVE_LIFECYCLE_FIXTURES, (), "sha256:" + "e" * 64, "sha256:" + "e" * 64,
+        )
+
+    def live_lifecycle_request_inputs(self) -> external_validation.LiveLifecycleRequestInputs:
+        return external_validation.LiveLifecycleRequestInputs(
+            "b" * 40, "a" * 40, "ythdelmar68/roundlet-forward-test", "d" * 40,
+            "live-lifecycle-case", "window-49", 17, "1" * 40, "2" * 40,
+            "3" * 40, "retention-49",
         )
 
     def live_lifecycle_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:

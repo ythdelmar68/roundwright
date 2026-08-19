@@ -1155,6 +1155,164 @@ class MaterializedLiveLifecycleContext:
         return _digest({"schema": "roundwright-live-lifecycle-context/v1", "descriptor": self.descriptor.payload()})
 
 
+@dataclass(frozen=True)
+class LiveLifecycleRequestInputs:
+    """Already-bound public primitives accepted at the opaque preflight boundary."""
+
+    base_sha: str
+    candidate_sha: str
+    target_repository: str
+    target_baseline_sha: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    recorder_commit: str
+    recorder_content: str
+    recorder_tree: str
+    retention_namespace: str
+
+    def __post_init__(self) -> None:
+        if (
+            _SHA.fullmatch(self.base_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or any(_SHA.fullmatch(value) is None for value in (
+                self.recorder_commit, self.recorder_content, self.recorder_tree,
+            ))
+            or not _safe_token(self.retention_namespace)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle request inputs are invalid")
+
+
+@dataclass(frozen=True)
+class LiveLifecyclePreparedRequest:
+    """Sealed request material consumed only by the product-owned run entrypoint."""
+
+    inputs: LiveLifecycleRequestInputs
+    capture_plan_digest: str
+    request_digest: str
+    recorder_identity: str
+    store_root_identity: str
+    store_identity: str
+    observation_identity: str
+    _request_value: Mapping[str, object] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.inputs) is not LiveLifecycleRequestInputs
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.capture_plan_digest, self.request_digest, self.recorder_identity,
+                self.store_root_identity, self.store_identity, self.observation_identity,
+            ))
+            or type(self._request_value) is not MappingProxyType
+        ):
+            raise ExternalValidationAdapterError("live lifecycle prepared request is invalid")
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-prepared-request/v1",
+            "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+            "base_sha": self.inputs.base_sha,
+            "candidate_sha": self.inputs.candidate_sha,
+            "case_id": self.inputs.case_id,
+            "observation_window": self.inputs.observation_window,
+            "ready_at": self.inputs.ready_at,
+            "capture_plan_digest": self.capture_plan_digest,
+            "request_digest": self.request_digest,
+            "recorder_identity": self.recorder_identity,
+            "store_identity": self.store_identity,
+            "observation_identity": self.observation_identity,
+        }
+
+
+def _live_lifecycle_store_root_identity(store_root: Path) -> str:
+    if not isinstance(store_root, Path) or not store_root.is_absolute():
+        raise ExternalValidationAdapterError("live lifecycle store root is invalid")
+    return _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "store_root": str(store_root.resolve(strict=False)).replace("\\", "/"),
+    })
+
+
+def prepare_live_lifecycle_shadow_request(
+    inputs: LiveLifecycleRequestInputs, store_root: Path,
+) -> LiveLifecyclePreparedRequest:
+    """Construct and validate one closed V2 request without exposing Harness internals.
+
+    This is the only product boundary that derives component, Recorder, store,
+    observation, and plan identities.  Callers supply selected public facts and
+    the exact retention root; they neither import Harness nor assemble a plan.
+    """
+
+    if type(inputs) is not LiveLifecycleRequestInputs:
+        raise ExternalValidationAdapterError("live lifecycle preflight inputs are invalid")
+    store_root_identity = _live_lifecycle_store_root_identity(store_root)
+    recorder_identity = _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "recorder_commit": inputs.recorder_commit,
+        "recorder_content": inputs.recorder_content,
+        "recorder_tree": inputs.recorder_tree,
+    })
+    store_identity = _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+        "candidate_sha": inputs.candidate_sha,
+        "retention_namespace": inputs.retention_namespace,
+        "recorder_identity": recorder_identity,
+        "store_root_identity": store_root_identity,
+    })
+    observation_identity = _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "base_sha": inputs.base_sha,
+        "candidate_sha": inputs.candidate_sha,
+        "target_repository": inputs.target_repository,
+        "target_baseline_sha": inputs.target_baseline_sha,
+        "case_id": inputs.case_id,
+        "observation_window": inputs.observation_window,
+        "ready_at": inputs.ready_at,
+        "store_identity": store_identity,
+    })
+    producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+    capture_plan = {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+        "case_id": inputs.case_id,
+        "candidate_sha": inputs.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "recorder_identity": recorder_identity,
+        "store_identity": store_identity,
+        "observation_identity": observation_identity,
+    }
+    harness = _harness_executor()
+    try:
+        plan = harness.prepare_capture(capture_plan)
+        plan_digest = plan.plan_digest
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle capture plan is invalid") from error
+    if _DIGEST.fullmatch(plan_digest) is None:
+        raise ExternalValidationAdapterError("live lifecycle capture plan is invalid")
+    descriptor = LiveLifecycleRuntimeDescriptor(
+        inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+        plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
+    )
+    request_value = {
+        "schema": "roundwright-harness-profile-executor-request/v2",
+        "capture_plan": capture_plan,
+        "execution_context": descriptor.payload(),
+    }
+    request_digest = _digest(request_value)
+    return LiveLifecyclePreparedRequest(
+        inputs, plan_digest, request_digest, recorder_identity, store_root_identity, store_identity,
+        observation_identity, MappingProxyType(request_value),
+    )
+
+
 def prepare_live_lifecycle_context(
     descriptor_value: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
 ) -> MaterializedLiveLifecycleContext:
@@ -1362,7 +1520,7 @@ def run_hosted_check_profile(
 
 
 def run_live_lifecycle_shadow_profile(
-    mode: Literal["validate", "execute"], request_value: Mapping[str, Any], store_root: Path,
+    mode: Literal["validate", "execute"], prepared_request: LiveLifecyclePreparedRequest, store_root: Path,
     snapshot: LiveLifecycleShadowSnapshot | None = None, *, expected_readiness_digest: str | None = None,
 ) -> object:
     """Run one already-armed, read-only lifecycle window through the V2 executor.
@@ -1374,6 +1532,14 @@ def run_live_lifecycle_shadow_profile(
 
     harness = _harness_executor()
     try:
+        if type(prepared_request) is not LiveLifecyclePreparedRequest:
+            raise ValueError
+        request_value = dict(prepared_request._request_value)
+        if (
+            _digest(request_value) != prepared_request.request_digest
+            or _live_lifecycle_store_root_identity(store_root) != prepared_request.store_root_identity
+        ):
+            raise ValueError
         request = harness.ExecutorRequest.parse(request_value)
         if (
             request.schema != "roundwright-harness-profile-executor-request/v2"
@@ -1384,10 +1550,10 @@ def run_live_lifecycle_shadow_profile(
             or (mode == "validate" and snapshot is not None)
         ):
             raise ValueError
-        plan = harness.prepare_capture(request.capture_plan)
         prepare_live_lifecycle_context(
-            request.execution_context, plan_digest=plan.plan_digest, candidate_sha=plan.candidate_sha,
-            case_id=plan.case_id, ready_at=plan.ready_at,
+            request.execution_context, plan_digest=prepared_request.capture_plan_digest,
+            candidate_sha=prepared_request.inputs.candidate_sha,
+            case_id=prepared_request.inputs.case_id, ready_at=prepared_request.inputs.ready_at,
         )
         return harness.run_profile_executor(
             mode, request_value, LiveLifecycleShadowProfileAdapter(snapshot), store_root,

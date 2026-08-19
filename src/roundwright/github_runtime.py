@@ -594,7 +594,11 @@ class _OwnerGitHubReadControl:
             raise GitHubRuntimeError("owner read dependency control is invalid")
         if (
             request.expected_sha is not None
-            and request.operation not in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
+            and request.operation not in {
+                GitHubReadOperation.BRANCH,
+                GitHubReadOperation.REMOTE_HEAD,
+                GitHubReadOperation.REPOSITORY_INVENTORY,
+            }
             and request.expected_sha != self.binding.candidate_sha
         ):
             raise GitHubRuntimeError("owner read dependency control does not match the requested candidate")
@@ -1076,6 +1080,69 @@ class GhMutationPayload:
             reviewers = tuple(self.value("reviewers").split(","))
             if not reviewers or tuple(sorted(reviewers)) != reviewers or len(set(reviewers)) != len(reviewers) or expected.get("reviewers_digest") != _sha256(("reviewers", reviewers)):
                 raise GitHubRuntimeError("gh reviewer payload does not match intent")
+
+
+class _OwnerGitHubReadHostChannel:
+    """Private bridge retaining process and raw-response capability at the host."""
+
+    __slots__ = ("__endpoint",)
+
+    def __init__(self, endpoint: _OwnerGitHubReadHostEndpoint) -> None:
+        if type(endpoint) is not _OwnerGitHubReadHostEndpoint:
+            raise GitHubRuntimeError("owner read host endpoint is invalid")
+        self.__endpoint = endpoint
+
+    def exchange_read(self, request: GitHubReadRequest) -> GitHubReadResult:
+        return self.__endpoint.read(request)
+
+    def exchange_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
+        return self.__endpoint.read_collection_page(request, cursor)
+
+
+def create_credentialed_github_read_capability(
+    runner: object,
+    binding: CandidateBinding,
+    dependency_control: DependencyExecutionControl,
+    capability_health: GitHubCapabilityHealth,
+    *,
+    clock: Callable[[], datetime],
+) -> OwnerGitHubReadIpcClient:
+    """Create the only public production read capability for Roundwright.
+
+    The credential-owning host supplies an opaque fixed ``gh`` runner and
+    already-observed dependency/capability evidence.  It cannot inject a
+    query, inventory, snapshot, health default, or Harness object.  The
+    returned client exposes only typed reads and an explicit deny-all mutation
+    response; provider commands and raw output remain in this module.
+    """
+
+    if (
+        not hasattr(runner, "run")
+        or type(binding) is not CandidateBinding
+        or type(dependency_control) is not DependencyExecutionControl
+        or type(capability_health) is not GitHubCapabilityHealth
+        or not callable(clock)
+    ):
+        raise GitHubRuntimeError("credentialed GitHub read capability inputs are invalid")
+    try:
+        observed_at = clock()
+    except Exception as error:
+        raise GitHubRuntimeError("credentialed GitHub read clock is unavailable") from error
+    if type(observed_at) is not datetime or observed_at.tzinfo is not timezone.utc:
+        raise GitHubRuntimeError("credentialed GitHub read clock is invalid")
+    now = int(observed_at.timestamp())
+    try:
+        dependency_control.require(binding, DependencyStage.GITHUB_READ, now=now)
+        _require_fresh_capabilities(
+            capability_health, (GitHubReadOperation.REPOSITORY_INVENTORY,), observed_at,
+        )
+    except (DependencyPolicyError, GitHubRuntimeError, ValueError) as error:
+        raise GitHubRuntimeError("credentialed GitHub read evidence is unavailable") from error
+    control = _OwnerGitHubReadControl(binding, dependency_control, now)
+    endpoint = _OwnerGitHubReadHostEndpoint(
+        runner, binding, control, capability_health, clock=clock,  # type: ignore[arg-type]
+    )
+    return OwnerGitHubReadIpcClient(capability_health, _OwnerGitHubReadHostChannel(endpoint))
 
 
 def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapabilityHealth:

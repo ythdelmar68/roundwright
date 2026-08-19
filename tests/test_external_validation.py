@@ -21,12 +21,14 @@ from roundwright.hosted_evidence import (
     HostedWorkflowRun,
 )
 from roundwright.github import (
-    BranchSnapshot,
     GitHubReadOperation,
     GitHubReadRequest,
     GitHubReadResult,
     RepositoryRef,
-    RepositorySnapshot,
+    RepositoryInventoryEvidence,
+    RepositoryInventoryFact,
+    RepositoryInventorySection,
+    RepositoryInventorySnapshot,
 )
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
@@ -347,12 +349,23 @@ class ExternalValidationTests(unittest.TestCase):
 
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls.append(request)
-                if request.operation is GitHubReadOperation.REPOSITORY:
-                    return GitHubReadResult(request, RepositorySnapshot(
-                        "forward-target", request.repository, "main", "d" * 40,
-                        "sha256:" + "a" * 64, "sha256:" + "b" * 64,
-                    ))
-                return GitHubReadResult(request, BranchSnapshot(request.repository, "main", "d" * 40))
+                collections = tuple(sorted((
+                    RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
+                    for index, section in enumerate(RepositoryInventorySection, 1)
+                ), key=lambda item: item.section.value))
+                facts = tuple(sorted((
+                    RepositoryInventoryFact("issue-4", "child", "issue-49"),
+                    RepositoryInventoryFact("issue-49", "standalone", "true"),
+                    RepositoryInventoryFact("issue-50", "label", "roundlet-ignore"),
+                    RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
+                    RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
+                    RepositoryInventoryFact("pull-request-81", "state", "merged"),
+                    RepositoryInventoryFact("issue-49", "supervisor-failover", "observed"),
+                ), key=lambda item: (item.subject, item.predicate, item.object)))
+                return GitHubReadResult(request, RepositoryInventorySnapshot(
+                    request.repository, "forward-target", "main", "d" * 40,
+                    "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections, facts,
+                ))
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -376,9 +389,9 @@ class ExternalValidationTests(unittest.TestCase):
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
         self.assertEqual([item.operation for item in capability.calls], [
-            GitHubReadOperation.REPOSITORY, GitHubReadOperation.BRANCH,
-            GitHubReadOperation.REPOSITORY, GitHubReadOperation.BRANCH,
-            GitHubReadOperation.REPOSITORY, GitHubReadOperation.BRANCH,
+            GitHubReadOperation.REPOSITORY_INVENTORY,
+            GitHubReadOperation.REPOSITORY_INVENTORY,
+            GitHubReadOperation.REPOSITORY_INVENTORY,
         ])
         self.assertFalse(hasattr(capability, "read_before"))
         self.assertFalse(hasattr(external_validation, "LiveLifecycleTransportRequest"))
@@ -405,6 +418,45 @@ class ExternalValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
                 external_validation.execute_live_lifecycle_shadow_session(session.public_receipt(), root, capability)
             self.assertEqual(capability.calls, 0)
+
+    def test_live_lifecycle_inventory_category_drift_blocks_before_harness_execute(self) -> None:
+        def inventory(repository: RepositoryRef, comment_evidence: str) -> RepositoryInventorySnapshot:
+            collections = []
+            for index, section in enumerate(RepositoryInventorySection, 1):
+                evidence = comment_evidence if section is RepositoryInventorySection.COMMENTS else "sha256:" + format(index, "064x")
+                collections.append(RepositoryInventoryEvidence(section, evidence, (f"{section.value}-1",), 1, True))
+            facts = (
+                RepositoryInventoryFact("issue-4", "child", "issue-49"),
+                RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
+                RepositoryInventoryFact("issue-49", "standalone", "true"),
+                RepositoryInventoryFact("issue-49", "supervisor-failover", "observed"),
+                RepositoryInventoryFact("issue-50", "label", "roundlet-ignore"),
+                RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
+                RepositoryInventoryFact("pull-request-81", "state", "merged"),
+            )
+            return RepositoryInventorySnapshot(
+                repository, "forward-target", "main", "d" * 40, "sha256:" + "a" * 64,
+                "sha256:" + "b" * 64,
+                tuple(sorted(collections, key=lambda item: item.section.value)), facts,
+            )
+
+        class DriftingReadCapability:
+            def __init__(self) -> None: self.calls = 0
+            def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+                self.calls += 1
+                evidence = "sha256:" + ("c" if self.calls < 3 else "d") * 64
+                return GitHubReadResult(request, inventory(request.repository, evidence))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, "sha256:" + "f" * 64)
+            capability = DriftingReadCapability()
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "zero-mutation"):
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
+        harness = sys.modules["roundwright_harness.executor"]
+        self.assertEqual(capability.calls, 3)
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate"])
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

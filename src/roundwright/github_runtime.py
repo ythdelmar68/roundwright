@@ -1161,6 +1161,54 @@ class _OwnerGitHubReadHostChannel:
         return self.__endpoint.read_collection_page(request, cursor)
 
 
+class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
+    """Factory-sealed read client retaining safe failure provenance privately."""
+
+    __slots__ = ("__inventory_failure_results",)
+
+    def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel) -> None:
+        if type(channel) is not _OwnerGitHubReadHostChannel:
+            raise GitHubRuntimeError("credentialed GitHub read channel is invalid")
+        super().__init__(health, channel)
+        self.__inventory_failure_results: dict[int, tuple[GitHubReadRequest, GitHubFailure, RepositoryInventoryReadFailureCode]] = {}
+
+    def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+        result = super().read(request)
+        if (
+            request.operation is GitHubReadOperation.REPOSITORY_INVENTORY
+            and result.failure is not None
+        ):
+            code = repository_inventory_failure_code(result.failure.public_reason)
+            if code is not None:
+                self.__inventory_failure_results[id(result)] = (request, result.failure, code)
+        return result
+
+    def _trusted_inventory_failure_code(
+        self, request: GitHubReadRequest, result: GitHubReadResult,
+    ) -> RepositoryInventoryReadFailureCode | None:
+        retained = self.__inventory_failure_results.get(id(result))
+        if retained is None:
+            return None
+        retained_request, retained_failure, code = retained
+        if retained_request is request and result.request == request and result.failure is retained_failure:
+            return code
+        return None
+
+
+def credentialed_repository_inventory_failure_code(
+    capability: object, request: GitHubReadRequest, result: GitHubReadResult,
+) -> RepositoryInventoryReadFailureCode | None:
+    """Return a code only for the exact factory-retained read result instance."""
+
+    if (
+        type(capability) is not _CredentialedGitHubReadCapability
+        or type(request) is not GitHubReadRequest
+        or type(result) is not GitHubReadResult
+    ):
+        return None
+    return capability._trusted_inventory_failure_code(request, result)
+
+
 class _CredentialedGhRunnerAdapter:
     """Normalize an opaque owner-process result before it reaches the adapter.
 
@@ -1233,7 +1281,7 @@ def create_credentialed_github_read_capability(
     endpoint = _OwnerGitHubReadHostEndpoint(
         _CredentialedGhRunnerAdapter(runner), binding, control, capability_health, clock=clock,
     )
-    return OwnerGitHubReadIpcClient(capability_health, _OwnerGitHubReadHostChannel(endpoint))
+    return _CredentialedGitHubReadCapability(capability_health, _OwnerGitHubReadHostChannel(endpoint))
 
 
 def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapabilityHealth:

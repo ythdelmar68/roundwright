@@ -587,7 +587,7 @@ class _OwnerGitHubReadControl:
             or type(binding) is not CandidateBinding
             or type(now) is not datetime
             or now.tzinfo is not timezone.utc
-            or self.now != int(now.timestamp())
+            or int(now.timestamp()) < self.now
             or self.binding != binding
             or self.binding.repository != request.repository.slug
         ):
@@ -603,7 +603,9 @@ class _OwnerGitHubReadControl:
         ):
             raise GitHubRuntimeError("owner read dependency control does not match the requested candidate")
         try:
-            self.dependency_control.require(self.binding, DependencyStage.GITHUB_READ, now=self.now)
+            self.dependency_control.require(
+                self.binding, DependencyStage.GITHUB_READ, now=int(now.timestamp()),
+            )
         except DependencyPolicyError as error:
             raise GitHubRuntimeError("owner read dependency control is stale") from error
 

@@ -542,8 +542,14 @@ class ExternalValidationTests(unittest.TestCase):
                 return OpaqueResult(0, json.dumps(self.payload))
 
         host = OpaqueCredentialHost(raw_inventory)
+        advancing_times = iter((
+            now,
+            now + timedelta(seconds=1),
+            now + timedelta(seconds=2),
+            now + timedelta(seconds=3),
+        ))
         capability = create_credentialed_github_read_capability(
-            host, binding, dependency_control, health, clock=lambda: now,
+            host, binding, dependency_control, health, clock=lambda: next(advancing_times),
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -574,6 +580,23 @@ class ExternalValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
                 external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, drifted_capability)
         self.assertEqual(len(drifted_host.commands), 1)
+        for label, read_time in (
+            ("reversed", now - timedelta(seconds=1)),
+            ("expired", now + timedelta(minutes=2)),
+        ):
+            with self.subTest(label=label):
+                denied_host = OpaqueCredentialHost(raw_inventory)
+                times = iter((now, read_time))
+                denied_capability = create_credentialed_github_read_capability(
+                    denied_host, binding, dependency_control, health, clock=lambda: next(times),
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("c"))
+                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                        external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, denied_capability)
+                self.assertEqual(denied_host.commands, [])
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

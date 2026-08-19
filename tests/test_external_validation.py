@@ -20,6 +20,14 @@ from roundwright.hosted_evidence import (
     HostedWorkflowJob,
     HostedWorkflowRun,
 )
+from roundwright.github import (
+    BranchSnapshot,
+    GitHubReadOperation,
+    GitHubReadRequest,
+    GitHubReadResult,
+    RepositoryRef,
+    RepositorySnapshot,
+)
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
@@ -333,40 +341,47 @@ class ExternalValidationTests(unittest.TestCase):
             )
 
     def test_live_lifecycle_durable_session_owns_transport_projection_and_one_shot_execute(self) -> None:
-        class ReadTransport:
+        class GenericReadCapability:
             def __init__(self) -> None:
-                self.calls: list[external_validation.LiveLifecycleTransportRequest] = []
+                self.calls: list[GitHubReadRequest] = []
 
-            def read(self, request: external_validation.LiveLifecycleTransportRequest) -> dict[str, object]:
+            def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls.append(request)
-                if request.operation in ("before", "after"):
-                    return {"target_sha": request.target_baseline_sha, "target_state": {"state": "unchanged"}}
-                return {
-                    "snapshots": {name: {"snapshot": name} for name in external_validation._LIVE_LIFECYCLE_SNAPSHOTS},
-                    "classified_differences": ["fixture-coverage"],
-                }
+                if request.operation is GitHubReadOperation.REPOSITORY:
+                    return GitHubReadResult(request, RepositorySnapshot(
+                        "forward-target", request.repository, "main", "d" * 40,
+                        "sha256:" + "a" * 64, "sha256:" + "b" * 64,
+                    ))
+                return GitHubReadResult(request, BranchSnapshot(request.repository, "main", "d" * 40))
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
-            transport = ReadTransport()
+            capability = GenericReadCapability()
             serialized = json.loads(json.dumps(session.public_receipt()))
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
-                external_validation.execute_live_lifecycle_shadow_session(serialized, root, transport)
-            self.assertEqual(transport.calls, [])
+                external_validation.execute_live_lifecycle_shadow_session(serialized, root, capability)
+            self.assertEqual(capability.calls, [])
             confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
                 serialized, root, "sha256:" + "f" * 64,
             )
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "capability"):
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, object())
+            self.assertEqual(capability.calls, [])
             result = external_validation.execute_live_lifecycle_shadow_session(
-                json.loads(json.dumps(confirmed.public_receipt())), root, transport,
+                json.loads(json.dumps(confirmed.public_receipt())), root, capability,
             )
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
-                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, transport)
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
-        self.assertEqual([item.operation for item in transport.calls], ["before", "lifecycle", "after"])
-        self.assertTrue(transport.calls[1].arm_before_first_live_event)
-        self.assertFalse(hasattr(transport, "read_before"))
+        self.assertEqual([item.operation for item in capability.calls], [
+            GitHubReadOperation.REPOSITORY, GitHubReadOperation.BRANCH,
+            GitHubReadOperation.REPOSITORY, GitHubReadOperation.BRANCH,
+            GitHubReadOperation.REPOSITORY, GitHubReadOperation.BRANCH,
+        ])
+        self.assertFalse(hasattr(capability, "read_before"))
+        self.assertFalse(hasattr(external_validation, "LiveLifecycleTransportRequest"))
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
         self.assertEqual(harness.run_calls[1][1]["expected_readiness_digest"], session.readiness.receipt_digest)
         snapshot = harness.run_calls[1][0][2].snapshot
@@ -374,22 +389,22 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(tuple(event.event_kind for event in snapshot.event_graph.events), tuple(external_validation.shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE).event_kinds))
 
     def test_live_lifecycle_session_rejects_drift_before_transport_dispatch(self) -> None:
-        class NeverCalledTransport:
+        class NeverCalledCapability:
             def __init__(self) -> None: self.calls = 0
-            def read(self, request: object) -> dict[str, object]:
+            def read(self, request: object) -> object:
                 self.calls += 1
                 raise AssertionError("transport must not be called")
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
-            transport = NeverCalledTransport()
+            capability = NeverCalledCapability()
             malformed = session.public_receipt(); malformed["readiness"]["candidate_sha"] = "c" * 40
             with self.assertRaises(external_validation.ExternalValidationAdapterError):
                 external_validation.confirm_live_lifecycle_shadow_trace(malformed, root, "sha256:" + "f" * 64)
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
-                external_validation.execute_live_lifecycle_shadow_session(session.public_receipt(), root, transport)
-            self.assertEqual(transport.calls, 0)
+                external_validation.execute_live_lifecycle_shadow_session(session.public_receipt(), root, capability)
+            self.assertEqual(capability.calls, 0)
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

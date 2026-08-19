@@ -6,7 +6,7 @@ import hashlib
 import importlib
 import json
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Protocol
@@ -23,6 +23,14 @@ from .shadow import (
     ShadowV2Error,
     ShadowV2EventGraph,
     shadow_evidence_profile,
+)
+from .github import (
+    BranchSnapshot,
+    GitHubReadOperation,
+    GitHubReadRequest,
+    GitHubReadResult,
+    RepositoryRef,
+    RepositorySnapshot,
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
@@ -1397,21 +1405,6 @@ class _LiveLifecycleReadyCapsule:
 
 
 @dataclass(frozen=True)
-class LiveLifecycleTransportRequest:
-    """Product-owned low-level read request; never a caller-built snapshot."""
-
-    target_repository: str
-    target_baseline_sha: str
-    base_sha: str
-    candidate_sha: str
-    case_id: str
-    observation_window: str
-    ready_at: int
-    operation: Literal["before", "lifecycle", "after"]
-    arm_before_first_live_event: bool
-
-
-@dataclass(frozen=True)
 class _LiveLifecycleTargetState:
     """Normalized target identity from one independent read-only observation."""
 
@@ -1448,66 +1441,90 @@ class _LiveLifecycleProviderObservation:
         object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
 
 
-class LiveLifecycleReadTransport(Protocol):
-    """Narrow low-level read transport; product code owns lifecycle semantics."""
+class GitHubReadCapability(Protocol):
+    """Reviewed generic GitHub read boundary, independent of this profile."""
 
-    def read(self, request: LiveLifecycleTransportRequest) -> Mapping[str, object]: ...
+    def read(self, request: GitHubReadRequest) -> GitHubReadResult: ...
+
+
+def _require_github_read_capability(capability: object) -> GitHubReadCapability:
+    if not callable(getattr(capability, "read", None)):
+        raise ExternalValidationAdapterError("generic GitHub read capability is invalid")
+    return capability  # type: ignore[return-value]
 
 
 class _RoundwrightLiveLifecycleProvider:
-    """The reviewed product adapter owning every lifecycle read and normalization."""
+    """Product adapter selecting generic GitHub reads and all profile projection."""
 
-    def __init__(self, transport: LiveLifecycleReadTransport) -> None:
-        if not callable(getattr(transport, "read", None)):
-            raise ExternalValidationAdapterError("live lifecycle read transport is invalid")
-        self._transport = transport
+    def __init__(self, capability: GitHubReadCapability, inputs: LiveLifecycleRequestInputs) -> None:
+        owner, name = inputs.target_repository.split("/", 1)
+        self._capability = _require_github_read_capability(capability)
+        self._repository = RepositoryRef(owner, name)
+        self._baseline_sha = inputs.target_baseline_sha
+        self._armed = False
 
-    def _read(
-        self, request: LiveLifecycleTransportRequest,
-    ) -> Mapping[str, object]:
+    def _read(self, request: GitHubReadRequest, expected: type[object]) -> object:
         try:
-            value = self._transport.read(request)
+            result = self._capability.read(request)
         except Exception as error:
-            raise ExternalValidationAdapterError("live lifecycle transport read failed") from error
-        if type(value) is not dict:
-            raise ExternalValidationAdapterError("live lifecycle transport response is invalid")
-        return value
+            raise ExternalValidationAdapterError("generic GitHub read failed") from error
+        if (
+            type(result) is not GitHubReadResult or result.request != request
+            or not result.ok or type(result.snapshot) is not expected
+        ):
+            raise ExternalValidationAdapterError("generic GitHub read result is invalid")
+        return result.snapshot
 
-    def read_before(self, request: LiveLifecycleTransportRequest) -> _LiveLifecycleTargetState:
-        value = self._read(request)
-        try:
-            if set(value) != {"target_sha", "target_state"}:
-                raise ValueError
-            return _LiveLifecycleTargetState(
-                request.target_repository, value["target_sha"], _digest(value["target_state"]),
-            )
-        except (TypeError, ValueError) as error:
-            raise ExternalValidationAdapterError("live lifecycle before response is invalid") from error
+    def _target_state(self) -> tuple[RepositorySnapshot, BranchSnapshot]:
+        repository = self._read(
+            GitHubReadRequest(GitHubReadOperation.REPOSITORY, self._repository), RepositorySnapshot,
+        )
+        assert type(repository) is RepositorySnapshot
+        if repository.repository != self._repository:
+            raise ExternalValidationAdapterError("generic GitHub repository identity has drifted")
+        branch = self._read(
+            GitHubReadRequest(
+                GitHubReadOperation.BRANCH, self._repository,
+                ref=repository.default_branch, expected_sha=self._baseline_sha,
+            ),
+            BranchSnapshot,
+        )
+        assert type(branch) is BranchSnapshot
+        if (branch.repository, branch.name, branch.sha) != (
+            self._repository, repository.default_branch, self._baseline_sha,
+        ):
+            raise ExternalValidationAdapterError("generic GitHub target baseline has drifted")
+        return repository, branch
 
-    def read_lifecycle(self, request: LiveLifecycleTransportRequest) -> _LiveLifecycleProviderObservation:
-        value = self._read(request)
-        try:
-            if set(value) != {"snapshots", "classified_differences"} or type(value["snapshots"]) is not dict:
-                raise ValueError
-            differences = value["classified_differences"]
-            if type(differences) is not list or any(type(item) is not str for item in differences):
-                raise ValueError
-            return _LiveLifecycleProviderObservation(
-                {name: _digest(item) for name, item in value["snapshots"].items()}, tuple(differences),
-            )
-        except (TypeError, ValueError) as error:
-            raise ExternalValidationAdapterError("live lifecycle observation response is invalid") from error
+    def read_before(self) -> _LiveLifecycleTargetState:
+        repository, branch = self._target_state()
+        return _LiveLifecycleTargetState(
+            self._repository.slug, branch.sha,
+            _digest({"repository": repository.repository_evidence_identity, "branch": branch.sha}),
+        )
 
-    def read_after(self, request: LiveLifecycleTransportRequest) -> _LiveLifecycleTargetState:
-        value = self._read(request)
-        try:
-            if set(value) != {"target_sha", "target_state"}:
-                raise ValueError
-            return _LiveLifecycleTargetState(
-                request.target_repository, value["target_sha"], _digest(value["target_state"]),
-            )
-        except (TypeError, ValueError) as error:
-            raise ExternalValidationAdapterError("live lifecycle after response is invalid") from error
+    def read_lifecycle(self) -> _LiveLifecycleProviderObservation:
+        self._armed = True
+        repository, branch = self._target_state()
+        snapshot_digests = {
+            name: _digest({
+                "snapshot": name,
+                "repository": repository.repository_evidence_identity,
+                "default_branch": repository.default_branch,
+                "branch_sha": branch.sha,
+            })
+            for name in _LIVE_LIFECYCLE_SNAPSHOTS
+        }
+        return _LiveLifecycleProviderObservation(snapshot_digests, ())
+
+    def read_after(self) -> _LiveLifecycleTargetState:
+        if not self._armed:
+            raise ExternalValidationAdapterError("live lifecycle window was not armed")
+        repository, branch = self._target_state()
+        return _LiveLifecycleTargetState(
+            self._repository.slug, branch.sha,
+            _digest({"repository": repository.repository_evidence_identity, "branch": branch.sha}),
+        )
 
 
 def _live_lifecycle_store_root_identity(store_root: Path) -> str:
@@ -1768,7 +1785,7 @@ def _materialize_live_lifecycle_shadow_profile(
     prepared_request: LiveLifecyclePreparedRequest,
     readiness: LiveLifecycleReadinessReceipt,
     store_root: Path,
-    transport: LiveLifecycleReadTransport,
+    capability: GitHubReadCapability,
 ) -> object:
     """Materialize one armed read-only lifecycle snapshot and delegate exactly once.
 
@@ -1778,18 +1795,13 @@ def _materialize_live_lifecycle_shadow_profile(
     """
 
     _validated_live_lifecycle_request(prepared_request, store_root)
-    provider = _RoundwrightLiveLifecycleProvider(transport)
+    provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
     inputs = prepared_request.inputs
-    request = LiveLifecycleTransportRequest(
-        inputs.target_repository, inputs.target_baseline_sha, inputs.base_sha,
-        inputs.candidate_sha, inputs.case_id, inputs.observation_window,
-        inputs.ready_at, "before", True,
-    )
-    before = provider.read_before(request)
+    before = provider.read_before()
     # The product creates this request with the arm flag before it makes the
     # sole lifecycle read.  A provider cannot supply an unarmed event graph.
-    observation = provider.read_lifecycle(replace(request, operation="lifecycle"))
-    after = provider.read_after(replace(request, operation="after"))
+    observation = provider.read_lifecycle()
+    after = provider.read_after()
     if (
         type(before) is not _LiveLifecycleTargetState
         or type(observation) is not _LiveLifecycleProviderObservation
@@ -1979,13 +1991,14 @@ def confirm_live_lifecycle_shadow_trace(
 
 
 def execute_live_lifecycle_shadow_session(
-    session_receipt: object, store_root: Path, transport: LiveLifecycleReadTransport,
+    session_receipt: object, store_root: Path, capability: GitHubReadCapability,
 ) -> object:
     """Consume one trace-confirmed durable session through product-owned reads."""
 
     receipt, prepared_request, consumed, trace = _load_live_lifecycle_session(session_receipt, store_root)
     if consumed or trace is None:
         raise ExternalValidationAdapterError("live lifecycle session is not trace-confirmed")
+    capability = _require_github_read_capability(capability)
     _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
         prepared_request, receipt.readiness, trace_readback_digest=trace, consumed=True,
     ), replace_existing=True)
@@ -1994,7 +2007,7 @@ def execute_live_lifecycle_shadow_session(
     )
     if not consumed_readback or trace_readback != trace:
         raise ExternalValidationAdapterError("live lifecycle session consume read-back failed")
-    return _materialize_live_lifecycle_shadow_profile(prepared_request, receipt.readiness, store_root, transport)
+    return _materialize_live_lifecycle_shadow_profile(prepared_request, receipt.readiness, store_root, capability)
 
 
 def prepare_live_lifecycle_context(

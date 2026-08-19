@@ -25,12 +25,12 @@ from .shadow import (
     shadow_evidence_profile,
 )
 from .github import (
-    BranchSnapshot,
     GitHubReadOperation,
     GitHubReadRequest,
     GitHubReadResult,
     RepositoryRef,
-    RepositorySnapshot,
+    RepositoryInventorySection,
+    RepositoryInventorySnapshot,
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
@@ -1026,6 +1026,20 @@ _LIVE_LIFECYCLE_SNAPSHOTS = (
     "roundlet-trace", "candidates", "reviews", "checks", "merge", "cleanup",
 )
 
+_LIVE_LIFECYCLE_CATEGORY_SECTIONS = {
+    "repository": (RepositoryInventorySection.REPOSITORY,),
+    "issues": (RepositoryInventorySection.ISSUES,),
+    "scheduling": (RepositoryInventorySection.ISSUE_RELATIONSHIPS, RepositoryInventorySection.ISSUE_LABELS),
+    "pull-requests": (RepositoryInventorySection.PULL_REQUESTS,),
+    "comments": (RepositoryInventorySection.COMMENTS,),
+    "roundlet-trace": (RepositoryInventorySection.COMMENTS,),
+    "candidates": (RepositoryInventorySection.PULL_REQUESTS, RepositoryInventorySection.REMOTE_HEADS),
+    "reviews": (RepositoryInventorySection.REVIEWS, RepositoryInventorySection.REQUESTED_REVIEWERS),
+    "checks": (RepositoryInventorySection.CHECKS, RepositoryInventorySection.WORKFLOW_RUNS),
+    "merge": (RepositoryInventorySection.MERGEABILITY, RepositoryInventorySection.CLOSING_REFERENCES),
+    "cleanup": (RepositoryInventorySection.REMOTE_HEADS,),
+}
+
 
 @dataclass(frozen=True)
 class LiveLifecycleShadowSnapshot:
@@ -1475,55 +1489,100 @@ class _RoundwrightLiveLifecycleProvider:
             raise ExternalValidationAdapterError("generic GitHub read result is invalid")
         return result.snapshot
 
-    def _target_state(self) -> tuple[RepositorySnapshot, BranchSnapshot]:
-        repository = self._read(
-            GitHubReadRequest(GitHubReadOperation.REPOSITORY, self._repository), RepositorySnapshot,
-        )
-        assert type(repository) is RepositorySnapshot
-        if repository.repository != self._repository:
-            raise ExternalValidationAdapterError("generic GitHub repository identity has drifted")
-        branch = self._read(
+    def _inventory(self) -> RepositoryInventorySnapshot:
+        inventory = self._read(
             GitHubReadRequest(
-                GitHubReadOperation.BRANCH, self._repository,
-                ref=repository.default_branch, expected_sha=self._baseline_sha,
-            ),
-            BranchSnapshot,
+                GitHubReadOperation.REPOSITORY_INVENTORY, self._repository,
+                expected_sha=self._baseline_sha,
+            ), RepositoryInventorySnapshot,
         )
-        assert type(branch) is BranchSnapshot
-        if (branch.repository, branch.name, branch.sha) != (
-            self._repository, repository.default_branch, self._baseline_sha,
+        assert type(inventory) is RepositoryInventorySnapshot
+        if (
+            inventory.repository != self._repository
+            or inventory.baseline_sha != self._baseline_sha
+            or inventory.collection(RepositoryInventorySection.REPOSITORY).complete is not True
         ):
-            raise ExternalValidationAdapterError("generic GitHub target baseline has drifted")
-        return repository, branch
+            raise ExternalValidationAdapterError("generic GitHub repository inventory has drifted")
+        return inventory
+
+    @staticmethod
+    def _fixture_classes(inventory: RepositoryInventorySnapshot) -> tuple[str, ...]:
+        facts = set(inventory.facts)
+        predicates = {(item.subject, item.predicate, item.object) for item in facts}
+        required = {
+            "umbrella": any(predicate == "child" for _, predicate, _ in predicates),
+            "standalone": any(predicate == "standalone" for _, predicate, _ in predicates),
+            "ignored": any(predicate == "label" and value == "roundlet-ignore" for _, predicate, value in predicates),
+            "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
+            "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
+            "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
+            "supervisor-failover": any(predicate == "supervisor-failover" for _, predicate, _ in predicates),
+        }
+        if not all(required.values()):
+            raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
+        return _LIVE_LIFECYCLE_FIXTURES
+
+    @staticmethod
+    def _observation(inventory: RepositoryInventorySnapshot) -> _LiveLifecycleProviderObservation:
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory)
+        snapshot_digests = {
+            category: _digest({
+                "category": category,
+                "repository": inventory.repository.slug,
+                "baseline_sha": inventory.baseline_sha,
+                "sections": [
+                    {
+                        "section": section.value,
+                        "evidence": inventory.collection(section).evidence_identity,
+                        "items": inventory.collection(section).item_identities,
+                        "pages": inventory.collection(section).page_count,
+                    }
+                    for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category]
+                ],
+                "facts": [
+                    (fact.subject, fact.predicate, fact.object)
+                    for fact in inventory.facts
+                    if any(section.value.split("-")[0] in fact.subject for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category])
+                ],
+                "fixtures": fixtures,
+            })
+            for category in _LIVE_LIFECYCLE_SNAPSHOTS
+        }
+        return _LiveLifecycleProviderObservation(snapshot_digests, ())
+
+    @staticmethod
+    def _target_state_digest(inventory: RepositoryInventorySnapshot) -> str:
+        """Bind before/after read-back to every observed generic collection."""
+
+        return _digest({
+            "repository": inventory.repository_evidence_identity,
+            "default_branch": inventory.default_branch_evidence_identity,
+            "baseline_sha": inventory.baseline_sha,
+            "collections": [
+                (item.section.value, item.evidence_identity, item.item_identities, item.page_count)
+                for item in inventory.collections
+            ],
+            "facts": [(item.subject, item.predicate, item.object) for item in inventory.facts],
+        })
 
     def read_before(self) -> _LiveLifecycleTargetState:
-        repository, branch = self._target_state()
+        inventory = self._inventory()
         return _LiveLifecycleTargetState(
-            self._repository.slug, branch.sha,
-            _digest({"repository": repository.repository_evidence_identity, "branch": branch.sha}),
+            self._repository.slug, inventory.baseline_sha,
+            self._target_state_digest(inventory),
         )
 
     def read_lifecycle(self) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        repository, branch = self._target_state()
-        snapshot_digests = {
-            name: _digest({
-                "snapshot": name,
-                "repository": repository.repository_evidence_identity,
-                "default_branch": repository.default_branch,
-                "branch_sha": branch.sha,
-            })
-            for name in _LIVE_LIFECYCLE_SNAPSHOTS
-        }
-        return _LiveLifecycleProviderObservation(snapshot_digests, ())
+        return self._observation(self._inventory())
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
             raise ExternalValidationAdapterError("live lifecycle window was not armed")
-        repository, branch = self._target_state()
+        inventory = self._inventory()
         return _LiveLifecycleTargetState(
-            self._repository.slug, branch.sha,
-            _digest({"repository": repository.repository_evidence_identity, "branch": branch.sha}),
+            self._repository.slug, inventory.baseline_sha,
+            self._target_state_digest(inventory),
         )
 
 

@@ -57,6 +57,10 @@ from .github import (
     ReviewsSnapshot,
     RequestedReviewersSnapshot,
     RepositoryRef,
+    RepositoryInventoryEvidence,
+    RepositoryInventoryFact,
+    RepositoryInventorySection,
+    RepositoryInventorySnapshot,
     normalize_github_response,
 )
 from .repository_policy import (
@@ -656,6 +660,8 @@ class _OwnerGitHubReadHostEndpoint:
         self.calls.append(("read", request.operation.value))
         if request.operation is GitHubReadOperation.REPOSITORY:
             return self._read_repository(request)
+        if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+            return self._read_repository_inventory(request)
         if request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
             return self._read_issue_with_relationships(request)
         if request.operation is GitHubReadOperation.CHECKS:
@@ -717,6 +723,32 @@ class _OwnerGitHubReadHostEndpoint:
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
                 "gh default branch response is malformed",
+            ))
+
+    def _read_repository_inventory(self, request: GitHubReadRequest) -> GitHubReadResult:
+        """Read a bounded, terminal generic public repository inventory.
+
+        The GraphQL request deliberately asks for provider page metadata on
+        every collection.  This first host boundary fails closed if any
+        collection exceeds its declared bound; it never labels a first page as
+        a complete inventory.  Future pagination expansion can only add pages
+        behind this reviewed projection, without changing the public contract.
+        """
+
+        outcome = self.__runner.run(_repository_inventory_command(request))
+        if outcome.exit_code != 0:
+            return GitHubReadResult(request, failure=GitHubFailure(
+                _failure_kind(outcome.exit_code), request.operation,
+                "gh repository inventory did not return a usable response",
+            ))
+        try:
+            raw = json.loads(outcome.stdout)
+            snapshot = _normalize_repository_inventory(request, raw)
+            return GitHubReadResult(request, snapshot=snapshot)
+        except (json.JSONDecodeError, GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return GitHubReadResult(request, failure=GitHubFailure(
+                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                "gh repository inventory is incomplete or malformed",
             ))
 
     def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
@@ -4105,6 +4137,129 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     else:
         raise GitHubRuntimeError("unsupported gh read operation")
     return ("api", "--method", "GET", path)
+
+
+def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]:
+    """Build the single read-only, profile-neutral inventory query."""
+
+    if (
+        type(request) is not GitHubReadRequest
+        or request.operation is not GitHubReadOperation.REPOSITORY_INVENTORY
+        or request.expected_sha is None
+    ):
+        raise GitHubRuntimeError("repository inventory request is invalid")
+    query = (
+        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+        "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
+        "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
+        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(last:1){totalCount pageInfo{hasNextPage endCursor}nodes{commit{checkSuites(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
+        "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
+    )
+    return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
+
+
+def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> RepositoryInventorySnapshot:
+    """Normalize terminal GraphQL inventory data into the core-only snapshot.
+
+    The projection rejects continuation pages and inconsistent totals instead
+    of inferring completeness.  It intentionally retains only IDs, state,
+    relationship labels and evidence digests.
+    """
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory repository does not match request")
+    default_ref = _raw_mapping(repository.get("defaultBranchRef"))
+    target = _raw_mapping(default_ref.get("target"))
+    if _raw_text(target, "oid") != request.expected_sha:
+        raise GitHubRuntimeError("inventory default head does not match baseline")
+    collection_keys = {
+        RepositoryInventorySection.ISSUES: "issues",
+        RepositoryInventorySection.PULL_REQUESTS: "pullRequests",
+        RepositoryInventorySection.REMOTE_HEADS: "refs",
+    }
+    roots: dict[RepositoryInventorySection, Mapping[str, object]] = {}
+    for section, key in collection_keys.items():
+        connection = _raw_mapping(repository.get(key))
+        page = _raw_mapping(connection.get("pageInfo"))
+        if _raw_bool(page, "hasNextPage"):
+            raise GitHubRuntimeError("inventory pagination is incomplete")
+        nodes = connection.get("nodes")
+        if type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes) or len(nodes) > 3200:
+            raise GitHubRuntimeError("inventory collection is incomplete")
+        roots[section] = connection
+    issues = roots[RepositoryInventorySection.ISSUES]
+    pull_requests = roots[RepositoryInventorySection.PULL_REQUESTS]
+    refs = roots[RepositoryInventorySection.REMOTE_HEADS]
+    nested: dict[RepositoryInventorySection, list[Mapping[str, object]]] = {
+        RepositoryInventorySection.ISSUE_RELATIONSHIPS: [],
+        RepositoryInventorySection.ISSUE_LABELS: [],
+        RepositoryInventorySection.COMMENTS: [],
+        RepositoryInventorySection.REVIEWS: [],
+        RepositoryInventorySection.REQUESTED_REVIEWERS: [],
+        RepositoryInventorySection.CHECKS: [],
+        RepositoryInventorySection.WORKFLOW_RUNS: [],
+        RepositoryInventorySection.MERGEABILITY: [],
+        RepositoryInventorySection.CLOSING_REFERENCES: [],
+    }
+    facts: list[RepositoryInventoryFact] = []
+    for issue in issues["nodes"]:  # type: ignore[index]
+        value = _raw_mapping(issue)
+        subject = f"issue-{_raw_integer(value, 'number')}"
+        facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
+        for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
+            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")
+            if _raw_bool(page, "hasNextPage") or type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes):
+                raise GitHubRuntimeError("inventory nested pagination is incomplete")
+            nested[section].append(connection)
+            for node in nodes:
+                child = _raw_mapping(node)
+                facts.append(RepositoryInventoryFact(subject, predicate, _raw_text(child, "name") if predicate == "label" else f"issue-{_raw_integer(child, 'number')}"))
+    for pull_request in pull_requests["nodes"]:  # type: ignore[index]
+        value = _raw_mapping(pull_request); subject = f"pull-request-{_raw_integer(value, 'number')}"
+        facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
+        facts.append(RepositoryInventoryFact(subject, "head-sha", _raw_text(value, "headRefOid")))
+        nested[RepositoryInventorySection.MERGEABILITY].append(value)
+        for section, key in ((RepositoryInventorySection.COMMENTS, "comments"), (RepositoryInventorySection.REVIEWS, "reviews"), (RepositoryInventorySection.REQUESTED_REVIEWERS, "reviewRequests"), (RepositoryInventorySection.CLOSING_REFERENCES, "closingIssuesReferences")):
+            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")
+            if _raw_bool(page, "hasNextPage") or type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes):
+                raise GitHubRuntimeError("inventory nested pagination is incomplete")
+            nested[section].append(connection)
+        commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = commits.get("nodes")
+        if _raw_bool(commits_page, "hasNextPage") or type(commit_nodes) is not list or _raw_integer(commits, "totalCount") != len(commit_nodes):
+            raise GitHubRuntimeError("inventory commit pagination is incomplete")
+        for commit_node in commit_nodes:
+            commit = _raw_mapping(_raw_mapping(commit_node).get("commit"))
+            suites = _raw_mapping(commit.get("checkSuites")); suites_page = _raw_mapping(suites.get("pageInfo")); suite_nodes = suites.get("nodes")
+            if _raw_bool(suites_page, "hasNextPage") or type(suite_nodes) is not list or _raw_integer(suites, "totalCount") != len(suite_nodes):
+                raise GitHubRuntimeError("inventory check pagination is incomplete")
+            nested[RepositoryInventorySection.CHECKS].append(suites)
+            for suite in suite_nodes:
+                suite_value = _raw_mapping(suite)
+                workflow = suite_value.get("workflowRun")
+                if workflow is not None:
+                    nested[RepositoryInventorySection.WORKFLOW_RUNS].append(_raw_mapping(workflow))
+    collections: list[RepositoryInventoryEvidence] = []
+    for section in RepositoryInventorySection:
+        source: object = roots.get(section, nested.get(section, repository))
+        identities: list[str] = []
+        if section in roots:
+            for node in roots[section]["nodes"]:  # type: ignore[index]
+                item = _raw_mapping(node)
+                identities.append(
+                    _raw_id(item, "id") if type(item.get("id")) is str else _raw_text(item, "name")
+                )
+            identities.sort()
+        collections.append(RepositoryInventoryEvidence(section, _sha256(source), tuple(identities), 1, True))
+    return RepositoryInventorySnapshot(
+        request.repository, _raw_id(repository, "id"), _raw_text(default_ref, "name"), request.expected_sha,
+        _sha256({"id": repository.get("id"), "owner": owner.get("login"), "name": repository.get("name")} ),
+        _sha256({"name": default_ref.get("name"), "oid": target.get("oid")} ),
+        tuple(sorted(collections, key=lambda item: item.section.value)),
+        tuple(sorted(set(facts), key=lambda item: (item.subject, item.predicate, item.object))),
+    )
 
 
 def _repository_default_branch_command(repository: RepositoryRef, default_branch: str) -> tuple[str, ...]:

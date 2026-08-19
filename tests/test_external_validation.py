@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, Lock, Thread
 from types import MappingProxyType, ModuleType, SimpleNamespace
 import unittest
 
@@ -699,6 +700,78 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,
         )
         self.assertIsNone(credentialed_repository_inventory_failure_code(sealed_capability, request, second_failure))
+        class InterleavingHost:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = Lock()
+                self.older_entered = Event()
+                self.release_older = Event()
+                self.newer_completed = Event()
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                with self.lock:
+                    self.calls += 1
+                    ordinal = self.calls
+                if ordinal == 1:
+                    self.older_entered.set()
+                    if not self.release_older.wait(5):
+                        raise RuntimeError("interleaving test timed out")
+                else:
+                    self.newer_completed.set()
+                return OpaqueResult(1, "")
+        interleaving_host = InterleavingHost()
+        interleaving_capability = create_credentialed_github_read_capability(
+            interleaving_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        interleaved: dict[str, GitHubReadResult] = {}
+        older_thread = Thread(target=lambda: interleaved.setdefault("older", interleaving_capability.read(request)))
+        newer_thread = Thread(target=lambda: interleaved.setdefault("newer", interleaving_capability.read(request)))
+        older_thread.start()
+        self.assertTrue(interleaving_host.older_entered.wait(5))
+        newer_thread.start()
+        newer_thread.join(5)
+        self.assertFalse(newer_thread.is_alive())
+        self.assertTrue(interleaving_host.newer_completed.is_set())
+        interleaving_host.release_older.set()
+        older_thread.join(5)
+        self.assertFalse(older_thread.is_alive())
+        self.assertIsNone(credentialed_repository_inventory_failure_code(interleaving_capability, request, interleaved["older"]))
+        self.assertEqual(
+            credentialed_repository_inventory_failure_code(interleaving_capability, request, interleaved["newer"]),
+            external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,
+        )
+        self.assertIsNone(credentialed_repository_inventory_failure_code(interleaving_capability, request, interleaved["newer"]))
+        class FirstFailureThenValidHost:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.valid = OpaqueCredentialHost(raw_inventory)
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                self.calls += 1
+                return OpaqueResult(1, "") if self.calls == 1 else self.valid.run(arguments)
+        success_capability = create_credentialed_github_read_capability(
+            FirstFailureThenValidHost(), binding, dependency_control, health, clock=lambda: now,
+        )
+        success_stale = success_capability.read(request)
+        self.assertTrue(success_capability.read(request).ok)
+        self.assertIsNone(credentialed_repository_inventory_failure_code(success_capability, request, success_stale))
+        class FirstFailureThenExceptionHost:
+            def __init__(self) -> None: self.calls = 0
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                self.calls += 1
+                if self.calls == 1:
+                    return OpaqueResult(1, "")
+                raise RuntimeError("host exception")
+        exception_capability = create_credentialed_github_read_capability(
+            FirstFailureThenExceptionHost(), binding, dependency_control, health, clock=lambda: now,
+        )
+        exception_stale = exception_capability.read(request)
+        self.assertFalse(exception_capability.read(request).ok)
+        self.assertIsNone(credentialed_repository_inventory_failure_code(exception_capability, request, exception_stale))
+        uncoded_capability = create_credentialed_github_read_capability(
+            OpaqueCredentialHost(raw_inventory, exit_code=1), binding, dependency_control, health, clock=lambda: now,
+        )
+        uncoded_stale = uncoded_capability.read(request)
+        uncoded_capability.read(GitHubReadRequest(GitHubReadOperation.REPOSITORY, RepositoryRef(owner, name)))
+        self.assertIsNone(credentialed_repository_inventory_failure_code(uncoded_capability, request, uncoded_stale))
         class ReplayCapability:
             def __init__(self, result: GitHubReadResult) -> None:
                 self.calls = 0
@@ -710,6 +783,7 @@ class ExternalValidationTests(unittest.TestCase):
         for label, replayed_result in (
             ("copied", copied_failure), ("recreated", recreated_failure),
             ("stale", first_failure), ("consumed", second_failure),
+            ("interleaved", interleaved["older"]),
         ):
             with self.subTest(replay=label):
                 replay = ReplayCapability(replayed_result)

@@ -4250,7 +4250,7 @@ def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
         "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
         "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
-        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(last:1){totalCount pageInfo{hasNextPage endCursor}nodes{commit{checkSuites(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
+        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{checkSuites(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
         "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
     )
     return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
@@ -4339,7 +4339,12 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
         commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = commits.get("nodes")
-        if _raw_bool(commits_page, "hasNextPage") or type(commit_nodes) is not list or _raw_integer(commits, "totalCount") != len(commit_nodes):
+        if (
+            _raw_bool(commits_page, "hasNextPage")
+            or type(commit_nodes) is not list
+            or _raw_integer(commits, "totalCount") != len(commit_nodes)
+            or len(commit_nodes) > 100
+        ):
             raise GitHubRuntimeError("inventory commit pagination is incomplete")
         for commit_node in commit_nodes:
             commit = _raw_mapping(_raw_mapping(commit_node).get("commit"))

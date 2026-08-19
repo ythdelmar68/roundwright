@@ -1164,7 +1164,7 @@ class _OwnerGitHubReadHostChannel:
 class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
     """Factory-sealed read client retaining safe failure provenance privately."""
 
-    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure")
+    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure", "__read_generation")
 
     def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel) -> None:
         if type(channel) is not _OwnerGitHubReadHostChannel:
@@ -1174,12 +1174,15 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
         self.__pending_inventory_failure: tuple[
             GitHubReadRequest, GitHubReadResult, GitHubFailure, RepositoryInventoryReadFailureCode,
         ] | None = None
+        self.__read_generation = 0
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
         # A second read always makes an earlier result stale, including when
         # the new read succeeds or the channel fails before returning a code.
         with self.__inventory_failure_lock:
             self.__pending_inventory_failure = None
+            self.__read_generation += 1
+            generation = self.__read_generation
         result = super().read(request)
         if (
             request.operation is GitHubReadOperation.REPOSITORY_INVENTORY
@@ -1188,7 +1191,8 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
             code = repository_inventory_failure_code(result.failure.public_reason)
             if code is not None:
                 with self.__inventory_failure_lock:
-                    self.__pending_inventory_failure = (request, result, result.failure, code)
+                    if generation == self.__read_generation:
+                        self.__pending_inventory_failure = (request, result, result.failure, code)
         return result
 
     def _trusted_inventory_failure_code(

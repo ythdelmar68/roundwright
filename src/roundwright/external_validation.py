@@ -1232,6 +1232,108 @@ class LiveLifecyclePreparedRequest:
         }
 
 
+_LIVE_LIFECYCLE_READINESS_SEAL = object()
+_LIVE_LIFECYCLE_READY_CAPSULE_SEAL = object()
+
+
+@dataclass(frozen=True)
+class LiveLifecycleReadinessReceipt:
+    """Path-free V2 readiness facts copied from the reviewed Harness receipt."""
+
+    capture_plan_digest: str
+    candidate_sha: str
+    case_id: str
+    ready_at: int
+    producer_identity: str
+    exporter_identity: str
+    comparator_identity: str
+    execution_context_input_digest: str
+    execution_context_identity: str
+    receipt_digest: str
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        if (
+            self._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_token(self.case_id)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.producer_identity, self.exporter_identity, self.comparator_identity,
+                self.execution_context_input_digest, self.execution_context_identity,
+                self.receipt_digest,
+            ))
+            or self.receipt_digest != _digest({
+                "schema": "roundwright-harness-profile-executor-readiness/v2",
+                "status": "ready", "state": "PREFLIGHT_READY",
+                "plan_digest": self.capture_plan_digest,
+                "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+                "case_id": self.case_id, "candidate_sha": self.candidate_sha,
+                "ready_at": self.ready_at,
+                "producer_identity": self.producer_identity,
+                "exporter_identity": self.exporter_identity,
+                "comparator_identity": self.comparator_identity,
+                "dispatch_count": 0, "record_count": 0, "verify_count": 0, "mutation_count": 0,
+                "execution_context_input_digest": self.execution_context_input_digest,
+                "execution_context_identity": self.execution_context_identity,
+            })
+        ):
+            raise ExternalValidationAdapterError("live lifecycle readiness receipt is invalid")
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-readiness/v1",
+            "capture_plan_digest": self.capture_plan_digest,
+            "candidate_sha": self.candidate_sha,
+            "case_id": self.case_id,
+            "ready_at": self.ready_at,
+            "producer_identity": self.producer_identity,
+            "exporter_identity": self.exporter_identity,
+            "comparator_identity": self.comparator_identity,
+            "execution_context_input_digest": self.execution_context_input_digest,
+            "execution_context_identity": self.execution_context_identity,
+            "receipt_digest": self.receipt_digest,
+        }
+
+
+@dataclass(frozen=True)
+class LiveLifecycleReadyCapsule:
+    """One sealed product preflight binding, consumed at most once."""
+
+    prepared_request: LiveLifecyclePreparedRequest
+    readiness: LiveLifecycleReadinessReceipt
+    capsule_digest: str = ""
+    _consumed: bool = field(default=False, repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        payload = {
+            "schema": "roundwright-live-lifecycle-ready-capsule/v1",
+            "request_digest": self.prepared_request.request_digest,
+            "capture_plan_digest": self.prepared_request.capture_plan_digest,
+            "store_identity": self.prepared_request.store_identity,
+            "readiness": self.readiness.public_receipt(),
+        }
+        digest = _digest(payload)
+        if (
+            self._seal is not _LIVE_LIFECYCLE_READY_CAPSULE_SEAL
+            or type(self.prepared_request) is not LiveLifecyclePreparedRequest
+            or type(self.readiness) is not LiveLifecycleReadinessReceipt
+            or type(self._consumed) is not bool
+            or (self.capsule_digest and self.capsule_digest != digest)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle ready capsule is invalid")
+        object.__setattr__(self, "capsule_digest", digest)
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-ready-capsule/v1",
+            "capsule_digest": self.capsule_digest,
+            "readiness": self.readiness.public_receipt(),
+        }
+
+
 @dataclass(frozen=True)
 class LiveLifecycleProviderRequest:
     """Public-safe facts given to a capability that can only read the target."""
@@ -1302,7 +1404,7 @@ def _live_lifecycle_store_root_identity(store_root: Path) -> str:
     })
 
 
-def prepare_live_lifecycle_shadow_request(
+def _prepare_live_lifecycle_shadow_request(
     inputs: LiveLifecycleRequestInputs, store_root: Path,
 ) -> LiveLifecyclePreparedRequest:
     """Construct and validate one closed V2 request without exposing Harness internals.
@@ -1378,26 +1480,181 @@ def prepare_live_lifecycle_shadow_request(
     )
 
 
+def _live_lifecycle_readiness_receipt(
+    harness_receipt: object, prepared_request: LiveLifecyclePreparedRequest,
+) -> LiveLifecycleReadinessReceipt:
+    """Validate and copy only public-safe fields from the Harness V2 receipt."""
+
+    harness = _harness_executor()
+    try:
+        if type(harness_receipt) is not harness.ExecutorReadinessReceipt:
+            raise ValueError
+        value = harness_receipt.as_dict()
+        if type(value) is not dict or set(value) != {
+            "schema", "status", "state", "plan_digest", "profile", "case_id", "candidate_sha",
+            "ready_at", "producer_identity", "exporter_identity", "comparator_identity",
+            "dispatch_count", "record_count", "verify_count", "mutation_count",
+            "execution_context_input_digest", "execution_context_identity", "receipt_digest",
+        }:
+            raise ValueError
+        receipt_digest = value["receipt_digest"]
+        core = {key: item for key, item in value.items() if key != "receipt_digest"}
+        producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+        descriptor = prepare_live_lifecycle_context(
+            dict(prepared_request._request_value["execution_context"]),
+            plan_digest=prepared_request.capture_plan_digest,
+            candidate_sha=prepared_request.inputs.candidate_sha,
+            case_id=prepared_request.inputs.case_id,
+            ready_at=prepared_request.inputs.ready_at,
+        )
+        if (
+            value["schema"] != "roundwright-harness-profile-executor-readiness/v2"
+            or value["status"] != "ready" or value["state"] != "PREFLIGHT_READY"
+            or value["plan_digest"] != prepared_request.capture_plan_digest
+            or value["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
+            or value["case_id"] != prepared_request.inputs.case_id
+            or value["candidate_sha"] != prepared_request.inputs.candidate_sha
+            or value["ready_at"] != prepared_request.inputs.ready_at
+            or (value["producer_identity"], value["exporter_identity"], value["comparator_identity"])
+            != (producer, exporter, comparator)
+            or (value["dispatch_count"], value["record_count"], value["verify_count"], value["mutation_count"])
+            != (0, 0, 0, 0)
+            or value["execution_context_input_digest"] != _digest(prepared_request._request_value["execution_context"])
+            or value["execution_context_identity"] != descriptor.identity
+            or type(receipt_digest) is not str or _DIGEST.fullmatch(receipt_digest) is None
+            or _digest(core) != receipt_digest
+        ):
+            raise ValueError
+        return LiveLifecycleReadinessReceipt(
+            prepared_request.capture_plan_digest, prepared_request.inputs.candidate_sha,
+            prepared_request.inputs.case_id, prepared_request.inputs.ready_at,
+            producer, exporter, comparator, value["execution_context_input_digest"],
+            value["execution_context_identity"], receipt_digest, _LIVE_LIFECYCLE_READINESS_SEAL,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle readiness receipt is invalid") from error
+
+
+def preflight_live_lifecycle_shadow_profile(
+    inputs: LiveLifecycleRequestInputs, store_root: Path,
+) -> LiveLifecycleReadyCapsule:
+    """Construct and provider-free validate one sealed lifecycle-ready capsule."""
+
+    prepared_request = _prepare_live_lifecycle_shadow_request(inputs, store_root)
+    request_value = _validated_live_lifecycle_request(prepared_request, store_root)
+    harness = _harness_executor()
+    try:
+        harness_receipt = harness.run_profile_executor(
+            "validate", request_value, LiveLifecycleShadowProfileAdapter(), store_root,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle preflight validation failed") from error
+    readiness = _live_lifecycle_readiness_receipt(harness_receipt, prepared_request)
+    return LiveLifecycleReadyCapsule(
+        prepared_request, readiness, _seal=_LIVE_LIFECYCLE_READY_CAPSULE_SEAL,
+    )
+
+
 def _validated_live_lifecycle_request(
     prepared_request: LiveLifecyclePreparedRequest, store_root: Path,
 ) -> dict[str, object]:
     if type(prepared_request) is not LiveLifecyclePreparedRequest:
         raise ExternalValidationAdapterError("live lifecycle prepared request is invalid")
     request_value = dict(prepared_request._request_value)
+    inputs = prepared_request.inputs
+    producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+    expected_capture_plan = {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+        "case_id": inputs.case_id,
+        "candidate_sha": inputs.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "recorder_identity": prepared_request.recorder_identity,
+        "store_identity": prepared_request.store_identity,
+        "observation_identity": prepared_request.observation_identity,
+    }
+    expected_descriptor = LiveLifecycleRuntimeDescriptor(
+        inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+        prepared_request.capture_plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
+    ).payload()
     if (
         _digest(request_value) != prepared_request.request_digest
         or _live_lifecycle_store_root_identity(store_root) != prepared_request.store_root_identity
+        or set(request_value) != {"schema", "capture_plan", "execution_context"}
+        or request_value.get("schema") != "roundwright-harness-profile-executor-request/v2"
+        or type(request_value["capture_plan"]) is not dict
+        or type(request_value["execution_context"]) is not dict
+        or request_value.get("capture_plan") != expected_capture_plan
+        or _digest(request_value["capture_plan"]) != prepared_request.capture_plan_digest
+        or request_value.get("execution_context") != expected_descriptor
     ):
         raise ExternalValidationAdapterError("live lifecycle prepared request has drifted")
     return request_value
 
 
+def _validated_live_lifecycle_ready_capsule(
+    capsule: LiveLifecycleReadyCapsule, store_root: Path,
+) -> LiveLifecyclePreparedRequest:
+    if type(capsule) is not LiveLifecycleReadyCapsule or capsule._consumed:
+        raise ExternalValidationAdapterError("live lifecycle ready capsule is unavailable")
+    if (
+        capsule._seal is not _LIVE_LIFECYCLE_READY_CAPSULE_SEAL
+        or type(capsule.prepared_request) is not LiveLifecyclePreparedRequest
+        or type(capsule.readiness) is not LiveLifecycleReadinessReceipt
+    ):
+        raise ExternalValidationAdapterError("live lifecycle ready capsule is invalid")
+    prepared_request = capsule.prepared_request
+    _validated_live_lifecycle_request(prepared_request, store_root)
+    readiness = capsule.readiness
+    producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+    if (
+        readiness._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+        or readiness.receipt_digest != _digest({
+            "schema": "roundwright-harness-profile-executor-readiness/v2",
+            "status": "ready", "state": "PREFLIGHT_READY",
+            "plan_digest": readiness.capture_plan_digest,
+            "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+            "case_id": readiness.case_id, "candidate_sha": readiness.candidate_sha,
+            "ready_at": readiness.ready_at,
+            "producer_identity": readiness.producer_identity,
+            "exporter_identity": readiness.exporter_identity,
+            "comparator_identity": readiness.comparator_identity,
+            "dispatch_count": 0, "record_count": 0, "verify_count": 0, "mutation_count": 0,
+            "execution_context_input_digest": readiness.execution_context_input_digest,
+            "execution_context_identity": readiness.execution_context_identity,
+        })
+        or capsule.capsule_digest != _digest({
+            "schema": "roundwright-live-lifecycle-ready-capsule/v1",
+            "request_digest": prepared_request.request_digest,
+            "capture_plan_digest": prepared_request.capture_plan_digest,
+            "store_identity": prepared_request.store_identity,
+            "readiness": readiness.public_receipt(),
+        })
+        or readiness.capture_plan_digest != prepared_request.capture_plan_digest
+        or (readiness.candidate_sha, readiness.case_id, readiness.ready_at)
+        != (prepared_request.inputs.candidate_sha, prepared_request.inputs.case_id, prepared_request.inputs.ready_at)
+        or (readiness.producer_identity, readiness.exporter_identity, readiness.comparator_identity)
+        != (producer, exporter, comparator)
+        or readiness.execution_context_input_digest != _digest(prepared_request._request_value["execution_context"])
+        or readiness.execution_context_identity != prepare_live_lifecycle_context(
+            dict(prepared_request._request_value["execution_context"]),
+            plan_digest=prepared_request.capture_plan_digest,
+            candidate_sha=prepared_request.inputs.candidate_sha,
+            case_id=prepared_request.inputs.case_id,
+            ready_at=prepared_request.inputs.ready_at,
+        ).identity
+    ):
+        raise ExternalValidationAdapterError("live lifecycle ready capsule has drifted")
+    return prepared_request
+
+
 def materialize_live_lifecycle_shadow_profile(
-    prepared_request: LiveLifecyclePreparedRequest,
+    capsule: LiveLifecycleReadyCapsule,
     store_root: Path,
     provider: LiveLifecycleReadOnlyProvider,
-    *,
-    expected_readiness_digest: str,
 ) -> object:
     """Materialize one armed read-only lifecycle snapshot and delegate exactly once.
 
@@ -1406,15 +1663,12 @@ def materialize_live_lifecycle_shadow_profile(
     snapshot, or reach the Harness executor directly.
     """
 
-    _validated_live_lifecycle_request(prepared_request, store_root)
-    if (
-        not isinstance(expected_readiness_digest, str)
-        or _DIGEST.fullmatch(expected_readiness_digest) is None
-        or not all(callable(getattr(provider, name, None)) for name in (
+    prepared_request = _validated_live_lifecycle_ready_capsule(capsule, store_root)
+    if not all(callable(getattr(provider, name, None)) for name in (
             "read_before", "read_lifecycle", "read_after",
-        ))
-    ):
+        )):
         raise ExternalValidationAdapterError("live lifecycle read-only provider is invalid")
+    object.__setattr__(capsule, "_consumed", True)
     inputs = prepared_request.inputs
     request = LiveLifecycleProviderRequest(
         inputs.target_repository, inputs.target_baseline_sha, inputs.base_sha,
@@ -1453,10 +1707,7 @@ def materialize_live_lifecycle_shadow_profile(
         observation.snapshot_digests, _LIVE_LIFECYCLE_FIXTURES,
         observation.classified_differences, before.state_digest, after.state_digest,
     )
-    return _run_prepared_live_lifecycle_shadow_profile(
-        "execute", prepared_request, store_root, snapshot,
-        expected_readiness_digest=expected_readiness_digest,
-    )
+    return _run_prepared_live_lifecycle_shadow_profile(prepared_request, capsule.readiness, store_root, snapshot)
 
 
 def prepare_live_lifecycle_context(
@@ -1666,8 +1917,10 @@ def run_hosted_check_profile(
 
 
 def _run_prepared_live_lifecycle_shadow_profile(
-    mode: Literal["validate", "execute"], prepared_request: LiveLifecyclePreparedRequest, store_root: Path,
-    snapshot: LiveLifecycleShadowSnapshot | None = None, *, expected_readiness_digest: str | None = None,
+    prepared_request: LiveLifecyclePreparedRequest,
+    readiness: LiveLifecycleReadinessReceipt,
+    store_root: Path,
+    snapshot: LiveLifecycleShadowSnapshot,
 ) -> object:
     """Run the product-materialized lifecycle snapshot through the V2 executor.
 
@@ -1678,7 +1931,11 @@ def _run_prepared_live_lifecycle_shadow_profile(
 
     harness = _harness_executor()
     try:
-        if type(prepared_request) is not LiveLifecyclePreparedRequest:
+        if (
+            type(prepared_request) is not LiveLifecyclePreparedRequest
+            or type(readiness) is not LiveLifecycleReadinessReceipt
+            or readiness._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+        ):
             raise ValueError
         request_value = dict(prepared_request._request_value)
         if (
@@ -1692,8 +1949,10 @@ def _run_prepared_live_lifecycle_shadow_profile(
             or request.capture_plan["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
             or request.execution_context is None
             or not isinstance(store_root, Path)
-            or (mode == "execute" and type(snapshot) is not LiveLifecycleShadowSnapshot)
-            or (mode == "validate" and snapshot is not None)
+            or type(snapshot) is not LiveLifecycleShadowSnapshot
+            or readiness.capture_plan_digest != prepared_request.capture_plan_digest
+            or (readiness.candidate_sha, readiness.case_id, readiness.ready_at)
+            != (prepared_request.inputs.candidate_sha, prepared_request.inputs.case_id, prepared_request.inputs.ready_at)
         ):
             raise ValueError
         prepare_live_lifecycle_context(
@@ -1702,8 +1961,8 @@ def _run_prepared_live_lifecycle_shadow_profile(
             case_id=prepared_request.inputs.case_id, ready_at=prepared_request.inputs.ready_at,
         )
         return harness.run_profile_executor(
-            mode, request_value, LiveLifecycleShadowProfileAdapter(snapshot), store_root,
-            expected_readiness_digest=expected_readiness_digest,
+            "execute", request_value, LiveLifecycleShadowProfileAdapter(snapshot), store_root,
+            expected_readiness_digest=readiness.receipt_digest,
         )
     except ExternalValidationAdapterError:
         raise

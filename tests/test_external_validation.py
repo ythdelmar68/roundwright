@@ -519,10 +519,10 @@ class ExternalValidationTests(unittest.TestCase):
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
                     "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviews": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviewRequests": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "closingIssuesReferences": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
                     "commits": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                        {"commit": {"checkSuites": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                        {"commit": {"oid": "1" * 40, "checkSuites": {"totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "suite-cursor-1"}, "nodes": [
                             {"id": "check-suite-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-1"}},
                         ]}}},
-                        {"commit": {"checkSuites": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                        {"commit": {"oid": "2" * 40, "checkSuites": {"totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "suite-cursor-2"}, "nodes": [
                             {"id": "check-suite-2", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-2"}},
                         ]}}},
                     ]},
@@ -542,6 +542,16 @@ class ExternalValidationTests(unittest.TestCase):
                 self.payload = payload
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
                 self.commands.append(arguments)
+                if "object(expression:$oid)" in arguments[3]:
+                    oid = next(value.removeprefix("oid=") for value in arguments if value.startswith("oid="))
+                    suffix = "1" if oid == "1" * 40 else "2" if oid == "2" * 40 else "unknown"
+                    return OpaqueResult(0, json.dumps({"data": {"repository": {
+                        "name": name, "owner": {"login": owner}, "object": {"oid": oid, "checkSuites": {
+                            "totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
+                                "id": f"check-suite-{suffix}-continued", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued"},
+                            }],
+                        }},
+                    }}}))
                 return OpaqueResult(0, json.dumps(self.payload))
 
         host = OpaqueCredentialHost(raw_inventory)
@@ -561,12 +571,16 @@ class ExternalValidationTests(unittest.TestCase):
             result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
-        self.assertEqual(len(host.commands), 3)
-        self.assertEqual(host.commands, [host.commands[0]] * 3)
-        self.assertEqual(host.commands[0][0:3], ("api", "graphql", "-f"))
-        self.assertIn("repository(owner:$owner,name:$name)", host.commands[0][3])
-        self.assertIn("commits(first:100)", host.commands[0][3])
-        self.assertEqual(host.commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
+        inventory_commands = [command for command in host.commands if "object(expression:$oid)" not in command[3]]
+        continuation_commands = [command for command in host.commands if "object(expression:$oid)" in command[3]]
+        self.assertEqual(len(inventory_commands), 3)
+        self.assertEqual(inventory_commands, [inventory_commands[0]] * 3)
+        self.assertEqual(len(continuation_commands), 6)
+        self.assertEqual(inventory_commands[0][0:3], ("api", "graphql", "-f"))
+        self.assertIn("repository(owner:$owner,name:$name)", inventory_commands[0][3])
+        self.assertIn("commits(first:100)", inventory_commands[0][3])
+        self.assertEqual(inventory_commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
+        self.assertTrue(all("checkSuites(first:100,after:$cursor)" in command[3] for command in continuation_commands))
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
         self.assertFalse(hasattr(capability, "query"))
@@ -599,6 +613,23 @@ class ExternalValidationTests(unittest.TestCase):
                     root = Path(temporary).resolve()
                     session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
                     confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("b"))
+                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                        external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
+                self.assertEqual(len(malformed_host.commands), 1)
+        for label, total_count, has_next in (("partial-suite", 2, False), ("over-bound-suite", 101, True)):
+            with self.subTest(label=label):
+                malformed_inventory = json.loads(json.dumps(raw_inventory))
+                suites = malformed_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"][0]["commit"]["checkSuites"]
+                suites["totalCount"] = total_count
+                suites["pageInfo"]["hasNextPage"] = has_next
+                malformed_host = OpaqueCredentialHost(malformed_inventory)
+                malformed_capability = create_credentialed_github_read_capability(
+                    malformed_host, binding, dependency_control, health, clock=lambda: now,
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("a"))
                     with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
                         external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
                 self.assertEqual(len(malformed_host.commands), 1)

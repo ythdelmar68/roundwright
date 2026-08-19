@@ -748,7 +748,9 @@ class _OwnerGitHubReadHostEndpoint:
                 "gh repository inventory did not return a usable response",
             ))
         try:
-            raw = json.loads(outcome.stdout)
+            raw = _complete_repository_inventory_check_suites(
+                request, json.loads(outcome.stdout), self.__runner,
+            )
             snapshot = _normalize_repository_inventory(request, raw)
             return GitHubReadResult(request, snapshot=snapshot)
         except (json.JSONDecodeError, GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
@@ -4250,10 +4252,151 @@ def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
         "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
         "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
-        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{checkSuites(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
+        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid checkSuites(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
         "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
     )
     return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
+
+
+def _repository_inventory_check_suites_command(
+    request: GitHubReadRequest, commit_oid: str, cursor: str,
+) -> tuple[str, ...]:
+    """Build the repository-owned continuation for one retained commit.
+
+    This command is intentionally private: callers can request only a generic
+    inventory, while the reviewed host owns the nested connection traversal.
+    """
+
+    if (
+        type(request) is not GitHubReadRequest
+        or request.operation is not GitHubReadOperation.REPOSITORY_INVENTORY
+        or request.expected_sha is None
+        or type(commit_oid) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", commit_oid) is None
+        or type(cursor) is not str
+        or _CURSOR.fullmatch(cursor) is None
+    ):
+        raise GitHubRuntimeError("repository inventory check-suite continuation is invalid")
+    query = (
+        "query($owner:String!,$name:String!,$oid:String!,$cursor:String!){repository(owner:$owner,name:$name){"
+        "name owner{login} object(expression:$oid){... on Commit{oid checkSuites(first:100,after:$cursor){"
+        "totalCount pageInfo{hasNextPage endCursor} nodes{id status conclusion workflowRun{id}}}}}}}"
+    )
+    return (
+        "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+        "-F", f"name={request.repository.name}", "-F", f"oid={commit_oid}", "-F", f"cursor={cursor}",
+    )
+
+
+def _complete_repository_inventory_check_suites(
+    request: GitHubReadRequest, raw: object, runner: _FixedGhReadRunner,
+) -> object:
+    """Complete bounded nested check-suite pages before public normalization.
+
+    The first inventory response establishes the retained pull-request commits.
+    Every non-terminal suite connection is then continued through a fixed query,
+    with repository, commit, cursor, cardinality, and duplicate checks on every
+    response.  A connection above its reviewed 100-item bound remains invalid.
+    """
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory repository does not match request")
+    default_ref = _raw_mapping(repository.get("defaultBranchRef"))
+    if _raw_text(_raw_mapping(default_ref.get("target")), "oid") != request.expected_sha:
+        raise GitHubRuntimeError("inventory default head does not match baseline")
+    pull_requests = _raw_mapping(repository.get("pullRequests"))
+    pull_request_nodes = pull_requests.get("nodes")
+    if type(pull_request_nodes) is not list:
+        raise GitHubRuntimeError("inventory pull-request collection is malformed")
+    for pull_request_node in pull_request_nodes:
+        pull_request = _raw_mapping(pull_request_node)
+        commits = _raw_mapping(pull_request.get("commits"))
+        commit_nodes = commits.get("nodes")
+        commit_page = _raw_mapping(commits.get("pageInfo"))
+        if (
+            type(commit_nodes) is not list
+            or _raw_bool(commit_page, "hasNextPage")
+            or _raw_integer(commits, "totalCount") != len(commit_nodes)
+            or len(commit_nodes) > 100
+        ):
+            raise GitHubRuntimeError("inventory commit pagination is incomplete")
+        for commit_node in commit_nodes:
+            commit = _raw_mapping(_raw_mapping(commit_node).get("commit"))
+            commit_oid = _raw_text(commit, "oid")
+            if re.fullmatch(r"[0-9a-f]{40}", commit_oid) is None:
+                raise GitHubRuntimeError("inventory commit identity is malformed")
+            suites = _raw_mapping(commit.get("checkSuites"))
+            if type(suites) is not dict:
+                raise GitHubRuntimeError("inventory check-suite collection is malformed")
+            total = _raw_integer(suites, "totalCount")
+            initial_nodes = suites.get("nodes")
+            page = _raw_mapping(suites.get("pageInfo"))
+            has_next = _raw_bool(page, "hasNextPage")
+            if type(initial_nodes) is not list or not 0 <= total <= 100 or len(initial_nodes) > total:
+                raise GitHubRuntimeError("inventory check pagination is incomplete")
+            suite_nodes = list(initial_nodes)
+            seen_ids = {_raw_id(_raw_mapping(node), "id") for node in suite_nodes}
+            if len(seen_ids) != len(suite_nodes):
+                raise GitHubRuntimeError("inventory check-suite evidence has duplicates")
+            cursor = page.get("endCursor")
+            if not has_next:
+                if len(suite_nodes) != total:
+                    raise GitHubRuntimeError("inventory check pagination is incomplete")
+                continue
+            if type(cursor) is not str or _CURSOR.fullmatch(cursor) is None:
+                raise GitHubRuntimeError("inventory check-suite cursor is malformed")
+            seen_cursors = {cursor}
+            for _ in range(32):
+                outcome = runner.run(_repository_inventory_check_suites_command(request, commit_oid, cursor))
+                if outcome.exit_code != 0:
+                    raise GitHubRuntimeError("inventory check-suite continuation failed")
+                page_total, page_nodes, has_next, next_cursor = _project_repository_inventory_check_suites_page(
+                    request, json.loads(outcome.stdout), commit_oid,
+                )
+                if page_total != total or len(suite_nodes) + len(page_nodes) > total:
+                    raise GitHubRuntimeError("inventory check pagination is incomplete")
+                page_ids = {_raw_id(_raw_mapping(node), "id") for node in page_nodes}
+                if len(page_ids) != len(page_nodes) or seen_ids.intersection(page_ids):
+                    raise GitHubRuntimeError("inventory check-suite evidence has duplicates")
+                suite_nodes.extend(page_nodes)
+                seen_ids.update(page_ids)
+                if not has_next:
+                    if len(suite_nodes) != total:
+                        raise GitHubRuntimeError("inventory check pagination is incomplete")
+                    suites["nodes"] = suite_nodes
+                    suites["pageInfo"] = {"hasNextPage": False, "endCursor": next_cursor}
+                    break
+                if type(next_cursor) is not str or _CURSOR.fullmatch(next_cursor) is None or next_cursor in seen_cursors:
+                    raise GitHubRuntimeError("inventory check-suite cursor is malformed")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise GitHubRuntimeError("inventory check-suite pagination exceeds bound")
+    return raw
+
+
+def _project_repository_inventory_check_suites_page(
+    request: GitHubReadRequest, raw: object, commit_oid: str,
+) -> tuple[int, list[object], bool, object]:
+    """Validate one continuation response without exposing its raw payload."""
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory continuation repository does not match request")
+    commit = _raw_mapping(repository.get("object"))
+    if _raw_text(commit, "oid") != commit_oid:
+        raise GitHubRuntimeError("inventory continuation commit does not match request")
+    suites = _raw_mapping(commit.get("checkSuites"))
+    nodes = suites.get("nodes")
+    page = _raw_mapping(suites.get("pageInfo"))
+    if type(nodes) is not list or len(nodes) > 100:
+        raise GitHubRuntimeError("inventory check pagination is incomplete")
+    return _raw_integer(suites, "totalCount"), nodes, _raw_bool(page, "hasNextPage"), page.get("endCursor")
 
 
 def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> RepositoryInventorySnapshot:

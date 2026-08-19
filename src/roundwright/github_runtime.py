@@ -4283,7 +4283,20 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             nested[section].append(connection)
             for node in nodes:
                 child = _raw_mapping(node)
-                facts.append(RepositoryInventoryFact(subject, predicate, _raw_text(child, "name") if predicate == "label" else f"issue-{_raw_integer(child, 'number')}"))
+                fact_value = _raw_text(child, "name") if predicate == "label" else f"issue-{_raw_integer(child, 'number')}"
+                facts.append(RepositoryInventoryFact(subject, predicate, fact_value))
+                if predicate == "label":
+                    derived_predicates = {
+                        "roundlet-malformed-parent-owner-input": "malformed-parent",
+                        "roundlet-dependency": "depends-on",
+                        "roundlet-supervisor-failover": "supervisor-failover",
+                    }
+                    if fact_value in derived_predicates:
+                        facts.append(RepositoryInventoryFact(subject, derived_predicates[fact_value], "observed"))
+        relationships = _raw_mapping(value.get("subIssues"))
+        relationship_nodes = relationships.get("nodes")
+        if type(relationship_nodes) is list and not relationship_nodes:
+            facts.append(RepositoryInventoryFact(subject, "standalone", "true"))
     for pull_request in pull_requests["nodes"]:  # type: ignore[index]
         value = _raw_mapping(pull_request); subject = f"pull-request-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))

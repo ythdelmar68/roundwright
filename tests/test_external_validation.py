@@ -5,6 +5,7 @@ import inspect
 import sys
 import tempfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType, ModuleType, SimpleNamespace
 import unittest
@@ -22,6 +23,7 @@ from roundwright.hosted_evidence import (
 )
 from roundwright.github import (
     GitHubReadOperation,
+    GitHubMutationOperation,
     GitHubReadRequest,
     GitHubReadResult,
     RepositoryRef,
@@ -29,6 +31,25 @@ from roundwright.github import (
     RepositoryInventoryFact,
     RepositoryInventorySection,
     RepositoryInventorySnapshot,
+)
+from roundwright.dependency_policy import (
+    BootstrapPolicyReceipt,
+    CandidateBinding,
+    ComponentPolicy,
+    DependencyComponent,
+    DependencyExecutionControl,
+    DependencyPolicy,
+    ObservedDependency,
+    PolicyTransition,
+    PolicyTransitionKind,
+    TrustedDependencyAdmission,
+    VersionRange,
+)
+from roundwright.github_runtime import (
+    CapabilityState,
+    GitHubCapabilityHealth,
+    OperationHealth,
+    create_credentialed_github_read_capability,
 )
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
@@ -457,6 +478,102 @@ class ExternalValidationTests(unittest.TestCase):
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(capability.calls, 3)
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate"])
+
+    def test_public_credentialed_factory_drives_three_product_owned_inventory_reads(self) -> None:
+        """The caller gives the factory only opaque host/evidence, never product data."""
+
+        now = datetime(2026, 8, 19, tzinfo=timezone.utc)
+        inputs = self.live_lifecycle_request_inputs()
+        owner, name = inputs.target_repository.split("/", 1)
+        binding = CandidateBinding(inputs.target_repository, "live-lifecycle-factory", inputs.candidate_sha)
+        digest = lambda character: "sha256:" + character * 64
+        components = (
+            ComponentPolicy(DependencyComponent.PACKAGE, "roundwright", VersionRange("0.0.0", "1.0.0"), "pypi-roundwright", digest("1"), digest("2")),
+            ComponentPolicy(DependencyComponent.GITHUB_CLI, "gh", VersionRange("2.0.0", "3.0.0"), "github-gh", digest("3"), digest("4")),
+        )
+        policy = DependencyPolicy(binding, digest("5"), int(now.timestamp()), 60, components, PolicyTransition(PolicyTransitionKind.BOOTSTRAP))
+        receipt = BootstrapPolicyReceipt.create(policy, reviewer_identity=digest("6"), authority_digest=digest("7"))
+        policy = replace(policy, transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, receipt))
+        dependency_control = DependencyExecutionControl(
+            policy,
+            tuple(ObservedDependency(binding, component.component, component.identifier, component.versions.minimum, component.source_identity, component.artifact_digest, component.executable_digest, int(now.timestamp()), policy.policy_digest) for component in components),
+            TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7")),
+        )
+        health = GitHubCapabilityHealth(tuple(
+            OperationHealth(
+                operation,
+                CapabilityState.AVAILABLE if operation is GitHubReadOperation.REPOSITORY_INVENTORY else CapabilityState.UNAVAILABLE,
+                now, digest(format(index % 10, "x")), now + timedelta(minutes=1),
+            )
+            for index, operation in enumerate((*GitHubReadOperation, *GitHubMutationOperation))
+        ))
+        raw_inventory = {
+            "data": {"repository": {
+                "id": "forward-target", "name": name, "owner": {"login": owner},
+                "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
+                "issues": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                    {"id": "issue-4", "number": 4, "state": "OPEN", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
+                    {"id": "issue-49", "number": 49, "state": "OPEN", "labels": {"totalCount": 4, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet-ignore"}, {"name": "roundlet-malformed-parent-owner-input"}, {"name": "roundlet-dependency"}, {"name": "roundlet-supervisor-failover"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                ]},
+                "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
+                    "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
+                    "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviews": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviewRequests": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "closingIssuesReferences": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+                    "commits": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                        {"commit": {"checkSuites": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                            {"id": "check-suite-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-1"}},
+                        ]}}},
+                    ]},
+                }]},
+                "refs": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+            }},
+        }
+
+        @dataclass(frozen=True)
+        class OpaqueResult:
+            exit_code: int
+            stdout: str
+
+        class OpaqueCredentialHost:
+            def __init__(self, payload: object) -> None:
+                self.commands: list[tuple[str, ...]] = []
+                self.payload = payload
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                self.commands.append(arguments)
+                return OpaqueResult(0, json.dumps(self.payload))
+
+        host = OpaqueCredentialHost(raw_inventory)
+        capability = create_credentialed_github_read_capability(
+            host, binding, dependency_control, health, clock=lambda: now,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("f"))
+            result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
+        harness = sys.modules["roundwright_harness.executor"]
+        self.assertEqual(result, {"status": "fake"})
+        self.assertEqual(len(host.commands), 3)
+        self.assertEqual(host.commands, [host.commands[0]] * 3)
+        self.assertEqual(host.commands[0][0:3], ("api", "graphql", "-f"))
+        self.assertIn("repository(owner:$owner,name:$name)", host.commands[0][3])
+        self.assertEqual(host.commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
+        self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
+        self.assertFalse(hasattr(capability, "query"))
+        self.assertFalse(hasattr(capability, "snapshot"))
+        drifted_inventory = json.loads(json.dumps(raw_inventory))
+        drifted_inventory["data"]["repository"]["defaultBranchRef"]["target"]["oid"] = "e" * 40
+        drifted_host = OpaqueCredentialHost(drifted_inventory)
+        drifted_capability = create_credentialed_github_read_capability(
+            drifted_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("e"))
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, drifted_capability)
+        self.assertEqual(len(drifted_host.commands), 1)
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

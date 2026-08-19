@@ -1164,15 +1164,22 @@ class _OwnerGitHubReadHostChannel:
 class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
     """Factory-sealed read client retaining safe failure provenance privately."""
 
-    __slots__ = ("__inventory_failure_results",)
+    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure")
 
     def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel) -> None:
         if type(channel) is not _OwnerGitHubReadHostChannel:
             raise GitHubRuntimeError("credentialed GitHub read channel is invalid")
         super().__init__(health, channel)
-        self.__inventory_failure_results: dict[int, tuple[GitHubReadRequest, GitHubFailure, RepositoryInventoryReadFailureCode]] = {}
+        self.__inventory_failure_lock = RLock()
+        self.__pending_inventory_failure: tuple[
+            GitHubReadRequest, GitHubReadResult, GitHubFailure, RepositoryInventoryReadFailureCode,
+        ] | None = None
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+        # A second read always makes an earlier result stale, including when
+        # the new read succeeds or the channel fails before returning a code.
+        with self.__inventory_failure_lock:
+            self.__pending_inventory_failure = None
         result = super().read(request)
         if (
             request.operation is GitHubReadOperation.REPOSITORY_INVENTORY
@@ -1180,19 +1187,27 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
         ):
             code = repository_inventory_failure_code(result.failure.public_reason)
             if code is not None:
-                self.__inventory_failure_results[id(result)] = (request, result.failure, code)
+                with self.__inventory_failure_lock:
+                    self.__pending_inventory_failure = (request, result, result.failure, code)
         return result
 
     def _trusted_inventory_failure_code(
         self, request: GitHubReadRequest, result: GitHubReadResult,
     ) -> RepositoryInventoryReadFailureCode | None:
-        retained = self.__inventory_failure_results.get(id(result))
-        if retained is None:
+        with self.__inventory_failure_lock:
+            retained = self.__pending_inventory_failure
+            if retained is None:
+                return None
+            retained_request, retained_result, retained_failure, code = retained
+            if (
+                retained_request is request
+                and retained_result is result
+                and result.request == request
+                and result.failure is retained_failure
+            ):
+                self.__pending_inventory_failure = None
+                return code
             return None
-        retained_request, retained_failure, code = retained
-        if retained_request is request and result.request == request and result.failure is retained_failure:
-            return code
-        return None
 
 
 def credentialed_repository_inventory_failure_code(

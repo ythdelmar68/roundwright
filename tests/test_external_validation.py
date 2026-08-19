@@ -22,8 +22,6 @@ from roundwright.hosted_evidence import (
     HostedWorkflowRun,
 )
 from roundwright.github import (
-    GitHubFailure,
-    GitHubFailureKind,
     GitHubReadOperation,
     GitHubMutationOperation,
     GitHubReadRequest,
@@ -51,7 +49,7 @@ from roundwright.github_runtime import (
     CapabilityState,
     GitHubCapabilityHealth,
     OperationHealth,
-    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
+    credentialed_repository_inventory_failure_code,
     create_credentialed_github_read_capability,
     repository_inventory_failure_code,
 )
@@ -682,24 +680,47 @@ class ExternalValidationTests(unittest.TestCase):
             failure_code(OpaqueCredentialHost(over_bound_inventory)),
             external_validation.RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE,
         )
-        class ArbitraryPublicReasonCapability:
-            def __init__(self) -> None: self.calls = 0
+        sealed_capability = create_credentialed_github_read_capability(
+            OpaqueCredentialHost(raw_inventory, exit_code=1), binding, dependency_control, health, clock=lambda: now,
+        )
+        first_failure = sealed_capability.read(request)
+        assert first_failure.failure is not None
+        copied_failure = GitHubReadResult(request, failure=first_failure.failure)
+        recreated_request = GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        )
+        recreated_failure = GitHubReadResult(recreated_request, failure=first_failure.failure)
+        self.assertIsNone(credentialed_repository_inventory_failure_code(sealed_capability, request, copied_failure))
+        self.assertIsNone(credentialed_repository_inventory_failure_code(sealed_capability, recreated_request, recreated_failure))
+        second_failure = sealed_capability.read(request)
+        self.assertIsNone(credentialed_repository_inventory_failure_code(sealed_capability, request, first_failure))
+        self.assertEqual(
+            credentialed_repository_inventory_failure_code(sealed_capability, request, second_failure),
+            external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,
+        )
+        self.assertIsNone(credentialed_repository_inventory_failure_code(sealed_capability, request, second_failure))
+        class ReplayCapability:
+            def __init__(self, result: GitHubReadResult) -> None:
+                self.calls = 0
+                self.result = result
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls += 1
-                return GitHubReadResult(request, failure=GitHubFailure(
-                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
-                    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":identity-drift",
-                ))
-        arbitrary_failure = ArbitraryPublicReasonCapability()
+                return self.result
         executes_before = len([item for item in harness.run_calls if item[0][0] == "execute"])
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
-            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("9"))
-            with self.assertRaises(external_validation.RepositoryInventoryFirstReadBoundaryError) as captured:
-                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, arbitrary_failure)
-        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
-        self.assertEqual(arbitrary_failure.calls, 1)
+        for label, replayed_result in (
+            ("copied", copied_failure), ("recreated", recreated_failure),
+            ("stale", first_failure), ("consumed", second_failure),
+        ):
+            with self.subTest(replay=label):
+                replay = ReplayCapability(replayed_result)
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("9"))
+                    with self.assertRaises(external_validation.RepositoryInventoryFirstReadBoundaryError) as captured:
+                        external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, replay)
+                self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+                self.assertEqual(replay.calls, 1)
         self.assertEqual(len([item for item in harness.run_calls if item[0][0] == "execute"]), executes_before)
         drifted_inventory = json.loads(json.dumps(raw_inventory))
         drifted_inventory["data"]["repository"]["defaultBranchRef"]["target"]["oid"] = "e" * 40

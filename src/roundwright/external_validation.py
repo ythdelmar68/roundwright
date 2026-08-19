@@ -14,6 +14,7 @@ from typing import Any, Literal, Mapping
 from .shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
+    LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     ShadowV2Error,
     ShadowV2EventGraph,
@@ -30,6 +31,7 @@ from .provider_attempt_runtime import (
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
 HOSTED_CHECK_SCHEMA = "roundwright-hosted-check-evidence/v1"
+LIVE_LIFECYCLE_SHADOW_SCHEMA = "roundwright-live-lifecycle-shadow/v1"
 _SHA = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -69,6 +71,7 @@ PROVIDER_ATTEMPT_COMPARATOR_IDENTITY = _digest(
 )
 PROVIDER_ATTEMPT_HISTORY_BLOCKER = "provider-attempt-runtime-unavailable"
 HOSTED_CHECK_OBSERVATION_BLOCKER = "hosted-check-observation-unavailable"
+LIVE_LIFECYCLE_OBSERVATION_BLOCKER = "live-lifecycle-shadow-observation-unavailable"
 
 
 def synthetic_component_identities() -> tuple[str, str, str]:
@@ -116,6 +119,27 @@ def hosted_check_component_identities() -> tuple[str, str, str]:
         HOSTED_CHECK_PRODUCER_IDENTITY,
         HOSTED_CHECK_EXPORTER_IDENTITY,
         HOSTED_CHECK_COMPARATOR_IDENTITY,
+    )
+
+
+LIVE_LIFECYCLE_PRODUCER_IDENTITY = _digest(
+    {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "component": "normalized-live-lifecycle-reader"}
+)
+LIVE_LIFECYCLE_EXPORTER_IDENTITY = _digest(
+    {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "component": "public-safe-lifecycle-exporter"}
+)
+LIVE_LIFECYCLE_COMPARATOR_IDENTITY = _digest(
+    {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "component": "zero-mutation-lifecycle-comparator"}
+)
+
+
+def live_lifecycle_shadow_component_identities() -> tuple[str, str, str]:
+    """Return the fixed identities for the armed live-lifecycle profile."""
+
+    return (
+        LIVE_LIFECYCLE_PRODUCER_IDENTITY,
+        LIVE_LIFECYCLE_EXPORTER_IDENTITY,
+        LIVE_LIFECYCLE_COMPARATOR_IDENTITY,
     )
 
 
@@ -981,7 +1005,311 @@ class HostedCheckProfileAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter:
+_LIVE_LIFECYCLE_FIXTURES = (
+    "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
+    "dependency", "merged-pr", "supervisor-failover",
+)
+_LIVE_LIFECYCLE_SNAPSHOTS = (
+    "repository", "issues", "scheduling", "pull-requests", "comments",
+    "roundlet-trace", "candidates", "reviews", "checks", "merge", "cleanup",
+)
+
+
+@dataclass(frozen=True)
+class LiveLifecycleShadowSnapshot:
+    """One public-safe, armed read-only lifecycle observation.
+
+    The snapshot carries only normalized identifiers and digests.  Raw GitHub
+    responses, local paths, credentials, and provider output stay with the
+    repository-owned Recorder and can never enter the profile projection.
+    """
+
+    target_repository: str
+    target_baseline_sha: str
+    target_observed_sha: str
+    candidate_sha: str
+    capture_plan_digest: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    armed_before_event_id: str
+    event_graph: ShadowV2EventGraph
+    snapshot_digests: Mapping[str, str]
+    fixture_classes: tuple[str, ...]
+    classified_differences: tuple[str, ...]
+    before_target_state_digest: str
+    after_target_state_digest: str
+    zero_mutation_readback_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        snapshots = dict(self.snapshot_digests) if type(self.snapshot_digests) in (dict, MappingProxyType) else None
+        if (
+            self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or self.target_observed_sha != self.target_baseline_sha
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or not _safe_token(self.case_id)
+            or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or not _safe_token(self.armed_before_event_id)
+            or type(self.event_graph) is not ShadowV2EventGraph
+            or snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
+            or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
+            or type(self.fixture_classes) is not tuple or self.fixture_classes != _LIVE_LIFECYCLE_FIXTURES
+            or type(self.classified_differences) is not tuple
+            or any(not _safe_token(value) for value in self.classified_differences)
+            or len(set(self.classified_differences)) != len(self.classified_differences)
+            or _DIGEST.fullmatch(self.before_target_state_digest) is None
+            or self.after_target_state_digest != self.before_target_state_digest
+        ):
+            raise ExternalValidationAdapterError("live lifecycle snapshot is invalid")
+        try:
+            self.event_graph.validate(shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE), self.candidate_sha)
+        except ShadowV2Error as error:
+            raise ExternalValidationAdapterError("live lifecycle graph is invalid") from error
+        if self.event_graph.events[0].event_id != self.armed_before_event_id:
+            raise ExternalValidationAdapterError("live lifecycle window was not armed before its first event")
+        object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
+        object.__setattr__(self, "zero_mutation_readback_digest", _digest({
+            "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+            "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha,
+            "target_observed_sha": self.target_observed_sha,
+            "before_target_state_digest": self.before_target_state_digest,
+            "after_target_state_digest": self.after_target_state_digest,
+        }))
+
+    def public_payload(self) -> dict[str, object]:
+        return {
+            "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha,
+            "target_observed_sha": self.target_observed_sha,
+            "observation_window": self.observation_window,
+            "ready_at": self.ready_at,
+            "armed_before_event_id": self.armed_before_event_id,
+            "snapshot_digests": dict(self.snapshot_digests),
+            "fixture_classes": list(self.fixture_classes),
+            "classified_differences": list(self.classified_differences),
+            "event_graph_digest": _digest(_graph_payload(self.event_graph)),
+            "zero_mutation_readback_digest": self.zero_mutation_readback_digest,
+        }
+
+
+@dataclass(frozen=True)
+class LiveLifecycleRuntimeDescriptor:
+    """Closed V2 context that pins one public target/window before arming."""
+
+    target_repository: str
+    target_baseline_sha: str
+    candidate_sha: str
+    capture_plan_digest: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    schema: str = "roundwright-live-lifecycle-runtime/v1"
+
+    @classmethod
+    def parse(cls, value: object) -> "LiveLifecycleRuntimeDescriptor":
+        if type(value) not in (dict, MappingProxyType):
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
+        raw = dict(value)
+        if set(raw) != {
+            "schema", "target_repository", "target_baseline_sha", "candidate_sha",
+            "capture_plan_digest", "case_id", "observation_window", "ready_at",
+        }:
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
+        try:
+            return cls(**raw)
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid") from error
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema != "roundwright-live-lifecycle-runtime/v1"
+            or self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+        ):
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema, "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha,
+            "candidate_sha": self.candidate_sha, "capture_plan_digest": self.capture_plan_digest,
+            "case_id": self.case_id, "observation_window": self.observation_window,
+            "ready_at": self.ready_at,
+        }
+
+
+@dataclass(frozen=True)
+class MaterializedLiveLifecycleContext:
+    descriptor: LiveLifecycleRuntimeDescriptor
+
+    @property
+    def identity(self) -> str:
+        return _digest({"schema": "roundwright-live-lifecycle-context/v1", "descriptor": self.descriptor.payload()})
+
+
+def prepare_live_lifecycle_context(
+    descriptor_value: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
+) -> MaterializedLiveLifecycleContext:
+    descriptor = LiveLifecycleRuntimeDescriptor.parse(descriptor_value)
+    if (descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at) != (
+        plan_digest, candidate_sha, case_id, ready_at,
+    ):
+        raise ExternalValidationAdapterError("live lifecycle runtime descriptor does not match capture plan")
+    return MaterializedLiveLifecycleContext(descriptor)
+
+
+def _live_lifecycle_binding_identity(binding: object) -> str:
+    try:
+        value = {
+            "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "profile": binding.profile,
+            "case_id": binding.case_id, "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at, "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("live lifecycle binding is invalid") from error
+    if (
+        value["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
+        or not _safe_token(value["case_id"])
+        or _SHA.fullmatch(value["candidate_sha"]) is None
+        or type(value["ready_at"]) is not int or value["ready_at"] < 0
+        or _DIGEST.fullmatch(value["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("live lifecycle binding is invalid")
+    return _digest(value)
+
+
+def _live_lifecycle_context(binding: object) -> MaterializedLiveLifecycleContext:
+    try:
+        context, descriptor_digest = binding.execution_context, binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("live lifecycle V2 execution context is unavailable") from error
+    if type(value) is not MaterializedLiveLifecycleContext or _DIGEST.fullmatch(descriptor_digest) is None:
+        raise ExternalValidationAdapterError("live lifecycle V2 execution context has drifted")
+    descriptor = value.descriptor
+    if (descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at) != (
+        binding.plan.plan_digest, binding.candidate_sha, binding.case_id, binding.ready_at,
+    ):
+        raise ExternalValidationAdapterError("live lifecycle V2 execution context has drifted")
+    return value
+
+
+def _bound_live_lifecycle_snapshot(
+    binding: object, snapshot: LiveLifecycleShadowSnapshot, context: MaterializedLiveLifecycleContext,
+) -> None:
+    descriptor = context.descriptor
+    if (
+        snapshot.target_repository != descriptor.target_repository
+        or snapshot.target_baseline_sha != descriptor.target_baseline_sha
+        or (snapshot.candidate_sha, snapshot.capture_plan_digest, snapshot.case_id, snapshot.ready_at, snapshot.observation_window)
+        != (binding.candidate_sha, binding.plan.plan_digest, binding.case_id, binding.ready_at, descriptor.observation_window)
+    ):
+        raise ExternalValidationAdapterError("live lifecycle snapshot has drifted")
+
+
+@dataclass(frozen=True)
+class LiveLifecycleShadowProfileAdapter:
+    """Read-only adapter for an already-armed and independently read-back window."""
+
+    snapshot: LiveLifecycleShadowSnapshot | None = None
+    profile_id: str = LIVE_LIFECYCLE_SHADOW_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile_id != LIVE_LIFECYCLE_SHADOW_PROFILE or (
+            self.snapshot is not None and type(self.snapshot) is not LiveLifecycleShadowSnapshot
+        ):
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(*live_lifecycle_shadow_component_identities())
+
+    def prepare_execution_context(self, preparation: object) -> object:
+        try:
+            context = prepare_live_lifecycle_context(
+                preparation.descriptor, plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha, case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("live lifecycle V2 execution context is invalid") from error
+
+    def validate(self, binding: object) -> None:
+        _live_lifecycle_binding_identity(binding)
+        _live_lifecycle_context(binding)
+        try:
+            actual = (
+                binding.components.producer_identity, binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("live lifecycle components are invalid") from error
+        if actual != live_lifecycle_shadow_component_identities():
+            raise ExternalValidationAdapterError("live lifecycle components have drifted")
+        if shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE).capture_mode.value != "armed-live-events":
+            raise ExternalValidationAdapterError("live lifecycle profile capture mode has drifted")
+
+    def execute(self, binding: object) -> object:
+        identity = _live_lifecycle_binding_identity(binding)
+        context = _live_lifecycle_context(binding)
+        if self.snapshot is None:
+            raise ExternalValidationAdapterError(LIVE_LIFECYCLE_OBSERVATION_BLOCKER)
+        _bound_live_lifecycle_snapshot(binding, self.snapshot, context)
+        return _harness_executor().ProfileExecution(
+            {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "binding_identity": identity, "snapshot": self.snapshot},
+            mutation_count=0,
+        )
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        identity = _live_lifecycle_binding_identity(binding)
+        context = _live_lifecycle_context(binding)
+        try:
+            value, mutation_count, snapshot = execution.value, execution.mutation_count, execution.value["snapshot"]
+        except (AttributeError, KeyError, TypeError) as error:
+            raise ExternalValidationAdapterError("live lifecycle result is invalid") from error
+        if (
+            type(value) is not dict or value.get("schema") != LIVE_LIFECYCLE_SHADOW_SCHEMA
+            or value.get("binding_identity") != identity or type(snapshot) is not LiveLifecycleShadowSnapshot
+            or mutation_count != 0
+        ):
+            raise ExternalValidationAdapterError("live lifecycle result has drifted")
+        _bound_live_lifecycle_snapshot(binding, snapshot, context)
+        return {
+            "schema": "roundwright-shadow-case/v2", "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+            "live_lifecycle_shadow": {
+                "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "binding_identity": identity,
+                "producer_identity": LIVE_LIFECYCLE_PRODUCER_IDENTITY,
+                "exporter_identity": LIVE_LIFECYCLE_EXPORTER_IDENTITY,
+                "comparator_identity": LIVE_LIFECYCLE_COMPARATOR_IDENTITY,
+                "snapshot": snapshot.public_payload(), "mutation_count": 0,
+            },
+        }
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise ExternalValidationAdapterError(LIVE_LIFECYCLE_OBSERVATION_BLOCKER)
+        expected = self.project(binding, self.execute(binding))
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        return _harness_executor().ProfileComparison(status, _digest({
+            "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "status": status,
+            "ready_at": binding.ready_at, "expected_identity": _digest(expected),
+            "observed_identity": _digest(evidence),
+        }))
+
+
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
@@ -990,6 +1318,8 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
         return ProviderAttemptAccountingAdapter(profile_id)
     if profile_id == HOSTED_CHECK_PROFILE:
         return HostedCheckProfileAdapter(profile_id=profile_id)
+    if profile_id == LIVE_LIFECYCLE_SHADOW_PROFILE:
+        return LiveLifecycleShadowProfileAdapter(profile_id=profile_id)
     raise ExternalValidationAdapterError("executor profile is unsupported")
 
 
@@ -1029,6 +1359,44 @@ def run_hosted_check_profile(
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("hosted check hosted entrypoint binding is invalid") from error
+
+
+def run_live_lifecycle_shadow_profile(
+    mode: Literal["validate", "execute"], request_value: Mapping[str, Any], store_root: Path,
+    snapshot: LiveLifecycleShadowSnapshot | None = None, *, expected_readiness_digest: str | None = None,
+) -> object:
+    """Run one already-armed, read-only lifecycle window through the V2 executor.
+
+    Preflight is deliberately incapable of opening a window: validate rejects a
+    snapshot, while execute accepts only a typed snapshot that was captured by
+    the reviewed Recorder after the plan was armed.
+    """
+
+    harness = _harness_executor()
+    try:
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
+            or request.execution_context is None
+            or not isinstance(store_root, Path)
+            or (mode == "execute" and type(snapshot) is not LiveLifecycleShadowSnapshot)
+            or (mode == "validate" and snapshot is not None)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        prepare_live_lifecycle_context(
+            request.execution_context, plan_digest=plan.plan_digest, candidate_sha=plan.candidate_sha,
+            case_id=plan.case_id, ready_at=plan.ready_at,
+        )
+        return harness.run_profile_executor(
+            mode, request_value, LiveLifecycleShadowProfileAdapter(snapshot), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except ExternalValidationAdapterError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle hosted entrypoint binding is invalid") from error
 
 
 def run_provider_attempt_accounting_profile(

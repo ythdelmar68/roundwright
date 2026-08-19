@@ -18,7 +18,17 @@ from roundwright.hosted_evidence import (
     HostedWorkflowJob,
     HostedWorkflowRun,
 )
-from roundwright.shadow import EXECUTOR_CONTRACT_SYNTHETIC_PROFILE, HOSTED_CHECK_PROFILE, PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+from roundwright.shadow import (
+    EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
+    HOSTED_CHECK_PROFILE,
+    LIVE_LIFECYCLE_SHADOW_PROFILE,
+    PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    EvidenceRole,
+    LifecycleAttempt,
+    LifecycleAttemptKind,
+    ShadowV2Event,
+    ShadowV2EventGraph,
+)
 
 
 @dataclass(frozen=True)
@@ -173,6 +183,32 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "observation-unavailable"):
             adapter.execute(exact)
 
+    def test_live_lifecycle_profile_requires_an_armed_typed_snapshot(self) -> None:
+        adapter = external_validation.roundwright_profile_adapter_factory(LIVE_LIFECYCLE_SHADOW_PROFILE)
+        producer, exporter, comparator = external_validation.live_lifecycle_shadow_component_identities()
+        exact = self.live_lifecycle_binding(adapter, producer, exporter, comparator)
+        self.assertEqual(adapter.component_identities, ProfileComponentIdentities(producer, exporter, comparator))
+        adapter.validate(exact)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "observation-unavailable"):
+            adapter.execute(exact)
+
+    def test_live_lifecycle_profile_projects_only_public_safe_zero_mutation_evidence(self) -> None:
+        snapshot = self.live_lifecycle_snapshot()
+        adapter = external_validation.LiveLifecycleShadowProfileAdapter(snapshot)
+        producer, exporter, comparator = external_validation.live_lifecycle_shadow_component_identities()
+        exact = self.live_lifecycle_binding(adapter, producer, exporter, comparator)
+        adapter.validate(exact)
+        execution = adapter.execute(exact)
+        evidence = adapter.project(exact, execution)
+        comparison = adapter.compare(exact, evidence)
+        projection = evidence["live_lifecycle_shadow"]
+        self.assertEqual(execution.mutation_count, 0)
+        self.assertEqual(projection["snapshot"]["target_observed_sha"], "b" * 40)
+        self.assertEqual(projection["snapshot"]["fixture_classes"], list(external_validation._LIVE_LIFECYCLE_FIXTURES))
+        self.assertTrue(projection["snapshot"]["zero_mutation_readback_digest"].startswith("sha256:"))
+        self.assertNotIn("raw", json.dumps(evidence).lower())
+        self.assertEqual(comparison.status, "pass")
+
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()
         adapter = external_validation.HostedCheckProfileAdapter(snapshot)
@@ -268,6 +304,41 @@ class ExternalValidationTests(unittest.TestCase):
         return external_validation.HostedCheckSnapshot(
             evidence, HostedCheckPolicy(("unit",), ("build-manifest",), 60),
             "refs/heads/codex/issue-48", 17, "run-48", "suite-48",
+        )
+
+    def live_lifecycle_snapshot(self) -> external_validation.LiveLifecycleShadowSnapshot:
+        candidate = "a" * 40
+        graph = ShadowV2EventGraph(
+            (LifecycleAttempt("worker-49", 1, LifecycleAttemptKind.WORKER, EvidenceRole.WORKER),),
+            (), (), (), (),
+            (ShadowV2Event("event-49", 1, "worker-49", "repository-snapshot", None, False),),
+        )
+        return external_validation.LiveLifecycleShadowSnapshot(
+            "ythdelmar68/roundlet-forward-test", "b" * 40, "b" * 40, candidate,
+            "sha256:" + "1" * 64, "live-lifecycle-case", "window-49", 17, "event-49", graph,
+            {name: "sha256:" + (f"{index:x}" * 64) for index, name in enumerate(external_validation._LIVE_LIFECYCLE_SNAPSHOTS, start=1)},
+            external_validation._LIVE_LIFECYCLE_FIXTURES, (), "sha256:" + "e" * 64, "sha256:" + "e" * 64,
+        )
+
+    def live_lifecycle_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:
+        plan = SimpleNamespace(
+            plan_digest="sha256:" + "1" * 64, profile=LIVE_LIFECYCLE_SHADOW_PROFILE,
+            case_id="live-lifecycle-case", candidate_sha="a" * 40, ready_at=17,
+        )
+        descriptor = {
+            "schema": "roundwright-live-lifecycle-runtime/v1",
+            "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
+            "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
+            "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
+        }
+        context = adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=plan))  # type: ignore[attr-defined]
+        return SimpleNamespace(
+            profile=LIVE_LIFECYCLE_SHADOW_PROFILE, case_id=plan.case_id,
+            candidate_sha=plan.candidate_sha, ready_at=plan.ready_at, plan=plan,
+            components=SimpleNamespace(
+                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
+            ),
+            execution_context=context, execution_context_input_digest="sha256:" + "2" * 64,
         )
 
     def hosted_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:

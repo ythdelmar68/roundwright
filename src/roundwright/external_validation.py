@@ -35,7 +35,7 @@ from .github import (
 from .github_runtime import (
     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     RepositoryInventoryReadFailureCode,
-    repository_inventory_failure_code,
+    credentialed_repository_inventory_failure_code,
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
@@ -1502,7 +1502,7 @@ class _RoundwrightLiveLifecycleProvider:
                 RepositoryInventoryReadFailureCode.HOST_FAILURE,
             ) from error
         if type(result) is GitHubReadResult and result.request == request and result.failure is not None:
-            code = repository_inventory_failure_code(result.failure.public_reason)
+            code = credentialed_repository_inventory_failure_code(self._capability, request, result)
             if code is None:
                 code = RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE
             raise RepositoryInventoryFirstReadBoundaryError(code)

@@ -53,6 +53,7 @@ from roundwright.github_runtime import (
     OperationHealth,
     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     create_credentialed_github_read_capability,
+    repository_inventory_failure_code,
 )
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
@@ -650,7 +651,7 @@ class ExternalValidationTests(unittest.TestCase):
             ).read(request)
             self.assertFalse(failed.ok)
             assert failed.failure is not None
-            code = external_validation.repository_inventory_failure_code(failed.failure.public_reason)
+            code = repository_inventory_failure_code(failed.failure.public_reason)
             self.assertIsNotNone(code)
             assert code is not None
             return code
@@ -681,7 +682,7 @@ class ExternalValidationTests(unittest.TestCase):
             failure_code(OpaqueCredentialHost(over_bound_inventory)),
             external_validation.RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE,
         )
-        class TypedFailureCapability:
+        class ArbitraryPublicReasonCapability:
             def __init__(self) -> None: self.calls = 0
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls += 1
@@ -689,16 +690,16 @@ class ExternalValidationTests(unittest.TestCase):
                     GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
                     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":identity-drift",
                 ))
-        typed_failure = TypedFailureCapability()
+        arbitrary_failure = ArbitraryPublicReasonCapability()
         executes_before = len([item for item in harness.run_calls if item[0][0] == "execute"])
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
             confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("9"))
             with self.assertRaises(external_validation.RepositoryInventoryFirstReadBoundaryError) as captured:
-                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, typed_failure)
-        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.IDENTITY_DRIFT)
-        self.assertEqual(typed_failure.calls, 1)
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, arbitrary_failure)
+        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+        self.assertEqual(arbitrary_failure.calls, 1)
         self.assertEqual(len([item for item in harness.run_calls if item[0][0] == "execute"]), executes_before)
         drifted_inventory = json.loads(json.dumps(raw_inventory))
         drifted_inventory["data"]["repository"]["defaultBranchRef"]["target"]["oid"] = "e" * 40

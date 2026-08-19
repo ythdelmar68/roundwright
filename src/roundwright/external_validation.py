@@ -6,7 +6,7 @@ import hashlib
 import importlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Protocol
@@ -1298,7 +1298,69 @@ class LiveLifecycleReadinessReceipt:
 
 
 @dataclass(frozen=True)
-class LiveLifecycleReadyCapsule:
+class LiveLifecycleSessionReceipt:
+    """Path-free handle for one durable, trace-gated lifecycle session."""
+
+    session_id: str
+    readiness: LiveLifecycleReadinessReceipt
+    receipt_digest: str = ""
+
+    def __post_init__(self) -> None:
+        payload = {
+            "schema": "roundwright-live-lifecycle-session-receipt/v1",
+            "session_id": self.session_id,
+            "readiness": self.readiness.public_receipt(),
+        }
+        digest = _digest(payload)
+        if (
+            _DIGEST.fullmatch(self.session_id) is None
+            or type(self.readiness) is not LiveLifecycleReadinessReceipt
+            or self.readiness._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+            or (self.receipt_digest and self.receipt_digest != digest)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid")
+        object.__setattr__(self, "receipt_digest", digest)
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-session-receipt/v1",
+            "session_id": self.session_id,
+            "readiness": self.readiness.public_receipt(),
+            "receipt_digest": self.receipt_digest,
+        }
+
+    @classmethod
+    def parse(cls, value: object) -> "LiveLifecycleSessionReceipt":
+        if (
+            type(value) is not dict or set(value) != {"schema", "session_id", "readiness", "receipt_digest"}
+            or value["schema"] != "roundwright-live-lifecycle-session-receipt/v1"
+        ):
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid")
+        readiness_value = value["readiness"]
+        if (
+            type(readiness_value) is not dict or set(readiness_value) != {
+            "schema", "capture_plan_digest", "candidate_sha", "case_id", "ready_at",
+            "producer_identity", "exporter_identity", "comparator_identity",
+            "execution_context_input_digest", "execution_context_identity", "receipt_digest",
+            } or readiness_value["schema"] != "roundwright-live-lifecycle-readiness/v1"
+        ):
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid")
+        try:
+            readiness = LiveLifecycleReadinessReceipt(
+                readiness_value["capture_plan_digest"], readiness_value["candidate_sha"],
+                readiness_value["case_id"], readiness_value["ready_at"],
+                readiness_value["producer_identity"], readiness_value["exporter_identity"],
+                readiness_value["comparator_identity"], readiness_value["execution_context_input_digest"],
+                readiness_value["execution_context_identity"], readiness_value["receipt_digest"],
+                _LIVE_LIFECYCLE_READINESS_SEAL,
+            )
+            return cls(value["session_id"], readiness, value["receipt_digest"])
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid") from error
+
+
+@dataclass(frozen=True)
+class _LiveLifecycleReadyCapsule:
     """One sealed product preflight binding, consumed at most once."""
 
     prepared_request: LiveLifecyclePreparedRequest
@@ -1335,8 +1397,8 @@ class LiveLifecycleReadyCapsule:
 
 
 @dataclass(frozen=True)
-class LiveLifecycleProviderRequest:
-    """Public-safe facts given to a capability that can only read the target."""
+class LiveLifecycleTransportRequest:
+    """Product-owned low-level read request; never a caller-built snapshot."""
 
     target_repository: str
     target_baseline_sha: str
@@ -1345,11 +1407,12 @@ class LiveLifecycleProviderRequest:
     case_id: str
     observation_window: str
     ready_at: int
+    operation: Literal["before", "lifecycle", "after"]
     arm_before_first_live_event: bool
 
 
 @dataclass(frozen=True)
-class LiveLifecycleTargetState:
+class _LiveLifecycleTargetState:
     """Normalized target identity from one independent read-only observation."""
 
     target_repository: str
@@ -1366,7 +1429,7 @@ class LiveLifecycleTargetState:
 
 
 @dataclass(frozen=True)
-class LiveLifecycleProviderObservation:
+class _LiveLifecycleProviderObservation:
     """Normalized content-free observations from an armed read-only window."""
 
     snapshot_digests: Mapping[str, str]
@@ -1385,14 +1448,66 @@ class LiveLifecycleProviderObservation:
         object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
 
 
-class LiveLifecycleReadOnlyProvider(Protocol):
-    """The sole external capability accepted by live lifecycle materialization."""
+class LiveLifecycleReadTransport(Protocol):
+    """Narrow low-level read transport; product code owns lifecycle semantics."""
 
-    def read_before(self, request: LiveLifecycleProviderRequest) -> LiveLifecycleTargetState: ...
+    def read(self, request: LiveLifecycleTransportRequest) -> Mapping[str, object]: ...
 
-    def read_lifecycle(self, request: LiveLifecycleProviderRequest) -> LiveLifecycleProviderObservation: ...
 
-    def read_after(self, request: LiveLifecycleProviderRequest) -> LiveLifecycleTargetState: ...
+class _RoundwrightLiveLifecycleProvider:
+    """The reviewed product adapter owning every lifecycle read and normalization."""
+
+    def __init__(self, transport: LiveLifecycleReadTransport) -> None:
+        if not callable(getattr(transport, "read", None)):
+            raise ExternalValidationAdapterError("live lifecycle read transport is invalid")
+        self._transport = transport
+
+    def _read(
+        self, request: LiveLifecycleTransportRequest,
+    ) -> Mapping[str, object]:
+        try:
+            value = self._transport.read(request)
+        except Exception as error:
+            raise ExternalValidationAdapterError("live lifecycle transport read failed") from error
+        if type(value) is not dict:
+            raise ExternalValidationAdapterError("live lifecycle transport response is invalid")
+        return value
+
+    def read_before(self, request: LiveLifecycleTransportRequest) -> _LiveLifecycleTargetState:
+        value = self._read(request)
+        try:
+            if set(value) != {"target_sha", "target_state"}:
+                raise ValueError
+            return _LiveLifecycleTargetState(
+                request.target_repository, value["target_sha"], _digest(value["target_state"]),
+            )
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle before response is invalid") from error
+
+    def read_lifecycle(self, request: LiveLifecycleTransportRequest) -> _LiveLifecycleProviderObservation:
+        value = self._read(request)
+        try:
+            if set(value) != {"snapshots", "classified_differences"} or type(value["snapshots"]) is not dict:
+                raise ValueError
+            differences = value["classified_differences"]
+            if type(differences) is not list or any(type(item) is not str for item in differences):
+                raise ValueError
+            return _LiveLifecycleProviderObservation(
+                {name: _digest(item) for name, item in value["snapshots"].items()}, tuple(differences),
+            )
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle observation response is invalid") from error
+
+    def read_after(self, request: LiveLifecycleTransportRequest) -> _LiveLifecycleTargetState:
+        value = self._read(request)
+        try:
+            if set(value) != {"target_sha", "target_state"}:
+                raise ValueError
+            return _LiveLifecycleTargetState(
+                request.target_repository, value["target_sha"], _digest(value["target_state"]),
+            )
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle after response is invalid") from error
 
 
 def _live_lifecycle_store_root_identity(store_root: Path) -> str:
@@ -1535,10 +1650,10 @@ def _live_lifecycle_readiness_receipt(
         raise ExternalValidationAdapterError("live lifecycle readiness receipt is invalid") from error
 
 
-def preflight_live_lifecycle_shadow_profile(
+def _preflight_live_lifecycle_shadow_profile(
     inputs: LiveLifecycleRequestInputs, store_root: Path,
-) -> LiveLifecycleReadyCapsule:
-    """Construct and provider-free validate one sealed lifecycle-ready capsule."""
+) -> tuple[LiveLifecyclePreparedRequest, LiveLifecycleReadinessReceipt]:
+    """Construct and provider-free validate one product-owned readiness binding."""
 
     prepared_request = _prepare_live_lifecycle_shadow_request(inputs, store_root)
     request_value = _validated_live_lifecycle_request(prepared_request, store_root)
@@ -1550,9 +1665,7 @@ def preflight_live_lifecycle_shadow_profile(
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("live lifecycle preflight validation failed") from error
     readiness = _live_lifecycle_readiness_receipt(harness_receipt, prepared_request)
-    return LiveLifecycleReadyCapsule(
-        prepared_request, readiness, _seal=_LIVE_LIFECYCLE_READY_CAPSULE_SEAL,
-    )
+    return prepared_request, readiness
 
 
 def _validated_live_lifecycle_request(
@@ -1596,9 +1709,9 @@ def _validated_live_lifecycle_request(
 
 
 def _validated_live_lifecycle_ready_capsule(
-    capsule: LiveLifecycleReadyCapsule, store_root: Path,
+    capsule: _LiveLifecycleReadyCapsule, store_root: Path,
 ) -> LiveLifecyclePreparedRequest:
-    if type(capsule) is not LiveLifecycleReadyCapsule or capsule._consumed:
+    if type(capsule) is not _LiveLifecycleReadyCapsule or capsule._consumed:
         raise ExternalValidationAdapterError("live lifecycle ready capsule is unavailable")
     if (
         capsule._seal is not _LIVE_LIFECYCLE_READY_CAPSULE_SEAL
@@ -1651,10 +1764,11 @@ def _validated_live_lifecycle_ready_capsule(
     return prepared_request
 
 
-def materialize_live_lifecycle_shadow_profile(
-    capsule: LiveLifecycleReadyCapsule,
+def _materialize_live_lifecycle_shadow_profile(
+    prepared_request: LiveLifecyclePreparedRequest,
+    readiness: LiveLifecycleReadinessReceipt,
     store_root: Path,
-    provider: LiveLifecycleReadOnlyProvider,
+    transport: LiveLifecycleReadTransport,
 ) -> object:
     """Materialize one armed read-only lifecycle snapshot and delegate exactly once.
 
@@ -1663,27 +1777,23 @@ def materialize_live_lifecycle_shadow_profile(
     snapshot, or reach the Harness executor directly.
     """
 
-    prepared_request = _validated_live_lifecycle_ready_capsule(capsule, store_root)
-    if not all(callable(getattr(provider, name, None)) for name in (
-            "read_before", "read_lifecycle", "read_after",
-        )):
-        raise ExternalValidationAdapterError("live lifecycle read-only provider is invalid")
-    object.__setattr__(capsule, "_consumed", True)
+    _validated_live_lifecycle_request(prepared_request, store_root)
+    provider = _RoundwrightLiveLifecycleProvider(transport)
     inputs = prepared_request.inputs
-    request = LiveLifecycleProviderRequest(
+    request = LiveLifecycleTransportRequest(
         inputs.target_repository, inputs.target_baseline_sha, inputs.base_sha,
         inputs.candidate_sha, inputs.case_id, inputs.observation_window,
-        inputs.ready_at, True,
+        inputs.ready_at, "before", True,
     )
     before = provider.read_before(request)
     # The product creates this request with the arm flag before it makes the
     # sole lifecycle read.  A provider cannot supply an unarmed event graph.
-    observation = provider.read_lifecycle(request)
-    after = provider.read_after(request)
+    observation = provider.read_lifecycle(replace(request, operation="lifecycle"))
+    after = provider.read_after(replace(request, operation="after"))
     if (
-        type(before) is not LiveLifecycleTargetState
-        or type(observation) is not LiveLifecycleProviderObservation
-        or type(after) is not LiveLifecycleTargetState
+        type(before) is not _LiveLifecycleTargetState
+        or type(observation) is not _LiveLifecycleProviderObservation
+        or type(after) is not _LiveLifecycleTargetState
         or (before.target_repository, before.target_sha) != (inputs.target_repository, inputs.target_baseline_sha)
         or after != before
     ):
@@ -1707,7 +1817,184 @@ def materialize_live_lifecycle_shadow_profile(
         observation.snapshot_digests, _LIVE_LIFECYCLE_FIXTURES,
         observation.classified_differences, before.state_digest, after.state_digest,
     )
-    return _run_prepared_live_lifecycle_shadow_profile(prepared_request, capsule.readiness, store_root, snapshot)
+    return _run_prepared_live_lifecycle_shadow_profile(prepared_request, readiness, store_root, snapshot)
+
+
+_LIVE_LIFECYCLE_SESSION_DIRECTORY = ".roundwright-live-lifecycle-sessions"
+
+
+def _live_lifecycle_session_id(
+    prepared_request: LiveLifecyclePreparedRequest, readiness: LiveLifecycleReadinessReceipt,
+) -> str:
+    return _digest({
+        "schema": "roundwright-live-lifecycle-session/v1",
+        "prepared": prepared_request.public_receipt(),
+        "readiness": readiness.public_receipt(),
+    })
+
+
+def _live_lifecycle_session_path(store_root: Path, session_id: str) -> Path:
+    if not isinstance(store_root, Path) or _DIGEST.fullmatch(session_id) is None:
+        raise ExternalValidationAdapterError("live lifecycle session location is invalid")
+    return store_root / _LIVE_LIFECYCLE_SESSION_DIRECTORY / f"{session_id[7:]}.json"
+
+
+def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[str, object]:
+    return {
+        "base_sha": inputs.base_sha, "candidate_sha": inputs.candidate_sha,
+        "target_repository": inputs.target_repository, "target_baseline_sha": inputs.target_baseline_sha,
+        "case_id": inputs.case_id, "observation_window": inputs.observation_window,
+        "ready_at": inputs.ready_at, "recorder_commit": inputs.recorder_commit,
+        "recorder_content": inputs.recorder_content, "recorder_tree": inputs.recorder_tree,
+        "retention_namespace": inputs.retention_namespace,
+    }
+
+
+def _live_lifecycle_session_payload(
+    prepared_request: LiveLifecyclePreparedRequest,
+    readiness: LiveLifecycleReadinessReceipt,
+    *,
+    trace_readback_digest: str | None,
+    consumed: bool,
+) -> dict[str, object]:
+    return {
+        "schema": "roundwright-live-lifecycle-session/v1",
+        "session_id": _live_lifecycle_session_id(prepared_request, readiness),
+        "inputs": _live_lifecycle_inputs_payload(prepared_request.inputs),
+        "prepared": {
+            "capture_plan_digest": prepared_request.capture_plan_digest,
+            "request_digest": prepared_request.request_digest,
+            "recorder_identity": prepared_request.recorder_identity,
+            "store_root_identity": prepared_request.store_root_identity,
+            "store_identity": prepared_request.store_identity,
+            "observation_identity": prepared_request.observation_identity,
+            "request_value": dict(prepared_request._request_value),
+        },
+        "readiness": readiness.public_receipt(),
+        "trace_readback_digest": trace_readback_digest,
+        "consumed": consumed,
+    }
+
+
+def _write_live_lifecycle_session(
+    store_root: Path, payload: Mapping[str, object], *, replace_existing: bool = False,
+) -> None:
+    session_id = payload.get("session_id")
+    if type(session_id) is not str:
+        raise ExternalValidationAdapterError("live lifecycle session is invalid")
+    path = _live_lifecycle_session_path(store_root, session_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and not replace_existing:
+            raise ExternalValidationAdapterError("live lifecycle session already exists")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(path)
+    except OSError as error:
+        raise ExternalValidationAdapterError("live lifecycle session persistence failed") from error
+
+
+def _coerce_live_lifecycle_session_receipt(value: object) -> LiveLifecycleSessionReceipt:
+    if type(value) is LiveLifecycleSessionReceipt:
+        return value
+    return LiveLifecycleSessionReceipt.parse(value)
+
+
+def _load_live_lifecycle_session(
+    receipt_value: object, store_root: Path,
+) -> tuple[LiveLifecycleSessionReceipt, LiveLifecyclePreparedRequest, bool, str | None]:
+    receipt = _coerce_live_lifecycle_session_receipt(receipt_value)
+    path = _live_lifecycle_session_path(store_root, receipt.session_id)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if type(value) is not dict or set(value) != {
+            "schema", "session_id", "inputs", "prepared", "readiness", "trace_readback_digest", "consumed",
+        } or value["schema"] != "roundwright-live-lifecycle-session/v1" or value["session_id"] != receipt.session_id:
+            raise ValueError
+        if type(value["inputs"]) is not dict or type(value["prepared"]) is not dict:
+            raise ValueError
+        inputs = LiveLifecycleRequestInputs(**value["inputs"])
+        prepared = value["prepared"]
+        if set(prepared) != {
+            "capture_plan_digest", "request_digest", "recorder_identity", "store_root_identity",
+            "store_identity", "observation_identity", "request_value",
+        } or type(prepared["request_value"]) is not dict:
+            raise ValueError
+        readiness = LiveLifecycleSessionReceipt.parse({
+            "schema": "roundwright-live-lifecycle-session-receipt/v1",
+            "session_id": receipt.session_id, "readiness": value["readiness"], "receipt_digest": receipt.receipt_digest,
+        }).readiness
+        materialized = LiveLifecyclePreparedRequest(
+            inputs, prepared["capture_plan_digest"], prepared["request_digest"], prepared["recorder_identity"],
+            prepared["store_root_identity"], prepared["store_identity"], prepared["observation_identity"],
+            MappingProxyType(prepared["request_value"]),
+        )
+        if (
+            _live_lifecycle_session_id(materialized, readiness) != receipt.session_id
+            or readiness.public_receipt() != receipt.readiness.public_receipt()
+            or type(value["consumed"]) is not bool
+            or (value["trace_readback_digest"] is not None and _DIGEST.fullmatch(value["trace_readback_digest"]) is None)
+        ):
+            raise ValueError
+        _validated_live_lifecycle_request(materialized, store_root)
+        return receipt, materialized, value["consumed"], value["trace_readback_digest"]
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExternalValidationAdapterError("live lifecycle durable session is invalid") from error
+
+
+def preflight_live_lifecycle_shadow_session(
+    inputs: LiveLifecycleRequestInputs, store_root: Path,
+) -> LiveLifecycleSessionReceipt:
+    """Durably retain one provider-free preflight until trace confirmation."""
+
+    prepared_request, readiness = _preflight_live_lifecycle_shadow_profile(inputs, store_root)
+    payload = _live_lifecycle_session_payload(
+        prepared_request, readiness, trace_readback_digest=None, consumed=False,
+    )
+    _write_live_lifecycle_session(store_root, payload)
+    receipt = LiveLifecycleSessionReceipt(payload["session_id"], readiness)
+    loaded, _prepared, consumed, trace = _load_live_lifecycle_session(receipt.public_receipt(), store_root)
+    if consumed or trace is not None or loaded.public_receipt() != receipt.public_receipt():
+        raise ExternalValidationAdapterError("live lifecycle session read-back failed")
+    return receipt
+
+
+def confirm_live_lifecycle_shadow_trace(
+    session_receipt: object, store_root: Path, trace_readback_digest: str,
+) -> LiveLifecycleSessionReceipt:
+    """Record exact public trace read-back before any provider capability is armed."""
+
+    if type(trace_readback_digest) is not str or _DIGEST.fullmatch(trace_readback_digest) is None:
+        raise ExternalValidationAdapterError("live lifecycle trace read-back is invalid")
+    receipt, prepared_request, consumed, trace = _load_live_lifecycle_session(session_receipt, store_root)
+    if consumed or trace is not None:
+        raise ExternalValidationAdapterError("live lifecycle session is unavailable")
+    _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
+        prepared_request, receipt.readiness, trace_readback_digest=trace_readback_digest, consumed=False,
+    ), replace_existing=True)
+    loaded, _prepared, loaded_consumed, loaded_trace = _load_live_lifecycle_session(receipt.public_receipt(), store_root)
+    if loaded_consumed or loaded_trace != trace_readback_digest:
+        raise ExternalValidationAdapterError("live lifecycle trace confirmation read-back failed")
+    return loaded
+
+
+def execute_live_lifecycle_shadow_session(
+    session_receipt: object, store_root: Path, transport: LiveLifecycleReadTransport,
+) -> object:
+    """Consume one trace-confirmed durable session through product-owned reads."""
+
+    receipt, prepared_request, consumed, trace = _load_live_lifecycle_session(session_receipt, store_root)
+    if consumed or trace is None:
+        raise ExternalValidationAdapterError("live lifecycle session is not trace-confirmed")
+    _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
+        prepared_request, receipt.readiness, trace_readback_digest=trace, consumed=True,
+    ), replace_existing=True)
+    _loaded, _prepared, consumed_readback, trace_readback = _load_live_lifecycle_session(
+        receipt.public_receipt(), store_root,
+    )
+    if not consumed_readback or trace_readback != trace:
+        raise ExternalValidationAdapterError("live lifecycle session consume read-back failed")
+    return _materialize_live_lifecycle_shadow_profile(prepared_request, receipt.readiness, store_root, transport)
 
 
 def prepare_live_lifecycle_context(

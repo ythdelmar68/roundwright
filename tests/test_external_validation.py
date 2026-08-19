@@ -292,10 +292,10 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertNotIn("raw", json.dumps(evidence).lower())
         self.assertEqual(comparison.status, "pass")
 
-    def test_public_live_lifecycle_preflight_owns_prepare_validate_and_typed_receipt(self) -> None:
+    def test_public_live_lifecycle_preflight_persists_a_path_free_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            capsule = external_validation.preflight_live_lifecycle_shadow_profile(
+            session = external_validation.preflight_live_lifecycle_shadow_session(
                 self.live_lifecycle_request_inputs(), root,
             )
         harness = sys.modules["roundwright_harness.executor"]
@@ -304,28 +304,27 @@ class ExternalValidationTests(unittest.TestCase):
         plan = harness.prepare_calls[0]
         self.assertEqual(plan["schema"], "roundwright-harness-capture-plan/v1")
         self.assertEqual(plan["profile"], LIVE_LIFECYCLE_SHADOW_PROFILE)
-        prepared = capsule.prepared_request
-        self.assertEqual(prepared.public_receipt()["capture_plan_digest"], prepared.capture_plan_digest)
-        self.assertNotIn("store_root", json.dumps(prepared.public_receipt()))
-        self.assertEqual(prepared._request_value["schema"], "roundwright-harness-profile-executor-request/v2")
-        self.assertEqual(capsule.readiness.receipt_digest, capsule.public_receipt()["readiness"]["receipt_digest"])
-        self.assertNotIn(str(root), json.dumps(capsule.public_receipt()))
+        self.assertEqual(session.readiness.capture_plan_digest, external_validation._digest(plan))
+        self.assertNotIn(str(root), json.dumps(session.public_receipt()))
+        self.assertEqual(session.readiness.receipt_digest, session.public_receipt()["readiness"]["receipt_digest"])
         self.assertFalse(hasattr(external_validation, "prepare_live_lifecycle_shadow_request"))
+        self.assertFalse(hasattr(external_validation, "preflight_live_lifecycle_shadow_profile"))
+        self.assertFalse(hasattr(external_validation, "materialize_live_lifecycle_shadow_profile"))
+        self.assertFalse(hasattr(external_validation, "LiveLifecycleReadOnlyProvider"))
 
     def test_live_lifecycle_request_factory_rejects_moved_inputs_and_changes_every_binding(self) -> None:
         inputs = self.live_lifecycle_request_inputs()
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
-            prepared = external_validation.preflight_live_lifecycle_shadow_profile(
+            prepared = external_validation.preflight_live_lifecycle_shadow_session(
                 inputs, Path(first).resolve(),
-            ).prepared_request
-            moved = external_validation.preflight_live_lifecycle_shadow_profile(
+            )
+            moved = external_validation.preflight_live_lifecycle_shadow_session(
                 replace(inputs, candidate_sha="c" * 40, observation_window="window-49-fresh"),
                 Path(second).resolve(),
-            ).prepared_request
-        self.assertNotEqual(prepared.capture_plan_digest, moved.capture_plan_digest)
-        self.assertNotEqual(prepared.request_digest, moved.request_digest)
-        self.assertNotEqual(prepared.observation_identity, moved.observation_identity)
-        self.assertNotEqual(prepared.store_identity, moved.store_identity)
+            )
+        self.assertNotEqual(prepared.session_id, moved.session_id)
+        self.assertNotEqual(prepared.readiness.capture_plan_digest, moved.readiness.capture_plan_digest)
+        self.assertNotEqual(prepared.readiness.receipt_digest, moved.readiness.receipt_digest)
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
             external_validation.LiveLifecycleRequestInputs(
                 inputs.base_sha, "not-a-sha", inputs.target_repository, inputs.target_baseline_sha,
@@ -333,160 +332,64 @@ class ExternalValidationTests(unittest.TestCase):
                 inputs.recorder_content, inputs.recorder_tree, inputs.retention_namespace,
             )
 
-    def test_live_lifecycle_materializer_owns_fixtures_graph_and_read_only_capture(self) -> None:
-        class ReadOnlyProvider:
+    def test_live_lifecycle_durable_session_owns_transport_projection_and_one_shot_execute(self) -> None:
+        class ReadTransport:
             def __init__(self) -> None:
-                self.calls: list[tuple[str, external_validation.LiveLifecycleProviderRequest]] = []
+                self.calls: list[external_validation.LiveLifecycleTransportRequest] = []
 
-            def read_before(
-                self, request: external_validation.LiveLifecycleProviderRequest,
-            ) -> external_validation.LiveLifecycleTargetState:
-                self.calls.append(("before", request))
-                return external_validation.LiveLifecycleTargetState(
-                    request.target_repository, request.target_baseline_sha, "sha256:" + "e" * 64,
-                )
-
-            def read_lifecycle(
-                self, request: external_validation.LiveLifecycleProviderRequest,
-            ) -> external_validation.LiveLifecycleProviderObservation:
-                self.calls.append(("lifecycle", request))
-                return external_validation.LiveLifecycleProviderObservation(
-                    {
-                        name: "sha256:" + (f"{index:x}" * 64)
-                        for index, name in enumerate(external_validation._LIVE_LIFECYCLE_SNAPSHOTS, start=1)
-                    },
-                    ("fixture-coverage",),
-                )
-
-            def read_after(
-                self, request: external_validation.LiveLifecycleProviderRequest,
-            ) -> external_validation.LiveLifecycleTargetState:
-                self.calls.append(("after", request))
-                return external_validation.LiveLifecycleTargetState(
-                    request.target_repository, request.target_baseline_sha, "sha256:" + "e" * 64,
-                )
+            def read(self, request: external_validation.LiveLifecycleTransportRequest) -> dict[str, object]:
+                self.calls.append(request)
+                if request.operation in ("before", "after"):
+                    return {"target_sha": request.target_baseline_sha, "target_state": {"state": "unchanged"}}
+                return {
+                    "snapshots": {name: {"snapshot": name} for name in external_validation._LIVE_LIFECYCLE_SNAPSHOTS},
+                    "classified_differences": ["fixture-coverage"],
+                }
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            capsule = external_validation.preflight_live_lifecycle_shadow_profile(
-                self.live_lifecycle_request_inputs(), root,
+            session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
+            transport = ReadTransport()
+            serialized = json.loads(json.dumps(session.public_receipt()))
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
+                external_validation.execute_live_lifecycle_shadow_session(serialized, root, transport)
+            self.assertEqual(transport.calls, [])
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
+                serialized, root, "sha256:" + "f" * 64,
             )
-            provider = ReadOnlyProvider()
-            result = external_validation.materialize_live_lifecycle_shadow_profile(
-                capsule, root, provider,
+            result = external_validation.execute_live_lifecycle_shadow_session(
+                json.loads(json.dumps(confirmed.public_receipt())), root, transport,
             )
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, transport)
         harness = sys.modules["roundwright_harness.executor"]
-        self.assertNotIn(
-            "snapshot",
-            inspect.signature(external_validation.materialize_live_lifecycle_shadow_profile).parameters,
-        )
-        self.assertNotIn(
-            "event_graph",
-            inspect.signature(external_validation.materialize_live_lifecycle_shadow_profile).parameters,
-        )
-        self.assertNotIn(
-            "expected_readiness_digest",
-            inspect.signature(external_validation.materialize_live_lifecycle_shadow_profile).parameters,
-        )
-        self.assertNotIn(
-            "prepared_request",
-            inspect.signature(external_validation.materialize_live_lifecycle_shadow_profile).parameters,
-        )
         self.assertEqual(result, {"status": "fake"})
-        self.assertEqual([name for name, _ in provider.calls], ["before", "lifecycle", "after"])
-        self.assertTrue(provider.calls[1][1].arm_before_first_live_event)
-        self.assertFalse(hasattr(provider, "mutate"))
+        self.assertEqual([item.operation for item in transport.calls], ["before", "lifecycle", "after"])
+        self.assertTrue(transport.calls[1].arm_before_first_live_event)
+        self.assertFalse(hasattr(transport, "read_before"))
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
-        self.assertEqual(
-            harness.run_calls[1][1]["expected_readiness_digest"], capsule.readiness.receipt_digest,
-        )
-        adapter = harness.run_calls[1][0][2]
-        snapshot = adapter.snapshot
+        self.assertEqual(harness.run_calls[1][1]["expected_readiness_digest"], session.readiness.receipt_digest)
+        snapshot = harness.run_calls[1][0][2].snapshot
         self.assertEqual(snapshot.fixture_classes, external_validation._LIVE_LIFECYCLE_FIXTURES)
-        self.assertEqual(snapshot.target_observed_sha, self.live_lifecycle_request_inputs().target_baseline_sha)
-        self.assertEqual(snapshot.before_target_state_digest, snapshot.after_target_state_digest)
-        self.assertEqual(
-            tuple(event.event_kind for event in snapshot.event_graph.events),
-            tuple(external_validation.shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE).event_kinds),
-        )
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unavailable"):
-            external_validation.materialize_live_lifecycle_shadow_profile(capsule, root, provider)
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
+        self.assertEqual(tuple(event.event_kind for event in snapshot.event_graph.events), tuple(external_validation.shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE).event_kinds))
 
-    def test_live_lifecycle_materializer_rejects_prepared_request_drift_before_provider_dispatch(self) -> None:
-        class NeverCalledProvider:
-            def __init__(self) -> None:
-                self.calls: list[str] = []
-
-            def read_before(self, request: object) -> object:
-                self.calls.append("before")
-                raise AssertionError("provider must not be called")
-
-            def read_lifecycle(self, request: object) -> object:
-                self.calls.append("lifecycle")
-                raise AssertionError("provider must not be called")
-
-            def read_after(self, request: object) -> object:
-                self.calls.append("after")
-                raise AssertionError("provider must not be called")
+    def test_live_lifecycle_session_rejects_drift_before_transport_dispatch(self) -> None:
+        class NeverCalledTransport:
+            def __init__(self) -> None: self.calls = 0
+            def read(self, request: object) -> dict[str, object]:
+                self.calls += 1
+                raise AssertionError("transport must not be called")
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            capsule = external_validation.preflight_live_lifecycle_shadow_profile(
-                self.live_lifecycle_request_inputs(), root,
-            )
-            capsule.prepared_request._request_value["capture_plan"]["candidate_sha"] = "c" * 40
-            provider = NeverCalledProvider()
-            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "drifted"):
-                external_validation.materialize_live_lifecycle_shadow_profile(
-                    capsule, root, provider,
-                )
-        harness = sys.modules["roundwright_harness.executor"]
-        self.assertEqual(provider.calls, [])
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate"])
-
-    def test_live_lifecycle_ready_capsule_rejects_receipt_identity_and_store_drift_before_provider(self) -> None:
-        class NeverCalledProvider:
-            def __init__(self) -> None:
-                self.calls: list[str] = []
-
-            def read_before(self, request: object) -> object:
-                self.calls.append("before")
-                raise AssertionError("provider must not be called")
-
-            def read_lifecycle(self, request: object) -> object:
-                self.calls.append("lifecycle")
-                raise AssertionError("provider must not be called")
-
-            def read_after(self, request: object) -> object:
-                self.calls.append("after")
-                raise AssertionError("provider must not be called")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            for field, value in (
-                ("receipt_digest", "sha256:" + "a" * 64),
-                ("candidate_sha", "c" * 40),
-                ("case_id", "moved-case"),
-                ("ready_at", 18),
-            ):
-                with self.subTest(field=field):
-                    capsule = external_validation.preflight_live_lifecycle_shadow_profile(
-                        self.live_lifecycle_request_inputs(), root,
-                    )
-                    object.__setattr__(capsule.readiness, field, value)
-                    provider = NeverCalledProvider()
-                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "drifted"):
-                        external_validation.materialize_live_lifecycle_shadow_profile(capsule, root, provider)
-                    self.assertEqual(provider.calls, [])
-
-            capsule = external_validation.preflight_live_lifecycle_shadow_profile(
-                self.live_lifecycle_request_inputs(), root,
-            )
-            provider = NeverCalledProvider()
-            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "drifted"):
-                external_validation.materialize_live_lifecycle_shadow_profile(capsule, root.parent, provider)
-            self.assertEqual(provider.calls, [])
+            session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
+            transport = NeverCalledTransport()
+            malformed = session.public_receipt(); malformed["readiness"]["candidate_sha"] = "c" * 40
+            with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation.confirm_live_lifecycle_shadow_trace(malformed, root, "sha256:" + "f" * 64)
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
+                external_validation.execute_live_lifecycle_shadow_session(session.public_receipt(), root, transport)
+            self.assertEqual(transport.calls, 0)
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

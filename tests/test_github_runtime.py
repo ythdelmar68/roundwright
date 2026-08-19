@@ -1411,7 +1411,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             owner_read_control(binding=CandidateBinding("other/repository", "github-read-host", SHA)),
             owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
             owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "github-read-host", "f" * 40)),
-            owner_read_control(now=NOW - timedelta(seconds=1)),
+            owner_read_control(now=NOW - timedelta(hours=2)),
         )
         for control in controls:
             with self.subTest(binding=control.binding, control_now=control.now):

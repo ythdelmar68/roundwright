@@ -32,6 +32,11 @@ from .github import (
     RepositoryInventorySection,
     RepositoryInventorySnapshot,
 )
+from .github_runtime import (
+    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
+    RepositoryInventoryReadFailureCode,
+    repository_inventory_failure_code,
+)
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
     ProviderAttemptHostInputs,
@@ -51,6 +56,18 @@ _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 class ExternalValidationAdapterError(ValueError):
     """A public executor adapter binding is incomplete or has drifted."""
+
+
+class RepositoryInventoryFirstReadBoundaryError(ExternalValidationAdapterError):
+    """Typed, public-safe inventory failure at the lifecycle adapter boundary."""
+
+    def __init__(self, code: RepositoryInventoryReadFailureCode) -> None:
+        if type(code) is not RepositoryInventoryReadFailureCode:
+            raise TypeError("repository inventory failure code is invalid")
+        self.code = code
+        super().__init__(
+            f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+        )
 
 
 def _digest(value: object) -> str:
@@ -1481,12 +1498,21 @@ class _RoundwrightLiveLifecycleProvider:
         try:
             result = self._capability.read(request)
         except Exception as error:
-            raise ExternalValidationAdapterError("generic GitHub read failed") from error
+            raise RepositoryInventoryFirstReadBoundaryError(
+                RepositoryInventoryReadFailureCode.HOST_FAILURE,
+            ) from error
+        if type(result) is GitHubReadResult and result.request == request and result.failure is not None:
+            code = repository_inventory_failure_code(result.failure.public_reason)
+            if code is None:
+                code = RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE
+            raise RepositoryInventoryFirstReadBoundaryError(code)
         if (
             type(result) is not GitHubReadResult or result.request != request
             or not result.ok or type(result.snapshot) is not expected
         ):
-            raise ExternalValidationAdapterError("generic GitHub read result is invalid")
+            raise RepositoryInventoryFirstReadBoundaryError(
+                RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+            )
         return result.snapshot
 
     def _inventory(self) -> RepositoryInventorySnapshot:

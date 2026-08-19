@@ -82,6 +82,59 @@ from .repository_policy import (
 # GraphQL cursors are opaque provider values (typically base64 and therefore
 # allowed to contain ``=``).  They are never interpolated into a shell.
 _CURSOR = re.compile(r"[^\x00-\x1f\x7f]{1,1024}\Z")
+ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED = (
+    "roundwright-repository-inventory-first-read-boundary__safe-subcause-not-retained"
+)
+
+
+class RepositoryInventoryReadFailureCode(StrEnum):
+    """Curated inventory failure classes; never a provider diagnostic channel."""
+
+    HOST_FAILURE = "host-failure"
+    MALFORMED_RESPONSE = "malformed-response"
+    IDENTITY_DRIFT = "identity-drift"
+    INCOMPLETE_CONNECTION = "incomplete-connection"
+    CURSOR_FAILURE = "cursor-failure"
+    DUPLICATE_EVIDENCE = "duplicate-evidence"
+    CARDINALITY_FAILURE = "cardinality-failure"
+    TIME_OR_HEALTH_FAILURE = "time-or-health-failure"
+
+
+def _repository_inventory_failure_reason(code: RepositoryInventoryReadFailureCode) -> str:
+    return f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+
+
+def repository_inventory_failure_code(public_reason: object) -> RepositoryInventoryReadFailureCode | None:
+    """Decode only this reviewed public-safe result code at the product boundary."""
+
+    if type(public_reason) is not str:
+        return None
+    prefix = ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":"
+    if not public_reason.startswith(prefix):
+        return None
+    try:
+        return RepositoryInventoryReadFailureCode(public_reason.removeprefix(prefix))
+    except ValueError:
+        return None
+
+
+def _classify_repository_inventory_error(error: BaseException) -> RepositoryInventoryReadFailureCode:
+    """Map internal validation outcomes to a finite public-safe code set."""
+
+    message = str(error).lower()
+    if "host" in message:
+        return RepositoryInventoryReadFailureCode.HOST_FAILURE
+    if "cursor" in message:
+        return RepositoryInventoryReadFailureCode.CURSOR_FAILURE
+    if "duplicate" in message:
+        return RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE
+    if "exceeds bound" in message or "over-bound" in message or "cardinality" in message:
+        return RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE
+    if "does not match" in message or "has drifted" in message or "default head" in message:
+        return RepositoryInventoryReadFailureCode.IDENTITY_DRIFT
+    if "incomplete" in message or "pagination" in message:
+        return RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION
+    return RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE
 
 
 class GitHubRuntimeError(ValueError):
@@ -662,6 +715,11 @@ class _OwnerGitHubReadHostEndpoint:
             raise GitHubContractError("read request is invalid")
         blocked = self._fresh_failure(request)
         if blocked is not None:
+            if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    blocked.kind, request.operation,
+                    _repository_inventory_failure_reason(RepositoryInventoryReadFailureCode.TIME_OR_HEALTH_FAILURE),
+                ))
             return GitHubReadResult(request, failure=blocked)
         self.calls.append(("read", request.operation.value))
         if request.operation is GitHubReadOperation.REPOSITORY:
@@ -745,18 +803,18 @@ class _OwnerGitHubReadHostEndpoint:
         if outcome.exit_code != 0:
             return GitHubReadResult(request, failure=GitHubFailure(
                 _failure_kind(outcome.exit_code), request.operation,
-                "gh repository inventory did not return a usable response",
+                _repository_inventory_failure_reason(RepositoryInventoryReadFailureCode.HOST_FAILURE),
             ))
         try:
-            raw = _complete_repository_inventory_check_suites(
+            raw = _complete_repository_inventory_connections(
                 request, json.loads(outcome.stdout), self.__runner,
             )
             snapshot = _normalize_repository_inventory(request, raw)
             return GitHubReadResult(request, snapshot=snapshot)
-        except (json.JSONDecodeError, GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+        except (json.JSONDecodeError, GitHubContractError, GitHubRuntimeError, TypeError, ValueError) as error:
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
-                "gh repository inventory is incomplete or malformed",
+                _repository_inventory_failure_reason(_classify_repository_inventory_error(error)),
             ))
 
     def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
@@ -4288,6 +4346,197 @@ def _repository_inventory_check_suites_command(
     )
 
 
+def _repository_inventory_connection_command(
+    request: GitHubReadRequest, connection: str, cursor: str, number: int | None = None,
+) -> tuple[str, ...]:
+    """Build one fixed continuation selected only by product inventory code."""
+
+    if (
+        type(request) is not GitHubReadRequest
+        or request.operation is not GitHubReadOperation.REPOSITORY_INVENTORY
+        or type(cursor) is not str
+        or _CURSOR.fullmatch(cursor) is None
+    ):
+        raise GitHubRuntimeError("inventory continuation request is invalid")
+    issue_node = (
+        "id number state labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} "
+        "subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}"
+    )
+    pull_request_node = (
+        "id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} "
+        "comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
+        "reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
+        "reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
+        "closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} "
+        "commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid "
+        "checkSuites(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}"
+    )
+    connections = {
+        "issues": f"issues(first:100,after:$cursor,states:[OPEN,CLOSED]){{totalCount pageInfo{{hasNextPage endCursor}}nodes{{{issue_node}}}}}",
+        "pull-requests": f"pullRequests(first:100,after:$cursor,states:[OPEN,CLOSED,MERGED]){{totalCount pageInfo{{hasNextPage endCursor}}nodes{{{pull_request_node}}}}}",
+        "refs": "refs(first:100,after:$cursor,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}",
+        "issue-labels": "labels(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{name}}",
+        "issue-sub-issues": "subIssues(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
+        "pull-request-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
+        "pull-request-reviews": "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
+        "pull-request-review-requests": "reviewRequests(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
+        "pull-request-closing-references": "closingIssuesReferences(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
+    }
+    selection = connections.get(connection)
+    if selection is None:
+        raise GitHubRuntimeError("inventory continuation selection is invalid")
+    base = "query($owner:String!,$name:String!,$cursor:String!){repository(owner:$owner,name:$name){name owner{login}"
+    command: tuple[str, ...]
+    if connection in {"issues", "pull-requests", "refs"}:
+        query = base + " " + selection + "}}"
+        command = ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
+    else:
+        if type(number) is not int or number <= 0:
+            raise GitHubRuntimeError("inventory continuation number is invalid")
+        target = "issue" if connection.startswith("issue-") else "pullRequest"
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!,$cursor:String!){repository(owner:$owner,name:$name){"
+            + "name owner{login} " + target + "(number:$number){number " + selection + "}"
+            + "}}"
+        )
+        command = (
+            "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+            "-F", f"name={request.repository.name}", "-F", f"number={number}",
+        )
+    return command + ("-F", f"cursor={cursor}")
+
+
+def _inventory_connection_identity(connection: str, node: object) -> str:
+    value = _raw_mapping(node)
+    if connection in {"issue-labels", "refs"}:
+        return _raw_text(value, "name")
+    if connection in {"issue-sub-issues", "pull-request-closing-references"}:
+        return str(_raw_integer(value, "number"))
+    if connection == "pull-request-commits":
+        return _raw_text(_raw_mapping(value.get("commit")), "oid")
+    return _raw_id(value, "id")
+
+
+def _inventory_continuation_connection(
+    request: GitHubReadRequest, raw: object, connection: str, number: int | None,
+) -> Mapping[str, object]:
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory continuation repository does not match request")
+    top_level = {"issues": "issues", "pull-requests": "pullRequests", "refs": "refs"}
+    if connection in top_level:
+        return _raw_mapping(repository.get(top_level[connection]))
+    target = _raw_mapping(repository.get("issue" if connection.startswith("issue-") else "pullRequest"))
+    if number is None or _raw_integer(target, "number") != number:
+        raise GitHubRuntimeError("inventory continuation target does not match request")
+    fields = {
+        "issue-labels": "labels", "issue-sub-issues": "subIssues",
+        "pull-request-comments": "comments", "pull-request-reviews": "reviews",
+        "pull-request-review-requests": "reviewRequests",
+        "pull-request-closing-references": "closingIssuesReferences",
+    }
+    return _raw_mapping(target.get(fields[connection]))
+
+
+def _complete_repository_inventory_connection(
+    request: GitHubReadRequest, runner: _FixedGhReadRunner, connection: str,
+    value: object, *, number: int | None = None, maximum: int = 3200,
+) -> None:
+    """Merge a bounded generic GraphQL connection into its private raw page."""
+
+    if type(value) is not dict or not 0 < maximum <= 3200:
+        raise GitHubRuntimeError("inventory connection is malformed")
+    total = _raw_integer(value, "totalCount")
+    nodes = value.get("nodes")
+    page = _raw_mapping(value.get("pageInfo"))
+    has_next = _raw_bool(page, "hasNextPage")
+    if type(nodes) is not list or total < 0 or total > maximum or len(nodes) > 100 or len(nodes) > total:
+        raise GitHubRuntimeError("inventory connection cardinality exceeds bound")
+    identities = {_inventory_connection_identity(connection, node) for node in nodes}
+    if len(identities) != len(nodes):
+        raise GitHubRuntimeError("inventory connection has duplicate evidence")
+    if not has_next:
+        if len(nodes) != total:
+            raise GitHubRuntimeError("inventory connection is incomplete")
+        return
+    if connection == "pull-request-commits":
+        raise GitHubRuntimeError("inventory commit pagination is incomplete")
+    cursor = page.get("endCursor")
+    if type(cursor) is not str or _CURSOR.fullmatch(cursor) is None:
+        raise GitHubRuntimeError("inventory connection cursor is malformed")
+    seen_cursors = {cursor}
+    merged = list(nodes)
+    for _ in range(31):
+        outcome = runner.run(_repository_inventory_connection_command(request, connection, cursor, number))
+        if outcome.exit_code != 0:
+            raise GitHubRuntimeError("inventory continuation host failed")
+        page_value = _inventory_continuation_connection(request, json.loads(outcome.stdout), connection, number)
+        page_total = _raw_integer(page_value, "totalCount")
+        page_nodes = page_value.get("nodes")
+        page_info = _raw_mapping(page_value.get("pageInfo"))
+        page_has_next = _raw_bool(page_info, "hasNextPage")
+        if type(page_nodes) is not list or page_total != total or len(page_nodes) > 100 or len(merged) + len(page_nodes) > total:
+            raise GitHubRuntimeError("inventory connection cardinality is incomplete")
+        page_ids = {_inventory_connection_identity(connection, node) for node in page_nodes}
+        if len(page_ids) != len(page_nodes) or identities.intersection(page_ids):
+            raise GitHubRuntimeError("inventory connection has duplicate evidence")
+        merged.extend(page_nodes)
+        identities.update(page_ids)
+        next_cursor = page_info.get("endCursor")
+        if not page_has_next:
+            if len(merged) != total:
+                raise GitHubRuntimeError("inventory connection is incomplete")
+            value["nodes"] = merged
+            value["pageInfo"] = {"hasNextPage": False, "endCursor": next_cursor}
+            return
+        if type(next_cursor) is not str or _CURSOR.fullmatch(next_cursor) is None or next_cursor in seen_cursors:
+            raise GitHubRuntimeError("inventory connection cursor is malformed")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    raise GitHubRuntimeError("inventory connection exceeds bound")
+
+
+def _complete_repository_inventory_connections(
+    request: GitHubReadRequest, raw: object, runner: _FixedGhReadRunner,
+) -> object:
+    """Complete every retained non-check-suite inventory connection privately."""
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory repository does not match request")
+    default_ref = _raw_mapping(repository.get("defaultBranchRef"))
+    if _raw_text(_raw_mapping(default_ref.get("target")), "oid") != request.expected_sha:
+        raise GitHubRuntimeError("inventory default head does not match baseline")
+    for connection, key in (("issues", "issues"), ("pull-requests", "pullRequests"), ("refs", "refs")):
+        _complete_repository_inventory_connection(request, runner, connection, repository.get(key))
+    issues = _raw_mapping(repository.get("issues")).get("nodes")
+    pull_requests = _raw_mapping(repository.get("pullRequests")).get("nodes")
+    if type(issues) is not list or type(pull_requests) is not list:
+        raise GitHubRuntimeError("inventory main connection is malformed")
+    for node in issues:
+        issue = _raw_mapping(node)
+        number = _raw_integer(issue, "number")
+        _complete_repository_inventory_connection(request, runner, "issue-labels", issue.get("labels"), number=number)
+        _complete_repository_inventory_connection(request, runner, "issue-sub-issues", issue.get("subIssues"), number=number)
+    for node in pull_requests:
+        pull_request = _raw_mapping(node)
+        number = _raw_integer(pull_request, "number")
+        for connection, key in (
+            ("pull-request-comments", "comments"), ("pull-request-reviews", "reviews"),
+            ("pull-request-review-requests", "reviewRequests"),
+            ("pull-request-closing-references", "closingIssuesReferences"),
+        ):
+            _complete_repository_inventory_connection(request, runner, connection, pull_request.get(key), number=number)
+        _complete_repository_inventory_connection(
+            request, runner, "pull-request-commits", pull_request.get("commits"), number=number, maximum=100,
+        )
+    return _complete_repository_inventory_check_suites(request, raw, runner)
+
+
 def _complete_repository_inventory_check_suites(
     request: GitHubReadRequest, raw: object, runner: _FixedGhReadRunner,
 ) -> object:
@@ -4316,11 +4565,12 @@ def _complete_repository_inventory_check_suites(
         commits = _raw_mapping(pull_request.get("commits"))
         commit_nodes = commits.get("nodes")
         commit_page = _raw_mapping(commits.get("pageInfo"))
+        if _raw_integer(commits, "totalCount") > 100 or (type(commit_nodes) is list and len(commit_nodes) > 100):
+            raise GitHubRuntimeError("inventory commit cardinality exceeds bound")
         if (
             type(commit_nodes) is not list
             or _raw_bool(commit_page, "hasNextPage")
             or _raw_integer(commits, "totalCount") != len(commit_nodes)
-            or len(commit_nodes) > 100
         ):
             raise GitHubRuntimeError("inventory commit pagination is incomplete")
         for commit_node in commit_nodes:
@@ -4335,7 +4585,9 @@ def _complete_repository_inventory_check_suites(
             initial_nodes = suites.get("nodes")
             page = _raw_mapping(suites.get("pageInfo"))
             has_next = _raw_bool(page, "hasNextPage")
-            if type(initial_nodes) is not list or not 0 <= total <= 100 or len(initial_nodes) > total:
+            if total > 100 or (type(initial_nodes) is list and len(initial_nodes) > 100):
+                raise GitHubRuntimeError("inventory check-suite cardinality exceeds bound")
+            if type(initial_nodes) is not list or total < 0 or len(initial_nodes) > total:
                 raise GitHubRuntimeError("inventory check pagination is incomplete")
             suite_nodes = list(initial_nodes)
             seen_ids = {_raw_id(_raw_mapping(node), "id") for node in suite_nodes}

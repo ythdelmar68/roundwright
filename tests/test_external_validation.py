@@ -22,6 +22,8 @@ from roundwright.hosted_evidence import (
     HostedWorkflowRun,
 )
 from roundwright.github import (
+    GitHubFailure,
+    GitHubFailureKind,
     GitHubReadOperation,
     GitHubMutationOperation,
     GitHubReadRequest,
@@ -49,6 +51,7 @@ from roundwright.github_runtime import (
     CapabilityState,
     GitHubCapabilityHealth,
     OperationHealth,
+    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     create_credentialed_github_read_capability,
 )
 from roundwright.shadow import (
@@ -537,11 +540,16 @@ class ExternalValidationTests(unittest.TestCase):
             stdout: str
 
         class OpaqueCredentialHost:
-            def __init__(self, payload: object) -> None:
+            def __init__(self, payload: object, *, issue_page: object | None = None, comment_page: object | None = None, exit_code: int = 0) -> None:
                 self.commands: list[tuple[str, ...]] = []
                 self.payload = payload
+                self.issue_page = issue_page
+                self.comment_page = comment_page
+                self.exit_code = exit_code
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
                 self.commands.append(arguments)
+                if self.exit_code:
+                    return OpaqueResult(self.exit_code, "")
                 if "object(expression:$oid)" in arguments[3]:
                     oid = next(value.removeprefix("oid=") for value in arguments if value.startswith("oid="))
                     suffix = "1" if oid == "1" * 40 else "2" if oid == "2" * 40 else "unknown"
@@ -551,6 +559,14 @@ class ExternalValidationTests(unittest.TestCase):
                                 "id": f"check-suite-{suffix}-continued", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued"},
                             }],
                         }},
+                    }}}))
+                if "issues(first:100,after:$cursor" in arguments[3] and self.issue_page is not None:
+                    return OpaqueResult(0, json.dumps({"data": {"repository": {
+                        "name": name, "owner": {"login": owner}, "issues": self.issue_page,
+                    }}}))
+                if "comments(first:100,after:$cursor" in arguments[3] and self.comment_page is not None:
+                    return OpaqueResult(0, json.dumps({"data": {"repository": {
+                        "name": name, "owner": {"login": owner}, "pullRequest": {"number": 81, "comments": self.comment_page},
                     }}}))
                 return OpaqueResult(0, json.dumps(self.payload))
 
@@ -585,6 +601,105 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
         self.assertFalse(hasattr(capability, "query"))
         self.assertFalse(hasattr(capability, "snapshot"))
+        def issue(number: int) -> dict[str, object]:
+            return {
+                "id": f"issue-{number}", "number": number, "state": "OPEN",
+                "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+                "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+            }
+        top_level_inventory = json.loads(json.dumps(raw_inventory))
+        top_level_inventory["data"]["repository"]["issues"] = {
+            "totalCount": 101, "pageInfo": {"hasNextPage": True, "endCursor": "issues-page-1"},
+            "nodes": [issue(number) for number in range(1, 101)],
+        }
+        top_level_host = OpaqueCredentialHost(
+            top_level_inventory,
+            issue_page={"totalCount": 101, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [issue(101)]},
+        )
+        top_level_capability = create_credentialed_github_read_capability(
+            top_level_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        top_level_result = top_level_capability.read(GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        ))
+        self.assertTrue(top_level_result.ok)
+        self.assertEqual(len(top_level_result.snapshot.collection(RepositoryInventorySection.ISSUES).item_identities), 101)  # type: ignore[union-attr]
+        self.assertEqual(sum("issues(first:100,after:$cursor" in command[3] for command in top_level_host.commands), 1)
+        nested_inventory = json.loads(json.dumps(raw_inventory))
+        nested_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"] = {
+            "totalCount": 101, "pageInfo": {"hasNextPage": True, "endCursor": "comments-page-1"},
+            "nodes": [{"id": f"comment-{number}"} for number in range(1, 101)],
+        }
+        nested_host = OpaqueCredentialHost(
+            nested_inventory,
+            comment_page={"totalCount": 101, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "comment-101"}]},
+        )
+        nested_capability = create_credentialed_github_read_capability(
+            nested_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        self.assertTrue(nested_capability.read(GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        )).ok)
+        self.assertEqual(sum("comments(first:100,after:$cursor" in command[3] for command in nested_host.commands), 1)
+        request = GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        )
+        def failure_code(host: OpaqueCredentialHost) -> external_validation.RepositoryInventoryReadFailureCode:
+            failed = create_credentialed_github_read_capability(
+                host, binding, dependency_control, health, clock=lambda: now,
+            ).read(request)
+            self.assertFalse(failed.ok)
+            assert failed.failure is not None
+            code = external_validation.repository_inventory_failure_code(failed.failure.public_reason)
+            self.assertIsNotNone(code)
+            assert code is not None
+            return code
+        self.assertEqual(
+            failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),
+            external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,
+        )
+        self.assertEqual(
+            failure_code(OpaqueCredentialHost({"data": {"repository": {}}})),
+            external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+        )
+        looping_inventory = json.loads(json.dumps(raw_inventory))
+        looping_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "comments-page-1"}, "nodes": [{"id": "comment-1"}],
+        }
+        self.assertEqual(
+            failure_code(OpaqueCredentialHost(
+                looping_inventory,
+                comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "comments-page-1"}, "nodes": [{"id": "comment-2"}]},
+            )),
+            external_validation.RepositoryInventoryReadFailureCode.CURSOR_FAILURE,
+        )
+        over_bound_inventory = json.loads(json.dumps(raw_inventory))
+        over_bound_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"] = {
+            "totalCount": 3201, "pageInfo": {"hasNextPage": True, "endCursor": "comments-page-1"}, "nodes": [{"id": "comment-1"}],
+        }
+        self.assertEqual(
+            failure_code(OpaqueCredentialHost(over_bound_inventory)),
+            external_validation.RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE,
+        )
+        class TypedFailureCapability:
+            def __init__(self) -> None: self.calls = 0
+            def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+                self.calls += 1
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
+                    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":identity-drift",
+                ))
+        typed_failure = TypedFailureCapability()
+        executes_before = len([item for item in harness.run_calls if item[0][0] == "execute"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("9"))
+            with self.assertRaises(external_validation.RepositoryInventoryFirstReadBoundaryError) as captured:
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, typed_failure)
+        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.IDENTITY_DRIFT)
+        self.assertEqual(typed_failure.calls, 1)
+        self.assertEqual(len([item for item in harness.run_calls if item[0][0] == "execute"]), executes_before)
         drifted_inventory = json.loads(json.dumps(raw_inventory))
         drifted_inventory["data"]["repository"]["defaultBranchRef"]["target"]["oid"] = "e" * 40
         drifted_host = OpaqueCredentialHost(drifted_inventory)
@@ -595,8 +710,9 @@ class ExternalValidationTests(unittest.TestCase):
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
             confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("e"))
-            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+            with self.assertRaisesRegex(external_validation.RepositoryInventoryFirstReadBoundaryError, "safe-subcause-not-retained") as captured:
                 external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, drifted_capability)
+        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.IDENTITY_DRIFT)
         self.assertEqual(len(drifted_host.commands), 1)
         for label, total_count in (("incomplete", 3), ("over-bound", 101)):
             with self.subTest(label=label):
@@ -613,8 +729,10 @@ class ExternalValidationTests(unittest.TestCase):
                     root = Path(temporary).resolve()
                     session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
                     confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("b"))
-                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                    with self.assertRaisesRegex(external_validation.RepositoryInventoryFirstReadBoundaryError, "safe-subcause-not-retained") as captured:
                         external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
+                expected = external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION if label == "incomplete" else external_validation.RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE
+                self.assertEqual(captured.exception.code, expected)
                 self.assertEqual(len(malformed_host.commands), 1)
         for label, total_count, has_next in (("partial-suite", 2, False), ("over-bound-suite", 101, True)):
             with self.subTest(label=label):
@@ -630,8 +748,10 @@ class ExternalValidationTests(unittest.TestCase):
                     root = Path(temporary).resolve()
                     session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
                     confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("a"))
-                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                    with self.assertRaisesRegex(external_validation.RepositoryInventoryFirstReadBoundaryError, "safe-subcause-not-retained") as captured:
                         external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
+                expected = external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION if label == "partial-suite" else external_validation.RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE
+                self.assertEqual(captured.exception.code, expected)
                 self.assertEqual(len(malformed_host.commands), 1)
         for label, read_time in (
             ("reversed", now - timedelta(seconds=1)),
@@ -647,8 +767,9 @@ class ExternalValidationTests(unittest.TestCase):
                     root = Path(temporary).resolve()
                     session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
                     confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("c"))
-                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                    with self.assertRaisesRegex(external_validation.RepositoryInventoryFirstReadBoundaryError, "safe-subcause-not-retained") as captured:
                         external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, denied_capability)
+                self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.TIME_OR_HEALTH_FAILURE)
                 self.assertEqual(denied_host.commands, [])
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:

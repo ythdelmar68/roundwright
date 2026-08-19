@@ -9,13 +9,17 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Protocol
 
 from .shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    EvidenceRole,
+    LifecycleAttempt,
+    LifecycleAttemptKind,
+    ShadowV2Event,
     ShadowV2Error,
     ShadowV2EventGraph,
     shadow_evidence_profile,
@@ -1228,6 +1232,67 @@ class LiveLifecyclePreparedRequest:
         }
 
 
+@dataclass(frozen=True)
+class LiveLifecycleProviderRequest:
+    """Public-safe facts given to a capability that can only read the target."""
+
+    target_repository: str
+    target_baseline_sha: str
+    base_sha: str
+    candidate_sha: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    arm_before_first_live_event: bool
+
+
+@dataclass(frozen=True)
+class LiveLifecycleTargetState:
+    """Normalized target identity from one independent read-only observation."""
+
+    target_repository: str
+    target_sha: str
+    state_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_sha) is None
+            or _DIGEST.fullmatch(self.state_digest) is None
+        ):
+            raise ExternalValidationAdapterError("live lifecycle target state is invalid")
+
+
+@dataclass(frozen=True)
+class LiveLifecycleProviderObservation:
+    """Normalized content-free observations from an armed read-only window."""
+
+    snapshot_digests: Mapping[str, str]
+    classified_differences: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        snapshots = dict(self.snapshot_digests) if type(self.snapshot_digests) in (dict, MappingProxyType) else None
+        if (
+            snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
+            or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
+            or type(self.classified_differences) is not tuple
+            or any(not _safe_token(value) for value in self.classified_differences)
+            or len(set(self.classified_differences)) != len(self.classified_differences)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle provider observation is invalid")
+        object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
+
+
+class LiveLifecycleReadOnlyProvider(Protocol):
+    """The sole external capability accepted by live lifecycle materialization."""
+
+    def read_before(self, request: LiveLifecycleProviderRequest) -> LiveLifecycleTargetState: ...
+
+    def read_lifecycle(self, request: LiveLifecycleProviderRequest) -> LiveLifecycleProviderObservation: ...
+
+    def read_after(self, request: LiveLifecycleProviderRequest) -> LiveLifecycleTargetState: ...
+
+
 def _live_lifecycle_store_root_identity(store_root: Path) -> str:
     if not isinstance(store_root, Path) or not store_root.is_absolute():
         raise ExternalValidationAdapterError("live lifecycle store root is invalid")
@@ -1310,6 +1375,87 @@ def prepare_live_lifecycle_shadow_request(
     return LiveLifecyclePreparedRequest(
         inputs, plan_digest, request_digest, recorder_identity, store_root_identity, store_identity,
         observation_identity, MappingProxyType(request_value),
+    )
+
+
+def _validated_live_lifecycle_request(
+    prepared_request: LiveLifecyclePreparedRequest, store_root: Path,
+) -> dict[str, object]:
+    if type(prepared_request) is not LiveLifecyclePreparedRequest:
+        raise ExternalValidationAdapterError("live lifecycle prepared request is invalid")
+    request_value = dict(prepared_request._request_value)
+    if (
+        _digest(request_value) != prepared_request.request_digest
+        or _live_lifecycle_store_root_identity(store_root) != prepared_request.store_root_identity
+    ):
+        raise ExternalValidationAdapterError("live lifecycle prepared request has drifted")
+    return request_value
+
+
+def materialize_live_lifecycle_shadow_profile(
+    prepared_request: LiveLifecyclePreparedRequest,
+    store_root: Path,
+    provider: LiveLifecycleReadOnlyProvider,
+    *,
+    expected_readiness_digest: str,
+) -> object:
+    """Materialize one armed read-only lifecycle snapshot and delegate exactly once.
+
+    Generic orchestration can provide a narrowly typed read capability, but it
+    cannot create a product event graph, infer fixture coverage, construct a
+    snapshot, or reach the Harness executor directly.
+    """
+
+    _validated_live_lifecycle_request(prepared_request, store_root)
+    if (
+        not isinstance(expected_readiness_digest, str)
+        or _DIGEST.fullmatch(expected_readiness_digest) is None
+        or not all(callable(getattr(provider, name, None)) for name in (
+            "read_before", "read_lifecycle", "read_after",
+        ))
+    ):
+        raise ExternalValidationAdapterError("live lifecycle read-only provider is invalid")
+    inputs = prepared_request.inputs
+    request = LiveLifecycleProviderRequest(
+        inputs.target_repository, inputs.target_baseline_sha, inputs.base_sha,
+        inputs.candidate_sha, inputs.case_id, inputs.observation_window,
+        inputs.ready_at, True,
+    )
+    before = provider.read_before(request)
+    # The product creates this request with the arm flag before it makes the
+    # sole lifecycle read.  A provider cannot supply an unarmed event graph.
+    observation = provider.read_lifecycle(request)
+    after = provider.read_after(request)
+    if (
+        type(before) is not LiveLifecycleTargetState
+        or type(observation) is not LiveLifecycleProviderObservation
+        or type(after) is not LiveLifecycleTargetState
+        or (before.target_repository, before.target_sha) != (inputs.target_repository, inputs.target_baseline_sha)
+        or after != before
+    ):
+        raise ExternalValidationAdapterError("live lifecycle zero-mutation read-back has drifted")
+    profile = shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE)
+    attempt_id = f"lifecycle-{inputs.case_id}"
+    events = tuple(
+        ShadowV2Event(
+            f"{inputs.case_id}-{ordinal}", ordinal, attempt_id, event_kind, None, False,
+        )
+        for ordinal, event_kind in enumerate(profile.event_kinds, start=1)
+    )
+    graph = ShadowV2EventGraph(
+        (LifecycleAttempt(attempt_id, 1, LifecycleAttemptKind.WORKER, EvidenceRole.WORKER),),
+        (), (), (), (), events,
+    )
+    snapshot = LiveLifecycleShadowSnapshot(
+        inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
+        inputs.candidate_sha, prepared_request.capture_plan_digest, inputs.case_id,
+        inputs.observation_window, inputs.ready_at, events[0].event_id, graph,
+        observation.snapshot_digests, _LIVE_LIFECYCLE_FIXTURES,
+        observation.classified_differences, before.state_digest, after.state_digest,
+    )
+    return _run_prepared_live_lifecycle_shadow_profile(
+        "execute", prepared_request, store_root, snapshot,
+        expected_readiness_digest=expected_readiness_digest,
     )
 
 
@@ -1519,15 +1665,15 @@ def run_hosted_check_profile(
         raise ExternalValidationAdapterError("hosted check hosted entrypoint binding is invalid") from error
 
 
-def run_live_lifecycle_shadow_profile(
+def _run_prepared_live_lifecycle_shadow_profile(
     mode: Literal["validate", "execute"], prepared_request: LiveLifecyclePreparedRequest, store_root: Path,
     snapshot: LiveLifecycleShadowSnapshot | None = None, *, expected_readiness_digest: str | None = None,
 ) -> object:
-    """Run one already-armed, read-only lifecycle window through the V2 executor.
+    """Run the product-materialized lifecycle snapshot through the V2 executor.
 
-    Preflight is deliberately incapable of opening a window: validate rejects a
-    snapshot, while execute accepts only a typed snapshot that was captured by
-    the reviewed Recorder after the plan was armed.
+    This private helper deliberately accepts the product-owned snapshot only
+    after ``materialize_live_lifecycle_shadow_profile`` has armed the window
+    and completed its independent before/after read-back.
     """
 
     harness = _harness_executor()

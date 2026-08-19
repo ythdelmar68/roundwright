@@ -1099,6 +1099,35 @@ class _OwnerGitHubReadHostChannel:
         return self.__endpoint.read_collection_page(request, cursor)
 
 
+class _CredentialedGhRunnerAdapter:
+    """Normalize an opaque owner-process result before it reaches the adapter.
+
+    The public factory intentionally does not expose the private command-result
+    type.  A conventional credential host may return a process-shaped
+    ``returncode`` result; normalize that internal shape once while retaining
+    stdout only long enough for the reviewed projection to parse it.
+    """
+
+    __slots__ = ("__host",)
+
+    def __init__(self, host: object) -> None:
+        if not hasattr(host, "run"):
+            raise GitHubRuntimeError("credentialed GitHub read host is invalid")
+        self.__host = host
+
+    def run(self, arguments: tuple[str, ...]) -> _GhCommandResult:
+        try:
+            result = self.__host.run(arguments)  # type: ignore[attr-defined]
+            exit_code = getattr(result, "returncode", getattr(result, "exit_code", None))
+            stdout = getattr(result, "stdout", None)
+        except Exception as error:
+            raise GitHubRuntimeError("credentialed GitHub read host failed") from error
+        try:
+            return _GhCommandResult(exit_code, stdout)
+        except GitHubRuntimeError as error:
+            raise GitHubRuntimeError("credentialed GitHub read host result is invalid") from error
+
+
 def create_credentialed_github_read_capability(
     runner: object,
     binding: CandidateBinding,
@@ -1140,7 +1169,7 @@ def create_credentialed_github_read_capability(
         raise GitHubRuntimeError("credentialed GitHub read evidence is unavailable") from error
     control = _OwnerGitHubReadControl(binding, dependency_control, now)
     endpoint = _OwnerGitHubReadHostEndpoint(
-        runner, binding, control, capability_health, clock=clock,  # type: ignore[arg-type]
+        _CredentialedGhRunnerAdapter(runner), binding, control, capability_health, clock=clock,
     )
     return OwnerGitHubReadIpcClient(capability_health, _OwnerGitHubReadHostChannel(endpoint))
 

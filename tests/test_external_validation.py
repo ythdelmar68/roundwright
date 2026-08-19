@@ -530,7 +530,7 @@ class ExternalValidationTests(unittest.TestCase):
 
         @dataclass(frozen=True)
         class OpaqueResult:
-            exit_code: int
+            returncode: int
             stdout: str
 
         class OpaqueCredentialHost:

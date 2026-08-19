@@ -518,9 +518,12 @@ class ExternalValidationTests(unittest.TestCase):
                 "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
                     "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviews": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviewRequests": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "closingIssuesReferences": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
-                    "commits": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                    "commits": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
                         {"commit": {"checkSuites": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
                             {"id": "check-suite-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-1"}},
+                        ]}}},
+                        {"commit": {"checkSuites": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                            {"id": "check-suite-2", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-2"}},
                         ]}}},
                     ]},
                 }]},
@@ -562,6 +565,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(host.commands, [host.commands[0]] * 3)
         self.assertEqual(host.commands[0][0:3], ("api", "graphql", "-f"))
         self.assertIn("repository(owner:$owner,name:$name)", host.commands[0][3])
+        self.assertIn("commits(first:100)", host.commands[0][3])
         self.assertEqual(host.commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
@@ -580,6 +584,24 @@ class ExternalValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
                 external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, drifted_capability)
         self.assertEqual(len(drifted_host.commands), 1)
+        for label, total_count in (("incomplete", 3), ("over-bound", 101)):
+            with self.subTest(label=label):
+                malformed_inventory = json.loads(json.dumps(raw_inventory))
+                commits = malformed_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]
+                commits["totalCount"] = total_count
+                if total_count > 100:
+                    commits["nodes"] = commits["nodes"] + [commits["nodes"][0]] * 99
+                malformed_host = OpaqueCredentialHost(malformed_inventory)
+                malformed_capability = create_credentialed_github_read_capability(
+                    malformed_host, binding, dependency_control, health, clock=lambda: now,
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("b"))
+                    with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "generic GitHub read result"):
+                        external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
+                self.assertEqual(len(malformed_host.commands), 1)
         for label, read_time in (
             ("reversed", now - timedelta(seconds=1)),
             ("expired", now + timedelta(minutes=2)),

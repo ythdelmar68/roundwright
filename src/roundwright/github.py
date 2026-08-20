@@ -28,6 +28,15 @@ _PUBLIC_TEXT = re.compile(r"[^\x00-\x1f\x7f]{1,512}\Z")
 _COMMENT_TEXT = re.compile(r"(?s)[^\x00\x7f]{1,65536}\Z")
 
 
+def _is_safe_remote_head_identity(value: str) -> bool:
+    return bool(
+        _REMOTE_HEAD_IDENTITY.fullmatch(value)
+        and ".." not in value
+        and not value.endswith(".")
+        and all(not component.endswith(".lock") for component in value.split("/"))
+    )
+
+
 class GitHubContractError(ValueError):
     """Raised when a caller constructs invalid typed GitHub contract data."""
 
@@ -543,7 +552,15 @@ class RepositoryInventoryEvidence:
         identity_pattern = _REMOTE_HEAD_IDENTITY if self.section is RepositoryInventorySection.REMOTE_HEADS else _TOKEN
         if (
             type(self.item_identities) is not tuple
-            or any(type(item) is not str or not identity_pattern.fullmatch(item) for item in self.item_identities)
+            or any(
+                type(item) is not str
+                or not (
+                    _is_safe_remote_head_identity(item)
+                    if self.section is RepositoryInventorySection.REMOTE_HEADS
+                    else identity_pattern.fullmatch(item)
+                )
+                for item in self.item_identities
+            )
             or tuple(sorted(self.item_identities)) != self.item_identities
             or len(set(self.item_identities)) != len(self.item_identities)
             or type(self.page_count) is not int

@@ -516,7 +516,7 @@ class ExternalValidationTests(unittest.TestCase):
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-4", "number": 4, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
+                    {"id": "issue-4", "number": 4, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": None, "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
                     {"id": "issue-49", "number": 49, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #4.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                     {"id": "issue-50", "number": 50, "state": "OPEN", "title": "Standalone fixture", "body": "", "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
@@ -970,6 +970,30 @@ class ExternalValidationTests(unittest.TestCase):
                 external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, drifted_capability)
         self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.IDENTITY_DRIFT)
         self.assertEqual(len(drifted_host.commands), 1)
+        executes_before_malformed_body = len([item for item in harness.run_calls if item[0][0] == "execute"])
+        for label, body in (("missing-body", None), ("non-text-body", 1)):
+            with self.subTest(label=label):
+                malformed_inventory = json.loads(json.dumps(raw_inventory))
+                issue = malformed_inventory["data"]["repository"]["issues"]["nodes"][0]
+                if label == "missing-body":
+                    issue.pop("body")
+                else:
+                    issue["body"] = body
+                malformed_host = OpaqueCredentialHost(malformed_inventory)
+                malformed_capability = create_credentialed_github_read_capability(
+                    malformed_host, binding, dependency_control, health, clock=lambda: now,
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("d"))
+                    with self.assertRaisesRegex(external_validation.RepositoryInventoryFirstReadBoundaryError, "safe-subcause-not-retained") as captured:
+                        external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
+                self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+                self.assertEqual(
+                    len([command for command in malformed_host.commands if "object(expression:$oid)" not in command[3]]), 1,
+                )
+        self.assertEqual(len([item for item in harness.run_calls if item[0][0] == "execute"]), executes_before_malformed_body)
         for label, total_count in (("incomplete", 3), ("over-bound", 101)):
             with self.subTest(label=label):
                 malformed_inventory = json.loads(json.dumps(raw_inventory))

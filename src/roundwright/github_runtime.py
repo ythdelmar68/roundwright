@@ -4801,7 +4801,10 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         value = _raw_mapping(issue)
         subject = f"issue-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
-        facts.extend(_inventory_scheduling_facts(subject, _raw_text(value, "title"), _raw_text(value, "body")))
+        if "body" not in value:
+            raise GitHubRuntimeError("inventory issue scheduling body is malformed")
+        body = _raw_optional_text(value, "body")
+        facts.extend(_inventory_scheduling_facts(subject, _raw_text(value, "title"), "" if body is None else body))
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")
             if _raw_bool(page, "hasNextPage") or type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes):

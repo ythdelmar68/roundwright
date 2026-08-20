@@ -516,9 +516,9 @@ class ExternalValidationTests(unittest.TestCase):
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-4", "number": 4, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": None, "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
-                    {"id": "issue-49", "number": 49, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #4.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
-                    {"id": "issue-50", "number": 50, "state": "OPEN", "title": "Standalone fixture", "body": "", "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
+                    {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
                 "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
@@ -583,6 +583,16 @@ class ExternalValidationTests(unittest.TestCase):
                     }}}))
                 return OpaqueResult(0, json.dumps(self.payload))
 
+        scheduling_host = OpaqueCredentialHost(raw_inventory)
+        scheduling_result = create_credentialed_github_read_capability(
+            scheduling_host, binding, dependency_control, health, clock=lambda: now,
+        ).read(GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        ))
+        self.assertTrue(scheduling_result.ok)
+        assert scheduling_result.snapshot is not None
+        self.assertIn(RepositoryInventoryFact("issue-3", "depends-on", "issue-2"), scheduling_result.snapshot.facts)
+        self.assertNotIn(RepositoryInventoryFact("issue-1", "depends-on", "issue-2"), scheduling_result.snapshot.facts)
         host = OpaqueCredentialHost(raw_inventory)
         advancing_times = iter((
             now,
@@ -763,6 +773,7 @@ class ExternalValidationTests(unittest.TestCase):
             return code
         for label, title, body, expected in (
             ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("malformed-dependency-marker", "Dependency fixture", "- Blocked by #not-an-issue", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),
             ("ambiguous-dependency", "Dependency fixture", "Blocked by #4\nBlocked by #4", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),
         ):
             with self.subTest(scheduling_fixture=label):

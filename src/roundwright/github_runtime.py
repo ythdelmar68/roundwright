@@ -86,6 +86,7 @@ _STANDALONE_FIXTURE = re.compile(r"\bstandalone[ -]fixture\b", re.IGNORECASE)
 _MALFORMED_PARENT_CHILD_FIXTURE = re.compile(r"\bmalformed[ -]parent child fixture\b", re.IGNORECASE)
 _OWNER_INPUT_FIXTURE = re.compile(r"\bowner[ -]input fixture\b", re.IGNORECASE)
 _BLOCKED_BY = re.compile(r"(?:^|\n)\s*(?:[-*]\s+)?Blocked by #(?P<number>[1-9][0-9]{0,8})\.?\s*(?=\n|\Z)", re.IGNORECASE)
+_BLOCKED_BY_DECLARATION = re.compile(r"(?:^|\n)[ \t]*(?:[-*][ \t]+)?Blocked by\b[^\r\n]*", re.IGNORECASE)
 ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED = (
     "roundwright-repository-inventory-first-read-boundary__safe-subcause-not-retained"
 )
@@ -4742,7 +4743,7 @@ def _inventory_scheduling_facts(
         facts.append(RepositoryInventoryFact(subject, "malformed-parent-child", "true"))
     if owner_input:
         facts.append(RepositoryInventoryFact(subject, "owner-input-fixture", "true"))
-    dependency_lines = tuple(line for line in body.splitlines() if "blocked by" in line.casefold())
+    dependency_lines = tuple(match[0] for match in _BLOCKED_BY_DECLARATION.finditer(body))
     dependencies = tuple(match["number"] for match in _BLOCKED_BY.finditer(body))
     if len(dependencies) != len(dependency_lines) or len(dependencies) != len(set(dependencies)):
         raise GitHubRuntimeError("inventory dependency scheduling is malformed")

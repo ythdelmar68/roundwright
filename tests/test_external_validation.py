@@ -23,6 +23,7 @@ from roundwright.hosted_evidence import (
     HostedWorkflowRun,
 )
 from roundwright.github import (
+    GitHubContractError,
     GitHubReadOperation,
     GitHubMutationOperation,
     GitHubReadRequest,
@@ -532,7 +533,10 @@ class ExternalValidationTests(unittest.TestCase):
                         ]}}},
                     ]},
                 }]},
-                "refs": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+                "refs": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                    {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
+                    {"name": "codex/docs/26-public-target-contract", "target": {"oid": inputs.target_baseline_sha}},
+                ]},
             }},
         }
 
@@ -633,6 +637,10 @@ class ExternalValidationTests(unittest.TestCase):
         ))
         self.assertTrue(top_level_result.ok)
         self.assertEqual(len(top_level_result.snapshot.collection(RepositoryInventorySection.ISSUES).item_identities), 101)  # type: ignore[union-attr]
+        self.assertEqual(
+            top_level_result.snapshot.collection(RepositoryInventorySection.REMOTE_HEADS).item_identities,  # type: ignore[union-attr]
+            ("codex/docs/26-public-target-contract", "main"),
+        )
         self.assertEqual(sum("issues(first:100,after:$cursor" in command[3] for command in top_level_host.commands), 1)
         def pull_request(number: int) -> dict[str, object]:
             empty = {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
@@ -709,6 +717,38 @@ class ExternalValidationTests(unittest.TestCase):
             self.assertIsNotNone(code)
             assert code is not None
             return code
+        valid_remote_heads = ("codex/docs/26-public-target-contract", "main")
+        self.assertIsInstance(
+            RepositoryInventoryEvidence(
+                RepositoryInventorySection.REMOTE_HEADS, digest("d"), valid_remote_heads, 1, True,
+            ),
+            RepositoryInventoryEvidence,
+        )
+        for label, identities in (
+            ("control", ("bad\x01ref",)),
+            ("malformed", ("codex//docs",)),
+            ("overlong", ("a" * 257,)),
+            ("duplicate", ("main", "main")),
+            ("unsorted", ("main", "codex/docs/26-public-target-contract")),
+            ("over-bound", tuple(f"head-{number:04d}" for number in range(3201))),
+        ):
+            with self.subTest(remote_head_contract=label):
+                with self.assertRaises(GitHubContractError):
+                    RepositoryInventoryEvidence(
+                        RepositoryInventorySection.REMOTE_HEADS, digest("d"), identities, 1, True,
+                    )
+        for label, names, expected in (
+            ("control", ("bad\x01ref",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("malformed", ("codex//docs",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("duplicate", ("main", "main"), external_validation.RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE),
+        ):
+            with self.subTest(remote_head_product=label):
+                malformed_inventory = json.loads(json.dumps(raw_inventory))
+                malformed_inventory["data"]["repository"]["refs"] = {
+                    "totalCount": len(names), "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{"name": item, "target": {"oid": inputs.target_baseline_sha}} for item in names],
+                }
+                self.assertEqual(failure_code(OpaqueCredentialHost(malformed_inventory)), expected)
         self.assertEqual(
             failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),
             external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,

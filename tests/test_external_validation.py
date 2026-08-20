@@ -522,11 +522,13 @@ class ExternalValidationTests(unittest.TestCase):
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
                     "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviews": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "reviewRequests": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "closingIssuesReferences": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
                     "commits": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                        {"commit": {"oid": "1" * 40, "checkSuites": {"totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "suite-cursor-1"}, "nodes": [
-                            {"id": "check-suite-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-1"}},
+                        {"commit": {"oid": "1" * 40, "checkSuites": {"totalCount": 12, "pageInfo": {"hasNextPage": True, "endCursor": "suite-cursor-1"}, "nodes": [
+                            {"id": f"check-suite-1-{number}", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-1-{number}"}}
+                            for number in range(1, 11)
                         ]}}},
-                        {"commit": {"oid": "2" * 40, "checkSuites": {"totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "suite-cursor-2"}, "nodes": [
-                            {"id": "check-suite-2", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-2"}},
+                        {"commit": {"oid": "2" * 40, "checkSuites": {"totalCount": 12, "pageInfo": {"hasNextPage": True, "endCursor": "suite-cursor-2"}, "nodes": [
+                            {"id": f"check-suite-2-{number}", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-2-{number}"}}
+                            for number in range(1, 11)
                         ]}}},
                     ]},
                 }]},
@@ -540,10 +542,11 @@ class ExternalValidationTests(unittest.TestCase):
             stdout: str
 
         class OpaqueCredentialHost:
-            def __init__(self, payload: object, *, issue_page: object | None = None, comment_page: object | None = None, exit_code: int = 0) -> None:
+            def __init__(self, payload: object, *, issue_page: object | None = None, pull_request_page: object | None = None, comment_page: object | None = None, exit_code: int = 0) -> None:
                 self.commands: list[tuple[str, ...]] = []
                 self.payload = payload
                 self.issue_page = issue_page
+                self.pull_request_page = pull_request_page
                 self.comment_page = comment_page
                 self.exit_code = exit_code
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
@@ -555,14 +558,19 @@ class ExternalValidationTests(unittest.TestCase):
                     suffix = "1" if oid == "1" * 40 else "2" if oid == "2" * 40 else "unknown"
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "object": {"oid": oid, "checkSuites": {
-                            "totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
-                                "id": f"check-suite-{suffix}-continued", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued"},
-                            }],
+                            "totalCount": 12, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                                {"id": f"check-suite-{suffix}-continued-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued-1"}},
+                                {"id": f"check-suite-{suffix}-continued-2", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued-2"}},
+                            ],
                         }},
                     }}}))
                 if "issues(first:100,after:$cursor" in arguments[3] and self.issue_page is not None:
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "issues": self.issue_page,
+                    }}}))
+                if "pullRequests(first:100,after:$cursor" in arguments[3] and self.pull_request_page is not None:
+                    return OpaqueResult(0, json.dumps({"data": {"repository": {
+                        "name": name, "owner": {"login": owner}, "pullRequests": self.pull_request_page,
                     }}}))
                 if "comments(first:100,after:$cursor" in arguments[3] and self.comment_page is not None:
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
@@ -595,6 +603,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(inventory_commands[0][0:3], ("api", "graphql", "-f"))
         self.assertIn("repository(owner:$owner,name:$name)", inventory_commands[0][3])
         self.assertIn("commits(first:100)", inventory_commands[0][3])
+        self.assertIn("checkSuites(first:10)", inventory_commands[0][3])
         self.assertEqual(inventory_commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
         self.assertTrue(all("checkSuites(first:100,after:$cursor)" in command[3] for command in continuation_commands))
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
@@ -625,6 +634,52 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(top_level_result.ok)
         self.assertEqual(len(top_level_result.snapshot.collection(RepositoryInventorySection.ISSUES).item_identities), 101)  # type: ignore[union-attr]
         self.assertEqual(sum("issues(first:100,after:$cursor" in command[3] for command in top_level_host.commands), 1)
+        def pull_request(number: int) -> dict[str, object]:
+            empty = {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+            return {
+                "id": f"pull-request-{number}", "number": number, "state": "MERGED",
+                "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49",
+                "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
+                "comments": dict(empty), "reviews": dict(empty), "reviewRequests": dict(empty),
+                "closingIssuesReferences": dict(empty), "commits": dict(empty),
+            }
+        pull_request_inventory = json.loads(json.dumps(raw_inventory))
+        pull_request_inventory["data"]["repository"]["pullRequests"] = {
+            "totalCount": 101, "pageInfo": {"hasNextPage": True, "endCursor": "pull-request-page-1"},
+            "nodes": [pull_request(number) for number in range(1, 101)],
+        }
+        pull_request_host = OpaqueCredentialHost(
+            pull_request_inventory,
+            pull_request_page={"totalCount": 101, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [pull_request(101)]},
+        )
+        pull_request_capability = create_credentialed_github_read_capability(
+            pull_request_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        self.assertTrue(pull_request_capability.read(GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        )).ok)
+        initial_query = next(command[3] for command in pull_request_host.commands if "pullRequests(first:100,states" in command[3])
+        pull_request_query = next(command[3] for command in pull_request_host.commands if "pullRequests(first:100,after:$cursor" in command[3])
+        def page_size(query: str, connection: str) -> int:
+            value = query.split(f"{connection}(first:", 1)[1]
+            return int(value.split(",", 1)[0].split(")", 1)[0])
+        def pull_request_node_budget(query: str, *, includes_initial_roots: bool) -> int:
+            pulls = page_size(query, "pullRequests")
+            commits = page_size(query, "commits")
+            suites = page_size(query, "checkSuites")
+            nested = sum(page_size(query, connection) for connection in (
+                "comments", "reviews", "reviewRequests", "closingIssuesReferences",
+            ))
+            budget = 1 + pulls * (1 + nested + commits * (1 + suites))
+            if includes_initial_roots:
+                issues = page_size(query, "issues")
+                budget += issues * (1 + page_size(query, "labels") + page_size(query, "subIssues"))
+                budget += page_size(query, "refs")
+            return budget
+        self.assertEqual(page_size(initial_query, "checkSuites"), 10)
+        self.assertEqual(page_size(pull_request_query, "checkSuites"), 10)
+        self.assertLessEqual(pull_request_node_budget(initial_query, includes_initial_roots=True), 500_000)
+        self.assertLessEqual(pull_request_node_budget(pull_request_query, includes_initial_roots=False), 500_000)
         nested_inventory = json.loads(json.dumps(raw_inventory))
         nested_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"] = {
             "totalCount": 101, "pageInfo": {"hasNextPage": True, "endCursor": "comments-page-1"},

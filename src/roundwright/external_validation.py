@@ -1538,7 +1538,7 @@ class _RoundwrightLiveLifecycleProvider:
         required = {
             "umbrella": any(predicate == "child" for _, predicate, _ in predicates),
             "standalone": any(predicate == "standalone" for _, predicate, _ in predicates),
-            "ignored": any(predicate == "label" and value == "roundlet-ignore" for _, predicate, value in predicates),
+            "ignored": any(predicate == "label" and value == "roundlet:ignore" for _, predicate, value in predicates),
             "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
             "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
             "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),

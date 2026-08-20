@@ -517,7 +517,7 @@ class ExternalValidationTests(unittest.TestCase):
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
                     {"id": "issue-4", "number": 4, "state": "OPEN", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
-                    {"id": "issue-49", "number": 49, "state": "OPEN", "labels": {"totalCount": 4, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet-ignore"}, {"name": "roundlet-malformed-parent-owner-input"}, {"name": "roundlet-dependency"}, {"name": "roundlet-supervisor-failover"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-49", "number": 49, "state": "OPEN", "labels": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet-ignore"}, {"name": "roundlet-malformed-parent-owner-input"}, {"name": "roundlet-dependency"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
                 "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
@@ -614,6 +614,30 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
         self.assertFalse(hasattr(capability, "query"))
         self.assertFalse(hasattr(capability, "snapshot"))
+        missing_fixture_inventory = json.loads(json.dumps(raw_inventory))
+        missing_fixture_inventory["data"]["repository"]["issues"]["nodes"][1]["labels"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"name": "roundlet-ignore"}, {"name": "roundlet-malformed-parent-owner-input"}],
+        }
+        missing_fixture_host = OpaqueCredentialHost(missing_fixture_inventory)
+        missing_fixture_capability = create_credentialed_github_read_capability(
+            missing_fixture_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            missing_fixture_session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            missing_fixture_confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
+                missing_fixture_session.public_receipt(), root, digest("e"),
+            )
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence is incomplete"):
+                external_validation.execute_live_lifecycle_shadow_session(
+                    missing_fixture_confirmed.public_receipt(), root, missing_fixture_capability,
+                )
+        missing_fixture_inventory_commands = [
+            command for command in missing_fixture_host.commands if "object(expression:$oid)" not in command[3]
+        ]
+        self.assertEqual(len(missing_fixture_inventory_commands), 2)
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute", "validate"])
         def issue(number: int) -> dict[str, object]:
             return {
                 "id": f"issue-{number}", "number": number, "state": "OPEN",
@@ -757,7 +781,7 @@ class ExternalValidationTests(unittest.TestCase):
                     "nodes": [{"name": item, "target": {"oid": inputs.target_baseline_sha}} for item in names],
                 }
                 self.assertEqual(failure_code(OpaqueCredentialHost(malformed_inventory)), expected)
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute", "validate"])
         self.assertEqual(
             failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),
             external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,

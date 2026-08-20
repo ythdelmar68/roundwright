@@ -82,6 +82,10 @@ from .repository_policy import (
 # GraphQL cursors are opaque provider values (typically base64 and therefore
 # allowed to contain ``=``).  They are never interpolated into a shell.
 _CURSOR = re.compile(r"[^\x00-\x1f\x7f]{1,1024}\Z")
+_STANDALONE_FIXTURE = re.compile(r"\bstandalone[ -]fixture\b", re.IGNORECASE)
+_MALFORMED_PARENT_CHILD_FIXTURE = re.compile(r"\bmalformed[ -]parent child fixture\b", re.IGNORECASE)
+_OWNER_INPUT_FIXTURE = re.compile(r"\bowner[ -]input fixture\b", re.IGNORECASE)
+_BLOCKED_BY = re.compile(r"(?:^|\n)\s*(?:[-*]\s+)?Blocked by #(?P<number>[1-9][0-9]{0,8})\.?\s*(?=\n|\Z)", re.IGNORECASE)
 ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED = (
     "roundwright-repository-inventory-first-read-boundary__safe-subcause-not-retained"
 )
@@ -4376,7 +4380,7 @@ def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]
     query = (
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
         "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
-        "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
+        "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state title body labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
         "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid checkSuites(first:10){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
         "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
     )
@@ -4426,7 +4430,7 @@ def _repository_inventory_connection_command(
     ):
         raise GitHubRuntimeError("inventory continuation request is invalid")
     issue_node = (
-        "id number state labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} "
+        "id number state title body labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} "
         "subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}"
     )
     pull_request_node = (
@@ -4718,6 +4722,34 @@ def _project_repository_inventory_check_suites_page(
     return _raw_integer(suites, "totalCount"), nodes, _raw_bool(page, "hasNextPage"), page.get("endCursor")
 
 
+def _inventory_scheduling_facts(
+    subject: str, title: str, body: str,
+) -> tuple[RepositoryInventoryFact, ...]:
+    """Project bounded public scheduling markers without retaining title/body prose."""
+
+    if len(title) > 512 or len(body) > 65_536 or "\x00" in title or "\x00" in body:
+        raise GitHubRuntimeError("inventory issue scheduling text is malformed")
+    text = f"{title}\n{body}"
+    facts: list[RepositoryInventoryFact] = []
+    standalone = len(_STANDALONE_FIXTURE.findall(text))
+    malformed_parent = len(_MALFORMED_PARENT_CHILD_FIXTURE.findall(text))
+    owner_input = len(_OWNER_INPUT_FIXTURE.findall(text))
+    if standalone > 1 or malformed_parent > 1 or owner_input > 1:
+        raise GitHubRuntimeError("inventory scheduling fixture is ambiguous")
+    if standalone:
+        facts.append(RepositoryInventoryFact(subject, "standalone", "true"))
+    if malformed_parent:
+        facts.append(RepositoryInventoryFact(subject, "malformed-parent-child", "true"))
+    if owner_input:
+        facts.append(RepositoryInventoryFact(subject, "owner-input-fixture", "true"))
+    dependency_lines = tuple(line for line in body.splitlines() if "blocked by" in line.casefold())
+    dependencies = tuple(match["number"] for match in _BLOCKED_BY.finditer(body))
+    if len(dependencies) != len(dependency_lines) or len(dependencies) != len(set(dependencies)):
+        raise GitHubRuntimeError("inventory dependency scheduling is malformed")
+    facts.extend(RepositoryInventoryFact(subject, "depends-on", f"issue-{number}") for number in dependencies)
+    return tuple(facts)
+
+
 def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> RepositoryInventorySnapshot:
     """Normalize terminal GraphQL inventory data into the core-only snapshot.
 
@@ -4769,6 +4801,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         value = _raw_mapping(issue)
         subject = f"issue-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
+        facts.extend(_inventory_scheduling_facts(subject, _raw_text(value, "title"), _raw_text(value, "body")))
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")
             if _raw_bool(page, "hasNextPage") or type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes):
@@ -4778,18 +4811,31 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
                 child = _raw_mapping(node)
                 fact_value = _raw_text(child, "name") if predicate == "label" else f"issue-{_raw_integer(child, 'number')}"
                 facts.append(RepositoryInventoryFact(subject, predicate, fact_value))
-                if predicate == "label":
-                    derived_predicates = {
-                        "roundlet-malformed-parent-owner-input": "malformed-parent",
-                        "roundlet-dependency": "depends-on",
-                        "roundlet-supervisor-failover": "supervisor-failover",
-                    }
-                    if fact_value in derived_predicates:
-                        facts.append(RepositoryInventoryFact(subject, derived_predicates[fact_value], "observed"))
-        relationships = _raw_mapping(value.get("subIssues"))
-        relationship_nodes = relationships.get("nodes")
-        if type(relationship_nodes) is list and not relationship_nodes:
-            facts.append(RepositoryInventoryFact(subject, "standalone", "true"))
+    issue_subjects = {item.subject for item in facts if item.predicate == "state" and item.subject.startswith("issue-")}
+    child_edges = [(item.subject, item.object) for item in facts if item.predicate == "child"]
+    child_subjects = {child for _, child in child_edges}
+    parent_counts = {child: sum(candidate == child for _, candidate in child_edges) for child in child_subjects}
+    malformed_children = {item.subject for item in facts if item.predicate == "malformed-parent-child"}
+    owner_input_parents = {item.subject for item in facts if item.predicate == "owner-input-fixture"}
+    if (
+        len(child_edges) != len(set(child_edges))
+        or any(parent == child or parent not in issue_subjects or child not in issue_subjects for parent, child in child_edges)
+        or any(count != 1 for count in parent_counts.values())
+        or any(item.subject not in issue_subjects or item.subject in child_subjects for item in facts if item.predicate == "standalone")
+        or any(
+            item.subject not in issue_subjects or item.object not in issue_subjects or item.subject == item.object
+            for item in facts if item.predicate == "depends-on"
+        )
+    ):
+        raise GitHubRuntimeError("inventory scheduling topology is malformed")
+    if malformed_children or owner_input_parents:
+        if len(malformed_children) != 1 or len(owner_input_parents) != 1:
+            raise GitHubRuntimeError("inventory malformed-parent topology is incomplete")
+        malformed_child = next(iter(malformed_children))
+        malformed_parents = {parent for parent, child in child_edges if child == malformed_child}
+        if len(malformed_parents) != 1 or malformed_parents != owner_input_parents:
+            raise GitHubRuntimeError("inventory malformed-parent topology is incomplete")
+        facts.append(RepositoryInventoryFact(malformed_child, "malformed-parent", "owner-input"))
     for pull_request in pull_requests["nodes"]:  # type: ignore[index]
         value = _raw_mapping(pull_request); subject = f"pull-request-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))

@@ -381,7 +381,7 @@ class ExternalValidationTests(unittest.TestCase):
                 facts = tuple(sorted((
                     RepositoryInventoryFact("issue-4", "child", "issue-49"),
                     RepositoryInventoryFact("issue-49", "standalone", "true"),
-                    RepositoryInventoryFact("issue-50", "label", "roundlet-ignore"),
+                    RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
                     RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                     RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
                     RepositoryInventoryFact("pull-request-81", "state", "merged"),
@@ -455,7 +455,7 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
                 RepositoryInventoryFact("issue-49", "standalone", "true"),
                 RepositoryInventoryFact("issue-49", "supervisor-failover", "observed"),
-                RepositoryInventoryFact("issue-50", "label", "roundlet-ignore"),
+                RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
                 RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("pull-request-81", "state", "merged"),
             )
@@ -515,9 +515,10 @@ class ExternalValidationTests(unittest.TestCase):
             "data": {"repository": {
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
-                "issues": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-4", "number": 4, "state": "OPEN", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
-                    {"id": "issue-49", "number": 49, "state": "OPEN", "labels": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet-ignore"}, {"name": "roundlet-malformed-parent-owner-input"}, {"name": "roundlet-dependency"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                    {"id": "issue-4", "number": 4, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 49}]}},
+                    {"id": "issue-49", "number": 49, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #4.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-50", "number": 50, "state": "OPEN", "title": "Standalone fixture", "body": "", "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
                 "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": inputs.candidate_sha, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
@@ -606,6 +607,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(len(continuation_commands), 6)
         self.assertEqual(inventory_commands[0][0:3], ("api", "graphql", "-f"))
         self.assertIn("repository(owner:$owner,name:$name)", inventory_commands[0][3])
+        self.assertIn("nodes{id number state title body", inventory_commands[0][3])
         self.assertIn("commits(first:100)", inventory_commands[0][3])
         self.assertIn("checkSuites(first:10)", inventory_commands[0][3])
         self.assertEqual(inventory_commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
@@ -614,33 +616,51 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
         self.assertFalse(hasattr(capability, "query"))
         self.assertFalse(hasattr(capability, "snapshot"))
-        missing_fixture_inventory = json.loads(json.dumps(raw_inventory))
-        missing_fixture_inventory["data"]["repository"]["issues"]["nodes"][1]["labels"] = {
-            "totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None},
-            "nodes": [{"name": "roundlet-ignore"}, {"name": "roundlet-malformed-parent-owner-input"}],
-        }
-        missing_fixture_host = OpaqueCredentialHost(missing_fixture_inventory)
-        missing_fixture_capability = create_credentialed_github_read_capability(
-            missing_fixture_host, binding, dependency_control, health, clock=lambda: now,
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            missing_fixture_session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
-            missing_fixture_confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
-                missing_fixture_session.public_receipt(), root, digest("e"),
+        def fixture_blocks_before_harness(inventory: object, expected_reads: int) -> None:
+            fixture_host = OpaqueCredentialHost(inventory)
+            fixture_capability = create_credentialed_github_read_capability(
+                fixture_host, binding, dependency_control, health, clock=lambda: now,
             )
-            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence is incomplete"):
-                external_validation.execute_live_lifecycle_shadow_session(
-                    missing_fixture_confirmed.public_receipt(), root, missing_fixture_capability,
-                )
-        missing_fixture_inventory_commands = [
-            command for command in missing_fixture_host.commands if "object(expression:$oid)" not in command[3]
-        ]
-        self.assertEqual(len(missing_fixture_inventory_commands), 2)
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute", "validate"])
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("e"))
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, fixture_capability)
+            inventory_commands = [command for command in fixture_host.commands if "object(expression:$oid)" not in command[3]]
+            self.assertEqual(len(inventory_commands), expected_reads)
+
+        missing_membership = json.loads(json.dumps(raw_inventory))
+        missing_membership["data"]["repository"]["issues"]["nodes"][0]["subIssues"] = {
+            "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [],
+        }
+        missing_standalone = json.loads(json.dumps(raw_inventory))
+        missing_standalone["data"]["repository"]["issues"]["nodes"][2]["title"] = "Ignored fixture"
+        missing_ignore = json.loads(json.dumps(raw_inventory))
+        missing_ignore["data"]["repository"]["issues"]["nodes"][2]["labels"] = {
+            "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [],
+        }
+        missing_malformed = json.loads(json.dumps(raw_inventory))
+        missing_malformed["data"]["repository"]["issues"]["nodes"][1]["title"] = "Dependency fixture"
+        missing_owner_input = json.loads(json.dumps(raw_inventory))
+        missing_owner_input["data"]["repository"]["issues"]["nodes"][0]["title"] = "Umbrella fixture"
+        missing_dependency = json.loads(json.dumps(raw_inventory))
+        missing_dependency["data"]["repository"]["issues"]["nodes"][1]["body"] = ""
+        missing_merged_pr = json.loads(json.dumps(raw_inventory))
+        missing_merged_pr["data"]["repository"]["pullRequests"]["nodes"][0]["state"] = "OPEN"
+        for fixture_name, inventory, expected_reads in (
+            ("membership", missing_membership, 1), ("standalone", missing_standalone, 2),
+            ("ignore", missing_ignore, 2), ("malformed-parent", missing_malformed, 1),
+            ("owner-input", missing_owner_input, 1), ("dependency", missing_dependency, 2),
+            ("merged-pr", missing_merged_pr, 2),
+        ):
+            with self.subTest(missing_fixture=fixture_name):
+                fixture_blocks_before_harness(inventory, expected_reads)
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"] + ["validate"] * 7)
         def issue(number: int) -> dict[str, object]:
             return {
                 "id": f"issue-{number}", "number": number, "state": "OPEN",
+                "title": "ordinary issue", "body": "",
                 "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
                 "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
             }
@@ -659,7 +679,7 @@ class ExternalValidationTests(unittest.TestCase):
         top_level_result = top_level_capability.read(GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
         ))
-        self.assertTrue(top_level_result.ok)
+        self.assertTrue(top_level_result.ok, top_level_result.failure)
         self.assertEqual(len(top_level_result.snapshot.collection(RepositoryInventorySection.ISSUES).item_identities), 101)  # type: ignore[union-attr]
         self.assertEqual(
             top_level_result.snapshot.collection(RepositoryInventorySection.REMOTE_HEADS).item_identities,  # type: ignore[union-attr]
@@ -741,6 +761,18 @@ class ExternalValidationTests(unittest.TestCase):
             self.assertIsNotNone(code)
             assert code is not None
             return code
+        for label, title, body, expected in (
+            ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("ambiguous-dependency", "Dependency fixture", "Blocked by #4\nBlocked by #4", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),
+        ):
+            with self.subTest(scheduling_fixture=label):
+                malformed_scheduling_inventory = json.loads(json.dumps(raw_inventory))
+                malformed_scheduling_inventory["data"]["repository"]["issues"]["nodes"][1]["title"] = title
+                malformed_scheduling_inventory["data"]["repository"]["issues"]["nodes"][1]["body"] = body
+                self.assertEqual(
+                    failure_code(OpaqueCredentialHost(malformed_scheduling_inventory)),
+                    expected,
+                )
         valid_remote_heads = ("codex/docs/26-public-target-contract", "main")
         self.assertIsInstance(
             RepositoryInventoryEvidence(
@@ -781,7 +813,7 @@ class ExternalValidationTests(unittest.TestCase):
                     "nodes": [{"name": item, "target": {"oid": inputs.target_baseline_sha}} for item in names],
                 }
                 self.assertEqual(failure_code(OpaqueCredentialHost(malformed_inventory)), expected)
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute", "validate"])
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"] + ["validate"] * 7)
         self.assertEqual(
             failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),
             external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,

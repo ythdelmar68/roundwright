@@ -1036,7 +1036,7 @@ class HostedCheckProfileAdapter:
 
 _LIVE_LIFECYCLE_FIXTURES = (
     "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
-    "dependency", "merged-pr", "supervisor-failover",
+    "dependency", "merged-pr",
 )
 _LIVE_LIFECYCLE_SNAPSHOTS = (
     "repository", "issues", "scheduling", "pull-requests", "comments",
@@ -1542,7 +1542,6 @@ class _RoundwrightLiveLifecycleProvider:
             "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
             "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
             "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
-            "supervisor-failover": any(predicate == "supervisor-failover" for _, predicate, _ in predicates),
         }
         if not all(required.values()):
             raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")

@@ -22,6 +22,7 @@ _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,255}\Z")
+_REMOTE_HEAD_IDENTITY = re.compile(r"(?=.{1,256}\Z)[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99})*\Z")
 _REVIEWER = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[[A-Za-z0-9-]{1,39}\])?|[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9-]{0,99})\Z")
 _PUBLIC_TEXT = re.compile(r"[^\x00-\x1f\x7f]{1,512}\Z")
 _COMMENT_TEXT = re.compile(r"(?s)[^\x00\x7f]{1,65536}\Z")
@@ -539,9 +540,10 @@ class RepositoryInventoryEvidence:
         if type(self.section) is not RepositoryInventorySection:
             raise GitHubContractError("inventory section is invalid")
         _validate_digest(self.evidence_identity, "inventory evidence")
+        identity_pattern = _REMOTE_HEAD_IDENTITY if self.section is RepositoryInventorySection.REMOTE_HEADS else _TOKEN
         if (
             type(self.item_identities) is not tuple
-            or any(type(item) is not str or not _TOKEN.fullmatch(item) for item in self.item_identities)
+            or any(type(item) is not str or not identity_pattern.fullmatch(item) for item in self.item_identities)
             or tuple(sorted(self.item_identities)) != self.item_identities
             or len(set(self.item_identities)) != len(self.item_identities)
             or type(self.page_count) is not int

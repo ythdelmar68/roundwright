@@ -728,6 +728,10 @@ class ExternalValidationTests(unittest.TestCase):
             ("control", ("bad\x01ref",)),
             ("malformed", ("codex//docs",)),
             ("overlong", ("a" * 257,)),
+            ("double-dot", ("feature..name",)),
+            ("trailing-dot", ("feature.",)),
+            ("lock-component", ("feature.lock",)),
+            ("nested-lock-component", ("feature/release.lock/fix",)),
             ("duplicate", ("main", "main")),
             ("unsorted", ("main", "codex/docs/26-public-target-contract")),
             ("over-bound", tuple(f"head-{number:04d}" for number in range(3201))),
@@ -740,6 +744,10 @@ class ExternalValidationTests(unittest.TestCase):
         for label, names, expected in (
             ("control", ("bad\x01ref",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("malformed", ("codex//docs",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("double-dot", ("feature..name",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("trailing-dot", ("feature.",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("lock-component", ("feature.lock",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
+            ("nested-lock-component", ("feature/release.lock/fix",), external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("duplicate", ("main", "main"), external_validation.RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE),
         ):
             with self.subTest(remote_head_product=label):
@@ -749,6 +757,7 @@ class ExternalValidationTests(unittest.TestCase):
                     "nodes": [{"name": item, "target": {"oid": inputs.target_baseline_sha}} for item in names],
                 }
                 self.assertEqual(failure_code(OpaqueCredentialHost(malformed_inventory)), expected)
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
         self.assertEqual(
             failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),
             external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,

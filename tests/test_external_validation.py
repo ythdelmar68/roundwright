@@ -635,6 +635,33 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertIn("checkSuites(first:10)", inventory_commands[0][3])
         self.assertEqual(inventory_commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
         self.assertTrue(all("checkSuites(first:100,after:$cursor)" in command[3] for command in continuation_commands))
+
+        class ReturnCodeResultWithGuardedLegacyAlias:
+            def __init__(self, result: OpaqueResult) -> None:
+                self.returncode = result.returncode
+                self.stdout = result.stdout
+
+            @property
+            def exit_code(self) -> int:
+                raise RuntimeError("private legacy return-code marker")
+
+        class ReturnCodeHost(OpaqueCredentialHost):
+            def run(self, arguments: tuple[str, ...]) -> ReturnCodeResultWithGuardedLegacyAlias:
+                return ReturnCodeResultWithGuardedLegacyAlias(super().run(arguments))
+
+        guarded_alias_host = ReturnCodeHost(raw_inventory)
+        guarded_alias_request = GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name),
+            expected_sha=inputs.target_baseline_sha,
+        )
+        guarded_alias_result = create_credentialed_github_read_capability(
+            guarded_alias_host, binding, dependency_control, health, clock=lambda: now,
+        ).read(guarded_alias_request)
+        self.assertTrue(guarded_alias_result.ok)
+        self.assertEqual(
+            guarded_alias_host.commands[0][-4:],
+            ("-F", f"owner={owner}", "-F", f"name={name}"),
+        )
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
         self.assertFalse(hasattr(capability, "query"))
@@ -899,8 +926,17 @@ class ExternalValidationTests(unittest.TestCase):
             assert code is not None and stage is not None
             return code, stage, failed.failure.public_reason
         class TransportFailureHost:
+            def __init__(self) -> None:
+                self.commands: list[tuple[str, ...]] = []
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                self.commands.append(arguments)
                 raise RuntimeError("private transport marker")
+        class NonzeroReturnHost:
+            def __init__(self) -> None:
+                self.commands: list[tuple[str, ...]] = []
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                self.commands.append(arguments)
+                return OpaqueResult(9, "private nonzero return marker")
         class InvalidResultHost:
             def run(self, arguments: tuple[str, ...]) -> object:
                 return object()
@@ -921,6 +957,18 @@ class ExternalValidationTests(unittest.TestCase):
                 self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
                 self.assertEqual(stage, expected_stage)
                 self.assertNotIn("private", public_reason)
+        transport_host = TransportFailureHost()
+        code, stage, public_reason = outer_failure_stage(transport_host)
+        self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+        self.assertEqual(stage, RepositoryInventoryFailureStage.TRANSPORT)
+        self.assertNotIn("private", public_reason)
+        self.assertEqual(transport_host.commands[0][0:3], ("api", "graphql", "-f"))
+        nonzero_host = NonzeroReturnHost()
+        code, stage, public_reason = outer_failure_stage(nonzero_host)
+        self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE)
+        self.assertEqual(stage, RepositoryInventoryFailureStage.TRANSPORT)
+        self.assertNotIn("private", public_reason)
+        self.assertEqual(nonzero_host.commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
         with patch.object(
             github_runtime, "_repository_inventory_command",
             side_effect=github_runtime.GitHubRuntimeError("private request marker"),

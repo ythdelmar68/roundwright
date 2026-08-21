@@ -1417,7 +1417,20 @@ class _CredentialedGhRunnerAdapter:
     def run(self, arguments: tuple[str, ...]) -> _GhCommandResult:
         try:
             result = self.__host.run(arguments)  # type: ignore[attr-defined]
-            exit_code = getattr(result, "returncode", getattr(result, "exit_code", None))
+        except Exception as error:
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+            ) from error
+        try:
+            # Do not evaluate the legacy alias unless the conventional
+            # subprocess-shaped return code is actually absent.  Some opaque
+            # credential hosts expose a guarded legacy attribute whose access
+            # is unavailable to this boundary; eager fallback evaluation
+            # would turn an otherwise valid process result into a transport
+            # failure.
+            exit_code = getattr(result, "returncode", None)
+            if exit_code is None:
+                exit_code = getattr(result, "exit_code", None)
             stdout = getattr(result, "stdout", None)
         except Exception as error:
             raise _RepositoryInventoryDiagnosticError(

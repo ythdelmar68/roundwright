@@ -1230,6 +1230,19 @@ class ExternalValidationTests(unittest.TestCase):
                         external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, denied_capability)
                 self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.TIME_OR_HEALTH_FAILURE)
                 self.assertEqual(denied_host.commands, [])
+        seam_host = InvalidJsonHost()
+        seam_capability = create_credentialed_github_read_capability(
+            seam_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("a"))
+            with self.assertRaises(external_validation.RepositoryInventoryFirstReadBoundaryError) as captured:
+                external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, seam_capability)
+        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+        self.assertEqual(captured.exception.stage, RepositoryInventoryFailureStage.JSON_DECODING)
+        self.assertNotIn("private-json-marker", str(captured.exception))
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

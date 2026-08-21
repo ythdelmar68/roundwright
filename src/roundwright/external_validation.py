@@ -34,8 +34,9 @@ from .github import (
 )
 from .github_runtime import (
     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
+    RepositoryInventoryFailureStage,
     RepositoryInventoryReadFailureCode,
-    credentialed_repository_inventory_failure_code,
+    credentialed_repository_inventory_failure,
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
@@ -61,12 +62,20 @@ class ExternalValidationAdapterError(ValueError):
 class RepositoryInventoryFirstReadBoundaryError(ExternalValidationAdapterError):
     """Typed, public-safe inventory failure at the lifecycle adapter boundary."""
 
-    def __init__(self, code: RepositoryInventoryReadFailureCode) -> None:
-        if type(code) is not RepositoryInventoryReadFailureCode:
-            raise TypeError("repository inventory failure code is invalid")
+    def __init__(
+        self,
+        code: RepositoryInventoryReadFailureCode,
+        stage: RepositoryInventoryFailureStage = RepositoryInventoryFailureStage.UNKNOWN,
+    ) -> None:
+        if type(code) is not RepositoryInventoryReadFailureCode or type(stage) is not RepositoryInventoryFailureStage:
+            raise TypeError("repository inventory failure is invalid")
         self.code = code
+        self.stage = stage
+        reason = f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+        if stage is not RepositoryInventoryFailureStage.UNKNOWN:
+            reason += f":{stage.value}"
         super().__init__(
-            f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+            reason
         )
 
 
@@ -1502,10 +1511,13 @@ class _RoundwrightLiveLifecycleProvider:
                 RepositoryInventoryReadFailureCode.HOST_FAILURE,
             ) from error
         if type(result) is GitHubReadResult and result.request == request and result.failure is not None:
-            code = credentialed_repository_inventory_failure_code(self._capability, request, result)
-            if code is None:
-                code = RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE
-            raise RepositoryInventoryFirstReadBoundaryError(code)
+            retained = credentialed_repository_inventory_failure(self._capability, request, result)
+            if retained is None:
+                retained = (
+                    RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                    RepositoryInventoryFailureStage.UNKNOWN,
+                )
+            raise RepositoryInventoryFirstReadBoundaryError(*retained)
         if (
             type(result) is not GitHubReadResult or result.request != request
             or not result.ok or type(result.snapshot) is not expected

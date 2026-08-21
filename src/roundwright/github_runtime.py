@@ -1331,7 +1331,8 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
         super().__init__(health, channel)
         self.__inventory_failure_lock = RLock()
         self.__pending_inventory_failure: tuple[
-            GitHubReadRequest, GitHubReadResult, GitHubFailure, RepositoryInventoryReadFailureCode,
+            GitHubReadRequest, GitHubReadResult, GitHubFailure,
+            RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
         ] | None = None
         self.__read_generation = 0
 
@@ -1348,20 +1349,21 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
             and result.failure is not None
         ):
             code = repository_inventory_failure_code(result.failure.public_reason)
-            if code is not None:
+            stage = repository_inventory_failure_stage(result.failure.public_reason)
+            if code is not None and stage is not None:
                 with self.__inventory_failure_lock:
                     if generation == self.__read_generation:
-                        self.__pending_inventory_failure = (request, result, result.failure, code)
+                        self.__pending_inventory_failure = (request, result, result.failure, code, stage)
         return result
 
-    def _trusted_inventory_failure_code(
+    def _trusted_inventory_failure(
         self, request: GitHubReadRequest, result: GitHubReadResult,
-    ) -> RepositoryInventoryReadFailureCode | None:
+    ) -> tuple[RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage] | None:
         with self.__inventory_failure_lock:
             retained = self.__pending_inventory_failure
             if retained is None:
                 return None
-            retained_request, retained_result, retained_failure, code = retained
+            retained_request, retained_result, retained_failure, code, stage = retained
             if (
                 retained_request is request
                 and retained_result is result
@@ -1369,14 +1371,14 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
                 and result.failure is retained_failure
             ):
                 self.__pending_inventory_failure = None
-                return code
+                return code, stage
             return None
 
 
-def credentialed_repository_inventory_failure_code(
+def credentialed_repository_inventory_failure(
     capability: object, request: GitHubReadRequest, result: GitHubReadResult,
-) -> RepositoryInventoryReadFailureCode | None:
-    """Return a code only for the exact factory-retained read result instance."""
+) -> tuple[RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage] | None:
+    """Return one exact factory-retained code/stage pair for a sealed result."""
 
     if (
         type(capability) is not _CredentialedGitHubReadCapability
@@ -1384,7 +1386,16 @@ def credentialed_repository_inventory_failure_code(
         or type(result) is not GitHubReadResult
     ):
         return None
-    return capability._trusted_inventory_failure_code(request, result)
+    return capability._trusted_inventory_failure(request, result)
+
+
+def credentialed_repository_inventory_failure_code(
+    capability: object, request: GitHubReadRequest, result: GitHubReadResult,
+) -> RepositoryInventoryReadFailureCode | None:
+    """Return a code only for the exact factory-retained read result instance."""
+
+    retained = credentialed_repository_inventory_failure(capability, request, result)
+    return None if retained is None else retained[0]
 
 
 class _CredentialedGhRunnerAdapter:

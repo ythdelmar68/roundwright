@@ -51,6 +51,7 @@ from roundwright.github_runtime import (
     CapabilityState,
     GitHubCapabilityHealth,
     OperationHealth,
+    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     RepositoryInventoryFailureStage,
     credentialed_repository_inventory_failure_code,
     create_credentialed_github_read_capability,
@@ -825,6 +826,64 @@ class ExternalValidationTests(unittest.TestCase):
                     repository_inventory_failure_stage(failed.failure.public_reason),
                     RepositoryInventoryFailureStage.CONNECTION_NODES,
                 )
+        for label, connection_path in (
+            ("root-refs", ("data", "repository", "refs")),
+            ("issue-sub-issues", ("data", "repository", "issues", "nodes", 1, "subIssues")),
+            ("pull-request-comments", ("data", "repository", "pullRequests", "nodes", 0, "comments")),
+            ("pull-request-reviews", ("data", "repository", "pullRequests", "nodes", 0, "reviews")),
+            ("pull-request-review-requests", ("data", "repository", "pullRequests", "nodes", 0, "reviewRequests")),
+            ("pull-request-closing-references", ("data", "repository", "pullRequests", "nodes", 0, "closingIssuesReferences")),
+        ):
+            with self.subTest(terminal_empty_nullability=label):
+                nullable_inventory = json.loads(json.dumps(raw_inventory))
+                connection: object = nullable_inventory
+                for component in connection_path:
+                    connection = connection[component]  # type: ignore[index]
+                assert type(connection) is dict
+                connection["totalCount"] = 0
+                connection["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+                connection["nodes"] = None
+                self.assertTrue(create_credentialed_github_read_capability(
+                    OpaqueCredentialHost(nullable_inventory), binding, dependency_control, health, clock=lambda: now,
+                ).read(request).ok)
+        def failure_stage(host: OpaqueCredentialHost) -> RepositoryInventoryFailureStage:
+            failed = create_credentialed_github_read_capability(
+                host, binding, dependency_control, health, clock=lambda: now,
+            ).read(request)
+            self.assertFalse(failed.ok)
+            assert failed.failure is not None
+            stage = repository_inventory_failure_stage(failed.failure.public_reason)
+            self.assertIsNotNone(stage)
+            assert stage is not None
+            return stage
+        root_inventory = {"private-root-marker": "must-not-escape"}
+        repository_inventory = json.loads(json.dumps(raw_inventory))
+        repository_inventory["data"]["repository"]["owner"]["login"] = "unexpected-owner"
+        connection_inventory = json.loads(json.dumps(raw_inventory))
+        connection_inventory["data"]["repository"]["issues"]["nodes"][1]["labels"] = {}
+        node_inventory = json.loads(json.dumps(raw_inventory))
+        node_inventory["data"]["repository"]["issues"]["nodes"][0]["labels"]["nodes"] = [None]
+        field_inventory = json.loads(json.dumps(raw_inventory))
+        field_inventory["data"]["repository"]["issues"]["nodes"][0]["labels"]["nodes"] = [{"name": 1}]
+        pagination_inventory = json.loads(json.dumps(raw_inventory))
+        pagination_connection = pagination_inventory["data"]["repository"]["issues"]["nodes"][1]["subIssues"]
+        pagination_connection["pageInfo"] = {"hasNextPage": True, "endCursor": None}
+        for label, inventory, expected_stage in (
+            ("root", root_inventory, RepositoryInventoryFailureStage.ROOT),
+            ("repository", repository_inventory, RepositoryInventoryFailureStage.REPOSITORY),
+            ("connection", connection_inventory, RepositoryInventoryFailureStage.CONNECTION),
+            ("node", node_inventory, RepositoryInventoryFailureStage.NODE),
+            ("field", field_inventory, RepositoryInventoryFailureStage.FIELD),
+            ("pagination", pagination_inventory, RepositoryInventoryFailureStage.PAGINATION),
+        ):
+            with self.subTest(structural_stage=label):
+                self.assertEqual(failure_stage(OpaqueCredentialHost(inventory)), expected_stage)
+        self.assertEqual(
+            repository_inventory_failure_stage(
+                f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:malformed-response",
+            ),
+            RepositoryInventoryFailureStage.UNKNOWN,
+        )
         for label, title, body, expected in (
             ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("malformed-dependency-marker", "Dependency fixture", "- Blocked by #not-an-issue", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),

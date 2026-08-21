@@ -110,7 +110,13 @@ class RepositoryInventoryFailureStage(StrEnum):
     """Closed, public-safe inventory structural categories."""
 
     UNKNOWN = "unknown"
+    ROOT = "root"
+    REPOSITORY = "repository"
+    CONNECTION = "connection"
     CONNECTION_NODES = "connection-nodes"
+    NODE = "node"
+    FIELD = "field"
+    PAGINATION = "pagination"
 
 
 def _repository_inventory_failure_reason(
@@ -153,7 +159,35 @@ def repository_inventory_failure_stage(public_reason: object) -> RepositoryInven
 
 
 def _repository_inventory_failure_stage(error: BaseException) -> RepositoryInventoryFailureStage:
-    return error.stage if type(error) is _RepositoryInventoryDiagnosticError else RepositoryInventoryFailureStage.UNKNOWN
+    if type(error) is _RepositoryInventoryDiagnosticError:
+        return error.stage
+    if type(error) is json.JSONDecodeError:
+        return RepositoryInventoryFailureStage.ROOT
+    message = str(error).lower()
+    if "repository" in message or "default head" in message:
+        return RepositoryInventoryFailureStage.REPOSITORY
+    if "pagination" in message or "cursor" in message or "incomplete" in message or "continuation" in message:
+        return RepositoryInventoryFailureStage.PAGINATION
+    if "connection" in message or "collection" in message:
+        return RepositoryInventoryFailureStage.CONNECTION
+    if "duplicate evidence" in message:
+        return RepositoryInventoryFailureStage.NODE
+    if (
+        "gh response object" in message
+        or "gh response projection" in message
+    ):
+        return RepositoryInventoryFailureStage.ROOT
+    if (
+        "gh response field" in message
+        or "gh response text" in message
+        or "gh response number" in message
+        or "gh response boolean" in message
+        or "gh response identity" in message
+        or "inventory label" in message
+        or "scheduling" in message
+    ):
+        return RepositoryInventoryFailureStage.FIELD
+    return RepositoryInventoryFailureStage.UNKNOWN
 
 
 def _classify_repository_inventory_error(error: BaseException) -> RepositoryInventoryReadFailureCode:
@@ -4552,7 +4586,10 @@ def _repository_inventory_connection_command(
 
 
 def _inventory_connection_identity(connection: str, node: object) -> str:
-    value = _raw_mapping(node)
+    try:
+        value = _raw_mapping(node)
+    except GitHubRuntimeError as error:
+        raise _RepositoryInventoryDiagnosticError(RepositoryInventoryFailureStage.NODE) from error
     if connection in {"issue-labels", "refs"}:
         return _raw_text(value, "name")
     if connection in {"issue-sub-issues", "pull-request-closing-references"}:
@@ -4593,10 +4630,15 @@ def _complete_repository_inventory_connection(
 
     if type(value) is not dict or not 0 < maximum <= 3200:
         raise GitHubRuntimeError("inventory connection is malformed")
-    total = _raw_integer(value, "totalCount")
-    page = _raw_mapping(value.get("pageInfo"))
-    has_next = _raw_bool(page, "hasNextPage")
-    nodes = _inventory_connection_nodes(value, page)
+    try:
+        total = _raw_integer(value, "totalCount")
+        page = _raw_mapping(value.get("pageInfo"))
+        has_next = _raw_bool(page, "hasNextPage")
+        nodes = _inventory_connection_nodes(value, page)
+    except _RepositoryInventoryDiagnosticError:
+        raise
+    except GitHubRuntimeError as error:
+        raise _RepositoryInventoryDiagnosticError(RepositoryInventoryFailureStage.CONNECTION) from error
     if total < 0 or total > maximum or len(nodes) > 100 or len(nodes) > total:
         raise GitHubRuntimeError("inventory connection cardinality exceeds bound")
     identities = {_inventory_connection_identity(connection, node) for node in nodes}

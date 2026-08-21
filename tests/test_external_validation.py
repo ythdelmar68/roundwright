@@ -597,15 +597,60 @@ class ExternalValidationTests(unittest.TestCase):
             stdout: str
 
         class OpaqueCredentialHost:
-            def __init__(self, payload: object, *, issue_page: object | None = None, pull_request_page: object | None = None, comment_page: object | None = None, nested_pages: dict[str, object] | None = None, exit_code: int = 0) -> None:
+            def __init__(self, payload: object, *, issue_page: object | None = None, pull_request_page: object | None = None, comment_page: object | None = None, nested_pages: dict[str, object] | None = None, check_suite_pages: dict[str, object] | None = None, exit_code: int = 0) -> None:
                 self.commands: list[tuple[str, ...]] = []
                 self.route_ledger: list[tuple[str, int | None, str | None, object, object]] = []
+                self.route_records: list[tuple[str, str, str | None, object, object]] = []
                 self.payload = payload
                 self.issue_page = issue_page
                 self.pull_request_page = pull_request_page
                 self.comment_page = comment_page
                 self.nested_pages = {} if nested_pages is None else nested_pages
+                self.check_suite_pages = {} if check_suite_pages is None else check_suite_pages
                 self.exit_code = exit_code
+
+            def _record(self, route: str, parent: str, incoming: str | None, page: object) -> None:
+                if type(page) is not dict or type(page.get("pageInfo")) is not dict:
+                    return
+                page_info = page["pageInfo"]
+                self.route_records.append((route, parent, incoming, page_info.get("endCursor"), page_info.get("hasNextPage")))
+
+            def _record_initial_inventory(self) -> None:
+                if not (
+                    type(self.payload) is dict
+                    and type(self.payload.get("data")) is dict
+                    and type(self.payload["data"].get("repository")) is dict
+                ):
+                    return
+                repository = self.payload["data"]["repository"]
+                for route, field in (("issues", "issues"), ("pull-requests", "pullRequests"), ("refs", "refs")):
+                    if type(repository.get(field)) is dict:
+                        self._record(route, f"repository:{owner}/{name}", None, repository[field])
+                issues = repository.get("issues")
+                if type(issues) is dict and type(issues.get("nodes")) is list:
+                    for issue in issues["nodes"]:
+                        if type(issue) is dict and type(issue.get("number")) is int:
+                            parent = f"issue:{issue['number']}"
+                            for route, field in (("labels", "labels"), ("subissues", "subIssues")):
+                                if type(issue.get(field)) is dict:
+                                    self._record(route, parent, None, issue[field])
+                pulls = repository.get("pullRequests")
+                if type(pulls) is dict and type(pulls.get("nodes")) is list:
+                    for pull in pulls["nodes"]:
+                        if type(pull) is not dict or type(pull.get("number")) is not int:
+                            continue
+                        parent = f"pull-request:{pull['number']}"
+                        if type(pull.get("closingIssuesReferences")) is dict:
+                            self._record("closing-references", parent, None, pull["closingIssuesReferences"])
+                        commits = pull.get("commits")
+                        if type(commits) is dict and type(commits.get("nodes")) is list:
+                            for commit_node in commits["nodes"]:
+                                if type(commit_node) is not dict or type(commit_node.get("commit")) is not dict:
+                                    continue
+                                commit = commit_node["commit"]
+                                if type(commit.get("oid")) is str and type(commit.get("checkSuites")) is dict:
+                                    self._record("check-suites", f"commit:{commit['oid']}", None, commit["checkSuites"])
+                                    self._record("workflow-runs", f"commit:{commit['oid']}", None, commit["checkSuites"])
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
                 self.commands.append(arguments)
                 if self.exit_code:
@@ -613,18 +658,26 @@ class ExternalValidationTests(unittest.TestCase):
                 if "pullRequests(first:100,states" in arguments[4] and type(self.payload) is dict and type(self.payload.get("data")) is dict and type(self.payload["data"].get("repository")) is dict and type(self.payload["data"]["repository"].get("pullRequests")) is dict:
                     initial = self.payload["data"]["repository"]["pullRequests"]
                     self.route_ledger.append(("pull-requests", None, None, initial["pageInfo"]["endCursor"], initial["pageInfo"]["hasNextPage"]))
+                    self._record_initial_inventory()
                 if "object(expression:$oid)" in arguments[4]:
                     oid = next(value.removeprefix("oid=") for value in arguments if value.startswith("oid="))
                     suffix = "1" if oid == "1" * 40 else "2" if oid == "2" * 40 else "unknown"
+                    incoming = next(value.removeprefix("cursor=") for value in arguments if value.startswith("cursor="))
+                    default_terminal_suites = {
+                        "totalCount": 12, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                            {"id": f"check-suite-{suffix}-continued-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued-1"}},
+                            {"id": f"check-suite-{suffix}-continued-2", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued-2"}},
+                        ],
+                    }
+                    terminal_suites = self.check_suite_pages.get(oid, default_terminal_suites)
+                    self._record("check-suites", f"commit:{oid}", incoming, terminal_suites)
+                    self._record("workflow-runs", f"commit:{oid}", incoming, terminal_suites)
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
-                        "name": name, "owner": {"login": owner}, "object": {"oid": oid, "checkSuites": {
-                            "totalCount": 12, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                                {"id": f"check-suite-{suffix}-continued-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued-1"}},
-                                {"id": f"check-suite-{suffix}-continued-2", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": f"workflow-run-{suffix}-continued-2"}},
-                            ],
-                        }},
+                        "name": name, "owner": {"login": owner}, "object": {"oid": oid, "checkSuites": terminal_suites},
                     }}}))
                 if "issues(first:100,after:$cursor" in arguments[4] and self.issue_page is not None:
+                    incoming = next((value.removeprefix("cursor=") for value in arguments if value.startswith("cursor=")), None)
+                    self._record("issues", f"repository:{owner}/{name}", incoming, self.issue_page)
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "issues": self.issue_page,
                     }}}))
@@ -632,6 +685,7 @@ class ExternalValidationTests(unittest.TestCase):
                     incoming = next((value.removeprefix("cursor=") for value in arguments if value.startswith("cursor=")), None)
                     page = self.pull_request_page
                     self.route_ledger.append(("pull-requests", None, incoming, page["pageInfo"]["endCursor"], page["pageInfo"]["hasNextPage"]))
+                    self._record("pull-requests", f"repository:{owner}/{name}", incoming, page)
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "pullRequests": page,
                     }}}))
@@ -653,6 +707,12 @@ class ExternalValidationTests(unittest.TestCase):
                         number = next((int(value.removeprefix("number=")) for value in arguments if value.startswith("number=")), None)
                         incoming = next((value.removeprefix("cursor=") for value in arguments if value.startswith("cursor=")), None)
                         self.route_ledger.append((field, number, incoming, page["pageInfo"]["endCursor"], page["pageInfo"]["hasNextPage"]))
+                        route = {
+                            "labels": "labels", "subIssues": "subissues",
+                            "closingIssuesReferences": "closing-references", "refs": "refs",
+                        }.get(field, field)
+                        parent = f"repository:{owner}/{name}" if target is None else f"{'issue' if target == 'issue' else 'pull-request'}:{number}"
+                        self._record(route, parent, incoming, page)
                         body: dict[str, object] = {"name": name, "owner": {"login": owner}}
                         if target is None:
                             body[field] = page
@@ -892,6 +952,84 @@ class ExternalValidationTests(unittest.TestCase):
                 "comments": dict(empty), "reviews": dict(empty), "reviewRequests": dict(empty),
                 "closingIssuesReferences": dict(empty), "commits": dict(empty),
             }
+        # The repository-inventory matrix deliberately uses the production
+        # continuation queries.  Each route has one nonterminal page followed
+        # by a distinct terminal identity; the typed host ledger prevents a
+        # fixture from accidentally proving a different parent or cursor path.
+        matrix_inventory = json.loads(json.dumps(raw_inventory))
+        matrix_repository = matrix_inventory["data"]["repository"]
+        matrix_issues = matrix_repository["issues"]["nodes"]
+        matrix_issues[2]["title"] = "ordinary fixture"
+        matrix_repository["issues"] = {
+            "totalCount": 3, "pageInfo": {"hasNextPage": True, "endCursor": "issues-page-1"},
+            "nodes": matrix_issues[:2],
+        }
+        matrix_pull = matrix_repository["pullRequests"]["nodes"][0]
+        matrix_repository["pullRequests"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "pull-requests-page-1"},
+            "nodes": [matrix_pull],
+        }
+        matrix_repository["refs"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "refs-page-1"},
+            "nodes": [{"name": "main", "target": {"oid": inputs.target_baseline_sha}}],
+        }
+        matrix_issues[0]["labels"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "labels-page-1"},
+            "nodes": [{"name": "first-label"}],
+        }
+        matrix_issues[0]["subIssues"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "subissues-page-1"},
+            "nodes": [{"number": 3}],
+        }
+        matrix_pull["closingIssuesReferences"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "closing-page-1"},
+            "nodes": [{"number": 1}],
+        }
+        matrix_host = OpaqueCredentialHost(
+            matrix_inventory,
+            issue_page={"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [matrix_issues[2]]},
+            pull_request_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [pull_request(82)]},
+            nested_pages={
+                "labels": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "z-label"}]},
+                "subIssues": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 2}]},
+                "closingIssuesReferences": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 2}]},
+                "refs": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "z-branch", "target": {"oid": inputs.target_baseline_sha}}]},
+            },
+        )
+        matrix_request = GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        )
+        matrix_result = create_credentialed_github_read_capability(
+            matrix_host, binding, dependency_control, health, clock=lambda: now,
+        ).read(matrix_request)
+        self.assertTrue(matrix_result.ok, matrix_result.failure)
+        assert matrix_result.snapshot is not None
+        for section, pages in (
+            (RepositoryInventorySection.ISSUES, 2), (RepositoryInventorySection.PULL_REQUESTS, 2),
+            (RepositoryInventorySection.ISSUE_LABELS, 4), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, 4),
+            (RepositoryInventorySection.CLOSING_REFERENCES, 3), (RepositoryInventorySection.CHECKS, 4),
+            (RepositoryInventorySection.WORKFLOW_RUNS, 4), (RepositoryInventorySection.REMOTE_HEADS, 2),
+        ):
+            evidence = matrix_result.snapshot.collection(section)
+            self.assertEqual(evidence.page_count, pages, section.value)
+            self.assertEqual(evidence.item_identities, tuple(sorted(set(evidence.item_identities))))
+        route_cases = {
+            "issues": ("repository:" + owner + "/" + name, "issues-page-1"),
+            "pull-requests": ("repository:" + owner + "/" + name, "pull-requests-page-1"),
+            "labels": ("issue:1", "labels-page-1"),
+            "subissues": ("issue:1", "subissues-page-1"),
+            "closing-references": ("pull-request:81", "closing-page-1"),
+            "check-suites": ("commit:" + "1" * 40, "suite-cursor-1"),
+            "workflow-runs": ("commit:" + "1" * 40, "suite-cursor-1"),
+            "refs": ("repository:" + owner + "/" + name, "refs-page-1"),
+        }
+        used_incoming_cursors: set[str] = set()
+        for route, (parent, cursor) in route_cases.items():
+            rows = [row for row in matrix_host.route_records if row[0] == route and row[1] == parent]
+            self.assertEqual(rows, [(route, parent, None, cursor, True), (route, parent, cursor, None, False)])
+            if route != "workflow-runs":
+                self.assertNotIn(cursor, used_incoming_cursors)
+                used_incoming_cursors.add(cursor)
         pull_request_inventory = json.loads(json.dumps(raw_inventory))
         pull_request_inventory["data"]["repository"]["pullRequests"] = {
             "totalCount": 101, "pageInfo": {"hasNextPage": True, "endCursor": "pull-request-page-1"},
@@ -964,6 +1102,201 @@ class ExternalValidationTests(unittest.TestCase):
             self.assertIsNotNone(code)
             assert code is not None
             return code
+        def duplicate_blocks_before_qualification(
+            route: str, inventory: object, **host_options: object,
+        ) -> None:
+            """A duplicate page is rejected before the harness can qualify it."""
+
+            with self.subTest(duplicate_route=route):
+                self.assertEqual(
+                    failure_code(OpaqueCredentialHost(inventory, **host_options)),
+                    external_validation.RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE,
+                )
+                proof_host = OpaqueCredentialHost(inventory, **host_options)
+                proof_capability = create_credentialed_github_read_capability(
+                    proof_host, binding, dependency_control, health, clock=lambda: now,
+                )
+                before = len(harness.run_calls)
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
+                        session.public_receipt(), root, digest("9"),
+                    )
+                    with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                        external_validation.execute_live_lifecycle_shadow_session(
+                            confirmed.public_receipt(), root, proof_capability,
+                        )
+                self.assertEqual([arguments[0] for arguments, _ in harness.run_calls[before:]], ["validate"])
+                self.assertTrue(any(row[0] == route for row in proof_host.route_records))
+
+        duplicate_issues = json.loads(json.dumps(raw_inventory))
+        duplicate_issue = duplicate_issues["data"]["repository"]["issues"]["nodes"][0]
+        duplicate_issues["data"]["repository"]["issues"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "duplicate-issues"},
+            "nodes": [duplicate_issue],
+        }
+        duplicate_blocks_before_qualification(
+            "issues", duplicate_issues,
+            issue_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [duplicate_issue]},
+        )
+        duplicate_pulls = json.loads(json.dumps(raw_inventory))
+        duplicate_pull = duplicate_pulls["data"]["repository"]["pullRequests"]["nodes"][0]
+        duplicate_pulls["data"]["repository"]["pullRequests"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "duplicate-pulls"},
+            "nodes": [duplicate_pull],
+        }
+        duplicate_blocks_before_qualification(
+            "pull-requests", duplicate_pulls,
+            pull_request_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [duplicate_pull]},
+        )
+        for route, field, node in (
+            ("labels", "labels", {"name": "duplicate-label"}),
+            ("subissues", "subIssues", {"number": 3}),
+        ):
+            duplicate_nested = json.loads(json.dumps(raw_inventory))
+            connection = duplicate_nested["data"]["repository"]["issues"]["nodes"][0][field]
+            connection.update({
+                "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "duplicate-" + route}, "nodes": [node],
+            })
+            duplicate_blocks_before_qualification(
+                route, duplicate_nested,
+                nested_pages={field: {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [node]}},
+            )
+        duplicate_closing = json.loads(json.dumps(raw_inventory))
+        closing = duplicate_closing["data"]["repository"]["pullRequests"]["nodes"][0]["closingIssuesReferences"]
+        closing.update({
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "duplicate-closing"}, "nodes": [{"number": 1}],
+        })
+        duplicate_blocks_before_qualification(
+            "closing-references", duplicate_closing,
+            nested_pages={"closingIssuesReferences": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 1}]}},
+        )
+        for route, terminal_suite in (
+            ("check-suites", {"id": "check-suite-1-1", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-1-continued"}}),
+            ("workflow-runs", {"id": "check-suite-workflow-distinct", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowRun": {"id": "workflow-run-1-1"}}),
+        ):
+            duplicate_checks = json.loads(json.dumps(raw_inventory))
+            suites = duplicate_checks["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"][0]["commit"]["checkSuites"]
+            suites.update({
+                "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "duplicate-" + route},
+                "nodes": [suites["nodes"][0]],
+            })
+            duplicate_blocks_before_qualification(
+                route, duplicate_checks,
+                check_suite_pages={"1" * 40: {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [terminal_suite]}},
+            )
+        duplicate_refs = json.loads(json.dumps(raw_inventory))
+        duplicate_refs["data"]["repository"]["refs"] = {
+            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "duplicate-refs"},
+            "nodes": [{"name": "main", "target": {"oid": inputs.target_baseline_sha}}],
+        }
+        duplicate_blocks_before_qualification(
+            "refs", duplicate_refs,
+            nested_pages={"refs": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "main", "target": {"oid": inputs.target_baseline_sha}}]}},
+        )
+        def accepted_optional_shape(
+            route: str, inventory: object, section: RepositoryInventorySection,
+            expected_identities: tuple[str, ...],
+        ) -> None:
+            with self.subTest(optional_route=route):
+                result = create_credentialed_github_read_capability(
+                    OpaqueCredentialHost(inventory), binding, dependency_control, health, clock=lambda: now,
+                ).read(request)
+                self.assertTrue(result.ok, result.failure)
+                assert result.snapshot is not None
+                self.assertEqual(result.snapshot.collection(section).item_identities, expected_identities)
+
+        # `nodes: null` is accepted only for an explicitly empty terminal
+        # connection.  `workflowRun` is the optional nested object: both null
+        # and absent mean no workflow identity and must not manufacture one.
+        for route, field, section in (
+            ("issues", "issues", RepositoryInventorySection.ISSUES),
+            ("pull-requests", "pullRequests", RepositoryInventorySection.PULL_REQUESTS),
+            ("refs", "refs", RepositoryInventorySection.REMOTE_HEADS),
+        ):
+            empty_root = json.loads(json.dumps(raw_inventory))
+            empty_root["data"]["repository"][field] = {
+                "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None,
+            }
+            accepted_optional_shape(route, empty_root, section, ())
+        empty_labels = json.loads(json.dumps(raw_inventory))
+        empty_labels["data"]["repository"]["issues"]["nodes"][1]["labels"] = {
+            "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None,
+        }
+        accepted_optional_shape(
+            "labels", empty_labels, RepositoryInventorySection.ISSUE_LABELS,
+            inventory_evidence.collection(RepositoryInventorySection.ISSUE_LABELS).item_identities,
+        )
+        empty_subissues = json.loads(json.dumps(raw_inventory))
+        empty_subissues["data"]["repository"]["issues"]["nodes"][2]["subIssues"] = {
+            "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None,
+        }
+        accepted_optional_shape("subissues", empty_subissues, RepositoryInventorySection.ISSUE_RELATIONSHIPS, ("3",))
+        empty_closing = json.loads(json.dumps(raw_inventory))
+        empty_closing["data"]["repository"]["pullRequests"]["nodes"][0]["closingIssuesReferences"] = {
+            "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None,
+        }
+        accepted_optional_shape("closing-references", empty_closing, RepositoryInventorySection.CLOSING_REFERENCES, ())
+        empty_checks = json.loads(json.dumps(raw_inventory))
+        empty_checks["data"]["repository"]["pullRequests"]["nodes"][0]["commits"] = {
+            "totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"commit": {"oid": "a" * 40, "checkSuites": {
+                "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None,
+            }}}],
+        }
+        accepted_optional_shape("check-suites", empty_checks, RepositoryInventorySection.CHECKS, ())
+        absent_workflow = json.loads(json.dumps(empty_checks))
+        absent_workflow["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"][0]["commit"]["checkSuites"] = {
+            "totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"id": "suite-without-workflow", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        }
+        accepted_optional_shape("workflow-runs", absent_workflow, RepositoryInventorySection.WORKFLOW_RUNS, ())
+        null_workflow = json.loads(json.dumps(absent_workflow))
+        null_workflow["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"][0]["workflowRun"] = None
+        accepted_optional_shape("workflow-runs-null", null_workflow, RepositoryInventorySection.WORKFLOW_RUNS, ())
+
+        def malformed_shape_blocks_before_qualification(route: str, inventory: object) -> None:
+            with self.subTest(malformed_optional_route=route):
+                self.assertEqual(
+                    failure_code(OpaqueCredentialHost(inventory)),
+                    external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                )
+                proof_capability = create_credentialed_github_read_capability(
+                    OpaqueCredentialHost(inventory), binding, dependency_control, health, clock=lambda: now,
+                )
+                before = len(harness.run_calls)
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+                    confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
+                        session.public_receipt(), root, digest("a"),
+                    )
+                    with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                        external_validation.execute_live_lifecycle_shadow_session(
+                            confirmed.public_receipt(), root, proof_capability,
+                        )
+                self.assertEqual([arguments[0] for arguments, _ in harness.run_calls[before:]], ["validate"])
+
+        malformed_shapes: list[tuple[str, object]] = []
+        for route, field in (("issues", "issues"), ("pull-requests", "pullRequests"), ("refs", "refs")):
+            malformed = json.loads(json.dumps(raw_inventory))
+            malformed["data"]["repository"][field].pop("nodes")
+            malformed_shapes.append((route, malformed))
+        for route, node_index, field in (
+            ("labels", 0, "labels"), ("subissues", 0, "subIssues"),
+            ("closing-references", 0, "closingIssuesReferences"),
+        ):
+            malformed = json.loads(json.dumps(raw_inventory))
+            parent = malformed["data"]["repository"]["issues"]["nodes"][node_index] if route in {"labels", "subissues"} else malformed["data"]["repository"]["pullRequests"]["nodes"][node_index]
+            parent[field].pop("nodes")
+            malformed_shapes.append((route, malformed))
+        for route in ("check-suites", "workflow-runs"):
+            malformed = json.loads(json.dumps(raw_inventory))
+            malformed["data"]["repository"]["pullRequests"]["nodes"][0]["commits"]["nodes"][0]["commit"]["checkSuites"].pop("nodes")
+            malformed_shapes.append((route, malformed))
+        for route, malformed in malformed_shapes:
+            malformed_shape_blocks_before_qualification(route, malformed)
         diagnostic_inventory = json.loads(json.dumps(raw_inventory))
         diagnostic_connection = diagnostic_inventory["data"]["repository"]["issues"]["nodes"][1]["labels"]
         diagnostic_connection["totalCount"] = 1
@@ -1221,7 +1554,7 @@ class ExternalValidationTests(unittest.TestCase):
                 self.assertEqual(failure_code(OpaqueCredentialHost(malformed_inventory)), expected)
         self.assertEqual(
             [arguments[0] for arguments, _ in harness.run_calls],
-            ["validate", "execute", "validate", "execute"] + ["validate"] * 7,
+            ["validate", "execute", "validate", "execute"] + ["validate"] * 23,
         )
         self.assertEqual(
             failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),

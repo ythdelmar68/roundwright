@@ -1505,6 +1505,7 @@ class _RoundletLifecycleProjection:
 
     candidate_sha: str
     formal_round: str
+    ready_at: int
     supervisor_attempts: tuple[tuple[str, str], ...]
 
 
@@ -1514,6 +1515,7 @@ class _RoundwrightLifecycleProjection:
 
     candidate_sha: str
     formal_round: str
+    ready_at: int
     supervisor_attempts: tuple[tuple[str, str], ...]
 
 
@@ -1524,35 +1526,30 @@ _SUPERVISOR_FAILOVER_ATTEMPTS = (
 )
 
 
-def _roundlet_lifecycle_projection(candidate_sha: str) -> _RoundletLifecycleProjection:
+def _roundlet_lifecycle_projection(candidate_sha: str, ready_at: int) -> _RoundletLifecycleProjection:
     """Return the reviewed Roundlet fixture independently of provider facts."""
 
-    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", _SUPERVISOR_FAILOVER_ATTEMPTS)
+    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", ready_at, _SUPERVISOR_FAILOVER_ATTEMPTS)
 
 
 def _roundwright_lifecycle_projection(
-    inventory: RepositoryInventorySnapshot, candidate_sha: str,
+    inventory: RepositoryInventorySnapshot, candidate_sha: str, ready_at: int,
 ) -> _RoundwrightLifecycleProjection:
     """Normalize only typed public facts emitted by the generic inventory."""
 
     facts = {(item.subject, item.predicate, item.object) for item in inventory.facts}
-    expected = {
-        ("lifecycle-supervisor-1", "profile", "sol"),
-        ("lifecycle-supervisor-1", "disposition", "cancelled"),
-        ("lifecycle-supervisor-2", "profile", "terra"),
-        ("lifecycle-supervisor-2", "disposition", "invalid-context"),
-        ("lifecycle-supervisor-3", "profile", "terra"),
-        ("lifecycle-supervisor-3", "disposition", "pass"),
-        ("lifecycle-formal-round-1", "candidate", candidate_sha),
-    }
-    if not expected.issubset(facts):
-        raise ExternalValidationAdapterError("repository inventory supervisor failover fixture is incomplete")
+    def fact(subject: str, predicate: str) -> str:
+        values = sorted(value for item_subject, item_predicate, value in facts if (item_subject, item_predicate) == (subject, predicate))
+        return values[0] if len(values) == 1 else "missing"
     attempts = tuple(
-        (next(value for subject, predicate, value in facts if subject == f"lifecycle-supervisor-{ordinal}" and predicate == "profile"),
-         next(value for subject, predicate, value in facts if subject == f"lifecycle-supervisor-{ordinal}" and predicate == "disposition"))
+        (fact(f"lifecycle-supervisor-{ordinal}", "profile"), fact(f"lifecycle-supervisor-{ordinal}", "disposition"))
         for ordinal in range(1, 4)
     )
-    return _RoundwrightLifecycleProjection(candidate_sha, "formal-round-1", attempts)
+    round_subjects = sorted(subject for subject, predicate, _value in facts if predicate == "candidate" and subject.startswith("lifecycle-formal-round-"))
+    formal_round = round_subjects[0].removeprefix("lifecycle-") if len(round_subjects) == 1 else "missing"
+    observed_candidate = fact(round_subjects[0], "candidate") if len(round_subjects) == 1 else "missing"
+    observed_ready_at = fact(round_subjects[0], "ready-at") if len(round_subjects) == 1 else "missing"
+    return _RoundwrightLifecycleProjection(observed_candidate, formal_round, int(observed_ready_at) if observed_ready_at.isdecimal() else -1, attempts)
 
 
 def _classified_lifecycle_differences(
@@ -1565,6 +1562,8 @@ def _classified_lifecycle_differences(
         differences.append("candidate-drift")
     if roundlet.formal_round != roundwright.formal_round:
         differences.append("formal-round-drift")
+    if roundlet.ready_at != roundwright.ready_at:
+        differences.append("ready-at-drift")
     for ordinal, (expected, observed) in enumerate(
         zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts, strict=True), start=1,
     ):
@@ -1596,6 +1595,7 @@ class _RoundwrightLiveLifecycleProvider:
         self._repository = RepositoryRef(owner, name)
         self._baseline_sha = inputs.target_baseline_sha
         self._candidate_sha = inputs.candidate_sha
+        self._ready_at = inputs.ready_at
         self._armed = False
 
     def _read(self, request: GitHubReadRequest, expected: type[object]) -> object:
@@ -1640,7 +1640,7 @@ class _RoundwrightLiveLifecycleProvider:
 
     @staticmethod
     def _fixture_classes(
-        inventory: RepositoryInventorySnapshot, candidate_sha: str,
+        inventory: RepositoryInventorySnapshot, candidate_sha: str, ready_at: int,
     ) -> tuple[str, ...]:
         facts = set(inventory.facts)
         predicates = {(item.subject, item.predicate, item.object) for item in facts}
@@ -1652,8 +1652,8 @@ class _RoundwrightLiveLifecycleProvider:
             "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
             "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
             "supervisor-failover": not _classified_lifecycle_differences(
-                _roundlet_lifecycle_projection(candidate_sha),
-                _roundwright_lifecycle_projection(inventory, candidate_sha),
+                _roundlet_lifecycle_projection(candidate_sha, ready_at),
+                _roundwright_lifecycle_projection(inventory, candidate_sha, ready_at),
             ),
         }
         if not all(required.values()):
@@ -1662,14 +1662,14 @@ class _RoundwrightLiveLifecycleProvider:
 
     @staticmethod
     def _observation(
-        inventory: RepositoryInventorySnapshot, candidate_sha: str,
+        inventory: RepositoryInventorySnapshot, candidate_sha: str, ready_at: int,
     ) -> _LiveLifecycleProviderObservation:
-        roundlet = _roundlet_lifecycle_projection(candidate_sha)
-        roundwright = _roundwright_lifecycle_projection(inventory, candidate_sha)
+        roundlet = _roundlet_lifecycle_projection(candidate_sha, ready_at)
+        roundwright = _roundwright_lifecycle_projection(inventory, candidate_sha, ready_at)
         differences = _classified_lifecycle_differences(roundlet, roundwright)
         if differences:
             raise ExternalValidationAdapterError("live lifecycle projection comparison has differences")
-        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, candidate_sha)
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, candidate_sha, ready_at)
         snapshot_digests = {
             category: _digest({
                 "category": category,
@@ -1719,7 +1719,7 @@ class _RoundwrightLiveLifecycleProvider:
 
     def read_lifecycle(self) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory(), self._candidate_sha)
+        return self._observation(self._inventory(), self._candidate_sha, self._ready_at)
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:

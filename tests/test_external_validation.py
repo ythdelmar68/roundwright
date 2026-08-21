@@ -399,6 +399,7 @@ class ExternalValidationTests(unittest.TestCase):
                     RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
                     RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
                     RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
+                    RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
                 ), key=lambda item: (item.subject, item.predicate, item.object)))
                 return GitHubReadResult(request, RepositoryInventorySnapshot(
                     request.repository, "forward-target", "main", "d" * 40,
@@ -474,6 +475,7 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
                 RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
                 RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
+                RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
                 RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
                 RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("pull-request-81", "state", "merged"),
@@ -536,7 +538,7 @@ class ExternalValidationTests(unittest.TestCase):
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=invalid-context round=formal-round-1 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=pass round=formal-round-1 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
+                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=invalid-context round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
                     {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                     {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},

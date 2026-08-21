@@ -4697,7 +4697,7 @@ def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
         "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
         "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state title body comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
-        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid checkSuites(first:10){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
+        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid checkSuites(first:10){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
         "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
     )
     return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
@@ -4751,7 +4751,7 @@ def _repository_inventory_connection_command(
     )
     pull_request_node = (
         "id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} "
-        "comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
+        "comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} "
         "reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
         "reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
         "closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} "
@@ -4765,7 +4765,7 @@ def _repository_inventory_connection_command(
         "issue-labels": "labels(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{name}}",
         "issue-sub-issues": "subIssues(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
         "issue-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id body}}",
-        "pull-request-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
+        "pull-request-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id body}}",
         "pull-request-reviews": "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
         "pull-request-review-requests": "reviewRequests(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
         "pull-request-closing-references": "closingIssuesReferences(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
@@ -5110,7 +5110,7 @@ def _inventory_label_fact_value(value: object) -> str:
 
 
 _ROUNDLET_FAILOVER_TRACE = re.compile(
-    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+candidate=([0-9a-f]{40})\Z"
+    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+ready_at=([0-9]+)\s+candidate=([0-9a-f]{40})\Z"
 )
 
 
@@ -5137,7 +5137,7 @@ def _inventory_section_identity(section: RepositoryInventorySection, node: objec
 def _inventory_roundlet_trace_facts(nodes: list[object]) -> tuple[RepositoryInventoryFact, ...]:
     """Project bounded marker fields only; never retain comment bodies."""
 
-    records: list[tuple[str, str, str]] = []
+    records: list[tuple[str, str, str, str, str]] = []
     for node in nodes:
         value = _raw_mapping(node)
         body = _raw_optional_text(value, "body")
@@ -5148,21 +5148,23 @@ def _inventory_roundlet_trace_facts(nodes: list[object]) -> tuple[RepositoryInve
             records.append(match.groups())
     if not records:
         return ()
-    if len(records) != 3 or tuple((profile, disposition) for profile, disposition, _round, _candidate in records) != (
+    if len(records) != 3 or tuple((profile, disposition) for profile, disposition, _round, _ready_at, _candidate in records) != (
         ("sol", "cancelled"), ("terra", "invalid-context"), ("terra", "pass"),
     ):
         raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
-    rounds = {round_id for _profile, _disposition, round_id, _candidate in records}
-    candidates = {candidate for _profile, _disposition, _round_id, candidate in records}
-    if rounds != {"formal-round-1"} or len(candidates) != 1:
+    rounds = {round_id for _profile, _disposition, round_id, _ready_at, _candidate in records}
+    ready_values = {ready_at for _profile, _disposition, _round_id, ready_at, _candidate in records}
+    candidates = {candidate for _profile, _disposition, _round_id, _ready_at, candidate in records}
+    if rounds != {"formal-round-1"} or len(ready_values) != 1 or len(candidates) != 1:
         raise GitHubRuntimeError("inventory Roundlet failover trace is inconsistent")
     facts: list[RepositoryInventoryFact] = []
-    for ordinal, (profile, disposition, _round_id, _candidate) in enumerate(records, start=1):
+    for ordinal, (profile, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
         facts.extend((
             RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "profile", profile),
             RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "disposition", disposition),
         ))
     facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", next(iter(candidates))))
+    facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", next(iter(ready_values))))
     return tuple(facts)
 
 
@@ -5215,6 +5217,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         RepositoryInventorySection.CLOSING_REFERENCES: [],
     }
     facts: list[RepositoryInventoryFact] = []
+    trace_nodes: list[object] = []
     for issue in root_nodes[RepositoryInventorySection.ISSUES]:
         value = _raw_mapping(issue)
         subject = f"issue-{_raw_integer(value, 'number')}"
@@ -5227,12 +5230,14 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         if _raw_bool(comment_page, "hasNextPage") or _raw_integer(comment_connection, "totalCount") != len(comment_nodes):
             raise GitHubRuntimeError("inventory nested pagination is incomplete")
         nested[RepositoryInventorySection.COMMENTS].append(comment_connection)
-        facts.extend(_inventory_roundlet_trace_facts(comment_nodes))
+        trace_nodes.extend(comment_nodes)
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
             if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
+            if section is RepositoryInventorySection.COMMENTS:
+                trace_nodes.extend(nodes)
             for node in nodes:
                 child = _raw_mapping(node)
                 fact_value = (
@@ -5296,6 +5301,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
                 workflow = suite_value.get("workflowRun")
                 if workflow is not None:
                     nested[RepositoryInventorySection.WORKFLOW_RUNS].append(_raw_mapping(workflow))
+    facts.extend(_inventory_roundlet_trace_facts(trace_nodes))
     collections: list[RepositoryInventoryEvidence] = []
     for section in RepositoryInventorySection:
         if section is RepositoryInventorySection.REPOSITORY:

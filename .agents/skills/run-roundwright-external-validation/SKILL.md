@@ -28,15 +28,16 @@ Before provisioning, invocation, replay, or mutation:
    class, mutation mode, case/contract/configuration identity, this skill's Git
    blob, qualification-contract blob, and public-safe evidence projection.
 5. Bind reviewed generic Roundlet orchestration merge
-   `1004cf0143aef9a777a64a3a0703b10a5680e959`, tree
-   `985b49fade4be8dec1355d183ad824cf9d67a354`, and installed skill content
-   `8df4fd5e58dd41de54aeae53ce66a5c49ab0f040` from Roundlet PR #82. It
+   `5169a4630de9c1a888e6f46254a5ef21e40c2b8b`, tree
+   `e84ad8c582f2a5583af99b7a80cdc03249e2d5fa`, and installed skill content
+   `3308a9a74e33f276bab6a5221e974f74a5cd0dc0` from Roundlet PR #88. It
    consumes the repository-owned executor as an opaque exact contract; it does
-   not construct a Roundwright runner or profile adapter. Roundlet PR #80 and
-   merge `96772438b251e56d483733179939245565b1374a` are the historical
-   predecessor only. Selecting that old binding for a new gate is an identity
-   conflict that blocks before `ARMED` with zero external action; it never
-   silently substitutes for PR #82.
+   not construct a Roundwright runner, profile adapter, or product-specific
+   lifecycle event. Roundlet PR #82 merge
+   `1004cf0143aef9a777a64a3a0703b10a5680e959` is the historical predecessor
+   only. Selecting that old binding for a new gate is an identity conflict that
+   blocks before `ARMED` with zero external action; it never silently
+   substitutes for PR #88.
 6. For an external route, bind the reviewed public toolbox repository
    `ythdelmar68/roundwright-harness` at commit
    `0154817a6fba345b78af25017eb312a1b2349cd6`. That canonical merge binds
@@ -50,7 +51,18 @@ Before provisioning, invocation, replay, or mutation:
    Recorder merge `10265c35c9d01d1fd26bd767ca3c1b245e4e9c52` and toolbox
    merge `42830db90acbba499989cd434cdc46b4627042e2` are historical and
    cannot substitute for an executor-selected gate.
-7. When the route names a disposable target, bind
+7. When the leaf selects ephemeral lifecycle observation, read the exact
+   root-referenced
+   `docs/operations/lifecycle-observation-contract.json`. Require Harness #11
+   merge `f13065e7fae7e48c21398c551cf1b724a4b26070`, tree
+   `ac6e3e21e7b2b559915b3cef0ce15648c5b22b1a`, lifecycle content
+   `e61c8157973e315f3308b674ed55ef2f4e15fb43`, and package tree
+   `2325174685e16b579e84e8771d96e85e6c7a253d`. Require the Roundlet identities
+   in step 5 plus skill tree `63117b2418ce17d45d099ae6009522a6a83df8ce`.
+   Recompute the tracked contract through
+   `roundwright.lifecycle_observation:lifecycle_observation_contract`; any
+   floating, stale, or candidate-authored replacement blocks before arming.
+8. When the route names a disposable target, bind
    `ythdelmar68/roundlet-forward-test` at baseline
    `4f39ef0e4e616eb896950d3756c433b624771a97`, its exact root instructions, the
    selected observation window or action, and the required semantic read-back.
@@ -115,6 +127,42 @@ is `synthetic-one-shot`. Use public factory
 `roundwright.external_validation:roundwright_profile_adapter_factory`. It is a
 deterministic provider-free, zero-mutation contract check and never substitutes
 for a later leaf's live profile evidence.
+
+## Execute the optional lifecycle observation sink
+
+Select this path only when both authoritative root instructions and the live
+leaf name the exact tracked lifecycle observation contract. Every other leaf
+binds `NOT_SELECTED`, creates no lifecycle store, and makes no sink call.
+
+Before the leaf's declared first ephemeral transition, verify the exact external
+pins and contract identity, then construct one closed
+`roundwright-harness-lifecycle-plan/v1`. Bind its window, repository, producer,
+store, candidate, capture plan, immutable `ready_at`, and the independent formal
+review epoch/round/mode. Invoke the tracked prepare entrypoint and read back its
+armed receipt before event one.
+
+Only the Orchestrator appends. For every selected transition it supplies one
+closed `roundwright-harness-lifecycle-event/v1`, receives an append receipt, and
+semantically reads back the new sequence, predecessor, event digest, and entry
+digest before advancing Roundlet state. Worker and Supervisor tasks never call
+the sink. Sink sequence numbers never consume or alter a formal review round.
+
+At the leaf-declared boundary, seal and independently verify the content-addressed
+ledger. Pass only that verified ledger to
+`roundwright.lifecycle_observation:project_verified_lifecycle`, then compare it
+with `compare_lifecycle_projections`. Any missing event or receipt, wrong
+predecessor/candidate/review tuple, changed `ready_at`, post-arm drift, or
+non-empty classified difference blocks the selected evidence path. Preserve a
+partial or stale window for diagnosis and open a genuinely fresh window; never
+backfill missed history.
+
+For correction #82, execute
+`roundwright.lifecycle_observation:run_synthetic_lifecycle_gate` with the exact
+candidate and Harness #11 source. Its provider-free sequence is cancelled,
+invalid-context, PASS, accepted-result, and formal-round-advanced within one
+formal round. The public receipt must report zero provider calls, zero GitHub
+mutations, and zero target mutations. This requalifies the adapter and does not
+satisfy #49's later live profile evidence.
 
 ## Route the selected gate
 

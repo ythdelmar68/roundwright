@@ -52,6 +52,10 @@ Planning transaction state: `BLOCKED_SCHEDULING`
 - Arm-before boundary: <the exact export or observation boundary>
 - Retention/read-back contract: <append-only content-addressed identity and receipt>
 - Missing-history/recapture behavior: <candidate movement or missing history rule>
+- Lifecycle observation sink: <NOT_SELECTED or exact authoritative contract path/identity>
+- Lifecycle event source: <generic Orchestrator transitions or N/A>
+- Lifecycle arm-before transition: <exact first ephemeral transition or N/A>
+- Lifecycle seal boundary: <exact terminal evidence boundary or N/A>
 
 ## Acceptance criteria
 

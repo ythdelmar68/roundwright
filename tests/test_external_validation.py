@@ -610,6 +610,9 @@ class ExternalValidationTests(unittest.TestCase):
                 self.commands.append(arguments)
                 if self.exit_code:
                     return OpaqueResult(self.exit_code, "")
+                if "pullRequests(first:100,states" in arguments[4]:
+                    initial = self.payload["data"]["repository"]["pullRequests"]
+                    self.route_ledger.append(("pull-requests", None, None, initial["pageInfo"]["endCursor"], initial["pageInfo"]["hasNextPage"]))
                 if "object(expression:$oid)" in arguments[4]:
                     oid = next(value.removeprefix("oid=") for value in arguments if value.startswith("oid="))
                     suffix = "1" if oid == "1" * 40 else "2" if oid == "2" * 40 else "unknown"
@@ -626,8 +629,11 @@ class ExternalValidationTests(unittest.TestCase):
                         "name": name, "owner": {"login": owner}, "issues": self.issue_page,
                     }}}))
                 if "pullRequests(first:100,after:$cursor" in arguments[4] and self.pull_request_page is not None:
+                    incoming = next((value.removeprefix("cursor=") for value in arguments if value.startswith("cursor=")), None)
+                    page = self.pull_request_page
+                    self.route_ledger.append(("pull-requests", None, incoming, page["pageInfo"]["endCursor"], page["pageInfo"]["hasNextPage"]))
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
-                        "name": name, "owner": {"login": owner}, "pullRequests": self.pull_request_page,
+                        "name": name, "owner": {"login": owner}, "pullRequests": page,
                     }}}))
                 if "comments(first:100,after:$cursor" in arguments[4] and self.comment_page is not None:
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
@@ -898,9 +904,15 @@ class ExternalValidationTests(unittest.TestCase):
         pull_request_capability = create_credentialed_github_read_capability(
             pull_request_host, binding, dependency_control, health, clock=lambda: now,
         )
-        self.assertTrue(pull_request_capability.read(GitHubReadRequest(
+        pull_request_result = pull_request_capability.read(GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
-        )).ok)
+        ))
+        self.assertTrue(pull_request_result.ok)
+        assert pull_request_result.snapshot is not None
+        self.assertEqual(pull_request_result.snapshot.collection(RepositoryInventorySection.PULL_REQUESTS).page_count, 2)
+        self.assertEqual(len(pull_request_result.snapshot.collection(RepositoryInventorySection.PULL_REQUESTS).item_identities), 101)
+        self.assertTrue(all(fact.object == "merged" for fact in pull_request_result.snapshot.facts if fact.predicate == "state" and fact.subject.startswith("pull-request-")))
+        self.assertEqual(pull_request_host.route_ledger, [("pull-requests", None, None, "pull-request-page-1", True), ("pull-requests", None, "pull-request-page-1", None, False)])
         initial_query = next(command[4] for command in pull_request_host.commands if "pullRequests(first:100,states" in command[4])
         pull_request_query = next(command[4] for command in pull_request_host.commands if "pullRequests(first:100,after:$cursor" in command[4])
         def page_size(query: str, connection: str) -> int:

@@ -82,6 +82,7 @@ from .repository_policy import (
 # GraphQL cursors are opaque provider values (typically base64 and therefore
 # allowed to contain ``=``).  They are never interpolated into a shell.
 _CURSOR = re.compile(r"[^\x00-\x1f\x7f]{1,1024}\Z")
+_INVENTORY_FACT_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,255}\Z")
 _STANDALONE_FIXTURE = re.compile(r"\bstandalone[ -]fixture\b", re.IGNORECASE)
 _MALFORMED_PARENT_CHILD_FIXTURE = re.compile(r"\bmalformed[ -]parent child fixture\b", re.IGNORECASE)
 _OWNER_INPUT_FIXTURE = re.compile(r"\bowner[ -]input fixture\b", re.IGNORECASE)
@@ -4751,6 +4752,24 @@ def _inventory_scheduling_facts(
     return tuple(facts)
 
 
+def _inventory_label_fact_value(value: object) -> str:
+    """Project a label without treating provider display prose as a fact token.
+
+    ``RepositoryInventoryFact`` intentionally accepts only a small token
+    alphabet.  GitHub label names, however, are public display strings and can
+    legitimately contain spaces or punctuation.  Preserve labels that already
+    carry product semantics (such as ``roundlet:ignore``), while committing
+    every other valid label to a deterministic public-safe identity.  The
+    complete raw label collection remains bound by its evidence digest.
+    """
+
+    if type(value) is not str or not value or len(value) > 512 or "\x00" in value or "\x7f" in value:
+        raise GitHubRuntimeError("inventory label is malformed")
+    if _INVENTORY_FACT_TOKEN.fullmatch(value):
+        return value
+    return "label-" + _sha256(("repository-inventory-label", value)).removeprefix("sha256:")
+
+
 def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> RepositoryInventorySnapshot:
     """Normalize terminal GraphQL inventory data into the core-only snapshot.
 
@@ -4813,7 +4832,11 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             nested[section].append(connection)
             for node in nodes:
                 child = _raw_mapping(node)
-                fact_value = _raw_text(child, "name") if predicate == "label" else f"issue-{_raw_integer(child, 'number')}"
+                fact_value = (
+                    _inventory_label_fact_value(child.get("name"))
+                    if predicate == "label"
+                    else f"issue-{_raw_integer(child, 'number')}"
+                )
                 facts.append(RepositoryInventoryFact(subject, predicate, fact_value))
     issue_subjects = {item.subject for item in facts if item.predicate == "state" and item.subject.startswith("issue-")}
     child_edges = [(item.subject, item.object) for item in facts if item.predicate == "child"]

@@ -1473,9 +1473,11 @@ class _CredentialedGhRunnerAdapter:
     """Normalize an opaque owner-process result before it reaches the adapter.
 
     The public factory intentionally does not expose the private command-result
-    type.  A conventional credential host may return a process-shaped
-    ``returncode`` result; normalize that internal shape once while retaining
-    stdout only long enough for the reviewed projection to parse it.
+    type.  The reviewed builders supply fixed ``gh`` subcommands, while the
+    credential host is a process launcher and therefore receives the executable
+    as the first argv item.  Normalize its process-shaped ``returncode`` result
+    once while retaining stdout only long enough for the reviewed projection to
+    parse it.
     """
 
     __slots__ = ("__host",)
@@ -1487,7 +1489,7 @@ class _CredentialedGhRunnerAdapter:
 
     def run(self, arguments: tuple[str, ...]) -> _GhCommandResult:
         try:
-            result = self.__host.run(arguments)  # type: ignore[attr-defined]
+            result = self.__host.run(("gh", *arguments))  # type: ignore[attr-defined]
         except Exception as error:
             raise _RepositoryInventoryDiagnosticError(
                 RepositoryInventoryFailureStage.TRANSPORT,

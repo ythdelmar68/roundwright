@@ -565,7 +565,7 @@ class ExternalValidationTests(unittest.TestCase):
                 self.commands.append(arguments)
                 if self.exit_code:
                     return OpaqueResult(self.exit_code, "")
-                if "object(expression:$oid)" in arguments[3]:
+                if "object(expression:$oid)" in arguments[4]:
                     oid = next(value.removeprefix("oid=") for value in arguments if value.startswith("oid="))
                     suffix = "1" if oid == "1" * 40 else "2" if oid == "2" * 40 else "unknown"
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
@@ -576,15 +576,15 @@ class ExternalValidationTests(unittest.TestCase):
                             ],
                         }},
                     }}}))
-                if "issues(first:100,after:$cursor" in arguments[3] and self.issue_page is not None:
+                if "issues(first:100,after:$cursor" in arguments[4] and self.issue_page is not None:
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "issues": self.issue_page,
                     }}}))
-                if "pullRequests(first:100,after:$cursor" in arguments[3] and self.pull_request_page is not None:
+                if "pullRequests(first:100,after:$cursor" in arguments[4] and self.pull_request_page is not None:
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "pullRequests": self.pull_request_page,
                     }}}))
-                if "comments(first:100,after:$cursor" in arguments[3] and self.comment_page is not None:
+                if "comments(first:100,after:$cursor" in arguments[4] and self.comment_page is not None:
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "pullRequest": {"number": 81, "comments": self.comment_page},
                     }}}))
@@ -625,18 +625,18 @@ class ExternalValidationTests(unittest.TestCase):
             result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
-        inventory_commands = [command for command in host.commands if "object(expression:$oid)" not in command[3]]
-        continuation_commands = [command for command in host.commands if "object(expression:$oid)" in command[3]]
+        inventory_commands = [command for command in host.commands if "object(expression:$oid)" not in command[4]]
+        continuation_commands = [command for command in host.commands if "object(expression:$oid)" in command[4]]
         self.assertEqual(len(inventory_commands), 3)
         self.assertEqual(inventory_commands, [inventory_commands[0]] * 3)
         self.assertEqual(len(continuation_commands), 6)
-        self.assertEqual(inventory_commands[0][0:3], ("api", "graphql", "-f"))
-        self.assertIn("repository(owner:$owner,name:$name)", inventory_commands[0][3])
-        self.assertIn("nodes{id number state title body", inventory_commands[0][3])
-        self.assertIn("commits(first:100)", inventory_commands[0][3])
-        self.assertIn("checkSuites(first:10)", inventory_commands[0][3])
+        self.assertEqual(inventory_commands[0][0:4], ("gh", "api", "graphql", "-f"))
+        self.assertIn("repository(owner:$owner,name:$name)", inventory_commands[0][4])
+        self.assertIn("nodes{id number state title body", inventory_commands[0][4])
+        self.assertIn("commits(first:100)", inventory_commands[0][4])
+        self.assertIn("checkSuites(first:10)", inventory_commands[0][4])
         self.assertEqual(inventory_commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
-        self.assertTrue(all("checkSuites(first:100,after:$cursor)" in command[3] for command in continuation_commands))
+        self.assertTrue(all("checkSuites(first:100,after:$cursor)" in command[4] for command in continuation_commands))
 
         class ReturnCodeResultWithGuardedLegacyAlias:
             def __init__(self, result: OpaqueResult) -> None:
@@ -664,7 +664,33 @@ class ExternalValidationTests(unittest.TestCase):
             guarded_alias_host.commands[0][-4:],
             ("-F", f"owner={owner}", "-F", f"name={name}"),
         )
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
+
+        class SubprocessLaunchHost(OpaqueCredentialHost):
+            """Hermetic process launcher: its argv must include the executable."""
+
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                if arguments[0:4] != ("gh", "api", "graphql", "-f"):
+                    raise FileNotFoundError("private executable launch marker")
+                return super().run(arguments)
+
+        process_host = SubprocessLaunchHost(raw_inventory)
+        process_capability = create_credentialed_github_read_capability(
+            process_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("8"))
+            process_result = external_validation.execute_live_lifecycle_shadow_session(
+                confirmed.public_receipt(), root, process_capability,
+            )
+        self.assertEqual(process_result, {"status": "fake"})
+        self.assertTrue(process_host.commands)
+        self.assertTrue(all(command[0:4] == ("gh", "api", "graphql", "-f") for command in process_host.commands))
+        self.assertEqual(
+            [arguments[0] for arguments, _ in harness.run_calls],
+            ["validate", "execute", "validate", "execute"],
+        )
         self.assertTrue(harness.run_calls[1][0][2].snapshot.zero_mutation_readback_digest.startswith("sha256:"))
         self.assertFalse(hasattr(capability, "query"))
         self.assertFalse(hasattr(capability, "snapshot"))
@@ -679,7 +705,7 @@ class ExternalValidationTests(unittest.TestCase):
                 confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("e"))
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
                     external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, fixture_capability)
-            inventory_commands = [command for command in fixture_host.commands if "object(expression:$oid)" not in command[3]]
+            inventory_commands = [command for command in fixture_host.commands if "object(expression:$oid)" not in command[4]]
             self.assertEqual(len(inventory_commands), expected_reads)
 
         missing_membership = json.loads(json.dumps(raw_inventory))
@@ -708,7 +734,10 @@ class ExternalValidationTests(unittest.TestCase):
         ):
             with self.subTest(missing_fixture=fixture_name):
                 fixture_blocks_before_harness(inventory, expected_reads)
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"] + ["validate"] * 7)
+        self.assertEqual(
+            [arguments[0] for arguments, _ in harness.run_calls],
+            ["validate", "execute", "validate", "execute"] + ["validate"] * 7,
+        )
         def issue(number: int) -> dict[str, object]:
             return {
                 "id": f"issue-{number}", "number": number, "state": "OPEN",
@@ -737,7 +766,7 @@ class ExternalValidationTests(unittest.TestCase):
             top_level_result.snapshot.collection(RepositoryInventorySection.REMOTE_HEADS).item_identities,  # type: ignore[union-attr]
             ("codex/docs/26-public-target-contract", "main"),
         )
-        self.assertEqual(sum("issues(first:100,after:$cursor" in command[3] for command in top_level_host.commands), 1)
+        self.assertEqual(sum("issues(first:100,after:$cursor" in command[4] for command in top_level_host.commands), 1)
         def pull_request(number: int) -> dict[str, object]:
             empty = {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
             return {
@@ -762,8 +791,8 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(pull_request_capability.read(GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
         )).ok)
-        initial_query = next(command[3] for command in pull_request_host.commands if "pullRequests(first:100,states" in command[3])
-        pull_request_query = next(command[3] for command in pull_request_host.commands if "pullRequests(first:100,after:$cursor" in command[3])
+        initial_query = next(command[4] for command in pull_request_host.commands if "pullRequests(first:100,states" in command[4])
+        pull_request_query = next(command[4] for command in pull_request_host.commands if "pullRequests(first:100,after:$cursor" in command[4])
         def page_size(query: str, connection: str) -> int:
             value = query.split(f"{connection}(first:", 1)[1]
             return int(value.split(",", 1)[0].split(")", 1)[0])
@@ -799,7 +828,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(nested_capability.read(GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
         )).ok)
-        self.assertEqual(sum("comments(first:100,after:$cursor" in command[3] for command in nested_host.commands), 1)
+        self.assertEqual(sum("comments(first:100,after:$cursor" in command[4] for command in nested_host.commands), 1)
         request = GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
         )
@@ -950,7 +979,7 @@ class ExternalValidationTests(unittest.TestCase):
                 self.commands: list[tuple[str, ...]] = []
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
                 self.commands.append(arguments)
-                raise RuntimeError("private transport marker")
+                raise FileNotFoundError("private transport marker")
         class NonzeroReturnHost:
             def __init__(self) -> None:
                 self.commands: list[tuple[str, ...]] = []
@@ -984,7 +1013,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(stage, RepositoryInventoryFailureStage.TRANSPORT)
         self.assertEqual(transport_subcategory, RepositoryInventoryTransportSubcategory.LAUNCH_EXCEPTION)
         self.assertNotIn("private", public_reason)
-        self.assertEqual(transport_host.commands[0][0:3], ("api", "graphql", "-f"))
+        self.assertEqual(transport_host.commands[0][0:4], ("gh", "api", "graphql", "-f"))
         nonzero_host = NonzeroReturnHost()
         code, stage, transport_subcategory, public_reason = outer_failure_stage(nonzero_host)
         self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE)
@@ -1064,7 +1093,10 @@ class ExternalValidationTests(unittest.TestCase):
                     "nodes": [{"name": item, "target": {"oid": inputs.target_baseline_sha}} for item in names],
                 }
                 self.assertEqual(failure_code(OpaqueCredentialHost(malformed_inventory)), expected)
-        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"] + ["validate"] * 7)
+        self.assertEqual(
+            [arguments[0] for arguments, _ in harness.run_calls],
+            ["validate", "execute", "validate", "execute"] + ["validate"] * 7,
+        )
         self.assertEqual(
             failure_code(OpaqueCredentialHost(raw_inventory, exit_code=1)),
             external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE,
@@ -1242,7 +1274,7 @@ class ExternalValidationTests(unittest.TestCase):
                         external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, malformed_capability)
                 self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
                 self.assertEqual(
-                    len([command for command in malformed_host.commands if "object(expression:$oid)" not in command[3]]), 1,
+                    len([command for command in malformed_host.commands if "object(expression:$oid)" not in command[4]]), 1,
                 )
         self.assertEqual(len([item for item in harness.run_calls if item[0][0] == "execute"]), executes_before_malformed_body)
         for label, total_count in (("incomplete", 3), ("over-bound", 101)):

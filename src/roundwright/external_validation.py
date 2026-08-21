@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,7 @@ from .shadow import (
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     EvidenceRole,
+    FormalReviewRoundReference,
     LifecycleAttempt,
     LifecycleAttemptKind,
     ShadowV2Event,
@@ -1061,7 +1063,7 @@ class HostedCheckProfileAdapter:
 
 _LIVE_LIFECYCLE_FIXTURES = (
     "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
-    "dependency", "merged-pr",
+    "dependency", "merged-pr", "supervisor-failover",
 )
 _LIVE_LIFECYCLE_SNAPSHOTS = (
     "repository", "issues", "scheduling", "pull-requests", "comments",
@@ -1497,6 +1499,82 @@ class _LiveLifecycleProviderObservation:
         object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
 
 
+@dataclass(frozen=True)
+class _RoundletLifecycleProjection:
+    """The independently specified Roundlet lifecycle fixture at ``ready_at``."""
+
+    candidate_sha: str
+    formal_round: str
+    supervisor_attempts: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _RoundwrightLifecycleProjection:
+    """The independently normalized Roundwright lifecycle facts at ``ready_at``."""
+
+    candidate_sha: str
+    formal_round: str
+    supervisor_attempts: tuple[tuple[str, str], ...]
+
+
+_SUPERVISOR_FAILOVER_ATTEMPTS = (
+    ("sol", "cancelled"),
+    ("terra", "invalid-context"),
+    ("terra", "pass"),
+)
+
+
+def _roundlet_lifecycle_projection(candidate_sha: str) -> _RoundletLifecycleProjection:
+    """Return the reviewed Roundlet fixture independently of provider facts."""
+
+    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", _SUPERVISOR_FAILOVER_ATTEMPTS)
+
+
+def _roundwright_lifecycle_projection(
+    inventory: RepositoryInventorySnapshot, candidate_sha: str,
+) -> _RoundwrightLifecycleProjection:
+    """Normalize only typed public facts emitted by the generic inventory."""
+
+    facts = {(item.subject, item.predicate, item.object) for item in inventory.facts}
+    expected = {
+        ("lifecycle-supervisor-1", "profile", "sol"),
+        ("lifecycle-supervisor-1", "disposition", "cancelled"),
+        ("lifecycle-supervisor-2", "profile", "terra"),
+        ("lifecycle-supervisor-2", "disposition", "invalid-context"),
+        ("lifecycle-supervisor-3", "profile", "terra"),
+        ("lifecycle-supervisor-3", "disposition", "pass"),
+        ("lifecycle-formal-round-1", "candidate", candidate_sha),
+    }
+    if not expected.issubset(facts):
+        raise ExternalValidationAdapterError("repository inventory supervisor failover fixture is incomplete")
+    attempts = tuple(
+        (next(value for subject, predicate, value in facts if subject == f"lifecycle-supervisor-{ordinal}" and predicate == "profile"),
+         next(value for subject, predicate, value in facts if subject == f"lifecycle-supervisor-{ordinal}" and predicate == "disposition"))
+        for ordinal in range(1, 4)
+    )
+    return _RoundwrightLifecycleProjection(candidate_sha, "formal-round-1", attempts)
+
+
+def _classified_lifecycle_differences(
+    roundlet: _RoundletLifecycleProjection, roundwright: _RoundwrightLifecycleProjection,
+) -> tuple[str, ...]:
+    """Preserve each classification; qualification fails rather than masking drift."""
+
+    differences: list[str] = []
+    if roundlet.candidate_sha != roundwright.candidate_sha:
+        differences.append("candidate-drift")
+    if roundlet.formal_round != roundwright.formal_round:
+        differences.append("formal-round-drift")
+    for ordinal, (expected, observed) in enumerate(
+        zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts, strict=True), start=1,
+    ):
+        if expected[0] != observed[0]:
+            differences.append(f"supervisor-profile-{ordinal}-drift")
+        if expected[1] != observed[1]:
+            differences.append(f"supervisor-disposition-{ordinal}-drift")
+    return tuple(differences)
+
+
 class GitHubReadCapability(Protocol):
     """Reviewed generic GitHub read boundary, independent of this profile."""
 
@@ -1517,6 +1595,7 @@ class _RoundwrightLiveLifecycleProvider:
         self._capability = _require_github_read_capability(capability)
         self._repository = RepositoryRef(owner, name)
         self._baseline_sha = inputs.target_baseline_sha
+        self._candidate_sha = inputs.candidate_sha
         self._armed = False
 
     def _read(self, request: GitHubReadRequest, expected: type[object]) -> object:
@@ -1560,7 +1639,9 @@ class _RoundwrightLiveLifecycleProvider:
         return inventory
 
     @staticmethod
-    def _fixture_classes(inventory: RepositoryInventorySnapshot) -> tuple[str, ...]:
+    def _fixture_classes(
+        inventory: RepositoryInventorySnapshot, candidate_sha: str,
+    ) -> tuple[str, ...]:
         facts = set(inventory.facts)
         predicates = {(item.subject, item.predicate, item.object) for item in facts}
         required = {
@@ -1570,14 +1651,25 @@ class _RoundwrightLiveLifecycleProvider:
             "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
             "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
             "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
+            "supervisor-failover": not _classified_lifecycle_differences(
+                _roundlet_lifecycle_projection(candidate_sha),
+                _roundwright_lifecycle_projection(inventory, candidate_sha),
+            ),
         }
         if not all(required.values()):
             raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
         return _LIVE_LIFECYCLE_FIXTURES
 
     @staticmethod
-    def _observation(inventory: RepositoryInventorySnapshot) -> _LiveLifecycleProviderObservation:
-        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory)
+    def _observation(
+        inventory: RepositoryInventorySnapshot, candidate_sha: str,
+    ) -> _LiveLifecycleProviderObservation:
+        roundlet = _roundlet_lifecycle_projection(candidate_sha)
+        roundwright = _roundwright_lifecycle_projection(inventory, candidate_sha)
+        differences = _classified_lifecycle_differences(roundlet, roundwright)
+        if differences:
+            raise ExternalValidationAdapterError("live lifecycle projection comparison has differences")
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, candidate_sha)
         snapshot_digests = {
             category: _digest({
                 "category": category,
@@ -1601,7 +1693,7 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        return _LiveLifecycleProviderObservation(snapshot_digests, ())
+        return _LiveLifecycleProviderObservation(snapshot_digests, differences)
 
     @staticmethod
     def _target_state_digest(inventory: RepositoryInventorySnapshot) -> str:
@@ -1627,7 +1719,7 @@ class _RoundwrightLiveLifecycleProvider:
 
     def read_lifecycle(self) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory())
+        return self._observation(self._inventory(), self._candidate_sha)
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -1923,16 +2015,22 @@ def _materialize_live_lifecycle_shadow_profile(
     ):
         raise ExternalValidationAdapterError("live lifecycle zero-mutation read-back has drifted")
     profile = shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE)
-    attempt_id = f"lifecycle-{inputs.case_id}"
+    round_id = "formal-round-1"
+    attempts = (
+        LifecycleAttempt("lifecycle-supervisor-1", 1, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, review_round_id=round_id),
+        LifecycleAttempt("lifecycle-supervisor-2", 2, LifecycleAttemptKind.FAILOVER, EvidenceRole.SUPERVISOR, "lifecycle-supervisor-1", round_id),
+        LifecycleAttempt("lifecycle-supervisor-3", 3, LifecycleAttemptKind.FAILOVER, EvidenceRole.SUPERVISOR, "lifecycle-supervisor-2", round_id),
+    )
     events = tuple(
         ShadowV2Event(
-            f"{inputs.case_id}-{ordinal}", ordinal, attempt_id, event_kind, None, False,
+            f"{inputs.case_id}-{ordinal}", ordinal,
+            attempts[min(ordinal - 1, len(attempts) - 1)].attempt_id, event_kind, None, False,
+            review_round_id=round_id,
         )
         for ordinal, event_kind in enumerate(profile.event_kinds, start=1)
     )
     graph = ShadowV2EventGraph(
-        (LifecycleAttempt(attempt_id, 1, LifecycleAttemptKind.WORKER, EvidenceRole.WORKER),),
-        (), (), (), (), events,
+        attempts, (), (FormalReviewRoundReference(round_id, 1, inputs.candidate_sha),), (), (), events,
     )
     snapshot = LiveLifecycleShadowSnapshot(
         inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
@@ -1961,6 +2059,29 @@ def _live_lifecycle_session_path(store_root: Path, session_id: str) -> Path:
     if not isinstance(store_root, Path) or _DIGEST.fullmatch(session_id) is None:
         raise ExternalValidationAdapterError("live lifecycle session location is invalid")
     return store_root / _LIVE_LIFECYCLE_SESSION_DIRECTORY / f"{session_id[7:]}.json"
+
+
+def _claim_live_lifecycle_session(store_root: Path, session_id: str) -> None:
+    """Atomically reserve one session before any provider capability is touched.
+
+    ``O_EXCL`` is the durable, cross-process single-winner primitive.  The
+    claim is intentionally separate from the human-readable receipt update so
+    a second process can never observe a stale ``consumed`` flag and dispatch.
+    """
+
+    session_path = _live_lifecycle_session_path(store_root, session_id)
+    claim_path = session_path.with_suffix(".claim")
+    try:
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(str(claim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as claim:
+            claim.write(session_id)
+            claim.flush()
+            os.fsync(claim.fileno())
+    except FileExistsError as error:
+        raise ExternalValidationAdapterError("live lifecycle session is already consumed") from error
+    except OSError as error:
+        raise ExternalValidationAdapterError("live lifecycle session claim persistence failed") from error
 
 
 def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[str, object]:
@@ -2111,6 +2232,7 @@ def execute_live_lifecycle_shadow_session(
     if consumed or trace is None:
         raise ExternalValidationAdapterError("live lifecycle session is not trace-confirmed")
     capability = _require_github_read_capability(capability)
+    _claim_live_lifecycle_session(store_root, receipt.session_id)
     _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
         prepared_request, receipt.readiness, trace_readback_digest=trace, consumed=True,
     ), replace_existing=True)

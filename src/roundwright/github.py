@@ -564,7 +564,11 @@ class RepositoryInventoryEvidence:
             or tuple(sorted(self.item_identities)) != self.item_identities
             or len(set(self.item_identities)) != len(self.item_identities)
             or type(self.page_count) is not int
-            or not 1 <= self.page_count <= 32
+            # A section can aggregate terminal pages from many nested
+            # connections (for example, one comment connection per issue).
+            # Each individual connection remains bounded to 32 pages by the
+            # host; the normalized aggregate is bounded by its 3200-item cap.
+            or not 1 <= self.page_count <= 3200
             or type(self.complete) is not bool
             or not self.complete
             or len(self.item_identities) > 3200

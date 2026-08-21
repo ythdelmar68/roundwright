@@ -4696,7 +4696,7 @@ def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]
     query = (
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
         "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
-        "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state title body labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
+        "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state title body comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
         "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid checkSuites(first:10){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
         "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
     )
@@ -4746,7 +4746,7 @@ def _repository_inventory_connection_command(
     ):
         raise GitHubRuntimeError("inventory continuation request is invalid")
     issue_node = (
-        "id number state title body labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} "
+        "id number state title body comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} "
         "subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}"
     )
     pull_request_node = (
@@ -4764,6 +4764,7 @@ def _repository_inventory_connection_command(
         "refs": "refs(first:100,after:$cursor,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}",
         "issue-labels": "labels(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{name}}",
         "issue-sub-issues": "subIssues(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
+        "issue-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id body}}",
         "pull-request-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
         "pull-request-reviews": "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
         "pull-request-review-requests": "reviewRequests(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
@@ -4822,7 +4823,7 @@ def _inventory_continuation_connection(
     if number is None or _raw_integer(target, "number") != number:
         raise GitHubRuntimeError("inventory continuation target does not match request")
     fields = {
-        "issue-labels": "labels", "issue-sub-issues": "subIssues",
+        "issue-labels": "labels", "issue-sub-issues": "subIssues", "issue-comments": "comments",
         "pull-request-comments": "comments", "pull-request-reviews": "reviews",
         "pull-request-review-requests": "reviewRequests",
         "pull-request-closing-references": "closingIssuesReferences",
@@ -4855,6 +4856,7 @@ def _complete_repository_inventory_connection(
     if not has_next:
         if len(nodes) != total:
             raise GitHubRuntimeError("inventory connection is incomplete")
+        value["_roundwright_page_count"] = 1
         return
     if connection == "pull-request-commits":
         raise GitHubRuntimeError("inventory commit pagination is incomplete")
@@ -4890,6 +4892,7 @@ def _complete_repository_inventory_connection(
                 raise GitHubRuntimeError("inventory connection is incomplete")
             value["nodes"] = merged
             value["pageInfo"] = {"hasNextPage": False, "endCursor": next_cursor}
+            value["_roundwright_page_count"] = len(seen_cursors) + 1
             return
         if type(next_cursor) is not str or _CURSOR.fullmatch(next_cursor) is None or next_cursor in seen_cursors:
             raise GitHubRuntimeError("inventory connection cursor is malformed")
@@ -4926,6 +4929,7 @@ def _complete_repository_inventory_connections(
         number = _raw_integer(issue, "number")
         _complete_repository_inventory_connection(request, runner, "issue-labels", issue.get("labels"), number=number)
         _complete_repository_inventory_connection(request, runner, "issue-sub-issues", issue.get("subIssues"), number=number)
+        _complete_repository_inventory_connection(request, runner, "issue-comments", issue.get("comments"), number=number)
     for node in pull_requests:
         pull_request = _raw_mapping(node)
         number = _raw_integer(pull_request, "number")
@@ -5000,6 +5004,7 @@ def _complete_repository_inventory_check_suites(
             if not has_next:
                 if len(suite_nodes) != total:
                     raise GitHubRuntimeError("inventory check pagination is incomplete")
+                suites["_roundwright_page_count"] = 1
                 continue
             if type(cursor) is not str or _CURSOR.fullmatch(cursor) is None:
                 raise GitHubRuntimeError("inventory check-suite cursor is malformed")
@@ -5026,6 +5031,7 @@ def _complete_repository_inventory_check_suites(
                         raise GitHubRuntimeError("inventory check pagination is incomplete")
                     suites["nodes"] = suite_nodes
                     suites["pageInfo"] = {"hasNextPage": False, "endCursor": next_cursor}
+                    suites["_roundwright_page_count"] = len(seen_cursors) + 1
                     break
                 if type(next_cursor) is not str or _CURSOR.fullmatch(next_cursor) is None or next_cursor in seen_cursors:
                     raise GitHubRuntimeError("inventory check-suite cursor is malformed")
@@ -5103,6 +5109,63 @@ def _inventory_label_fact_value(value: object) -> str:
     return "label-" + _sha256(("repository-inventory-label", value)).removeprefix("sha256:")
 
 
+_ROUNDLET_FAILOVER_TRACE = re.compile(
+    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+candidate=([0-9a-f]{40})\Z"
+)
+
+
+def _inventory_connection_page_count(connection: Mapping[str, object]) -> int:
+    """Read the host-retained terminal page count without trusting raw input."""
+
+    value = connection.get("_roundwright_page_count", 1)
+    if type(value) is not int or not 1 <= value <= 32:
+        raise GitHubRuntimeError("inventory page count is invalid")
+    return value
+
+
+def _inventory_section_identity(section: RepositoryInventorySection, node: object) -> str:
+    value = _raw_mapping(node)
+    if section is RepositoryInventorySection.ISSUE_LABELS:
+        return _inventory_label_fact_value(value.get("name"))
+    if section in {RepositoryInventorySection.ISSUE_RELATIONSHIPS, RepositoryInventorySection.CLOSING_REFERENCES}:
+        return str(_raw_integer(value, "number"))
+    if section is RepositoryInventorySection.REMOTE_HEADS:
+        return _raw_text(value, "name")
+    return _raw_id(value, "id")
+
+
+def _inventory_roundlet_trace_facts(nodes: list[object]) -> tuple[RepositoryInventoryFact, ...]:
+    """Project bounded marker fields only; never retain comment bodies."""
+
+    records: list[tuple[str, str, str]] = []
+    for node in nodes:
+        value = _raw_mapping(node)
+        body = _raw_optional_text(value, "body")
+        if body is None:
+            continue
+        match = _ROUNDLET_FAILOVER_TRACE.fullmatch(body)
+        if match is not None:
+            records.append(match.groups())
+    if not records:
+        return ()
+    if len(records) != 3 or tuple((profile, disposition) for profile, disposition, _round, _candidate in records) != (
+        ("sol", "cancelled"), ("terra", "invalid-context"), ("terra", "pass"),
+    ):
+        raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
+    rounds = {round_id for _profile, _disposition, round_id, _candidate in records}
+    candidates = {candidate for _profile, _disposition, _round_id, candidate in records}
+    if rounds != {"formal-round-1"} or len(candidates) != 1:
+        raise GitHubRuntimeError("inventory Roundlet failover trace is inconsistent")
+    facts: list[RepositoryInventoryFact] = []
+    for ordinal, (profile, disposition, _round_id, _candidate) in enumerate(records, start=1):
+        facts.extend((
+            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "profile", profile),
+            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "disposition", disposition),
+        ))
+    facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", next(iter(candidates))))
+    return tuple(facts)
+
+
 def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> RepositoryInventorySnapshot:
     """Normalize terminal GraphQL inventory data into the core-only snapshot.
 
@@ -5160,6 +5223,11 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             raise GitHubRuntimeError("inventory issue scheduling body is malformed")
         body = _raw_optional_text(value, "body")
         facts.extend(_inventory_scheduling_facts(subject, _raw_text(value, "title"), "" if body is None else body))
+        comment_connection = _raw_mapping(value.get("comments")); comment_page = _raw_mapping(comment_connection.get("pageInfo")); comment_nodes = _inventory_connection_nodes(comment_connection, comment_page)
+        if _raw_bool(comment_page, "hasNextPage") or _raw_integer(comment_connection, "totalCount") != len(comment_nodes):
+            raise GitHubRuntimeError("inventory nested pagination is incomplete")
+        nested[RepositoryInventorySection.COMMENTS].append(comment_connection)
+        facts.extend(_inventory_roundlet_trace_facts(comment_nodes))
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
             if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
@@ -5230,16 +5298,35 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
                     nested[RepositoryInventorySection.WORKFLOW_RUNS].append(_raw_mapping(workflow))
     collections: list[RepositoryInventoryEvidence] = []
     for section in RepositoryInventorySection:
-        source: object = roots.get(section, nested.get(section, repository))
-        identities: list[str] = []
-        if section in roots:
-            for node in root_nodes[section]:
-                item = _raw_mapping(node)
-                identities.append(
-                    _raw_id(item, "id") if type(item.get("id")) is str else _raw_text(item, "name")
-                )
-            identities.sort()
-        collections.append(RepositoryInventoryEvidence(section, _sha256(source), tuple(identities), 1, True))
+        if section is RepositoryInventorySection.REPOSITORY:
+            source: object = repository
+            identities = [_raw_id(repository, "id")]
+            page_count = 1
+        elif section in roots:
+            connection = roots[section]
+            source = connection
+            identities = [_inventory_section_identity(section, node) for node in root_nodes[section]]
+            page_count = _inventory_connection_page_count(connection)
+        else:
+            connections = nested.get(section, [])
+            source = connections
+            identities = []
+            page_count = 0
+            if section in {RepositoryInventorySection.MERGEABILITY, RepositoryInventorySection.WORKFLOW_RUNS}:
+                identities = [_raw_id(connection, "id") for connection in connections]
+                page_count = max(1, len(connections))
+            else:
+                for connection in connections:
+                    page = _raw_mapping(connection.get("pageInfo"))
+                    nodes = _inventory_connection_nodes(connection, page)
+                    identities.extend(_inventory_section_identity(section, node) for node in nodes)
+                    page_count += _inventory_connection_page_count(connection)
+            if not connections:
+                page_count = 1
+        identities.sort()
+        if len(identities) != len(set(identities)):
+            raise GitHubRuntimeError("inventory collection has duplicate evidence")
+        collections.append(RepositoryInventoryEvidence(section, _sha256(source), tuple(identities), page_count, True))
     return RepositoryInventorySnapshot(
         request.repository, _raw_id(repository, "id"), _raw_text(default_ref, "name"), request.expected_sha,
         _sha256({"id": repository.get("id"), "owner": owner.get("login"), "name": repository.get("name")} ),

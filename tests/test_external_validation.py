@@ -392,7 +392,13 @@ class ExternalValidationTests(unittest.TestCase):
                     RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                     RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
                     RepositoryInventoryFact("pull-request-81", "state", "merged"),
-                    RepositoryInventoryFact("issue-49", "supervisor-failover", "observed"),
+                    RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
+                    RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
+                    RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
+                    RepositoryInventoryFact("lifecycle-supervisor-2", "disposition", "invalid-context"),
+                    RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
+                    RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
+                    RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
                 ), key=lambda item: (item.subject, item.predicate, item.object)))
                 return GitHubReadResult(request, RepositoryInventorySnapshot(
                     request.repository, "forward-target", "main", "d" * 40,
@@ -461,7 +467,13 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryFact("issue-4", "child", "issue-49"),
                 RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
                 RepositoryInventoryFact("issue-49", "standalone", "true"),
-                RepositoryInventoryFact("issue-49", "supervisor-failover", "observed"),
+                RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
+                RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
+                RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
+                RepositoryInventoryFact("lifecycle-supervisor-2", "disposition", "invalid-context"),
+                RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
+                RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
+                RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
                 RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
                 RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("pull-request-81", "state", "merged"),
@@ -469,7 +481,8 @@ class ExternalValidationTests(unittest.TestCase):
             return RepositoryInventorySnapshot(
                 repository, "forward-target", "main", "d" * 40, "sha256:" + "a" * 64,
                 "sha256:" + "b" * 64,
-                tuple(sorted(collections, key=lambda item: item.section.value)), facts,
+                tuple(sorted(collections, key=lambda item: item.section.value)),
+                tuple(sorted(facts, key=lambda item: (item.subject, item.predicate, item.object))),
             )
 
         class DriftingReadCapability:
@@ -523,9 +536,9 @@ class ExternalValidationTests(unittest.TestCase):
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
-                    {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
-                    {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=invalid-context round=formal-round-1 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=pass round=formal-round-1 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
+                    {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
                 "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
                     "id": "pull-request-81", "number": 81, "state": "MERGED", "headRefOid": None, "headRefName": "codex-issue-49", "mergeStateStatus": "CLEAN", "mergeCommit": {"oid": inputs.candidate_sha},
@@ -742,6 +755,7 @@ class ExternalValidationTests(unittest.TestCase):
             return {
                 "id": f"issue-{number}", "number": number, "state": "OPEN",
                 "title": "ordinary issue", "body": "",
+                "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
                 "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
                 "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
             }
@@ -1003,7 +1017,11 @@ class ExternalValidationTests(unittest.TestCase):
         ):
             with self.subTest(outer_inventory_stage=label):
                 code, stage, transport_subcategory, public_reason = outer_failure_stage(host)
-                self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+                self.assertEqual(
+                    code,
+                    external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION
+                    if label == "normalizer" else external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                )
                 self.assertEqual(stage, expected_stage)
                 self.assertEqual(transport_subcategory, expected_subcategory)
                 self.assertNotIn("private", public_reason)

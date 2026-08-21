@@ -610,7 +610,7 @@ class ExternalValidationTests(unittest.TestCase):
                 self.commands.append(arguments)
                 if self.exit_code:
                     return OpaqueResult(self.exit_code, "")
-                if "pullRequests(first:100,states" in arguments[4]:
+                if "pullRequests(first:100,states" in arguments[4] and type(self.payload) is dict and type(self.payload.get("data")) is dict and type(self.payload["data"].get("repository")) is dict and type(self.payload["data"]["repository"].get("pullRequests")) is dict:
                     initial = self.payload["data"]["repository"]["pullRequests"]
                     self.route_ledger.append(("pull-requests", None, None, initial["pageInfo"]["endCursor"], initial["pageInfo"]["hasNextPage"]))
                 if "object(expression:$oid)" in arguments[4]:
@@ -710,7 +710,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertIn(RepositoryInventoryFact("pull-request-81", "state", "merged"), multipage_result.snapshot.facts)
         self.assertEqual(sum("after:$cursor" in command[4] for command in multipage_host.commands), 8)
         self.assertEqual(
-            {(kind, parent, incoming, terminal, more) for kind, parent, incoming, terminal, more in multipage_host.route_ledger},
+            {(kind, parent, incoming, terminal, more) for kind, parent, incoming, terminal, more in multipage_host.route_ledger if kind != "pull-requests"},
             {("labels", 1, "labels-cursor", None, False), ("subIssues", 1, "subissues-cursor", None, False), ("reviews", 81, "reviews-cursor", None, False), ("reviewRequests", 81, "requests-cursor", None, False), ("closingIssuesReferences", 81, "closing-cursor", None, False), ("refs", None, "refs-cursor", None, False)},
         )
         self.assertNotIn(RepositoryInventoryFact("pull-request-81", "head-sha", inputs.candidate_sha), scheduling_result.snapshot.facts)

@@ -59,7 +59,8 @@ repository boundaries below.
 The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
 then #40, #41, #42, #59, #46, planning correction #65, external-validation
 correction #67, #47, capture-plan correction #72, #44, executor correction
-#75, #45, reviewed-Runlet binding correction #78, then #48–#51.
+#75, #45, reviewed-Runlet binding correction #78, #48, lifecycle observation
+correction #82, then #49–#51.
 Issue #59
 completes the canonical schema v2 mutation vocabulary and authority-block
 isolation before the live broker can continue. Issue #65 installs the
@@ -75,7 +76,12 @@ before live provider-attempt accounting resumes. Issue #78 adopts reviewed
 Roundlet PR #82 merge `1004cf0143aef9a777a64a3a0703b10a5680e959` after
 #45 and requires one fresh post-merge provider-free synthetic receipt before
 #48. It reuses the existing synthetic profile and does not modify Harness or
-create a new evidence profile. The Phase 3 qualification
+create a new evidence profile. Issue #82 follows completed #48 and adopts the
+reviewed Roundlet lifecycle producer plus Harness lifecycle ledger into one
+exact repository-owned contract. Its provider-free synthetic sequence must
+seal, project, and compare successfully before a completely fresh #49 live
+window begins. It does not move #49's product profile or live evidence into the
+correction. The Phase 3 qualification
 result may produce `PROMOTION_READY` only; it cannot start a Canary by itself.
 
 Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for

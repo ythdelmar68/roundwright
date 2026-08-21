@@ -18,9 +18,21 @@ by the allowlisted owner.
 
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |
 | --- | --- | --- | --- | --- |
-| Generic Orchestrator | `ythdelmar68/roundlet` | canonical merge `1004cf0143aef9a777a64a3a0703b10a5680e959`; skill content `8df4fd5e58dd41de54aeae53ce66a5c49ab0f040`; tree `985b49fade4be8dec1355d183ad824cf9d67a354` | Consume one exact repository-owned executor, derive typed schemas from that binding, keep validation/review sequences independent, and retain unique auxiliary evidence before cleanup | Roundwright profile logic, Recorder, provider adapter, evidence store, accounting-domain discriminator, or a second runner |
-| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `0154817a6fba345b78af25017eb312a1b2349cd6`; executor content `0f980f75a05ec616395b2cbfed9724417d00d335`; tree `d9fba0facfe561850c0dbff913e8021541b98ca5` | Exact candidate-bound read-only doctor, provider, hosted, provenance, Shadow, canary, and cross-environment commands under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, or mutation target |
+| Generic Orchestrator | `ythdelmar68/roundlet` | canonical merge `5169a4630de9c1a888e6f46254a5ef21e40c2b8b`; skill content `3308a9a74e33f276bab6a5221e974f74a5cd0dc0`; tree `e84ad8c582f2a5583af99b7a80cdc03249e2d5fa` | Consume exact repository-owned executor and optional lifecycle-sink contracts, keep external/sink/review sequences independent, and retain unique auxiliary evidence before cleanup | Roundwright profile logic, Recorder, provider adapter, evidence store, accounting-domain discriminator, or a second runner |
+| Execution toolbox | `ythdelmar68/roundwright-harness` | canonical merge `f13065e7fae7e48c21398c551cf1b724a4b26070`; executor content `0f980f75a05ec616395b2cbfed9724417d00d335`; lifecycle content `e61c8157973e315f3308b674ed55ef2f4e15fb43`; tree `ac6e3e21e7b2b559915b3cef0ce15648c5b22b1a` | Exact candidate-bound read-only execution plus phase-neutral opt-in lifecycle append/read-back/seal/verify under the standing read-only switch | A floating ref, Roundwright authority source, credential store, global Python environment, mutation target, or product semantic comparator |
 | Disposable remote target | `ythdelmar68/roundlet-forward-test` | baseline `4f39ef0e4e616eb896950d3756c433b624771a97` | Read-only Phase 3 observation and exact Phase 4-or-later allowlisted lifecycle/Canary work under the independent mutation switch | Production, unique work, Roundwright authority, another repository, or a floating target |
+
+Roundlet PR #88 added the opt-in generic lifecycle observation sink while
+preserving zero calls, storage, and behavior for repositories/leaves that do
+not select it. Canonical merge
+`5169a4630de9c1a888e6f46254a5ef21e40c2b8b` has parents
+`ee2670af97e9be5eae4755bd855d156d43e5d2b8` and
+`a6aa16d623cb169f78fad9886ec416a7c4afd7b5`, resolves to tree
+`e84ad8c582f2a5583af99b7a80cdc03249e2d5fa`, and binds installed skill
+content `3308a9a74e33f276bab6a5221e974f74a5cd0dc0` plus skill tree
+`63117b2418ce17d45d099ae6009522a6a83df8ce`. Only the Orchestrator may invoke
+the opaque repository-owned sink; no Roundwright phase or profile semantic is
+embedded in Roundlet.
 
 Roundlet PR #82 corrected generic executor-schema derivation, separated the
 opaque external-validation sequence from the formal Supervisor tuple, refreshed
@@ -41,7 +53,17 @@ Roundlet PR #80 / merge
 `cdfaec6fbcb521edb96a65a88ed4eed62a84f07a` remain the historical
 predecessor. They cannot satisfy a newly selected gate. An old/new identity
 conflict blocks before `ARMED` with zero external action and requires one
-wholly fresh binding from the active PR #82 identity.
+wholly fresh binding from the active PR #88 identity.
+
+Harness PR #12 / issue #11 added the phase-neutral generic lifecycle ledger.
+Canonical merge `f13065e7fae7e48c21398c551cf1b724a4b26070` has parents
+`0154817a6fba345b78af25017eb312a1b2349cd6` and
+`22d75bf9823ff6e70494e39c0c88b13f6b43bf64`, resolves to tree
+`ac6e3e21e7b2b559915b3cef0ce15648c5b22b1a`, and binds lifecycle content
+`e61c8157973e315f3308b674ed55ef2f4e15fb43` plus package tree
+`2325174685e16b579e84e8771d96e85e6c7a253d`. The ledger validates closed
+generic events, appends and reads back a hash chain, and seals/verifies a
+content-addressed bundle; it never assigns product semantics.
 
 Harness PR #10 added V2 execution-context materialization to the one
 phase-neutral versioned profile executor. Canonical merge
@@ -247,6 +269,31 @@ synthetic correction profile
 `roundwright-shadow-profile/executor-contract-synthetic/v1` proves the contract
 with deterministic zero-action, zero-mutation evidence. It does not satisfy or
 replace a downstream leaf's live profile-specific evidence.
+
+### Optional lifecycle observation contract
+
+The authoritative machine-readable contract is
+[`lifecycle-observation-contract.json`](lifecycle-observation-contract.json).
+It pins Harness #11 merge `f13065e7fae7e48c21398c551cf1b724a4b26070`
+and Roundlet #87 merge `5169a4630de9c1a888e6f46254a5ef21e40c2b8b`,
+their exact trees/content, the closed generic plan/event schemas, and the
+Roundwright projection/comparison entrypoints. A leaf must explicitly select
+it; absence means `NOT_SELECTED` with zero calls, storage, or lifecycle change.
+
+The selected plan is persisted before the first declared ephemeral transition.
+Each event append is immediately read back before Roundlet advances that
+transition. The ledger is sealed and verified content-addressedly before the
+Roundwright adapter projects it into the selected profile. The adapter compares
+every semantic field, and any non-empty classified difference fails. Candidate,
+review tuple, time, window, predecessor, schema, producer, store, capture-plan,
+or receipt movement makes the window stale. Missing pre-arm history is never
+backfilled.
+
+Roundlet remains generic: it knows only prepare, append/read-back, and
+seal/verify. Harness remains phase-neutral: it validates generic closed events
+but does not decide a Shadow gate. Only Roundwright assigns profile semantics.
+The synthetic #82 gate calls no provider, mutates no GitHub repository or
+forward target, and cannot replace #49's later fresh live evidence.
 
 ## Owner interaction and recovery
 

@@ -18,6 +18,9 @@ leaf or standalone issue, read and use
 Before executing, replaying, recovering, or reconstructing a Roundwright gate
 whose leaf declares external validation, read and use
 [`$run-roundwright-external-validation`](.agents/skills/run-roundwright-external-validation/SKILL.md).
+Use the same skill when a leaf selects the root-referenced lifecycle observation
+contract at
+[`docs/operations/lifecycle-observation-contract.json`](docs/operations/lifecycle-observation-contract.json).
 
 Before building or running the packaging preflight, read and use
 [`docs/operations/validation-toolchain.md`](docs/operations/validation-toolchain.md).

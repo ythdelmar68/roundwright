@@ -118,6 +118,15 @@ content-addressed store, and immutable capture time. The selected profile's
 readiness preflight must pass before its arm-before boundary. Candidate movement
 requires recapture; planning must never reconstruct missing historical evidence.
 
+Record a separate lifecycle observation selection. Use `NOT_SELECTED` unless
+the leaf requires transition-time facts that will not survive cleanup. When it
+is selected, name the exact authoritative
+`docs/operations/lifecycle-observation-contract.json`, the first transition
+that must occur after arming, the generic event source, seal boundary, and
+missing-history rule. The planning transaction does not invoke the sink or
+invent a future window/candidate; Roundlet resolves those exact values at
+selection time through `$run-roundwright-external-validation`.
+
 ## Compose the issue body
 
 Start from the tracked GitHub template and fill every applicable field:
@@ -130,6 +139,9 @@ Start from the tracked GitHub template and fill every applicable field:
   expectation, selection-time bindings, and public-safe evidence boundary;
 - Shadow cycle, canonical references, evidence/comparison identity, or a
   concrete N/A reason;
+- lifecycle observation selection (`NOT_SELECTED` or the exact authoritative
+  contract), event source, arm-before transition, seal boundary, and recapture
+  rule;
 - typed and bounded acceptance criteria;
 - authority, phase, mutation, deferred-work, and non-goal boundaries; and
 - scheduling/read-back record.

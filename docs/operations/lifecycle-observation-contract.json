@@ -1,0 +1,41 @@
+{
+  "contract_identity": "sha256:6752833ae7cabd0ce7e3c45a9bf964f068a3df8728d77e3cfa6fbe126faa8ed8",
+  "entrypoints": {
+    "append_readback": "roundwright_harness.lifecycle:append_lifecycle_event",
+    "compare": "roundwright.lifecycle_observation:compare_lifecycle_projections",
+    "prepare": "roundwright_harness.lifecycle:prepare_lifecycle",
+    "project": "roundwright.lifecycle_observation:project_verified_lifecycle",
+    "seal": "roundwright_harness.lifecycle:seal_lifecycle",
+    "verify": "roundwright_harness.lifecycle:verify_lifecycle"
+  },
+  "harness": {
+    "component_tree": "2325174685e16b579e84e8771d96e85e6c7a253d",
+    "content_blob": "e61c8157973e315f3308b674ed55ef2f4e15fb43",
+    "merge_commit": "f13065e7fae7e48c21398c551cf1b724a4b26070",
+    "repository": "ythdelmar68/roundwright-harness",
+    "tree": "ac6e3e21e7b2b559915b3cef0ce15648c5b22b1a"
+  },
+  "mutation_mode": "provider-free-github-free-target-free-zero-mutation",
+  "privacy": "closed-public-safe-no-raw-output-or-paths",
+  "producer_identity": "sha256:ef379d1e9386fb14c976f51fbfad9e0f2f7627d6ae3228278c72499b7ee534ca",
+  "repository_identity": "sha256:f2a4d1128d152297dd5e5518157fbeb912039552d7d9239076674a356c797658",
+  "roundlet": {
+    "component_tree": "63117b2418ce17d45d099ae6009522a6a83df8ce",
+    "content_blob": "3308a9a74e33f276bab6a5221e974f74a5cd0dc0",
+    "merge_commit": "5169a4630de9c1a888e6f46254a5ef21e40c2b8b",
+    "repository": "ythdelmar68/roundlet",
+    "tree": "e84ad8c582f2a5583af99b7a80cdc03249e2d5fa"
+  },
+  "schema": "roundwright-lifecycle-observation-contract/v1",
+  "schemas": {
+    "bundle": "roundwright-harness-lifecycle-bundle/v1",
+    "comparison": "roundwright-lifecycle-shadow-comparison/v1",
+    "event": "roundwright-harness-lifecycle-event/v1",
+    "plan": "roundwright-harness-lifecycle-plan/v1",
+    "projection": "roundwright-lifecycle-shadow-projection/v1",
+    "seal_receipt": "roundwright-harness-lifecycle-seal-receipt/v1"
+  },
+  "selection": "leaf-explicit-opt-in",
+  "status": "active",
+  "target_profile": "roundwright-shadow-profile/live-lifecycle-shadow/v1"
+}

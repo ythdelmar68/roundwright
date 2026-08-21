@@ -63,9 +63,11 @@ class ExternalValidationContractTests(unittest.TestCase):
             "`none`/`none`",
             "`harness`/`toolbox`",
             "`harness+forward-test`/`toolbox+disposable-target`",
-            "1004cf0143aef9a777a64a3a0703b10a5680e959",
-            "985b49fade4be8dec1355d183ad824cf9d67a354",
-            "8df4fd5e58dd41de54aeae53ce66a5c49ab0f040",
+            "5169a4630de9c1a888e6f46254a5ef21e40c2b8b",
+            "e84ad8c582f2a5583af99b7a80cdc03249e2d5fa",
+            "3308a9a74e33f276bab6a5221e974f74a5cd0dc0",
+            "f13065e7fae7e48c21398c551cf1b724a4b26070",
+            "e61c8157973e315f3308b674ed55ef2f4e15fb43",
             "0154817a6fba345b78af25017eb312a1b2349cd6",
             "0f980f75a05ec616395b2cbfed9724417d00d335",
             "cf669e186a739a8597cfaf9f050ce3bdcadda334",
@@ -87,7 +89,7 @@ class ExternalValidationContractTests(unittest.TestCase):
             "blocks before `ARMED` with zero external action",
         ):
             self.assertIn(value, normalized_skill)
-        self.assertIn("Roundlet PR #80", skill)
+        self.assertIn("Roundlet PR #82", skill)
         self.assertIn("historical predecessor", normalized_skill)
         self.assertNotIn("TODO", skill)
         self.assertIn(f"${SKILL_NAME}", metadata)
@@ -117,14 +119,15 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertIn("Harness PR #4", contract)
         self.assertIn("Harness PR #6", contract)
         self.assertIn("Harness PR #10", contract)
+        self.assertIn("Roundlet PR #88", contract)
         self.assertIn("Roundlet PR #82", contract)
         self.assertIn("Roundlet PR #80", contract)
         active_row = next(
             line for line in contract.splitlines() if "| Generic Orchestrator |" in line
         )
-        self.assertIn("1004cf0143aef9a777a64a3a0703b10a5680e959", active_row)
-        self.assertIn("985b49fade4be8dec1355d183ad824cf9d67a354", active_row)
-        self.assertIn("8df4fd5e58dd41de54aeae53ce66a5c49ab0f040", active_row)
+        self.assertIn("5169a4630de9c1a888e6f46254a5ef21e40c2b8b", active_row)
+        self.assertIn("e84ad8c582f2a5583af99b7a80cdc03249e2d5fa", active_row)
+        self.assertIn("3308a9a74e33f276bab6a5221e974f74a5cd0dc0", active_row)
         self.assertNotIn("96772438b251e56d483733179939245565b1374a", active_row)
         normalized = " ".join(contract.split())
         self.assertIn("historical predecessor", normalized)
@@ -150,7 +153,7 @@ class ExternalValidationContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         normalized = " ".join(roadmap.split())
         self.assertIn(
-            "#75, #45, reviewed-Runlet binding correction #78, then #48–#51",
+            "#75, #45, reviewed-Runlet binding correction #78, #48, lifecycle observation correction #82, then #49–#51",
             normalized,
         )
         self.assertIn("1004cf0143aef9a777a64a3a0703b10a5680e959", roadmap)

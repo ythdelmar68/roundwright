@@ -58,6 +58,17 @@ the exact repository-owned public adapter factory and one reviewed Harness
 request, parser, plan, component identities, store, and readiness receipt; a
 leaf never supplies a candidate-specific wrapper or second runner.
 
+Lifecycle observation is an independent opt-in. A leaf records `NOT_SELECTED`
+unless it needs ephemeral transition-time facts. A selected leaf references the
+exact tracked
+[`lifecycle-observation-contract.json`](lifecycle-observation-contract.json),
+names the first transition that must occur after arming, and states the seal and
+fresh-recapture boundaries. At execution selection, Roundlet binds the exact
+candidate, immutable `ready_at`, formal review tuple, window, producer, schema,
+store, and capture plan. The Orchestrator alone appends and reads back events;
+role tasks never write the sink. Missing pre-arm history requires a fresh live
+window and is never reconstructed.
+
 The external-validation declaration is a routing and evidence record. The
 standing Booleans in authoritative root policy remove repetitive approval only
 for a mechanically conforming selected route; the declaration alone never

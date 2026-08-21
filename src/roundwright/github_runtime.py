@@ -5323,7 +5323,10 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             page_count = 0
             if section in {RepositoryInventorySection.MERGEABILITY, RepositoryInventorySection.WORKFLOW_RUNS}:
                 identities = [_raw_id(connection, "id") for connection in connections]
-                page_count = max(1, len(connections))
+                if section is RepositoryInventorySection.MERGEABILITY:
+                    page_count = _inventory_connection_page_count(roots[RepositoryInventorySection.PULL_REQUESTS])
+                else:
+                    page_count = sum(_inventory_connection_page_count(item) for item in nested[RepositoryInventorySection.CHECKS]) or 1
             else:
                 for connection in connections:
                     page = _raw_mapping(connection.get("pageInfo"))

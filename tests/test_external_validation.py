@@ -641,6 +641,17 @@ class ExternalValidationTests(unittest.TestCase):
         ))
         self.assertTrue(scheduling_result.ok)
         assert scheduling_result.snapshot is not None
+        inventory_evidence = scheduling_result.snapshot
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.COMMENTS).page_count, 4)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.ISSUE_LABELS).page_count, 3)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.ISSUE_RELATIONSHIPS).page_count, 3)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.REVIEWS).page_count, 1)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.REQUESTED_REVIEWERS).page_count, 1)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.CLOSING_REFERENCES).page_count, 1)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.CHECKS).page_count, 4)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.WORKFLOW_RUNS).page_count, 4)
+        self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.MERGEABILITY).page_count, 1)
+        self.assertTrue(all(item.item_identities == tuple(sorted(set(item.item_identities))) for item in inventory_evidence.collections))
         self.assertNotIn(RepositoryInventoryFact("pull-request-81", "head-sha", inputs.candidate_sha), scheduling_result.snapshot.facts)
         self.assertIn(RepositoryInventoryFact("issue-3", "depends-on", "issue-2"), scheduling_result.snapshot.facts)
         self.assertNotIn(RepositoryInventoryFact("issue-1", "depends-on", "issue-2"), scheduling_result.snapshot.facts)

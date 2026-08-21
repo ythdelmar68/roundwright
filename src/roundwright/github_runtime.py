@@ -110,6 +110,13 @@ class RepositoryInventoryFailureStage(StrEnum):
     """Closed, public-safe inventory structural categories."""
 
     UNKNOWN = "unknown"
+    REQUEST = "request"
+    TRANSPORT = "transport"
+    GRAPHQL_ENVELOPE = "graphql-envelope"
+    JSON_DECODING = "json-decoding"
+    CAPABILITY = "capability"
+    NORMALIZER = "normalizer"
+    RESULT_SEALING = "result-sealing"
     ROOT = "root"
     REPOSITORY = "repository"
     CONNECTION = "connection"
@@ -188,6 +195,19 @@ def _repository_inventory_failure_stage(error: BaseException) -> RepositoryInven
     ):
         return RepositoryInventoryFailureStage.FIELD
     return RepositoryInventoryFailureStage.UNKNOWN
+
+
+def _repository_inventory_failure_result(
+    request: GitHubReadRequest,
+    code: RepositoryInventoryReadFailureCode,
+    stage: RepositoryInventoryFailureStage,
+    kind: GitHubFailureKind = GitHubFailureKind.MALFORMED_RESPONSE,
+) -> GitHubReadResult:
+    """Seal only fixed inventory failure tokens across outer runtime layers."""
+
+    return GitHubReadResult(request, failure=GitHubFailure(
+        kind, request.operation, _repository_inventory_failure_reason(code, stage),
+    ))
 
 
 def _classify_repository_inventory_error(error: BaseException) -> RepositoryInventoryReadFailureCode:
@@ -660,10 +680,20 @@ class OwnerGitHubReadIpcClient:
         try:
             result = channel.exchange_read(request)
         except (AttributeError, TypeError, ValueError):
+            if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+                return _repository_inventory_failure_result(
+                    request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                    RepositoryInventoryFailureStage.CAPABILITY, GitHubFailureKind.UNAVAILABLE,
+                )
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.UNAVAILABLE, request.operation, "owner read IPC response is unavailable",
             ))
         if type(result) is not GitHubReadResult or result.request != request:
+            if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+                return _repository_inventory_failure_result(
+                    request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                    RepositoryInventoryFailureStage.CAPABILITY,
+                )
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "owner read IPC response drifted",
             ))
@@ -879,25 +909,64 @@ class _OwnerGitHubReadHostEndpoint:
         behind this reviewed projection, without changing the public contract.
         """
 
-        outcome = self.__runner.run(_repository_inventory_command(request))
-        if outcome.exit_code != 0:
-            return GitHubReadResult(request, failure=GitHubFailure(
-                _failure_kind(outcome.exit_code), request.operation,
-                _repository_inventory_failure_reason(RepositoryInventoryReadFailureCode.HOST_FAILURE),
-            ))
         try:
-            raw = _complete_repository_inventory_connections(
-                request, json.loads(outcome.stdout), self.__runner,
+            command = _repository_inventory_command(request)
+        except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.REQUEST,
             )
+        try:
+            outcome = self.__runner.run(command)
+        except _RepositoryInventoryDiagnosticError as error:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+            )
+        except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.TRANSPORT,
+            )
+        if outcome.exit_code != 0:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.HOST_FAILURE,
+                RepositoryInventoryFailureStage.TRANSPORT, _failure_kind(outcome.exit_code),
+            )
+        try:
+            envelope = _decode_inventory_graphql(outcome.stdout)
+        except _RepositoryInventoryDiagnosticError as error:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+            )
+        except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE,
+            )
+        try:
+            raw = _complete_repository_inventory_connections(request, envelope, self.__runner)
             snapshot = _normalize_repository_inventory(request, raw)
+        except _RepositoryInventoryDiagnosticError as error:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+            )
+        except GitHubContractError as error:
+            return _repository_inventory_failure_result(
+                request, _classify_repository_inventory_error(error),
+                RepositoryInventoryFailureStage.NORMALIZER,
+            )
+        except (GitHubRuntimeError, TypeError, ValueError) as error:
+            stage = _repository_inventory_failure_stage(error)
+            return _repository_inventory_failure_result(
+                request, _classify_repository_inventory_error(error), stage,
+            )
+        try:
             return GitHubReadResult(request, snapshot=snapshot)
-        except (json.JSONDecodeError, GitHubContractError, GitHubRuntimeError, TypeError, ValueError) as error:
-            return GitHubReadResult(request, failure=GitHubFailure(
-                GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
-                _repository_inventory_failure_reason(
-                    _classify_repository_inventory_error(error), _repository_inventory_failure_stage(error),
-                ),
-            ))
+        except GitHubContractError:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.RESULT_SEALING,
+            )
 
     def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
         """Compose REST issue metadata with every native GraphQL child page."""
@@ -1332,11 +1401,15 @@ class _CredentialedGhRunnerAdapter:
             exit_code = getattr(result, "returncode", getattr(result, "exit_code", None))
             stdout = getattr(result, "stdout", None)
         except Exception as error:
-            raise GitHubRuntimeError("credentialed GitHub read host failed") from error
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+            ) from error
         try:
             return _GhCommandResult(exit_code, stdout)
         except GitHubRuntimeError as error:
-            raise GitHubRuntimeError("credentialed GitHub read host result is invalid") from error
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.CAPABILITY,
+            ) from error
 
 
 def create_credentialed_github_read_capability(
@@ -4378,6 +4451,33 @@ def _raw_bool(mapping: Mapping[str, object], key: str) -> bool:
     return value
 
 
+def _inventory_graphql_envelope(raw: object) -> Mapping[str, object]:
+    """Require a complete GraphQL success envelope before inventory parsing."""
+
+    if type(raw) is not dict:
+        raise _RepositoryInventoryDiagnosticError(RepositoryInventoryFailureStage.ROOT)
+    if (
+        "data" not in raw
+        or "errors" in raw
+        or type(raw["data"]) is not dict
+    ):
+        raise _RepositoryInventoryDiagnosticError(
+            RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE,
+        )
+    return raw
+
+
+def _decode_inventory_graphql(stdout: str) -> Mapping[str, object]:
+    """Decode one private host response into a required GraphQL envelope."""
+
+    try:
+        return _inventory_graphql_envelope(json.loads(stdout))
+    except json.JSONDecodeError as error:
+        raise _RepositoryInventoryDiagnosticError(
+            RepositoryInventoryFailureStage.JSON_DECODING,
+        ) from error
+
+
 def _inventory_connection_nodes(
     connection: Mapping[str, object], page: Mapping[str, object],
 ) -> list[object]:
@@ -4659,7 +4759,9 @@ def _complete_repository_inventory_connection(
         outcome = runner.run(_repository_inventory_connection_command(request, connection, cursor, number))
         if outcome.exit_code != 0:
             raise GitHubRuntimeError("inventory continuation host failed")
-        page_value = _inventory_continuation_connection(request, json.loads(outcome.stdout), connection, number)
+        page_value = _inventory_continuation_connection(
+            request, _decode_inventory_graphql(outcome.stdout), connection, number,
+        )
         page_total = _raw_integer(page_value, "totalCount")
         page_info = _raw_mapping(page_value.get("pageInfo"))
         page_has_next = _raw_bool(page_info, "hasNextPage")
@@ -4796,7 +4898,7 @@ def _complete_repository_inventory_check_suites(
                 if outcome.exit_code != 0:
                     raise GitHubRuntimeError("inventory check-suite continuation failed")
                 page_total, page_nodes, has_next, next_cursor = _project_repository_inventory_check_suites_page(
-                    request, json.loads(outcome.stdout), commit_oid,
+                    request, _decode_inventory_graphql(outcome.stdout), commit_oid,
                 )
                 if page_total != total or len(suite_nodes) + len(page_nodes) > total:
                     raise GitHubRuntimeError("inventory check pagination is incomplete")

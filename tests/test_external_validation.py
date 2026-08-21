@@ -856,7 +856,7 @@ class ExternalValidationTests(unittest.TestCase):
             self.assertIsNotNone(stage)
             assert stage is not None
             return stage
-        root_inventory = {"private-root-marker": "must-not-escape"}
+        root_inventory: object = []
         repository_inventory = json.loads(json.dumps(raw_inventory))
         repository_inventory["data"]["repository"]["owner"]["login"] = "unexpected-owner"
         connection_inventory = json.loads(json.dumps(raw_inventory))
@@ -884,6 +884,41 @@ class ExternalValidationTests(unittest.TestCase):
             ),
             RepositoryInventoryFailureStage.UNKNOWN,
         )
+        def outer_failure_stage(host: object) -> tuple[external_validation.RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage, str]:
+            failed = create_credentialed_github_read_capability(
+                host, binding, dependency_control, health, clock=lambda: now,
+            ).read(request)
+            self.assertFalse(failed.ok)
+            assert failed.failure is not None
+            code = repository_inventory_failure_code(failed.failure.public_reason)
+            stage = repository_inventory_failure_stage(failed.failure.public_reason)
+            self.assertIsNotNone(code)
+            self.assertIsNotNone(stage)
+            assert code is not None and stage is not None
+            return code, stage, failed.failure.public_reason
+        class TransportFailureHost:
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                raise RuntimeError("private transport marker")
+        class InvalidResultHost:
+            def run(self, arguments: tuple[str, ...]) -> object:
+                return object()
+        class InvalidJsonHost:
+            def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
+                return OpaqueResult(0, "{private-json-marker")
+        normalizer_inventory = json.loads(json.dumps(raw_inventory))
+        normalizer_inventory["data"]["repository"]["id"] = "invalid repository identity"
+        for label, host, expected_stage in (
+            ("transport", TransportFailureHost(), RepositoryInventoryFailureStage.TRANSPORT),
+            ("capability", InvalidResultHost(), RepositoryInventoryFailureStage.CAPABILITY),
+            ("json", InvalidJsonHost(), RepositoryInventoryFailureStage.JSON_DECODING),
+            ("graphql-envelope", OpaqueCredentialHost({"errors": [{"message": "private-graphql-marker"}]}), RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE),
+            ("normalizer", OpaqueCredentialHost(normalizer_inventory), RepositoryInventoryFailureStage.NORMALIZER),
+        ):
+            with self.subTest(outer_inventory_stage=label):
+                code, stage, public_reason = outer_failure_stage(host)
+                self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+                self.assertEqual(stage, expected_stage)
+                self.assertNotIn("private", public_reason)
         for label, title, body, expected in (
             ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("malformed-dependency-marker", "Dependency fixture", "- Blocked by #not-an-issue", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),

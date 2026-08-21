@@ -5134,34 +5134,37 @@ def _inventory_section_identity(section: RepositoryInventorySection, node: objec
     return _raw_id(value, "id")
 
 
-def _inventory_roundlet_trace_facts(nodes: list[object]) -> tuple[RepositoryInventoryFact, ...]:
+def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[RepositoryInventoryFact, ...]:
     """Project bounded marker fields only; never retain comment bodies."""
 
-    records: list[tuple[str, str, str, str, str]] = []
-    for node in nodes:
+    records: list[tuple[str, str, str, str, str, str, str]] = []
+    for surface, node in nodes:
         value = _raw_mapping(node)
         body = _raw_optional_text(value, "body")
         if body is None:
             continue
         match = _ROUNDLET_FAILOVER_TRACE.fullmatch(body)
         if match is not None:
-            records.append(match.groups())
+            records.append((surface, _raw_id(value, "id"), *match.groups()))
     if not records:
         return ()
-    if len(records) != 3 or tuple((profile, disposition) for profile, disposition, _round, _ready_at, _candidate in records) != (
+    if len(records) != 3 or tuple((profile, disposition) for _surface, _identity, profile, disposition, _round, _ready_at, _candidate in records) != (
         ("sol", "cancelled"), ("terra", "invalid-context"), ("terra", "pass"),
     ):
         raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
-    rounds = {round_id for _profile, _disposition, round_id, _ready_at, _candidate in records}
-    ready_values = {ready_at for _profile, _disposition, _round_id, ready_at, _candidate in records}
-    candidates = {candidate for _profile, _disposition, _round_id, _ready_at, candidate in records}
+    rounds = {round_id for _surface, _identity, _profile, _disposition, round_id, _ready_at, _candidate in records}
+    ready_values = {ready_at for _surface, _identity, _profile, _disposition, _round_id, ready_at, _candidate in records}
+    candidates = {candidate for _surface, _identity, _profile, _disposition, _round_id, _ready_at, candidate in records}
     if rounds != {"formal-round-1"} or len(ready_values) != 1 or len(candidates) != 1:
         raise GitHubRuntimeError("inventory Roundlet failover trace is inconsistent")
     facts: list[RepositoryInventoryFact] = []
-    for ordinal, (profile, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
+    for ordinal, (surface, identity, profile, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
         facts.extend((
             RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "profile", profile),
             RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "disposition", disposition),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "surface", surface),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "marker", "lifecycle"),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "semantic", f"supervisor-{ordinal}"),
         ))
     facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", next(iter(candidates))))
     facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", next(iter(ready_values))))
@@ -5217,7 +5220,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         RepositoryInventorySection.CLOSING_REFERENCES: [],
     }
     facts: list[RepositoryInventoryFact] = []
-    trace_nodes: list[object] = []
+    trace_nodes: list[tuple[str, object]] = []
     for issue in root_nodes[RepositoryInventorySection.ISSUES]:
         value = _raw_mapping(issue)
         subject = f"issue-{_raw_integer(value, 'number')}"
@@ -5230,14 +5233,14 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         if _raw_bool(comment_page, "hasNextPage") or _raw_integer(comment_connection, "totalCount") != len(comment_nodes):
             raise GitHubRuntimeError("inventory nested pagination is incomplete")
         nested[RepositoryInventorySection.COMMENTS].append(comment_connection)
-        trace_nodes.extend(comment_nodes)
+        trace_nodes.extend(("issue", node) for node in comment_nodes)
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
             if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
             if section is RepositoryInventorySection.COMMENTS:
-                trace_nodes.extend(nodes)
+                trace_nodes.extend(("pull-request", node) for node in nodes)
             for node in nodes:
                 child = _raw_mapping(node)
                 fact_value = (

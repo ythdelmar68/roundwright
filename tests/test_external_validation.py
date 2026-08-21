@@ -800,6 +800,31 @@ class ExternalValidationTests(unittest.TestCase):
             RepositoryInventoryFailureStage.CONNECTION_NODES,
         )
         self.assertNotIn("provider-secret-must-not-escape", diagnostic_result.failure.public_reason)
+        for label, total_count, has_next, remove_nodes in (
+            ("missing-terminal-empty", 0, False, True),
+            ("nonempty-null", 1, False, False),
+            ("paginated-null", 0, True, False),
+        ):
+            with self.subTest(null_nodes_boundary=label):
+                malformed_inventory = json.loads(json.dumps(raw_inventory))
+                connection = malformed_inventory["data"]["repository"]["issues"]["nodes"][1]["labels"]
+                connection["totalCount"] = total_count
+                connection["pageInfo"]["hasNextPage"] = has_next
+                if remove_nodes:
+                    connection.pop("nodes")
+                failed = create_credentialed_github_read_capability(
+                    OpaqueCredentialHost(malformed_inventory), binding, dependency_control, health, clock=lambda: now,
+                ).read(request)
+                self.assertFalse(failed.ok)
+                assert failed.failure is not None
+                self.assertEqual(
+                    repository_inventory_failure_code(failed.failure.public_reason),
+                    external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                )
+                self.assertEqual(
+                    repository_inventory_failure_stage(failed.failure.public_reason),
+                    RepositoryInventoryFailureStage.CONNECTION_NODES,
+                )
         for label, title, body, expected in (
             ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("malformed-dependency-marker", "Dependency fixture", "- Blocked by #not-an-issue", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),

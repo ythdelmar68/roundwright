@@ -4356,7 +4356,11 @@ def _inventory_connection_nodes(
     provider output.
     """
 
-    nodes = connection.get("nodes")
+    if "nodes" not in connection:
+        raise _RepositoryInventoryDiagnosticError(
+            RepositoryInventoryFailureStage.CONNECTION_NODES,
+        )
+    nodes = connection["nodes"]
     if type(nodes) is list:
         return nodes
     if (

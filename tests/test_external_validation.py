@@ -597,12 +597,13 @@ class ExternalValidationTests(unittest.TestCase):
             stdout: str
 
         class OpaqueCredentialHost:
-            def __init__(self, payload: object, *, issue_page: object | None = None, pull_request_page: object | None = None, comment_page: object | None = None, exit_code: int = 0) -> None:
+            def __init__(self, payload: object, *, issue_page: object | None = None, pull_request_page: object | None = None, comment_page: object | None = None, nested_pages: dict[str, object] | None = None, exit_code: int = 0) -> None:
                 self.commands: list[tuple[str, ...]] = []
                 self.payload = payload
                 self.issue_page = issue_page
                 self.pull_request_page = pull_request_page
                 self.comment_page = comment_page
+                self.nested_pages = {} if nested_pages is None else nested_pages
                 self.exit_code = exit_code
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
                 self.commands.append(arguments)
@@ -631,6 +632,24 @@ class ExternalValidationTests(unittest.TestCase):
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
                         "name": name, "owner": {"login": owner}, "pullRequest": {"number": 81, "comments": self.comment_page},
                     }}}))
+                selections = {
+                    "labels(first:100,after:$cursor": ("issue", "labels"),
+                    "subIssues(first:100,after:$cursor": ("issue", "subIssues"),
+                    "reviews(first:100,after:$cursor": ("pullRequest", "reviews"),
+                    "reviewRequests(first:100,after:$cursor": ("pullRequest", "reviewRequests"),
+                    "closingIssuesReferences(first:100,after:$cursor": ("pullRequest", "closingIssuesReferences"),
+                    "refs(first:100,after:$cursor": (None, "refs"),
+                }
+                for selector, (target, field) in selections.items():
+                    if selector in arguments[4] and field in self.nested_pages:
+                        page = self.nested_pages[field]
+                        number = next((int(value.removeprefix("number=")) for value in arguments if value.startswith("number=")), None)
+                        body: dict[str, object] = {"name": name, "owner": {"login": owner}}
+                        if target is None:
+                            body[field] = page
+                        else:
+                            body[target] = {"number": number, field: page}
+                        return OpaqueResult(0, json.dumps({"data": {"repository": body}}))
                 return OpaqueResult(0, json.dumps(self.payload))
 
         scheduling_host = OpaqueCredentialHost(raw_inventory)
@@ -652,6 +671,35 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.WORKFLOW_RUNS).page_count, 4)
         self.assertEqual(inventory_evidence.collection(RepositoryInventorySection.MERGEABILITY).page_count, 1)
         self.assertTrue(all(item.item_identities == tuple(sorted(set(item.item_identities))) for item in inventory_evidence.collections))
+        multipage_inventory = json.loads(json.dumps(raw_inventory))
+        issue = multipage_inventory["data"]["repository"]["issues"]["nodes"][0]
+        pull = multipage_inventory["data"]["repository"]["pullRequests"]["nodes"][0]
+        refs = multipage_inventory["data"]["repository"]["refs"]
+        first = {"totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"}, "nodes": None}
+        issue["labels"] = {**first, "nodes": [{"name": "first-label"}]}
+        issue["subIssues"] = {**first, "nodes": [{"number": 3}]}
+        multipage_inventory["data"]["repository"]["issues"]["nodes"][2]["title"] = "ordinary fixture"
+        pull["reviews"] = {**first, "nodes": [{"id": "review-1"}]}
+        pull["reviewRequests"] = {**first, "nodes": [{"id": "review-request-1"}]}
+        pull["closingIssuesReferences"] = {**first, "nodes": [{"number": 1}]}
+        refs.update({**first, "nodes": [{"name": "main", "target": {"oid": inputs.target_baseline_sha}}]})
+        terminal = {"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}}
+        multipage_host = OpaqueCredentialHost(multipage_inventory, nested_pages={
+            "labels": {**terminal, "nodes": [{"name": "z-label"}]},
+            "subIssues": {**terminal, "nodes": [{"number": 2}]},
+            "reviews": {**terminal, "nodes": [{"id": "review-2"}]},
+            "reviewRequests": {**terminal, "nodes": [{"id": "review-request-2"}]},
+            "closingIssuesReferences": {**terminal, "nodes": [{"number": 2}]},
+            "refs": {**terminal, "nodes": [{"name": "z-branch", "target": {"oid": inputs.target_baseline_sha}}]},
+        })
+        multipage_result = create_credentialed_github_read_capability(multipage_host, binding, dependency_control, health, clock=lambda: now).read(GitHubReadRequest(GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha))
+        self.assertTrue(multipage_result.ok)
+        assert multipage_result.snapshot is not None
+        for section, pages in ((RepositoryInventorySection.ISSUE_LABELS, 4), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, 4), (RepositoryInventorySection.REVIEWS, 2), (RepositoryInventorySection.REQUESTED_REVIEWERS, 2), (RepositoryInventorySection.CLOSING_REFERENCES, 2), (RepositoryInventorySection.REMOTE_HEADS, 2)):
+            self.assertEqual(multipage_result.snapshot.collection(section).page_count, pages)
+            self.assertEqual(multipage_result.snapshot.collection(section).item_identities, tuple(sorted(multipage_result.snapshot.collection(section).item_identities)))
+        self.assertIn(RepositoryInventoryFact("pull-request-81", "state", "merged"), multipage_result.snapshot.facts)
+        self.assertEqual(sum("after:$cursor" in command[4] for command in multipage_host.commands), 8)
         self.assertNotIn(RepositoryInventoryFact("pull-request-81", "head-sha", inputs.candidate_sha), scheduling_result.snapshot.facts)
         self.assertIn(RepositoryInventoryFact("issue-3", "depends-on", "issue-2"), scheduling_result.snapshot.facts)
         self.assertNotIn(RepositoryInventoryFact("issue-1", "depends-on", "issue-2"), scheduling_result.snapshot.facts)

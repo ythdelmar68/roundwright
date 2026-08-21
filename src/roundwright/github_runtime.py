@@ -106,8 +106,19 @@ class RepositoryInventoryReadFailureCode(StrEnum):
     TIME_OR_HEALTH_FAILURE = "time-or-health-failure"
 
 
-def _repository_inventory_failure_reason(code: RepositoryInventoryReadFailureCode) -> str:
-    return f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+class RepositoryInventoryFailureStage(StrEnum):
+    """Closed, public-safe inventory structural categories."""
+
+    UNKNOWN = "unknown"
+    CONNECTION_NODES = "connection-nodes"
+
+
+def _repository_inventory_failure_reason(
+    code: RepositoryInventoryReadFailureCode,
+    stage: RepositoryInventoryFailureStage = RepositoryInventoryFailureStage.UNKNOWN,
+) -> str:
+    prefix = f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+    return prefix if stage is RepositoryInventoryFailureStage.UNKNOWN else f"{prefix}:{stage.value}"
 
 
 def repository_inventory_failure_code(public_reason: object) -> RepositoryInventoryReadFailureCode | None:
@@ -119,9 +130,30 @@ def repository_inventory_failure_code(public_reason: object) -> RepositoryInvent
     if not public_reason.startswith(prefix):
         return None
     try:
-        return RepositoryInventoryReadFailureCode(public_reason.removeprefix(prefix))
+        return RepositoryInventoryReadFailureCode(public_reason.removeprefix(prefix).partition(":")[0])
     except ValueError:
         return None
+
+
+def repository_inventory_failure_stage(public_reason: object) -> RepositoryInventoryFailureStage | None:
+    """Decode the optional closed structural category without provider detail."""
+
+    if type(public_reason) is not str:
+        return None
+    prefix = ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":"
+    if not public_reason.startswith(prefix):
+        return None
+    _code, separator, value = public_reason.removeprefix(prefix).partition(":")
+    if not separator:
+        return RepositoryInventoryFailureStage.UNKNOWN
+    try:
+        return RepositoryInventoryFailureStage(value)
+    except ValueError:
+        return RepositoryInventoryFailureStage.UNKNOWN
+
+
+def _repository_inventory_failure_stage(error: BaseException) -> RepositoryInventoryFailureStage:
+    return error.stage if type(error) is _RepositoryInventoryDiagnosticError else RepositoryInventoryFailureStage.UNKNOWN
 
 
 def _classify_repository_inventory_error(error: BaseException) -> RepositoryInventoryReadFailureCode:
@@ -145,6 +177,14 @@ def _classify_repository_inventory_error(error: BaseException) -> RepositoryInve
 
 class GitHubRuntimeError(ValueError):
     """Raised when runtime-only adapter evidence is malformed."""
+
+
+class _RepositoryInventoryDiagnosticError(GitHubRuntimeError):
+    """Carry only a reviewed structural category to the sealed boundary."""
+
+    def __init__(self, stage: RepositoryInventoryFailureStage) -> None:
+        self.stage = stage
+        super().__init__("inventory structural validation failed")
 
 
 def _trusted_utc_now() -> datetime:
@@ -820,7 +860,9 @@ class _OwnerGitHubReadHostEndpoint:
         except (json.JSONDecodeError, GitHubContractError, GitHubRuntimeError, TypeError, ValueError) as error:
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
-                _repository_inventory_failure_reason(_classify_repository_inventory_error(error)),
+                _repository_inventory_failure_reason(
+                    _classify_repository_inventory_error(error), _repository_inventory_failure_stage(error),
+                ),
             ))
 
     def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
@@ -4302,6 +4344,32 @@ def _raw_bool(mapping: Mapping[str, object], key: str) -> bool:
     return value
 
 
+def _inventory_connection_nodes(
+    connection: Mapping[str, object], page: Mapping[str, object],
+) -> list[object]:
+    """Accept only GitHub's terminal empty/null connection representation.
+
+    GraphQL may encode an empty terminal connection as ``nodes: null``.  That
+    shape carries no missing evidence when its declared count is zero and it
+    has no next page.  Every other non-list representation remains a sealed,
+    fail-closed structural error; the stage retains neither a field value nor
+    provider output.
+    """
+
+    nodes = connection.get("nodes")
+    if type(nodes) is list:
+        return nodes
+    if (
+        nodes is None
+        and _raw_integer(connection, "totalCount") == 0
+        and not _raw_bool(page, "hasNextPage")
+    ):
+        return []
+    raise _RepositoryInventoryDiagnosticError(
+        RepositoryInventoryFailureStage.CONNECTION_NODES,
+    )
+
+
 def _raw_number_matches(mapping: Mapping[str, object], request: GitHubReadRequest) -> None:
     if request.number is None or _raw_integer(mapping, "number") != request.number:
         raise GitHubRuntimeError("gh response number does not match request")
@@ -4522,10 +4590,10 @@ def _complete_repository_inventory_connection(
     if type(value) is not dict or not 0 < maximum <= 3200:
         raise GitHubRuntimeError("inventory connection is malformed")
     total = _raw_integer(value, "totalCount")
-    nodes = value.get("nodes")
     page = _raw_mapping(value.get("pageInfo"))
     has_next = _raw_bool(page, "hasNextPage")
-    if type(nodes) is not list or total < 0 or total > maximum or len(nodes) > 100 or len(nodes) > total:
+    nodes = _inventory_connection_nodes(value, page)
+    if total < 0 or total > maximum or len(nodes) > 100 or len(nodes) > total:
         raise GitHubRuntimeError("inventory connection cardinality exceeds bound")
     identities = {_inventory_connection_identity(connection, node) for node in nodes}
     if len(identities) != len(nodes):
@@ -4547,10 +4615,10 @@ def _complete_repository_inventory_connection(
             raise GitHubRuntimeError("inventory continuation host failed")
         page_value = _inventory_continuation_connection(request, json.loads(outcome.stdout), connection, number)
         page_total = _raw_integer(page_value, "totalCount")
-        page_nodes = page_value.get("nodes")
         page_info = _raw_mapping(page_value.get("pageInfo"))
         page_has_next = _raw_bool(page_info, "hasNextPage")
-        if type(page_nodes) is not list or page_total != total or len(page_nodes) > 100 or len(merged) + len(page_nodes) > total:
+        page_nodes = _inventory_connection_nodes(page_value, page_info)
+        if page_total != total or len(page_nodes) > 100 or len(merged) + len(page_nodes) > total:
             raise GitHubRuntimeError("inventory connection cardinality is incomplete")
         page_ids = {_inventory_connection_identity(connection, node) for node in page_nodes}
         if len(page_ids) != len(page_nodes) or identities.intersection(page_ids):
@@ -4586,10 +4654,14 @@ def _complete_repository_inventory_connections(
         raise GitHubRuntimeError("inventory default head does not match baseline")
     for connection, key in (("issues", "issues"), ("pull-requests", "pullRequests"), ("refs", "refs")):
         _complete_repository_inventory_connection(request, runner, connection, repository.get(key))
-    issues = _raw_mapping(repository.get("issues")).get("nodes")
-    pull_requests = _raw_mapping(repository.get("pullRequests")).get("nodes")
-    if type(issues) is not list or type(pull_requests) is not list:
-        raise GitHubRuntimeError("inventory main connection is malformed")
+    issues_connection = _raw_mapping(repository.get("issues"))
+    pull_requests_connection = _raw_mapping(repository.get("pullRequests"))
+    issues = _inventory_connection_nodes(
+        issues_connection, _raw_mapping(issues_connection.get("pageInfo")),
+    )
+    pull_requests = _inventory_connection_nodes(
+        pull_requests_connection, _raw_mapping(pull_requests_connection.get("pageInfo")),
+    )
     for node in issues:
         issue = _raw_mapping(node)
         number = _raw_integer(issue, "number")
@@ -4630,19 +4702,18 @@ def _complete_repository_inventory_check_suites(
     if _raw_text(_raw_mapping(default_ref.get("target")), "oid") != request.expected_sha:
         raise GitHubRuntimeError("inventory default head does not match baseline")
     pull_requests = _raw_mapping(repository.get("pullRequests"))
-    pull_request_nodes = pull_requests.get("nodes")
-    if type(pull_request_nodes) is not list:
-        raise GitHubRuntimeError("inventory pull-request collection is malformed")
+    pull_request_nodes = _inventory_connection_nodes(
+        pull_requests, _raw_mapping(pull_requests.get("pageInfo")),
+    )
     for pull_request_node in pull_request_nodes:
         pull_request = _raw_mapping(pull_request_node)
         commits = _raw_mapping(pull_request.get("commits"))
-        commit_nodes = commits.get("nodes")
         commit_page = _raw_mapping(commits.get("pageInfo"))
-        if _raw_integer(commits, "totalCount") > 100 or (type(commit_nodes) is list and len(commit_nodes) > 100):
+        commit_nodes = _inventory_connection_nodes(commits, commit_page)
+        if _raw_integer(commits, "totalCount") > 100 or len(commit_nodes) > 100:
             raise GitHubRuntimeError("inventory commit cardinality exceeds bound")
         if (
-            type(commit_nodes) is not list
-            or _raw_bool(commit_page, "hasNextPage")
+            _raw_bool(commit_page, "hasNextPage")
             or _raw_integer(commits, "totalCount") != len(commit_nodes)
         ):
             raise GitHubRuntimeError("inventory commit pagination is incomplete")
@@ -4655,12 +4726,12 @@ def _complete_repository_inventory_check_suites(
             if type(suites) is not dict:
                 raise GitHubRuntimeError("inventory check-suite collection is malformed")
             total = _raw_integer(suites, "totalCount")
-            initial_nodes = suites.get("nodes")
             page = _raw_mapping(suites.get("pageInfo"))
             has_next = _raw_bool(page, "hasNextPage")
-            if total > 100 or (type(initial_nodes) is list and len(initial_nodes) > 100):
+            initial_nodes = _inventory_connection_nodes(suites, page)
+            if total > 100 or len(initial_nodes) > 100:
                 raise GitHubRuntimeError("inventory check-suite cardinality exceeds bound")
-            if type(initial_nodes) is not list or total < 0 or len(initial_nodes) > total:
+            if total < 0 or len(initial_nodes) > total:
                 raise GitHubRuntimeError("inventory check pagination is incomplete")
             suite_nodes = list(initial_nodes)
             seen_ids = {_raw_id(_raw_mapping(node), "id") for node in suite_nodes}
@@ -4717,9 +4788,9 @@ def _project_repository_inventory_check_suites_page(
     if _raw_text(commit, "oid") != commit_oid:
         raise GitHubRuntimeError("inventory continuation commit does not match request")
     suites = _raw_mapping(commit.get("checkSuites"))
-    nodes = suites.get("nodes")
     page = _raw_mapping(suites.get("pageInfo"))
-    if type(nodes) is not list or len(nodes) > 100:
+    nodes = _inventory_connection_nodes(suites, page)
+    if len(nodes) > 100:
         raise GitHubRuntimeError("inventory check pagination is incomplete")
     return _raw_integer(suites, "totalCount"), nodes, _raw_bool(page, "hasNextPage"), page.get("endCursor")
 
@@ -4793,15 +4864,17 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         RepositoryInventorySection.REMOTE_HEADS: "refs",
     }
     roots: dict[RepositoryInventorySection, Mapping[str, object]] = {}
+    root_nodes: dict[RepositoryInventorySection, list[object]] = {}
     for section, key in collection_keys.items():
         connection = _raw_mapping(repository.get(key))
         page = _raw_mapping(connection.get("pageInfo"))
+        nodes = _inventory_connection_nodes(connection, page)
         if _raw_bool(page, "hasNextPage"):
             raise GitHubRuntimeError("inventory pagination is incomplete")
-        nodes = connection.get("nodes")
-        if type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes) or len(nodes) > 3200:
+        if _raw_integer(connection, "totalCount") != len(nodes) or len(nodes) > 3200:
             raise GitHubRuntimeError("inventory collection is incomplete")
         roots[section] = connection
+        root_nodes[section] = nodes
     issues = roots[RepositoryInventorySection.ISSUES]
     pull_requests = roots[RepositoryInventorySection.PULL_REQUESTS]
     refs = roots[RepositoryInventorySection.REMOTE_HEADS]
@@ -4817,7 +4890,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         RepositoryInventorySection.CLOSING_REFERENCES: [],
     }
     facts: list[RepositoryInventoryFact] = []
-    for issue in issues["nodes"]:  # type: ignore[index]
+    for issue in root_nodes[RepositoryInventorySection.ISSUES]:
         value = _raw_mapping(issue)
         subject = f"issue-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
@@ -4826,8 +4899,8 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         body = _raw_optional_text(value, "body")
         facts.extend(_inventory_scheduling_facts(subject, _raw_text(value, "title"), "" if body is None else body))
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
-            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")
-            if _raw_bool(page, "hasNextPage") or type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes):
+            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
+            if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
             for node in nodes:
@@ -4863,7 +4936,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         if len(malformed_parents) != 1 or malformed_parents != owner_input_parents:
             raise GitHubRuntimeError("inventory malformed-parent topology is incomplete")
         facts.append(RepositoryInventoryFact(malformed_child, "malformed-parent", "owner-input"))
-    for pull_request in pull_requests["nodes"]:  # type: ignore[index]
+    for pull_request in root_nodes[RepositoryInventorySection.PULL_REQUESTS]:
         value = _raw_mapping(pull_request); subject = f"pull-request-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
         head_sha = _raw_optional_text(value, "headRefOid")
@@ -4871,22 +4944,21 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             facts.append(RepositoryInventoryFact(subject, "head-sha", head_sha))
         nested[RepositoryInventorySection.MERGEABILITY].append(value)
         for section, key in ((RepositoryInventorySection.COMMENTS, "comments"), (RepositoryInventorySection.REVIEWS, "reviews"), (RepositoryInventorySection.REQUESTED_REVIEWERS, "reviewRequests"), (RepositoryInventorySection.CLOSING_REFERENCES, "closingIssuesReferences")):
-            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")
-            if _raw_bool(page, "hasNextPage") or type(nodes) is not list or _raw_integer(connection, "totalCount") != len(nodes):
+            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
+            if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
-        commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = commits.get("nodes")
+        commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = _inventory_connection_nodes(commits, commits_page)
         if (
             _raw_bool(commits_page, "hasNextPage")
-            or type(commit_nodes) is not list
             or _raw_integer(commits, "totalCount") != len(commit_nodes)
             or len(commit_nodes) > 100
         ):
             raise GitHubRuntimeError("inventory commit pagination is incomplete")
         for commit_node in commit_nodes:
             commit = _raw_mapping(_raw_mapping(commit_node).get("commit"))
-            suites = _raw_mapping(commit.get("checkSuites")); suites_page = _raw_mapping(suites.get("pageInfo")); suite_nodes = suites.get("nodes")
-            if _raw_bool(suites_page, "hasNextPage") or type(suite_nodes) is not list or _raw_integer(suites, "totalCount") != len(suite_nodes):
+            suites = _raw_mapping(commit.get("checkSuites")); suites_page = _raw_mapping(suites.get("pageInfo")); suite_nodes = _inventory_connection_nodes(suites, suites_page)
+            if _raw_bool(suites_page, "hasNextPage") or _raw_integer(suites, "totalCount") != len(suite_nodes):
                 raise GitHubRuntimeError("inventory check pagination is incomplete")
             nested[RepositoryInventorySection.CHECKS].append(suites)
             for suite in suite_nodes:
@@ -4899,7 +4971,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         source: object = roots.get(section, nested.get(section, repository))
         identities: list[str] = []
         if section in roots:
-            for node in roots[section]["nodes"]:  # type: ignore[index]
+            for node in root_nodes[section]:
                 item = _raw_mapping(node)
                 identities.append(
                     _raw_id(item, "id") if type(item.get("id")) is str else _raw_text(item, "name")

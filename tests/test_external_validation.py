@@ -51,9 +51,11 @@ from roundwright.github_runtime import (
     CapabilityState,
     GitHubCapabilityHealth,
     OperationHealth,
+    RepositoryInventoryFailureStage,
     credentialed_repository_inventory_failure_code,
     create_credentialed_github_read_capability,
     repository_inventory_failure_code,
+    repository_inventory_failure_stage,
 )
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
@@ -517,7 +519,7 @@ class ExternalValidationTests(unittest.TestCase):
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
                     {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
-                    {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
+                    {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                     {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
                 "pullRequests": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
@@ -779,6 +781,25 @@ class ExternalValidationTests(unittest.TestCase):
             self.assertIsNotNone(code)
             assert code is not None
             return code
+        diagnostic_inventory = json.loads(json.dumps(raw_inventory))
+        diagnostic_connection = diagnostic_inventory["data"]["repository"]["issues"]["nodes"][1]["labels"]
+        diagnostic_connection["totalCount"] = 1
+        diagnostic_connection["nodes"] = None
+        diagnostic_connection["private-response-marker"] = "provider-secret-must-not-escape"
+        diagnostic_result = create_credentialed_github_read_capability(
+            OpaqueCredentialHost(diagnostic_inventory), binding, dependency_control, health, clock=lambda: now,
+        ).read(request)
+        self.assertFalse(diagnostic_result.ok)
+        assert diagnostic_result.failure is not None
+        self.assertEqual(
+            repository_inventory_failure_code(diagnostic_result.failure.public_reason),
+            external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+        )
+        self.assertEqual(
+            repository_inventory_failure_stage(diagnostic_result.failure.public_reason),
+            RepositoryInventoryFailureStage.CONNECTION_NODES,
+        )
+        self.assertNotIn("provider-secret-must-not-escape", diagnostic_result.failure.public_reason)
         for label, title, body, expected in (
             ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("malformed-dependency-marker", "Dependency fixture", "- Blocked by #not-an-issue", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),

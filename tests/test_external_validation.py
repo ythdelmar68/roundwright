@@ -458,6 +458,34 @@ class ExternalValidationTests(unittest.TestCase):
                 external_validation.execute_live_lifecycle_shadow_session(session.public_receipt(), root, capability)
             self.assertEqual(capability.calls, 0)
 
+    def test_live_lifecycle_concurrent_execute_claims_one_winner_before_provider_access(self) -> None:
+        """An overlap barrier proves a loser cannot reach the provider seam."""
+        class Capability:
+            def read(self, request: object) -> object:
+                raise AssertionError("the patched provider seam is the only permitted access")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, "sha256:" + "f" * 64)
+            entered, release, calls, outcomes = Event(), Event(), [], []
+            def materialize(*_arguments: object) -> object:
+                calls.append("provider")
+                entered.set()
+                release.wait(2)
+                return {"status": "fake"}
+            def execute() -> None:
+                try:
+                    outcomes.append(external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, Capability()))
+                except external_validation.ExternalValidationAdapterError as error:
+                    outcomes.append(str(error))
+            with patch.object(external_validation, "_materialize_live_lifecycle_shadow_profile", materialize):
+                first, second = Thread(target=execute), Thread(target=execute)
+                first.start(); self.assertTrue(entered.wait(2)); second.start(); second.join(2); release.set(); first.join(2)
+            self.assertEqual(calls, ["provider"])
+            self.assertEqual(outcomes.count({"status": "fake"}), 1)
+            self.assertTrue(any(type(value) is str and ("already consumed" in value or "not trace-confirmed" in value) for value in outcomes))
+
     def test_live_lifecycle_inventory_category_drift_blocks_before_harness_execute(self) -> None:
         def inventory(repository: RepositoryRef, comment_evidence: str) -> RepositoryInventorySnapshot:
             collections = []

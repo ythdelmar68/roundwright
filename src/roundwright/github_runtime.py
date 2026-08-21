@@ -210,6 +210,20 @@ def _repository_inventory_failure_result(
     ))
 
 
+def _seal_repository_inventory_snapshot(
+    request: GitHubReadRequest, snapshot: object,
+) -> GitHubReadResult:
+    """Seal a normalized inventory without exposing a construction failure."""
+
+    try:
+        return GitHubReadResult(request, snapshot=snapshot)  # type: ignore[arg-type]
+    except GitHubContractError:
+        return _repository_inventory_failure_result(
+            request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+            RepositoryInventoryFailureStage.RESULT_SEALING,
+        )
+
+
 def _classify_repository_inventory_error(error: BaseException) -> RepositoryInventoryReadFailureCode:
     """Map internal validation outcomes to a finite public-safe code set."""
 
@@ -960,13 +974,7 @@ class _OwnerGitHubReadHostEndpoint:
             return _repository_inventory_failure_result(
                 request, _classify_repository_inventory_error(error), stage,
             )
-        try:
-            return GitHubReadResult(request, snapshot=snapshot)
-        except GitHubContractError:
-            return _repository_inventory_failure_result(
-                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
-                RepositoryInventoryFailureStage.RESULT_SEALING,
-            )
+        return _seal_repository_inventory_snapshot(request, snapshot)
 
     def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
         """Compose REST issue metadata with every native GraphQL child page."""

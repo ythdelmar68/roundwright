@@ -10,10 +10,12 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from types import MappingProxyType, ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright import external_validation
+import roundwright.github_runtime as github_runtime
 from roundwright.hosted_evidence import (
     HostedCheck,
     HostedCheckEvidence,
@@ -919,6 +921,24 @@ class ExternalValidationTests(unittest.TestCase):
                 self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
                 self.assertEqual(stage, expected_stage)
                 self.assertNotIn("private", public_reason)
+        with patch.object(
+            github_runtime, "_repository_inventory_command",
+            side_effect=github_runtime.GitHubRuntimeError("private request marker"),
+        ):
+            code, stage, public_reason = outer_failure_stage(OpaqueCredentialHost(raw_inventory))
+        self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
+        self.assertEqual(stage, RepositoryInventoryFailureStage.REQUEST)
+        self.assertNotIn("private", public_reason)
+        sealing_result = github_runtime._seal_repository_inventory_snapshot(request, object())
+        assert sealing_result.failure is not None
+        self.assertEqual(
+            repository_inventory_failure_code(sealing_result.failure.public_reason),
+            external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+        )
+        self.assertEqual(
+            repository_inventory_failure_stage(sealing_result.failure.public_reason),
+            RepositoryInventoryFailureStage.RESULT_SEALING,
+        )
         for label, title, body, expected in (
             ("malformed-parent", "Malformed-parent fixture", "", external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION),
             ("malformed-dependency-marker", "Dependency fixture", "- Blocked by #not-an-issue", external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE),

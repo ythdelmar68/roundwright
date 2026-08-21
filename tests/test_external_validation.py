@@ -334,6 +334,89 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertNotIn("raw", json.dumps(evidence).lower())
         self.assertEqual(comparison.status, "pass")
 
+    def test_live_lifecycle_classified_mismatch_is_bounded_blocked_evidence(self) -> None:
+        differences = (
+            "candidate-drift", "ready-at-drift", "supervisor-disposition-3-drift",
+        )
+        snapshot = self.live_lifecycle_snapshot(differences)
+        adapter = external_validation.LiveLifecycleShadowProfileAdapter(snapshot)
+        producer, exporter, comparator = external_validation.live_lifecycle_shadow_component_identities()
+        exact = self.live_lifecycle_binding(adapter, producer, exporter, comparator)
+
+        execution = adapter.execute(exact)
+        evidence = adapter.project(exact, execution)
+        comparison = adapter.compare(exact, evidence)
+        projection = evidence["live_lifecycle_shadow"]
+        retained = projection["snapshot"]
+
+        self.assertEqual(execution.mutation_count, 0)
+        self.assertEqual(retained["classified_differences"], list(differences))
+        self.assertEqual(retained["classified_difference_count"], len(differences))
+        self.assertEqual(retained["ready_at"], 17)
+        self.assertNotIn("provider-secret", json.dumps(evidence))
+        self.assertNotIn("raw", json.dumps(evidence).lower())
+        self.assertEqual(comparison.status, "fail")
+        self.assertTrue(comparison.result_identity.startswith("sha256:"))
+
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            self.live_lifecycle_snapshot(tuple(f"difference-{index}" for index in range(17)))
+
+    def test_live_lifecycle_session_retains_classified_mismatch_for_sealed_execution(self) -> None:
+        def inventory(repository: RepositoryRef) -> RepositoryInventorySnapshot:
+            collections = tuple(sorted((
+                RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
+                for index, section in enumerate(RepositoryInventorySection, 1)
+            ), key=lambda item: item.section.value))
+            facts = tuple(sorted((
+                RepositoryInventoryFact("issue-4", "child", "issue-49"),
+                RepositoryInventoryFact("issue-49", "standalone", "true"),
+                RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
+                RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
+                RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
+                RepositoryInventoryFact("pull-request-81", "state", "merged"),
+                RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
+                RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
+                RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
+                RepositoryInventoryFact("lifecycle-supervisor-2", "disposition", "invalid-context"),
+                RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
+                RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "blocked"),
+                RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
+                RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
+            ), key=lambda item: (item.subject, item.predicate, item.object)))
+            return RepositoryInventorySnapshot(
+                repository, "forward-target", "main", "d" * 40,
+                "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections, facts,
+            )
+
+        class MismatchCapability:
+            def __init__(self) -> None: self.calls = 0
+            def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+                self.calls += 1
+                return GitHubReadResult(request, inventory(request.repository))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(self.live_lifecycle_request_inputs(), root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
+                session.public_receipt(), root, "sha256:" + "f" * 64,
+            )
+            capability = MismatchCapability()
+            result = external_validation.execute_live_lifecycle_shadow_session(
+                confirmed.public_receipt(), root, capability,
+            )
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace-confirmed"):
+                external_validation.execute_live_lifecycle_shadow_session(
+                    confirmed.public_receipt(), root, capability,
+                )
+        harness = sys.modules["roundwright_harness.executor"]
+        snapshot = harness.run_calls[-1][0][2].snapshot
+        self.assertEqual(result, {"status": "fake"})
+        self.assertEqual(capability.calls, 3)
+        self.assertEqual(snapshot.classified_differences, ("supervisor-disposition-3-drift",))
+        self.assertEqual(snapshot.candidate_sha, "a" * 40)
+        self.assertEqual(snapshot.ready_at, 17)
+        self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
+
     def test_public_live_lifecycle_preflight_persists_a_path_free_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -1924,7 +2007,9 @@ class ExternalValidationTests(unittest.TestCase):
             "refs/heads/codex/issue-48", 17, "run-48", "suite-48",
         )
 
-    def live_lifecycle_snapshot(self) -> external_validation.LiveLifecycleShadowSnapshot:
+    def live_lifecycle_snapshot(
+        self, classified_differences: tuple[str, ...] = (),
+    ) -> external_validation.LiveLifecycleShadowSnapshot:
         candidate = "a" * 40
         graph = ShadowV2EventGraph(
             (LifecycleAttempt("worker-49", 1, LifecycleAttemptKind.WORKER, EvidenceRole.WORKER),),
@@ -1935,7 +2020,8 @@ class ExternalValidationTests(unittest.TestCase):
             "ythdelmar68/roundlet-forward-test", "b" * 40, "b" * 40, candidate,
             "sha256:" + "1" * 64, "live-lifecycle-case", "window-49", 17, "event-49", graph,
             {name: "sha256:" + (f"{index:x}" * 64) for index, name in enumerate(external_validation._LIVE_LIFECYCLE_SNAPSHOTS, start=1)},
-            external_validation._LIVE_LIFECYCLE_FIXTURES, (), "sha256:" + "e" * 64, "sha256:" + "e" * 64,
+            external_validation._LIVE_LIFECYCLE_FIXTURES, classified_differences,
+            "sha256:" + "e" * 64, "sha256:" + "e" * 64,
         )
 
     def live_lifecycle_request_inputs(self) -> external_validation.LiveLifecycleRequestInputs:

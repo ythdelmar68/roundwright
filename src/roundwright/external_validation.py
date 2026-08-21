@@ -1069,6 +1069,7 @@ _LIVE_LIFECYCLE_SNAPSHOTS = (
     "repository", "issues", "scheduling", "pull-requests", "comments",
     "roundlet-trace", "candidates", "reviews", "checks", "merge", "cleanup",
 )
+_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES = 16
 
 _LIVE_LIFECYCLE_CATEGORY_SECTIONS = {
     "repository": (RepositoryInventorySection.REPOSITORY,),
@@ -1130,6 +1131,7 @@ class LiveLifecycleShadowSnapshot:
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
+            or len(self.classified_differences) > _LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES
             or _DIGEST.fullmatch(self.before_target_state_digest) is None
             or self.after_target_state_digest != self.before_target_state_digest
         ):
@@ -1161,6 +1163,7 @@ class LiveLifecycleShadowSnapshot:
             "snapshot_digests": dict(self.snapshot_digests),
             "fixture_classes": list(self.fixture_classes),
             "classified_differences": list(self.classified_differences),
+            "classified_difference_count": len(self.classified_differences),
             "event_graph_digest": _digest(_graph_payload(self.event_graph)),
             "zero_mutation_readback_digest": self.zero_mutation_readback_digest,
         }
@@ -1494,6 +1497,7 @@ class _LiveLifecycleProviderObservation:
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
+            or len(self.classified_differences) > _LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES
         ):
             raise ExternalValidationAdapterError("live lifecycle provider observation is invalid")
         object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
@@ -1651,10 +1655,10 @@ class _RoundwrightLiveLifecycleProvider:
             "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
             "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
             "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
-            "supervisor-failover": not _classified_lifecycle_differences(
-                _roundlet_lifecycle_projection(candidate_sha, ready_at),
-                _roundwright_lifecycle_projection(inventory, candidate_sha, ready_at),
-            ),
+            # Comparator drift is retained separately as typed blocked
+            # evidence.  This fixture confirms the route was observed; it is
+            # not a second, lossy pass/fail gate.
+            "supervisor-failover": True,
         }
         if not all(required.values()):
             raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
@@ -1667,8 +1671,6 @@ class _RoundwrightLiveLifecycleProvider:
         roundlet = _roundlet_lifecycle_projection(candidate_sha, ready_at)
         roundwright = _roundwright_lifecycle_projection(inventory, candidate_sha, ready_at)
         differences = _classified_lifecycle_differences(roundlet, roundwright)
-        if differences:
-            raise ExternalValidationAdapterError("live lifecycle projection comparison has differences")
         fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, candidate_sha, ready_at)
         snapshot_digests = {
             category: _digest({
@@ -2390,11 +2392,15 @@ class LiveLifecycleShadowProfileAdapter:
         if snapshot is None:
             raise ExternalValidationAdapterError(LIVE_LIFECYCLE_OBSERVATION_BLOCKER)
         expected = self.project(binding, self.execute(binding))
-        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        # A non-empty classified set is itself sealed blocked evidence.  It
+        # must survive projection but can never normalize to a passing result.
+        status = "fail" if snapshot.classified_differences or type(evidence) is not dict or evidence != expected else "pass"
         return _harness_executor().ProfileComparison(status, _digest({
             "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "status": status,
             "ready_at": binding.ready_at, "expected_identity": _digest(expected),
             "observed_identity": _digest(evidence),
+            "classified_differences": list(snapshot.classified_differences),
+            "classified_difference_count": len(snapshot.classified_differences),
         }))
 
 

@@ -126,12 +126,30 @@ class RepositoryInventoryFailureStage(StrEnum):
     PAGINATION = "pagination"
 
 
+class RepositoryInventoryTransportSubcategory(StrEnum):
+    """Closed public-safe facts for the credentialed host process seam."""
+
+    UNKNOWN = "unknown"
+    LAUNCH_EXCEPTION = "launch-exception"
+    INVALID_RESULT_SHAPE = "invalid-result-shape"
+    NONZERO_RETURN = "nonzero-return"
+
+
 def _repository_inventory_failure_reason(
     code: RepositoryInventoryReadFailureCode,
     stage: RepositoryInventoryFailureStage = RepositoryInventoryFailureStage.UNKNOWN,
+    transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
 ) -> str:
     prefix = f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
-    return prefix if stage is RepositoryInventoryFailureStage.UNKNOWN else f"{prefix}:{stage.value}"
+    if stage is RepositoryInventoryFailureStage.UNKNOWN:
+        return prefix
+    reason = f"{prefix}:{stage.value}"
+    if (
+        stage is RepositoryInventoryFailureStage.TRANSPORT
+        and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+    ):
+        reason += f":{transport_subcategory.value}"
+    return reason
 
 
 def repository_inventory_failure_code(public_reason: object) -> RepositoryInventoryReadFailureCode | None:
@@ -156,13 +174,35 @@ def repository_inventory_failure_stage(public_reason: object) -> RepositoryInven
     prefix = ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":"
     if not public_reason.startswith(prefix):
         return None
-    _code, separator, value = public_reason.removeprefix(prefix).partition(":")
-    if not separator:
+    values = public_reason.removeprefix(prefix).split(":")
+    if len(values) == 1:
         return RepositoryInventoryFailureStage.UNKNOWN
     try:
-        return RepositoryInventoryFailureStage(value)
+        return RepositoryInventoryFailureStage(values[1])
     except ValueError:
         return RepositoryInventoryFailureStage.UNKNOWN
+
+
+def repository_inventory_transport_subcategory(
+    public_reason: object,
+) -> RepositoryInventoryTransportSubcategory | None:
+    """Decode one closed process-seam category without retaining host detail."""
+
+    if (
+        type(public_reason) is not str
+        or repository_inventory_failure_code(public_reason) is None
+        or repository_inventory_failure_stage(public_reason) is not RepositoryInventoryFailureStage.TRANSPORT
+    ):
+        return None
+    values = public_reason.removeprefix(
+        ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":",
+    ).split(":")
+    if len(values) != 3:
+        return RepositoryInventoryTransportSubcategory.UNKNOWN
+    try:
+        return RepositoryInventoryTransportSubcategory(values[2])
+    except ValueError:
+        return RepositoryInventoryTransportSubcategory.UNKNOWN
 
 
 def _repository_inventory_failure_stage(error: BaseException) -> RepositoryInventoryFailureStage:
@@ -202,11 +242,12 @@ def _repository_inventory_failure_result(
     code: RepositoryInventoryReadFailureCode,
     stage: RepositoryInventoryFailureStage,
     kind: GitHubFailureKind = GitHubFailureKind.MALFORMED_RESPONSE,
+    transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
 ) -> GitHubReadResult:
     """Seal only fixed inventory failure tokens across outer runtime layers."""
 
     return GitHubReadResult(request, failure=GitHubFailure(
-        kind, request.operation, _repository_inventory_failure_reason(code, stage),
+        kind, request.operation, _repository_inventory_failure_reason(code, stage, transport_subcategory),
     ))
 
 
@@ -250,8 +291,22 @@ class GitHubRuntimeError(ValueError):
 class _RepositoryInventoryDiagnosticError(GitHubRuntimeError):
     """Carry only a reviewed structural category to the sealed boundary."""
 
-    def __init__(self, stage: RepositoryInventoryFailureStage) -> None:
+    def __init__(
+        self,
+        stage: RepositoryInventoryFailureStage,
+        transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
+    ) -> None:
+        if (
+            type(stage) is not RepositoryInventoryFailureStage
+            or type(transport_subcategory) is not RepositoryInventoryTransportSubcategory
+            or (
+                stage is not RepositoryInventoryFailureStage.TRANSPORT
+                and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+            )
+        ):
+            raise GitHubRuntimeError("inventory diagnostic category is invalid")
         self.stage = stage
+        self.transport_subcategory = transport_subcategory
         super().__init__("inventory structural validation failed")
 
 
@@ -935,6 +990,7 @@ class _OwnerGitHubReadHostEndpoint:
         except _RepositoryInventoryDiagnosticError as error:
             return _repository_inventory_failure_result(
                 request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+                transport_subcategory=error.transport_subcategory,
             )
         except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
             return _repository_inventory_failure_result(
@@ -945,12 +1001,14 @@ class _OwnerGitHubReadHostEndpoint:
             return _repository_inventory_failure_result(
                 request, RepositoryInventoryReadFailureCode.HOST_FAILURE,
                 RepositoryInventoryFailureStage.TRANSPORT, _failure_kind(outcome.exit_code),
+                RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
             )
         try:
             envelope = _decode_inventory_graphql(outcome.stdout)
         except _RepositoryInventoryDiagnosticError as error:
             return _repository_inventory_failure_result(
                 request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+                transport_subcategory=error.transport_subcategory,
             )
         except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
             return _repository_inventory_failure_result(
@@ -963,6 +1021,7 @@ class _OwnerGitHubReadHostEndpoint:
         except _RepositoryInventoryDiagnosticError as error:
             return _repository_inventory_failure_result(
                 request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+                transport_subcategory=error.transport_subcategory,
             )
         except GitHubContractError as error:
             return _repository_inventory_failure_result(
@@ -1333,6 +1392,7 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
         self.__pending_inventory_failure: tuple[
             GitHubReadRequest, GitHubReadResult, GitHubFailure,
             RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
+            RepositoryInventoryTransportSubcategory,
         ] | None = None
         self.__read_generation = 0
 
@@ -1350,20 +1410,28 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
         ):
             code = repository_inventory_failure_code(result.failure.public_reason)
             stage = repository_inventory_failure_stage(result.failure.public_reason)
+            transport_subcategory = repository_inventory_transport_subcategory(result.failure.public_reason)
             if code is not None and stage is not None:
+                if transport_subcategory is None:
+                    transport_subcategory = RepositoryInventoryTransportSubcategory.UNKNOWN
                 with self.__inventory_failure_lock:
                     if generation == self.__read_generation:
-                        self.__pending_inventory_failure = (request, result, result.failure, code, stage)
+                        self.__pending_inventory_failure = (
+                            request, result, result.failure, code, stage, transport_subcategory,
+                        )
         return result
 
     def _trusted_inventory_failure(
         self, request: GitHubReadRequest, result: GitHubReadResult,
-    ) -> tuple[RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage] | None:
+    ) -> tuple[
+        RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
+        RepositoryInventoryTransportSubcategory,
+    ] | None:
         with self.__inventory_failure_lock:
             retained = self.__pending_inventory_failure
             if retained is None:
                 return None
-            retained_request, retained_result, retained_failure, code, stage = retained
+            retained_request, retained_result, retained_failure, code, stage, transport_subcategory = retained
             if (
                 retained_request is request
                 and retained_result is result
@@ -1371,14 +1439,17 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
                 and result.failure is retained_failure
             ):
                 self.__pending_inventory_failure = None
-                return code, stage
+                return code, stage, transport_subcategory
             return None
 
 
 def credentialed_repository_inventory_failure(
     capability: object, request: GitHubReadRequest, result: GitHubReadResult,
-) -> tuple[RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage] | None:
-    """Return one exact factory-retained code/stage pair for a sealed result."""
+) -> tuple[
+    RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
+    RepositoryInventoryTransportSubcategory,
+] | None:
+    """Return one exact factory-retained failure tuple for a sealed result."""
 
     if (
         type(capability) is not _CredentialedGitHubReadCapability
@@ -1420,6 +1491,7 @@ class _CredentialedGhRunnerAdapter:
         except Exception as error:
             raise _RepositoryInventoryDiagnosticError(
                 RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.LAUNCH_EXCEPTION,
             ) from error
         try:
             # Do not evaluate the legacy alias unless the conventional
@@ -1435,12 +1507,14 @@ class _CredentialedGhRunnerAdapter:
         except Exception as error:
             raise _RepositoryInventoryDiagnosticError(
                 RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.INVALID_RESULT_SHAPE,
             ) from error
         try:
             return _GhCommandResult(exit_code, stdout)
         except GitHubRuntimeError as error:
             raise _RepositoryInventoryDiagnosticError(
-                RepositoryInventoryFailureStage.CAPABILITY,
+                RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.INVALID_RESULT_SHAPE,
             ) from error
 
 
@@ -4790,7 +4864,10 @@ def _complete_repository_inventory_connection(
     for _ in range(31):
         outcome = runner.run(_repository_inventory_connection_command(request, connection, cursor, number))
         if outcome.exit_code != 0:
-            raise GitHubRuntimeError("inventory continuation host failed")
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
+            )
         page_value = _inventory_continuation_connection(
             request, _decode_inventory_graphql(outcome.stdout), connection, number,
         )
@@ -4928,7 +5005,10 @@ def _complete_repository_inventory_check_suites(
             for _ in range(32):
                 outcome = runner.run(_repository_inventory_check_suites_command(request, commit_oid, cursor))
                 if outcome.exit_code != 0:
-                    raise GitHubRuntimeError("inventory check-suite continuation failed")
+                    raise _RepositoryInventoryDiagnosticError(
+                        RepositoryInventoryFailureStage.TRANSPORT,
+                        RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
+                    )
                 page_total, page_nodes, has_next, next_cursor = _project_repository_inventory_check_suites_page(
                     request, _decode_inventory_graphql(outcome.stdout), commit_oid,
                 )

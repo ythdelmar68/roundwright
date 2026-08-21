@@ -55,10 +55,12 @@ from roundwright.github_runtime import (
     OperationHealth,
     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     RepositoryInventoryFailureStage,
+    RepositoryInventoryTransportSubcategory,
     credentialed_repository_inventory_failure_code,
     create_credentialed_github_read_capability,
     repository_inventory_failure_code,
     repository_inventory_failure_stage,
+    repository_inventory_transport_subcategory,
 )
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
@@ -913,7 +915,24 @@ class ExternalValidationTests(unittest.TestCase):
             ),
             RepositoryInventoryFailureStage.UNKNOWN,
         )
-        def outer_failure_stage(host: object) -> tuple[external_validation.RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage, str]:
+        self.assertEqual(
+            repository_inventory_transport_subcategory(
+                f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:malformed-response:transport",
+            ),
+            RepositoryInventoryTransportSubcategory.UNKNOWN,
+        )
+        self.assertEqual(
+            repository_inventory_transport_subcategory(
+                f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:malformed-response:transport:unrecognized",
+            ),
+            RepositoryInventoryTransportSubcategory.UNKNOWN,
+        )
+        def outer_failure_stage(host: object) -> tuple[
+            external_validation.RepositoryInventoryReadFailureCode,
+            RepositoryInventoryFailureStage,
+            RepositoryInventoryTransportSubcategory | None,
+            str,
+        ]:
             failed = create_credentialed_github_read_capability(
                 host, binding, dependency_control, health, clock=lambda: now,
             ).read(request)
@@ -921,10 +940,11 @@ class ExternalValidationTests(unittest.TestCase):
             assert failed.failure is not None
             code = repository_inventory_failure_code(failed.failure.public_reason)
             stage = repository_inventory_failure_stage(failed.failure.public_reason)
+            transport_subcategory = repository_inventory_transport_subcategory(failed.failure.public_reason)
             self.assertIsNotNone(code)
             self.assertIsNotNone(stage)
             assert code is not None and stage is not None
-            return code, stage, failed.failure.public_reason
+            return code, stage, transport_subcategory, failed.failure.public_reason
         class TransportFailureHost:
             def __init__(self) -> None:
                 self.commands: list[tuple[str, ...]] = []
@@ -945,37 +965,41 @@ class ExternalValidationTests(unittest.TestCase):
                 return OpaqueResult(0, "{private-json-marker")
         normalizer_inventory = json.loads(json.dumps(raw_inventory))
         normalizer_inventory["data"]["repository"]["id"] = "invalid repository identity"
-        for label, host, expected_stage in (
-            ("transport", TransportFailureHost(), RepositoryInventoryFailureStage.TRANSPORT),
-            ("capability", InvalidResultHost(), RepositoryInventoryFailureStage.CAPABILITY),
-            ("json", InvalidJsonHost(), RepositoryInventoryFailureStage.JSON_DECODING),
-            ("graphql-envelope", OpaqueCredentialHost({"errors": [{"message": "private-graphql-marker"}]}), RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE),
-            ("normalizer", OpaqueCredentialHost(normalizer_inventory), RepositoryInventoryFailureStage.NORMALIZER),
+        for label, host, expected_stage, expected_subcategory in (
+            ("launch", TransportFailureHost(), RepositoryInventoryFailureStage.TRANSPORT, RepositoryInventoryTransportSubcategory.LAUNCH_EXCEPTION),
+            ("invalid-result", InvalidResultHost(), RepositoryInventoryFailureStage.TRANSPORT, RepositoryInventoryTransportSubcategory.INVALID_RESULT_SHAPE),
+            ("json", InvalidJsonHost(), RepositoryInventoryFailureStage.JSON_DECODING, None),
+            ("graphql-envelope", OpaqueCredentialHost({"errors": [{"message": "private-graphql-marker"}]}), RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE, None),
+            ("normalizer", OpaqueCredentialHost(normalizer_inventory), RepositoryInventoryFailureStage.NORMALIZER, None),
         ):
             with self.subTest(outer_inventory_stage=label):
-                code, stage, public_reason = outer_failure_stage(host)
+                code, stage, transport_subcategory, public_reason = outer_failure_stage(host)
                 self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
                 self.assertEqual(stage, expected_stage)
+                self.assertEqual(transport_subcategory, expected_subcategory)
                 self.assertNotIn("private", public_reason)
         transport_host = TransportFailureHost()
-        code, stage, public_reason = outer_failure_stage(transport_host)
+        code, stage, transport_subcategory, public_reason = outer_failure_stage(transport_host)
         self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
         self.assertEqual(stage, RepositoryInventoryFailureStage.TRANSPORT)
+        self.assertEqual(transport_subcategory, RepositoryInventoryTransportSubcategory.LAUNCH_EXCEPTION)
         self.assertNotIn("private", public_reason)
         self.assertEqual(transport_host.commands[0][0:3], ("api", "graphql", "-f"))
         nonzero_host = NonzeroReturnHost()
-        code, stage, public_reason = outer_failure_stage(nonzero_host)
+        code, stage, transport_subcategory, public_reason = outer_failure_stage(nonzero_host)
         self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE)
         self.assertEqual(stage, RepositoryInventoryFailureStage.TRANSPORT)
+        self.assertEqual(transport_subcategory, RepositoryInventoryTransportSubcategory.NONZERO_RETURN)
         self.assertNotIn("private", public_reason)
         self.assertEqual(nonzero_host.commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
         with patch.object(
             github_runtime, "_repository_inventory_command",
             side_effect=github_runtime.GitHubRuntimeError("private request marker"),
         ):
-            code, stage, public_reason = outer_failure_stage(OpaqueCredentialHost(raw_inventory))
+            code, stage, transport_subcategory, public_reason = outer_failure_stage(OpaqueCredentialHost(raw_inventory))
         self.assertEqual(code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
         self.assertEqual(stage, RepositoryInventoryFailureStage.REQUEST)
+        self.assertIsNone(transport_subcategory)
         self.assertNotIn("private", public_reason)
         sealing_result = github_runtime._seal_repository_inventory_snapshot(request, object())
         assert sealing_result.failure is not None
@@ -1291,6 +1315,26 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE)
         self.assertEqual(captured.exception.stage, RepositoryInventoryFailureStage.JSON_DECODING)
         self.assertNotIn("private-json-marker", str(captured.exception))
+        transport_seam_host = NonzeroReturnHost()
+        transport_seam_capability = create_credentialed_github_read_capability(
+            transport_seam_host, binding, dependency_control, health, clock=lambda: now,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("b"))
+            with self.assertRaises(external_validation.RepositoryInventoryFirstReadBoundaryError) as captured:
+                external_validation.execute_live_lifecycle_shadow_session(
+                    confirmed.public_receipt(), root, transport_seam_capability,
+                )
+        self.assertEqual(captured.exception.code, external_validation.RepositoryInventoryReadFailureCode.HOST_FAILURE)
+        self.assertEqual(captured.exception.stage, RepositoryInventoryFailureStage.TRANSPORT)
+        self.assertEqual(
+            captured.exception.transport_subcategory,
+            RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
+        )
+        self.assertNotIn("private nonzero return marker", str(captured.exception))
+        self.assertEqual(len(transport_seam_host.commands), 1)
 
     def test_hosted_check_profile_projects_and_compares_a_deterministic_typed_fake(self) -> None:
         snapshot = self.hosted_snapshot()

@@ -36,6 +36,7 @@ from .github_runtime import (
     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     RepositoryInventoryFailureStage,
     RepositoryInventoryReadFailureCode,
+    RepositoryInventoryTransportSubcategory,
     credentialed_repository_inventory_failure,
 )
 from .provider_attempt_runtime import (
@@ -66,14 +67,29 @@ class RepositoryInventoryFirstReadBoundaryError(ExternalValidationAdapterError):
         self,
         code: RepositoryInventoryReadFailureCode,
         stage: RepositoryInventoryFailureStage = RepositoryInventoryFailureStage.UNKNOWN,
+        transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
     ) -> None:
-        if type(code) is not RepositoryInventoryReadFailureCode or type(stage) is not RepositoryInventoryFailureStage:
+        if (
+            type(code) is not RepositoryInventoryReadFailureCode
+            or type(stage) is not RepositoryInventoryFailureStage
+            or type(transport_subcategory) is not RepositoryInventoryTransportSubcategory
+            or (
+                stage is not RepositoryInventoryFailureStage.TRANSPORT
+                and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+            )
+        ):
             raise TypeError("repository inventory failure is invalid")
         self.code = code
         self.stage = stage
+        self.transport_subcategory = transport_subcategory
         reason = f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
         if stage is not RepositoryInventoryFailureStage.UNKNOWN:
             reason += f":{stage.value}"
+        if (
+            stage is RepositoryInventoryFailureStage.TRANSPORT
+            and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+        ):
+            reason += f":{transport_subcategory.value}"
         super().__init__(
             reason
         )

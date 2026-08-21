@@ -4866,7 +4866,9 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
     for pull_request in pull_requests["nodes"]:  # type: ignore[index]
         value = _raw_mapping(pull_request); subject = f"pull-request-{_raw_integer(value, 'number')}"
         facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
-        facts.append(RepositoryInventoryFact(subject, "head-sha", _raw_text(value, "headRefOid")))
+        head_sha = _raw_optional_text(value, "headRefOid")
+        if head_sha is not None:
+            facts.append(RepositoryInventoryFact(subject, "head-sha", head_sha))
         nested[RepositoryInventorySection.MERGEABILITY].append(value)
         for section, key in ((RepositoryInventorySection.COMMENTS, "comments"), (RepositoryInventorySection.REVIEWS, "reviews"), (RepositoryInventorySection.REQUESTED_REVIEWERS, "reviewRequests"), (RepositoryInventorySection.CLOSING_REFERENCES, "closingIssuesReferences")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = connection.get("nodes")

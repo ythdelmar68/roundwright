@@ -5286,6 +5286,11 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
+            # Trace markers may be split across issue and pull-request
+            # comments.  Keep terminal PR comments in the same bounded trace
+            # ledger, with their actual surface, before normalizing markers.
+            if section is RepositoryInventorySection.COMMENTS:
+                trace_nodes.extend(("pull-request", node) for node in nodes)
         commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = _inventory_connection_nodes(commits, commits_page)
         if (
             _raw_bool(commits_page, "hasNextPage")

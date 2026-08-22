@@ -15,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright import external_validation
+from roundwright import lifecycle_observation
 import roundwright.github_runtime as github_runtime
 from roundwright.hosted_evidence import (
     HostedCheck,
@@ -275,8 +276,16 @@ def provider_binding(**updates: object) -> ExecutorBinding:
 class ExternalValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self._prior_package, self._prior_module = fake_harness()
+        self._lifecycle_projection = self.live_lifecycle_projection()
+        self._lifecycle_project_patch = patch.object(
+            external_validation.lifecycle_observation,
+            "project_verified_lifecycle",
+            return_value=self._lifecycle_projection,
+        )
+        self._lifecycle_project_patch.start()
 
     def tearDown(self) -> None:
+        self._lifecycle_project_patch.stop()
         for name, value in (
             ("roundwright_harness", self._prior_package),
             ("roundwright_harness.executor", self._prior_module),
@@ -412,34 +421,21 @@ class ExternalValidationTests(unittest.TestCase):
 
     def test_live_lifecycle_event_projection_is_exact_and_drift_is_closed(self) -> None:
         expected = external_validation._roundlet_lifecycle_projection("a" * 40, 17)
-        observed = external_validation._roundwright_lifecycle_projection(
-            self.live_lifecycle_event_graph(), 17,
-        )
+        observed = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
         self.assertEqual(external_validation._classified_lifecycle_differences(expected, observed), ())
-
-        altered_candidate = ShadowV2EventGraph(
-            self.live_lifecycle_event_graph().attempts, (),
-            (FormalReviewRoundReference("formal-round-1", 1, "b" * 40),), (), (),
-            self.live_lifecycle_event_graph().events,
-        )
-        altered_round = ShadowV2EventGraph(
-            self.live_lifecycle_event_graph().attempts, (),
-            (FormalReviewRoundReference("formal-round-2", 1, "a" * 40),), (), (),
-            self.live_lifecycle_event_graph().events,
-        )
         self.assertEqual(
             external_validation._classified_lifecycle_differences(
-                expected, external_validation._roundwright_lifecycle_projection(altered_candidate, 17),
+                expected, replace(observed, candidate_sha="b" * 40),
             ), ("candidate-drift",),
         )
         self.assertEqual(
             external_validation._classified_lifecycle_differences(
-                expected, external_validation._roundwright_lifecycle_projection(altered_round, 17),
+                expected, replace(observed, formal_round="formal-round-2"),
             ), ("formal-round-drift",),
         )
         self.assertEqual(
             external_validation._classified_lifecycle_differences(
-                expected, external_validation._roundwright_lifecycle_projection(self.live_lifecycle_event_graph(), 18),
+                expected, replace(observed, ready_at=18),
             ), ("ready-at-drift",),
         )
 
@@ -469,6 +465,49 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(differences, tuple(sorted(set(differences))))
         self.assertLessEqual(len(differences), external_validation._LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES)
 
+    def test_live_lifecycle_ledger_failure_blocks_before_any_inventory_read(self) -> None:
+        class NeverCalledCapability:
+            def __init__(self) -> None: self.calls = 0
+            def read(self, request: object) -> object:
+                self.calls += 1
+                raise AssertionError("a rejected ledger must not arm inventory")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            session = external_validation.preflight_live_lifecycle_shadow_session(
+                self.live_lifecycle_request_inputs(), root,
+            )
+            confirmed = external_validation.confirm_live_lifecycle_shadow_trace(
+                session.public_receipt(), root, "sha256:" + "f" * 64,
+            )
+            capability = NeverCalledCapability()
+            with patch.object(
+                external_validation.lifecycle_observation,
+                "project_verified_lifecycle",
+                side_effect=lifecycle_observation.LifecycleObservationError("retention drift"),
+            ):
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "ledger verification"):
+                    external_validation.execute_live_lifecycle_shadow_session(
+                        confirmed.public_receipt(), root, capability,
+                    )
+        self.assertEqual(capability.calls, 0)
+
+    def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
+        candidate = "a" * 40
+        marker = lambda profile, disposition: (
+            f"ROUNDLET_LIFECYCLE supervisor={profile} disposition={disposition} "
+            f"round=formal-round-1 ready_at=17 candidate={candidate}"
+        )
+        nodes = [
+            ("issue", {"id": "trace-1", "body": marker("sol", "cancelled")}),
+            ("issue", {"id": "trace-2", "body": marker("terra", "invalid-context")}),
+            ("pull-request", {"id": "trace-3", "body": marker("terra", "pass")}),
+        ]
+        facts = github_runtime._inventory_roundlet_trace_facts(nodes)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request"), facts)
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
+            github_runtime._inventory_roundlet_trace_facts([*nodes, nodes[-1]])
+
     def test_public_live_lifecycle_preflight_persists_a_path_free_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -496,7 +535,12 @@ class ExternalValidationTests(unittest.TestCase):
                 inputs, Path(first).resolve(),
             )
             moved = external_validation.preflight_live_lifecycle_shadow_session(
-                replace(inputs, candidate_sha="c" * 40, observation_window="window-49-fresh"),
+                replace(
+                    inputs, candidate_sha="c" * 40, observation_window="window-49-fresh",
+                    lifecycle_ledger=external_validation.LiveLifecycleLedgerBinding(
+                        lifecycle_observation._synthetic_plan("c" * 40, 17), "sha256:" + "3" * 64,
+                    ),
+                ),
                 Path(second).resolve(),
             )
         self.assertNotEqual(prepared.session_id, moved.session_id)
@@ -506,7 +550,7 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.LiveLifecycleRequestInputs(
                 inputs.base_sha, "not-a-sha", inputs.target_repository, inputs.target_baseline_sha,
                 inputs.case_id, inputs.observation_window, inputs.ready_at, inputs.recorder_commit,
-                inputs.recorder_content, inputs.recorder_tree, inputs.retention_namespace,
+                inputs.recorder_content, inputs.recorder_tree, inputs.retention_namespace, inputs.lifecycle_ledger,
             )
 
     def test_live_lifecycle_durable_session_owns_transport_projection_and_one_shot_execute(self) -> None:
@@ -2093,8 +2137,27 @@ class ExternalValidationTests(unittest.TestCase):
         return external_validation.LiveLifecycleRequestInputs(
             "b" * 40, "a" * 40, "ythdelmar68/roundlet-forward-test", "d" * 40,
             "live-lifecycle-case", "window-49", 17, "1" * 40, "2" * 40,
-            "3" * 40, "retention-49",
+            "3" * 40, "retention-49", external_validation.LiveLifecycleLedgerBinding(
+                lifecycle_observation._synthetic_plan("a" * 40, 17), "sha256:" + "3" * 64,
+            ),
         )
+
+    @staticmethod
+    def live_lifecycle_projection() -> lifecycle_observation.LifecycleShadowProjection:
+        plan = lifecycle_observation._synthetic_plan("a" * 40, 17)
+        events = lifecycle_observation._synthetic_events(plan)
+        core = {
+            "schema": lifecycle_observation.HARNESS_SEAL_RECEIPT_SCHEMA,
+            "status": "sealed", "event_schema": lifecycle_observation.HARNESS_EVENT_SCHEMA,
+            "plan_digest": lifecycle_observation._digest(plan),
+            "window_identity": plan["window_identity"], "repository_identity": plan["repository_identity"],
+            "candidate_sha": plan["candidate_sha"], "ready_at": plan["ready_at"],
+            "event_count": len(events), "head_event_digest": lifecycle_observation._digest(events[-1]),
+            "head_entry_digest": "sha256:" + "1" * 64, "manifest_digest": "sha256:" + "2" * 64,
+            "ledger_digest": "sha256:" + "3" * 64, "retention_identity": "sha256:" + "4" * 64,
+        }
+        receipt = SimpleNamespace(as_dict=lambda: {**core, "receipt_digest": lifecycle_observation._digest(core)})
+        return lifecycle_observation.project_lifecycle_events(plan, events, receipt)
 
     def live_lifecycle_binding(self, adapter: object, producer: str, exporter: str, comparator: str) -> SimpleNamespace:
         plan = SimpleNamespace(

@@ -48,6 +48,7 @@ from .provider_attempt_runtime import (
     install_host_runtime,
     prepare_context as prepare_provider_attempt_context,
 )
+from . import lifecycle_observation
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
@@ -1230,6 +1231,31 @@ class MaterializedLiveLifecycleContext:
 
 
 @dataclass(frozen=True)
+class LiveLifecycleLedgerBinding:
+    """Public-safe locator for the exact ledger sealed before the live read."""
+
+    plan: Mapping[str, object]
+    ledger_digest: str
+
+    def __post_init__(self) -> None:
+        plan = dict(self.plan) if type(self.plan) in (dict, MappingProxyType) else None
+        if plan is None or _DIGEST.fullmatch(self.ledger_digest) is None:
+            raise ExternalValidationAdapterError("live lifecycle ledger binding is invalid")
+        try:
+            lifecycle_observation._validated_plan(plan)
+        except lifecycle_observation.LifecycleObservationError as error:
+            raise ExternalValidationAdapterError("live lifecycle ledger binding is invalid") from error
+        object.__setattr__(self, "plan", MappingProxyType(plan))
+
+    @property
+    def plan_digest(self) -> str:
+        return lifecycle_observation._digest(dict(self.plan))
+
+    def public_payload(self) -> dict[str, object]:
+        return {"plan": dict(self.plan), "ledger_digest": self.ledger_digest}
+
+
+@dataclass(frozen=True)
 class LiveLifecycleRequestInputs:
     """Already-bound public primitives accepted at the opaque preflight boundary."""
 
@@ -1244,6 +1270,7 @@ class LiveLifecycleRequestInputs:
     recorder_content: str
     recorder_tree: str
     retention_namespace: str
+    lifecycle_ledger: LiveLifecycleLedgerBinding
 
     def __post_init__(self) -> None:
         if (
@@ -1257,6 +1284,10 @@ class LiveLifecycleRequestInputs:
                 self.recorder_commit, self.recorder_content, self.recorder_tree,
             ))
             or not _safe_token(self.retention_namespace)
+            or type(self.lifecycle_ledger) is not LiveLifecycleLedgerBinding
+            or (
+                self.lifecycle_ledger.plan["candidate_sha"], self.lifecycle_ledger.plan["ready_at"]
+            ) != (self.candidate_sha, self.ready_at)
         ):
             raise ExternalValidationAdapterError("live lifecycle request inputs are invalid")
 
@@ -1294,6 +1325,8 @@ class LiveLifecyclePreparedRequest:
             "case_id": self.inputs.case_id,
             "observation_window": self.inputs.observation_window,
             "ready_at": self.inputs.ready_at,
+            "lifecycle_plan_digest": self.inputs.lifecycle_ledger.plan_digest,
+            "lifecycle_ledger_digest": self.inputs.lifecycle_ledger.ledger_digest,
             "capture_plan_digest": self.capture_plan_digest,
             "request_digest": self.request_digest,
             "recorder_identity": self.recorder_identity,
@@ -1523,6 +1556,7 @@ class _RoundwrightLifecycleProjection:
     formal_round: str
     ready_at: int
     supervisor_attempts: tuple[tuple[str, str], ...]
+    supervisor_sequence_valid: bool
 
 
 _SUPERVISOR_FAILOVER_ATTEMPTS = (
@@ -1539,41 +1573,42 @@ def _roundlet_lifecycle_projection(candidate_sha: str, ready_at: int) -> _Roundl
 
 
 def _roundwright_lifecycle_projection(
-    event_graph: ShadowV2EventGraph, ready_at: int,
+    lifecycle: lifecycle_observation.LifecycleShadowProjection,
 ) -> _RoundwrightLifecycleProjection:
-    """Project dynamic lifecycle facts from the bound typed event stream.
+    """Project dynamic lifecycle facts from one verified sealed ledger.
 
     Forward-target inventory is intentionally absent here: it establishes only
     read-only fixture coverage and before/after target state.  Candidate and
-    review facts belong to the captured lifecycle graph that is sealed with the
-    request's exact plan/window/``ready_at`` binding.
+    review facts belong to the exact lifecycle ledger read back through the
+    repository lifecycle-observation contract.  Model and disposition values
+    are captured artifact/event facts; never infer them from ordinal or kind.
     """
-
-    rounds = event_graph.review_rounds
-    round_reference = rounds[0] if len(rounds) == 1 else None
+    completed = tuple(
+        event for event in lifecycle.events
+        if event.role == "supervisor" and event.transition == "attempt_completed"
+    )
+    expected_order = (1, 2, 3)
+    sequence_valid = (
+        len(completed) == len(expected_order)
+        and tuple(event.review_attempt for event in completed) == expected_order
+        and len({event.attempt_identity for event in completed}) == len(completed)
+    )
     attempts_by_ordinal = {
-        item.ordinal: item
-        for item in event_graph.attempts
-        if item.role is EvidenceRole.SUPERVISOR
-    }
+        event.review_attempt: event for event in completed
+    } if sequence_valid else {}
 
     def supervisor_outcome(ordinal: int) -> tuple[str, str]:
-        attempt = attempts_by_ordinal.get(ordinal)
-        if attempt is None:
+        event = attempts_by_ordinal.get(ordinal)
+        if event is None:
             return ("missing", "missing")
-        if ordinal == 1 and attempt.kind is LifecycleAttemptKind.SUPERVISOR:
-            return ("sol", "cancelled")
-        if ordinal == 2 and attempt.kind is LifecycleAttemptKind.FAILOVER:
-            return ("terra", "invalid-context")
-        if ordinal == 3 and attempt.kind is LifecycleAttemptKind.FAILOVER:
-            return ("terra", "pass")
-        return ("missing", "missing")
+        return (event.model_profile, event.disposition.replace("_", "-"))
 
     return _RoundwrightLifecycleProjection(
-        round_reference.candidate_sha if round_reference is not None else "missing",
-        round_reference.review_round_id if round_reference is not None else "missing",
-        ready_at,
+        lifecycle.candidate_sha,
+        f"formal-round-{lifecycle.review_round}",
+        lifecycle.ready_at,
         tuple(supervisor_outcome(ordinal) for ordinal in range(1, 4)),
+        sequence_valid,
     )
 
 
@@ -1589,6 +1624,8 @@ def _classified_lifecycle_differences(
         differences.append("formal-round-drift")
     if roundlet.ready_at != roundwright.ready_at:
         differences.append("ready-at-drift")
+    if not roundwright.supervisor_sequence_valid:
+        differences.append("supervisor-sequence-drift")
     for ordinal, (expected, observed) in enumerate(
         zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts, strict=True), start=1,
     ):
@@ -1794,6 +1831,8 @@ def _prepare_live_lifecycle_shadow_request(
         "case_id": inputs.case_id,
         "observation_window": inputs.observation_window,
         "ready_at": inputs.ready_at,
+        "lifecycle_plan_digest": inputs.lifecycle_ledger.plan_digest,
+        "lifecycle_ledger_digest": inputs.lifecycle_ledger.ledger_digest,
         "store_identity": store_identity,
     })
     producer, exporter, comparator = live_lifecycle_shadow_component_identities()
@@ -2017,8 +2056,27 @@ def _materialize_live_lifecycle_shadow_profile(
     """
 
     _validated_live_lifecycle_request(prepared_request, store_root)
-    provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
     inputs = prepared_request.inputs
+    # The contract-owned projection verifies the retained ledger before the
+    # target read is armed.  A missing, moved, unsealed, or mismatched ledger
+    # therefore blocks without provider access and cannot self-satisfy from a
+    # locally manufactured event graph.
+    try:
+        verified_lifecycle = lifecycle_observation.project_verified_lifecycle(
+            dict(inputs.lifecycle_ledger.plan), store_root,
+            inputs.lifecycle_ledger.ledger_digest,
+        )
+    except lifecycle_observation.LifecycleObservationError as error:
+        raise ExternalValidationAdapterError("live lifecycle ledger verification failed") from error
+    if (
+        verified_lifecycle.candidate_sha != inputs.candidate_sha
+        or verified_lifecycle.ready_at != inputs.ready_at
+        or verified_lifecycle.review_epoch != 1
+        or verified_lifecycle.review_mode != "complete"
+        or verified_lifecycle.ledger_digest != inputs.lifecycle_ledger.ledger_digest
+    ):
+        raise ExternalValidationAdapterError("live lifecycle ledger binding has drifted")
+    provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
     before = provider.read_before()
     # The product creates this request with the arm flag before it makes the
     # sole lifecycle read.  A provider cannot supply an unarmed event graph.
@@ -2051,7 +2109,7 @@ def _materialize_live_lifecycle_shadow_profile(
         attempts, (), (FormalReviewRoundReference(round_id, 1, inputs.candidate_sha),), (), (), events,
     )
     roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at)
-    roundwright = _roundwright_lifecycle_projection(graph, inputs.ready_at)
+    roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
     differences = _classified_lifecycle_differences(roundlet, roundwright)
     snapshot = LiveLifecycleShadowSnapshot(
         inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
@@ -2113,6 +2171,7 @@ def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[s
         "ready_at": inputs.ready_at, "recorder_commit": inputs.recorder_commit,
         "recorder_content": inputs.recorder_content, "recorder_tree": inputs.recorder_tree,
         "retention_namespace": inputs.retention_namespace,
+        "lifecycle_ledger": inputs.lifecycle_ledger.public_payload(),
     }
 
 
@@ -2179,7 +2238,17 @@ def _load_live_lifecycle_session(
             raise ValueError
         if type(value["inputs"]) is not dict or type(value["prepared"]) is not dict:
             raise ValueError
-        inputs = LiveLifecycleRequestInputs(**value["inputs"])
+        input_value = dict(value["inputs"])
+        ledger_value = input_value.get("lifecycle_ledger")
+        if (
+            type(ledger_value) is not dict
+            or set(ledger_value) != {"plan", "ledger_digest"}
+        ):
+            raise ValueError
+        input_value["lifecycle_ledger"] = LiveLifecycleLedgerBinding(
+            ledger_value["plan"], ledger_value["ledger_digest"],
+        )
+        inputs = LiveLifecycleRequestInputs(**input_value)
         prepared = value["prepared"]
         if set(prepared) != {
             "capture_plan_digest", "request_digest", "recorder_identity", "store_root_identity",

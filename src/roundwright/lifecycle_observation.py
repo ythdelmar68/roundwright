@@ -122,6 +122,7 @@ _DISPOSITIONS = {
     "unaccepted",
     "stale",
 }
+_SUPERVISOR_MODELS = ("sol", "terra")
 
 
 class LifecycleObservationError(ValueError):
@@ -154,6 +155,43 @@ def _safe_token(value: object) -> bool:
         word in lowered
         for word in ("token", "secret", "credential", "password", "ghp_")
     ) and not lowered.startswith("sk-")
+
+
+def supervisor_model_artifact(model: str) -> str:
+    """Return the sealed public-safe artifact identity for one model profile.
+
+    The generic Harness ledger retains artifact identities rather than raw
+    provider records.  This fixed vocabulary makes the selected profile a
+    typed, sealed lifecycle fact without exposing a provider payload.
+    """
+
+    if model not in _SUPERVISOR_MODELS:
+        raise LifecycleObservationError("supervisor model artifact is invalid")
+    return _digest({
+        "schema": "roundwright-supervisor-model-artifact/v1",
+        "model": model,
+    })
+
+
+_SUPERVISOR_MODEL_ARTIFACTS = {
+    supervisor_model_artifact(model): model for model in _SUPERVISOR_MODELS
+}
+
+
+def _captured_supervisor_model(references: Sequence[str]) -> str:
+    """Decode exactly one model fact from sealed artifact references.
+
+    Absence, duplication, or a changed profile is deliberately represented as
+    ``missing`` so the live comparator blocks instead of inferring a model
+    from attempt ordinal or lifecycle kind.
+    """
+
+    models = [
+        _SUPERVISOR_MODEL_ARTIFACTS[reference]
+        for reference in references
+        if reference in _SUPERVISOR_MODEL_ARTIFACTS
+    ]
+    return models[0] if len(models) == 1 else "missing"
 
 
 @dataclass(frozen=True)
@@ -352,6 +390,7 @@ class ProjectedLifecycleEvent:
     predecessor_event_digest: str | None
     artifact_references: tuple[str, ...]
     event_digest: str
+    model_profile: str = "missing"
 
     def __post_init__(self) -> None:
         if (
@@ -378,6 +417,7 @@ class ProjectedLifecycleEvent:
             or type(self.artifact_references) is not tuple
             or any(not _safe_digest(item) for item in self.artifact_references)
             or not _safe_digest(self.event_digest)
+            or self.model_profile not in {*_SUPERVISOR_MODELS, "missing"}
         ):
             raise LifecycleObservationError("projected lifecycle event is invalid")
 
@@ -715,6 +755,7 @@ def project_lifecycle_events(
                 predecessor,
                 tuple(event["artifact_references"]),
                 event_digest,
+                _captured_supervisor_model(event["artifact_references"]),
             )
         )
         predecessor = event_digest
@@ -859,7 +900,9 @@ def _synthetic_events(plan: Mapping[str, object]) -> list[dict[str, object]]:
             "accepted_result": accepted,
             "successor_candidate_sha": None,
             "predecessor_event_digest": predecessor,
-            "artifact_references": [],
+            "artifact_references": [
+                supervisor_model_artifact("sol" if attempt == 1 else "terra"),
+            ],
         }
         events.append(event)
         predecessor = _digest(event)

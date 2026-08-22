@@ -35,6 +35,7 @@ from .github import (
     RepositoryInventorySnapshot,
 )
 from .github_runtime import (
+    GitHubRuntimeError,
     ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
     RepositoryInventoryFailureStage,
     RepositoryInventoryReadFailureCode,
@@ -1112,18 +1113,137 @@ class _FixtureOutcome:
             raise ExternalValidationAdapterError("live lifecycle fixture outcome is invalid")
 
 
-# These are independently reviewed Roundlet expectations, not values derived
-# from Roundwright's inventory projection.  A missing or altered target fact
-# therefore cannot manufacture its own expected PASS.
-_ROUNDLET_FIXTURE_OUTCOMES = {
-    "umbrella": _FixtureOutcome("umbrella", "umbrella", "children-present", "not-applicable", "open", "not-applicable", "none", "retain-readonly"),
-    "standalone": _FixtureOutcome("standalone", "standalone", "no-parent", "not-applicable", "open", "not-applicable", "none", "retain-readonly"),
-    "ignored": _FixtureOutcome("ignored", "ignored", "not-applicable", "not-applicable", "open", "excluded", "roundlet-ignore", "retain-readonly"),
-    "malformed-parent-owner-input": _FixtureOutcome("malformed-parent-owner-input", "malformed-parent", "owner-input", "not-applicable", "open", "blocked", "owner-input", "retain-readonly"),
-    "dependency": _FixtureOutcome("dependency", "dependent", "blocked-by-parent", "not-applicable", "open", "blocked", "dependency", "retain-readonly"),
-    "merged-pr": _FixtureOutcome("merged-pr", "merged-pr", "not-applicable", "not-applicable", "merged", "passed", "none", "retain-readonly"),
-    "supervisor-failover": _FixtureOutcome("supervisor-failover", "supervisor-failover", "not-applicable", "three-sealed-attempts", "accepted", "passed", "none", "retain-readonly"),
-}
+@dataclass(frozen=True)
+class FixtureSelectionManifest:
+    """Closed owner-reviewed selectors and expectations bound into V2 context.
+
+    Expectations are supplied externally and remain independent of observed
+    inventory/lifecycle facts.  The product validates their shape and digest,
+    then derives observations only from its own normalizer/classifier and the
+    verified lifecycle ledger.
+    """
+
+    value: Mapping[str, object]
+    manifest_digest: str
+
+    @classmethod
+    def parse(cls, value: object, manifest_digest: object) -> "FixtureSelectionManifest":
+        if type(value) is not dict or type(manifest_digest) is not str:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        return cls(MappingProxyType(dict(value)), manifest_digest)
+
+    @staticmethod
+    def _freeze(value: object) -> object:
+        if type(value) is dict:
+            return MappingProxyType({key: FixtureSelectionManifest._freeze(item) for key, item in value.items()})
+        if type(value) is list:
+            return tuple(FixtureSelectionManifest._freeze(item) for item in value)
+        return value
+
+    @staticmethod
+    def _thaw(value: object) -> object:
+        if type(value) is MappingProxyType:
+            return {key: FixtureSelectionManifest._thaw(item) for key, item in value.items()}
+        if type(value) is tuple:
+            return [FixtureSelectionManifest._thaw(item) for item in value]
+        return value
+
+    def __post_init__(self) -> None:
+        raw = dict(self.value) if type(self.value) is MappingProxyType else None
+        contract = lifecycle_observation.lifecycle_observation_contract()
+        required = {"schema", "run_id", "contract_id", "leaf", "target", "binding", "authority", "fixtures"}
+        if (
+            raw is None or set(raw) != required
+            or raw.get("schema") != "roundlet-owner-reviewed-fixture-selection-expectation-manifest/v1"
+            or not _safe_token(raw.get("run_id"))
+            or type(raw.get("contract_id")) is not str or re.fullmatch(r"[0-9a-f]{64}", raw["contract_id"]) is None
+            or type(raw.get("leaf")) is not int or raw["leaf"] < 1
+            or _DIGEST.fullmatch(self.manifest_digest) is None
+            or self.manifest_digest != _digest(raw)
+            or type(raw.get("target")) is not dict
+            or set(raw["target"]) != {"repository", "baseline_sha"}
+            or raw["target"].get("repository") != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(raw["target"].get("baseline_sha", "")) is None
+            or type(raw.get("binding")) is not dict
+            or set(raw["binding"]) != {
+                "authoritative_extension_point", "capture_observation_identity_must_commit_manifest_digest",
+                "lifecycle_contract_identity", "lifecycle_contract_identity_must_remain_unchanged",
+            }
+            or raw["binding"].get("authoritative_extension_point") != "roundwright-harness-profile-executor-request/v2.execution_context"
+            or raw["binding"].get("capture_observation_identity_must_commit_manifest_digest") is not True
+            or raw["binding"].get("lifecycle_contract_identity") != contract["contract_identity"]
+            or raw["binding"].get("lifecycle_contract_identity_must_remain_unchanged") is not True
+            or type(raw.get("authority")) is not dict
+            or raw["authority"].get("effect") != "external-owner-reviewed-reference-decision"
+            or raw["authority"].get("repository_mutation") is not False
+            or raw["authority"].get("target_mutation") is not False
+            or type(raw["authority"].get("owner_allowlist")) is not list
+            or raw["authority"]["owner_allowlist"] != ["ythdelmar68"]
+            or type(raw.get("fixtures")) is not list or len(raw["fixtures"]) != len(_LIVE_LIFECYCLE_FIXTURES)
+        ):
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        fixtures: dict[str, object] = {}
+        selectors: set[tuple[object, ...]] = set()
+        for item in raw["fixtures"]:
+            if type(item) is not dict or set(item) != {"fixture", "selector", "expectation"}:
+                raise ExternalValidationAdapterError("fixture manifest is invalid")
+            fixture, selector, expectation = item["fixture"], item["selector"], item["expectation"]
+            if fixture not in _LIVE_LIFECYCLE_FIXTURES or fixture in fixtures or type(selector) is not dict or type(expectation) is not dict:
+                raise ExternalValidationAdapterError("fixture manifest is invalid")
+            if set(expectation) != {"classification", "dependencies", "attempt_accounting", "state", "gates", "blockers", "next_action"}:
+                raise ExternalValidationAdapterError("fixture manifest is invalid")
+            try:
+                _FixtureOutcome(fixture, **expectation)
+            except (TypeError, ExternalValidationAdapterError) as error:
+                raise ExternalValidationAdapterError("fixture manifest is invalid") from error
+            if fixture == "supervisor-failover":
+                if set(selector) != {"kind", "attempts"} or selector.get("kind") != "sealed-lifecycle-attempt-sequence" or type(selector.get("attempts")) is not list or len(selector["attempts"]) != 3:
+                    raise ExternalValidationAdapterError("fixture manifest is invalid")
+                attempts = []
+                for ordinal, attempt in enumerate(selector["attempts"], 1):
+                    if type(attempt) is not dict or set(attempt) != {"ordinal", "model", "reasoning", "disposition"} or attempt.get("ordinal") != ordinal or not all(_safe_token(attempt.get(field)) for field in ("model", "reasoning", "disposition")):
+                        raise ExternalValidationAdapterError("fixture manifest is invalid")
+                    attempts.append((attempt["model"], attempt["reasoning"], attempt["disposition"]))
+                if len(set(attempts)) != len(attempts):
+                    raise ExternalValidationAdapterError("fixture manifest is invalid")
+            else:
+                if set(selector) != {"kind", "number"} or selector.get("kind") not in {"issue", "pull-request"} or type(selector.get("number")) is not int or selector["number"] < 1:
+                    raise ExternalValidationAdapterError("fixture manifest is invalid")
+                key = (selector["kind"], selector["number"])
+                if key in selectors:
+                    raise ExternalValidationAdapterError("fixture manifest selectors conflict")
+                selectors.add(key)
+            fixtures[fixture] = item
+        if tuple(fixtures) != _LIVE_LIFECYCLE_FIXTURES:
+            raise ExternalValidationAdapterError("fixture manifest is incomplete")
+        object.__setattr__(self, "value", self._freeze(raw))
+
+    @property
+    def target_repository(self) -> str:
+        return self.value["target"]["repository"]  # type: ignore[index]
+
+    @property
+    def target_baseline_sha(self) -> str:
+        return self.value["target"]["baseline_sha"]  # type: ignore[index]
+
+    def selector_map(self) -> dict[str, tuple[str, int]]:
+        return {
+            item["fixture"]: (item["selector"]["kind"], item["selector"]["number"])
+            for item in self.value["fixtures"]  # type: ignore[index]
+            if item["fixture"] != "supervisor-failover"
+        }
+
+    def expected_outcomes(self) -> tuple[_FixtureOutcome, ...]:
+        return tuple(_FixtureOutcome(item["fixture"], **item["expectation"]) for item in self.value["fixtures"])  # type: ignore[index]
+
+    def supervisor_attempts(self) -> tuple[tuple[str, str, str], ...]:
+        item = next(item for item in self.value["fixtures"] if item["fixture"] == "supervisor-failover")  # type: ignore[index]
+        return tuple((attempt["model"], attempt["reasoning"], attempt["disposition"]) for attempt in item["selector"]["attempts"])
+
+    def payload(self) -> dict[str, object]:
+        value = self._thaw(self.value)
+        assert type(value) is dict
+        return value
 
 
 @dataclass(frozen=True)
@@ -1232,7 +1352,8 @@ class LiveLifecycleRuntimeDescriptor:
     case_id: str
     observation_window: str
     ready_at: int
-    schema: str = "roundwright-live-lifecycle-runtime/v1"
+    fixture_manifest: FixtureSelectionManifest
+    schema: str = "roundwright-live-lifecycle-runtime/v2"
 
     @classmethod
     def parse(cls, value: object) -> "LiveLifecycleRuntimeDescriptor":
@@ -1241,23 +1362,29 @@ class LiveLifecycleRuntimeDescriptor:
         raw = dict(value)
         if set(raw) != {
             "schema", "target_repository", "target_baseline_sha", "candidate_sha",
-            "capture_plan_digest", "case_id", "observation_window", "ready_at",
+            "capture_plan_digest", "case_id", "observation_window", "ready_at", "fixture_manifest", "fixture_manifest_digest",
         }:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
         try:
+            raw["fixture_manifest"] = FixtureSelectionManifest.parse(
+                raw["fixture_manifest"], raw.pop("fixture_manifest_digest"),
+            )
             return cls(**raw)
         except (TypeError, ValueError) as error:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid") from error
 
     def __post_init__(self) -> None:
         if (
-            self.schema != "roundwright-live-lifecycle-runtime/v1"
+            self.schema != "roundwright-live-lifecycle-runtime/v2"
             or self.target_repository != "ythdelmar68/roundlet-forward-test"
             or _SHA.fullmatch(self.target_baseline_sha) is None
             or _SHA.fullmatch(self.candidate_sha) is None
             or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
             or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.fixture_manifest) is not FixtureSelectionManifest
+            or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
+            != (self.target_repository, self.target_baseline_sha)
         ):
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
 
@@ -1267,7 +1394,8 @@ class LiveLifecycleRuntimeDescriptor:
             "target_baseline_sha": self.target_baseline_sha,
             "candidate_sha": self.candidate_sha, "capture_plan_digest": self.capture_plan_digest,
             "case_id": self.case_id, "observation_window": self.observation_window,
-            "ready_at": self.ready_at,
+            "ready_at": self.ready_at, "fixture_manifest": self.fixture_manifest.payload(),
+            "fixture_manifest_digest": self.fixture_manifest.manifest_digest,
         }
 
 
@@ -1321,6 +1449,7 @@ class LiveLifecycleRequestInputs:
     recorder_tree: str
     retention_namespace: str
     lifecycle_ledger: LiveLifecycleLedgerBinding
+    fixture_manifest: FixtureSelectionManifest | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -1335,6 +1464,7 @@ class LiveLifecycleRequestInputs:
             ))
             or not _safe_token(self.retention_namespace)
             or type(self.lifecycle_ledger) is not LiveLifecycleLedgerBinding
+            or (self.fixture_manifest is not None and type(self.fixture_manifest) is not FixtureSelectionManifest)
             or (
                 self.lifecycle_ledger.plan["candidate_sha"], self.lifecycle_ledger.plan["ready_at"]
             ) != (self.candidate_sha, self.ready_at)
@@ -1614,13 +1744,6 @@ class _RoundwrightLifecycleProjection:
     supervisor_sequence_valid: bool
 
 
-_SUPERVISOR_FAILOVER_ATTEMPTS = (
-    ("sol", "xhigh", "cancelled"),
-    ("terra", "high", "invalid-context"),
-    ("terra", "high", "pass"),
-)
-
-
 def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[str, str]:
     """Decode one retained Supervisor profile only for the live comparator.
 
@@ -1639,10 +1762,12 @@ def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[s
     return profiles.get(artifact_references[0], ("missing", "missing"))
 
 
-def _roundlet_lifecycle_projection(candidate_sha: str, ready_at: int) -> _RoundletLifecycleProjection:
-    """Return the reviewed Roundlet fixture independently of provider facts."""
+def _roundlet_lifecycle_projection(
+    candidate_sha: str, ready_at: int, manifest: FixtureSelectionManifest,
+) -> _RoundletLifecycleProjection:
+    """Return external expectations independently of provider facts."""
 
-    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", ready_at, _SUPERVISOR_FAILOVER_ATTEMPTS)
+    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", ready_at, manifest.supervisor_attempts())
 
 
 def _roundwright_lifecycle_projection(
@@ -1715,6 +1840,7 @@ def _classified_lifecycle_differences(
 def _roundwright_fixture_outcomes(
     inventory: RepositoryInventorySnapshot,
     lifecycle: _RoundwrightLifecycleProjection,
+    manifest: FixtureSelectionManifest,
 ) -> tuple[_FixtureOutcome, ...]:
     """Classify every declared fixture through the normalized production facts.
 
@@ -1724,7 +1850,13 @@ def _roundwright_fixture_outcomes(
     supplied fixture result and it never derives the Roundlet expectation.
     """
 
-    repository = {item.fixture: item for item in project_repository_fixture_outcomes(inventory)}
+    try:
+        repository = {
+            item.fixture: item
+            for item in project_repository_fixture_outcomes(inventory, manifest.selector_map())
+        }
+    except GitHubRuntimeError as error:
+        raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete") from error
     outcomes = [
         _FixtureOutcome(
             fixture, item.classification, item.dependencies, "not-applicable",
@@ -1735,7 +1867,7 @@ def _roundwright_fixture_outcomes(
         if item is not None
     ]
     exact_attempts = not _classified_lifecycle_differences(
-        _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at), lifecycle,
+        _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest), lifecycle,
     )
     outcomes.append(_FixtureOutcome(
         "supervisor-failover",
@@ -1750,10 +1882,10 @@ def _roundwright_fixture_outcomes(
     return tuple(outcomes)
 
 
-def _roundlet_fixture_outcomes() -> tuple[_FixtureOutcome, ...]:
-    """Return the reviewed expectation source, independently of target reads."""
+def _roundlet_fixture_outcomes(manifest: FixtureSelectionManifest) -> tuple[_FixtureOutcome, ...]:
+    """Return externally reviewed expectations, never target-read results."""
 
-    return tuple(_ROUNDLET_FIXTURE_OUTCOMES[fixture] for fixture in _LIVE_LIFECYCLE_FIXTURES)
+    return manifest.expected_outcomes()
 
 
 def _fixture_outcome_differences(
@@ -1785,6 +1917,7 @@ def _fixture_outcome_differences(
 def _roundlet_trace_differences(
     inventory: RepositoryInventorySnapshot,
     lifecycle: lifecycle_observation.LifecycleShadowProjection,
+    expected: _RoundletLifecycleProjection,
 ) -> tuple[str, ...]:
     """Bind normalized Roundlet trace facts to the sealed ledger.
 
@@ -1815,8 +1948,8 @@ def _roundlet_trace_differences(
         event for event in lifecycle.events
         if event.role == "supervisor" and event.transition == "attempt_completed"
     )
-    expected_profiles = tuple(_private_supervisor_profile(event.artifact_references) for event in completed)
-    expected_dispositions = tuple(event.disposition.replace("_", "-") for event in completed)
+    expected_profiles = tuple((item[0], item[1]) for item in expected.supervisor_attempts)
+    expected_dispositions = tuple(item[2] for item in expected.supervisor_attempts)
     for ordinal in range(1, 4):
         matches = [record for record in records.values() if record.get("ordinal") == str(ordinal)]
         if len(matches) != 1:
@@ -1864,7 +1997,10 @@ class _RoundwrightLiveLifecycleProvider:
         self._baseline_sha = inputs.target_baseline_sha
         self._candidate_sha = inputs.candidate_sha
         self._ready_at = inputs.ready_at
+        self._manifest = inputs.fixture_manifest
         self._armed = False
+        if self._manifest is None:
+            raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
 
     def _read(self, request: GitHubReadRequest, expected: type[object]) -> object:
         try:
@@ -1910,9 +2046,10 @@ class _RoundwrightLiveLifecycleProvider:
     def _fixture_classes(
         inventory: RepositoryInventorySnapshot,
         lifecycle: _RoundwrightLifecycleProjection,
+        manifest: FixtureSelectionManifest,
     ) -> tuple[str, ...]:
-        observed = _roundwright_fixture_outcomes(inventory, lifecycle)
-        differences = _fixture_outcome_differences(_roundlet_fixture_outcomes(), observed)
+        observed = _roundwright_fixture_outcomes(inventory, lifecycle, manifest)
+        differences = _fixture_outcome_differences(_roundlet_fixture_outcomes(manifest), observed)
         if differences:
             # The caller receives no partially qualified fixture set.  The
             # bounded dimension labels remain available to the sealed profile
@@ -1928,10 +2065,11 @@ class _RoundwrightLiveLifecycleProvider:
         inventory: RepositoryInventorySnapshot,
         lifecycle: _RoundwrightLifecycleProjection,
         sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
+        manifest: FixtureSelectionManifest,
     ) -> _LiveLifecycleProviderObservation:
-        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, lifecycle)
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, lifecycle, manifest)
         fixture_differences = _fixture_outcome_differences(
-            _roundlet_fixture_outcomes(), _roundwright_fixture_outcomes(inventory, lifecycle),
+            _roundlet_fixture_outcomes(manifest), _roundwright_fixture_outcomes(inventory, lifecycle, manifest),
         )
         snapshot_digests = {
             category: _digest({
@@ -1956,7 +2094,10 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        trace_differences = _roundlet_trace_differences(inventory, sealed_lifecycle)
+        trace_differences = _roundlet_trace_differences(
+            inventory, sealed_lifecycle,
+            _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest),
+        )
         return _LiveLifecycleProviderObservation(
             snapshot_digests, fixtures,
             tuple(sorted(set((*fixture_differences, *trace_differences)))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]),
@@ -1989,7 +2130,7 @@ class _RoundwrightLiveLifecycleProvider:
         sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
     ) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory(), lifecycle, sealed_lifecycle)
+        return self._observation(self._inventory(), lifecycle, sealed_lifecycle, self._manifest)
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -2022,6 +2163,13 @@ def _prepare_live_lifecycle_shadow_request(
 
     if type(inputs) is not LiveLifecycleRequestInputs:
         raise ExternalValidationAdapterError("live lifecycle preflight inputs are invalid")
+    if inputs.fixture_manifest is None:
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
+    manifest = inputs.fixture_manifest
+    if (manifest.target_repository, manifest.target_baseline_sha) != (
+        inputs.target_repository, inputs.target_baseline_sha,
+    ):
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest target has drifted")
     store_root_identity = _live_lifecycle_store_root_identity(store_root)
     recorder_identity = _digest({
         "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
@@ -2048,6 +2196,7 @@ def _prepare_live_lifecycle_shadow_request(
         "ready_at": inputs.ready_at,
         "lifecycle_plan_digest": inputs.lifecycle_ledger.plan_digest,
         "lifecycle_ledger_digest": inputs.lifecycle_ledger.ledger_digest,
+        "fixture_manifest_digest": manifest.manifest_digest,
         "store_identity": store_identity,
     })
     producer, exporter, comparator = live_lifecycle_shadow_component_identities()
@@ -2074,7 +2223,7 @@ def _prepare_live_lifecycle_shadow_request(
         raise ExternalValidationAdapterError("live lifecycle capture plan is invalid")
     descriptor = LiveLifecycleRuntimeDescriptor(
         inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
-        plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
+        plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at, manifest,
     )
     request_value = {
         "schema": "roundwright-harness-profile-executor-request/v2",
@@ -2185,6 +2334,7 @@ def _validated_live_lifecycle_request(
     expected_descriptor = LiveLifecycleRuntimeDescriptor(
         inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
         prepared_request.capture_plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
+        inputs.fixture_manifest,
     ).payload()
     if (
         _digest(request_value) != prepared_request.request_digest
@@ -2292,7 +2442,9 @@ def _materialize_live_lifecycle_shadow_profile(
     ):
         raise ExternalValidationAdapterError("live lifecycle ledger binding has drifted")
     provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
-    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at)
+    if inputs.fixture_manifest is None:
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
+    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at, inputs.fixture_manifest)
     roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
     before = provider.read_before()
     # The product creates this request with the arm flag before it makes the
@@ -2371,6 +2523,10 @@ def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[s
         "recorder_content": inputs.recorder_content, "recorder_tree": inputs.recorder_tree,
         "retention_namespace": inputs.retention_namespace,
         "lifecycle_ledger": inputs.lifecycle_ledger.public_payload(),
+        "fixture_manifest": None if inputs.fixture_manifest is None else {
+            "value": inputs.fixture_manifest.payload(),
+            "manifest_digest": inputs.fixture_manifest.manifest_digest,
+        },
     }
 
 
@@ -2446,6 +2602,12 @@ def _load_live_lifecycle_session(
             raise ValueError
         input_value["lifecycle_ledger"] = LiveLifecycleLedgerBinding(
             ledger_value["plan"], ledger_value["ledger_digest"],
+        )
+        manifest_value = input_value.get("fixture_manifest")
+        if type(manifest_value) is not dict or set(manifest_value) != {"value", "manifest_digest"}:
+            raise ValueError
+        input_value["fixture_manifest"] = FixtureSelectionManifest.parse(
+            manifest_value["value"], manifest_value["manifest_digest"],
         )
         inputs = LiveLifecycleRequestInputs(**input_value)
         prepared = value["prepared"]

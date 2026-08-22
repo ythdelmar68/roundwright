@@ -380,16 +380,12 @@ class ExternalValidationTests(unittest.TestCase):
                 for index, section in enumerate(RepositoryInventorySection, 1)
             ), key=lambda item: item.section.value))
             facts = tuple(sorted((
-                RepositoryInventoryFact("issue-4", "child", "issue-49"),
-                RepositoryInventoryFact("issue-49", "standalone", "true"),
-                RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
-                RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
-                RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
-                RepositoryInventoryFact("issue-4", "state", "open"),
-                RepositoryInventoryFact("issue-49", "state", "open"),
-                RepositoryInventoryFact("issue-50", "state", "open"),
-                RepositoryInventoryFact("issue-51", "state", "open"),
-                RepositoryInventoryFact("pull-request-81", "state", "merged"),
+                RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-6", "standalone", "true"),
+                RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"), RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
+                RepositoryInventoryFact("issue-3", "depends-on", "issue-1"), RepositoryInventoryFact("issue-1", "state", "open"),
+                RepositoryInventoryFact("issue-3", "state", "closed"), RepositoryInventoryFact("issue-6", "state", "closed"),
+                RepositoryInventoryFact("issue-7", "state", "open"), RepositoryInventoryFact("issue-9", "state", "open"),
+                RepositoryInventoryFact("pull-request-10", "state", "merged"),
                 *github_runtime._inventory_roundlet_trace_facts([
                     ("issue", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
                     ("issue", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
@@ -431,7 +427,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
 
     def test_live_lifecycle_event_projection_is_exact_and_drift_is_closed(self) -> None:
-        expected = external_validation._roundlet_lifecycle_projection("a" * 40, 17)
+        expected = external_validation._roundlet_lifecycle_projection("a" * 40, 17, self.fixture_manifest())
         sealed = self.live_lifecycle_projection()
         observed = external_validation._roundwright_lifecycle_projection(sealed)
         self.assertEqual(external_validation._classified_lifecycle_differences(expected, observed), ())
@@ -539,29 +535,30 @@ class ExternalValidationTests(unittest.TestCase):
 
     def test_supervisor_failover_fixture_requires_verified_lifecycle_facts(self) -> None:
         inventory = SimpleNamespace(facts=(
-            RepositoryInventoryFact("issue-4", "child", "issue-49"),
-            RepositoryInventoryFact("issue-49", "standalone", "true"),
-            RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
-            RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
-            RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
-            RepositoryInventoryFact("issue-4", "state", "open"),
-            RepositoryInventoryFact("issue-49", "state", "open"),
-            RepositoryInventoryFact("issue-50", "state", "open"),
-            RepositoryInventoryFact("issue-51", "state", "open"),
-            RepositoryInventoryFact("pull-request-81", "state", "merged"),
+            RepositoryInventoryFact("issue-1", "child", "issue-2"),
+            RepositoryInventoryFact("issue-6", "standalone", "true"),
+            RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"),
+            RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
+            RepositoryInventoryFact("issue-3", "depends-on", "issue-1"),
+            RepositoryInventoryFact("issue-1", "state", "open"),
+            RepositoryInventoryFact("issue-3", "state", "closed"),
+            RepositoryInventoryFact("issue-6", "state", "closed"),
+            RepositoryInventoryFact("issue-7", "state", "open"),
+            RepositoryInventoryFact("issue-9", "state", "open"),
+            RepositoryInventoryFact("pull-request-10", "state", "merged"),
         ))
         verified = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
         self.assertIn(
             "supervisor-failover",
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, verified),
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, verified, self.fixture_manifest()),
         )
         changed = replace(verified, supervisor_attempts=(("terra", "xhigh", "cancelled"), *verified.supervisor_attempts[1:]))
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed)
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed, self.fixture_manifest())
         self.assertIn(
             "supervisor-profile-1-drift",
             external_validation._classified_lifecycle_differences(
-                external_validation._roundlet_lifecycle_projection("a" * 40, 17), changed,
+                external_validation._roundlet_lifecycle_projection("a" * 40, 17, self.fixture_manifest()), changed,
             ),
         )
         wrong_reasoning = replace(
@@ -569,11 +566,11 @@ class ExternalValidationTests(unittest.TestCase):
             supervisor_attempts=(("sol", "high", "cancelled"), *verified.supervisor_attempts[1:]),
         )
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning)
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning, self.fixture_manifest())
         self.assertIn(
             "supervisor-reasoning-1-drift",
             external_validation._classified_lifecycle_differences(
-                external_validation._roundlet_lifecycle_projection("a" * 40, 17), wrong_reasoning,
+                external_validation._roundlet_lifecycle_projection("a" * 40, 17, self.fixture_manifest()), wrong_reasoning,
             ),
         )
 
@@ -582,16 +579,17 @@ class ExternalValidationTests(unittest.TestCase):
 
         candidate = "a" * 40
         facts = (
-            RepositoryInventoryFact("issue-4", "child", "issue-49"),
-            RepositoryInventoryFact("issue-49", "standalone", "true"),
-            RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
-            RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
-            RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
-            RepositoryInventoryFact("issue-4", "state", "open"),
-            RepositoryInventoryFact("issue-49", "state", "open"),
-            RepositoryInventoryFact("issue-50", "state", "open"),
-            RepositoryInventoryFact("issue-51", "state", "open"),
-            RepositoryInventoryFact("pull-request-81", "state", "merged"),
+            RepositoryInventoryFact("issue-1", "child", "issue-2"),
+            RepositoryInventoryFact("issue-6", "standalone", "true"),
+            RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"),
+            RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
+            RepositoryInventoryFact("issue-3", "depends-on", "issue-1"),
+            RepositoryInventoryFact("issue-1", "state", "open"),
+            RepositoryInventoryFact("issue-3", "state", "closed"),
+            RepositoryInventoryFact("issue-6", "state", "closed"),
+            RepositoryInventoryFact("issue-7", "state", "open"),
+            RepositoryInventoryFact("issue-9", "state", "open"),
+            RepositoryInventoryFact("pull-request-10", "state", "merged"),
             *github_runtime._inventory_roundlet_trace_facts([
                 ("issue", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate=" + candidate}),
                 ("issue", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate=" + candidate}),
@@ -609,12 +607,13 @@ class ExternalValidationTests(unittest.TestCase):
         )
         sealed = self.live_lifecycle_projection()
         lifecycle = external_validation._roundwright_lifecycle_projection(sealed)
-        expected = external_validation._roundlet_fixture_outcomes()
+        manifest = self.fixture_manifest()
+        expected = external_validation._roundlet_fixture_outcomes(manifest)
 
         # This is the real normalized inventory -> production classifier /
         # scheduler -> Roundwright adapter -> live observation path.
         product_outcomes = github_runtime.project_repository_fixture_outcomes(inventory)
-        observed = external_validation._roundwright_fixture_outcomes(inventory, lifecycle)
+        observed = external_validation._roundwright_fixture_outcomes(inventory, lifecycle, manifest)
         self.assertEqual(
             tuple(item.fixture for item in product_outcomes),
             external_validation._LIVE_LIFECYCLE_FIXTURES[:-1],
@@ -622,7 +621,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(external_validation._fixture_outcome_differences(expected, observed), ())
         self.assertEqual(
             external_validation._RoundwrightLiveLifecycleProvider._observation(
-                inventory, lifecycle, sealed,
+                inventory, lifecycle, sealed, manifest,
             ).classified_differences,
             (),
         )
@@ -636,13 +635,13 @@ class ExternalValidationTests(unittest.TestCase):
             with patch.object(
                 external_validation, "project_repository_fixture_outcomes", return_value=tuple(altered_product),
             ):
-                altered_observed = external_validation._roundwright_fixture_outcomes(inventory, lifecycle)
+                altered_observed = external_validation._roundwright_fixture_outcomes(inventory, lifecycle, manifest)
                 self.assertEqual(
                     external_validation._fixture_outcome_differences(expected, altered_observed),
                     (f"fixture-umbrella-{field}-drift",),
                 )
                 with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-                    external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, lifecycle, sealed)
+                    external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, lifecycle, sealed, manifest)
 
         # Attempt accounting is supplied by the sealed lifecycle production
         # projection.  A changed lifecycle input is retained through the same
@@ -651,29 +650,60 @@ class ExternalValidationTests(unittest.TestCase):
             lifecycle,
             supervisor_attempts=(("terra", "xhigh", "cancelled"), *lifecycle.supervisor_attempts[1:]),
         )
-        changed_observed = external_validation._roundwright_fixture_outcomes(inventory, changed_lifecycle)
+        changed_observed = external_validation._roundwright_fixture_outcomes(inventory, changed_lifecycle, manifest)
         self.assertIn(
             "fixture-supervisor-failover-attempt_accounting-drift",
             external_validation._fixture_outcome_differences(expected, changed_observed),
         )
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, changed_lifecycle, sealed)
+            external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, changed_lifecycle, sealed, manifest)
 
         # A missing normalized fact cannot pass by omission, and malformed
         # normalized evidence fails before the classifier can infer a result.
         missing = replace(
             inventory,
-            facts=tuple(fact for fact in inventory.facts if fact.subject != "issue-49" or fact.predicate != "standalone"),
-        )
-        missing_observed = external_validation._roundwright_fixture_outcomes(missing, lifecycle)
-        self.assertIn(
-            "fixture-standalone-classification-drift",
-            external_validation._fixture_outcome_differences(expected, missing_observed),
+            facts=tuple(fact for fact in inventory.facts if fact.subject != "issue-6" or fact.predicate != "standalone"),
         )
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._observation(missing, lifecycle, sealed)
+            external_validation._roundwright_fixture_outcomes(missing, lifecycle, manifest)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+            external_validation._RoundwrightLiveLifecycleProvider._observation(missing, lifecycle, sealed, manifest)
         with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "fixture inventory"):
             github_runtime.project_repository_fixture_outcomes(SimpleNamespace(facts=("malformed",)))
+
+    def test_fixture_manifest_selects_exact_closed_subjects_and_rejects_drift(self) -> None:
+        manifest = self.fixture_manifest()
+        self.assertEqual(manifest.selector_map(), {
+            "umbrella": ("issue", 1), "standalone": ("issue", 6), "ignored": ("issue", 7),
+            "malformed-parent-owner-input": ("issue", 9), "dependency": ("issue", 3),
+            "merged-pr": ("pull-request", 10),
+        })
+        value = manifest.payload()
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "manifest"):
+            external_validation.FixtureSelectionManifest.parse(value, "sha256:" + "0" * 64)
+        duplicate = json.loads(json.dumps(value))
+        duplicate["fixtures"][4]["selector"] = {"kind": "issue", "number": 6}
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "selectors conflict"):
+            external_validation.FixtureSelectionManifest.parse(duplicate, external_validation._digest(duplicate))
+
+        facts = (
+            RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-1", "state", "open"),
+            RepositoryInventoryFact("issue-6", "standalone", "true"), RepositoryInventoryFact("issue-6", "state", "closed"),
+            RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"), RepositoryInventoryFact("issue-7", "state", "open"),
+            RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"), RepositoryInventoryFact("issue-9", "state", "open"),
+            RepositoryInventoryFact("issue-3", "depends-on", "issue-1"), RepositoryInventoryFact("issue-3", "state", "closed"),
+            RepositoryInventoryFact("pull-request-10", "state", "merged"),
+            # Valid but unselected subjects must not hide the selected facts.
+            RepositoryInventoryFact("issue-20", "child", "issue-21"), RepositoryInventoryFact("issue-20", "state", "open"),
+            RepositoryInventoryFact("pull-request-22", "state", "merged"),
+        )
+        inventory = SimpleNamespace(facts=facts)
+        observed = github_runtime.project_repository_fixture_outcomes(inventory, manifest.selector_map())
+        self.assertEqual(tuple(item.state for item in observed), ("open", "closed", "open", "open", "closed", "merged"))
+        drifted = replace(self.live_lifecycle_request_inputs(), target_baseline_sha="c" * 40)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "manifest target"):
+                external_validation.preflight_live_lifecycle_shadow_session(drifted, Path(temporary).resolve())
 
     def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
         candidate = "a" * 40
@@ -759,16 +789,12 @@ class ExternalValidationTests(unittest.TestCase):
                     for index, section in enumerate(RepositoryInventorySection, 1)
                 ), key=lambda item: item.section.value))
                 facts = tuple(sorted((
-                    RepositoryInventoryFact("issue-4", "child", "issue-49"),
-                    RepositoryInventoryFact("issue-49", "standalone", "true"),
-                    RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
-                    RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
-                    RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
-                    RepositoryInventoryFact("issue-4", "state", "open"),
-                    RepositoryInventoryFact("issue-49", "state", "open"),
-                    RepositoryInventoryFact("issue-50", "state", "open"),
-                    RepositoryInventoryFact("issue-51", "state", "open"),
-                    RepositoryInventoryFact("pull-request-81", "state", "merged"),
+                    RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-6", "standalone", "true"),
+                    RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"), RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
+                    RepositoryInventoryFact("issue-3", "depends-on", "issue-1"), RepositoryInventoryFact("issue-1", "state", "open"),
+                    RepositoryInventoryFact("issue-3", "state", "closed"), RepositoryInventoryFact("issue-6", "state", "closed"),
+                    RepositoryInventoryFact("issue-7", "state", "open"), RepositoryInventoryFact("issue-9", "state", "open"),
+                    RepositoryInventoryFact("pull-request-10", "state", "merged"),
                     RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
                     RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
                     RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
@@ -871,13 +897,10 @@ class ExternalValidationTests(unittest.TestCase):
                 evidence = comment_evidence if section is RepositoryInventorySection.COMMENTS else "sha256:" + format(index, "064x")
                 collections.append(RepositoryInventoryEvidence(section, evidence, (f"{section.value}-1",), 1, True))
             facts = (
-                RepositoryInventoryFact("issue-4", "child", "issue-49"),
-                RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
-                RepositoryInventoryFact("issue-49", "standalone", "true"),
-                RepositoryInventoryFact("issue-4", "state", "open"),
-                RepositoryInventoryFact("issue-49", "state", "open"),
-                RepositoryInventoryFact("issue-50", "state", "open"),
-                RepositoryInventoryFact("issue-51", "state", "open"),
+                RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-3", "depends-on", "issue-1"),
+                RepositoryInventoryFact("issue-6", "standalone", "true"), RepositoryInventoryFact("issue-1", "state", "open"),
+                RepositoryInventoryFact("issue-3", "state", "closed"), RepositoryInventoryFact("issue-6", "state", "closed"),
+                RepositoryInventoryFact("issue-7", "state", "open"), RepositoryInventoryFact("issue-9", "state", "open"),
                 RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
                 RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
                 RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
@@ -886,9 +909,9 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
                 RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
                 RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
-                RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
-                RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
-                RepositoryInventoryFact("pull-request-81", "state", "merged"),
+                RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"),
+                RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
+                RepositoryInventoryFact("pull-request-10", "state", "merged"),
             )
             return RepositoryInventorySnapshot(
                 repository, "forward-target", "main", "d" * 40, "sha256:" + "a" * 64,
@@ -1183,7 +1206,11 @@ class ExternalValidationTests(unittest.TestCase):
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
             confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("f"))
-            result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
+            with patch.object(
+                external_validation, "project_repository_fixture_outcomes",
+                return_value=external_validation._roundlet_fixture_outcomes(inputs.fixture_manifest)[:-1],
+            ):
+                result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
         inventory_commands = [command for command in host.commands if "object(expression:$oid)" not in command[4]]
@@ -1242,9 +1269,13 @@ class ExternalValidationTests(unittest.TestCase):
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
             confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("8"))
-            process_result = external_validation.execute_live_lifecycle_shadow_session(
-                confirmed.public_receipt(), root, process_capability,
-            )
+            with patch.object(
+                external_validation, "project_repository_fixture_outcomes",
+                return_value=external_validation._roundlet_fixture_outcomes(inputs.fixture_manifest)[:-1],
+            ):
+                process_result = external_validation.execute_live_lifecycle_shadow_session(
+                    confirmed.public_receipt(), root, process_capability,
+                )
         self.assertEqual(process_result, {"status": "fake"})
         self.assertTrue(process_host.commands)
         self.assertTrue(all(command[0:4] == ("gh", "api", "graphql", "-f") for command in process_host.commands))
@@ -2444,7 +2475,36 @@ class ExternalValidationTests(unittest.TestCase):
             "3" * 40, "retention-49", external_validation.LiveLifecycleLedgerBinding(
                 lifecycle_observation._synthetic_plan("a" * 40, 17), "sha256:" + "3" * 64,
             ),
+            self.fixture_manifest(),
         )
+
+    @staticmethod
+    def fixture_manifest(baseline: str = "d" * 40) -> external_validation.FixtureSelectionManifest:
+        expectations = (
+            ("umbrella", {"kind": "issue", "number": 1}, ("umbrella", "children-present", "not-applicable", "open", "not-applicable", "none", "retain-readonly")),
+            ("standalone", {"kind": "issue", "number": 6}, ("standalone", "no-parent", "not-applicable", "closed", "not-applicable", "none", "retain-readonly")),
+            ("ignored", {"kind": "issue", "number": 7}, ("ignored", "not-applicable", "not-applicable", "open", "excluded", "roundlet-ignore", "retain-readonly")),
+            ("malformed-parent-owner-input", {"kind": "issue", "number": 9}, ("malformed-parent", "owner-input", "not-applicable", "open", "blocked", "owner-input", "retain-readonly")),
+            ("dependency", {"kind": "issue", "number": 3}, ("dependent", "blocked-by-parent", "not-applicable", "closed", "blocked", "dependency", "retain-readonly")),
+            ("merged-pr", {"kind": "pull-request", "number": 10}, ("merged-pr", "not-applicable", "not-applicable", "merged", "passed", "none", "retain-readonly")),
+            ("supervisor-failover", {"kind": "sealed-lifecycle-attempt-sequence", "attempts": [
+                {"ordinal": 1, "model": "sol", "reasoning": "xhigh", "disposition": "cancelled"},
+                {"ordinal": 2, "model": "terra", "reasoning": "high", "disposition": "invalid-context"},
+                {"ordinal": 3, "model": "terra", "reasoning": "high", "disposition": "pass"},
+            ]}, ("supervisor-failover", "not-applicable", "three-sealed-attempts", "accepted", "passed", "none", "retain-readonly")),
+        )
+        value = {
+            "schema": "roundlet-owner-reviewed-fixture-selection-expectation-manifest/v1",
+            "run_id": "test-run-49", "contract_id": "d" * 64, "leaf": 49,
+            "target": {"repository": "ythdelmar68/roundlet-forward-test", "baseline_sha": baseline},
+            "binding": {"authoritative_extension_point": "roundwright-harness-profile-executor-request/v2.execution_context", "capture_observation_identity_must_commit_manifest_digest": True, "lifecycle_contract_identity": lifecycle_observation.lifecycle_observation_contract()["contract_identity"], "lifecycle_contract_identity_must_remain_unchanged": True},
+            "authority": {"effect": "external-owner-reviewed-reference-decision", "owner_allowlist": ["ythdelmar68"], "repository_mutation": False, "target_mutation": False},
+            "fixtures": [
+                {"fixture": fixture, "selector": selector, "expectation": dict(zip(("classification", "dependencies", "attempt_accounting", "state", "gates", "blockers", "next_action"), expectation, strict=True))}
+                for fixture, selector, expectation in expectations
+            ],
+        }
+        return external_validation.FixtureSelectionManifest.parse(value, external_validation._digest(value))
 
     @staticmethod
     def live_lifecycle_projection() -> lifecycle_observation.LifecycleShadowProjection:
@@ -2469,10 +2529,12 @@ class ExternalValidationTests(unittest.TestCase):
             case_id="live-lifecycle-case", candidate_sha="a" * 40, ready_at=17,
         )
         descriptor = {
-            "schema": "roundwright-live-lifecycle-runtime/v1",
+            "schema": "roundwright-live-lifecycle-runtime/v2",
             "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
+            "fixture_manifest": self.fixture_manifest("b" * 40).payload(),
+            "fixture_manifest_digest": self.fixture_manifest("b" * 40).manifest_digest,
         }
         context = adapter.prepare_execution_context(SimpleNamespace(descriptor=descriptor, plan=plan))  # type: ignore[attr-defined]
         return SimpleNamespace(

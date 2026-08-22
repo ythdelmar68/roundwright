@@ -5116,6 +5116,7 @@ class RepositoryFixtureOutcome:
 
 def project_repository_fixture_outcomes(
     inventory: RepositoryInventorySnapshot,
+    selectors: Mapping[str, tuple[str, int]] | None = None,
 ) -> tuple[RepositoryFixtureOutcome, ...]:
     """Run the production inventory classifier and scheduler for each fixture.
 
@@ -5128,6 +5129,74 @@ def project_repository_fixture_outcomes(
     if type(facts_value) is not tuple or any(type(item) is not RepositoryInventoryFact for item in facts_value):
         raise GitHubRuntimeError("repository fixture inventory is invalid")
     facts = {(item.subject, item.predicate, item.object) for item in facts_value}
+    if selectors is not None:
+        # The product classifier normally discovers its fixture subjects from
+        # a complete inventory.  A sealed external manifest may instead name
+        # the exact public subjects to classify.  It supplies only selectors,
+        # never outcomes, and a duplicate or conflicting subject fails before
+        # any scheduler result is produced.
+        if type(selectors) is not dict or set(selectors) != {
+            "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
+            "dependency", "merged-pr",
+        }:
+            raise GitHubRuntimeError("repository fixture selectors are invalid")
+        subjects: dict[str, str] = {}
+        for fixture, value in selectors.items():
+            if (
+                type(value) is not tuple or len(value) != 2
+                or value[0] not in {"issue", "pull-request"}
+                or type(value[1]) is not int or value[1] < 1
+            ):
+                raise GitHubRuntimeError("repository fixture selectors are invalid")
+            subjects[fixture] = f"{value[0]}-{value[1]}"
+        if len(set(subjects.values())) != len(subjects.values()):
+            raise GitHubRuntimeError("repository fixture selectors conflict")
+
+        def state(subject: str) -> str:
+            values = {item.object for item in facts_value if item.subject == subject and item.predicate == "state"}
+            if len(values) != 1 or next(iter(values)) not in {"open", "closed", "merged"}:
+                raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+            return next(iter(values))
+
+        def outcome(fixture: str, classification: str, dependency: str, gates: str, blockers: str) -> RepositoryFixtureOutcome:
+            return RepositoryFixtureOutcome(
+                fixture, classification, dependency, state(subjects[fixture]), gates, blockers, "retain-readonly",
+            )
+
+        def has(subject: str, predicate: str, object_value: str | None = None) -> bool:
+            return any(
+                item.subject == subject and item.predicate == predicate
+                and (object_value is None or item.object == object_value)
+                for item in facts_value
+            )
+
+        umbrella = subjects["umbrella"]
+        standalone = subjects["standalone"]
+        ignored = subjects["ignored"]
+        malformed = subjects["malformed-parent-owner-input"]
+        dependency = subjects["dependency"]
+        merged = subjects["merged-pr"]
+        if not any(item.subject == umbrella and item.predicate == "child" for item in facts_value):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        if not has(standalone, "standalone", "true") or any(
+            item.predicate == "child" and item.object == standalone for item in facts_value
+        ):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        if not has(ignored, "label", "roundlet:ignore"):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        if not has(malformed, "malformed-parent", "owner-input"):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        dependency_edges = [item for item in facts_value if item.subject == dependency and item.predicate == "depends-on"]
+        if len(dependency_edges) != 1:
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        return (
+            outcome("umbrella", "umbrella", "children-present", "not-applicable", "none"),
+            outcome("standalone", "standalone", "no-parent", "not-applicable", "none"),
+            outcome("ignored", "ignored", "not-applicable", "excluded", "roundlet-ignore"),
+            outcome("malformed-parent-owner-input", "malformed-parent", "owner-input", "blocked", "owner-input"),
+            outcome("dependency", "dependent", "blocked-by-parent", "blocked", "dependency"),
+            outcome("merged-pr", "merged-pr", "not-applicable", "passed", "none"),
+        )
     state_by_subject = {
         subject: value for subject, predicate, value in facts
         if predicate == "state" and value in {"open", "closed", "merged"}

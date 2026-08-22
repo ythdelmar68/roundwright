@@ -1155,9 +1155,12 @@ class FixtureSelectionManifest:
     def from_projection(cls, value: object, manifest_digest: object) -> "FixtureSelectionManifest":
         """Rehydrate a checked public projection; it is not an owner seal."""
 
-        if type(value) is not dict or type(manifest_digest) is not str:
+        if type(value) not in (dict, MappingProxyType) or type(manifest_digest) is not str:
             raise ExternalValidationAdapterError("fixture manifest is invalid")
-        return cls(MappingProxyType(dict(value)), manifest_digest)
+        copied = cls._thaw(value)
+        if type(copied) is not dict:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        return cls(MappingProxyType(copied), manifest_digest)
 
     @staticmethod
     def _freeze(value: object) -> object:

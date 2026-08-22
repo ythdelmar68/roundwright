@@ -715,6 +715,47 @@ class ExternalValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "manifest target"):
                 external_validation.preflight_live_lifecycle_shadow_session(drifted, Path(temporary).resolve())
 
+    def test_harness_v2_validate_projection_accepts_read_only_manifest_without_owner_seal(self) -> None:
+        sealed = self.fixture_manifest("b" * 40)
+        projection = external_validation.FixtureSelectionManifest._freeze(sealed.payload())
+        projected = external_validation.FixtureSelectionManifest.from_projection(
+            projection, sealed.manifest_digest,
+        )
+        self.assertEqual(projected.payload(), sealed.payload())
+        self.assertFalse(projected.is_owner_sealed)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "manifest"):
+            external_validation.FixtureSelectionManifest.from_projection(
+                MappingProxyType({"schema": "malformed"}), sealed.manifest_digest,
+            )
+
+        adapter = external_validation.LiveLifecycleShadowProfileAdapter()
+        producer, exporter, comparator = external_validation.live_lifecycle_shadow_component_identities()
+        plan = SimpleNamespace(
+            plan_digest="sha256:" + "1" * 64, profile=LIVE_LIFECYCLE_SHADOW_PROFILE,
+            case_id="live-lifecycle-case", candidate_sha="a" * 40, ready_at=17,
+        )
+        descriptor = {
+            "schema": "roundwright-live-lifecycle-runtime/v2",
+            "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
+            "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
+            "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
+            "fixture_manifest": sealed.payload(), "fixture_manifest_digest": sealed.manifest_digest,
+        }
+        context = adapter.prepare_execution_context(SimpleNamespace(
+            descriptor=external_validation.FixtureSelectionManifest._freeze(descriptor), plan=plan,
+        ))
+        adapter.validate(SimpleNamespace(
+            profile=LIVE_LIFECYCLE_SHADOW_PROFILE, case_id=plan.case_id,
+            candidate_sha=plan.candidate_sha, ready_at=plan.ready_at, plan=plan,
+            components=SimpleNamespace(
+                producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator,
+            ), execution_context=context, execution_context_input_digest="sha256:" + "2" * 64,
+        ))
+        with tempfile.TemporaryDirectory() as temporary:
+            unsealed = replace(self.live_lifecycle_request_inputs(), fixture_manifest=projected)
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unsealed"):
+                external_validation.preflight_live_lifecycle_shadow_session(unsealed, Path(temporary).resolve())
+
     def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
         candidate = "a" * 40
         marker = lambda profile, reasoning, disposition: (

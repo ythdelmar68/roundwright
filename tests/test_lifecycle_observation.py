@@ -41,6 +41,13 @@ class LifecycleObservationTests(unittest.TestCase):
         }
         return SimpleNamespace(as_dict=lambda: {**core, "receipt_digest": lifecycle._digest(core)})
 
+    @staticmethod
+    def rechain(events: list[dict[str, object]]) -> None:
+        predecessor = None
+        for event in events:
+            event["predecessor_event_digest"] = predecessor
+            predecessor = lifecycle._digest(event)
+
     def projection(self) -> lifecycle.LifecycleShadowProjection:
         plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
         events = lifecycle._synthetic_events(plan)
@@ -89,6 +96,44 @@ class LifecycleObservationTests(unittest.TestCase):
         self.assertEqual(projection.candidate_sha, self.candidate)
         self.assertEqual(projection.ready_at, self.ready_at)
         self.assertEqual(projection.classified_differences, ())
+
+    def test_supervisor_profile_artifacts_bind_model_and_reasoning(self) -> None:
+        projection = self.projection()
+        completed = tuple(
+            (event.model_profile, event.reasoning_profile, event.disposition)
+            for event in projection.events if event.transition == "attempt_completed"
+        )
+        self.assertEqual(
+            completed,
+            (("sol", "xhigh", "cancelled"), ("terra", "high", "invalid_context"), ("terra", "high", "pass")),
+        )
+        self.assertTrue(lifecycle.supervisor_profile_artifact("sol", "xhigh").startswith("sha256:"))
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "profile artifact"):
+            lifecycle.supervisor_profile_artifact("sol", "high")
+
+        plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
+        legacy_events = lifecycle._synthetic_events(plan)
+        legacy_events[1]["artifact_references"] = [
+            lifecycle._digest({
+                "schema": "roundwright-supervisor-model-artifact/v1",
+                "model": "sol",
+            }),
+        ]
+        self.rechain(legacy_events)
+        legacy = lifecycle.project_lifecycle_events(plan, legacy_events, self.seal(plan, legacy_events))
+        self.assertEqual(legacy.events[1].model_profile, "missing")
+        self.assertEqual(legacy.events[1].reasoning_profile, "missing")
+
+        duplicate_events = lifecycle._synthetic_events(plan)
+        duplicate_events[1]["artifact_references"] *= 2
+        self.rechain(duplicate_events)
+        duplicate = lifecycle.project_lifecycle_events(
+            plan, duplicate_events, self.seal(plan, duplicate_events),
+        )
+        self.assertEqual(
+            (duplicate.events[1].model_profile, duplicate.events[1].reasoning_profile),
+            ("missing", "missing"),
+        )
 
     def test_comparator_checks_every_field_and_rejects_declared_difference(self) -> None:
         expected = self.projection()

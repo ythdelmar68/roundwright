@@ -442,17 +442,19 @@ class ExternalValidationTests(unittest.TestCase):
         )
 
         for ordinal in range(3):
-            for field in range(2):
+            for field in range(3):
                 attempts = list(observed.supervisor_attempts)
-                profile, disposition = attempts[ordinal]
+                profile, reasoning, disposition = attempts[ordinal]
                 attempts[ordinal] = (
                     "missing" if field == 0 else profile,
-                    "missing" if field == 1 else disposition,
+                    "missing" if field == 1 else reasoning,
+                    "missing" if field == 2 else disposition,
                 )
                 changed = replace(observed, supervisor_attempts=tuple(attempts))
                 expected_category = (
                     f"supervisor-profile-{ordinal + 1}-drift"
-                    if field == 0 else f"supervisor-disposition-{ordinal + 1}-drift"
+                    if field == 0 else f"supervisor-reasoning-{ordinal + 1}-drift"
+                    if field == 1 else f"supervisor-disposition-{ordinal + 1}-drift"
                 )
                 self.assertEqual(
                     external_validation._classified_lifecycle_differences(expected, changed),
@@ -462,7 +464,7 @@ class ExternalValidationTests(unittest.TestCase):
         differences = external_validation._classified_lifecycle_differences(
             expected,
             replace(observed, candidate_sha="b" * 40, ready_at=18,
-                    supervisor_attempts=(("missing", "missing"), *observed.supervisor_attempts[1:])),
+                    supervisor_attempts=(("missing", "missing", "missing"), *observed.supervisor_attempts[1:])),
         )
         self.assertEqual(differences, tuple(sorted(set(differences))))
         self.assertLessEqual(len(differences), external_validation._LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES)
@@ -519,7 +521,7 @@ class ExternalValidationTests(unittest.TestCase):
             "supervisor-failover",
             external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, verified),
         )
-        changed = replace(verified, supervisor_attempts=(("terra", "cancelled"), *verified.supervisor_attempts[1:]))
+        changed = replace(verified, supervisor_attempts=(("terra", "xhigh", "cancelled"), *verified.supervisor_attempts[1:]))
         self.assertNotIn(
             "supervisor-failover",
             external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed),
@@ -530,22 +532,41 @@ class ExternalValidationTests(unittest.TestCase):
                 external_validation._roundlet_lifecycle_projection("a" * 40, 17), changed,
             ),
         )
+        wrong_reasoning = replace(
+            verified,
+            supervisor_attempts=(("sol", "high", "cancelled"), *verified.supervisor_attempts[1:]),
+        )
+        self.assertNotIn(
+            "supervisor-failover",
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning),
+        )
+        self.assertIn(
+            "supervisor-reasoning-1-drift",
+            external_validation._classified_lifecycle_differences(
+                external_validation._roundlet_lifecycle_projection("a" * 40, 17), wrong_reasoning,
+            ),
+        )
 
     def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
         candidate = "a" * 40
-        marker = lambda profile, disposition: (
-            f"ROUNDLET_LIFECYCLE supervisor={profile} disposition={disposition} "
+        marker = lambda profile, reasoning, disposition: (
+            f"ROUNDLET_LIFECYCLE supervisor={profile} reasoning={reasoning} disposition={disposition} "
             f"round=formal-round-1 ready_at=17 candidate={candidate}"
         )
         nodes = [
-            ("issue", {"id": "trace-1", "body": marker("sol", "cancelled")}),
-            ("issue", {"id": "trace-2", "body": marker("terra", "invalid-context")}),
-            ("pull-request", {"id": "trace-3", "body": marker("terra", "pass")}),
+            ("issue", {"id": "trace-1", "body": marker("sol", "xhigh", "cancelled")}),
+            ("issue", {"id": "trace-2", "body": marker("terra", "high", "invalid-context")}),
+            ("pull-request", {"id": "trace-3", "body": marker("terra", "high", "pass")}),
         ]
         facts = github_runtime._inventory_roundlet_trace_facts(nodes)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request"), facts)
         with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
             github_runtime._inventory_roundlet_trace_facts([*nodes, nodes[-1]])
+        legacy_nodes = [
+            ("issue", {"id": "legacy-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 ready_at=17 candidate={candidate}"}),
+        ]
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "legacy"):
+            github_runtime._inventory_roundlet_trace_facts(legacy_nodes)
 
     def test_public_live_lifecycle_preflight_persists_a_path_free_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -785,7 +806,7 @@ class ExternalValidationTests(unittest.TestCase):
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=invalid-context round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
+                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
                     {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                     {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
@@ -1323,7 +1344,7 @@ class ExternalValidationTests(unittest.TestCase):
         split_pull_comments = split_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]
         split_pull_comments.update({
             "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "pr-trace-page-1"},
-            "nodes": [{"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}],
+            "nodes": [{"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}],
         })
         split_trace_host = OpaqueCredentialHost(
             split_trace_inventory,
@@ -1339,6 +1360,8 @@ class ExternalValidationTests(unittest.TestCase):
         split_facts = set(split_trace_result.snapshot.facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-1", "surface", "issue"), split_facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request"), split_facts)
+        self.assertIn(RepositoryInventoryFact("lifecycle-supervisor-1", "reasoning", "xhigh"), split_facts)
+        self.assertIn(RepositoryInventoryFact("lifecycle-supervisor-3", "reasoning", "high"), split_facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "marker", "lifecycle"), split_facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "semantic", "supervisor-3"), split_facts)
         self.assertEqual(
@@ -1368,6 +1391,24 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(
             repository_inventory_failure_code(duplicate_trace_result.failure.public_reason),  # type: ignore[union-attr]
             external_validation.RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE,
+        )
+        legacy_trace_inventory = json.loads(json.dumps(split_trace_inventory))
+        legacy_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]["nodes"][0]["body"] = (
+            f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled "
+            f"round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"
+        )
+        legacy_trace_result = create_credentialed_github_read_capability(
+            OpaqueCredentialHost(
+                legacy_trace_inventory,
+                comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "pr-trace-terminal"}]},
+            ), binding, dependency_control, health, clock=lambda: now,
+        ).read(GitHubReadRequest(
+            GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
+        ))
+        self.assertFalse(legacy_trace_result.ok)
+        self.assertEqual(
+            repository_inventory_failure_code(legacy_trace_result.failure.public_reason),  # type: ignore[union-attr]
+            external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
         )
         request = GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,

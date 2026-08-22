@@ -5110,7 +5110,7 @@ def _inventory_label_fact_value(value: object) -> str:
 
 
 _ROUNDLET_FAILOVER_TRACE = re.compile(
-    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+ready_at=([0-9]+)\s+candidate=([0-9a-f]{40})\Z"
+    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+reasoning=(xhigh|high)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+ready_at=([0-9]+)\s+candidate=([0-9a-f]{40})\Z"
 )
 
 
@@ -5137,30 +5137,36 @@ def _inventory_section_identity(section: RepositoryInventorySection, node: objec
 def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[RepositoryInventoryFact, ...]:
     """Project bounded marker fields only; never retain comment bodies."""
 
-    records: list[tuple[str, str, str, str, str, str, str]] = []
+    records: list[tuple[str, str, str, str, str, str, str, str]] = []
     for surface, node in nodes:
         value = _raw_mapping(node)
         body = _raw_optional_text(value, "body")
         if body is None:
             continue
         match = _ROUNDLET_FAILOVER_TRACE.fullmatch(body)
+        if match is None and body.startswith("ROUNDLET_LIFECYCLE"):
+            # Version-1/model-only markers cannot prove the exact configured
+            # Supervisor profile.  Reject them rather than treating them as
+            # absent evidence or upgrading them by inference.
+            raise GitHubRuntimeError("inventory Roundlet failover trace is legacy or malformed")
         if match is not None:
             records.append((surface, _raw_id(value, "id"), *match.groups()))
     if not records:
         return ()
-    if len(records) != 3 or tuple((profile, disposition) for _surface, _identity, profile, disposition, _round, _ready_at, _candidate in records) != (
-        ("sol", "cancelled"), ("terra", "invalid-context"), ("terra", "pass"),
+    if len(records) != 3 or tuple((profile, reasoning, disposition) for _surface, _identity, profile, reasoning, disposition, _round, _ready_at, _candidate in records) != (
+        ("sol", "xhigh", "cancelled"), ("terra", "high", "invalid-context"), ("terra", "high", "pass"),
     ):
         raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
-    rounds = {round_id for _surface, _identity, _profile, _disposition, round_id, _ready_at, _candidate in records}
-    ready_values = {ready_at for _surface, _identity, _profile, _disposition, _round_id, ready_at, _candidate in records}
-    candidates = {candidate for _surface, _identity, _profile, _disposition, _round_id, _ready_at, candidate in records}
+    rounds = {round_id for _surface, _identity, _profile, _reasoning, _disposition, round_id, _ready_at, _candidate in records}
+    ready_values = {ready_at for _surface, _identity, _profile, _reasoning, _disposition, _round_id, ready_at, _candidate in records}
+    candidates = {candidate for _surface, _identity, _profile, _reasoning, _disposition, _round_id, _ready_at, candidate in records}
     if rounds != {"formal-round-1"} or len(ready_values) != 1 or len(candidates) != 1:
         raise GitHubRuntimeError("inventory Roundlet failover trace is inconsistent")
     facts: list[RepositoryInventoryFact] = []
-    for ordinal, (surface, identity, profile, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
+    for ordinal, (surface, identity, profile, reasoning, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
         facts.extend((
             RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "profile", profile),
+            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "reasoning", reasoning),
             RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "disposition", disposition),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "surface", surface),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "marker", "lifecycle"),

@@ -1562,7 +1562,7 @@ class _RoundletLifecycleProjection:
     candidate_sha: str
     formal_round: str
     ready_at: int
-    supervisor_attempts: tuple[tuple[str, str], ...]
+    supervisor_attempts: tuple[tuple[str, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -1572,14 +1572,14 @@ class _RoundwrightLifecycleProjection:
     candidate_sha: str
     formal_round: str
     ready_at: int
-    supervisor_attempts: tuple[tuple[str, str], ...]
+    supervisor_attempts: tuple[tuple[str, str, str], ...]
     supervisor_sequence_valid: bool
 
 
 _SUPERVISOR_FAILOVER_ATTEMPTS = (
-    ("sol", "cancelled"),
-    ("terra", "invalid-context"),
-    ("terra", "pass"),
+    ("sol", "xhigh", "cancelled"),
+    ("terra", "high", "invalid-context"),
+    ("terra", "high", "pass"),
 )
 
 
@@ -1614,11 +1614,11 @@ def _roundwright_lifecycle_projection(
         event.review_attempt: event for event in completed
     } if sequence_valid else {}
 
-    def supervisor_outcome(ordinal: int) -> tuple[str, str]:
+    def supervisor_outcome(ordinal: int) -> tuple[str, str, str]:
         event = attempts_by_ordinal.get(ordinal)
         if event is None:
-            return ("missing", "missing")
-        return (event.model_profile, event.disposition.replace("_", "-"))
+            return ("missing", "missing", "missing")
+        return (event.model_profile, event.reasoning_profile, event.disposition.replace("_", "-"))
 
     return _RoundwrightLifecycleProjection(
         lifecycle.candidate_sha,
@@ -1649,6 +1649,8 @@ def _classified_lifecycle_differences(
         if expected[0] != observed[0]:
             differences.append(f"supervisor-profile-{ordinal}-drift")
         if expected[1] != observed[1]:
+            differences.append(f"supervisor-reasoning-{ordinal}-drift")
+        if expected[2] != observed[2]:
             differences.append(f"supervisor-disposition-{ordinal}-drift")
     return tuple(sorted(set(differences)))
 

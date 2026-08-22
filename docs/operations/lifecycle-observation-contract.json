@@ -1,5 +1,5 @@
 {
-  "contract_identity": "sha256:978b54f84af39df9de6139419a955966aaa05c33df5317bcbcb6c2b0257d6b89",
+  "contract_identity": "sha256:6752833ae7cabd0ce7e3c45a9bf964f068a3df8728d77e3cfa6fbe126faa8ed8",
   "entrypoints": {
     "append_readback": "roundwright_harness.lifecycle:append_lifecycle_event",
     "compare": "roundwright.lifecycle_observation:compare_lifecycle_projections",
@@ -33,8 +33,7 @@
     "event": "roundwright-harness-lifecycle-event/v1",
     "plan": "roundwright-harness-lifecycle-plan/v1",
     "projection": "roundwright-lifecycle-shadow-projection/v1",
-    "seal_receipt": "roundwright-harness-lifecycle-seal-receipt/v1",
-    "supervisor_profile_artifact": "roundwright-supervisor-profile-artifact/v2"
+    "seal_receipt": "roundwright-harness-lifecycle-seal-receipt/v1"
   },
   "selection": "leaf-explicit-opt-in",
   "status": "active",

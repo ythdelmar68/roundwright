@@ -56,6 +56,10 @@ class LifecycleObservationTests(unittest.TestCase):
     def test_authoritative_contract_pins_reviewed_external_identities(self) -> None:
         contract = lifecycle.lifecycle_observation_contract()
 
+        self.assertEqual(
+            contract["contract_identity"],
+            "sha256:6752833ae7cabd0ce7e3c45a9bf964f068a3df8728d77e3cfa6fbe126faa8ed8",
+        )
         self.assertEqual(contract["harness"]["merge_commit"], lifecycle.HARNESS_MERGE_COMMIT)
         self.assertEqual(contract["harness"]["tree"], lifecycle.HARNESS_TREE)
         self.assertEqual(contract["roundlet"]["merge_commit"], lifecycle.ROUNDLET_MERGE_COMMIT)
@@ -70,6 +74,17 @@ class LifecycleObservationTests(unittest.TestCase):
         drifted["roundlet"] = {**contract["roundlet"], "tree": "0" * 40}
         with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "drifted"):
             lifecycle.validate_lifecycle_observation_contract(drifted)
+        profile_registry_drift = dict(contract)
+        profile_registry_drift["schemas"] = {
+            **contract["schemas"],
+            "supervisor_profile_artifact": lifecycle.SUPERVISOR_PROFILE_ARTIFACT_SCHEMA,
+        }
+        profile_registry_drift["contract_identity"] = lifecycle._digest({
+            key: value for key, value in profile_registry_drift.items()
+            if key != "contract_identity"
+        })
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "drifted"):
+            lifecycle.validate_lifecycle_observation_contract(profile_registry_drift)
         tracked = json.loads(
             (ROOT / "docs" / "operations" / "lifecycle-observation-contract.json").read_text(
                 encoding="utf-8"

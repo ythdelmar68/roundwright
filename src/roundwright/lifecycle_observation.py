@@ -257,7 +257,6 @@ def lifecycle_observation_contract() -> dict[str, object]:
             "seal_receipt": HARNESS_SEAL_RECEIPT_SCHEMA,
             "projection": LIFECYCLE_PROJECTION_SCHEMA,
             "comparison": LIFECYCLE_COMPARISON_SCHEMA,
-            "supervisor_profile_artifact": SUPERVISOR_PROFILE_ARTIFACT_SCHEMA,
         },
         "entrypoints": {
             "prepare": "roundwright_harness.lifecycle:prepare_lifecycle",

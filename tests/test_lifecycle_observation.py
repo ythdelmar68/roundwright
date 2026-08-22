@@ -112,43 +112,32 @@ class LifecycleObservationTests(unittest.TestCase):
         self.assertEqual(projection.ready_at, self.ready_at)
         self.assertEqual(projection.classified_differences, ())
 
-    def test_supervisor_profile_artifacts_bind_model_and_reasoning(self) -> None:
-        projection = self.projection()
-        completed = tuple(
-            (event.model_profile, event.reasoning_profile, event.disposition)
-            for event in projection.events if event.transition == "attempt_completed"
-        )
+    def test_v1_projection_keeps_its_pre_candidate_semantic_shape_and_identity(self) -> None:
+        plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
+        events = lifecycle._synthetic_events(plan)
+        for event in events:
+            event["artifact_references"] = []
+        self.rechain(events)
+        projection = lifecycle.project_lifecycle_events(plan, events, self.seal(plan, events))
+        payload = projection.semantic_payload()
         self.assertEqual(
-            completed,
-            (("sol", "xhigh", "cancelled"), ("terra", "high", "invalid_context"), ("terra", "high", "pass")),
+            tuple(payload["events"][1]),
+            (
+                "sequence", "occurred_at", "role", "task_identity", "attempt_identity",
+                "review_attempt", "transition", "disposition", "accepted_result",
+                "successor_candidate_sha", "predecessor_event_digest", "artifact_references",
+                "event_digest",
+            ),
+        )
+        # This digest was captured from the independently reviewed v1 ledger
+        # fixture before profile-private decoding was introduced.
+        self.assertEqual(
+            lifecycle._digest(payload),
+            "sha256:cb4401bf39dfe698f7a634501a5701fc342ee55b14203dad9bfd8027dbf55e4c",
         )
         self.assertTrue(lifecycle.supervisor_profile_artifact("sol", "xhigh").startswith("sha256:"))
         with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "profile artifact"):
             lifecycle.supervisor_profile_artifact("sol", "high")
-
-        plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
-        legacy_events = lifecycle._synthetic_events(plan)
-        legacy_events[1]["artifact_references"] = [
-            lifecycle._digest({
-                "schema": "roundwright-supervisor-model-artifact/v1",
-                "model": "sol",
-            }),
-        ]
-        self.rechain(legacy_events)
-        legacy = lifecycle.project_lifecycle_events(plan, legacy_events, self.seal(plan, legacy_events))
-        self.assertEqual(legacy.events[1].model_profile, "missing")
-        self.assertEqual(legacy.events[1].reasoning_profile, "missing")
-
-        duplicate_events = lifecycle._synthetic_events(plan)
-        duplicate_events[1]["artifact_references"] *= 2
-        self.rechain(duplicate_events)
-        duplicate = lifecycle.project_lifecycle_events(
-            plan, duplicate_events, self.seal(plan, duplicate_events),
-        )
-        self.assertEqual(
-            (duplicate.events[1].model_profile, duplicate.events[1].reasoning_profile),
-            ("missing", "missing"),
-        )
 
     def test_comparator_checks_every_field_and_rejects_declared_difference(self) -> None:
         expected = self.projection()

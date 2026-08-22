@@ -175,28 +175,6 @@ def supervisor_profile_artifact(model: str, reasoning: str) -> str:
     })
 
 
-_SUPERVISOR_MODEL_ARTIFACTS = {
-    supervisor_profile_artifact(model, reasoning): (model, reasoning)
-    for model, reasoning in _SUPERVISOR_PROFILES
-}
-
-
-def _captured_supervisor_profile(references: Sequence[str]) -> tuple[str, str]:
-    """Decode exactly one model/reasoning fact from sealed references.
-
-    Absence, duplication, or a changed profile is deliberately represented as
-    ``missing`` so the live comparator blocks instead of inferring a model
-    from attempt ordinal or lifecycle kind.
-    """
-
-    # The completed Supervisor record must carry one and only one version-2
-    # profile artifact.  In particular, a model-only version-1 digest cannot
-    # be paired with a new artifact and silently ignored during migration.
-    if len(references) != 1:
-        return ("missing", "missing")
-    return _SUPERVISOR_MODEL_ARTIFACTS.get(references[0], ("missing", "missing"))
-
-
 @dataclass(frozen=True)
 class ReviewedComponentPin:
     repository: str
@@ -393,8 +371,6 @@ class ProjectedLifecycleEvent:
     predecessor_event_digest: str | None
     artifact_references: tuple[str, ...]
     event_digest: str
-    model_profile: str = "missing"
-    reasoning_profile: str = "missing"
 
     def __post_init__(self) -> None:
         if (
@@ -421,7 +397,6 @@ class ProjectedLifecycleEvent:
             or type(self.artifact_references) is not tuple
             or any(not _safe_digest(item) for item in self.artifact_references)
             or not _safe_digest(self.event_digest)
-            or (self.model_profile, self.reasoning_profile) not in {*_SUPERVISOR_PROFILES, ("missing", "missing")}
         ):
             raise LifecycleObservationError("projected lifecycle event is invalid")
 
@@ -744,7 +719,6 @@ def project_lifecycle_events(
             ):
                 raise LifecycleObservationError("formal lifecycle advancement is invalid")
             formal_advance_count += 1
-        model_profile, reasoning_profile = _captured_supervisor_profile(event["artifact_references"])
         projected.append(
             ProjectedLifecycleEvent(
                 sequence,
@@ -760,8 +734,6 @@ def project_lifecycle_events(
                 predecessor,
                 tuple(event["artifact_references"]),
                 event_digest,
-                model_profile,
-                reasoning_profile,
             )
         )
         predecessor = event_digest

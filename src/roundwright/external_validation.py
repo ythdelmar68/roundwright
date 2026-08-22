@@ -1088,6 +1088,44 @@ _LIVE_LIFECYCLE_CATEGORY_SECTIONS = {
 
 
 @dataclass(frozen=True)
+class _FixtureOutcome:
+    """One typed, public-safe Roundlet fixture outcome at ``ready_at``."""
+
+    fixture: str
+    classification: str
+    dependencies: str
+    attempt_accounting: str
+    state: str
+    gates: str
+    blockers: str
+    next_action: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.fixture not in _LIVE_LIFECYCLE_FIXTURES
+            or not all(_safe_token(value) for value in (
+                self.classification, self.dependencies, self.attempt_accounting,
+                self.state, self.gates, self.blockers, self.next_action,
+            ))
+        ):
+            raise ExternalValidationAdapterError("live lifecycle fixture outcome is invalid")
+
+
+# These are independently reviewed Roundlet expectations, not values derived
+# from Roundwright's inventory projection.  A missing or altered target fact
+# therefore cannot manufacture its own expected PASS.
+_ROUNDLET_FIXTURE_OUTCOMES = {
+    "umbrella": _FixtureOutcome("umbrella", "umbrella", "children-present", "not-applicable", "open", "not-applicable", "none", "retain-readonly"),
+    "standalone": _FixtureOutcome("standalone", "standalone", "no-parent", "not-applicable", "open", "not-applicable", "none", "retain-readonly"),
+    "ignored": _FixtureOutcome("ignored", "ignored", "not-applicable", "not-applicable", "open", "excluded", "roundlet-ignore", "retain-readonly"),
+    "malformed-parent-owner-input": _FixtureOutcome("malformed-parent-owner-input", "malformed-parent", "owner-input", "not-applicable", "open", "blocked", "owner-input", "retain-readonly"),
+    "dependency": _FixtureOutcome("dependency", "dependent", "blocked-by-parent", "not-applicable", "open", "blocked", "dependency", "retain-readonly"),
+    "merged-pr": _FixtureOutcome("merged-pr", "merged-pr", "not-applicable", "not-applicable", "merged", "passed", "none", "retain-readonly"),
+    "supervisor-failover": _FixtureOutcome("supervisor-failover", "supervisor-failover", "not-applicable", "three-sealed-attempts", "accepted", "passed", "none", "retain-readonly"),
+}
+
+
+@dataclass(frozen=True)
 class LiveLifecycleShadowSnapshot:
     """One public-safe, armed read-only lifecycle observation.
 
@@ -1127,10 +1165,9 @@ class LiveLifecycleShadowSnapshot:
             or snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
             or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
             or type(self.fixture_classes) is not tuple
-            or self.fixture_classes not in {
-                _LIVE_LIFECYCLE_FIXTURES,
-                tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item != "supervisor-failover"),
-            }
+            or any(item not in _LIVE_LIFECYCLE_FIXTURES for item in self.fixture_classes)
+            or len(set(self.fixture_classes)) != len(self.fixture_classes)
+            or self.fixture_classes != tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item in self.fixture_classes)
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
@@ -1541,10 +1578,10 @@ class _LiveLifecycleProviderObservation:
         if (
             snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
             or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
-            or self.fixture_classes not in {
-                _LIVE_LIFECYCLE_FIXTURES,
-                tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item != "supervisor-failover"),
-            }
+            or type(self.fixture_classes) is not tuple
+            or any(item not in _LIVE_LIFECYCLE_FIXTURES for item in self.fixture_classes)
+            or len(set(self.fixture_classes)) != len(self.fixture_classes)
+            or self.fixture_classes != tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item in self.fixture_classes)
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
@@ -1583,6 +1620,24 @@ _SUPERVISOR_FAILOVER_ATTEMPTS = (
 )
 
 
+def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[str, str]:
+    """Decode one retained Supervisor profile only for the live comparator.
+
+    The authoritative lifecycle projection deliberately remains the reviewed
+    v1 shape.  A profile is a private interpretation of an already sealed
+    artifact reference: absence, duplication, and unknown references are all
+    explicit missing evidence and consequently block the comparison.
+    """
+
+    if type(artifact_references) is not tuple or len(artifact_references) != 1:
+        return ("missing", "missing")
+    profiles = {
+        lifecycle_observation.supervisor_profile_artifact("sol", "xhigh"): ("sol", "xhigh"),
+        lifecycle_observation.supervisor_profile_artifact("terra", "high"): ("terra", "high"),
+    }
+    return profiles.get(artifact_references[0], ("missing", "missing"))
+
+
 def _roundlet_lifecycle_projection(candidate_sha: str, ready_at: int) -> _RoundletLifecycleProjection:
     """Return the reviewed Roundlet fixture independently of provider facts."""
 
@@ -1618,7 +1673,8 @@ def _roundwright_lifecycle_projection(
         event = attempts_by_ordinal.get(ordinal)
         if event is None:
             return ("missing", "missing", "missing")
-        return (event.model_profile, event.reasoning_profile, event.disposition.replace("_", "-"))
+        model, reasoning = _private_supervisor_profile(event.artifact_references)
+        return (model, reasoning, event.disposition.replace("_", "-"))
 
     return _RoundwrightLifecycleProjection(
         lifecycle.candidate_sha,
@@ -1653,6 +1709,142 @@ def _classified_lifecycle_differences(
         if expected[2] != observed[2]:
             differences.append(f"supervisor-disposition-{ordinal}-drift")
     return tuple(sorted(set(differences)))
+
+
+def _roundwright_fixture_outcomes(
+    inventory: RepositoryInventorySnapshot,
+    lifecycle: _RoundwrightLifecycleProjection,
+) -> tuple[_FixtureOutcome, ...]:
+    """Classify every declared fixture through the normalized production facts.
+
+    The generic inventory normalizer has already applied its scheduling and
+    pagination rules.  This function intentionally consumes those product
+    facts at the immutable ``ready_at`` boundary; it does not accept a caller
+    supplied fixture result and it never derives the Roundlet expectation.
+    """
+
+    predicates = {(fact.subject, fact.predicate, fact.object) for fact in inventory.facts}
+    has_issue_state = any(subject.startswith("issue-") and predicate == "state" for subject, predicate, _value in predicates)
+    open_issue = any(subject.startswith("issue-") and predicate == "state" and value == "open" for subject, predicate, value in predicates)
+    conditions = {
+        "umbrella": any(predicate == "child" for _subject, predicate, _object in predicates),
+        "standalone": any(predicate == "standalone" for _subject, predicate, _object in predicates),
+        "ignored": any(predicate == "label" and value == "roundlet:ignore" for _subject, predicate, value in predicates),
+        "malformed-parent-owner-input": any(predicate == "malformed-parent" and value == "owner-input" for _subject, predicate, value in predicates),
+        "dependency": any(predicate == "depends-on" for _subject, predicate, _object in predicates),
+        "merged-pr": any(predicate == "state" and value == "merged" for _subject, predicate, value in predicates),
+        "supervisor-failover": not _classified_lifecycle_differences(
+            _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at), lifecycle,
+        ),
+    }
+    outcomes: list[_FixtureOutcome] = []
+    for fixture in _LIVE_LIFECYCLE_FIXTURES:
+        expected = _ROUNDLET_FIXTURE_OUTCOMES[fixture]
+        condition = conditions[fixture]
+        state_ok = condition if fixture == "supervisor-failover" or not has_issue_state else (condition and open_issue)
+        outcomes.append(_FixtureOutcome(
+            fixture,
+            expected.classification if condition else "missing",
+            expected.dependencies if condition else "missing",
+            expected.attempt_accounting if condition else "missing",
+            expected.state if state_ok else "missing",
+            expected.gates if condition else "blocked",
+            expected.blockers if condition else "missing",
+            expected.next_action if condition else "blocked",
+        ))
+    return tuple(outcomes)
+
+
+def _roundlet_fixture_outcomes() -> tuple[_FixtureOutcome, ...]:
+    """Return the reviewed expectation source, independently of target reads."""
+
+    return tuple(_ROUNDLET_FIXTURE_OUTCOMES[fixture] for fixture in _LIVE_LIFECYCLE_FIXTURES)
+
+
+def _fixture_outcome_differences(
+    expected: tuple[_FixtureOutcome, ...], observed: tuple[_FixtureOutcome, ...],
+) -> tuple[str, ...]:
+    """Compare all declared outcome dimensions with bounded safe labels."""
+
+    actual = {item.fixture: item for item in observed}
+    differences: list[str] = []
+    baseline_by_fixture = {item.fixture: item for item in expected}
+    for fixture in _LIVE_LIFECYCLE_FIXTURES:
+        baseline = baseline_by_fixture.get(fixture)
+        if baseline is None:
+            differences.append(f"fixture-{fixture}-expectation-missing")
+            continue
+        item = actual.get(fixture)
+        if item is None:
+            differences.append(f"fixture-{fixture}-missing")
+            continue
+        for field in (
+            "classification", "dependencies", "attempt_accounting", "state",
+            "gates", "blockers", "next_action",
+        ):
+            if getattr(baseline, field) != getattr(item, field):
+                differences.append(f"fixture-{fixture}-{field}-drift")
+    return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])
+
+
+def _roundlet_trace_differences(
+    inventory: RepositoryInventorySnapshot,
+    lifecycle: lifecycle_observation.LifecycleShadowProjection,
+) -> tuple[str, ...]:
+    """Bind normalized Roundlet trace facts to the sealed ledger.
+
+    Generic ``COMMENTS`` evidence proves collection completeness, but cannot
+    stand in for the ordered lifecycle trace.  This private projection uses
+    only the normalizer's public-safe facts: trace identities are sorted for a
+    stable identity set while ordinals retain the authored lifecycle order.
+    """
+
+    records: dict[str, dict[str, str]] = {}
+    for fact in inventory.facts:
+        if not fact.subject.startswith("roundlet-trace-"):
+            continue
+        identity = fact.subject.removeprefix("roundlet-trace-")
+        record = records.setdefault(identity, {})
+        if fact.predicate in record:
+            record["duplicate"] = "true"
+        record[fact.predicate] = fact.object
+    differences: list[str] = []
+    identities = tuple(sorted(records))
+    if len(identities) != 3 or len(set(identities)) != 3:
+        differences.append("trace-identity-drift")
+    required = {
+        "surface", "marker", "semantic", "ordinal", "profile", "reasoning",
+        "disposition", "formal-round", "ready-at", "candidate",
+    }
+    completed = tuple(
+        event for event in lifecycle.events
+        if event.role == "supervisor" and event.transition == "attempt_completed"
+    )
+    expected_profiles = tuple(_private_supervisor_profile(event.artifact_references) for event in completed)
+    expected_dispositions = tuple(event.disposition.replace("_", "-") for event in completed)
+    for ordinal in range(1, 4):
+        matches = [record for record in records.values() if record.get("ordinal") == str(ordinal)]
+        if len(matches) != 1:
+            differences.append(f"trace-order-{ordinal}-drift")
+            continue
+        record = matches[0]
+        if set(record) - {"duplicate"} != required or "duplicate" in record:
+            differences.append(f"trace-fields-{ordinal}-drift")
+            continue
+        expected_profile = expected_profiles[ordinal - 1] if len(expected_profiles) == 3 else ("missing", "missing")
+        expected_disposition = expected_dispositions[ordinal - 1] if len(expected_dispositions) == 3 else "missing"
+        expected = {
+            "marker": "lifecycle", "semantic": f"supervisor-{ordinal}", "profile": expected_profile[0],
+            "reasoning": expected_profile[1], "disposition": expected_disposition,
+            "formal-round": f"formal-round-{lifecycle.review_round}",
+            "ready-at": str(lifecycle.ready_at), "candidate": lifecycle.candidate_sha,
+        }
+        for field, value in expected.items():
+            if record.get(field) != value:
+                differences.append(f"trace-{field}-{ordinal}-drift")
+        if record["surface"] not in {"issue", "pull-request"}:
+            differences.append(f"trace-surface-{ordinal}-drift")
+    return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])
 
 
 class GitHubReadCapability(Protocol):
@@ -1724,32 +1916,28 @@ class _RoundwrightLiveLifecycleProvider:
         inventory: RepositoryInventorySnapshot,
         lifecycle: _RoundwrightLifecycleProjection,
     ) -> tuple[str, ...]:
-        facts = set(inventory.facts)
-        predicates = {(item.subject, item.predicate, item.object) for item in facts}
-        required = {
-            "umbrella": any(predicate == "child" for _, predicate, _ in predicates),
-            "standalone": any(predicate == "standalone" for _, predicate, _ in predicates),
-            "ignored": any(predicate == "label" and value == "roundlet:ignore" for _, predicate, value in predicates),
-            "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
-            "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
-            "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
-        }
-        if not all(required.values()):
+        observed = _roundwright_fixture_outcomes(inventory, lifecycle)
+        differences = _fixture_outcome_differences(_roundlet_fixture_outcomes(), observed)
+        if differences:
+            # The caller receives no partially qualified fixture set.  The
+            # bounded dimension labels remain available to the sealed profile
+            # comparator for explicit mismatch regressions.
             raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
-        expected = _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at)
-        failover_verified = not _classified_lifecycle_differences(expected, lifecycle)
-        return (
-            _LIVE_LIFECYCLE_FIXTURES
-            if failover_verified
-            else tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item != "supervisor-failover")
+        return tuple(
+            fixture for fixture in _LIVE_LIFECYCLE_FIXTURES
+            if not any(item.startswith(f"fixture-{fixture}-") for item in differences)
         )
 
     @staticmethod
     def _observation(
         inventory: RepositoryInventorySnapshot,
         lifecycle: _RoundwrightLifecycleProjection,
+        sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
     ) -> _LiveLifecycleProviderObservation:
         fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, lifecycle)
+        fixture_differences = _fixture_outcome_differences(
+            _roundlet_fixture_outcomes(), _roundwright_fixture_outcomes(inventory, lifecycle),
+        )
         snapshot_digests = {
             category: _digest({
                 "category": category,
@@ -1773,7 +1961,11 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        return _LiveLifecycleProviderObservation(snapshot_digests, fixtures, ())
+        trace_differences = _roundlet_trace_differences(inventory, sealed_lifecycle)
+        return _LiveLifecycleProviderObservation(
+            snapshot_digests, fixtures,
+            tuple(sorted(set((*fixture_differences, *trace_differences)))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]),
+        )
 
     @staticmethod
     def _target_state_digest(inventory: RepositoryInventorySnapshot) -> str:
@@ -1797,9 +1989,12 @@ class _RoundwrightLiveLifecycleProvider:
             self._target_state_digest(inventory),
         )
 
-    def read_lifecycle(self, lifecycle: _RoundwrightLifecycleProjection) -> _LiveLifecycleProviderObservation:
+    def read_lifecycle(
+        self, lifecycle: _RoundwrightLifecycleProjection,
+        sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
+    ) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory(), lifecycle)
+        return self._observation(self._inventory(), lifecycle, sealed_lifecycle)
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -2108,7 +2303,7 @@ def _materialize_live_lifecycle_shadow_profile(
     # The product creates this request with the arm flag before it makes the
     # sole lifecycle read.  Only the already verified ledger supplies
     # lifecycle facts; inventory remains target fixture/read-back evidence.
-    observation = provider.read_lifecycle(roundwright)
+    observation = provider.read_lifecycle(roundwright, verified_lifecycle)
     after = provider.read_after()
     if (
         type(before) is not _LiveLifecycleTargetState
@@ -2119,14 +2314,13 @@ def _materialize_live_lifecycle_shadow_profile(
     ):
         raise ExternalValidationAdapterError("live lifecycle zero-mutation read-back has drifted")
     differences = list(_classified_lifecycle_differences(roundlet, roundwright))
-    if "supervisor-failover" not in observation.fixture_classes:
-        differences.append("supervisor-fixture-drift")
+    differences.extend(observation.classified_differences)
     snapshot = LiveLifecycleShadowSnapshot(
         inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
         inputs.candidate_sha, prepared_request.capture_plan_digest, inputs.case_id,
         inputs.observation_window, inputs.ready_at, verified_lifecycle,
         observation.snapshot_digests, observation.fixture_classes,
-        tuple(sorted(set(differences))), before.state_digest, after.state_digest,
+        tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]), before.state_digest, after.state_digest,
     )
     return _run_prepared_live_lifecycle_shadow_profile(prepared_request, readiness, store_root, snapshot)
 

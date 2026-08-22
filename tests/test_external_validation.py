@@ -386,6 +386,11 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
                 RepositoryInventoryFact("pull-request-81", "state", "merged"),
+                *github_runtime._inventory_roundlet_trace_facts([
+                    ("issue", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
+                    ("issue", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
+                    ("pull-request", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
+                ]),
             ), key=lambda item: (item.subject, item.predicate, item.object)))
             return RepositoryInventorySnapshot(
                 repository, "forward-target", "main", "d" * 40,
@@ -423,7 +428,8 @@ class ExternalValidationTests(unittest.TestCase):
 
     def test_live_lifecycle_event_projection_is_exact_and_drift_is_closed(self) -> None:
         expected = external_validation._roundlet_lifecycle_projection("a" * 40, 17)
-        observed = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
+        sealed = self.live_lifecycle_projection()
+        observed = external_validation._roundwright_lifecycle_projection(sealed)
         self.assertEqual(external_validation._classified_lifecycle_differences(expected, observed), ())
         self.assertEqual(
             external_validation._classified_lifecycle_differences(
@@ -468,6 +474,26 @@ class ExternalValidationTests(unittest.TestCase):
         )
         self.assertEqual(differences, tuple(sorted(set(differences))))
         self.assertLessEqual(len(differences), external_validation._LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES)
+
+        # Exact model/reasoning is a live-only interpretation of retained
+        # artifact identities.  It must fail closed without changing v1
+        # projected event semantics.
+        missing_event = replace(sealed.events[1], artifact_references=())
+        missing = external_validation._roundwright_lifecycle_projection(
+            replace(sealed, events=(sealed.events[0], missing_event, *sealed.events[2:])),
+        )
+        self.assertEqual(
+            external_validation._classified_lifecycle_differences(expected, missing),
+            ("supervisor-profile-1-drift", "supervisor-reasoning-1-drift"),
+        )
+        duplicate_event = replace(sealed.events[1], artifact_references=sealed.events[1].artifact_references * 2)
+        duplicate = external_validation._roundwright_lifecycle_projection(
+            replace(sealed, events=(sealed.events[0], duplicate_event, *sealed.events[2:])),
+        )
+        self.assertEqual(
+            external_validation._classified_lifecycle_differences(expected, duplicate),
+            ("supervisor-profile-1-drift", "supervisor-reasoning-1-drift"),
+        )
 
     def test_live_lifecycle_ledger_failure_blocks_before_any_inventory_read(self) -> None:
         class NeverCalledCapability:
@@ -522,10 +548,8 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, verified),
         )
         changed = replace(verified, supervisor_attempts=(("terra", "xhigh", "cancelled"), *verified.supervisor_attempts[1:]))
-        self.assertNotIn(
-            "supervisor-failover",
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed),
-        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed)
         self.assertIn(
             "supervisor-profile-1-drift",
             external_validation._classified_lifecycle_differences(
@@ -536,16 +560,28 @@ class ExternalValidationTests(unittest.TestCase):
             verified,
             supervisor_attempts=(("sol", "high", "cancelled"), *verified.supervisor_attempts[1:]),
         )
-        self.assertNotIn(
-            "supervisor-failover",
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning),
-        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning)
         self.assertIn(
             "supervisor-reasoning-1-drift",
             external_validation._classified_lifecycle_differences(
                 external_validation._roundlet_lifecycle_projection("a" * 40, 17), wrong_reasoning,
             ),
         )
+
+    def test_fixture_outcomes_compare_every_typed_dimension_without_self_derived_pass(self) -> None:
+        expected = external_validation._roundlet_fixture_outcomes()
+        self.assertEqual(tuple(item.fixture for item in expected), external_validation._LIVE_LIFECYCLE_FIXTURES)
+        for ordinal, field in enumerate((
+            "classification", "dependencies", "attempt_accounting", "state",
+            "gates", "blockers", "next_action",
+        )):
+            altered = list(expected)
+            altered[ordinal] = replace(altered[ordinal], **{field: "drifted"})
+            self.assertEqual(
+                external_validation._fixture_outcome_differences(expected, tuple(altered)),
+                (f"fixture-{altered[ordinal].fixture}-{field}-drift",),
+            )
 
     def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
         candidate = "a" * 40
@@ -560,8 +596,14 @@ class ExternalValidationTests(unittest.TestCase):
         ]
         facts = github_runtime._inventory_roundlet_trace_facts(nodes)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request"), facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "reasoning", "high"), facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "candidate", candidate), facts)
         with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
             github_runtime._inventory_roundlet_trace_facts([*nodes, nodes[-1]])
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
+            github_runtime._inventory_roundlet_trace_facts((nodes[1], nodes[0], nodes[2]))
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
+            github_runtime._inventory_roundlet_trace_facts(nodes[:-1])
         legacy_nodes = [
             ("issue", {"id": "legacy-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 ready_at=17 candidate={candidate}"}),
         ]
@@ -1423,6 +1465,31 @@ class ExternalValidationTests(unittest.TestCase):
             self.assertIsNotNone(code)
             assert code is not None
             return code
+        # These all traverse the same production cursor route used above;
+        # none invokes the marker helper directly.
+        absent_trace_inventory = json.loads(json.dumps(split_trace_inventory))
+        absent_comments = absent_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]
+        absent_comments.update({"totalCount": 1, "nodes": absent_comments["nodes"][1:]})
+        reordered_trace_inventory = json.loads(json.dumps(split_trace_inventory))
+        reordered_comments = reordered_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]["nodes"]
+        reordered_comments[0]["body"], reordered_comments[1]["body"] = reordered_comments[1]["body"], reordered_comments[0]["body"]
+        drifted_trace_inventory = json.loads(json.dumps(split_trace_inventory))
+        drifted_comment = drifted_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]["nodes"][0]
+        drifted_comment["body"] = drifted_comment["body"].replace(inputs.candidate_sha, "b" * 40)
+        for trace_name, inventory in (
+            ("absent", absent_trace_inventory), ("reordered", reordered_trace_inventory), ("candidate-drift", drifted_trace_inventory),
+        ):
+            with self.subTest(trace_name=trace_name):
+                self.assertIn(
+                    failure_code(OpaqueCredentialHost(
+                        inventory,
+                        comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "pr-trace-terminal"}]},
+                    )),
+                    {
+                        external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                        external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION,
+                    },
+                )
         def duplicate_blocks_before_qualification(
             route: str, inventory: object, **host_options: object,
         ) -> None:

@@ -5135,7 +5135,7 @@ def _inventory_section_identity(section: RepositoryInventorySection, node: objec
 
 
 def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[RepositoryInventoryFact, ...]:
-    """Project bounded marker fields only; never retain comment bodies."""
+    """Project the complete ordered marker trace without retaining bodies."""
 
     records: list[tuple[str, str, str, str, str, str, str, str]] = []
     for surface, node in nodes:
@@ -5153,8 +5153,12 @@ def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[Re
             records.append((surface, _raw_id(value, "id"), *match.groups()))
     if not records:
         return ()
-    if len(records) != 3 or tuple((profile, reasoning, disposition) for _surface, _identity, profile, reasoning, disposition, _round, _ready_at, _candidate in records) != (
+    if (
+        len(records) != 3
+        or len({identity for _surface, identity, *_rest in records}) != 3
+        or tuple((profile, reasoning, disposition) for _surface, _identity, profile, reasoning, disposition, _round, _ready_at, _candidate in records) != (
         ("sol", "xhigh", "cancelled"), ("terra", "high", "invalid-context"), ("terra", "high", "pass"),
+        )
     ):
         raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
     rounds = {round_id for _surface, _identity, _profile, _reasoning, _disposition, round_id, _ready_at, _candidate in records}
@@ -5171,6 +5175,13 @@ def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[Re
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "surface", surface),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "marker", "lifecycle"),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "semantic", f"supervisor-{ordinal}"),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ordinal", str(ordinal)),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "profile", profile),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "reasoning", reasoning),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "disposition", disposition),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "formal-round", _round_id),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ready-at", _ready_at),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "candidate", _candidate),
         ))
     facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", next(iter(candidates))))
     facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", next(iter(ready_values))))

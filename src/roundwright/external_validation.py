@@ -1131,6 +1131,7 @@ class LiveLifecycleShadowSnapshot:
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
+            or self.classified_differences != tuple(sorted(self.classified_differences))
             or len(self.classified_differences) > _LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES
             or _DIGEST.fullmatch(self.before_target_state_digest) is None
             or self.after_target_state_digest != self.before_target_state_digest
@@ -1497,6 +1498,7 @@ class _LiveLifecycleProviderObservation:
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
+            or self.classified_differences != tuple(sorted(self.classified_differences))
             or len(self.classified_differences) > _LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES
         ):
             raise ExternalValidationAdapterError("live lifecycle provider observation is invalid")
@@ -1537,23 +1539,42 @@ def _roundlet_lifecycle_projection(candidate_sha: str, ready_at: int) -> _Roundl
 
 
 def _roundwright_lifecycle_projection(
-    inventory: RepositoryInventorySnapshot, candidate_sha: str, ready_at: int,
+    event_graph: ShadowV2EventGraph, ready_at: int,
 ) -> _RoundwrightLifecycleProjection:
-    """Normalize only typed public facts emitted by the generic inventory."""
+    """Project dynamic lifecycle facts from the bound typed event stream.
 
-    facts = {(item.subject, item.predicate, item.object) for item in inventory.facts}
-    def fact(subject: str, predicate: str) -> str:
-        values = sorted(value for item_subject, item_predicate, value in facts if (item_subject, item_predicate) == (subject, predicate))
-        return values[0] if len(values) == 1 else "missing"
-    attempts = tuple(
-        (fact(f"lifecycle-supervisor-{ordinal}", "profile"), fact(f"lifecycle-supervisor-{ordinal}", "disposition"))
-        for ordinal in range(1, 4)
+    Forward-target inventory is intentionally absent here: it establishes only
+    read-only fixture coverage and before/after target state.  Candidate and
+    review facts belong to the captured lifecycle graph that is sealed with the
+    request's exact plan/window/``ready_at`` binding.
+    """
+
+    rounds = event_graph.review_rounds
+    round_reference = rounds[0] if len(rounds) == 1 else None
+    attempts_by_ordinal = {
+        item.ordinal: item
+        for item in event_graph.attempts
+        if item.role is EvidenceRole.SUPERVISOR
+    }
+
+    def supervisor_outcome(ordinal: int) -> tuple[str, str]:
+        attempt = attempts_by_ordinal.get(ordinal)
+        if attempt is None:
+            return ("missing", "missing")
+        if ordinal == 1 and attempt.kind is LifecycleAttemptKind.SUPERVISOR:
+            return ("sol", "cancelled")
+        if ordinal == 2 and attempt.kind is LifecycleAttemptKind.FAILOVER:
+            return ("terra", "invalid-context")
+        if ordinal == 3 and attempt.kind is LifecycleAttemptKind.FAILOVER:
+            return ("terra", "pass")
+        return ("missing", "missing")
+
+    return _RoundwrightLifecycleProjection(
+        round_reference.candidate_sha if round_reference is not None else "missing",
+        round_reference.review_round_id if round_reference is not None else "missing",
+        ready_at,
+        tuple(supervisor_outcome(ordinal) for ordinal in range(1, 4)),
     )
-    round_subjects = sorted(subject for subject, predicate, _value in facts if predicate == "candidate" and subject.startswith("lifecycle-formal-round-"))
-    formal_round = round_subjects[0].removeprefix("lifecycle-") if len(round_subjects) == 1 else "missing"
-    observed_candidate = fact(round_subjects[0], "candidate") if len(round_subjects) == 1 else "missing"
-    observed_ready_at = fact(round_subjects[0], "ready-at") if len(round_subjects) == 1 else "missing"
-    return _RoundwrightLifecycleProjection(observed_candidate, formal_round, int(observed_ready_at) if observed_ready_at.isdecimal() else -1, attempts)
 
 
 def _classified_lifecycle_differences(
@@ -1575,7 +1596,7 @@ def _classified_lifecycle_differences(
             differences.append(f"supervisor-profile-{ordinal}-drift")
         if expected[1] != observed[1]:
             differences.append(f"supervisor-disposition-{ordinal}-drift")
-    return tuple(differences)
+    return tuple(sorted(set(differences)))
 
 
 class GitHubReadCapability(Protocol):
@@ -1643,9 +1664,7 @@ class _RoundwrightLiveLifecycleProvider:
         return inventory
 
     @staticmethod
-    def _fixture_classes(
-        inventory: RepositoryInventorySnapshot, candidate_sha: str, ready_at: int,
-    ) -> tuple[str, ...]:
+    def _fixture_classes(inventory: RepositoryInventorySnapshot) -> tuple[str, ...]:
         facts = set(inventory.facts)
         predicates = {(item.subject, item.predicate, item.object) for item in facts}
         required = {
@@ -1666,12 +1685,9 @@ class _RoundwrightLiveLifecycleProvider:
 
     @staticmethod
     def _observation(
-        inventory: RepositoryInventorySnapshot, candidate_sha: str, ready_at: int,
+        inventory: RepositoryInventorySnapshot,
     ) -> _LiveLifecycleProviderObservation:
-        roundlet = _roundlet_lifecycle_projection(candidate_sha, ready_at)
-        roundwright = _roundwright_lifecycle_projection(inventory, candidate_sha, ready_at)
-        differences = _classified_lifecycle_differences(roundlet, roundwright)
-        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, candidate_sha, ready_at)
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory)
         snapshot_digests = {
             category: _digest({
                 "category": category,
@@ -1695,7 +1711,7 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        return _LiveLifecycleProviderObservation(snapshot_digests, differences)
+        return _LiveLifecycleProviderObservation(snapshot_digests, ())
 
     @staticmethod
     def _target_state_digest(inventory: RepositoryInventorySnapshot) -> str:
@@ -1721,7 +1737,7 @@ class _RoundwrightLiveLifecycleProvider:
 
     def read_lifecycle(self) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory(), self._candidate_sha, self._ready_at)
+        return self._observation(self._inventory())
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -2034,12 +2050,15 @@ def _materialize_live_lifecycle_shadow_profile(
     graph = ShadowV2EventGraph(
         attempts, (), (FormalReviewRoundReference(round_id, 1, inputs.candidate_sha),), (), (), events,
     )
+    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at)
+    roundwright = _roundwright_lifecycle_projection(graph, inputs.ready_at)
+    differences = _classified_lifecycle_differences(roundlet, roundwright)
     snapshot = LiveLifecycleShadowSnapshot(
         inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
         inputs.candidate_sha, prepared_request.capture_plan_digest, inputs.case_id,
         inputs.observation_window, inputs.ready_at, events[0].event_id, graph,
         observation.snapshot_digests, _LIVE_LIFECYCLE_FIXTURES,
-        observation.classified_differences, before.state_digest, after.state_digest,
+        differences, before.state_digest, after.state_digest,
     )
     return _run_prepared_live_lifecycle_shadow_profile(prepared_request, readiness, store_root, snapshot)
 

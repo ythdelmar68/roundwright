@@ -68,6 +68,7 @@ from roundwright.shadow import (
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     EvidenceRole,
+    FormalReviewRoundReference,
     LifecycleAttempt,
     LifecycleAttemptKind,
     ShadowV2Event,
@@ -361,7 +362,7 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
             self.live_lifecycle_snapshot(tuple(f"difference-{index}" for index in range(17)))
 
-    def test_live_lifecycle_session_retains_classified_mismatch_for_sealed_execution(self) -> None:
+    def test_live_lifecycle_session_uses_bound_events_not_static_inventory_for_execution(self) -> None:
         def inventory(repository: RepositoryRef) -> RepositoryInventorySnapshot:
             collections = tuple(sorted((
                 RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
@@ -374,14 +375,6 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
                 RepositoryInventoryFact("pull-request-81", "state", "merged"),
-                RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
-                RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
-                RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
-                RepositoryInventoryFact("lifecycle-supervisor-2", "disposition", "invalid-context"),
-                RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
-                RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "blocked"),
-                RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
-                RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
             ), key=lambda item: (item.subject, item.predicate, item.object)))
             return RepositoryInventorySnapshot(
                 repository, "forward-target", "main", "d" * 40,
@@ -412,10 +405,69 @@ class ExternalValidationTests(unittest.TestCase):
         snapshot = harness.run_calls[-1][0][2].snapshot
         self.assertEqual(result, {"status": "fake"})
         self.assertEqual(capability.calls, 3)
-        self.assertEqual(snapshot.classified_differences, ("supervisor-disposition-3-drift",))
+        self.assertEqual(snapshot.classified_differences, ())
         self.assertEqual(snapshot.candidate_sha, "a" * 40)
         self.assertEqual(snapshot.ready_at, 17)
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
+
+    def test_live_lifecycle_event_projection_is_exact_and_drift_is_closed(self) -> None:
+        expected = external_validation._roundlet_lifecycle_projection("a" * 40, 17)
+        observed = external_validation._roundwright_lifecycle_projection(
+            self.live_lifecycle_event_graph(), 17,
+        )
+        self.assertEqual(external_validation._classified_lifecycle_differences(expected, observed), ())
+
+        altered_candidate = ShadowV2EventGraph(
+            self.live_lifecycle_event_graph().attempts, (),
+            (FormalReviewRoundReference("formal-round-1", 1, "b" * 40),), (), (),
+            self.live_lifecycle_event_graph().events,
+        )
+        altered_round = ShadowV2EventGraph(
+            self.live_lifecycle_event_graph().attempts, (),
+            (FormalReviewRoundReference("formal-round-2", 1, "a" * 40),), (), (),
+            self.live_lifecycle_event_graph().events,
+        )
+        self.assertEqual(
+            external_validation._classified_lifecycle_differences(
+                expected, external_validation._roundwright_lifecycle_projection(altered_candidate, 17),
+            ), ("candidate-drift",),
+        )
+        self.assertEqual(
+            external_validation._classified_lifecycle_differences(
+                expected, external_validation._roundwright_lifecycle_projection(altered_round, 17),
+            ), ("formal-round-drift",),
+        )
+        self.assertEqual(
+            external_validation._classified_lifecycle_differences(
+                expected, external_validation._roundwright_lifecycle_projection(self.live_lifecycle_event_graph(), 18),
+            ), ("ready-at-drift",),
+        )
+
+        for ordinal in range(3):
+            for field in range(2):
+                attempts = list(observed.supervisor_attempts)
+                profile, disposition = attempts[ordinal]
+                attempts[ordinal] = (
+                    "missing" if field == 0 else profile,
+                    "missing" if field == 1 else disposition,
+                )
+                changed = replace(observed, supervisor_attempts=tuple(attempts))
+                expected_category = (
+                    f"supervisor-profile-{ordinal + 1}-drift"
+                    if field == 0 else f"supervisor-disposition-{ordinal + 1}-drift"
+                )
+                self.assertEqual(
+                    external_validation._classified_lifecycle_differences(expected, changed),
+                    (expected_category,),
+                )
+
+        differences = external_validation._classified_lifecycle_differences(
+            expected,
+            replace(observed, candidate_sha="b" * 40, ready_at=18,
+                    supervisor_attempts=(("missing", "missing"), *observed.supervisor_attempts[1:])),
+        )
+        self.assertEqual(differences, tuple(sorted(set(differences))))
+        self.assertLessEqual(len(differences), external_validation._LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES)
 
     def test_public_live_lifecycle_preflight_persists_a_path_free_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2022,6 +2074,19 @@ class ExternalValidationTests(unittest.TestCase):
             {name: "sha256:" + (f"{index:x}" * 64) for index, name in enumerate(external_validation._LIVE_LIFECYCLE_SNAPSHOTS, start=1)},
             external_validation._LIVE_LIFECYCLE_FIXTURES, classified_differences,
             "sha256:" + "e" * 64, "sha256:" + "e" * 64,
+        )
+
+    @staticmethod
+    def live_lifecycle_event_graph() -> ShadowV2EventGraph:
+        round_id = "formal-round-1"
+        attempts = (
+            LifecycleAttempt("lifecycle-supervisor-1", 1, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, review_round_id=round_id),
+            LifecycleAttempt("lifecycle-supervisor-2", 2, LifecycleAttemptKind.FAILOVER, EvidenceRole.SUPERVISOR, "lifecycle-supervisor-1", round_id),
+            LifecycleAttempt("lifecycle-supervisor-3", 3, LifecycleAttemptKind.FAILOVER, EvidenceRole.SUPERVISOR, "lifecycle-supervisor-2", round_id),
+        )
+        return ShadowV2EventGraph(
+            attempts, (), (FormalReviewRoundReference(round_id, 1, "a" * 40),), (), (),
+            (ShadowV2Event("event-49", 1, "lifecycle-supervisor-1", "repository-snapshot", None, False, review_round_id=round_id),),
         )
 
     def live_lifecycle_request_inputs(self) -> external_validation.LiveLifecycleRequestInputs:

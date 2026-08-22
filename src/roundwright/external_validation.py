@@ -1104,8 +1104,7 @@ class LiveLifecycleShadowSnapshot:
     case_id: str
     observation_window: str
     ready_at: int
-    armed_before_event_id: str
-    event_graph: ShadowV2EventGraph
+    lifecycle_projection: lifecycle_observation.LifecycleShadowProjection
     snapshot_digests: Mapping[str, str]
     fixture_classes: tuple[str, ...]
     classified_differences: tuple[str, ...]
@@ -1124,11 +1123,14 @@ class LiveLifecycleShadowSnapshot:
             or not _safe_token(self.case_id)
             or not _safe_token(self.observation_window)
             or type(self.ready_at) is not int or self.ready_at < 0
-            or not _safe_token(self.armed_before_event_id)
-            or type(self.event_graph) is not ShadowV2EventGraph
+            or type(self.lifecycle_projection) is not lifecycle_observation.LifecycleShadowProjection
             or snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
             or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
-            or type(self.fixture_classes) is not tuple or self.fixture_classes != _LIVE_LIFECYCLE_FIXTURES
+            or type(self.fixture_classes) is not tuple
+            or self.fixture_classes not in {
+                _LIVE_LIFECYCLE_FIXTURES,
+                tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item != "supervisor-failover"),
+            }
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
@@ -1138,12 +1140,14 @@ class LiveLifecycleShadowSnapshot:
             or self.after_target_state_digest != self.before_target_state_digest
         ):
             raise ExternalValidationAdapterError("live lifecycle snapshot is invalid")
-        try:
-            self.event_graph.validate(shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE), self.candidate_sha)
-        except ShadowV2Error as error:
-            raise ExternalValidationAdapterError("live lifecycle graph is invalid") from error
-        if self.event_graph.events[0].event_id != self.armed_before_event_id:
-            raise ExternalValidationAdapterError("live lifecycle window was not armed before its first event")
+        if (
+            self.lifecycle_projection.candidate_sha != self.candidate_sha
+            or self.lifecycle_projection.ready_at != self.ready_at
+            or self.lifecycle_projection.review_epoch != 1
+            or self.lifecycle_projection.review_mode != "complete"
+            or not self.lifecycle_projection.events
+        ):
+            raise ExternalValidationAdapterError("verified live lifecycle projection has drifted")
         object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
         object.__setattr__(self, "zero_mutation_readback_digest", _digest({
             "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
@@ -1161,12 +1165,20 @@ class LiveLifecycleShadowSnapshot:
             "target_observed_sha": self.target_observed_sha,
             "observation_window": self.observation_window,
             "ready_at": self.ready_at,
-            "armed_before_event_id": self.armed_before_event_id,
             "snapshot_digests": dict(self.snapshot_digests),
             "fixture_classes": list(self.fixture_classes),
             "classified_differences": list(self.classified_differences),
             "classified_difference_count": len(self.classified_differences),
-            "event_graph_digest": _digest(_graph_payload(self.event_graph)),
+            "verified_lifecycle": {
+                "ledger_digest": self.lifecycle_projection.ledger_digest,
+                "plan_digest": self.lifecycle_projection.plan_digest,
+                "window_identity": self.lifecycle_projection.window_identity,
+                "candidate_sha": self.lifecycle_projection.candidate_sha,
+                "ready_at": self.lifecycle_projection.ready_at,
+                "review_epoch": self.lifecycle_projection.review_epoch,
+                "review_round": self.lifecycle_projection.review_round,
+                "event_digest": _digest(self.lifecycle_projection.semantic_payload()),
+            },
             "zero_mutation_readback_digest": self.zero_mutation_readback_digest,
         }
 
@@ -1521,6 +1533,7 @@ class _LiveLifecycleProviderObservation:
     """Normalized content-free observations from an armed read-only window."""
 
     snapshot_digests: Mapping[str, str]
+    fixture_classes: tuple[str, ...]
     classified_differences: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1528,6 +1541,10 @@ class _LiveLifecycleProviderObservation:
         if (
             snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
             or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
+            or self.fixture_classes not in {
+                _LIVE_LIFECYCLE_FIXTURES,
+                tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item != "supervisor-failover"),
+            }
             or type(self.classified_differences) is not tuple
             or any(not _safe_token(value) for value in self.classified_differences)
             or len(set(self.classified_differences)) != len(self.classified_differences)
@@ -1701,7 +1718,10 @@ class _RoundwrightLiveLifecycleProvider:
         return inventory
 
     @staticmethod
-    def _fixture_classes(inventory: RepositoryInventorySnapshot) -> tuple[str, ...]:
+    def _fixture_classes(
+        inventory: RepositoryInventorySnapshot,
+        lifecycle: _RoundwrightLifecycleProjection,
+    ) -> tuple[str, ...]:
         facts = set(inventory.facts)
         predicates = {(item.subject, item.predicate, item.object) for item in facts}
         required = {
@@ -1711,20 +1731,23 @@ class _RoundwrightLiveLifecycleProvider:
             "malformed-parent-owner-input": any(predicate == "malformed-parent" for _, predicate, _ in predicates),
             "dependency": any(predicate == "depends-on" for _, predicate, _ in predicates),
             "merged-pr": any(predicate == "state" and value == "merged" for _, predicate, value in predicates),
-            # Comparator drift is retained separately as typed blocked
-            # evidence.  This fixture confirms the route was observed; it is
-            # not a second, lossy pass/fail gate.
-            "supervisor-failover": True,
         }
         if not all(required.values()):
             raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
-        return _LIVE_LIFECYCLE_FIXTURES
+        expected = _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at)
+        failover_verified = not _classified_lifecycle_differences(expected, lifecycle)
+        return (
+            _LIVE_LIFECYCLE_FIXTURES
+            if failover_verified
+            else tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item != "supervisor-failover")
+        )
 
     @staticmethod
     def _observation(
         inventory: RepositoryInventorySnapshot,
+        lifecycle: _RoundwrightLifecycleProjection,
     ) -> _LiveLifecycleProviderObservation:
-        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory)
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, lifecycle)
         snapshot_digests = {
             category: _digest({
                 "category": category,
@@ -1748,7 +1771,7 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        return _LiveLifecycleProviderObservation(snapshot_digests, ())
+        return _LiveLifecycleProviderObservation(snapshot_digests, fixtures, ())
 
     @staticmethod
     def _target_state_digest(inventory: RepositoryInventorySnapshot) -> str:
@@ -1772,9 +1795,9 @@ class _RoundwrightLiveLifecycleProvider:
             self._target_state_digest(inventory),
         )
 
-    def read_lifecycle(self) -> _LiveLifecycleProviderObservation:
+    def read_lifecycle(self, lifecycle: _RoundwrightLifecycleProjection) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory())
+        return self._observation(self._inventory(), lifecycle)
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -2077,10 +2100,13 @@ def _materialize_live_lifecycle_shadow_profile(
     ):
         raise ExternalValidationAdapterError("live lifecycle ledger binding has drifted")
     provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
+    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at)
+    roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
     before = provider.read_before()
     # The product creates this request with the arm flag before it makes the
-    # sole lifecycle read.  A provider cannot supply an unarmed event graph.
-    observation = provider.read_lifecycle()
+    # sole lifecycle read.  Only the already verified ledger supplies
+    # lifecycle facts; inventory remains target fixture/read-back evidence.
+    observation = provider.read_lifecycle(roundwright)
     after = provider.read_after()
     if (
         type(before) is not _LiveLifecycleTargetState
@@ -2090,33 +2116,15 @@ def _materialize_live_lifecycle_shadow_profile(
         or after != before
     ):
         raise ExternalValidationAdapterError("live lifecycle zero-mutation read-back has drifted")
-    profile = shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE)
-    round_id = "formal-round-1"
-    attempts = (
-        LifecycleAttempt("lifecycle-supervisor-1", 1, LifecycleAttemptKind.SUPERVISOR, EvidenceRole.SUPERVISOR, review_round_id=round_id),
-        LifecycleAttempt("lifecycle-supervisor-2", 2, LifecycleAttemptKind.FAILOVER, EvidenceRole.SUPERVISOR, "lifecycle-supervisor-1", round_id),
-        LifecycleAttempt("lifecycle-supervisor-3", 3, LifecycleAttemptKind.FAILOVER, EvidenceRole.SUPERVISOR, "lifecycle-supervisor-2", round_id),
-    )
-    events = tuple(
-        ShadowV2Event(
-            f"{inputs.case_id}-{ordinal}", ordinal,
-            attempts[min(ordinal - 1, len(attempts) - 1)].attempt_id, event_kind, None, False,
-            review_round_id=round_id,
-        )
-        for ordinal, event_kind in enumerate(profile.event_kinds, start=1)
-    )
-    graph = ShadowV2EventGraph(
-        attempts, (), (FormalReviewRoundReference(round_id, 1, inputs.candidate_sha),), (), (), events,
-    )
-    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at)
-    roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
-    differences = _classified_lifecycle_differences(roundlet, roundwright)
+    differences = list(_classified_lifecycle_differences(roundlet, roundwright))
+    if "supervisor-failover" not in observation.fixture_classes:
+        differences.append("supervisor-fixture-drift")
     snapshot = LiveLifecycleShadowSnapshot(
         inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
         inputs.candidate_sha, prepared_request.capture_plan_digest, inputs.case_id,
-        inputs.observation_window, inputs.ready_at, events[0].event_id, graph,
-        observation.snapshot_digests, _LIVE_LIFECYCLE_FIXTURES,
-        differences, before.state_digest, after.state_digest,
+        inputs.observation_window, inputs.ready_at, verified_lifecycle,
+        observation.snapshot_digests, observation.fixture_classes,
+        tuple(sorted(set(differences))), before.state_digest, after.state_digest,
     )
     return _run_prepared_live_lifecycle_shadow_profile(prepared_request, readiness, store_root, snapshot)
 

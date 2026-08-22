@@ -577,19 +577,103 @@ class ExternalValidationTests(unittest.TestCase):
             ),
         )
 
-    def test_fixture_outcomes_compare_every_typed_dimension_without_self_derived_pass(self) -> None:
+    def test_fixture_outcomes_production_projection_retains_each_drift_and_blocks(self) -> None:
+        """The normalized product path, never Roundlet expectations, supplies observed results."""
+
+        candidate = "a" * 40
+        facts = (
+            RepositoryInventoryFact("issue-4", "child", "issue-49"),
+            RepositoryInventoryFact("issue-49", "standalone", "true"),
+            RepositoryInventoryFact("issue-50", "label", "roundlet:ignore"),
+            RepositoryInventoryFact("issue-51", "malformed-parent", "owner-input"),
+            RepositoryInventoryFact("issue-49", "depends-on", "issue-4"),
+            RepositoryInventoryFact("issue-4", "state", "open"),
+            RepositoryInventoryFact("issue-49", "state", "open"),
+            RepositoryInventoryFact("issue-50", "state", "open"),
+            RepositoryInventoryFact("issue-51", "state", "open"),
+            RepositoryInventoryFact("pull-request-81", "state", "merged"),
+            *github_runtime._inventory_roundlet_trace_facts([
+                ("issue", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate=" + candidate}),
+                ("issue", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate=" + candidate}),
+                ("pull-request", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate=" + candidate}),
+            ]),
+        )
+        collections = tuple(sorted((
+            RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
+            for index, section in enumerate(RepositoryInventorySection, 1)
+        ), key=lambda item: item.section.value))
+        inventory = RepositoryInventorySnapshot(
+            RepositoryRef("ythdelmar68", "roundlet-forward-test"), "forward-target", "main", "d" * 40,
+            "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections,
+            tuple(sorted(facts, key=lambda item: (item.subject, item.predicate, item.object))),
+        )
+        sealed = self.live_lifecycle_projection()
+        lifecycle = external_validation._roundwright_lifecycle_projection(sealed)
         expected = external_validation._roundlet_fixture_outcomes()
-        self.assertEqual(tuple(item.fixture for item in expected), external_validation._LIVE_LIFECYCLE_FIXTURES)
-        for ordinal, field in enumerate((
-            "classification", "dependencies", "attempt_accounting", "state",
-            "gates", "blockers", "next_action",
-        )):
-            altered = list(expected)
-            altered[ordinal] = replace(altered[ordinal], **{field: "drifted"})
-            self.assertEqual(
-                external_validation._fixture_outcome_differences(expected, tuple(altered)),
-                (f"fixture-{altered[ordinal].fixture}-{field}-drift",),
-            )
+
+        # This is the real normalized inventory -> production classifier /
+        # scheduler -> Roundwright adapter -> live observation path.
+        product_outcomes = github_runtime.project_repository_fixture_outcomes(inventory)
+        observed = external_validation._roundwright_fixture_outcomes(inventory, lifecycle)
+        self.assertEqual(
+            tuple(item.fixture for item in product_outcomes),
+            external_validation._LIVE_LIFECYCLE_FIXTURES[:-1],
+        )
+        self.assertEqual(external_validation._fixture_outcome_differences(expected, observed), ())
+        self.assertEqual(
+            external_validation._RoundwrightLiveLifecycleProvider._observation(
+                inventory, lifecycle, sealed,
+            ).classified_differences,
+            (),
+        )
+
+        # Six dimensions originate in the repository classifier/scheduler.
+        # Altering its typed product output must remain a single, bounded
+        # classified difference and prevent qualification.
+        for field in ("classification", "dependencies", "state", "gates", "blockers", "next_action"):
+            altered_product = list(product_outcomes)
+            altered_product[0] = replace(altered_product[0], **{field: "drifted"})
+            with patch.object(
+                external_validation, "project_repository_fixture_outcomes", return_value=tuple(altered_product),
+            ):
+                altered_observed = external_validation._roundwright_fixture_outcomes(inventory, lifecycle)
+                self.assertEqual(
+                    external_validation._fixture_outcome_differences(expected, altered_observed),
+                    (f"fixture-umbrella-{field}-drift",),
+                )
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+                    external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, lifecycle, sealed)
+
+        # Attempt accounting is supplied by the sealed lifecycle production
+        # projection.  A changed lifecycle input is retained through the same
+        # adapter rather than manufacturing an expected-side mismatch.
+        changed_lifecycle = replace(
+            lifecycle,
+            supervisor_attempts=(("terra", "xhigh", "cancelled"), *lifecycle.supervisor_attempts[1:]),
+        )
+        changed_observed = external_validation._roundwright_fixture_outcomes(inventory, changed_lifecycle)
+        self.assertIn(
+            "fixture-supervisor-failover-attempt_accounting-drift",
+            external_validation._fixture_outcome_differences(expected, changed_observed),
+        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+            external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, changed_lifecycle, sealed)
+
+        # A missing normalized fact cannot pass by omission, and malformed
+        # normalized evidence fails before the classifier can infer a result.
+        missing = replace(
+            inventory,
+            facts=tuple(fact for fact in inventory.facts if fact.subject != "issue-49" or fact.predicate != "standalone"),
+        )
+        missing_observed = external_validation._roundwright_fixture_outcomes(missing, lifecycle)
+        self.assertIn(
+            "fixture-standalone-classification-drift",
+            external_validation._fixture_outcome_differences(expected, missing_observed),
+        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+            external_validation._RoundwrightLiveLifecycleProvider._observation(missing, lifecycle, sealed)
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "fixture inventory"):
+            github_runtime.project_repository_fixture_outcomes(SimpleNamespace(facts=("malformed",)))
 
     def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
         candidate = "a" * 40

@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import re
+import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -1125,9 +1126,35 @@ class FixtureSelectionManifest:
 
     value: Mapping[str, object]
     manifest_digest: str
+    raw_utf8: bytes | None = field(default=None, repr=False, compare=False)
 
     @classmethod
-    def parse(cls, value: object, manifest_digest: object) -> "FixtureSelectionManifest":
+    def parse(cls, raw_utf8: object, manifest_digest: object) -> "FixtureSelectionManifest":
+        """Verify owner-sealed UTF-8 bytes before decoding the manifest."""
+
+        if type(raw_utf8) is not bytes or type(manifest_digest) is not str:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        if len(raw_utf8) > 65_536 or "sha256:" + hashlib.sha256(raw_utf8).hexdigest() != manifest_digest:
+            raise ExternalValidationAdapterError("fixture manifest digest has drifted")
+        try:
+            def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                value: dict[str, object] = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate key")
+                    value[key] = item
+                return value
+            value = json.loads(raw_utf8.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalValidationAdapterError("fixture manifest is invalid") from error
+        if type(value) is not dict:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        return cls(MappingProxyType(value), manifest_digest, raw_utf8)
+
+    @classmethod
+    def from_projection(cls, value: object, manifest_digest: object) -> "FixtureSelectionManifest":
+        """Rehydrate a checked public projection; it is not an owner seal."""
+
         if type(value) is not dict or type(manifest_digest) is not str:
             raise ExternalValidationAdapterError("fixture manifest is invalid")
         return cls(MappingProxyType(dict(value)), manifest_digest)
@@ -1159,7 +1186,10 @@ class FixtureSelectionManifest:
             or type(raw.get("contract_id")) is not str or re.fullmatch(r"[0-9a-f]{64}", raw["contract_id"]) is None
             or type(raw.get("leaf")) is not int or raw["leaf"] < 1
             or _DIGEST.fullmatch(self.manifest_digest) is None
-            or self.manifest_digest != _digest(raw)
+            or (self.raw_utf8 is not None and (
+                type(self.raw_utf8) is not bytes
+                or "sha256:" + hashlib.sha256(self.raw_utf8).hexdigest() != self.manifest_digest
+            ))
             or type(raw.get("target")) is not dict
             or set(raw["target"]) != {"repository", "baseline_sha"}
             or raw["target"].get("repository") != "ythdelmar68/roundlet-forward-test"
@@ -1217,6 +1247,10 @@ class FixtureSelectionManifest:
         if tuple(fixtures) != _LIVE_LIFECYCLE_FIXTURES:
             raise ExternalValidationAdapterError("fixture manifest is incomplete")
         object.__setattr__(self, "value", self._freeze(raw))
+
+    @property
+    def is_owner_sealed(self) -> bool:
+        return self.raw_utf8 is not None
 
     @property
     def target_repository(self) -> str:
@@ -1366,7 +1400,7 @@ class LiveLifecycleRuntimeDescriptor:
         }:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
         try:
-            raw["fixture_manifest"] = FixtureSelectionManifest.parse(
+            raw["fixture_manifest"] = FixtureSelectionManifest.from_projection(
                 raw["fixture_manifest"], raw.pop("fixture_manifest_digest"),
             )
             return cls(**raw)
@@ -2166,6 +2200,8 @@ def _prepare_live_lifecycle_shadow_request(
     if inputs.fixture_manifest is None:
         raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
     manifest = inputs.fixture_manifest
+    if not manifest.is_owner_sealed:
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest is unsealed")
     if (manifest.target_repository, manifest.target_baseline_sha) != (
         inputs.target_repository, inputs.target_baseline_sha,
     ):
@@ -2526,6 +2562,7 @@ def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[s
         "fixture_manifest": None if inputs.fixture_manifest is None else {
             "value": inputs.fixture_manifest.payload(),
             "manifest_digest": inputs.fixture_manifest.manifest_digest,
+            "raw_utf8_b64": None if inputs.fixture_manifest.raw_utf8 is None else base64.b64encode(inputs.fixture_manifest.raw_utf8).decode("ascii"),
         },
     }
 
@@ -2604,11 +2641,18 @@ def _load_live_lifecycle_session(
             ledger_value["plan"], ledger_value["ledger_digest"],
         )
         manifest_value = input_value.get("fixture_manifest")
-        if type(manifest_value) is not dict or set(manifest_value) != {"value", "manifest_digest"}:
+        if type(manifest_value) is not dict or set(manifest_value) != {"value", "manifest_digest", "raw_utf8_b64"}:
             raise ValueError
-        input_value["fixture_manifest"] = FixtureSelectionManifest.parse(
-            manifest_value["value"], manifest_value["manifest_digest"],
-        )
+        if type(manifest_value["raw_utf8_b64"]) is not str:
+            raise ValueError
+        try:
+            raw_manifest = base64.b64decode(manifest_value["raw_utf8_b64"], validate=True)
+        except ValueError as error:
+            raise ValueError from error
+        manifest = FixtureSelectionManifest.parse(raw_manifest, manifest_value["manifest_digest"])
+        if manifest.payload() != manifest_value["value"]:
+            raise ValueError
+        input_value["fixture_manifest"] = manifest
         inputs = LiveLifecycleRequestInputs(**input_value)
         prepared = value["prepared"]
         if set(prepared) != {

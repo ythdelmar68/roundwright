@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import inspect
 import sys
 import tempfile
@@ -679,12 +680,21 @@ class ExternalValidationTests(unittest.TestCase):
             "merged-pr": ("pull-request", 10),
         })
         value = manifest.payload()
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(manifest.manifest_digest, "sha256:" + hashlib.sha256(raw).hexdigest())
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "manifest"):
-            external_validation.FixtureSelectionManifest.parse(value, "sha256:" + "0" * 64)
+            external_validation.FixtureSelectionManifest.parse(raw, "sha256:" + "0" * 64)
         duplicate = json.loads(json.dumps(value))
         duplicate["fixtures"][4]["selector"] = {"kind": "issue", "number": 6}
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "selectors conflict"):
-            external_validation.FixtureSelectionManifest.parse(duplicate, external_validation._digest(duplicate))
+            duplicate_raw = json.dumps(duplicate, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+            external_validation.FixtureSelectionManifest.parse(
+                duplicate_raw, "sha256:" + hashlib.sha256(duplicate_raw).hexdigest(),
+            )
+        altered = raw[:-1]
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "digest"):
+            external_validation.FixtureSelectionManifest.parse(altered, manifest.manifest_digest)
 
         facts = (
             RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-1", "state", "open"),
@@ -2504,7 +2514,10 @@ class ExternalValidationTests(unittest.TestCase):
                 for fixture, selector, expectation in expectations
             ],
         }
-        return external_validation.FixtureSelectionManifest.parse(value, external_validation._digest(value))
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        return external_validation.FixtureSelectionManifest.parse(
+            raw, "sha256:" + hashlib.sha256(raw).hexdigest(),
+        )
 
     @staticmethod
     def live_lifecycle_projection() -> lifecycle_observation.LifecycleShadowProjection:

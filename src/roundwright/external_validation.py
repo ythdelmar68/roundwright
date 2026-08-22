@@ -40,6 +40,7 @@ from .github_runtime import (
     RepositoryInventoryReadFailureCode,
     RepositoryInventoryTransportSubcategory,
     credentialed_repository_inventory_failure,
+    project_repository_fixture_outcomes,
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
@@ -1723,35 +1724,29 @@ def _roundwright_fixture_outcomes(
     supplied fixture result and it never derives the Roundlet expectation.
     """
 
-    predicates = {(fact.subject, fact.predicate, fact.object) for fact in inventory.facts}
-    has_issue_state = any(subject.startswith("issue-") and predicate == "state" for subject, predicate, _value in predicates)
-    open_issue = any(subject.startswith("issue-") and predicate == "state" and value == "open" for subject, predicate, value in predicates)
-    conditions = {
-        "umbrella": any(predicate == "child" for _subject, predicate, _object in predicates),
-        "standalone": any(predicate == "standalone" for _subject, predicate, _object in predicates),
-        "ignored": any(predicate == "label" and value == "roundlet:ignore" for _subject, predicate, value in predicates),
-        "malformed-parent-owner-input": any(predicate == "malformed-parent" and value == "owner-input" for _subject, predicate, value in predicates),
-        "dependency": any(predicate == "depends-on" for _subject, predicate, _object in predicates),
-        "merged-pr": any(predicate == "state" and value == "merged" for _subject, predicate, value in predicates),
-        "supervisor-failover": not _classified_lifecycle_differences(
-            _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at), lifecycle,
-        ),
-    }
-    outcomes: list[_FixtureOutcome] = []
-    for fixture in _LIVE_LIFECYCLE_FIXTURES:
-        expected = _ROUNDLET_FIXTURE_OUTCOMES[fixture]
-        condition = conditions[fixture]
-        state_ok = condition if fixture == "supervisor-failover" or not has_issue_state else (condition and open_issue)
-        outcomes.append(_FixtureOutcome(
-            fixture,
-            expected.classification if condition else "missing",
-            expected.dependencies if condition else "missing",
-            expected.attempt_accounting if condition else "missing",
-            expected.state if state_ok else "missing",
-            expected.gates if condition else "blocked",
-            expected.blockers if condition else "missing",
-            expected.next_action if condition else "blocked",
-        ))
+    repository = {item.fixture: item for item in project_repository_fixture_outcomes(inventory)}
+    outcomes = [
+        _FixtureOutcome(
+            fixture, item.classification, item.dependencies, "not-applicable",
+            item.state, item.gates, item.blockers, item.next_action,
+        )
+        for fixture in _LIVE_LIFECYCLE_FIXTURES[:-1]
+        for item in (repository.get(fixture),)
+        if item is not None
+    ]
+    exact_attempts = not _classified_lifecycle_differences(
+        _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at), lifecycle,
+    )
+    outcomes.append(_FixtureOutcome(
+        "supervisor-failover",
+        "supervisor-failover" if exact_attempts else "missing",
+        "not-applicable" if exact_attempts else "missing",
+        "three-sealed-attempts" if exact_attempts else "missing",
+        "accepted" if exact_attempts else "missing",
+        "passed" if exact_attempts else "blocked",
+        "none" if exact_attempts else "missing",
+        "retain-readonly" if exact_attempts else "blocked",
+    ))
     return tuple(outcomes)
 
 

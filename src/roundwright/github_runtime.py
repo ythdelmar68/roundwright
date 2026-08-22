@@ -5091,6 +5091,74 @@ def _inventory_scheduling_facts(
     return tuple(facts)
 
 
+@dataclass(frozen=True)
+class RepositoryFixtureOutcome:
+    """One normalized repository scheduling result for the live fixture set."""
+
+    fixture: str
+    classification: str
+    dependencies: str
+    state: str
+    gates: str
+    blockers: str
+    next_action: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            type(value) is str and _INVENTORY_FACT_TOKEN.fullmatch(value)
+            for value in (
+                self.fixture, self.classification, self.dependencies, self.state,
+                self.gates, self.blockers, self.next_action,
+            )
+        ):
+            raise GitHubRuntimeError("repository fixture outcome is invalid")
+
+
+def project_repository_fixture_outcomes(
+    inventory: RepositoryInventorySnapshot,
+) -> tuple[RepositoryFixtureOutcome, ...]:
+    """Run the production inventory classifier and scheduler for each fixture.
+
+    This projection intentionally has no Roundlet expectation dependency.  It
+    consumes the normalized issue topology, labels, dependency declarations,
+    and PR state produced by the credentialed inventory normalizer.
+    """
+
+    facts_value = getattr(inventory, "facts", None)
+    if type(facts_value) is not tuple or any(type(item) is not RepositoryInventoryFact for item in facts_value):
+        raise GitHubRuntimeError("repository fixture inventory is invalid")
+    facts = {(item.subject, item.predicate, item.object) for item in facts_value}
+    state_by_subject = {
+        subject: value for subject, predicate, value in facts
+        if predicate == "state" and value in {"open", "closed", "merged"}
+    }
+    child_edges = tuple((subject, object) for subject, predicate, object in facts if predicate == "child")
+    dependencies = tuple((subject, object) for subject, predicate, object in facts if predicate == "depends-on")
+    def result(
+        fixture: str, classification: str, dependency: str, subject: str | None,
+        gates: str, blockers: str,
+    ) -> RepositoryFixtureOutcome:
+        state = state_by_subject.get(subject or "", "missing")
+        if state == "missing":
+            return RepositoryFixtureOutcome(fixture, classification, dependency, state, "blocked", "missing", "blocked")
+        return RepositoryFixtureOutcome(fixture, classification, dependency, state, gates, blockers, "retain-readonly")
+    umbrella_parent = child_edges[0][0] if len(child_edges) == 1 else None
+    standalone_subjects = tuple(subject for subject, predicate, value in facts if predicate == "standalone" and value == "true")
+    ignored_subjects = tuple(subject for subject, predicate, value in facts if predicate == "label" and value == "roundlet:ignore")
+    malformed_subjects = tuple(subject for subject, predicate, value in facts if predicate == "malformed-parent" and value == "owner-input")
+    dependency_subject = dependencies[0][0] if len(dependencies) == 1 else None
+    merged_subjects = tuple(subject for subject, predicate, value in facts if predicate == "state" and value == "merged")
+    values = (
+        result("umbrella", "umbrella" if umbrella_parent else "missing", "children-present" if umbrella_parent else "missing", umbrella_parent, "not-applicable", "none"),
+        result("standalone", "standalone" if len(standalone_subjects) == 1 else "missing", "no-parent" if len(standalone_subjects) == 1 else "missing", standalone_subjects[0] if len(standalone_subjects) == 1 else None, "not-applicable", "none"),
+        result("ignored", "ignored" if len(ignored_subjects) == 1 else "missing", "not-applicable" if len(ignored_subjects) == 1 else "missing", ignored_subjects[0] if len(ignored_subjects) == 1 else None, "excluded", "roundlet-ignore"),
+        result("malformed-parent-owner-input", "malformed-parent" if len(malformed_subjects) == 1 else "missing", "owner-input" if len(malformed_subjects) == 1 else "missing", malformed_subjects[0] if len(malformed_subjects) == 1 else None, "blocked", "owner-input"),
+        result("dependency", "dependent" if dependency_subject else "missing", "blocked-by-parent" if dependency_subject else "missing", dependency_subject, "blocked", "dependency"),
+        result("merged-pr", "merged-pr" if len(merged_subjects) == 1 else "missing", "not-applicable" if len(merged_subjects) == 1 else "missing", merged_subjects[0] if len(merged_subjects) == 1 else None, "passed", "none"),
+    )
+    return values
+
+
 def _inventory_label_fact_value(value: object) -> str:
     """Project a label without treating provider display prose as a fact token.
 

@@ -340,7 +340,10 @@ class ExternalValidationTests(unittest.TestCase):
         projection = evidence["live_lifecycle_shadow"]
         self.assertEqual(execution.mutation_count, 0)
         self.assertEqual(projection["snapshot"]["target_observed_sha"], "b" * 40)
-        self.assertEqual(projection["snapshot"]["fixture_classes"], list(external_validation._LIVE_LIFECYCLE_FIXTURES))
+        self.assertEqual(
+            projection["snapshot"]["fixture_classes"],
+            list(external_validation._LIVE_LIFECYCLE_REPOSITORY_FIXTURES),
+        )
         self.assertIn("verified_lifecycle", projection["snapshot"])
         self.assertNotIn("event_graph_digest", projection["snapshot"])
         self.assertTrue(projection["snapshot"]["zero_mutation_readback_digest"].startswith("sha256:"))
@@ -380,21 +383,25 @@ class ExternalValidationTests(unittest.TestCase):
                 RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
                 for index, section in enumerate(RepositoryInventorySection, 1)
             ), key=lambda item: item.section.value))
-            facts = tuple(sorted((
+            fixture_facts = (
                 RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-6", "standalone", "true"),
                 RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"), RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("issue-3", "depends-on", "issue-1"), RepositoryInventoryFact("issue-1", "state", "open"),
                 RepositoryInventoryFact("issue-3", "state", "closed"), RepositoryInventoryFact("issue-6", "state", "closed"),
                 RepositoryInventoryFact("issue-7", "state", "open"), RepositoryInventoryFact("issue-9", "state", "open"),
                 RepositoryInventoryFact("pull-request-10", "state", "merged"),
-                *github_runtime._inventory_roundlet_trace_facts([
-                    ("issue", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
-                    ("issue", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
-                    ("pull-request", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate=" + "a" * 40}),
-                ]),
-            ), key=lambda item: (item.subject, item.predicate, item.object)))
+            )
+            trace_facts = github_runtime._inventory_roundlet_trace_facts([
+                    ("pull-request-84", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 attempt=1 ready_at=17 candidate=" + "a" * 40}),
+                    ("pull-request-84", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 attempt=2 ready_at=17 candidate=" + "a" * 40}),
+                    ("pull-request-84", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=pass round=formal-round-1 attempt=3 ready_at=17 candidate=" + "a" * 40}),
+                ])
+            trace_facts = (*trace_facts, RepositoryInventoryFact("pull-request-84", "head-sha", "a" * 40))
+            selected_facts = fixture_facts if repository.name == "roundlet-forward-test" else trace_facts
+            facts = tuple(sorted(selected_facts, key=lambda item: (item.subject, item.predicate, item.object)))
+            baseline = "d" * 40 if repository.name == "roundlet-forward-test" else "b" * 40
             return RepositoryInventorySnapshot(
-                repository, "forward-target", "main", "d" * 40,
+                repository, "forward-target" if repository.name == "roundlet-forward-test" else "roundwright-trace", "main", baseline,
                 "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections, facts,
             )
 
@@ -421,7 +428,7 @@ class ExternalValidationTests(unittest.TestCase):
         harness = sys.modules["roundwright_harness.executor"]
         snapshot = harness.run_calls[-1][0][2].snapshot
         self.assertEqual(result, {"status": "fake"})
-        self.assertEqual(capability.calls, 3)
+        self.assertEqual(capability.calls, 4)
         self.assertEqual(snapshot.classified_differences, ())
         self.assertEqual(snapshot.candidate_sha, "a" * 40)
         self.assertEqual(snapshot.ready_at, 17)
@@ -496,6 +503,75 @@ class ExternalValidationTests(unittest.TestCase):
             ("supervisor-profile-1-drift", "supervisor-reasoning-1-drift"),
         )
 
+    def test_live_trace_compares_the_actual_single_attempt_window_not_the_synthetic_shape(self) -> None:
+        plan = lifecycle_observation._synthetic_plan("a" * 40, 17)
+        source = lifecycle_observation._synthetic_events(plan)[4:]
+        events: list[dict[str, object]] = []
+        predecessor: str | None = None
+        for sequence, raw in enumerate(source):
+            event = dict(raw)
+            event["sequence"] = sequence
+            event["occurred_at"] = plan["ready_at"] + sequence
+            event["review_attempt"] = 1
+            event["predecessor_event_digest"] = predecessor
+            events.append(event)
+            predecessor = lifecycle_observation._digest(event)
+        core = {
+            "schema": lifecycle_observation.HARNESS_SEAL_RECEIPT_SCHEMA,
+            "status": "sealed", "event_schema": lifecycle_observation.HARNESS_EVENT_SCHEMA,
+            "plan_digest": lifecycle_observation._digest(plan),
+            "window_identity": plan["window_identity"], "repository_identity": plan["repository_identity"],
+            "candidate_sha": plan["candidate_sha"], "ready_at": plan["ready_at"],
+            "event_count": len(events), "head_event_digest": predecessor,
+            "head_entry_digest": "sha256:" + "1" * 64, "manifest_digest": "sha256:" + "2" * 64,
+            "ledger_digest": "sha256:" + "3" * 64, "retention_identity": "sha256:" + "4" * 64,
+        }
+        receipt = SimpleNamespace(
+            as_dict=lambda: {**core, "receipt_digest": lifecycle_observation._digest(core)},
+        )
+        sealed = lifecycle_observation.project_lifecycle_events(plan, events, receipt)
+        projected = external_validation._roundwright_lifecycle_projection(sealed)
+        self.assertTrue(projected.supervisor_sequence_valid)
+        self.assertEqual(projected.supervisor_attempts, (("terra", "high", "pass"),))
+
+        markers = external_validation.live_lifecycle_trace_markers(sealed)
+        self.assertEqual(markers, (
+            "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=pass "
+            "round=formal-round-1 attempt=1 ready_at=17 candidate=" + "a" * 40,
+        ))
+        facts = github_runtime._inventory_roundlet_trace_facts([(
+            "pull-request-84", {"id": "live-trace-1", "body": markers[0]},
+        )])
+        facts = (*facts, RepositoryInventoryFact("pull-request-84", "head-sha", "a" * 40))
+        self.assertEqual(
+            external_validation._roundlet_trace_differences(SimpleNamespace(facts=facts), sealed, 84),
+            (),
+        )
+        wrong_surface = github_runtime._inventory_roundlet_trace_facts([(
+            "issue-49", {"id": "live-trace-wrong-surface", "body": markers[0]},
+        )])
+        wrong_surface = (*wrong_surface, RepositoryInventoryFact("pull-request-84", "head-sha", "a" * 40))
+        self.assertIn(
+            "trace-surface-1-drift",
+            external_validation._roundlet_trace_differences(
+                SimpleNamespace(facts=wrong_surface), sealed, 84,
+            ),
+        )
+        wrong_head = tuple(
+            fact for fact in facts
+            if not (fact.subject == "pull-request-84" and fact.predicate == "head-sha")
+        )
+        self.assertIn(
+            "trace-pull-request-head-drift",
+            external_validation._roundlet_trace_differences(
+                SimpleNamespace(facts=wrong_head), sealed, 84,
+            ),
+        )
+        self.assertIn(
+            "trace-identity-drift",
+            external_validation._roundlet_trace_differences(SimpleNamespace(facts=()), sealed, 84),
+        )
+
     def test_live_lifecycle_ledger_failure_blocks_before_any_inventory_read(self) -> None:
         class NeverCalledCapability:
             def __init__(self) -> None: self.calls = 0
@@ -549,13 +625,15 @@ class ExternalValidationTests(unittest.TestCase):
             RepositoryInventoryFact("pull-request-10", "state", "merged"),
         ))
         verified = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
-        self.assertIn(
+        self.assertNotIn(
             "supervisor-failover",
             external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, verified, self.fixture_manifest()),
         )
         changed = replace(verified, supervisor_attempts=(("terra", "xhigh", "cancelled"), *verified.supervisor_attempts[1:]))
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed, self.fixture_manifest())
+        self.assertEqual(
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed, self.fixture_manifest()),
+            external_validation._LIVE_LIFECYCLE_REPOSITORY_FIXTURES,
+        )
         self.assertIn(
             "supervisor-profile-1-drift",
             external_validation._classified_lifecycle_differences(
@@ -566,8 +644,10 @@ class ExternalValidationTests(unittest.TestCase):
             verified,
             supervisor_attempts=(("sol", "high", "cancelled"), *verified.supervisor_attempts[1:]),
         )
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning, self.fixture_manifest())
+        self.assertEqual(
+            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning, self.fixture_manifest()),
+            external_validation._LIVE_LIFECYCLE_REPOSITORY_FIXTURES,
+        )
         self.assertIn(
             "supervisor-reasoning-1-drift",
             external_validation._classified_lifecycle_differences(
@@ -592,10 +672,11 @@ class ExternalValidationTests(unittest.TestCase):
             RepositoryInventoryFact("issue-9", "state", "open"),
             RepositoryInventoryFact("pull-request-10", "state", "merged"),
             *github_runtime._inventory_roundlet_trace_facts([
-                ("issue", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate=" + candidate}),
-                ("issue", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate=" + candidate}),
-                ("pull-request", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate=" + candidate}),
+                ("pull-request-84", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 attempt=1 ready_at=17 candidate=" + candidate}),
+                ("pull-request-84", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 attempt=2 ready_at=17 candidate=" + candidate}),
+                ("pull-request-84", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=pass round=formal-round-1 attempt=3 ready_at=17 candidate=" + candidate}),
             ]),
+            RepositoryInventoryFact("pull-request-84", "head-sha", candidate),
         )
         collections = tuple(sorted((
             RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
@@ -622,7 +703,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(external_validation._fixture_outcome_differences(expected, observed), ())
         self.assertEqual(
             external_validation._RoundwrightLiveLifecycleProvider._observation(
-                inventory, lifecycle, sealed, manifest,
+                inventory, inventory, lifecycle, sealed, manifest, 84,
             ).classified_differences,
             (),
         )
@@ -642,7 +723,9 @@ class ExternalValidationTests(unittest.TestCase):
                     (f"fixture-umbrella-{field}-drift",),
                 )
                 with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-                    external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, lifecycle, sealed, manifest)
+                    external_validation._RoundwrightLiveLifecycleProvider._observation(
+                        inventory, inventory, lifecycle, sealed, manifest, 84,
+                    )
 
         # Attempt accounting is supplied by the sealed lifecycle production
         # projection.  A changed lifecycle input is retained through the same
@@ -656,8 +739,12 @@ class ExternalValidationTests(unittest.TestCase):
             "fixture-supervisor-failover-attempt_accounting-drift",
             external_validation._fixture_outcome_differences(expected, changed_observed),
         )
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, changed_lifecycle, sealed, manifest)
+        self.assertEqual(
+            external_validation._RoundwrightLiveLifecycleProvider._observation(
+                inventory, inventory, changed_lifecycle, sealed, manifest, 84,
+            ).classified_differences,
+            (),
+        )
 
         # A missing normalized fact cannot pass by omission, and malformed
         # normalized evidence fails before the classifier can infer a result.
@@ -668,7 +755,9 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
             external_validation._roundwright_fixture_outcomes(missing, lifecycle, manifest)
         with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._observation(missing, lifecycle, sealed, manifest)
+            external_validation._RoundwrightLiveLifecycleProvider._observation(
+                missing, inventory, lifecycle, sealed, manifest, 84,
+            )
         with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "fixture inventory"):
             github_runtime.project_repository_fixture_outcomes(SimpleNamespace(facts=("malformed",)))
 
@@ -737,6 +826,8 @@ class ExternalValidationTests(unittest.TestCase):
         descriptor = {
             "schema": "roundwright-live-lifecycle-runtime/v2",
             "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
+            "trace_repository": "ythdelmar68/roundwright", "trace_baseline_sha": "c" * 40,
+            "trace_pull_request": 84,
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
             "fixture_manifest": sealed.payload(), "fixture_manifest_digest": sealed.manifest_digest,
@@ -758,30 +849,38 @@ class ExternalValidationTests(unittest.TestCase):
 
     def test_roundlet_trace_preserves_pull_request_comment_surface_and_rejects_duplicates(self) -> None:
         candidate = "a" * 40
-        marker = lambda profile, reasoning, disposition: (
-            f"ROUNDLET_LIFECYCLE supervisor={profile} reasoning={reasoning} disposition={disposition} "
-            f"round=formal-round-1 ready_at=17 candidate={candidate}"
+        marker = lambda attempt, profile, reasoning, disposition: (
+            f"ROUNDLET_LIFECYCLE_V2 supervisor={profile} reasoning={reasoning} disposition={disposition} "
+            f"round=formal-round-1 attempt={attempt} ready_at=17 candidate={candidate}"
         )
         nodes = [
-            ("issue", {"id": "trace-1", "body": marker("sol", "xhigh", "cancelled")}),
-            ("issue", {"id": "trace-2", "body": marker("terra", "high", "invalid-context")}),
-            ("pull-request", {"id": "trace-3", "body": marker("terra", "high", "pass")}),
+            ("issue-49", {"id": "trace-1", "body": marker(1, "sol", "xhigh", "cancelled")}),
+            ("pull-request-83", {"id": "trace-2", "body": marker(2, "terra", "high", "invalid-context")}),
+            ("pull-request-84", {"id": "trace-3", "body": marker(3, "terra", "high", "pass")}),
         ]
         facts = github_runtime._inventory_roundlet_trace_facts(nodes)
-        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request"), facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request-84"), facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "reasoning", "high"), facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "candidate", candidate), facts)
-        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "identity"):
             github_runtime._inventory_roundlet_trace_facts([*nodes, nodes[-1]])
-        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
-            github_runtime._inventory_roundlet_trace_facts((nodes[1], nodes[0], nodes[2]))
-        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "incomplete"):
-            github_runtime._inventory_roundlet_trace_facts(nodes[:-1])
+        self.assertEqual(
+            set(github_runtime._inventory_roundlet_trace_facts((nodes[1], nodes[0], nodes[2]))),
+            set(facts),
+        )
+        self.assertTrue(github_runtime._inventory_roundlet_trace_facts(nodes[:-1]))
         legacy_nodes = [
-            ("issue", {"id": "legacy-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 ready_at=17 candidate={candidate}"}),
+            ("issue-49", {"id": "legacy-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled round=formal-round-1 ready_at=17 candidate={candidate}"}),
         ]
-        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "legacy"):
-            github_runtime._inventory_roundlet_trace_facts(legacy_nodes)
+        self.assertEqual(github_runtime._inventory_roundlet_trace_facts(legacy_nodes), ())
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "malformed"):
+            github_runtime._inventory_roundlet_trace_facts([
+                ("issue-49", {"id": "bad-v2", "body": "ROUNDLET_LIFECYCLE_V2 malformed"}),
+            ])
+        with self.assertRaisesRegex(github_runtime.GitHubRuntimeError, "surface"):
+            github_runtime._inventory_roundlet_trace_facts([
+                ("pull-request", {"id": "bad-surface", "body": marker(1, "terra", "high", "pass")}),
+            ])
 
     def test_public_live_lifecycle_preflight_persists_a_path_free_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -824,6 +923,7 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
             external_validation.LiveLifecycleRequestInputs(
                 inputs.base_sha, "not-a-sha", inputs.target_repository, inputs.target_baseline_sha,
+                inputs.trace_repository, inputs.trace_baseline_sha, inputs.trace_pull_request,
                 inputs.case_id, inputs.observation_window, inputs.ready_at, inputs.recorder_commit,
                 inputs.recorder_content, inputs.recorder_tree, inputs.retention_namespace, inputs.lifecycle_ledger,
             )
@@ -839,25 +939,26 @@ class ExternalValidationTests(unittest.TestCase):
                     RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
                     for index, section in enumerate(RepositoryInventorySection, 1)
                 ), key=lambda item: item.section.value))
-                facts = tuple(sorted((
+                fixture_facts = (
                     RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-6", "standalone", "true"),
                     RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"), RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
                     RepositoryInventoryFact("issue-3", "depends-on", "issue-1"), RepositoryInventoryFact("issue-1", "state", "open"),
                     RepositoryInventoryFact("issue-3", "state", "closed"), RepositoryInventoryFact("issue-6", "state", "closed"),
                     RepositoryInventoryFact("issue-7", "state", "open"), RepositoryInventoryFact("issue-9", "state", "open"),
                     RepositoryInventoryFact("pull-request-10", "state", "merged"),
-                    RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
-                    RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
-                    RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
-                    RepositoryInventoryFact("lifecycle-supervisor-2", "disposition", "invalid-context"),
-                    RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
-                    RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
-                    RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
-                    RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
-                ), key=lambda item: (item.subject, item.predicate, item.object)))
+                )
+                trace_facts = github_runtime._inventory_roundlet_trace_facts([
+                    ("pull-request-84", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 attempt=1 ready_at=17 candidate=" + "a" * 40}),
+                    ("pull-request-84", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 attempt=2 ready_at=17 candidate=" + "a" * 40}),
+                    ("pull-request-84", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=pass round=formal-round-1 attempt=3 ready_at=17 candidate=" + "a" * 40}),
+                ])
+                trace_facts = (*trace_facts, RepositoryInventoryFact("pull-request-84", "head-sha", "a" * 40))
+                facts = fixture_facts if request.repository.name == "roundlet-forward-test" else trace_facts
+                baseline = "d" * 40 if request.repository.name == "roundlet-forward-test" else "b" * 40
                 return GitHubReadResult(request, RepositoryInventorySnapshot(
-                    request.repository, "forward-target", "main", "d" * 40,
-                    "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections, facts,
+                    request.repository, "forward-target" if request.repository.name == "roundlet-forward-test" else "roundwright-trace", "main", baseline,
+                    "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections,
+                    tuple(sorted(facts, key=lambda item: (item.subject, item.predicate, item.object))),
                 ))
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -885,14 +986,18 @@ class ExternalValidationTests(unittest.TestCase):
             GitHubReadOperation.REPOSITORY_INVENTORY,
             GitHubReadOperation.REPOSITORY_INVENTORY,
             GitHubReadOperation.REPOSITORY_INVENTORY,
+            GitHubReadOperation.REPOSITORY_INVENTORY,
         ])
         self.assertFalse(hasattr(capability, "read_before"))
         self.assertFalse(hasattr(external_validation, "LiveLifecycleTransportRequest"))
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
         self.assertEqual(harness.run_calls[1][1]["expected_readiness_digest"], session.readiness.receipt_digest)
         snapshot = harness.run_calls[1][0][2].snapshot
-        self.assertEqual(snapshot.fixture_classes, external_validation._LIVE_LIFECYCLE_FIXTURES)
+        self.assertEqual(snapshot.fixture_classes, external_validation._LIVE_LIFECYCLE_REPOSITORY_FIXTURES)
         self.assertEqual(snapshot.lifecycle_projection.ledger_digest, "sha256:" + "3" * 64)
+        self.assertEqual(snapshot.trace_pull_request, 84)
+        self.assertEqual(snapshot.confirmed_trace_readback_digest, "sha256:" + "f" * 64)
+        self.assertEqual(snapshot.public_payload()["confirmed_trace_readback_digest"], "sha256:" + "f" * 64)
         self.assertFalse(hasattr(snapshot, "event_graph"))
 
     def test_live_lifecycle_session_rejects_drift_before_transport_dispatch(self) -> None:
@@ -947,25 +1052,25 @@ class ExternalValidationTests(unittest.TestCase):
             for index, section in enumerate(RepositoryInventorySection, 1):
                 evidence = comment_evidence if section is RepositoryInventorySection.COMMENTS else "sha256:" + format(index, "064x")
                 collections.append(RepositoryInventoryEvidence(section, evidence, (f"{section.value}-1",), 1, True))
-            facts = (
+            fixture_facts = (
                 RepositoryInventoryFact("issue-1", "child", "issue-2"), RepositoryInventoryFact("issue-3", "depends-on", "issue-1"),
                 RepositoryInventoryFact("issue-6", "standalone", "true"), RepositoryInventoryFact("issue-1", "state", "open"),
                 RepositoryInventoryFact("issue-3", "state", "closed"), RepositoryInventoryFact("issue-6", "state", "closed"),
                 RepositoryInventoryFact("issue-7", "state", "open"), RepositoryInventoryFact("issue-9", "state", "open"),
-                RepositoryInventoryFact("lifecycle-supervisor-1", "profile", "sol"),
-                RepositoryInventoryFact("lifecycle-supervisor-1", "disposition", "cancelled"),
-                RepositoryInventoryFact("lifecycle-supervisor-2", "profile", "terra"),
-                RepositoryInventoryFact("lifecycle-supervisor-2", "disposition", "invalid-context"),
-                RepositoryInventoryFact("lifecycle-supervisor-3", "profile", "terra"),
-                RepositoryInventoryFact("lifecycle-supervisor-3", "disposition", "pass"),
-                RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", "a" * 40),
-                RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", "17"),
                 RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"),
                 RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
                 RepositoryInventoryFact("pull-request-10", "state", "merged"),
             )
+            trace_facts = github_runtime._inventory_roundlet_trace_facts([
+                ("pull-request-84", {"id": "trace-1", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 attempt=1 ready_at=17 candidate=" + "a" * 40}),
+                ("pull-request-84", {"id": "trace-2", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 attempt=2 ready_at=17 candidate=" + "a" * 40}),
+                ("pull-request-84", {"id": "trace-3", "body": "ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=pass round=formal-round-1 attempt=3 ready_at=17 candidate=" + "a" * 40}),
+            ])
+            trace_facts = (*trace_facts, RepositoryInventoryFact("pull-request-84", "head-sha", "a" * 40))
+            facts = fixture_facts if repository.name == "roundlet-forward-test" else trace_facts
+            baseline = "d" * 40 if repository.name == "roundlet-forward-test" else "b" * 40
             return RepositoryInventorySnapshot(
-                repository, "forward-target", "main", "d" * 40, "sha256:" + "a" * 64,
+                repository, "forward-target" if repository.name == "roundlet-forward-test" else "roundwright-trace", "main", baseline, "sha256:" + "a" * 64,
                 "sha256:" + "b" * 64,
                 tuple(sorted(collections, key=lambda item: item.section.value)),
                 tuple(sorted(facts, key=lambda item: (item.subject, item.predicate, item.object))),
@@ -986,7 +1091,7 @@ class ExternalValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "zero-mutation"):
                 external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
-        self.assertEqual(capability.calls, 3)
+        self.assertEqual(capability.calls, 4)
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate"])
 
     def test_public_credentialed_factory_drives_three_product_owned_inventory_reads(self) -> None:
@@ -1009,6 +1114,25 @@ class ExternalValidationTests(unittest.TestCase):
             tuple(ObservedDependency(binding, component.component, component.identifier, component.versions.minimum, component.source_identity, component.artifact_digest, component.executable_digest, int(now.timestamp()), policy.policy_digest) for component in components),
             TrustedDependencyAdmission(binding, policy.core_fingerprint, receipt.receipt_digest, digest("6"), digest("7")),
         )
+        trace_binding = CandidateBinding(
+            inputs.trace_repository, "live-lifecycle-trace-factory", inputs.trace_baseline_sha,
+        )
+        trace_policy = DependencyPolicy(
+            trace_binding, digest("5"), int(now.timestamp()), 60, components,
+            PolicyTransition(PolicyTransitionKind.BOOTSTRAP),
+        )
+        trace_receipt = BootstrapPolicyReceipt.create(
+            trace_policy, reviewer_identity=digest("6"), authority_digest=digest("7"),
+        )
+        trace_policy = replace(
+            trace_policy,
+            transition=PolicyTransition(PolicyTransitionKind.BOOTSTRAP, trace_receipt),
+        )
+        trace_dependency_control = DependencyExecutionControl(
+            trace_policy,
+            tuple(ObservedDependency(trace_binding, component.component, component.identifier, component.versions.minimum, component.source_identity, component.artifact_digest, component.executable_digest, int(now.timestamp()), trace_policy.policy_digest) for component in components),
+            TrustedDependencyAdmission(trace_binding, trace_policy.core_fingerprint, trace_receipt.receipt_digest, digest("6"), digest("7")),
+        )
         health = GitHubCapabilityHealth(tuple(
             OperationHealth(
                 operation,
@@ -1022,7 +1146,7 @@ class ExternalValidationTests(unittest.TestCase):
                 "id": "forward-target", "name": name, "owner": {"login": owner},
                 "defaultBranchRef": {"name": "main", "target": {"oid": inputs.target_baseline_sha}},
                 "issues": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
+                    {"id": "issue-1", "number": 1, "state": "OPEN", "title": "Umbrella owner-input fixture", "body": "2. #3 — Dependent proof leaf (P0; blocked by #2).", "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-1", "body": f"ROUNDLET_LIFECYCLE_V2 supervisor=sol reasoning=xhigh disposition=cancelled round=formal-round-1 attempt=1 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-2", "body": f"ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=invalid-context round=formal-round-1 attempt=2 ready_at=17 candidate={inputs.candidate_sha}"}, {"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE_V2 supervisor=terra reasoning=high disposition=pass round=formal-round-1 attempt=3 ready_at=17 candidate={inputs.candidate_sha}"}]}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "needs triage"}]}, "subIssues": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"number": 3}]}},
                     {"id": "issue-3", "number": 3, "state": "OPEN", "title": "Malformed-parent child fixture", "body": "- Blocked by #2.", "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": None}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                     {"id": "issue-2", "number": 2, "state": "OPEN", "title": "Standalone fixture", "body": None, "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}, "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "roundlet:ignore"}]}, "subIssues": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}},
                 ]},
@@ -1045,6 +1169,37 @@ class ExternalValidationTests(unittest.TestCase):
                     {"name": "codex/docs/26-public-target-contract", "target": {"oid": inputs.target_baseline_sha}},
                 ]},
             }},
+        }
+        trace_owner, trace_name = inputs.trace_repository.split("/", 1)
+        trace_raw_inventory = json.loads(json.dumps(raw_inventory))
+        trace_repository = trace_raw_inventory["data"]["repository"]
+        trace_repository["id"] = "roundwright-trace"
+        trace_repository["name"] = trace_name
+        trace_repository["owner"] = {"login": trace_owner}
+        trace_repository["defaultBranchRef"]["target"]["oid"] = inputs.trace_baseline_sha
+        trace_repository["refs"] = {
+            "totalCount": 1,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"name": "main", "target": {"oid": inputs.trace_baseline_sha}}],
+        }
+        trace_comments = trace_repository["issues"]["nodes"][0]["comments"]
+        trace_repository["issues"]["nodes"][0]["comments"] = {
+            "totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [],
+        }
+        trace_pull_request = json.loads(json.dumps(trace_repository["pullRequests"]["nodes"][0]))
+        trace_pull_request.update({
+            "id": f"pull-request-{inputs.trace_pull_request}",
+            "number": inputs.trace_pull_request,
+            "state": "OPEN",
+            "headRefOid": inputs.candidate_sha,
+            "mergeCommit": None,
+            "comments": trace_comments,
+            "commits": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        })
+        trace_repository["pullRequests"] = {
+            "totalCount": 1,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [trace_pull_request],
         }
 
         @dataclass(frozen=True)
@@ -1149,9 +1304,10 @@ class ExternalValidationTests(unittest.TestCase):
                     }}}))
                 if "comments(first:100,after:$cursor" in arguments[4] and self.comment_page is not None:
                     incoming = next((value.removeprefix("cursor=") for value in arguments if value.startswith("cursor=")), None)
-                    self._record("comments", "pull-request:81", incoming, self.comment_page)
+                    number = next(int(value.removeprefix("number=")) for value in arguments if value.startswith("number="))
+                    self._record("comments", f"pull-request:{number}", incoming, self.comment_page)
                     return OpaqueResult(0, json.dumps({"data": {"repository": {
-                        "name": name, "owner": {"login": owner}, "pullRequest": {"number": 81, "comments": self.comment_page},
+                        "name": name, "owner": {"login": owner}, "pullRequest": {"number": number, "comments": self.comment_page},
                     }}}))
                 selections = {
                     "labels(first:100,after:$cursor": ("issue", "labels"),
@@ -1253,6 +1409,10 @@ class ExternalValidationTests(unittest.TestCase):
         capability = create_credentialed_github_read_capability(
             host, binding, dependency_control, health, clock=lambda: next(advancing_times),
         )
+        trace_host = OpaqueCredentialHost(trace_raw_inventory)
+        trace_capability = create_credentialed_github_read_capability(
+            trace_host, trace_binding, trace_dependency_control, health, clock=lambda: now,
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
@@ -1261,7 +1421,10 @@ class ExternalValidationTests(unittest.TestCase):
                 external_validation, "project_repository_fixture_outcomes",
                 return_value=external_validation._roundlet_fixture_outcomes(inputs.fixture_manifest)[:-1],
             ):
-                result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
+                result = external_validation.execute_live_lifecycle_shadow_session(
+                    confirmed.public_receipt(), root,
+                    external_validation.LiveLifecycleReadCapabilities(capability, trace_capability),
+                )
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
         inventory_commands = [command for command in host.commands if "object(expression:$oid)" not in command[4]]
@@ -1276,6 +1439,10 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertIn("checkSuites(first:10)", inventory_commands[0][4])
         self.assertEqual(inventory_commands[0][-4:], ("-F", f"owner={owner}", "-F", f"name={name}"))
         self.assertTrue(all("checkSuites(first:100,after:$cursor)" in command[4] for command in continuation_commands))
+        self.assertEqual(
+            len([command for command in trace_host.commands if "object(expression:$oid)" not in command[4]]),
+            1,
+        )
 
         class ReturnCodeResultWithGuardedLegacyAlias:
             def __init__(self, result: OpaqueResult) -> None:
@@ -1325,7 +1492,10 @@ class ExternalValidationTests(unittest.TestCase):
                 return_value=external_validation._roundlet_fixture_outcomes(inputs.fixture_manifest)[:-1],
             ):
                 process_result = external_validation.execute_live_lifecycle_shadow_session(
-                    confirmed.public_receipt(), root, process_capability,
+                    confirmed.public_receipt(), root,
+                    external_validation.LiveLifecycleReadCapabilities(
+                        process_capability, trace_capability,
+                    ),
                 )
         self.assertEqual(process_result, {"status": "fake"})
         self.assertTrue(process_host.commands)
@@ -1347,7 +1517,12 @@ class ExternalValidationTests(unittest.TestCase):
                 session = external_validation.preflight_live_lifecycle_shadow_session(inputs, root)
                 confirmed = external_validation.confirm_live_lifecycle_shadow_trace(session.public_receipt(), root, digest("e"))
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
-                    external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, fixture_capability)
+                    external_validation.execute_live_lifecycle_shadow_session(
+                        confirmed.public_receipt(), root,
+                        external_validation.LiveLifecycleReadCapabilities(
+                            fixture_capability, trace_capability,
+                        ),
+                    )
             inventory_commands = [command for command in fixture_host.commands if "object(expression:$oid)" not in command[4]]
             self.assertEqual(len(inventory_commands), expected_reads)
 
@@ -1559,20 +1734,26 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(sum("comments(first:100,after:$cursor" in command[4] for command in nested_host.commands), 1)
 
         # Exercise the production inventory continuation route with the
-        # three trace markers split across issue and terminally paginated PR
-        # comments.  The host ledger proves the cursor/parent receipts used by
+        # three trace markers split across the initial and terminally paginated
+        # exact implementation-PR comments.  The host ledger proves the cursor/parent receipts used by
         # the normalizer, not merely the marker parser in isolation.
         split_trace_inventory = json.loads(json.dumps(raw_inventory))
         split_issue_comments = split_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]
-        split_issue_comments.update({"totalCount": 2, "nodes": split_issue_comments["nodes"][:2]})
-        split_pull_comments = split_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]
+        trace_markers = split_issue_comments["nodes"]
+        split_issue_comments.update({"totalCount": 0, "nodes": []})
+        split_pull_request = split_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]
+        split_pull_request.update({
+            "id": "pull-request-84", "number": 84, "state": "OPEN",
+            "headRefOid": inputs.candidate_sha, "mergeCommit": None,
+        })
+        split_pull_comments = split_pull_request["comments"]
         split_pull_comments.update({
-            "totalCount": 2, "pageInfo": {"hasNextPage": True, "endCursor": "pr-trace-page-1"},
-            "nodes": [{"id": "trace-3", "body": f"ROUNDLET_LIFECYCLE supervisor=terra reasoning=high disposition=pass round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"}],
+            "totalCount": 3, "pageInfo": {"hasNextPage": True, "endCursor": "pr-trace-page-1"},
+            "nodes": trace_markers[:2],
         })
         split_trace_host = OpaqueCredentialHost(
             split_trace_inventory,
-            comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "pr-trace-terminal"}]},
+            comment_page={"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [trace_markers[2]]},
         )
         split_trace_result = create_credentialed_github_read_capability(
             split_trace_host, binding, dependency_control, health, clock=lambda: now,
@@ -1582,11 +1763,11 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(split_trace_result.ok, split_trace_result.failure)
         assert split_trace_result.snapshot is not None
         split_facts = set(split_trace_result.snapshot.facts)
-        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-1", "surface", "issue"), split_facts)
-        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request"), split_facts)
-        self.assertIn(RepositoryInventoryFact("lifecycle-supervisor-1", "reasoning", "xhigh"), split_facts)
-        self.assertIn(RepositoryInventoryFact("lifecycle-supervisor-3", "reasoning", "high"), split_facts)
-        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "marker", "lifecycle"), split_facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-1", "surface", "pull-request-84"), split_facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "surface", "pull-request-84"), split_facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-1", "reasoning", "xhigh"), split_facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "reasoning", "high"), split_facts)
+        self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "marker", "lifecycle-v2"), split_facts)
         self.assertIn(RepositoryInventoryFact("roundlet-trace-trace-3", "semantic", "supervisor-3"), split_facts)
         self.assertEqual(
             [row for row in split_trace_host.route_records if row[0] == "comments"],
@@ -1594,8 +1775,8 @@ class ExternalValidationTests(unittest.TestCase):
                 ("comments", "issue:1", None, None, False),
                 ("comments", "issue:3", None, None, False),
                 ("comments", "issue:2", None, None, False),
-                ("comments", "pull-request:81", None, "pr-trace-page-1", True),
-                ("comments", "pull-request:81", "pr-trace-page-1", None, False),
+                ("comments", "pull-request:84", None, "pr-trace-page-1", True),
+                ("comments", "pull-request:84", "pr-trace-page-1", None, False),
             ],
         )
         self.assertEqual(
@@ -1604,7 +1785,7 @@ class ExternalValidationTests(unittest.TestCase):
         )
         duplicate_trace_host = OpaqueCredentialHost(
             split_trace_inventory,
-            comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-3"}]},
+            comment_page={"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "trace-2"}]},
         )
         duplicate_trace_result = create_credentialed_github_read_capability(
             duplicate_trace_host, binding, dependency_control, health, clock=lambda: now,
@@ -1617,14 +1798,14 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE,
         )
         legacy_trace_inventory = json.loads(json.dumps(split_trace_inventory))
-        legacy_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]["nodes"][0]["body"] = (
-            f"ROUNDLET_LIFECYCLE supervisor=sol disposition=cancelled "
+        legacy_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]["nodes"][0]["body"] = (
+            f"ROUNDLET_LIFECYCLE_V2 supervisor=sol disposition=cancelled "
             f"round=formal-round-1 ready_at=17 candidate={inputs.candidate_sha}"
         )
         legacy_trace_result = create_credentialed_github_read_capability(
             OpaqueCredentialHost(
                 legacy_trace_inventory,
-                comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "pr-trace-terminal"}]},
+                comment_page={"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [trace_markers[2]]},
             ), binding, dependency_control, health, clock=lambda: now,
         ).read(GitHubReadRequest(
             GitHubReadOperation.REPOSITORY_INVENTORY, RepositoryRef(owner, name), expected_sha=inputs.target_baseline_sha,
@@ -1650,10 +1831,10 @@ class ExternalValidationTests(unittest.TestCase):
         # These all traverse the same production cursor route used above;
         # none invokes the marker helper directly.
         absent_trace_inventory = json.loads(json.dumps(split_trace_inventory))
-        absent_comments = absent_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]
-        absent_comments.update({"totalCount": 1, "nodes": absent_comments["nodes"][1:]})
+        absent_comments = absent_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]
+        absent_comments.update({"totalCount": 2, "nodes": absent_comments["nodes"][1:]})
         reordered_trace_inventory = json.loads(json.dumps(split_trace_inventory))
-        reordered_comments = reordered_trace_inventory["data"]["repository"]["issues"]["nodes"][0]["comments"]["nodes"]
+        reordered_comments = reordered_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]["nodes"]
         reordered_comments[0]["body"], reordered_comments[1]["body"] = reordered_comments[1]["body"], reordered_comments[0]["body"]
         drifted_trace_inventory = json.loads(json.dumps(split_trace_inventory))
         drifted_comment = drifted_trace_inventory["data"]["repository"]["pullRequests"]["nodes"][0]["comments"]["nodes"][0]
@@ -1662,16 +1843,18 @@ class ExternalValidationTests(unittest.TestCase):
             ("absent", absent_trace_inventory), ("reordered", reordered_trace_inventory), ("candidate-drift", drifted_trace_inventory),
         ):
             with self.subTest(trace_name=trace_name):
-                self.assertIn(
-                    failure_code(OpaqueCredentialHost(
+                result = create_credentialed_github_read_capability(
+                    OpaqueCredentialHost(
                         inventory,
-                        comment_page={"totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "pr-trace-terminal"}]},
-                    )),
-                    {
-                        external_validation.RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
-                        external_validation.RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION,
-                    },
+                        comment_page={"totalCount": 2 if trace_name == "absent" else 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [trace_markers[2]]},
+                    ), binding, dependency_control, health, clock=lambda: now,
+                ).read(request)
+                self.assertTrue(result.ok, result.failure)
+                assert type(result.snapshot) is RepositoryInventorySnapshot
+                differences = external_validation._roundlet_trace_differences(
+                    result.snapshot, self.live_lifecycle_projection(), inputs.trace_pull_request,
                 )
+                self.assertEqual(differences == (), trace_name == "reordered")
         def duplicate_blocks_before_qualification(
             route: str, inventory: object, **host_options: object,
         ) -> None:
@@ -2499,10 +2682,12 @@ class ExternalValidationTests(unittest.TestCase):
     ) -> external_validation.LiveLifecycleShadowSnapshot:
         candidate = "a" * 40
         return external_validation.LiveLifecycleShadowSnapshot(
-            "ythdelmar68/roundlet-forward-test", "b" * 40, "b" * 40, candidate,
+            "ythdelmar68/roundlet-forward-test", "b" * 40, "b" * 40,
+            "ythdelmar68/roundwright", "c" * 40, 84, "sha256:" + "d" * 64,
+            "sha256:" + "f" * 64, candidate,
             "sha256:" + "1" * 64, "live-lifecycle-case", "window-49", 17, self.live_lifecycle_projection(),
             {name: "sha256:" + (f"{index:x}" * 64) for index, name in enumerate(external_validation._LIVE_LIFECYCLE_SNAPSHOTS, start=1)},
-            external_validation._LIVE_LIFECYCLE_FIXTURES, classified_differences,
+            external_validation._LIVE_LIFECYCLE_REPOSITORY_FIXTURES, classified_differences,
             "sha256:" + "e" * 64, "sha256:" + "e" * 64,
         )
 
@@ -2522,6 +2707,7 @@ class ExternalValidationTests(unittest.TestCase):
     def live_lifecycle_request_inputs(self) -> external_validation.LiveLifecycleRequestInputs:
         return external_validation.LiveLifecycleRequestInputs(
             "b" * 40, "a" * 40, "ythdelmar68/roundlet-forward-test", "d" * 40,
+            "ythdelmar68/roundwright", "b" * 40, 84,
             "live-lifecycle-case", "window-49", 17, "1" * 40, "2" * 40,
             "3" * 40, "retention-49", external_validation.LiveLifecycleLedgerBinding(
                 lifecycle_observation._synthetic_plan("a" * 40, 17), "sha256:" + "3" * 64,
@@ -2585,6 +2771,8 @@ class ExternalValidationTests(unittest.TestCase):
         descriptor = {
             "schema": "roundwright-live-lifecycle-runtime/v2",
             "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
+            "trace_repository": "ythdelmar68/roundwright", "trace_baseline_sha": "c" * 40,
+            "trace_pull_request": 84,
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
             "fixture_manifest": self.fixture_manifest("b" * 40).payload(),

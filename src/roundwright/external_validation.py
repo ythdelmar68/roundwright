@@ -1069,6 +1069,7 @@ _LIVE_LIFECYCLE_FIXTURES = (
     "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
     "dependency", "merged-pr", "supervisor-failover",
 )
+_LIVE_LIFECYCLE_REPOSITORY_FIXTURES = _LIVE_LIFECYCLE_FIXTURES[:-1]
 _LIVE_LIFECYCLE_SNAPSHOTS = (
     "repository", "issues", "scheduling", "pull-requests", "comments",
     "roundlet-trace", "candidates", "reviews", "checks", "merge", "cleanup",
@@ -1295,6 +1296,11 @@ class LiveLifecycleShadowSnapshot:
     target_repository: str
     target_baseline_sha: str
     target_observed_sha: str
+    trace_repository: str
+    trace_baseline_sha: str
+    trace_pull_request: int
+    trace_state_digest: str
+    confirmed_trace_readback_digest: str
     candidate_sha: str
     capture_plan_digest: str
     case_id: str
@@ -1314,6 +1320,11 @@ class LiveLifecycleShadowSnapshot:
             self.target_repository != "ythdelmar68/roundlet-forward-test"
             or _SHA.fullmatch(self.target_baseline_sha) is None
             or self.target_observed_sha != self.target_baseline_sha
+            or self.trace_repository != "ythdelmar68/roundwright"
+            or _SHA.fullmatch(self.trace_baseline_sha) is None
+            or type(self.trace_pull_request) is not int or self.trace_pull_request < 1
+            or _DIGEST.fullmatch(self.trace_state_digest) is None
+            or _DIGEST.fullmatch(self.confirmed_trace_readback_digest) is None
             or _SHA.fullmatch(self.candidate_sha) is None
             or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or not _safe_token(self.case_id)
@@ -1358,6 +1369,11 @@ class LiveLifecycleShadowSnapshot:
             "target_repository": self.target_repository,
             "target_baseline_sha": self.target_baseline_sha,
             "target_observed_sha": self.target_observed_sha,
+            "trace_repository": self.trace_repository,
+            "trace_baseline_sha": self.trace_baseline_sha,
+            "trace_pull_request": self.trace_pull_request,
+            "trace_state_digest": self.trace_state_digest,
+            "confirmed_trace_readback_digest": self.confirmed_trace_readback_digest,
             "observation_window": self.observation_window,
             "ready_at": self.ready_at,
             "snapshot_digests": dict(self.snapshot_digests),
@@ -1384,6 +1400,9 @@ class LiveLifecycleRuntimeDescriptor:
 
     target_repository: str
     target_baseline_sha: str
+    trace_repository: str
+    trace_baseline_sha: str
+    trace_pull_request: int
     candidate_sha: str
     capture_plan_digest: str
     case_id: str
@@ -1398,7 +1417,8 @@ class LiveLifecycleRuntimeDescriptor:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
         raw = dict(value)
         if set(raw) != {
-            "schema", "target_repository", "target_baseline_sha", "candidate_sha",
+            "schema", "target_repository", "target_baseline_sha", "trace_repository",
+            "trace_baseline_sha", "trace_pull_request", "candidate_sha",
             "capture_plan_digest", "case_id", "observation_window", "ready_at", "fixture_manifest", "fixture_manifest_digest",
         }:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
@@ -1415,6 +1435,9 @@ class LiveLifecycleRuntimeDescriptor:
             self.schema != "roundwright-live-lifecycle-runtime/v2"
             or self.target_repository != "ythdelmar68/roundlet-forward-test"
             or _SHA.fullmatch(self.target_baseline_sha) is None
+            or self.trace_repository != "ythdelmar68/roundwright"
+            or _SHA.fullmatch(self.trace_baseline_sha) is None
+            or type(self.trace_pull_request) is not int or self.trace_pull_request < 1
             or _SHA.fullmatch(self.candidate_sha) is None
             or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
@@ -1429,6 +1452,9 @@ class LiveLifecycleRuntimeDescriptor:
         return {
             "schema": self.schema, "target_repository": self.target_repository,
             "target_baseline_sha": self.target_baseline_sha,
+            "trace_repository": self.trace_repository,
+            "trace_baseline_sha": self.trace_baseline_sha,
+            "trace_pull_request": self.trace_pull_request,
             "candidate_sha": self.candidate_sha, "capture_plan_digest": self.capture_plan_digest,
             "case_id": self.case_id, "observation_window": self.observation_window,
             "ready_at": self.ready_at, "fixture_manifest": self.fixture_manifest.payload(),
@@ -1478,6 +1504,9 @@ class LiveLifecycleRequestInputs:
     candidate_sha: str
     target_repository: str
     target_baseline_sha: str
+    trace_repository: str
+    trace_baseline_sha: str
+    trace_pull_request: int
     case_id: str
     observation_window: str
     ready_at: int
@@ -1494,6 +1523,10 @@ class LiveLifecycleRequestInputs:
             or _SHA.fullmatch(self.candidate_sha) is None
             or self.target_repository != "ythdelmar68/roundlet-forward-test"
             or _SHA.fullmatch(self.target_baseline_sha) is None
+            or self.trace_repository != "ythdelmar68/roundwright"
+            or _SHA.fullmatch(self.trace_baseline_sha) is None
+            or self.trace_baseline_sha != self.base_sha
+            or type(self.trace_pull_request) is not int or self.trace_pull_request < 1
             or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
             or type(self.ready_at) is not int or self.ready_at < 0
             or any(_SHA.fullmatch(value) is None for value in (
@@ -1539,6 +1572,11 @@ class LiveLifecyclePreparedRequest:
             "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
             "base_sha": self.inputs.base_sha,
             "candidate_sha": self.inputs.candidate_sha,
+            "target_repository": self.inputs.target_repository,
+            "target_baseline_sha": self.inputs.target_baseline_sha,
+            "trace_repository": self.inputs.trace_repository,
+            "trace_baseline_sha": self.inputs.trace_baseline_sha,
+            "trace_pull_request": self.inputs.trace_pull_request,
             "case_id": self.inputs.case_id,
             "observation_window": self.inputs.observation_window,
             "ready_at": self.inputs.ready_at,
@@ -1822,9 +1860,9 @@ def _roundwright_lifecycle_projection(
         event for event in lifecycle.events
         if event.role == "supervisor" and event.transition == "attempt_completed"
     )
-    expected_order = (1, 2, 3)
+    expected_order = tuple(range(1, len(completed) + 1))
     sequence_valid = (
-        len(completed) == len(expected_order)
+        bool(completed)
         and tuple(event.review_attempt for event in completed) == expected_order
         and len({event.attempt_identity for event in completed}) == len(completed)
     )
@@ -1843,9 +1881,32 @@ def _roundwright_lifecycle_projection(
         lifecycle.candidate_sha,
         f"formal-round-{lifecycle.review_round}",
         lifecycle.ready_at,
-        tuple(supervisor_outcome(ordinal) for ordinal in range(1, 4)),
+        tuple(supervisor_outcome(ordinal) for ordinal in expected_order),
         sequence_valid,
     )
+
+
+def live_lifecycle_trace_markers(
+    lifecycle: lifecycle_observation.LifecycleShadowProjection,
+) -> tuple[str, ...]:
+    """Render the exact public-safe V2 trace expected for one sealed window."""
+
+    if type(lifecycle) is not lifecycle_observation.LifecycleShadowProjection:
+        raise ExternalValidationAdapterError("live lifecycle trace projection is invalid")
+    projected = _roundwright_lifecycle_projection(lifecycle)
+    if not projected.supervisor_sequence_valid:
+        raise ExternalValidationAdapterError("live lifecycle trace sequence is invalid")
+    markers: list[str] = []
+    for ordinal, (profile, reasoning, disposition) in enumerate(
+        projected.supervisor_attempts, start=1,
+    ):
+        marker = (
+            f"ROUNDLET_LIFECYCLE_V2 supervisor={profile} reasoning={reasoning} "
+            f"disposition={disposition} round={projected.formal_round} attempt={ordinal} "
+            f"ready_at={projected.ready_at} candidate={projected.candidate_sha}"
+        )
+        markers.append(marker)
+    return tuple(markers)
 
 
 def _classified_lifecycle_differences(
@@ -1862,8 +1923,10 @@ def _classified_lifecycle_differences(
         differences.append("ready-at-drift")
     if not roundwright.supervisor_sequence_valid:
         differences.append("supervisor-sequence-drift")
+    if len(roundlet.supervisor_attempts) != len(roundwright.supervisor_attempts):
+        differences.append("supervisor-attempt-count-drift")
     for ordinal, (expected, observed) in enumerate(
-        zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts, strict=True), start=1,
+        zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts), start=1,
     ):
         if expected[0] != observed[0]:
             differences.append(f"supervisor-profile-{ordinal}-drift")
@@ -1927,13 +1990,14 @@ def _roundlet_fixture_outcomes(manifest: FixtureSelectionManifest) -> tuple[_Fix
 
 def _fixture_outcome_differences(
     expected: tuple[_FixtureOutcome, ...], observed: tuple[_FixtureOutcome, ...],
+    fixtures: tuple[str, ...] = _LIVE_LIFECYCLE_FIXTURES,
 ) -> tuple[str, ...]:
     """Compare all declared outcome dimensions with bounded safe labels."""
 
     actual = {item.fixture: item for item in observed}
     differences: list[str] = []
     baseline_by_fixture = {item.fixture: item for item in expected}
-    for fixture in _LIVE_LIFECYCLE_FIXTURES:
+    for fixture in fixtures:
         baseline = baseline_by_fixture.get(fixture)
         if baseline is None:
             differences.append(f"fixture-{fixture}-expectation-missing")
@@ -1954,7 +2018,7 @@ def _fixture_outcome_differences(
 def _roundlet_trace_differences(
     inventory: RepositoryInventorySnapshot,
     lifecycle: lifecycle_observation.LifecycleShadowProjection,
-    expected: _RoundletLifecycleProjection,
+    trace_pull_request: int,
 ) -> tuple[str, ...]:
     """Bind normalized Roundlet trace facts to the sealed ledger.
 
@@ -1974,20 +2038,35 @@ def _roundlet_trace_differences(
             record["duplicate"] = "true"
         record[fact.predicate] = fact.object
     differences: list[str] = []
+    formal_round = f"formal-round-{lifecycle.review_round}"
+    expected_surface = f"pull-request-{trace_pull_request}"
+    if not any(
+        fact.subject == expected_surface
+        and fact.predicate == "head-sha"
+        and fact.object == lifecycle.candidate_sha
+        for fact in inventory.facts
+    ):
+        differences.append("trace-pull-request-head-drift")
+    records = {
+        identity: record for identity, record in records.items()
+        if (
+            record.get("candidate") == lifecycle.candidate_sha
+            and record.get("ready-at") == str(lifecycle.ready_at)
+            and record.get("formal-round") == formal_round
+        )
+    }
     identities = tuple(sorted(records))
-    if len(identities) != 3 or len(set(identities)) != 3:
+    completed = tuple(
+        event for event in lifecycle.events
+        if event.role == "supervisor" and event.transition == "attempt_completed"
+    )
+    if len(identities) != len(completed) or len(set(identities)) != len(completed):
         differences.append("trace-identity-drift")
     required = {
         "surface", "marker", "semantic", "ordinal", "profile", "reasoning",
         "disposition", "formal-round", "ready-at", "candidate",
     }
-    completed = tuple(
-        event for event in lifecycle.events
-        if event.role == "supervisor" and event.transition == "attempt_completed"
-    )
-    expected_profiles = tuple((item[0], item[1]) for item in expected.supervisor_attempts)
-    expected_dispositions = tuple(item[2] for item in expected.supervisor_attempts)
-    for ordinal in range(1, 4):
+    for ordinal, completed_event in enumerate(completed, start=1):
         matches = [record for record in records.values() if record.get("ordinal") == str(ordinal)]
         if len(matches) != 1:
             differences.append(f"trace-order-{ordinal}-drift")
@@ -1996,18 +2075,18 @@ def _roundlet_trace_differences(
         if set(record) - {"duplicate"} != required or "duplicate" in record:
             differences.append(f"trace-fields-{ordinal}-drift")
             continue
-        expected_profile = expected_profiles[ordinal - 1] if len(expected_profiles) == 3 else ("missing", "missing")
-        expected_disposition = expected_dispositions[ordinal - 1] if len(expected_dispositions) == 3 else "missing"
+        expected_profile = _private_supervisor_profile(completed_event.artifact_references)
+        expected_disposition = completed_event.disposition.replace("_", "-")
         expected = {
-            "marker": "lifecycle", "semantic": f"supervisor-{ordinal}", "profile": expected_profile[0],
+            "marker": "lifecycle-v2", "semantic": f"supervisor-{ordinal}", "profile": expected_profile[0],
             "reasoning": expected_profile[1], "disposition": expected_disposition,
-            "formal-round": f"formal-round-{lifecycle.review_round}",
+            "formal-round": formal_round,
             "ready-at": str(lifecycle.ready_at), "candidate": lifecycle.candidate_sha,
         }
         for field, value in expected.items():
             if record.get(field) != value:
                 differences.append(f"trace-{field}-{ordinal}-drift")
-        if record["surface"] not in {"issue", "pull-request"}:
+        if record["surface"] != expected_surface:
             differences.append(f"trace-surface-{ordinal}-drift")
     return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])
 
@@ -2016,6 +2095,18 @@ class GitHubReadCapability(Protocol):
     """Reviewed generic GitHub read boundary, independent of this profile."""
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult: ...
+
+
+@dataclass(frozen=True)
+class LiveLifecycleReadCapabilities:
+    """Separately authorized read boundaries for target fixtures and PR trace."""
+
+    target: GitHubReadCapability
+    trace: GitHubReadCapability
+
+    def __post_init__(self) -> None:
+        _require_github_read_capability(self.target)
+        _require_github_read_capability(self.trace)
 
 
 def _require_github_read_capability(capability: object) -> GitHubReadCapability:
@@ -2029,9 +2120,22 @@ class _RoundwrightLiveLifecycleProvider:
 
     def __init__(self, capability: GitHubReadCapability, inputs: LiveLifecycleRequestInputs) -> None:
         owner, name = inputs.target_repository.split("/", 1)
-        self._capability = _require_github_read_capability(capability)
+        trace_owner, trace_name = inputs.trace_repository.split("/", 1)
+        if type(capability) is LiveLifecycleReadCapabilities:
+            self._target_capability = _require_github_read_capability(capability.target)
+            self._trace_capability = _require_github_read_capability(capability.trace)
+        else:
+            # A generic fake may intentionally implement both public reads.
+            # A repository-bound real capability will fail closed on the
+            # second repository unless the caller supplies the typed pair.
+            shared = _require_github_read_capability(capability)
+            self._target_capability = shared
+            self._trace_capability = shared
         self._repository = RepositoryRef(owner, name)
         self._baseline_sha = inputs.target_baseline_sha
+        self._trace_repository = RepositoryRef(trace_owner, trace_name)
+        self._trace_baseline_sha = inputs.trace_baseline_sha
+        self._trace_pull_request = inputs.trace_pull_request
         self._candidate_sha = inputs.candidate_sha
         self._ready_at = inputs.ready_at
         self._manifest = inputs.fixture_manifest
@@ -2039,15 +2143,17 @@ class _RoundwrightLiveLifecycleProvider:
         if self._manifest is None:
             raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
 
-    def _read(self, request: GitHubReadRequest, expected: type[object]) -> object:
+    def _read(
+        self, capability: GitHubReadCapability, request: GitHubReadRequest, expected: type[object],
+    ) -> object:
         try:
-            result = self._capability.read(request)
+            result = capability.read(request)
         except Exception as error:
             raise RepositoryInventoryFirstReadBoundaryError(
                 RepositoryInventoryReadFailureCode.HOST_FAILURE,
             ) from error
         if type(result) is GitHubReadResult and result.request == request and result.failure is not None:
-            retained = credentialed_repository_inventory_failure(self._capability, request, result)
+            retained = credentialed_repository_inventory_failure(capability, request, result)
             if retained is None:
                 retained = (
                     RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
@@ -2063,17 +2169,26 @@ class _RoundwrightLiveLifecycleProvider:
             )
         return result.snapshot
 
-    def _inventory(self) -> RepositoryInventorySnapshot:
+    def _inventory(
+        self, repository: RepositoryRef | None = None, baseline_sha: str | None = None,
+    ) -> RepositoryInventorySnapshot:
+        selected_repository = self._repository if repository is None else repository
+        selected_baseline = self._baseline_sha if baseline_sha is None else baseline_sha
+        capability = (
+            self._target_capability if selected_repository == self._repository
+            else self._trace_capability
+        )
         inventory = self._read(
+            capability,
             GitHubReadRequest(
-                GitHubReadOperation.REPOSITORY_INVENTORY, self._repository,
-                expected_sha=self._baseline_sha,
+                GitHubReadOperation.REPOSITORY_INVENTORY, selected_repository,
+                expected_sha=selected_baseline,
             ), RepositoryInventorySnapshot,
         )
         assert type(inventory) is RepositoryInventorySnapshot
         if (
-            inventory.repository != self._repository
-            or inventory.baseline_sha != self._baseline_sha
+            inventory.repository != selected_repository
+            or inventory.baseline_sha != selected_baseline
             or inventory.collection(RepositoryInventorySection.REPOSITORY).complete is not True
         ):
             raise ExternalValidationAdapterError("generic GitHub repository inventory has drifted")
@@ -2086,54 +2201,65 @@ class _RoundwrightLiveLifecycleProvider:
         manifest: FixtureSelectionManifest,
     ) -> tuple[str, ...]:
         observed = _roundwright_fixture_outcomes(inventory, lifecycle, manifest)
-        differences = _fixture_outcome_differences(_roundlet_fixture_outcomes(manifest), observed)
+        differences = _fixture_outcome_differences(
+            _roundlet_fixture_outcomes(manifest), observed,
+            _LIVE_LIFECYCLE_REPOSITORY_FIXTURES,
+        )
         if differences:
             # The caller receives no partially qualified fixture set.  The
             # bounded dimension labels remain available to the sealed profile
             # comparator for explicit mismatch regressions.
             raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
         return tuple(
-            fixture for fixture in _LIVE_LIFECYCLE_FIXTURES
+            fixture for fixture in _LIVE_LIFECYCLE_REPOSITORY_FIXTURES
             if not any(item.startswith(f"fixture-{fixture}-") for item in differences)
         )
 
     @staticmethod
     def _observation(
         inventory: RepositoryInventorySnapshot,
+        trace_inventory: RepositoryInventorySnapshot,
         lifecycle: _RoundwrightLifecycleProjection,
         sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
         manifest: FixtureSelectionManifest,
+        trace_pull_request: int,
     ) -> _LiveLifecycleProviderObservation:
         fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, lifecycle, manifest)
         fixture_differences = _fixture_outcome_differences(
             _roundlet_fixture_outcomes(manifest), _roundwright_fixture_outcomes(inventory, lifecycle, manifest),
+            _LIVE_LIFECYCLE_REPOSITORY_FIXTURES,
         )
         snapshot_digests = {
             category: _digest({
                 "category": category,
-                "repository": inventory.repository.slug,
-                "baseline_sha": inventory.baseline_sha,
+                "repository": source_inventory.repository.slug,
+                "baseline_sha": source_inventory.baseline_sha,
                 "sections": [
                     {
                         "section": section.value,
-                        "evidence": inventory.collection(section).evidence_identity,
-                        "items": inventory.collection(section).item_identities,
-                        "pages": inventory.collection(section).page_count,
+                        "evidence": source_inventory.collection(section).evidence_identity,
+                        "items": source_inventory.collection(section).item_identities,
+                        "pages": source_inventory.collection(section).page_count,
                     }
                     for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category]
                 ],
                 "facts": [
                     (fact.subject, fact.predicate, fact.object)
-                    for fact in inventory.facts
-                    if any(section.value.split("-")[0] in fact.subject for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category])
+                    for fact in source_inventory.facts
+                    if (
+                        category == "roundlet-trace" and fact.subject.startswith("roundlet-trace-")
+                    ) or any(
+                        section.value.split("-")[0] in fact.subject
+                        for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category]
+                    )
                 ],
                 "fixtures": fixtures,
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
+            for source_inventory in (trace_inventory if category == "roundlet-trace" else inventory,)
         }
         trace_differences = _roundlet_trace_differences(
-            inventory, sealed_lifecycle,
-            _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest),
+            trace_inventory, sealed_lifecycle, trace_pull_request,
         )
         return _LiveLifecycleProviderObservation(
             snapshot_digests, fixtures,
@@ -2165,9 +2291,16 @@ class _RoundwrightLiveLifecycleProvider:
     def read_lifecycle(
         self, lifecycle: _RoundwrightLifecycleProjection,
         sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
-    ) -> _LiveLifecycleProviderObservation:
+    ) -> tuple[_LiveLifecycleProviderObservation, str]:
         self._armed = True
-        return self._observation(self._inventory(), lifecycle, sealed_lifecycle, self._manifest)
+        trace_inventory = self._inventory(self._trace_repository, self._trace_baseline_sha)
+        return (
+            self._observation(
+                self._inventory(), trace_inventory, lifecycle, sealed_lifecycle,
+                self._manifest, self._trace_pull_request,
+            ),
+            self._target_state_digest(trace_inventory),
+        )
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -2230,6 +2363,9 @@ def _prepare_live_lifecycle_shadow_request(
         "candidate_sha": inputs.candidate_sha,
         "target_repository": inputs.target_repository,
         "target_baseline_sha": inputs.target_baseline_sha,
+        "trace_repository": inputs.trace_repository,
+        "trace_baseline_sha": inputs.trace_baseline_sha,
+        "trace_pull_request": inputs.trace_pull_request,
         "case_id": inputs.case_id,
         "observation_window": inputs.observation_window,
         "ready_at": inputs.ready_at,
@@ -2261,7 +2397,8 @@ def _prepare_live_lifecycle_shadow_request(
     if _DIGEST.fullmatch(plan_digest) is None:
         raise ExternalValidationAdapterError("live lifecycle capture plan is invalid")
     descriptor = LiveLifecycleRuntimeDescriptor(
-        inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+        inputs.target_repository, inputs.target_baseline_sha,
+        inputs.trace_repository, inputs.trace_baseline_sha, inputs.trace_pull_request, inputs.candidate_sha,
         plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at, manifest,
     )
     request_value = {
@@ -2371,7 +2508,8 @@ def _validated_live_lifecycle_request(
         "observation_identity": prepared_request.observation_identity,
     }
     expected_descriptor = LiveLifecycleRuntimeDescriptor(
-        inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+        inputs.target_repository, inputs.target_baseline_sha,
+        inputs.trace_repository, inputs.trace_baseline_sha, inputs.trace_pull_request, inputs.candidate_sha,
         prepared_request.capture_plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
         inputs.fixture_manifest,
     ).payload()
@@ -2451,6 +2589,7 @@ def _materialize_live_lifecycle_shadow_profile(
     readiness: LiveLifecycleReadinessReceipt,
     store_root: Path,
     capability: GitHubReadCapability,
+    confirmed_trace_readback_digest: str,
 ) -> object:
     """Materialize one armed read-only lifecycle snapshot and delegate exactly once.
 
@@ -2483,13 +2622,12 @@ def _materialize_live_lifecycle_shadow_profile(
     provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
     if inputs.fixture_manifest is None:
         raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
-    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at, inputs.fixture_manifest)
     roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
     before = provider.read_before()
     # The product creates this request with the arm flag before it makes the
     # sole lifecycle read.  Only the already verified ledger supplies
     # lifecycle facts; inventory remains target fixture/read-back evidence.
-    observation = provider.read_lifecycle(roundwright, verified_lifecycle)
+    observation, trace_state_digest = provider.read_lifecycle(roundwright, verified_lifecycle)
     after = provider.read_after()
     if (
         type(before) is not _LiveLifecycleTargetState
@@ -2499,10 +2637,12 @@ def _materialize_live_lifecycle_shadow_profile(
         or after != before
     ):
         raise ExternalValidationAdapterError("live lifecycle zero-mutation read-back has drifted")
-    differences = list(_classified_lifecycle_differences(roundlet, roundwright))
+    differences = [] if roundwright.supervisor_sequence_valid else ["supervisor-sequence-drift"]
     differences.extend(observation.classified_differences)
     snapshot = LiveLifecycleShadowSnapshot(
         inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
+        inputs.trace_repository, inputs.trace_baseline_sha, inputs.trace_pull_request, trace_state_digest,
+        confirmed_trace_readback_digest,
         inputs.candidate_sha, prepared_request.capture_plan_digest, inputs.case_id,
         inputs.observation_window, inputs.ready_at, verified_lifecycle,
         observation.snapshot_digests, observation.fixture_classes,
@@ -2557,6 +2697,8 @@ def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[s
     return {
         "base_sha": inputs.base_sha, "candidate_sha": inputs.candidate_sha,
         "target_repository": inputs.target_repository, "target_baseline_sha": inputs.target_baseline_sha,
+        "trace_repository": inputs.trace_repository, "trace_baseline_sha": inputs.trace_baseline_sha,
+        "trace_pull_request": inputs.trace_pull_request,
         "case_id": inputs.case_id, "observation_window": inputs.observation_window,
         "ready_at": inputs.ready_at, "recorder_commit": inputs.recorder_commit,
         "recorder_content": inputs.recorder_content, "recorder_tree": inputs.recorder_tree,
@@ -2722,14 +2864,16 @@ def confirm_live_lifecycle_shadow_trace(
 
 
 def execute_live_lifecycle_shadow_session(
-    session_receipt: object, store_root: Path, capability: GitHubReadCapability,
+    session_receipt: object, store_root: Path,
+    capability: GitHubReadCapability | LiveLifecycleReadCapabilities,
 ) -> object:
     """Consume one trace-confirmed durable session through product-owned reads."""
 
     receipt, prepared_request, consumed, trace = _load_live_lifecycle_session(session_receipt, store_root)
     if consumed or trace is None:
         raise ExternalValidationAdapterError("live lifecycle session is not trace-confirmed")
-    capability = _require_github_read_capability(capability)
+    if type(capability) is not LiveLifecycleReadCapabilities:
+        capability = _require_github_read_capability(capability)
     _claim_live_lifecycle_session(store_root, receipt.session_id)
     _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
         prepared_request, receipt.readiness, trace_readback_digest=trace, consumed=True,
@@ -2739,7 +2883,9 @@ def execute_live_lifecycle_shadow_session(
     )
     if not consumed_readback or trace_readback != trace:
         raise ExternalValidationAdapterError("live lifecycle session consume read-back failed")
-    return _materialize_live_lifecycle_shadow_profile(prepared_request, receipt.readiness, store_root, capability)
+    return _materialize_live_lifecycle_shadow_profile(
+        prepared_request, receipt.readiness, store_root, capability, trace,
+    )
 
 
 def prepare_live_lifecycle_context(

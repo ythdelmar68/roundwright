@@ -5246,8 +5246,11 @@ def _inventory_label_fact_value(value: object) -> str:
     return "label-" + _sha256(("repository-inventory-label", value)).removeprefix("sha256:")
 
 
-_ROUNDLET_FAILOVER_TRACE = re.compile(
-    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+reasoning=(xhigh|high)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+ready_at=([0-9]+)\s+candidate=([0-9a-f]{40})\Z"
+_ROUNDLET_LIFECYCLE_TRACE_V2 = re.compile(
+    r"ROUNDLET_LIFECYCLE_V2\s+supervisor=(sol|terra)\s+reasoning=(xhigh|high)\s+"
+    r"disposition=(cancelled|invalid-context|pass|findings|failed)\s+"
+    r"round=(formal-round-[1-9][0-9]*)\s+attempt=([1-9][0-9]*)\s+"
+    r"ready_at=([0-9]+)\s+candidate=([0-9a-f]{40})\Z"
 )
 
 
@@ -5272,56 +5275,48 @@ def _inventory_section_identity(section: RepositoryInventorySection, node: objec
 
 
 def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[RepositoryInventoryFact, ...]:
-    """Project the complete ordered marker trace without retaining bodies."""
+    """Project versioned lifecycle markers without retaining comment bodies.
 
-    records: list[tuple[str, str, str, str, str, str, str, str]] = []
+    V1 markers were tied to one synthetic three-attempt fixture.  They remain
+    historical public trace, but are deliberately not upgraded into V2 live
+    evidence.  V2 carries an authored attempt ordinal and may describe any
+    real, bounded Supervisor attempt sequence.  Exact candidate/window
+    filtering and sequence comparison belong to the profile comparator.
+    """
+
+    records: list[tuple[str, str, str, str, str, str, str, str, str]] = []
     for surface, node in nodes:
+        if re.fullmatch(r"(?:issue|pull-request)-[1-9][0-9]*", surface) is None:
+            raise GitHubRuntimeError("inventory Roundlet lifecycle trace surface is invalid")
         value = _raw_mapping(node)
         body = _raw_optional_text(value, "body")
         if body is None:
             continue
-        match = _ROUNDLET_FAILOVER_TRACE.fullmatch(body)
-        if match is None and body.startswith("ROUNDLET_LIFECYCLE"):
-            # Version-1/model-only markers cannot prove the exact configured
-            # Supervisor profile.  Reject them rather than treating them as
-            # absent evidence or upgrading them by inference.
-            raise GitHubRuntimeError("inventory Roundlet failover trace is legacy or malformed")
+        match = _ROUNDLET_LIFECYCLE_TRACE_V2.fullmatch(body)
+        if match is None and body.startswith("ROUNDLET_LIFECYCLE_V2"):
+            raise GitHubRuntimeError("inventory Roundlet lifecycle V2 trace is malformed")
         if match is not None:
             records.append((surface, _raw_id(value, "id"), *match.groups()))
     if not records:
         return ()
-    if (
-        len(records) != 3
-        or len({identity for _surface, identity, *_rest in records}) != 3
-        or tuple((profile, reasoning, disposition) for _surface, _identity, profile, reasoning, disposition, _round, _ready_at, _candidate in records) != (
-        ("sol", "xhigh", "cancelled"), ("terra", "high", "invalid-context"), ("terra", "high", "pass"),
-        )
-    ):
-        raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
-    rounds = {round_id for _surface, _identity, _profile, _reasoning, _disposition, round_id, _ready_at, _candidate in records}
-    ready_values = {ready_at for _surface, _identity, _profile, _reasoning, _disposition, _round_id, ready_at, _candidate in records}
-    candidates = {candidate for _surface, _identity, _profile, _reasoning, _disposition, _round_id, _ready_at, candidate in records}
-    if rounds != {"formal-round-1"} or len(ready_values) != 1 or len(candidates) != 1:
-        raise GitHubRuntimeError("inventory Roundlet failover trace is inconsistent")
+    if len({identity for _surface, identity, *_rest in records}) != len(records):
+        raise GitHubRuntimeError("inventory Roundlet lifecycle V2 trace identity is duplicated")
     facts: list[RepositoryInventoryFact] = []
-    for ordinal, (surface, identity, profile, reasoning, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
+    for surface, identity, profile, reasoning, disposition, round_id, attempt, ready_at, candidate in records:
+        if int(attempt) > 32:
+            raise GitHubRuntimeError("inventory Roundlet lifecycle V2 attempt is out of range")
         facts.extend((
-            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "profile", profile),
-            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "reasoning", reasoning),
-            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "disposition", disposition),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "surface", surface),
-            RepositoryInventoryFact(f"roundlet-trace-{identity}", "marker", "lifecycle"),
-            RepositoryInventoryFact(f"roundlet-trace-{identity}", "semantic", f"supervisor-{ordinal}"),
-            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ordinal", str(ordinal)),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "marker", "lifecycle-v2"),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "semantic", f"supervisor-{attempt}"),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ordinal", attempt),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "profile", profile),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "reasoning", reasoning),
             RepositoryInventoryFact(f"roundlet-trace-{identity}", "disposition", disposition),
-            RepositoryInventoryFact(f"roundlet-trace-{identity}", "formal-round", _round_id),
-            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ready-at", _ready_at),
-            RepositoryInventoryFact(f"roundlet-trace-{identity}", "candidate", _candidate),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "formal-round", round_id),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ready-at", ready_at),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "candidate", candidate),
         ))
-    facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", next(iter(candidates))))
-    facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", next(iter(ready_values))))
     return tuple(facts)
 
 
@@ -5387,14 +5382,12 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
         if _raw_bool(comment_page, "hasNextPage") or _raw_integer(comment_connection, "totalCount") != len(comment_nodes):
             raise GitHubRuntimeError("inventory nested pagination is incomplete")
         nested[RepositoryInventorySection.COMMENTS].append(comment_connection)
-        trace_nodes.extend(("issue", node) for node in comment_nodes)
+        trace_nodes.extend((subject, node) for node in comment_nodes)
         for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
             connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
             if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
                 raise GitHubRuntimeError("inventory nested pagination is incomplete")
             nested[section].append(connection)
-            if section is RepositoryInventorySection.COMMENTS:
-                trace_nodes.extend(("pull-request", node) for node in nodes)
             for node in nodes:
                 child = _raw_mapping(node)
                 fact_value = (
@@ -5444,7 +5437,7 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
             # comments.  Keep terminal PR comments in the same bounded trace
             # ledger, with their actual surface, before normalizing markers.
             if section is RepositoryInventorySection.COMMENTS:
-                trace_nodes.extend(("pull-request", node) for node in nodes)
+                trace_nodes.extend((subject, node) for node in nodes)
         commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = _inventory_connection_nodes(commits, commits_page)
         if (
             _raw_bool(commits_page, "hasNextPage")

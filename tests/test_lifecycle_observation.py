@@ -41,6 +41,13 @@ class LifecycleObservationTests(unittest.TestCase):
         }
         return SimpleNamespace(as_dict=lambda: {**core, "receipt_digest": lifecycle._digest(core)})
 
+    @staticmethod
+    def rechain(events: list[dict[str, object]]) -> None:
+        predecessor = None
+        for event in events:
+            event["predecessor_event_digest"] = predecessor
+            predecessor = lifecycle._digest(event)
+
     def projection(self) -> lifecycle.LifecycleShadowProjection:
         plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
         events = lifecycle._synthetic_events(plan)
@@ -49,6 +56,10 @@ class LifecycleObservationTests(unittest.TestCase):
     def test_authoritative_contract_pins_reviewed_external_identities(self) -> None:
         contract = lifecycle.lifecycle_observation_contract()
 
+        self.assertEqual(
+            contract["contract_identity"],
+            "sha256:6752833ae7cabd0ce7e3c45a9bf964f068a3df8728d77e3cfa6fbe126faa8ed8",
+        )
         self.assertEqual(contract["harness"]["merge_commit"], lifecycle.HARNESS_MERGE_COMMIT)
         self.assertEqual(contract["harness"]["tree"], lifecycle.HARNESS_TREE)
         self.assertEqual(contract["roundlet"]["merge_commit"], lifecycle.ROUNDLET_MERGE_COMMIT)
@@ -63,6 +74,17 @@ class LifecycleObservationTests(unittest.TestCase):
         drifted["roundlet"] = {**contract["roundlet"], "tree": "0" * 40}
         with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "drifted"):
             lifecycle.validate_lifecycle_observation_contract(drifted)
+        profile_registry_drift = dict(contract)
+        profile_registry_drift["schemas"] = {
+            **contract["schemas"],
+            "supervisor_profile_artifact": lifecycle.SUPERVISOR_PROFILE_ARTIFACT_SCHEMA,
+        }
+        profile_registry_drift["contract_identity"] = lifecycle._digest({
+            key: value for key, value in profile_registry_drift.items()
+            if key != "contract_identity"
+        })
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "drifted"):
+            lifecycle.validate_lifecycle_observation_contract(profile_registry_drift)
         tracked = json.loads(
             (ROOT / "docs" / "operations" / "lifecycle-observation-contract.json").read_text(
                 encoding="utf-8"
@@ -89,6 +111,33 @@ class LifecycleObservationTests(unittest.TestCase):
         self.assertEqual(projection.candidate_sha, self.candidate)
         self.assertEqual(projection.ready_at, self.ready_at)
         self.assertEqual(projection.classified_differences, ())
+
+    def test_v1_projection_keeps_its_pre_candidate_semantic_shape_and_identity(self) -> None:
+        plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
+        events = lifecycle._synthetic_events(plan)
+        for event in events:
+            event["artifact_references"] = []
+        self.rechain(events)
+        projection = lifecycle.project_lifecycle_events(plan, events, self.seal(plan, events))
+        payload = projection.semantic_payload()
+        self.assertEqual(
+            tuple(payload["events"][1]),
+            (
+                "sequence", "occurred_at", "role", "task_identity", "attempt_identity",
+                "review_attempt", "transition", "disposition", "accepted_result",
+                "successor_candidate_sha", "predecessor_event_digest", "artifact_references",
+                "event_digest",
+            ),
+        )
+        # This digest was captured from the independently reviewed v1 ledger
+        # fixture before profile-private decoding was introduced.
+        self.assertEqual(
+            lifecycle._digest(payload),
+            "sha256:cb4401bf39dfe698f7a634501a5701fc342ee55b14203dad9bfd8027dbf55e4c",
+        )
+        self.assertTrue(lifecycle.supervisor_profile_artifact("sol", "xhigh").startswith("sha256:"))
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "profile artifact"):
+            lifecycle.supervisor_profile_artifact("sol", "high")
 
     def test_comparator_checks_every_field_and_rejects_declared_difference(self) -> None:
         expected = self.projection()

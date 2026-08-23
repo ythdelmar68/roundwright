@@ -122,6 +122,8 @@ _DISPOSITIONS = {
     "unaccepted",
     "stale",
 }
+SUPERVISOR_PROFILE_ARTIFACT_SCHEMA = "roundwright-supervisor-profile-artifact/v2"
+_SUPERVISOR_PROFILES = (("sol", "xhigh"), ("terra", "high"))
 
 
 class LifecycleObservationError(ValueError):
@@ -154,6 +156,23 @@ def _safe_token(value: object) -> bool:
         word in lowered
         for word in ("token", "secret", "credential", "password", "ghp_")
     ) and not lowered.startswith("sk-")
+
+
+def supervisor_profile_artifact(model: str, reasoning: str) -> str:
+    """Return the sealed identity for one exact public Supervisor profile.
+
+    The generic Harness ledger retains artifact identities rather than raw
+    provider records.  This fixed vocabulary makes the selected profile a
+    typed, sealed lifecycle fact without exposing a provider payload.
+    """
+
+    if (model, reasoning) not in _SUPERVISOR_PROFILES:
+        raise LifecycleObservationError("supervisor profile artifact is invalid")
+    return _digest({
+        "schema": SUPERVISOR_PROFILE_ARTIFACT_SCHEMA,
+        "model": model,
+        "reasoning": reasoning,
+    })
 
 
 @dataclass(frozen=True)
@@ -859,7 +878,10 @@ def _synthetic_events(plan: Mapping[str, object]) -> list[dict[str, object]]:
             "accepted_result": accepted,
             "successor_candidate_sha": None,
             "predecessor_event_digest": predecessor,
-            "artifact_references": [],
+            "artifact_references": [
+                supervisor_profile_artifact("sol", "xhigh") if attempt == 1
+                else supervisor_profile_artifact("terra", "high"),
+            ],
         }
         events.append(event)
         predecessor = _digest(event)

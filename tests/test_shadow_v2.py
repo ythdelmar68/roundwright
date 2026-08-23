@@ -1056,8 +1056,9 @@ class ShadowV2Tests(unittest.TestCase):
         synthetic = shadow_evidence_profile(EXECUTOR_CONTRACT_SYNTHETIC_PROFILE)
         provider_attempts = shadow_evidence_profile("roundwright-shadow-profile/provider-attempt-accounting/v1")
         hosted_checks = shadow_evidence_profile(HOSTED_CHECK_PROFILE)
+        live_lifecycle = shadow_evidence_profile("roundwright-shadow-profile/live-lifecycle-shadow/v1")
         self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
-        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic, provider_attempts, hosted_checks))
+        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle))
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
         self.assertEqual(worker.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
@@ -1066,6 +1067,8 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(synthetic.event_kinds, ("executor-contract-result",))
         self.assertEqual(provider_attempts.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
         self.assertEqual(provider_attempts.arm_before, "before-first-selected-provider-attempt")
+        self.assertEqual(live_lifecycle.capture_mode, CaptureMode.ARMED_LIVE_EVENTS)
+        self.assertEqual(live_lifecycle.arm_before, "before-first-live-lifecycle-event")
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

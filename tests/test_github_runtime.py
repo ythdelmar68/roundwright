@@ -70,6 +70,7 @@ from roundwright.github_runtime import (
     _pre_dispatch_reads_identity,
     _GhBrokerExecutor,
     _validate_created_resource_locator,
+    create_credentialed_github_read_capability,
     schema_v2_authorization_bundle,
     unavailable_capability_health,
 )
@@ -1342,6 +1343,37 @@ class GitHubRuntimeTests(unittest.TestCase):
                 self.assertTrue(result.ok)
                 self.assertEqual(len(transport.requests), 1)
 
+    def test_public_credentialed_read_capability_factory_requires_exact_fresh_evidence(self) -> None:
+        """The public factory exposes no query, snapshot, or test-control input."""
+
+        binding = owner_read_binding()
+        control = owner_read_control(binding=binding)
+        runner = Runner()
+        capability = create_credentialed_github_read_capability(
+            runner, binding, control.dependency_control,
+            health(GitHubReadOperation.REPOSITORY_INVENTORY), clock=lambda: NOW,
+        )
+        self.assertIsInstance(capability, OwnerGitHubReadIpcClient)
+        self.assertFalse(hasattr(capability, "run"))
+        self.assertFalse(hasattr(capability, "query"))
+        self.assertFalse(hasattr(capability, "snapshot"))
+        self.assertEqual(runner.calls, [])
+        cases = (
+            ("repository", CandidateBinding("other/repository", binding.task_id, binding.candidate_sha), control.dependency_control, health(GitHubReadOperation.REPOSITORY_INVENTORY)),
+            ("task", CandidateBinding(binding.repository, "other-task", binding.candidate_sha), control.dependency_control, health(GitHubReadOperation.REPOSITORY_INVENTORY)),
+            ("candidate", CandidateBinding(binding.repository, binding.task_id, "f" * 40), control.dependency_control, health(GitHubReadOperation.REPOSITORY_INVENTORY)),
+            ("unavailable", binding, control.dependency_control, health()),
+            ("stale", binding, control.dependency_control, health(GitHubReadOperation.REPOSITORY_INVENTORY, observed_at=NOW - timedelta(minutes=6))),
+        )
+        for name, candidate, dependency, matrix in cases:
+            with self.subTest(name=name):
+                rejected_runner = Runner()
+                with self.assertRaises(ValueError):
+                    create_credentialed_github_read_capability(
+                        rejected_runner, candidate, dependency, matrix, clock=lambda: NOW,
+                    )
+                self.assertEqual(rejected_runner.calls, [])
+
     def test_credentialed_read_host_rejects_future_and_expired_health_before_runner(self) -> None:
         """AVAILABLE is insufficient outside the owner-clock validity interval."""
 
@@ -1379,7 +1411,7 @@ class GitHubRuntimeTests(unittest.TestCase):
             owner_read_control(binding=CandidateBinding("other/repository", "github-read-host", SHA)),
             owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "other-task", SHA)),
             owner_read_control(binding=CandidateBinding(REPOSITORY.slug, "github-read-host", "f" * 40)),
-            owner_read_control(now=NOW - timedelta(seconds=1)),
+            owner_read_control(now=NOW - timedelta(hours=2)),
         )
         for control in controls:
             with self.subTest(binding=control.binding, control_now=control.now):

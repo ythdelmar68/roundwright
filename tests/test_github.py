@@ -21,6 +21,10 @@ from roundwright.github import (
     MutationReceipt,
     RepositoryRef,
     RequestedReviewersSnapshot,
+    RepositoryInventoryEvidence,
+    RepositoryInventoryFact,
+    RepositoryInventorySection,
+    RepositoryInventorySnapshot,
     _is_snapshot,
     _validate_snapshot_for,
     normalize_github_response,
@@ -47,7 +51,7 @@ class GitHubAdapterTests(unittest.TestCase):
             values["number"] = 40
         if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}:
             values["ref"] = "main"
-        if operation in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}:
+        if operation in {GitHubReadOperation.REPOSITORY_INVENTORY, GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}:
             values["expected_sha"] = SHA
         values.update(changes)
         return GitHubReadRequest(**values)  # type: ignore[arg-type]
@@ -56,6 +60,7 @@ class GitHubAdapterTests(unittest.TestCase):
         repository = {"owner": "example", "name": "roundwright"}
         payloads: dict[GitHubReadOperation, dict[str, object]] = {
             GitHubReadOperation.REPOSITORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "default_branch_sha": SHA, "repository_evidence_identity": DIGEST, "default_branch_evidence_identity": READBACK_DIGEST},
+            GitHubReadOperation.REPOSITORY_INVENTORY: {"repository": repository, "id": "repo-1", "default_branch": "main", "baseline_sha": SHA, "repository_evidence_identity": DIGEST, "default_branch_evidence_identity": READBACK_DIGEST, "collections": [{"section": section.value, "evidence_identity": "sha256:" + format(index, "064x"), "item_identities": [f"{section.value}-1"], "page_count": 1, "complete": True} for index, section in enumerate(sorted(RepositoryInventorySection, key=lambda item: item.value), 1)], "facts": [{"subject": "issue-1", "predicate": "child", "object": "issue-2"}]},
             GitHubReadOperation.ISSUE: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
             GitHubReadOperation.ISSUE_RELATIONSHIPS: {"repository": repository, "id": "issue-40", "number": 40, "state": "OPEN", "parent_number": 2, "sub_issue_numbers": [41], "issue_evidence_identity": DIGEST, "relationship_evidence_identity": READBACK_DIGEST},
             GitHubReadOperation.COMMENTS: {"repository": repository, "issue_number": 40, "target_kind": "ISSUE", "comments": [{"id": "comment-1", "author_id": "owner-1", "body": "public evidence", "created_at": "2026-08-05T00:00:00Z"}]},
@@ -70,6 +75,23 @@ class GitHubAdapterTests(unittest.TestCase):
             GitHubReadOperation.REMOTE_HEAD: {"repository": repository, "ref": "main", "sha": SHA},
         }
         return payloads[operation]
+
+    def test_repository_inventory_requires_every_terminal_collection_and_exact_baseline(self) -> None:
+        request = self.request(GitHubReadOperation.REPOSITORY_INVENTORY)
+        snapshot = normalize_github_response(request, self.payload(GitHubReadOperation.REPOSITORY_INVENTORY))
+        self.assertIsInstance(snapshot, RepositoryInventorySnapshot)
+        self.assertEqual(snapshot.baseline_sha, SHA)
+        self.assertEqual(len(snapshot.collections), len(RepositoryInventorySection))
+        malformed = self.payload(GitHubReadOperation.REPOSITORY_INVENTORY)
+        malformed["collections"] = malformed["collections"][:-1]  # type: ignore[index]
+        with self.assertRaises(GitHubContractError):
+            normalize_github_response(request, malformed)
+        duplicate = self.payload(GitHubReadOperation.REPOSITORY_INVENTORY)
+        duplicate["collections"] = duplicate["collections"] + [duplicate["collections"][0]]  # type: ignore[index]
+        with self.assertRaises(GitHubContractError):
+            normalize_github_response(request, duplicate)
+        with self.assertRaises(GitHubContractError):
+            GitHubReadRequest(GitHubReadOperation.REPOSITORY_INVENTORY, REPOSITORY)
 
     def test_every_declared_read_normalizes_to_the_expected_immutable_snapshot(self) -> None:
         for operation in GitHubReadOperation:

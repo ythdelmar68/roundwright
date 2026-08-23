@@ -5,19 +5,44 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 import re
+import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Protocol
 
 from .shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
+    LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    EvidenceRole,
+    FormalReviewRoundReference,
+    LifecycleAttempt,
+    LifecycleAttemptKind,
+    ShadowV2Event,
     ShadowV2Error,
     ShadowV2EventGraph,
     shadow_evidence_profile,
+)
+from .github import (
+    GitHubReadOperation,
+    GitHubReadRequest,
+    GitHubReadResult,
+    RepositoryRef,
+    RepositoryInventorySection,
+    RepositoryInventorySnapshot,
+)
+from .github_runtime import (
+    GitHubRuntimeError,
+    ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED,
+    RepositoryInventoryFailureStage,
+    RepositoryInventoryReadFailureCode,
+    RepositoryInventoryTransportSubcategory,
+    credentialed_repository_inventory_failure,
+    project_repository_fixture_outcomes,
 )
 from .provider_attempt_runtime import (
     MaterializedProviderAttemptContext,
@@ -26,10 +51,12 @@ from .provider_attempt_runtime import (
     install_host_runtime,
     prepare_context as prepare_provider_attempt_context,
 )
+from . import lifecycle_observation
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
 HOSTED_CHECK_SCHEMA = "roundwright-hosted-check-evidence/v1"
+LIVE_LIFECYCLE_SHADOW_SCHEMA = "roundwright-live-lifecycle-shadow/v1"
 _SHA = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -37,6 +64,41 @@ _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 class ExternalValidationAdapterError(ValueError):
     """A public executor adapter binding is incomplete or has drifted."""
+
+
+class RepositoryInventoryFirstReadBoundaryError(ExternalValidationAdapterError):
+    """Typed, public-safe inventory failure at the lifecycle adapter boundary."""
+
+    def __init__(
+        self,
+        code: RepositoryInventoryReadFailureCode,
+        stage: RepositoryInventoryFailureStage = RepositoryInventoryFailureStage.UNKNOWN,
+        transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
+    ) -> None:
+        if (
+            type(code) is not RepositoryInventoryReadFailureCode
+            or type(stage) is not RepositoryInventoryFailureStage
+            or type(transport_subcategory) is not RepositoryInventoryTransportSubcategory
+            or (
+                stage is not RepositoryInventoryFailureStage.TRANSPORT
+                and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+            )
+        ):
+            raise TypeError("repository inventory failure is invalid")
+        self.code = code
+        self.stage = stage
+        self.transport_subcategory = transport_subcategory
+        reason = f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+        if stage is not RepositoryInventoryFailureStage.UNKNOWN:
+            reason += f":{stage.value}"
+        if (
+            stage is RepositoryInventoryFailureStage.TRANSPORT
+            and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+        ):
+            reason += f":{transport_subcategory.value}"
+        super().__init__(
+            reason
+        )
 
 
 def _digest(value: object) -> str:
@@ -69,6 +131,7 @@ PROVIDER_ATTEMPT_COMPARATOR_IDENTITY = _digest(
 )
 PROVIDER_ATTEMPT_HISTORY_BLOCKER = "provider-attempt-runtime-unavailable"
 HOSTED_CHECK_OBSERVATION_BLOCKER = "hosted-check-observation-unavailable"
+LIVE_LIFECYCLE_OBSERVATION_BLOCKER = "live-lifecycle-shadow-observation-unavailable"
 
 
 def synthetic_component_identities() -> tuple[str, str, str]:
@@ -116,6 +179,27 @@ def hosted_check_component_identities() -> tuple[str, str, str]:
         HOSTED_CHECK_PRODUCER_IDENTITY,
         HOSTED_CHECK_EXPORTER_IDENTITY,
         HOSTED_CHECK_COMPARATOR_IDENTITY,
+    )
+
+
+LIVE_LIFECYCLE_PRODUCER_IDENTITY = _digest(
+    {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "component": "normalized-live-lifecycle-reader"}
+)
+LIVE_LIFECYCLE_EXPORTER_IDENTITY = _digest(
+    {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "component": "public-safe-lifecycle-exporter"}
+)
+LIVE_LIFECYCLE_COMPARATOR_IDENTITY = _digest(
+    {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "component": "zero-mutation-lifecycle-comparator"}
+)
+
+
+def live_lifecycle_shadow_component_identities() -> tuple[str, str, str]:
+    """Return the fixed identities for the armed live-lifecycle profile."""
+
+    return (
+        LIVE_LIFECYCLE_PRODUCER_IDENTITY,
+        LIVE_LIFECYCLE_EXPORTER_IDENTITY,
+        LIVE_LIFECYCLE_COMPARATOR_IDENTITY,
     )
 
 
@@ -981,7 +1065,1842 @@ class HostedCheckProfileAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter:
+_LIVE_LIFECYCLE_FIXTURES = (
+    "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
+    "dependency", "merged-pr", "supervisor-failover",
+)
+_LIVE_LIFECYCLE_SNAPSHOTS = (
+    "repository", "issues", "scheduling", "pull-requests", "comments",
+    "roundlet-trace", "candidates", "reviews", "checks", "merge", "cleanup",
+)
+_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES = 16
+
+_LIVE_LIFECYCLE_CATEGORY_SECTIONS = {
+    "repository": (RepositoryInventorySection.REPOSITORY,),
+    "issues": (RepositoryInventorySection.ISSUES,),
+    "scheduling": (RepositoryInventorySection.ISSUE_RELATIONSHIPS, RepositoryInventorySection.ISSUE_LABELS),
+    "pull-requests": (RepositoryInventorySection.PULL_REQUESTS,),
+    "comments": (RepositoryInventorySection.COMMENTS,),
+    "roundlet-trace": (RepositoryInventorySection.COMMENTS,),
+    "candidates": (RepositoryInventorySection.PULL_REQUESTS, RepositoryInventorySection.REMOTE_HEADS),
+    "reviews": (RepositoryInventorySection.REVIEWS, RepositoryInventorySection.REQUESTED_REVIEWERS),
+    "checks": (RepositoryInventorySection.CHECKS, RepositoryInventorySection.WORKFLOW_RUNS),
+    "merge": (RepositoryInventorySection.MERGEABILITY, RepositoryInventorySection.CLOSING_REFERENCES),
+    "cleanup": (RepositoryInventorySection.REMOTE_HEADS,),
+}
+
+
+@dataclass(frozen=True)
+class _FixtureOutcome:
+    """One typed, public-safe Roundlet fixture outcome at ``ready_at``."""
+
+    fixture: str
+    classification: str
+    dependencies: str
+    attempt_accounting: str
+    state: str
+    gates: str
+    blockers: str
+    next_action: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.fixture not in _LIVE_LIFECYCLE_FIXTURES
+            or not all(_safe_token(value) for value in (
+                self.classification, self.dependencies, self.attempt_accounting,
+                self.state, self.gates, self.blockers, self.next_action,
+            ))
+        ):
+            raise ExternalValidationAdapterError("live lifecycle fixture outcome is invalid")
+
+
+@dataclass(frozen=True)
+class FixtureSelectionManifest:
+    """Closed owner-reviewed selectors and expectations bound into V2 context.
+
+    Expectations are supplied externally and remain independent of observed
+    inventory/lifecycle facts.  The product validates their shape and digest,
+    then derives observations only from its own normalizer/classifier and the
+    verified lifecycle ledger.
+    """
+
+    value: Mapping[str, object]
+    manifest_digest: str
+    raw_utf8: bytes | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def parse(cls, raw_utf8: object, manifest_digest: object) -> "FixtureSelectionManifest":
+        """Verify owner-sealed UTF-8 bytes before decoding the manifest."""
+
+        if type(raw_utf8) is not bytes or type(manifest_digest) is not str:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        if len(raw_utf8) > 65_536 or "sha256:" + hashlib.sha256(raw_utf8).hexdigest() != manifest_digest:
+            raise ExternalValidationAdapterError("fixture manifest digest has drifted")
+        try:
+            def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                value: dict[str, object] = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate key")
+                    value[key] = item
+                return value
+            value = json.loads(raw_utf8.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalValidationAdapterError("fixture manifest is invalid") from error
+        if type(value) is not dict:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        return cls(MappingProxyType(value), manifest_digest, raw_utf8)
+
+    @classmethod
+    def from_projection(cls, value: object, manifest_digest: object) -> "FixtureSelectionManifest":
+        """Rehydrate a checked public projection; it is not an owner seal."""
+
+        if type(value) not in (dict, MappingProxyType) or type(manifest_digest) is not str:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        copied = cls._thaw(value)
+        if type(copied) is not dict:
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        return cls(MappingProxyType(copied), manifest_digest)
+
+    @staticmethod
+    def _freeze(value: object) -> object:
+        if type(value) is dict:
+            return MappingProxyType({key: FixtureSelectionManifest._freeze(item) for key, item in value.items()})
+        if type(value) is list:
+            return tuple(FixtureSelectionManifest._freeze(item) for item in value)
+        return value
+
+    @staticmethod
+    def _thaw(value: object) -> object:
+        if type(value) is MappingProxyType:
+            return {key: FixtureSelectionManifest._thaw(item) for key, item in value.items()}
+        if type(value) is tuple:
+            return [FixtureSelectionManifest._thaw(item) for item in value]
+        return value
+
+    def __post_init__(self) -> None:
+        raw = dict(self.value) if type(self.value) is MappingProxyType else None
+        contract = lifecycle_observation.lifecycle_observation_contract()
+        required = {"schema", "run_id", "contract_id", "leaf", "target", "binding", "authority", "fixtures"}
+        if (
+            raw is None or set(raw) != required
+            or raw.get("schema") != "roundlet-owner-reviewed-fixture-selection-expectation-manifest/v1"
+            or not _safe_token(raw.get("run_id"))
+            or type(raw.get("contract_id")) is not str or re.fullmatch(r"[0-9a-f]{64}", raw["contract_id"]) is None
+            or type(raw.get("leaf")) is not int or raw["leaf"] < 1
+            or _DIGEST.fullmatch(self.manifest_digest) is None
+            or (self.raw_utf8 is not None and (
+                type(self.raw_utf8) is not bytes
+                or "sha256:" + hashlib.sha256(self.raw_utf8).hexdigest() != self.manifest_digest
+            ))
+            or type(raw.get("target")) is not dict
+            or set(raw["target"]) != {"repository", "baseline_sha"}
+            or raw["target"].get("repository") != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(raw["target"].get("baseline_sha", "")) is None
+            or type(raw.get("binding")) is not dict
+            or set(raw["binding"]) != {
+                "authoritative_extension_point", "capture_observation_identity_must_commit_manifest_digest",
+                "lifecycle_contract_identity", "lifecycle_contract_identity_must_remain_unchanged",
+            }
+            or raw["binding"].get("authoritative_extension_point") != "roundwright-harness-profile-executor-request/v2.execution_context"
+            or raw["binding"].get("capture_observation_identity_must_commit_manifest_digest") is not True
+            or raw["binding"].get("lifecycle_contract_identity") != contract["contract_identity"]
+            or raw["binding"].get("lifecycle_contract_identity_must_remain_unchanged") is not True
+            or type(raw.get("authority")) is not dict
+            or raw["authority"].get("effect") != "external-owner-reviewed-reference-decision"
+            or raw["authority"].get("repository_mutation") is not False
+            or raw["authority"].get("target_mutation") is not False
+            or type(raw["authority"].get("owner_allowlist")) is not list
+            or raw["authority"]["owner_allowlist"] != ["ythdelmar68"]
+            or type(raw.get("fixtures")) is not list or len(raw["fixtures"]) != len(_LIVE_LIFECYCLE_FIXTURES)
+        ):
+            raise ExternalValidationAdapterError("fixture manifest is invalid")
+        fixtures: dict[str, object] = {}
+        selectors: set[tuple[object, ...]] = set()
+        for item in raw["fixtures"]:
+            if type(item) is not dict or set(item) != {"fixture", "selector", "expectation"}:
+                raise ExternalValidationAdapterError("fixture manifest is invalid")
+            fixture, selector, expectation = item["fixture"], item["selector"], item["expectation"]
+            if fixture not in _LIVE_LIFECYCLE_FIXTURES or fixture in fixtures or type(selector) is not dict or type(expectation) is not dict:
+                raise ExternalValidationAdapterError("fixture manifest is invalid")
+            if set(expectation) != {"classification", "dependencies", "attempt_accounting", "state", "gates", "blockers", "next_action"}:
+                raise ExternalValidationAdapterError("fixture manifest is invalid")
+            try:
+                _FixtureOutcome(fixture, **expectation)
+            except (TypeError, ExternalValidationAdapterError) as error:
+                raise ExternalValidationAdapterError("fixture manifest is invalid") from error
+            if fixture == "supervisor-failover":
+                if set(selector) != {"kind", "attempts"} or selector.get("kind") != "sealed-lifecycle-attempt-sequence" or type(selector.get("attempts")) is not list or len(selector["attempts"]) != 3:
+                    raise ExternalValidationAdapterError("fixture manifest is invalid")
+                attempts = []
+                for ordinal, attempt in enumerate(selector["attempts"], 1):
+                    if type(attempt) is not dict or set(attempt) != {"ordinal", "model", "reasoning", "disposition"} or attempt.get("ordinal") != ordinal or not all(_safe_token(attempt.get(field)) for field in ("model", "reasoning", "disposition")):
+                        raise ExternalValidationAdapterError("fixture manifest is invalid")
+                    attempts.append((attempt["model"], attempt["reasoning"], attempt["disposition"]))
+                if len(set(attempts)) != len(attempts):
+                    raise ExternalValidationAdapterError("fixture manifest is invalid")
+            else:
+                if set(selector) != {"kind", "number"} or selector.get("kind") not in {"issue", "pull-request"} or type(selector.get("number")) is not int or selector["number"] < 1:
+                    raise ExternalValidationAdapterError("fixture manifest is invalid")
+                key = (selector["kind"], selector["number"])
+                if key in selectors:
+                    raise ExternalValidationAdapterError("fixture manifest selectors conflict")
+                selectors.add(key)
+            fixtures[fixture] = item
+        if tuple(fixtures) != _LIVE_LIFECYCLE_FIXTURES:
+            raise ExternalValidationAdapterError("fixture manifest is incomplete")
+        object.__setattr__(self, "value", self._freeze(raw))
+
+    @property
+    def is_owner_sealed(self) -> bool:
+        return self.raw_utf8 is not None
+
+    @property
+    def target_repository(self) -> str:
+        return self.value["target"]["repository"]  # type: ignore[index]
+
+    @property
+    def target_baseline_sha(self) -> str:
+        return self.value["target"]["baseline_sha"]  # type: ignore[index]
+
+    def selector_map(self) -> dict[str, tuple[str, int]]:
+        return {
+            item["fixture"]: (item["selector"]["kind"], item["selector"]["number"])
+            for item in self.value["fixtures"]  # type: ignore[index]
+            if item["fixture"] != "supervisor-failover"
+        }
+
+    def expected_outcomes(self) -> tuple[_FixtureOutcome, ...]:
+        return tuple(_FixtureOutcome(item["fixture"], **item["expectation"]) for item in self.value["fixtures"])  # type: ignore[index]
+
+    def supervisor_attempts(self) -> tuple[tuple[str, str, str], ...]:
+        item = next(item for item in self.value["fixtures"] if item["fixture"] == "supervisor-failover")  # type: ignore[index]
+        return tuple((attempt["model"], attempt["reasoning"], attempt["disposition"]) for attempt in item["selector"]["attempts"])
+
+    def payload(self) -> dict[str, object]:
+        value = self._thaw(self.value)
+        assert type(value) is dict
+        return value
+
+
+@dataclass(frozen=True)
+class LiveLifecycleShadowSnapshot:
+    """One public-safe, armed read-only lifecycle observation.
+
+    The snapshot carries only normalized identifiers and digests.  Raw GitHub
+    responses, local paths, credentials, and provider output stay with the
+    repository-owned Recorder and can never enter the profile projection.
+    """
+
+    target_repository: str
+    target_baseline_sha: str
+    target_observed_sha: str
+    candidate_sha: str
+    capture_plan_digest: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    lifecycle_projection: lifecycle_observation.LifecycleShadowProjection
+    snapshot_digests: Mapping[str, str]
+    fixture_classes: tuple[str, ...]
+    classified_differences: tuple[str, ...]
+    before_target_state_digest: str
+    after_target_state_digest: str
+    zero_mutation_readback_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        snapshots = dict(self.snapshot_digests) if type(self.snapshot_digests) in (dict, MappingProxyType) else None
+        if (
+            self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or self.target_observed_sha != self.target_baseline_sha
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or not _safe_token(self.case_id)
+            or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.lifecycle_projection) is not lifecycle_observation.LifecycleShadowProjection
+            or snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
+            or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
+            or type(self.fixture_classes) is not tuple
+            or any(item not in _LIVE_LIFECYCLE_FIXTURES for item in self.fixture_classes)
+            or len(set(self.fixture_classes)) != len(self.fixture_classes)
+            or self.fixture_classes != tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item in self.fixture_classes)
+            or type(self.classified_differences) is not tuple
+            or any(not _safe_token(value) for value in self.classified_differences)
+            or len(set(self.classified_differences)) != len(self.classified_differences)
+            or self.classified_differences != tuple(sorted(self.classified_differences))
+            or len(self.classified_differences) > _LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES
+            or _DIGEST.fullmatch(self.before_target_state_digest) is None
+            or self.after_target_state_digest != self.before_target_state_digest
+        ):
+            raise ExternalValidationAdapterError("live lifecycle snapshot is invalid")
+        if (
+            self.lifecycle_projection.candidate_sha != self.candidate_sha
+            or self.lifecycle_projection.ready_at != self.ready_at
+            or self.lifecycle_projection.review_epoch != 1
+            or self.lifecycle_projection.review_mode != "complete"
+            or not self.lifecycle_projection.events
+        ):
+            raise ExternalValidationAdapterError("verified live lifecycle projection has drifted")
+        object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
+        object.__setattr__(self, "zero_mutation_readback_digest", _digest({
+            "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+            "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha,
+            "target_observed_sha": self.target_observed_sha,
+            "before_target_state_digest": self.before_target_state_digest,
+            "after_target_state_digest": self.after_target_state_digest,
+        }))
+
+    def public_payload(self) -> dict[str, object]:
+        return {
+            "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha,
+            "target_observed_sha": self.target_observed_sha,
+            "observation_window": self.observation_window,
+            "ready_at": self.ready_at,
+            "snapshot_digests": dict(self.snapshot_digests),
+            "fixture_classes": list(self.fixture_classes),
+            "classified_differences": list(self.classified_differences),
+            "classified_difference_count": len(self.classified_differences),
+            "verified_lifecycle": {
+                "ledger_digest": self.lifecycle_projection.ledger_digest,
+                "plan_digest": self.lifecycle_projection.plan_digest,
+                "window_identity": self.lifecycle_projection.window_identity,
+                "candidate_sha": self.lifecycle_projection.candidate_sha,
+                "ready_at": self.lifecycle_projection.ready_at,
+                "review_epoch": self.lifecycle_projection.review_epoch,
+                "review_round": self.lifecycle_projection.review_round,
+                "event_digest": _digest(self.lifecycle_projection.semantic_payload()),
+            },
+            "zero_mutation_readback_digest": self.zero_mutation_readback_digest,
+        }
+
+
+@dataclass(frozen=True)
+class LiveLifecycleRuntimeDescriptor:
+    """Closed V2 context that pins one public target/window before arming."""
+
+    target_repository: str
+    target_baseline_sha: str
+    candidate_sha: str
+    capture_plan_digest: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    fixture_manifest: FixtureSelectionManifest
+    schema: str = "roundwright-live-lifecycle-runtime/v2"
+
+    @classmethod
+    def parse(cls, value: object) -> "LiveLifecycleRuntimeDescriptor":
+        if type(value) not in (dict, MappingProxyType):
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
+        raw = dict(value)
+        if set(raw) != {
+            "schema", "target_repository", "target_baseline_sha", "candidate_sha",
+            "capture_plan_digest", "case_id", "observation_window", "ready_at", "fixture_manifest", "fixture_manifest_digest",
+        }:
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
+        try:
+            raw["fixture_manifest"] = FixtureSelectionManifest.from_projection(
+                raw["fixture_manifest"], raw.pop("fixture_manifest_digest"),
+            )
+            return cls(**raw)
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid") from error
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema != "roundwright-live-lifecycle-runtime/v2"
+            or self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.fixture_manifest) is not FixtureSelectionManifest
+            or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
+            != (self.target_repository, self.target_baseline_sha)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema, "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha,
+            "candidate_sha": self.candidate_sha, "capture_plan_digest": self.capture_plan_digest,
+            "case_id": self.case_id, "observation_window": self.observation_window,
+            "ready_at": self.ready_at, "fixture_manifest": self.fixture_manifest.payload(),
+            "fixture_manifest_digest": self.fixture_manifest.manifest_digest,
+        }
+
+
+@dataclass(frozen=True)
+class MaterializedLiveLifecycleContext:
+    descriptor: LiveLifecycleRuntimeDescriptor
+
+    @property
+    def identity(self) -> str:
+        return _digest({"schema": "roundwright-live-lifecycle-context/v1", "descriptor": self.descriptor.payload()})
+
+
+@dataclass(frozen=True)
+class LiveLifecycleLedgerBinding:
+    """Public-safe locator for the exact ledger sealed before the live read."""
+
+    plan: Mapping[str, object]
+    ledger_digest: str
+
+    def __post_init__(self) -> None:
+        plan = dict(self.plan) if type(self.plan) in (dict, MappingProxyType) else None
+        if plan is None or _DIGEST.fullmatch(self.ledger_digest) is None:
+            raise ExternalValidationAdapterError("live lifecycle ledger binding is invalid")
+        try:
+            lifecycle_observation._validated_plan(plan)
+        except lifecycle_observation.LifecycleObservationError as error:
+            raise ExternalValidationAdapterError("live lifecycle ledger binding is invalid") from error
+        object.__setattr__(self, "plan", MappingProxyType(plan))
+
+    @property
+    def plan_digest(self) -> str:
+        return lifecycle_observation._digest(dict(self.plan))
+
+    def public_payload(self) -> dict[str, object]:
+        return {"plan": dict(self.plan), "ledger_digest": self.ledger_digest}
+
+
+@dataclass(frozen=True)
+class LiveLifecycleRequestInputs:
+    """Already-bound public primitives accepted at the opaque preflight boundary."""
+
+    base_sha: str
+    candidate_sha: str
+    target_repository: str
+    target_baseline_sha: str
+    case_id: str
+    observation_window: str
+    ready_at: int
+    recorder_commit: str
+    recorder_content: str
+    recorder_tree: str
+    retention_namespace: str
+    lifecycle_ledger: LiveLifecycleLedgerBinding
+    fixture_manifest: FixtureSelectionManifest | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            _SHA.fullmatch(self.base_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or any(_SHA.fullmatch(value) is None for value in (
+                self.recorder_commit, self.recorder_content, self.recorder_tree,
+            ))
+            or not _safe_token(self.retention_namespace)
+            or type(self.lifecycle_ledger) is not LiveLifecycleLedgerBinding
+            or (self.fixture_manifest is not None and type(self.fixture_manifest) is not FixtureSelectionManifest)
+            or (
+                self.lifecycle_ledger.plan["candidate_sha"], self.lifecycle_ledger.plan["ready_at"]
+            ) != (self.candidate_sha, self.ready_at)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle request inputs are invalid")
+
+
+@dataclass(frozen=True)
+class LiveLifecyclePreparedRequest:
+    """Sealed request material consumed only by the product-owned run entrypoint."""
+
+    inputs: LiveLifecycleRequestInputs
+    capture_plan_digest: str
+    request_digest: str
+    recorder_identity: str
+    store_root_identity: str
+    store_identity: str
+    observation_identity: str
+    _request_value: Mapping[str, object] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.inputs) is not LiveLifecycleRequestInputs
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.capture_plan_digest, self.request_digest, self.recorder_identity,
+                self.store_root_identity, self.store_identity, self.observation_identity,
+            ))
+            or type(self._request_value) is not MappingProxyType
+        ):
+            raise ExternalValidationAdapterError("live lifecycle prepared request is invalid")
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-prepared-request/v1",
+            "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+            "base_sha": self.inputs.base_sha,
+            "candidate_sha": self.inputs.candidate_sha,
+            "case_id": self.inputs.case_id,
+            "observation_window": self.inputs.observation_window,
+            "ready_at": self.inputs.ready_at,
+            "lifecycle_plan_digest": self.inputs.lifecycle_ledger.plan_digest,
+            "lifecycle_ledger_digest": self.inputs.lifecycle_ledger.ledger_digest,
+            "capture_plan_digest": self.capture_plan_digest,
+            "request_digest": self.request_digest,
+            "recorder_identity": self.recorder_identity,
+            "store_identity": self.store_identity,
+            "observation_identity": self.observation_identity,
+        }
+
+
+_LIVE_LIFECYCLE_READINESS_SEAL = object()
+_LIVE_LIFECYCLE_READY_CAPSULE_SEAL = object()
+
+
+@dataclass(frozen=True)
+class LiveLifecycleReadinessReceipt:
+    """Path-free V2 readiness facts copied from the reviewed Harness receipt."""
+
+    capture_plan_digest: str
+    candidate_sha: str
+    case_id: str
+    ready_at: int
+    producer_identity: str
+    exporter_identity: str
+    comparator_identity: str
+    execution_context_input_digest: str
+    execution_context_identity: str
+    receipt_digest: str
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        if (
+            self._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_token(self.case_id)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.producer_identity, self.exporter_identity, self.comparator_identity,
+                self.execution_context_input_digest, self.execution_context_identity,
+                self.receipt_digest,
+            ))
+            or self.receipt_digest != _digest({
+                "schema": "roundwright-harness-profile-executor-readiness/v2",
+                "status": "ready", "state": "PREFLIGHT_READY",
+                "plan_digest": self.capture_plan_digest,
+                "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+                "case_id": self.case_id, "candidate_sha": self.candidate_sha,
+                "ready_at": self.ready_at,
+                "producer_identity": self.producer_identity,
+                "exporter_identity": self.exporter_identity,
+                "comparator_identity": self.comparator_identity,
+                "dispatch_count": 0, "record_count": 0, "verify_count": 0, "mutation_count": 0,
+                "execution_context_input_digest": self.execution_context_input_digest,
+                "execution_context_identity": self.execution_context_identity,
+            })
+        ):
+            raise ExternalValidationAdapterError("live lifecycle readiness receipt is invalid")
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-readiness/v1",
+            "capture_plan_digest": self.capture_plan_digest,
+            "candidate_sha": self.candidate_sha,
+            "case_id": self.case_id,
+            "ready_at": self.ready_at,
+            "producer_identity": self.producer_identity,
+            "exporter_identity": self.exporter_identity,
+            "comparator_identity": self.comparator_identity,
+            "execution_context_input_digest": self.execution_context_input_digest,
+            "execution_context_identity": self.execution_context_identity,
+            "receipt_digest": self.receipt_digest,
+        }
+
+
+@dataclass(frozen=True)
+class LiveLifecycleSessionReceipt:
+    """Path-free handle for one durable, trace-gated lifecycle session."""
+
+    session_id: str
+    readiness: LiveLifecycleReadinessReceipt
+    receipt_digest: str = ""
+
+    def __post_init__(self) -> None:
+        payload = {
+            "schema": "roundwright-live-lifecycle-session-receipt/v1",
+            "session_id": self.session_id,
+            "readiness": self.readiness.public_receipt(),
+        }
+        digest = _digest(payload)
+        if (
+            _DIGEST.fullmatch(self.session_id) is None
+            or type(self.readiness) is not LiveLifecycleReadinessReceipt
+            or self.readiness._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+            or (self.receipt_digest and self.receipt_digest != digest)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid")
+        object.__setattr__(self, "receipt_digest", digest)
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-session-receipt/v1",
+            "session_id": self.session_id,
+            "readiness": self.readiness.public_receipt(),
+            "receipt_digest": self.receipt_digest,
+        }
+
+    @classmethod
+    def parse(cls, value: object) -> "LiveLifecycleSessionReceipt":
+        if (
+            type(value) is not dict or set(value) != {"schema", "session_id", "readiness", "receipt_digest"}
+            or value["schema"] != "roundwright-live-lifecycle-session-receipt/v1"
+        ):
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid")
+        readiness_value = value["readiness"]
+        if (
+            type(readiness_value) is not dict or set(readiness_value) != {
+            "schema", "capture_plan_digest", "candidate_sha", "case_id", "ready_at",
+            "producer_identity", "exporter_identity", "comparator_identity",
+            "execution_context_input_digest", "execution_context_identity", "receipt_digest",
+            } or readiness_value["schema"] != "roundwright-live-lifecycle-readiness/v1"
+        ):
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid")
+        try:
+            readiness = LiveLifecycleReadinessReceipt(
+                readiness_value["capture_plan_digest"], readiness_value["candidate_sha"],
+                readiness_value["case_id"], readiness_value["ready_at"],
+                readiness_value["producer_identity"], readiness_value["exporter_identity"],
+                readiness_value["comparator_identity"], readiness_value["execution_context_input_digest"],
+                readiness_value["execution_context_identity"], readiness_value["receipt_digest"],
+                _LIVE_LIFECYCLE_READINESS_SEAL,
+            )
+            return cls(value["session_id"], readiness, value["receipt_digest"])
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("live lifecycle session receipt is invalid") from error
+
+
+@dataclass(frozen=True)
+class _LiveLifecycleReadyCapsule:
+    """One sealed product preflight binding, consumed at most once."""
+
+    prepared_request: LiveLifecyclePreparedRequest
+    readiness: LiveLifecycleReadinessReceipt
+    capsule_digest: str = ""
+    _consumed: bool = field(default=False, repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        payload = {
+            "schema": "roundwright-live-lifecycle-ready-capsule/v1",
+            "request_digest": self.prepared_request.request_digest,
+            "capture_plan_digest": self.prepared_request.capture_plan_digest,
+            "store_identity": self.prepared_request.store_identity,
+            "readiness": self.readiness.public_receipt(),
+        }
+        digest = _digest(payload)
+        if (
+            self._seal is not _LIVE_LIFECYCLE_READY_CAPSULE_SEAL
+            or type(self.prepared_request) is not LiveLifecyclePreparedRequest
+            or type(self.readiness) is not LiveLifecycleReadinessReceipt
+            or type(self._consumed) is not bool
+            or (self.capsule_digest and self.capsule_digest != digest)
+        ):
+            raise ExternalValidationAdapterError("live lifecycle ready capsule is invalid")
+        object.__setattr__(self, "capsule_digest", digest)
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-live-lifecycle-ready-capsule/v1",
+            "capsule_digest": self.capsule_digest,
+            "readiness": self.readiness.public_receipt(),
+        }
+
+
+@dataclass(frozen=True)
+class _LiveLifecycleTargetState:
+    """Normalized target identity from one independent read-only observation."""
+
+    target_repository: str
+    target_sha: str
+    state_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.target_repository != "ythdelmar68/roundlet-forward-test"
+            or _SHA.fullmatch(self.target_sha) is None
+            or _DIGEST.fullmatch(self.state_digest) is None
+        ):
+            raise ExternalValidationAdapterError("live lifecycle target state is invalid")
+
+
+@dataclass(frozen=True)
+class _LiveLifecycleProviderObservation:
+    """Normalized content-free observations from an armed read-only window."""
+
+    snapshot_digests: Mapping[str, str]
+    fixture_classes: tuple[str, ...]
+    classified_differences: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        snapshots = dict(self.snapshot_digests) if type(self.snapshot_digests) in (dict, MappingProxyType) else None
+        if (
+            snapshots is None or set(snapshots) != set(_LIVE_LIFECYCLE_SNAPSHOTS)
+            or any(_DIGEST.fullmatch(value) is None for value in snapshots.values())
+            or type(self.fixture_classes) is not tuple
+            or any(item not in _LIVE_LIFECYCLE_FIXTURES for item in self.fixture_classes)
+            or len(set(self.fixture_classes)) != len(self.fixture_classes)
+            or self.fixture_classes != tuple(item for item in _LIVE_LIFECYCLE_FIXTURES if item in self.fixture_classes)
+            or type(self.classified_differences) is not tuple
+            or any(not _safe_token(value) for value in self.classified_differences)
+            or len(set(self.classified_differences)) != len(self.classified_differences)
+            or self.classified_differences != tuple(sorted(self.classified_differences))
+            or len(self.classified_differences) > _LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES
+        ):
+            raise ExternalValidationAdapterError("live lifecycle provider observation is invalid")
+        object.__setattr__(self, "snapshot_digests", MappingProxyType(snapshots))
+
+
+@dataclass(frozen=True)
+class _RoundletLifecycleProjection:
+    """The independently specified Roundlet lifecycle fixture at ``ready_at``."""
+
+    candidate_sha: str
+    formal_round: str
+    ready_at: int
+    supervisor_attempts: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True)
+class _RoundwrightLifecycleProjection:
+    """The independently normalized Roundwright lifecycle facts at ``ready_at``."""
+
+    candidate_sha: str
+    formal_round: str
+    ready_at: int
+    supervisor_attempts: tuple[tuple[str, str, str], ...]
+    supervisor_sequence_valid: bool
+
+
+def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[str, str]:
+    """Decode one retained Supervisor profile only for the live comparator.
+
+    The authoritative lifecycle projection deliberately remains the reviewed
+    v1 shape.  A profile is a private interpretation of an already sealed
+    artifact reference: absence, duplication, and unknown references are all
+    explicit missing evidence and consequently block the comparison.
+    """
+
+    if type(artifact_references) is not tuple or len(artifact_references) != 1:
+        return ("missing", "missing")
+    profiles = {
+        lifecycle_observation.supervisor_profile_artifact("sol", "xhigh"): ("sol", "xhigh"),
+        lifecycle_observation.supervisor_profile_artifact("terra", "high"): ("terra", "high"),
+    }
+    return profiles.get(artifact_references[0], ("missing", "missing"))
+
+
+def _roundlet_lifecycle_projection(
+    candidate_sha: str, ready_at: int, manifest: FixtureSelectionManifest,
+) -> _RoundletLifecycleProjection:
+    """Return external expectations independently of provider facts."""
+
+    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", ready_at, manifest.supervisor_attempts())
+
+
+def _roundwright_lifecycle_projection(
+    lifecycle: lifecycle_observation.LifecycleShadowProjection,
+) -> _RoundwrightLifecycleProjection:
+    """Project dynamic lifecycle facts from one verified sealed ledger.
+
+    Forward-target inventory is intentionally absent here: it establishes only
+    read-only fixture coverage and before/after target state.  Candidate and
+    review facts belong to the exact lifecycle ledger read back through the
+    repository lifecycle-observation contract.  Model and disposition values
+    are captured artifact/event facts; never infer them from ordinal or kind.
+    """
+    completed = tuple(
+        event for event in lifecycle.events
+        if event.role == "supervisor" and event.transition == "attempt_completed"
+    )
+    expected_order = (1, 2, 3)
+    sequence_valid = (
+        len(completed) == len(expected_order)
+        and tuple(event.review_attempt for event in completed) == expected_order
+        and len({event.attempt_identity for event in completed}) == len(completed)
+    )
+    attempts_by_ordinal = {
+        event.review_attempt: event for event in completed
+    } if sequence_valid else {}
+
+    def supervisor_outcome(ordinal: int) -> tuple[str, str, str]:
+        event = attempts_by_ordinal.get(ordinal)
+        if event is None:
+            return ("missing", "missing", "missing")
+        model, reasoning = _private_supervisor_profile(event.artifact_references)
+        return (model, reasoning, event.disposition.replace("_", "-"))
+
+    return _RoundwrightLifecycleProjection(
+        lifecycle.candidate_sha,
+        f"formal-round-{lifecycle.review_round}",
+        lifecycle.ready_at,
+        tuple(supervisor_outcome(ordinal) for ordinal in range(1, 4)),
+        sequence_valid,
+    )
+
+
+def _classified_lifecycle_differences(
+    roundlet: _RoundletLifecycleProjection, roundwright: _RoundwrightLifecycleProjection,
+) -> tuple[str, ...]:
+    """Preserve each classification; qualification fails rather than masking drift."""
+
+    differences: list[str] = []
+    if roundlet.candidate_sha != roundwright.candidate_sha:
+        differences.append("candidate-drift")
+    if roundlet.formal_round != roundwright.formal_round:
+        differences.append("formal-round-drift")
+    if roundlet.ready_at != roundwright.ready_at:
+        differences.append("ready-at-drift")
+    if not roundwright.supervisor_sequence_valid:
+        differences.append("supervisor-sequence-drift")
+    for ordinal, (expected, observed) in enumerate(
+        zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts, strict=True), start=1,
+    ):
+        if expected[0] != observed[0]:
+            differences.append(f"supervisor-profile-{ordinal}-drift")
+        if expected[1] != observed[1]:
+            differences.append(f"supervisor-reasoning-{ordinal}-drift")
+        if expected[2] != observed[2]:
+            differences.append(f"supervisor-disposition-{ordinal}-drift")
+    return tuple(sorted(set(differences)))
+
+
+def _roundwright_fixture_outcomes(
+    inventory: RepositoryInventorySnapshot,
+    lifecycle: _RoundwrightLifecycleProjection,
+    manifest: FixtureSelectionManifest,
+) -> tuple[_FixtureOutcome, ...]:
+    """Classify every declared fixture through the normalized production facts.
+
+    The generic inventory normalizer has already applied its scheduling and
+    pagination rules.  This function intentionally consumes those product
+    facts at the immutable ``ready_at`` boundary; it does not accept a caller
+    supplied fixture result and it never derives the Roundlet expectation.
+    """
+
+    try:
+        repository = {
+            item.fixture: item
+            for item in project_repository_fixture_outcomes(inventory, manifest.selector_map())
+        }
+    except GitHubRuntimeError as error:
+        raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete") from error
+    outcomes = [
+        _FixtureOutcome(
+            fixture, item.classification, item.dependencies, "not-applicable",
+            item.state, item.gates, item.blockers, item.next_action,
+        )
+        for fixture in _LIVE_LIFECYCLE_FIXTURES[:-1]
+        for item in (repository.get(fixture),)
+        if item is not None
+    ]
+    exact_attempts = not _classified_lifecycle_differences(
+        _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest), lifecycle,
+    )
+    outcomes.append(_FixtureOutcome(
+        "supervisor-failover",
+        "supervisor-failover" if exact_attempts else "missing",
+        "not-applicable" if exact_attempts else "missing",
+        "three-sealed-attempts" if exact_attempts else "missing",
+        "accepted" if exact_attempts else "missing",
+        "passed" if exact_attempts else "blocked",
+        "none" if exact_attempts else "missing",
+        "retain-readonly" if exact_attempts else "blocked",
+    ))
+    return tuple(outcomes)
+
+
+def _roundlet_fixture_outcomes(manifest: FixtureSelectionManifest) -> tuple[_FixtureOutcome, ...]:
+    """Return externally reviewed expectations, never target-read results."""
+
+    return manifest.expected_outcomes()
+
+
+def _fixture_outcome_differences(
+    expected: tuple[_FixtureOutcome, ...], observed: tuple[_FixtureOutcome, ...],
+) -> tuple[str, ...]:
+    """Compare all declared outcome dimensions with bounded safe labels."""
+
+    actual = {item.fixture: item for item in observed}
+    differences: list[str] = []
+    baseline_by_fixture = {item.fixture: item for item in expected}
+    for fixture in _LIVE_LIFECYCLE_FIXTURES:
+        baseline = baseline_by_fixture.get(fixture)
+        if baseline is None:
+            differences.append(f"fixture-{fixture}-expectation-missing")
+            continue
+        item = actual.get(fixture)
+        if item is None:
+            differences.append(f"fixture-{fixture}-missing")
+            continue
+        for field in (
+            "classification", "dependencies", "attempt_accounting", "state",
+            "gates", "blockers", "next_action",
+        ):
+            if getattr(baseline, field) != getattr(item, field):
+                differences.append(f"fixture-{fixture}-{field}-drift")
+    return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])
+
+
+def _roundlet_trace_differences(
+    inventory: RepositoryInventorySnapshot,
+    lifecycle: lifecycle_observation.LifecycleShadowProjection,
+    expected: _RoundletLifecycleProjection,
+) -> tuple[str, ...]:
+    """Bind normalized Roundlet trace facts to the sealed ledger.
+
+    Generic ``COMMENTS`` evidence proves collection completeness, but cannot
+    stand in for the ordered lifecycle trace.  This private projection uses
+    only the normalizer's public-safe facts: trace identities are sorted for a
+    stable identity set while ordinals retain the authored lifecycle order.
+    """
+
+    records: dict[str, dict[str, str]] = {}
+    for fact in inventory.facts:
+        if not fact.subject.startswith("roundlet-trace-"):
+            continue
+        identity = fact.subject.removeprefix("roundlet-trace-")
+        record = records.setdefault(identity, {})
+        if fact.predicate in record:
+            record["duplicate"] = "true"
+        record[fact.predicate] = fact.object
+    differences: list[str] = []
+    identities = tuple(sorted(records))
+    if len(identities) != 3 or len(set(identities)) != 3:
+        differences.append("trace-identity-drift")
+    required = {
+        "surface", "marker", "semantic", "ordinal", "profile", "reasoning",
+        "disposition", "formal-round", "ready-at", "candidate",
+    }
+    completed = tuple(
+        event for event in lifecycle.events
+        if event.role == "supervisor" and event.transition == "attempt_completed"
+    )
+    expected_profiles = tuple((item[0], item[1]) for item in expected.supervisor_attempts)
+    expected_dispositions = tuple(item[2] for item in expected.supervisor_attempts)
+    for ordinal in range(1, 4):
+        matches = [record for record in records.values() if record.get("ordinal") == str(ordinal)]
+        if len(matches) != 1:
+            differences.append(f"trace-order-{ordinal}-drift")
+            continue
+        record = matches[0]
+        if set(record) - {"duplicate"} != required or "duplicate" in record:
+            differences.append(f"trace-fields-{ordinal}-drift")
+            continue
+        expected_profile = expected_profiles[ordinal - 1] if len(expected_profiles) == 3 else ("missing", "missing")
+        expected_disposition = expected_dispositions[ordinal - 1] if len(expected_dispositions) == 3 else "missing"
+        expected = {
+            "marker": "lifecycle", "semantic": f"supervisor-{ordinal}", "profile": expected_profile[0],
+            "reasoning": expected_profile[1], "disposition": expected_disposition,
+            "formal-round": f"formal-round-{lifecycle.review_round}",
+            "ready-at": str(lifecycle.ready_at), "candidate": lifecycle.candidate_sha,
+        }
+        for field, value in expected.items():
+            if record.get(field) != value:
+                differences.append(f"trace-{field}-{ordinal}-drift")
+        if record["surface"] not in {"issue", "pull-request"}:
+            differences.append(f"trace-surface-{ordinal}-drift")
+    return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])
+
+
+class GitHubReadCapability(Protocol):
+    """Reviewed generic GitHub read boundary, independent of this profile."""
+
+    def read(self, request: GitHubReadRequest) -> GitHubReadResult: ...
+
+
+def _require_github_read_capability(capability: object) -> GitHubReadCapability:
+    if not callable(getattr(capability, "read", None)):
+        raise ExternalValidationAdapterError("generic GitHub read capability is invalid")
+    return capability  # type: ignore[return-value]
+
+
+class _RoundwrightLiveLifecycleProvider:
+    """Product adapter selecting generic GitHub reads and all profile projection."""
+
+    def __init__(self, capability: GitHubReadCapability, inputs: LiveLifecycleRequestInputs) -> None:
+        owner, name = inputs.target_repository.split("/", 1)
+        self._capability = _require_github_read_capability(capability)
+        self._repository = RepositoryRef(owner, name)
+        self._baseline_sha = inputs.target_baseline_sha
+        self._candidate_sha = inputs.candidate_sha
+        self._ready_at = inputs.ready_at
+        self._manifest = inputs.fixture_manifest
+        self._armed = False
+        if self._manifest is None:
+            raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
+
+    def _read(self, request: GitHubReadRequest, expected: type[object]) -> object:
+        try:
+            result = self._capability.read(request)
+        except Exception as error:
+            raise RepositoryInventoryFirstReadBoundaryError(
+                RepositoryInventoryReadFailureCode.HOST_FAILURE,
+            ) from error
+        if type(result) is GitHubReadResult and result.request == request and result.failure is not None:
+            retained = credentialed_repository_inventory_failure(self._capability, request, result)
+            if retained is None:
+                retained = (
+                    RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                    RepositoryInventoryFailureStage.UNKNOWN,
+                )
+            raise RepositoryInventoryFirstReadBoundaryError(*retained)
+        if (
+            type(result) is not GitHubReadResult or result.request != request
+            or not result.ok or type(result.snapshot) is not expected
+        ):
+            raise RepositoryInventoryFirstReadBoundaryError(
+                RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+            )
+        return result.snapshot
+
+    def _inventory(self) -> RepositoryInventorySnapshot:
+        inventory = self._read(
+            GitHubReadRequest(
+                GitHubReadOperation.REPOSITORY_INVENTORY, self._repository,
+                expected_sha=self._baseline_sha,
+            ), RepositoryInventorySnapshot,
+        )
+        assert type(inventory) is RepositoryInventorySnapshot
+        if (
+            inventory.repository != self._repository
+            or inventory.baseline_sha != self._baseline_sha
+            or inventory.collection(RepositoryInventorySection.REPOSITORY).complete is not True
+        ):
+            raise ExternalValidationAdapterError("generic GitHub repository inventory has drifted")
+        return inventory
+
+    @staticmethod
+    def _fixture_classes(
+        inventory: RepositoryInventorySnapshot,
+        lifecycle: _RoundwrightLifecycleProjection,
+        manifest: FixtureSelectionManifest,
+    ) -> tuple[str, ...]:
+        observed = _roundwright_fixture_outcomes(inventory, lifecycle, manifest)
+        differences = _fixture_outcome_differences(_roundlet_fixture_outcomes(manifest), observed)
+        if differences:
+            # The caller receives no partially qualified fixture set.  The
+            # bounded dimension labels remain available to the sealed profile
+            # comparator for explicit mismatch regressions.
+            raise ExternalValidationAdapterError("repository inventory fixture evidence is incomplete")
+        return tuple(
+            fixture for fixture in _LIVE_LIFECYCLE_FIXTURES
+            if not any(item.startswith(f"fixture-{fixture}-") for item in differences)
+        )
+
+    @staticmethod
+    def _observation(
+        inventory: RepositoryInventorySnapshot,
+        lifecycle: _RoundwrightLifecycleProjection,
+        sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
+        manifest: FixtureSelectionManifest,
+    ) -> _LiveLifecycleProviderObservation:
+        fixtures = _RoundwrightLiveLifecycleProvider._fixture_classes(inventory, lifecycle, manifest)
+        fixture_differences = _fixture_outcome_differences(
+            _roundlet_fixture_outcomes(manifest), _roundwright_fixture_outcomes(inventory, lifecycle, manifest),
+        )
+        snapshot_digests = {
+            category: _digest({
+                "category": category,
+                "repository": inventory.repository.slug,
+                "baseline_sha": inventory.baseline_sha,
+                "sections": [
+                    {
+                        "section": section.value,
+                        "evidence": inventory.collection(section).evidence_identity,
+                        "items": inventory.collection(section).item_identities,
+                        "pages": inventory.collection(section).page_count,
+                    }
+                    for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category]
+                ],
+                "facts": [
+                    (fact.subject, fact.predicate, fact.object)
+                    for fact in inventory.facts
+                    if any(section.value.split("-")[0] in fact.subject for section in _LIVE_LIFECYCLE_CATEGORY_SECTIONS[category])
+                ],
+                "fixtures": fixtures,
+            })
+            for category in _LIVE_LIFECYCLE_SNAPSHOTS
+        }
+        trace_differences = _roundlet_trace_differences(
+            inventory, sealed_lifecycle,
+            _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest),
+        )
+        return _LiveLifecycleProviderObservation(
+            snapshot_digests, fixtures,
+            tuple(sorted(set((*fixture_differences, *trace_differences)))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]),
+        )
+
+    @staticmethod
+    def _target_state_digest(inventory: RepositoryInventorySnapshot) -> str:
+        """Bind before/after read-back to every observed generic collection."""
+
+        return _digest({
+            "repository": inventory.repository_evidence_identity,
+            "default_branch": inventory.default_branch_evidence_identity,
+            "baseline_sha": inventory.baseline_sha,
+            "collections": [
+                (item.section.value, item.evidence_identity, item.item_identities, item.page_count)
+                for item in inventory.collections
+            ],
+            "facts": [(item.subject, item.predicate, item.object) for item in inventory.facts],
+        })
+
+    def read_before(self) -> _LiveLifecycleTargetState:
+        inventory = self._inventory()
+        return _LiveLifecycleTargetState(
+            self._repository.slug, inventory.baseline_sha,
+            self._target_state_digest(inventory),
+        )
+
+    def read_lifecycle(
+        self, lifecycle: _RoundwrightLifecycleProjection,
+        sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
+    ) -> _LiveLifecycleProviderObservation:
+        self._armed = True
+        return self._observation(self._inventory(), lifecycle, sealed_lifecycle, self._manifest)
+
+    def read_after(self) -> _LiveLifecycleTargetState:
+        if not self._armed:
+            raise ExternalValidationAdapterError("live lifecycle window was not armed")
+        inventory = self._inventory()
+        return _LiveLifecycleTargetState(
+            self._repository.slug, inventory.baseline_sha,
+            self._target_state_digest(inventory),
+        )
+
+
+def _live_lifecycle_store_root_identity(store_root: Path) -> str:
+    if not isinstance(store_root, Path) or not store_root.is_absolute():
+        raise ExternalValidationAdapterError("live lifecycle store root is invalid")
+    return _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "store_root": str(store_root.resolve(strict=False)).replace("\\", "/"),
+    })
+
+
+def _prepare_live_lifecycle_shadow_request(
+    inputs: LiveLifecycleRequestInputs, store_root: Path,
+) -> LiveLifecyclePreparedRequest:
+    """Construct and validate one closed V2 request without exposing Harness internals.
+
+    This is the only product boundary that derives component, Recorder, store,
+    observation, and plan identities.  Callers supply selected public facts and
+    the exact retention root; they neither import Harness nor assemble a plan.
+    """
+
+    if type(inputs) is not LiveLifecycleRequestInputs:
+        raise ExternalValidationAdapterError("live lifecycle preflight inputs are invalid")
+    if inputs.fixture_manifest is None:
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
+    manifest = inputs.fixture_manifest
+    if not manifest.is_owner_sealed:
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest is unsealed")
+    if (manifest.target_repository, manifest.target_baseline_sha) != (
+        inputs.target_repository, inputs.target_baseline_sha,
+    ):
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest target has drifted")
+    store_root_identity = _live_lifecycle_store_root_identity(store_root)
+    recorder_identity = _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "recorder_commit": inputs.recorder_commit,
+        "recorder_content": inputs.recorder_content,
+        "recorder_tree": inputs.recorder_tree,
+    })
+    store_identity = _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+        "candidate_sha": inputs.candidate_sha,
+        "retention_namespace": inputs.retention_namespace,
+        "recorder_identity": recorder_identity,
+        "store_root_identity": store_root_identity,
+    })
+    observation_identity = _digest({
+        "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,
+        "base_sha": inputs.base_sha,
+        "candidate_sha": inputs.candidate_sha,
+        "target_repository": inputs.target_repository,
+        "target_baseline_sha": inputs.target_baseline_sha,
+        "case_id": inputs.case_id,
+        "observation_window": inputs.observation_window,
+        "ready_at": inputs.ready_at,
+        "lifecycle_plan_digest": inputs.lifecycle_ledger.plan_digest,
+        "lifecycle_ledger_digest": inputs.lifecycle_ledger.ledger_digest,
+        "fixture_manifest_digest": manifest.manifest_digest,
+        "store_identity": store_identity,
+    })
+    producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+    capture_plan = {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+        "case_id": inputs.case_id,
+        "candidate_sha": inputs.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "recorder_identity": recorder_identity,
+        "store_identity": store_identity,
+        "observation_identity": observation_identity,
+    }
+    harness = _harness_executor()
+    try:
+        plan = harness.prepare_capture(capture_plan)
+        plan_digest = plan.plan_digest
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle capture plan is invalid") from error
+    if _DIGEST.fullmatch(plan_digest) is None:
+        raise ExternalValidationAdapterError("live lifecycle capture plan is invalid")
+    descriptor = LiveLifecycleRuntimeDescriptor(
+        inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+        plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at, manifest,
+    )
+    request_value = {
+        "schema": "roundwright-harness-profile-executor-request/v2",
+        "capture_plan": capture_plan,
+        "execution_context": descriptor.payload(),
+    }
+    request_digest = _digest(request_value)
+    return LiveLifecyclePreparedRequest(
+        inputs, plan_digest, request_digest, recorder_identity, store_root_identity, store_identity,
+        observation_identity, MappingProxyType(request_value),
+    )
+
+
+def _live_lifecycle_readiness_receipt(
+    harness_receipt: object, prepared_request: LiveLifecyclePreparedRequest,
+) -> LiveLifecycleReadinessReceipt:
+    """Validate and copy only public-safe fields from the Harness V2 receipt."""
+
+    harness = _harness_executor()
+    try:
+        if type(harness_receipt) is not harness.ExecutorReadinessReceipt:
+            raise ValueError
+        value = harness_receipt.as_dict()
+        if type(value) is not dict or set(value) != {
+            "schema", "status", "state", "plan_digest", "profile", "case_id", "candidate_sha",
+            "ready_at", "producer_identity", "exporter_identity", "comparator_identity",
+            "dispatch_count", "record_count", "verify_count", "mutation_count",
+            "execution_context_input_digest", "execution_context_identity", "receipt_digest",
+        }:
+            raise ValueError
+        receipt_digest = value["receipt_digest"]
+        core = {key: item for key, item in value.items() if key != "receipt_digest"}
+        producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+        descriptor = prepare_live_lifecycle_context(
+            dict(prepared_request._request_value["execution_context"]),
+            plan_digest=prepared_request.capture_plan_digest,
+            candidate_sha=prepared_request.inputs.candidate_sha,
+            case_id=prepared_request.inputs.case_id,
+            ready_at=prepared_request.inputs.ready_at,
+        )
+        if (
+            value["schema"] != "roundwright-harness-profile-executor-readiness/v2"
+            or value["status"] != "ready" or value["state"] != "PREFLIGHT_READY"
+            or value["plan_digest"] != prepared_request.capture_plan_digest
+            or value["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
+            or value["case_id"] != prepared_request.inputs.case_id
+            or value["candidate_sha"] != prepared_request.inputs.candidate_sha
+            or value["ready_at"] != prepared_request.inputs.ready_at
+            or (value["producer_identity"], value["exporter_identity"], value["comparator_identity"])
+            != (producer, exporter, comparator)
+            or (value["dispatch_count"], value["record_count"], value["verify_count"], value["mutation_count"])
+            != (0, 0, 0, 0)
+            or value["execution_context_input_digest"] != _digest(prepared_request._request_value["execution_context"])
+            or value["execution_context_identity"] != descriptor.identity
+            or type(receipt_digest) is not str or _DIGEST.fullmatch(receipt_digest) is None
+            or _digest(core) != receipt_digest
+        ):
+            raise ValueError
+        return LiveLifecycleReadinessReceipt(
+            prepared_request.capture_plan_digest, prepared_request.inputs.candidate_sha,
+            prepared_request.inputs.case_id, prepared_request.inputs.ready_at,
+            producer, exporter, comparator, value["execution_context_input_digest"],
+            value["execution_context_identity"], receipt_digest, _LIVE_LIFECYCLE_READINESS_SEAL,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle readiness receipt is invalid") from error
+
+
+def _preflight_live_lifecycle_shadow_profile(
+    inputs: LiveLifecycleRequestInputs, store_root: Path,
+) -> tuple[LiveLifecyclePreparedRequest, LiveLifecycleReadinessReceipt]:
+    """Construct and provider-free validate one product-owned readiness binding."""
+
+    prepared_request = _prepare_live_lifecycle_shadow_request(inputs, store_root)
+    request_value = _validated_live_lifecycle_request(prepared_request, store_root)
+    harness = _harness_executor()
+    try:
+        harness_receipt = harness.run_profile_executor(
+            "validate", request_value, LiveLifecycleShadowProfileAdapter(), store_root,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle preflight validation failed") from error
+    readiness = _live_lifecycle_readiness_receipt(harness_receipt, prepared_request)
+    return prepared_request, readiness
+
+
+def _validated_live_lifecycle_request(
+    prepared_request: LiveLifecyclePreparedRequest, store_root: Path,
+) -> dict[str, object]:
+    if type(prepared_request) is not LiveLifecyclePreparedRequest:
+        raise ExternalValidationAdapterError("live lifecycle prepared request is invalid")
+    request_value = dict(prepared_request._request_value)
+    inputs = prepared_request.inputs
+    producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+    expected_capture_plan = {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+        "case_id": inputs.case_id,
+        "candidate_sha": inputs.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "recorder_identity": prepared_request.recorder_identity,
+        "store_identity": prepared_request.store_identity,
+        "observation_identity": prepared_request.observation_identity,
+    }
+    expected_descriptor = LiveLifecycleRuntimeDescriptor(
+        inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+        prepared_request.capture_plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
+        inputs.fixture_manifest,
+    ).payload()
+    if (
+        _digest(request_value) != prepared_request.request_digest
+        or _live_lifecycle_store_root_identity(store_root) != prepared_request.store_root_identity
+        or set(request_value) != {"schema", "capture_plan", "execution_context"}
+        or request_value.get("schema") != "roundwright-harness-profile-executor-request/v2"
+        or type(request_value["capture_plan"]) is not dict
+        or type(request_value["execution_context"]) is not dict
+        or request_value.get("capture_plan") != expected_capture_plan
+        or _digest(request_value["capture_plan"]) != prepared_request.capture_plan_digest
+        or request_value.get("execution_context") != expected_descriptor
+    ):
+        raise ExternalValidationAdapterError("live lifecycle prepared request has drifted")
+    return request_value
+
+
+def _validated_live_lifecycle_ready_capsule(
+    capsule: _LiveLifecycleReadyCapsule, store_root: Path,
+) -> LiveLifecyclePreparedRequest:
+    if type(capsule) is not _LiveLifecycleReadyCapsule or capsule._consumed:
+        raise ExternalValidationAdapterError("live lifecycle ready capsule is unavailable")
+    if (
+        capsule._seal is not _LIVE_LIFECYCLE_READY_CAPSULE_SEAL
+        or type(capsule.prepared_request) is not LiveLifecyclePreparedRequest
+        or type(capsule.readiness) is not LiveLifecycleReadinessReceipt
+    ):
+        raise ExternalValidationAdapterError("live lifecycle ready capsule is invalid")
+    prepared_request = capsule.prepared_request
+    _validated_live_lifecycle_request(prepared_request, store_root)
+    readiness = capsule.readiness
+    producer, exporter, comparator = live_lifecycle_shadow_component_identities()
+    if (
+        readiness._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+        or readiness.receipt_digest != _digest({
+            "schema": "roundwright-harness-profile-executor-readiness/v2",
+            "status": "ready", "state": "PREFLIGHT_READY",
+            "plan_digest": readiness.capture_plan_digest,
+            "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+            "case_id": readiness.case_id, "candidate_sha": readiness.candidate_sha,
+            "ready_at": readiness.ready_at,
+            "producer_identity": readiness.producer_identity,
+            "exporter_identity": readiness.exporter_identity,
+            "comparator_identity": readiness.comparator_identity,
+            "dispatch_count": 0, "record_count": 0, "verify_count": 0, "mutation_count": 0,
+            "execution_context_input_digest": readiness.execution_context_input_digest,
+            "execution_context_identity": readiness.execution_context_identity,
+        })
+        or capsule.capsule_digest != _digest({
+            "schema": "roundwright-live-lifecycle-ready-capsule/v1",
+            "request_digest": prepared_request.request_digest,
+            "capture_plan_digest": prepared_request.capture_plan_digest,
+            "store_identity": prepared_request.store_identity,
+            "readiness": readiness.public_receipt(),
+        })
+        or readiness.capture_plan_digest != prepared_request.capture_plan_digest
+        or (readiness.candidate_sha, readiness.case_id, readiness.ready_at)
+        != (prepared_request.inputs.candidate_sha, prepared_request.inputs.case_id, prepared_request.inputs.ready_at)
+        or (readiness.producer_identity, readiness.exporter_identity, readiness.comparator_identity)
+        != (producer, exporter, comparator)
+        or readiness.execution_context_input_digest != _digest(prepared_request._request_value["execution_context"])
+        or readiness.execution_context_identity != prepare_live_lifecycle_context(
+            dict(prepared_request._request_value["execution_context"]),
+            plan_digest=prepared_request.capture_plan_digest,
+            candidate_sha=prepared_request.inputs.candidate_sha,
+            case_id=prepared_request.inputs.case_id,
+            ready_at=prepared_request.inputs.ready_at,
+        ).identity
+    ):
+        raise ExternalValidationAdapterError("live lifecycle ready capsule has drifted")
+    return prepared_request
+
+
+def _materialize_live_lifecycle_shadow_profile(
+    prepared_request: LiveLifecyclePreparedRequest,
+    readiness: LiveLifecycleReadinessReceipt,
+    store_root: Path,
+    capability: GitHubReadCapability,
+) -> object:
+    """Materialize one armed read-only lifecycle snapshot and delegate exactly once.
+
+    Generic orchestration can provide a narrowly typed read capability, but it
+    cannot create a product event graph, infer fixture coverage, construct a
+    snapshot, or reach the Harness executor directly.
+    """
+
+    _validated_live_lifecycle_request(prepared_request, store_root)
+    inputs = prepared_request.inputs
+    # The contract-owned projection verifies the retained ledger before the
+    # target read is armed.  A missing, moved, unsealed, or mismatched ledger
+    # therefore blocks without provider access and cannot self-satisfy from a
+    # locally manufactured event graph.
+    try:
+        verified_lifecycle = lifecycle_observation.project_verified_lifecycle(
+            dict(inputs.lifecycle_ledger.plan), store_root,
+            inputs.lifecycle_ledger.ledger_digest,
+        )
+    except lifecycle_observation.LifecycleObservationError as error:
+        raise ExternalValidationAdapterError("live lifecycle ledger verification failed") from error
+    if (
+        verified_lifecycle.candidate_sha != inputs.candidate_sha
+        or verified_lifecycle.ready_at != inputs.ready_at
+        or verified_lifecycle.review_epoch != 1
+        or verified_lifecycle.review_mode != "complete"
+        or verified_lifecycle.ledger_digest != inputs.lifecycle_ledger.ledger_digest
+    ):
+        raise ExternalValidationAdapterError("live lifecycle ledger binding has drifted")
+    provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
+    if inputs.fixture_manifest is None:
+        raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
+    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at, inputs.fixture_manifest)
+    roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
+    before = provider.read_before()
+    # The product creates this request with the arm flag before it makes the
+    # sole lifecycle read.  Only the already verified ledger supplies
+    # lifecycle facts; inventory remains target fixture/read-back evidence.
+    observation = provider.read_lifecycle(roundwright, verified_lifecycle)
+    after = provider.read_after()
+    if (
+        type(before) is not _LiveLifecycleTargetState
+        or type(observation) is not _LiveLifecycleProviderObservation
+        or type(after) is not _LiveLifecycleTargetState
+        or (before.target_repository, before.target_sha) != (inputs.target_repository, inputs.target_baseline_sha)
+        or after != before
+    ):
+        raise ExternalValidationAdapterError("live lifecycle zero-mutation read-back has drifted")
+    differences = list(_classified_lifecycle_differences(roundlet, roundwright))
+    differences.extend(observation.classified_differences)
+    snapshot = LiveLifecycleShadowSnapshot(
+        inputs.target_repository, inputs.target_baseline_sha, after.target_sha,
+        inputs.candidate_sha, prepared_request.capture_plan_digest, inputs.case_id,
+        inputs.observation_window, inputs.ready_at, verified_lifecycle,
+        observation.snapshot_digests, observation.fixture_classes,
+        tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]), before.state_digest, after.state_digest,
+    )
+    return _run_prepared_live_lifecycle_shadow_profile(prepared_request, readiness, store_root, snapshot)
+
+
+_LIVE_LIFECYCLE_SESSION_DIRECTORY = ".roundwright-live-lifecycle-sessions"
+
+
+def _live_lifecycle_session_id(
+    prepared_request: LiveLifecyclePreparedRequest, readiness: LiveLifecycleReadinessReceipt,
+) -> str:
+    return _digest({
+        "schema": "roundwright-live-lifecycle-session/v1",
+        "prepared": prepared_request.public_receipt(),
+        "readiness": readiness.public_receipt(),
+    })
+
+
+def _live_lifecycle_session_path(store_root: Path, session_id: str) -> Path:
+    if not isinstance(store_root, Path) or _DIGEST.fullmatch(session_id) is None:
+        raise ExternalValidationAdapterError("live lifecycle session location is invalid")
+    return store_root / _LIVE_LIFECYCLE_SESSION_DIRECTORY / f"{session_id[7:]}.json"
+
+
+def _claim_live_lifecycle_session(store_root: Path, session_id: str) -> None:
+    """Atomically reserve one session before any provider capability is touched.
+
+    ``O_EXCL`` is the durable, cross-process single-winner primitive.  The
+    claim is intentionally separate from the human-readable receipt update so
+    a second process can never observe a stale ``consumed`` flag and dispatch.
+    """
+
+    session_path = _live_lifecycle_session_path(store_root, session_id)
+    claim_path = session_path.with_suffix(".claim")
+    try:
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(str(claim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as claim:
+            claim.write(session_id)
+            claim.flush()
+            os.fsync(claim.fileno())
+    except FileExistsError as error:
+        raise ExternalValidationAdapterError("live lifecycle session is already consumed") from error
+    except OSError as error:
+        raise ExternalValidationAdapterError("live lifecycle session claim persistence failed") from error
+
+
+def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[str, object]:
+    return {
+        "base_sha": inputs.base_sha, "candidate_sha": inputs.candidate_sha,
+        "target_repository": inputs.target_repository, "target_baseline_sha": inputs.target_baseline_sha,
+        "case_id": inputs.case_id, "observation_window": inputs.observation_window,
+        "ready_at": inputs.ready_at, "recorder_commit": inputs.recorder_commit,
+        "recorder_content": inputs.recorder_content, "recorder_tree": inputs.recorder_tree,
+        "retention_namespace": inputs.retention_namespace,
+        "lifecycle_ledger": inputs.lifecycle_ledger.public_payload(),
+        "fixture_manifest": None if inputs.fixture_manifest is None else {
+            "value": inputs.fixture_manifest.payload(),
+            "manifest_digest": inputs.fixture_manifest.manifest_digest,
+            "raw_utf8_b64": None if inputs.fixture_manifest.raw_utf8 is None else base64.b64encode(inputs.fixture_manifest.raw_utf8).decode("ascii"),
+        },
+    }
+
+
+def _live_lifecycle_session_payload(
+    prepared_request: LiveLifecyclePreparedRequest,
+    readiness: LiveLifecycleReadinessReceipt,
+    *,
+    trace_readback_digest: str | None,
+    consumed: bool,
+) -> dict[str, object]:
+    return {
+        "schema": "roundwright-live-lifecycle-session/v1",
+        "session_id": _live_lifecycle_session_id(prepared_request, readiness),
+        "inputs": _live_lifecycle_inputs_payload(prepared_request.inputs),
+        "prepared": {
+            "capture_plan_digest": prepared_request.capture_plan_digest,
+            "request_digest": prepared_request.request_digest,
+            "recorder_identity": prepared_request.recorder_identity,
+            "store_root_identity": prepared_request.store_root_identity,
+            "store_identity": prepared_request.store_identity,
+            "observation_identity": prepared_request.observation_identity,
+            "request_value": dict(prepared_request._request_value),
+        },
+        "readiness": readiness.public_receipt(),
+        "trace_readback_digest": trace_readback_digest,
+        "consumed": consumed,
+    }
+
+
+def _write_live_lifecycle_session(
+    store_root: Path, payload: Mapping[str, object], *, replace_existing: bool = False,
+) -> None:
+    session_id = payload.get("session_id")
+    if type(session_id) is not str:
+        raise ExternalValidationAdapterError("live lifecycle session is invalid")
+    path = _live_lifecycle_session_path(store_root, session_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and not replace_existing:
+            raise ExternalValidationAdapterError("live lifecycle session already exists")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(path)
+    except OSError as error:
+        raise ExternalValidationAdapterError("live lifecycle session persistence failed") from error
+
+
+def _coerce_live_lifecycle_session_receipt(value: object) -> LiveLifecycleSessionReceipt:
+    if type(value) is LiveLifecycleSessionReceipt:
+        return value
+    return LiveLifecycleSessionReceipt.parse(value)
+
+
+def _load_live_lifecycle_session(
+    receipt_value: object, store_root: Path,
+) -> tuple[LiveLifecycleSessionReceipt, LiveLifecyclePreparedRequest, bool, str | None]:
+    receipt = _coerce_live_lifecycle_session_receipt(receipt_value)
+    path = _live_lifecycle_session_path(store_root, receipt.session_id)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if type(value) is not dict or set(value) != {
+            "schema", "session_id", "inputs", "prepared", "readiness", "trace_readback_digest", "consumed",
+        } or value["schema"] != "roundwright-live-lifecycle-session/v1" or value["session_id"] != receipt.session_id:
+            raise ValueError
+        if type(value["inputs"]) is not dict or type(value["prepared"]) is not dict:
+            raise ValueError
+        input_value = dict(value["inputs"])
+        ledger_value = input_value.get("lifecycle_ledger")
+        if (
+            type(ledger_value) is not dict
+            or set(ledger_value) != {"plan", "ledger_digest"}
+        ):
+            raise ValueError
+        input_value["lifecycle_ledger"] = LiveLifecycleLedgerBinding(
+            ledger_value["plan"], ledger_value["ledger_digest"],
+        )
+        manifest_value = input_value.get("fixture_manifest")
+        if type(manifest_value) is not dict or set(manifest_value) != {"value", "manifest_digest", "raw_utf8_b64"}:
+            raise ValueError
+        if type(manifest_value["raw_utf8_b64"]) is not str:
+            raise ValueError
+        try:
+            raw_manifest = base64.b64decode(manifest_value["raw_utf8_b64"], validate=True)
+        except ValueError as error:
+            raise ValueError from error
+        manifest = FixtureSelectionManifest.parse(raw_manifest, manifest_value["manifest_digest"])
+        if manifest.payload() != manifest_value["value"]:
+            raise ValueError
+        input_value["fixture_manifest"] = manifest
+        inputs = LiveLifecycleRequestInputs(**input_value)
+        prepared = value["prepared"]
+        if set(prepared) != {
+            "capture_plan_digest", "request_digest", "recorder_identity", "store_root_identity",
+            "store_identity", "observation_identity", "request_value",
+        } or type(prepared["request_value"]) is not dict:
+            raise ValueError
+        readiness = LiveLifecycleSessionReceipt.parse({
+            "schema": "roundwright-live-lifecycle-session-receipt/v1",
+            "session_id": receipt.session_id, "readiness": value["readiness"], "receipt_digest": receipt.receipt_digest,
+        }).readiness
+        materialized = LiveLifecyclePreparedRequest(
+            inputs, prepared["capture_plan_digest"], prepared["request_digest"], prepared["recorder_identity"],
+            prepared["store_root_identity"], prepared["store_identity"], prepared["observation_identity"],
+            MappingProxyType(prepared["request_value"]),
+        )
+        if (
+            _live_lifecycle_session_id(materialized, readiness) != receipt.session_id
+            or readiness.public_receipt() != receipt.readiness.public_receipt()
+            or type(value["consumed"]) is not bool
+            or (value["trace_readback_digest"] is not None and _DIGEST.fullmatch(value["trace_readback_digest"]) is None)
+        ):
+            raise ValueError
+        _validated_live_lifecycle_request(materialized, store_root)
+        return receipt, materialized, value["consumed"], value["trace_readback_digest"]
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExternalValidationAdapterError("live lifecycle durable session is invalid") from error
+
+
+def preflight_live_lifecycle_shadow_session(
+    inputs: LiveLifecycleRequestInputs, store_root: Path,
+) -> LiveLifecycleSessionReceipt:
+    """Durably retain one provider-free preflight until trace confirmation."""
+
+    prepared_request, readiness = _preflight_live_lifecycle_shadow_profile(inputs, store_root)
+    payload = _live_lifecycle_session_payload(
+        prepared_request, readiness, trace_readback_digest=None, consumed=False,
+    )
+    _write_live_lifecycle_session(store_root, payload)
+    receipt = LiveLifecycleSessionReceipt(payload["session_id"], readiness)
+    loaded, _prepared, consumed, trace = _load_live_lifecycle_session(receipt.public_receipt(), store_root)
+    if consumed or trace is not None or loaded.public_receipt() != receipt.public_receipt():
+        raise ExternalValidationAdapterError("live lifecycle session read-back failed")
+    return receipt
+
+
+def confirm_live_lifecycle_shadow_trace(
+    session_receipt: object, store_root: Path, trace_readback_digest: str,
+) -> LiveLifecycleSessionReceipt:
+    """Record exact public trace read-back before any provider capability is armed."""
+
+    if type(trace_readback_digest) is not str or _DIGEST.fullmatch(trace_readback_digest) is None:
+        raise ExternalValidationAdapterError("live lifecycle trace read-back is invalid")
+    receipt, prepared_request, consumed, trace = _load_live_lifecycle_session(session_receipt, store_root)
+    if consumed or trace is not None:
+        raise ExternalValidationAdapterError("live lifecycle session is unavailable")
+    _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
+        prepared_request, receipt.readiness, trace_readback_digest=trace_readback_digest, consumed=False,
+    ), replace_existing=True)
+    loaded, _prepared, loaded_consumed, loaded_trace = _load_live_lifecycle_session(receipt.public_receipt(), store_root)
+    if loaded_consumed or loaded_trace != trace_readback_digest:
+        raise ExternalValidationAdapterError("live lifecycle trace confirmation read-back failed")
+    return loaded
+
+
+def execute_live_lifecycle_shadow_session(
+    session_receipt: object, store_root: Path, capability: GitHubReadCapability,
+) -> object:
+    """Consume one trace-confirmed durable session through product-owned reads."""
+
+    receipt, prepared_request, consumed, trace = _load_live_lifecycle_session(session_receipt, store_root)
+    if consumed or trace is None:
+        raise ExternalValidationAdapterError("live lifecycle session is not trace-confirmed")
+    capability = _require_github_read_capability(capability)
+    _claim_live_lifecycle_session(store_root, receipt.session_id)
+    _write_live_lifecycle_session(store_root, _live_lifecycle_session_payload(
+        prepared_request, receipt.readiness, trace_readback_digest=trace, consumed=True,
+    ), replace_existing=True)
+    _loaded, _prepared, consumed_readback, trace_readback = _load_live_lifecycle_session(
+        receipt.public_receipt(), store_root,
+    )
+    if not consumed_readback or trace_readback != trace:
+        raise ExternalValidationAdapterError("live lifecycle session consume read-back failed")
+    return _materialize_live_lifecycle_shadow_profile(prepared_request, receipt.readiness, store_root, capability)
+
+
+def prepare_live_lifecycle_context(
+    descriptor_value: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
+) -> MaterializedLiveLifecycleContext:
+    descriptor = LiveLifecycleRuntimeDescriptor.parse(descriptor_value)
+    if (descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at) != (
+        plan_digest, candidate_sha, case_id, ready_at,
+    ):
+        raise ExternalValidationAdapterError("live lifecycle runtime descriptor does not match capture plan")
+    return MaterializedLiveLifecycleContext(descriptor)
+
+
+def _live_lifecycle_binding_identity(binding: object) -> str:
+    try:
+        value = {
+            "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "profile": binding.profile,
+            "case_id": binding.case_id, "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at, "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("live lifecycle binding is invalid") from error
+    if (
+        value["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
+        or not _safe_token(value["case_id"])
+        or _SHA.fullmatch(value["candidate_sha"]) is None
+        or type(value["ready_at"]) is not int or value["ready_at"] < 0
+        or _DIGEST.fullmatch(value["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("live lifecycle binding is invalid")
+    return _digest(value)
+
+
+def _live_lifecycle_context(binding: object) -> MaterializedLiveLifecycleContext:
+    try:
+        context, descriptor_digest = binding.execution_context, binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("live lifecycle V2 execution context is unavailable") from error
+    if type(value) is not MaterializedLiveLifecycleContext or _DIGEST.fullmatch(descriptor_digest) is None:
+        raise ExternalValidationAdapterError("live lifecycle V2 execution context has drifted")
+    descriptor = value.descriptor
+    if (descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at) != (
+        binding.plan.plan_digest, binding.candidate_sha, binding.case_id, binding.ready_at,
+    ):
+        raise ExternalValidationAdapterError("live lifecycle V2 execution context has drifted")
+    return value
+
+
+def _bound_live_lifecycle_snapshot(
+    binding: object, snapshot: LiveLifecycleShadowSnapshot, context: MaterializedLiveLifecycleContext,
+) -> None:
+    descriptor = context.descriptor
+    if (
+        snapshot.target_repository != descriptor.target_repository
+        or snapshot.target_baseline_sha != descriptor.target_baseline_sha
+        or (snapshot.candidate_sha, snapshot.capture_plan_digest, snapshot.case_id, snapshot.ready_at, snapshot.observation_window)
+        != (binding.candidate_sha, binding.plan.plan_digest, binding.case_id, binding.ready_at, descriptor.observation_window)
+    ):
+        raise ExternalValidationAdapterError("live lifecycle snapshot has drifted")
+
+
+@dataclass(frozen=True)
+class LiveLifecycleShadowProfileAdapter:
+    """Read-only adapter for an already-armed and independently read-back window."""
+
+    snapshot: LiveLifecycleShadowSnapshot | None = None
+    profile_id: str = LIVE_LIFECYCLE_SHADOW_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile_id != LIVE_LIFECYCLE_SHADOW_PROFILE or (
+            self.snapshot is not None and type(self.snapshot) is not LiveLifecycleShadowSnapshot
+        ):
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(*live_lifecycle_shadow_component_identities())
+
+    def prepare_execution_context(self, preparation: object) -> object:
+        try:
+            context = prepare_live_lifecycle_context(
+                preparation.descriptor, plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha, case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("live lifecycle V2 execution context is invalid") from error
+
+    def validate(self, binding: object) -> None:
+        _live_lifecycle_binding_identity(binding)
+        _live_lifecycle_context(binding)
+        try:
+            actual = (
+                binding.components.producer_identity, binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("live lifecycle components are invalid") from error
+        if actual != live_lifecycle_shadow_component_identities():
+            raise ExternalValidationAdapterError("live lifecycle components have drifted")
+        if shadow_evidence_profile(LIVE_LIFECYCLE_SHADOW_PROFILE).capture_mode.value != "armed-live-events":
+            raise ExternalValidationAdapterError("live lifecycle profile capture mode has drifted")
+
+    def execute(self, binding: object) -> object:
+        identity = _live_lifecycle_binding_identity(binding)
+        context = _live_lifecycle_context(binding)
+        if self.snapshot is None:
+            raise ExternalValidationAdapterError(LIVE_LIFECYCLE_OBSERVATION_BLOCKER)
+        _bound_live_lifecycle_snapshot(binding, self.snapshot, context)
+        return _harness_executor().ProfileExecution(
+            {"schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "binding_identity": identity, "snapshot": self.snapshot},
+            mutation_count=0,
+        )
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        identity = _live_lifecycle_binding_identity(binding)
+        context = _live_lifecycle_context(binding)
+        try:
+            value, mutation_count, snapshot = execution.value, execution.mutation_count, execution.value["snapshot"]
+        except (AttributeError, KeyError, TypeError) as error:
+            raise ExternalValidationAdapterError("live lifecycle result is invalid") from error
+        if (
+            type(value) is not dict or value.get("schema") != LIVE_LIFECYCLE_SHADOW_SCHEMA
+            or value.get("binding_identity") != identity or type(snapshot) is not LiveLifecycleShadowSnapshot
+            or mutation_count != 0
+        ):
+            raise ExternalValidationAdapterError("live lifecycle result has drifted")
+        _bound_live_lifecycle_snapshot(binding, snapshot, context)
+        return {
+            "schema": "roundwright-shadow-case/v2", "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+            "live_lifecycle_shadow": {
+                "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "binding_identity": identity,
+                "producer_identity": LIVE_LIFECYCLE_PRODUCER_IDENTITY,
+                "exporter_identity": LIVE_LIFECYCLE_EXPORTER_IDENTITY,
+                "comparator_identity": LIVE_LIFECYCLE_COMPARATOR_IDENTITY,
+                "snapshot": snapshot.public_payload(), "mutation_count": 0,
+            },
+        }
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise ExternalValidationAdapterError(LIVE_LIFECYCLE_OBSERVATION_BLOCKER)
+        expected = self.project(binding, self.execute(binding))
+        # A non-empty classified set is itself sealed blocked evidence.  It
+        # must survive projection but can never normalize to a passing result.
+        status = "fail" if snapshot.classified_differences or type(evidence) is not dict or evidence != expected else "pass"
+        return _harness_executor().ProfileComparison(status, _digest({
+            "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA, "status": status,
+            "ready_at": binding.ready_at, "expected_identity": _digest(expected),
+            "observed_identity": _digest(evidence),
+            "classified_differences": list(snapshot.classified_differences),
+            "classified_difference_count": len(snapshot.classified_differences),
+        }))
+
+
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
@@ -990,6 +2909,8 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
         return ProviderAttemptAccountingAdapter(profile_id)
     if profile_id == HOSTED_CHECK_PROFILE:
         return HostedCheckProfileAdapter(profile_id=profile_id)
+    if profile_id == LIVE_LIFECYCLE_SHADOW_PROFILE:
+        return LiveLifecycleShadowProfileAdapter(profile_id=profile_id)
     raise ExternalValidationAdapterError("executor profile is unsupported")
 
 
@@ -1029,6 +2950,60 @@ def run_hosted_check_profile(
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("hosted check hosted entrypoint binding is invalid") from error
+
+
+def _run_prepared_live_lifecycle_shadow_profile(
+    prepared_request: LiveLifecyclePreparedRequest,
+    readiness: LiveLifecycleReadinessReceipt,
+    store_root: Path,
+    snapshot: LiveLifecycleShadowSnapshot,
+) -> object:
+    """Run the product-materialized lifecycle snapshot through the V2 executor.
+
+    This private helper deliberately accepts the product-owned snapshot only
+    after ``materialize_live_lifecycle_shadow_profile`` has armed the window
+    and completed its independent before/after read-back.
+    """
+
+    harness = _harness_executor()
+    try:
+        if (
+            type(prepared_request) is not LiveLifecyclePreparedRequest
+            or type(readiness) is not LiveLifecycleReadinessReceipt
+            or readiness._seal is not _LIVE_LIFECYCLE_READINESS_SEAL
+        ):
+            raise ValueError
+        request_value = dict(prepared_request._request_value)
+        if (
+            _digest(request_value) != prepared_request.request_digest
+            or _live_lifecycle_store_root_identity(store_root) != prepared_request.store_root_identity
+        ):
+            raise ValueError
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != LIVE_LIFECYCLE_SHADOW_PROFILE
+            or request.execution_context is None
+            or not isinstance(store_root, Path)
+            or type(snapshot) is not LiveLifecycleShadowSnapshot
+            or readiness.capture_plan_digest != prepared_request.capture_plan_digest
+            or (readiness.candidate_sha, readiness.case_id, readiness.ready_at)
+            != (prepared_request.inputs.candidate_sha, prepared_request.inputs.case_id, prepared_request.inputs.ready_at)
+        ):
+            raise ValueError
+        prepare_live_lifecycle_context(
+            request.execution_context, plan_digest=prepared_request.capture_plan_digest,
+            candidate_sha=prepared_request.inputs.candidate_sha,
+            case_id=prepared_request.inputs.case_id, ready_at=prepared_request.inputs.ready_at,
+        )
+        return harness.run_profile_executor(
+            "execute", request_value, LiveLifecycleShadowProfileAdapter(snapshot), store_root,
+            expected_readiness_digest=readiness.receipt_digest,
+        )
+    except ExternalValidationAdapterError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("live lifecycle hosted entrypoint binding is invalid") from error
 
 
 def run_provider_attempt_accounting_profile(

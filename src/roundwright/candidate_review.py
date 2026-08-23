@@ -17,6 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import wraps
 from pathlib import Path
 from typing import Iterable
 
@@ -31,6 +32,19 @@ from .worker_planning import ProviderDispatchControl
 
 class CandidateReviewError(StateError):
     """Raised when candidate-bound implementation or diff review is unsafe."""
+
+
+def _normalize_implementation_dispatch_sqlite_errors(operation):
+    """Keep competing repair reservations behind the typed review boundary."""
+
+    @wraps(operation)
+    def normalized(*arguments, **keywords):
+        try:
+            return operation(*arguments, **keywords)
+        except sqlite3.Error as error:
+            raise CandidateReviewError("implementation dispatch state is unavailable") from error
+
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -314,6 +328,7 @@ class PersistedDiffReview:
     content_digest: str
 
 
+@_normalize_implementation_dispatch_sqlite_errors
 def begin_implementation(
     repository: RepositoryIdentity,
     identity: TaskIdentity,

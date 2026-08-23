@@ -57,6 +57,10 @@ from .github import (
     ReviewsSnapshot,
     RequestedReviewersSnapshot,
     RepositoryRef,
+    RepositoryInventoryEvidence,
+    RepositoryInventoryFact,
+    RepositoryInventorySection,
+    RepositoryInventorySnapshot,
     normalize_github_response,
 )
 from .repository_policy import (
@@ -78,10 +82,232 @@ from .repository_policy import (
 # GraphQL cursors are opaque provider values (typically base64 and therefore
 # allowed to contain ``=``).  They are never interpolated into a shell.
 _CURSOR = re.compile(r"[^\x00-\x1f\x7f]{1,1024}\Z")
+_INVENTORY_FACT_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,255}\Z")
+_STANDALONE_FIXTURE = re.compile(r"\bstandalone[ -]fixture\b", re.IGNORECASE)
+_MALFORMED_PARENT_CHILD_FIXTURE = re.compile(r"\bmalformed[ -]parent child fixture\b", re.IGNORECASE)
+_OWNER_INPUT_FIXTURE = re.compile(r"\bowner[ -]input fixture\b", re.IGNORECASE)
+_BLOCKED_BY = re.compile(r"(?:^|\n)\s*(?:[-*]\s+)?Blocked by #(?P<number>[1-9][0-9]{0,8})\.?\s*(?=\n|\Z)", re.IGNORECASE)
+_BLOCKED_BY_DECLARATION = re.compile(r"(?:^|\n)[ \t]*(?:[-*][ \t]+)?Blocked by\b[^\r\n]*", re.IGNORECASE)
+ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED = (
+    "roundwright-repository-inventory-first-read-boundary__safe-subcause-not-retained"
+)
+
+
+class RepositoryInventoryReadFailureCode(StrEnum):
+    """Curated inventory failure classes; never a provider diagnostic channel."""
+
+    HOST_FAILURE = "host-failure"
+    MALFORMED_RESPONSE = "malformed-response"
+    IDENTITY_DRIFT = "identity-drift"
+    INCOMPLETE_CONNECTION = "incomplete-connection"
+    CURSOR_FAILURE = "cursor-failure"
+    DUPLICATE_EVIDENCE = "duplicate-evidence"
+    CARDINALITY_FAILURE = "cardinality-failure"
+    TIME_OR_HEALTH_FAILURE = "time-or-health-failure"
+
+
+class RepositoryInventoryFailureStage(StrEnum):
+    """Closed, public-safe inventory structural categories."""
+
+    UNKNOWN = "unknown"
+    REQUEST = "request"
+    TRANSPORT = "transport"
+    GRAPHQL_ENVELOPE = "graphql-envelope"
+    JSON_DECODING = "json-decoding"
+    CAPABILITY = "capability"
+    NORMALIZER = "normalizer"
+    RESULT_SEALING = "result-sealing"
+    ROOT = "root"
+    REPOSITORY = "repository"
+    CONNECTION = "connection"
+    CONNECTION_NODES = "connection-nodes"
+    NODE = "node"
+    FIELD = "field"
+    PAGINATION = "pagination"
+
+
+class RepositoryInventoryTransportSubcategory(StrEnum):
+    """Closed public-safe facts for the credentialed host process seam."""
+
+    UNKNOWN = "unknown"
+    LAUNCH_EXCEPTION = "launch-exception"
+    INVALID_RESULT_SHAPE = "invalid-result-shape"
+    NONZERO_RETURN = "nonzero-return"
+
+
+def _repository_inventory_failure_reason(
+    code: RepositoryInventoryReadFailureCode,
+    stage: RepositoryInventoryFailureStage = RepositoryInventoryFailureStage.UNKNOWN,
+    transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
+) -> str:
+    prefix = f"{ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED}:{code.value}"
+    if stage is RepositoryInventoryFailureStage.UNKNOWN:
+        return prefix
+    reason = f"{prefix}:{stage.value}"
+    if (
+        stage is RepositoryInventoryFailureStage.TRANSPORT
+        and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+    ):
+        reason += f":{transport_subcategory.value}"
+    return reason
+
+
+def repository_inventory_failure_code(public_reason: object) -> RepositoryInventoryReadFailureCode | None:
+    """Decode only this reviewed public-safe result code at the product boundary."""
+
+    if type(public_reason) is not str:
+        return None
+    prefix = ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":"
+    if not public_reason.startswith(prefix):
+        return None
+    try:
+        return RepositoryInventoryReadFailureCode(public_reason.removeprefix(prefix).partition(":")[0])
+    except ValueError:
+        return None
+
+
+def repository_inventory_failure_stage(public_reason: object) -> RepositoryInventoryFailureStage | None:
+    """Decode the optional closed structural category without provider detail."""
+
+    if type(public_reason) is not str:
+        return None
+    prefix = ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":"
+    if not public_reason.startswith(prefix):
+        return None
+    values = public_reason.removeprefix(prefix).split(":")
+    if len(values) == 1:
+        return RepositoryInventoryFailureStage.UNKNOWN
+    try:
+        return RepositoryInventoryFailureStage(values[1])
+    except ValueError:
+        return RepositoryInventoryFailureStage.UNKNOWN
+
+
+def repository_inventory_transport_subcategory(
+    public_reason: object,
+) -> RepositoryInventoryTransportSubcategory | None:
+    """Decode one closed process-seam category without retaining host detail."""
+
+    if (
+        type(public_reason) is not str
+        or repository_inventory_failure_code(public_reason) is None
+        or repository_inventory_failure_stage(public_reason) is not RepositoryInventoryFailureStage.TRANSPORT
+    ):
+        return None
+    values = public_reason.removeprefix(
+        ROUNDWRIGHT_REPOSITORY_INVENTORY_FIRST_READ_BOUNDARY__SAFE_SUBCAUSE_NOT_RETAINED + ":",
+    ).split(":")
+    if len(values) != 3:
+        return RepositoryInventoryTransportSubcategory.UNKNOWN
+    try:
+        return RepositoryInventoryTransportSubcategory(values[2])
+    except ValueError:
+        return RepositoryInventoryTransportSubcategory.UNKNOWN
+
+
+def _repository_inventory_failure_stage(error: BaseException) -> RepositoryInventoryFailureStage:
+    if type(error) is _RepositoryInventoryDiagnosticError:
+        return error.stage
+    if type(error) is json.JSONDecodeError:
+        return RepositoryInventoryFailureStage.ROOT
+    message = str(error).lower()
+    if "repository" in message or "default head" in message:
+        return RepositoryInventoryFailureStage.REPOSITORY
+    if "pagination" in message or "cursor" in message or "incomplete" in message or "continuation" in message:
+        return RepositoryInventoryFailureStage.PAGINATION
+    if "connection" in message or "collection" in message:
+        return RepositoryInventoryFailureStage.CONNECTION
+    if "duplicate evidence" in message:
+        return RepositoryInventoryFailureStage.NODE
+    if (
+        "gh response object" in message
+        or "gh response projection" in message
+    ):
+        return RepositoryInventoryFailureStage.ROOT
+    if (
+        "gh response field" in message
+        or "gh response text" in message
+        or "gh response number" in message
+        or "gh response boolean" in message
+        or "gh response identity" in message
+        or "inventory label" in message
+        or "scheduling" in message
+    ):
+        return RepositoryInventoryFailureStage.FIELD
+    return RepositoryInventoryFailureStage.UNKNOWN
+
+
+def _repository_inventory_failure_result(
+    request: GitHubReadRequest,
+    code: RepositoryInventoryReadFailureCode,
+    stage: RepositoryInventoryFailureStage,
+    kind: GitHubFailureKind = GitHubFailureKind.MALFORMED_RESPONSE,
+    transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
+) -> GitHubReadResult:
+    """Seal only fixed inventory failure tokens across outer runtime layers."""
+
+    return GitHubReadResult(request, failure=GitHubFailure(
+        kind, request.operation, _repository_inventory_failure_reason(code, stage, transport_subcategory),
+    ))
+
+
+def _seal_repository_inventory_snapshot(
+    request: GitHubReadRequest, snapshot: object,
+) -> GitHubReadResult:
+    """Seal a normalized inventory without exposing a construction failure."""
+
+    try:
+        return GitHubReadResult(request, snapshot=snapshot)  # type: ignore[arg-type]
+    except GitHubContractError:
+        return _repository_inventory_failure_result(
+            request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+            RepositoryInventoryFailureStage.RESULT_SEALING,
+        )
+
+
+def _classify_repository_inventory_error(error: BaseException) -> RepositoryInventoryReadFailureCode:
+    """Map internal validation outcomes to a finite public-safe code set."""
+
+    message = str(error).lower()
+    if "host" in message:
+        return RepositoryInventoryReadFailureCode.HOST_FAILURE
+    if "cursor" in message:
+        return RepositoryInventoryReadFailureCode.CURSOR_FAILURE
+    if "duplicate" in message:
+        return RepositoryInventoryReadFailureCode.DUPLICATE_EVIDENCE
+    if "exceeds bound" in message or "over-bound" in message or "cardinality" in message:
+        return RepositoryInventoryReadFailureCode.CARDINALITY_FAILURE
+    if "does not match" in message or "has drifted" in message or "default head" in message:
+        return RepositoryInventoryReadFailureCode.IDENTITY_DRIFT
+    if "incomplete" in message or "pagination" in message:
+        return RepositoryInventoryReadFailureCode.INCOMPLETE_CONNECTION
+    return RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE
 
 
 class GitHubRuntimeError(ValueError):
     """Raised when runtime-only adapter evidence is malformed."""
+
+
+class _RepositoryInventoryDiagnosticError(GitHubRuntimeError):
+    """Carry only a reviewed structural category to the sealed boundary."""
+
+    def __init__(
+        self,
+        stage: RepositoryInventoryFailureStage,
+        transport_subcategory: RepositoryInventoryTransportSubcategory = RepositoryInventoryTransportSubcategory.UNKNOWN,
+    ) -> None:
+        if (
+            type(stage) is not RepositoryInventoryFailureStage
+            or type(transport_subcategory) is not RepositoryInventoryTransportSubcategory
+            or (
+                stage is not RepositoryInventoryFailureStage.TRANSPORT
+                and transport_subcategory is not RepositoryInventoryTransportSubcategory.UNKNOWN
+            )
+        ):
+            raise GitHubRuntimeError("inventory diagnostic category is invalid")
+        self.stage = stage
+        self.transport_subcategory = transport_subcategory
+        super().__init__("inventory structural validation failed")
 
 
 def _trusted_utc_now() -> datetime:
@@ -523,10 +749,20 @@ class OwnerGitHubReadIpcClient:
         try:
             result = channel.exchange_read(request)
         except (AttributeError, TypeError, ValueError):
+            if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+                return _repository_inventory_failure_result(
+                    request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                    RepositoryInventoryFailureStage.CAPABILITY, GitHubFailureKind.UNAVAILABLE,
+                )
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.UNAVAILABLE, request.operation, "owner read IPC response is unavailable",
             ))
         if type(result) is not GitHubReadResult or result.request != request:
+            if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+                return _repository_inventory_failure_result(
+                    request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                    RepositoryInventoryFailureStage.CAPABILITY,
+                )
             return GitHubReadResult(request, failure=GitHubFailure(
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation, "owner read IPC response drifted",
             ))
@@ -583,19 +819,25 @@ class _OwnerGitHubReadControl:
             or type(binding) is not CandidateBinding
             or type(now) is not datetime
             or now.tzinfo is not timezone.utc
-            or self.now != int(now.timestamp())
+            or int(now.timestamp()) < self.now
             or self.binding != binding
             or self.binding.repository != request.repository.slug
         ):
             raise GitHubRuntimeError("owner read dependency control is invalid")
         if (
             request.expected_sha is not None
-            and request.operation not in {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
+            and request.operation not in {
+                GitHubReadOperation.BRANCH,
+                GitHubReadOperation.REMOTE_HEAD,
+                GitHubReadOperation.REPOSITORY_INVENTORY,
+            }
             and request.expected_sha != self.binding.candidate_sha
         ):
             raise GitHubRuntimeError("owner read dependency control does not match the requested candidate")
         try:
-            self.dependency_control.require(self.binding, DependencyStage.GITHUB_READ, now=self.now)
+            self.dependency_control.require(
+                self.binding, DependencyStage.GITHUB_READ, now=int(now.timestamp()),
+            )
         except DependencyPolicyError as error:
             raise GitHubRuntimeError("owner read dependency control is stale") from error
 
@@ -652,10 +894,17 @@ class _OwnerGitHubReadHostEndpoint:
             raise GitHubContractError("read request is invalid")
         blocked = self._fresh_failure(request)
         if blocked is not None:
+            if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+                return GitHubReadResult(request, failure=GitHubFailure(
+                    blocked.kind, request.operation,
+                    _repository_inventory_failure_reason(RepositoryInventoryReadFailureCode.TIME_OR_HEALTH_FAILURE),
+                ))
             return GitHubReadResult(request, failure=blocked)
         self.calls.append(("read", request.operation.value))
         if request.operation is GitHubReadOperation.REPOSITORY:
             return self._read_repository(request)
+        if request.operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+            return self._read_repository_inventory(request)
         if request.operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
             return self._read_issue_with_relationships(request)
         if request.operation is GitHubReadOperation.CHECKS:
@@ -718,6 +967,73 @@ class _OwnerGitHubReadHostEndpoint:
                 GitHubFailureKind.MALFORMED_RESPONSE, request.operation,
                 "gh default branch response is malformed",
             ))
+
+    def _read_repository_inventory(self, request: GitHubReadRequest) -> GitHubReadResult:
+        """Read a bounded, terminal generic public repository inventory.
+
+        The GraphQL request deliberately asks for provider page metadata on
+        every collection.  This first host boundary fails closed if any
+        collection exceeds its declared bound; it never labels a first page as
+        a complete inventory.  Future pagination expansion can only add pages
+        behind this reviewed projection, without changing the public contract.
+        """
+
+        try:
+            command = _repository_inventory_command(request)
+        except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.REQUEST,
+            )
+        try:
+            outcome = self.__runner.run(command)
+        except _RepositoryInventoryDiagnosticError as error:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+                transport_subcategory=error.transport_subcategory,
+            )
+        except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.TRANSPORT,
+            )
+        if outcome.exit_code != 0:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.HOST_FAILURE,
+                RepositoryInventoryFailureStage.TRANSPORT, _failure_kind(outcome.exit_code),
+                RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
+            )
+        try:
+            envelope = _decode_inventory_graphql(outcome.stdout)
+        except _RepositoryInventoryDiagnosticError as error:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+                transport_subcategory=error.transport_subcategory,
+            )
+        except (GitHubContractError, GitHubRuntimeError, TypeError, ValueError):
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE,
+                RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE,
+            )
+        try:
+            raw = _complete_repository_inventory_connections(request, envelope, self.__runner)
+            snapshot = _normalize_repository_inventory(request, raw)
+        except _RepositoryInventoryDiagnosticError as error:
+            return _repository_inventory_failure_result(
+                request, RepositoryInventoryReadFailureCode.MALFORMED_RESPONSE, error.stage,
+                transport_subcategory=error.transport_subcategory,
+            )
+        except GitHubContractError as error:
+            return _repository_inventory_failure_result(
+                request, _classify_repository_inventory_error(error),
+                RepositoryInventoryFailureStage.NORMALIZER,
+            )
+        except (GitHubRuntimeError, TypeError, ValueError) as error:
+            stage = _repository_inventory_failure_stage(error)
+            return _repository_inventory_failure_result(
+                request, _classify_repository_inventory_error(error), stage,
+            )
+        return _seal_repository_inventory_snapshot(request, snapshot)
 
     def _read_issue_with_relationships(self, request: GitHubReadRequest) -> GitHubReadResult:
         """Compose REST issue metadata with every native GraphQL child page."""
@@ -1044,6 +1360,210 @@ class GhMutationPayload:
             reviewers = tuple(self.value("reviewers").split(","))
             if not reviewers or tuple(sorted(reviewers)) != reviewers or len(set(reviewers)) != len(reviewers) or expected.get("reviewers_digest") != _sha256(("reviewers", reviewers)):
                 raise GitHubRuntimeError("gh reviewer payload does not match intent")
+
+
+class _OwnerGitHubReadHostChannel:
+    """Private bridge retaining process and raw-response capability at the host."""
+
+    __slots__ = ("__endpoint",)
+
+    def __init__(self, endpoint: _OwnerGitHubReadHostEndpoint) -> None:
+        if type(endpoint) is not _OwnerGitHubReadHostEndpoint:
+            raise GitHubRuntimeError("owner read host endpoint is invalid")
+        self.__endpoint = endpoint
+
+    def exchange_read(self, request: GitHubReadRequest) -> GitHubReadResult:
+        return self.__endpoint.read(request)
+
+    def exchange_collection_page(self, request: GitHubReadRequest, cursor: str | None) -> "CollectionPage | None":
+        return self.__endpoint.read_collection_page(request, cursor)
+
+
+class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
+    """Factory-sealed read client retaining safe failure provenance privately."""
+
+    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure", "__read_generation")
+
+    def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel) -> None:
+        if type(channel) is not _OwnerGitHubReadHostChannel:
+            raise GitHubRuntimeError("credentialed GitHub read channel is invalid")
+        super().__init__(health, channel)
+        self.__inventory_failure_lock = RLock()
+        self.__pending_inventory_failure: tuple[
+            GitHubReadRequest, GitHubReadResult, GitHubFailure,
+            RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
+            RepositoryInventoryTransportSubcategory,
+        ] | None = None
+        self.__read_generation = 0
+
+    def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+        # A second read always makes an earlier result stale, including when
+        # the new read succeeds or the channel fails before returning a code.
+        with self.__inventory_failure_lock:
+            self.__pending_inventory_failure = None
+            self.__read_generation += 1
+            generation = self.__read_generation
+        result = super().read(request)
+        if (
+            request.operation is GitHubReadOperation.REPOSITORY_INVENTORY
+            and result.failure is not None
+        ):
+            code = repository_inventory_failure_code(result.failure.public_reason)
+            stage = repository_inventory_failure_stage(result.failure.public_reason)
+            transport_subcategory = repository_inventory_transport_subcategory(result.failure.public_reason)
+            if code is not None and stage is not None:
+                if transport_subcategory is None:
+                    transport_subcategory = RepositoryInventoryTransportSubcategory.UNKNOWN
+                with self.__inventory_failure_lock:
+                    if generation == self.__read_generation:
+                        self.__pending_inventory_failure = (
+                            request, result, result.failure, code, stage, transport_subcategory,
+                        )
+        return result
+
+    def _trusted_inventory_failure(
+        self, request: GitHubReadRequest, result: GitHubReadResult,
+    ) -> tuple[
+        RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
+        RepositoryInventoryTransportSubcategory,
+    ] | None:
+        with self.__inventory_failure_lock:
+            retained = self.__pending_inventory_failure
+            if retained is None:
+                return None
+            retained_request, retained_result, retained_failure, code, stage, transport_subcategory = retained
+            if (
+                retained_request is request
+                and retained_result is result
+                and result.request == request
+                and result.failure is retained_failure
+            ):
+                self.__pending_inventory_failure = None
+                return code, stage, transport_subcategory
+            return None
+
+
+def credentialed_repository_inventory_failure(
+    capability: object, request: GitHubReadRequest, result: GitHubReadResult,
+) -> tuple[
+    RepositoryInventoryReadFailureCode, RepositoryInventoryFailureStage,
+    RepositoryInventoryTransportSubcategory,
+] | None:
+    """Return one exact factory-retained failure tuple for a sealed result."""
+
+    if (
+        type(capability) is not _CredentialedGitHubReadCapability
+        or type(request) is not GitHubReadRequest
+        or type(result) is not GitHubReadResult
+    ):
+        return None
+    return capability._trusted_inventory_failure(request, result)
+
+
+def credentialed_repository_inventory_failure_code(
+    capability: object, request: GitHubReadRequest, result: GitHubReadResult,
+) -> RepositoryInventoryReadFailureCode | None:
+    """Return a code only for the exact factory-retained read result instance."""
+
+    retained = credentialed_repository_inventory_failure(capability, request, result)
+    return None if retained is None else retained[0]
+
+
+class _CredentialedGhRunnerAdapter:
+    """Normalize an opaque owner-process result before it reaches the adapter.
+
+    The public factory intentionally does not expose the private command-result
+    type.  The reviewed builders supply fixed ``gh`` subcommands, while the
+    credential host is a process launcher and therefore receives the executable
+    as the first argv item.  Normalize its process-shaped ``returncode`` result
+    once while retaining stdout only long enough for the reviewed projection to
+    parse it.
+    """
+
+    __slots__ = ("__host",)
+
+    def __init__(self, host: object) -> None:
+        if not hasattr(host, "run"):
+            raise GitHubRuntimeError("credentialed GitHub read host is invalid")
+        self.__host = host
+
+    def run(self, arguments: tuple[str, ...]) -> _GhCommandResult:
+        try:
+            result = self.__host.run(("gh", *arguments))  # type: ignore[attr-defined]
+        except Exception as error:
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.LAUNCH_EXCEPTION,
+            ) from error
+        try:
+            # Do not evaluate the legacy alias unless the conventional
+            # subprocess-shaped return code is actually absent.  Some opaque
+            # credential hosts expose a guarded legacy attribute whose access
+            # is unavailable to this boundary; eager fallback evaluation
+            # would turn an otherwise valid process result into a transport
+            # failure.
+            exit_code = getattr(result, "returncode", None)
+            if exit_code is None:
+                exit_code = getattr(result, "exit_code", None)
+            stdout = getattr(result, "stdout", None)
+        except Exception as error:
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.INVALID_RESULT_SHAPE,
+            ) from error
+        try:
+            return _GhCommandResult(exit_code, stdout)
+        except GitHubRuntimeError as error:
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.INVALID_RESULT_SHAPE,
+            ) from error
+
+
+def create_credentialed_github_read_capability(
+    runner: object,
+    binding: CandidateBinding,
+    dependency_control: DependencyExecutionControl,
+    capability_health: GitHubCapabilityHealth,
+    *,
+    clock: Callable[[], datetime],
+) -> OwnerGitHubReadIpcClient:
+    """Create the only public production read capability for Roundwright.
+
+    The credential-owning host supplies an opaque fixed ``gh`` runner and
+    already-observed dependency/capability evidence.  It cannot inject a
+    query, inventory, snapshot, health default, or Harness object.  The
+    returned client exposes only typed reads and an explicit deny-all mutation
+    response; provider commands and raw output remain in this module.
+    """
+
+    if (
+        not hasattr(runner, "run")
+        or type(binding) is not CandidateBinding
+        or type(dependency_control) is not DependencyExecutionControl
+        or type(capability_health) is not GitHubCapabilityHealth
+        or not callable(clock)
+    ):
+        raise GitHubRuntimeError("credentialed GitHub read capability inputs are invalid")
+    try:
+        observed_at = clock()
+    except Exception as error:
+        raise GitHubRuntimeError("credentialed GitHub read clock is unavailable") from error
+    if type(observed_at) is not datetime or observed_at.tzinfo is not timezone.utc:
+        raise GitHubRuntimeError("credentialed GitHub read clock is invalid")
+    now = int(observed_at.timestamp())
+    try:
+        dependency_control.require(binding, DependencyStage.GITHUB_READ, now=now)
+        _require_fresh_capabilities(
+            capability_health, (GitHubReadOperation.REPOSITORY_INVENTORY,), observed_at,
+        )
+    except (DependencyPolicyError, GitHubRuntimeError, ValueError) as error:
+        raise GitHubRuntimeError("credentialed GitHub read evidence is unavailable") from error
+    control = _OwnerGitHubReadControl(binding, dependency_control, now)
+    endpoint = _OwnerGitHubReadHostEndpoint(
+        _CredentialedGhRunnerAdapter(runner), binding, control, capability_health, clock=clock,
+    )
+    return _CredentialedGitHubReadCapability(capability_health, _OwnerGitHubReadHostChannel(endpoint))
 
 
 def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapabilityHealth:
@@ -4039,6 +4559,63 @@ def _raw_bool(mapping: Mapping[str, object], key: str) -> bool:
     return value
 
 
+def _inventory_graphql_envelope(raw: object) -> Mapping[str, object]:
+    """Require a complete GraphQL success envelope before inventory parsing."""
+
+    if type(raw) is not dict:
+        raise _RepositoryInventoryDiagnosticError(RepositoryInventoryFailureStage.ROOT)
+    if (
+        "data" not in raw
+        or "errors" in raw
+        or type(raw["data"]) is not dict
+    ):
+        raise _RepositoryInventoryDiagnosticError(
+            RepositoryInventoryFailureStage.GRAPHQL_ENVELOPE,
+        )
+    return raw
+
+
+def _decode_inventory_graphql(stdout: str) -> Mapping[str, object]:
+    """Decode one private host response into a required GraphQL envelope."""
+
+    try:
+        return _inventory_graphql_envelope(json.loads(stdout))
+    except json.JSONDecodeError as error:
+        raise _RepositoryInventoryDiagnosticError(
+            RepositoryInventoryFailureStage.JSON_DECODING,
+        ) from error
+
+
+def _inventory_connection_nodes(
+    connection: Mapping[str, object], page: Mapping[str, object],
+) -> list[object]:
+    """Accept only GitHub's terminal empty/null connection representation.
+
+    GraphQL may encode an empty terminal connection as ``nodes: null``.  That
+    shape carries no missing evidence when its declared count is zero and it
+    has no next page.  Every other non-list representation remains a sealed,
+    fail-closed structural error; the stage retains neither a field value nor
+    provider output.
+    """
+
+    if "nodes" not in connection:
+        raise _RepositoryInventoryDiagnosticError(
+            RepositoryInventoryFailureStage.CONNECTION_NODES,
+        )
+    nodes = connection["nodes"]
+    if type(nodes) is list:
+        return nodes
+    if (
+        nodes is None
+        and _raw_integer(connection, "totalCount") == 0
+        and not _raw_bool(page, "hasNextPage")
+    ):
+        return []
+    raise _RepositoryInventoryDiagnosticError(
+        RepositoryInventoryFailureStage.CONNECTION_NODES,
+    )
+
+
 def _raw_number_matches(mapping: Mapping[str, object], request: GitHubReadRequest) -> None:
     if request.number is None or _raw_integer(mapping, "number") != request.number:
         raise GitHubRuntimeError("gh response number does not match request")
@@ -4105,6 +4682,829 @@ def _read_command(request: GitHubReadRequest) -> tuple[str, ...]:
     else:
         raise GitHubRuntimeError("unsupported gh read operation")
     return ("api", "--method", "GET", path)
+
+
+def _repository_inventory_command(request: GitHubReadRequest) -> tuple[str, ...]:
+    """Build the single read-only, profile-neutral inventory query."""
+
+    if (
+        type(request) is not GitHubReadRequest
+        or request.operation is not GitHubReadOperation.REPOSITORY_INVENTORY
+        or request.expected_sha is None
+    ):
+        raise GitHubRuntimeError("repository inventory request is invalid")
+    query = (
+        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+        "id name owner{login} defaultBranchRef{name target{... on Commit{oid}}} "
+        "issues(first:100,states:[OPEN,CLOSED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state title body comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}}} "
+        "pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){totalCount pageInfo{hasNextPage endCursor}nodes{id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid checkSuites(first:10){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}}}} "
+        "refs(first:100,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}}}"
+    )
+    return ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
+
+
+def _repository_inventory_check_suites_command(
+    request: GitHubReadRequest, commit_oid: str, cursor: str,
+) -> tuple[str, ...]:
+    """Build the repository-owned continuation for one retained commit.
+
+    This command is intentionally private: callers can request only a generic
+    inventory, while the reviewed host owns the nested connection traversal.
+    """
+
+    if (
+        type(request) is not GitHubReadRequest
+        or request.operation is not GitHubReadOperation.REPOSITORY_INVENTORY
+        or request.expected_sha is None
+        or type(commit_oid) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", commit_oid) is None
+        or type(cursor) is not str
+        or _CURSOR.fullmatch(cursor) is None
+    ):
+        raise GitHubRuntimeError("repository inventory check-suite continuation is invalid")
+    query = (
+        "query($owner:String!,$name:String!,$oid:String!,$cursor:String!){repository(owner:$owner,name:$name){"
+        "name owner{login} object(expression:$oid){... on Commit{oid checkSuites(first:100,after:$cursor){"
+        "totalCount pageInfo{hasNextPage endCursor} nodes{id status conclusion workflowRun{id}}}}}}}"
+    )
+    return (
+        "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+        "-F", f"name={request.repository.name}", "-F", f"oid={commit_oid}", "-F", f"cursor={cursor}",
+    )
+
+
+def _repository_inventory_connection_command(
+    request: GitHubReadRequest, connection: str, cursor: str, number: int | None = None,
+) -> tuple[str, ...]:
+    """Build one fixed continuation selected only by product inventory code."""
+
+    if (
+        type(request) is not GitHubReadRequest
+        or request.operation is not GitHubReadOperation.REPOSITORY_INVENTORY
+        or type(cursor) is not str
+        or _CURSOR.fullmatch(cursor) is None
+    ):
+        raise GitHubRuntimeError("inventory continuation request is invalid")
+    issue_node = (
+        "id number state title body comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} labels(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{name}} "
+        "subIssues(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}}"
+    )
+    pull_request_node = (
+        "id number state headRefOid headRefName mergeStateStatus mergeCommit{oid} "
+        "comments(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id body}} "
+        "reviews(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
+        "reviewRequests(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{id}} "
+        "closingIssuesReferences(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{number}} "
+        "commits(first:100){totalCount pageInfo{hasNextPage endCursor}nodes{commit{oid "
+        "checkSuites(first:10){totalCount pageInfo{hasNextPage endCursor}nodes{id status conclusion workflowRun{id}}}}}"
+    )
+    connections = {
+        "issues": f"issues(first:100,after:$cursor,states:[OPEN,CLOSED]){{totalCount pageInfo{{hasNextPage endCursor}}nodes{{{issue_node}}}}}",
+        "pull-requests": f"pullRequests(first:100,after:$cursor,states:[OPEN,CLOSED,MERGED]){{totalCount pageInfo{{hasNextPage endCursor}}nodes{{{pull_request_node}}}}}",
+        "refs": "refs(first:100,after:$cursor,refPrefix:\"refs/heads/\"){totalCount pageInfo{hasNextPage endCursor}nodes{name target{... on Commit{oid}}}}",
+        "issue-labels": "labels(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{name}}",
+        "issue-sub-issues": "subIssues(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
+        "issue-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id body}}",
+        "pull-request-comments": "comments(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id body}}",
+        "pull-request-reviews": "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
+        "pull-request-review-requests": "reviewRequests(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{id}}",
+        "pull-request-closing-references": "closingIssuesReferences(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{number}}",
+    }
+    selection = connections.get(connection)
+    if selection is None:
+        raise GitHubRuntimeError("inventory continuation selection is invalid")
+    base = "query($owner:String!,$name:String!,$cursor:String!){repository(owner:$owner,name:$name){name owner{login}"
+    command: tuple[str, ...]
+    if connection in {"issues", "pull-requests", "refs"}:
+        query = base + " " + selection + "}}"
+        command = ("api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}", "-F", f"name={request.repository.name}")
+    else:
+        if type(number) is not int or number <= 0:
+            raise GitHubRuntimeError("inventory continuation number is invalid")
+        target = "issue" if connection.startswith("issue-") else "pullRequest"
+        query = (
+            "query($owner:String!,$name:String!,$number:Int!,$cursor:String!){repository(owner:$owner,name:$name){"
+            + "name owner{login} " + target + "(number:$number){number " + selection + "}"
+            + "}}"
+        )
+        command = (
+            "api", "graphql", "-f", f"query={query}", "-F", f"owner={request.repository.owner}",
+            "-F", f"name={request.repository.name}", "-F", f"number={number}",
+        )
+    return command + ("-F", f"cursor={cursor}")
+
+
+def _inventory_connection_identity(connection: str, node: object) -> str:
+    try:
+        value = _raw_mapping(node)
+    except GitHubRuntimeError as error:
+        raise _RepositoryInventoryDiagnosticError(RepositoryInventoryFailureStage.NODE) from error
+    if connection in {"issue-labels", "refs"}:
+        return _raw_text(value, "name")
+    if connection in {"issue-sub-issues", "pull-request-closing-references"}:
+        return str(_raw_integer(value, "number"))
+    if connection == "pull-request-commits":
+        return _raw_text(_raw_mapping(value.get("commit")), "oid")
+    return _raw_id(value, "id")
+
+
+def _inventory_continuation_connection(
+    request: GitHubReadRequest, raw: object, connection: str, number: int | None,
+) -> Mapping[str, object]:
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory continuation repository does not match request")
+    top_level = {"issues": "issues", "pull-requests": "pullRequests", "refs": "refs"}
+    if connection in top_level:
+        return _raw_mapping(repository.get(top_level[connection]))
+    target = _raw_mapping(repository.get("issue" if connection.startswith("issue-") else "pullRequest"))
+    if number is None or _raw_integer(target, "number") != number:
+        raise GitHubRuntimeError("inventory continuation target does not match request")
+    fields = {
+        "issue-labels": "labels", "issue-sub-issues": "subIssues", "issue-comments": "comments",
+        "pull-request-comments": "comments", "pull-request-reviews": "reviews",
+        "pull-request-review-requests": "reviewRequests",
+        "pull-request-closing-references": "closingIssuesReferences",
+    }
+    return _raw_mapping(target.get(fields[connection]))
+
+
+def _complete_repository_inventory_connection(
+    request: GitHubReadRequest, runner: _FixedGhReadRunner, connection: str,
+    value: object, *, number: int | None = None, maximum: int = 3200,
+) -> None:
+    """Merge a bounded generic GraphQL connection into its private raw page."""
+
+    if type(value) is not dict or not 0 < maximum <= 3200:
+        raise GitHubRuntimeError("inventory connection is malformed")
+    try:
+        total = _raw_integer(value, "totalCount")
+        page = _raw_mapping(value.get("pageInfo"))
+        has_next = _raw_bool(page, "hasNextPage")
+        nodes = _inventory_connection_nodes(value, page)
+    except _RepositoryInventoryDiagnosticError:
+        raise
+    except GitHubRuntimeError as error:
+        raise _RepositoryInventoryDiagnosticError(RepositoryInventoryFailureStage.CONNECTION) from error
+    if total < 0 or total > maximum or len(nodes) > 100 or len(nodes) > total:
+        raise GitHubRuntimeError("inventory connection cardinality exceeds bound")
+    identities = {_inventory_connection_identity(connection, node) for node in nodes}
+    if len(identities) != len(nodes):
+        raise GitHubRuntimeError("inventory connection has duplicate evidence")
+    if not has_next:
+        if len(nodes) != total:
+            raise GitHubRuntimeError("inventory connection is incomplete")
+        value["_roundwright_page_count"] = 1
+        return
+    if connection == "pull-request-commits":
+        raise GitHubRuntimeError("inventory commit pagination is incomplete")
+    cursor = page.get("endCursor")
+    if type(cursor) is not str or _CURSOR.fullmatch(cursor) is None:
+        raise GitHubRuntimeError("inventory connection cursor is malformed")
+    seen_cursors = {cursor}
+    merged = list(nodes)
+    for _ in range(31):
+        outcome = runner.run(_repository_inventory_connection_command(request, connection, cursor, number))
+        if outcome.exit_code != 0:
+            raise _RepositoryInventoryDiagnosticError(
+                RepositoryInventoryFailureStage.TRANSPORT,
+                RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
+            )
+        page_value = _inventory_continuation_connection(
+            request, _decode_inventory_graphql(outcome.stdout), connection, number,
+        )
+        page_total = _raw_integer(page_value, "totalCount")
+        page_info = _raw_mapping(page_value.get("pageInfo"))
+        page_has_next = _raw_bool(page_info, "hasNextPage")
+        page_nodes = _inventory_connection_nodes(page_value, page_info)
+        if page_total != total or len(page_nodes) > 100 or len(merged) + len(page_nodes) > total:
+            raise GitHubRuntimeError("inventory connection cardinality is incomplete")
+        page_ids = {_inventory_connection_identity(connection, node) for node in page_nodes}
+        if len(page_ids) != len(page_nodes) or identities.intersection(page_ids):
+            raise GitHubRuntimeError("inventory connection has duplicate evidence")
+        merged.extend(page_nodes)
+        identities.update(page_ids)
+        next_cursor = page_info.get("endCursor")
+        if not page_has_next:
+            if len(merged) != total:
+                raise GitHubRuntimeError("inventory connection is incomplete")
+            value["nodes"] = merged
+            value["pageInfo"] = {"hasNextPage": False, "endCursor": next_cursor}
+            value["_roundwright_page_count"] = len(seen_cursors) + 1
+            return
+        if type(next_cursor) is not str or _CURSOR.fullmatch(next_cursor) is None or next_cursor in seen_cursors:
+            raise GitHubRuntimeError("inventory connection cursor is malformed")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    raise GitHubRuntimeError("inventory connection exceeds bound")
+
+
+def _complete_repository_inventory_connections(
+    request: GitHubReadRequest, raw: object, runner: _FixedGhReadRunner,
+) -> object:
+    """Complete every retained non-check-suite inventory connection privately."""
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory repository does not match request")
+    default_ref = _raw_mapping(repository.get("defaultBranchRef"))
+    if _raw_text(_raw_mapping(default_ref.get("target")), "oid") != request.expected_sha:
+        raise GitHubRuntimeError("inventory default head does not match baseline")
+    for connection, key in (("issues", "issues"), ("pull-requests", "pullRequests"), ("refs", "refs")):
+        _complete_repository_inventory_connection(request, runner, connection, repository.get(key))
+    issues_connection = _raw_mapping(repository.get("issues"))
+    pull_requests_connection = _raw_mapping(repository.get("pullRequests"))
+    issues = _inventory_connection_nodes(
+        issues_connection, _raw_mapping(issues_connection.get("pageInfo")),
+    )
+    pull_requests = _inventory_connection_nodes(
+        pull_requests_connection, _raw_mapping(pull_requests_connection.get("pageInfo")),
+    )
+    for node in issues:
+        issue = _raw_mapping(node)
+        number = _raw_integer(issue, "number")
+        _complete_repository_inventory_connection(request, runner, "issue-labels", issue.get("labels"), number=number)
+        _complete_repository_inventory_connection(request, runner, "issue-sub-issues", issue.get("subIssues"), number=number)
+        _complete_repository_inventory_connection(request, runner, "issue-comments", issue.get("comments"), number=number)
+    for node in pull_requests:
+        pull_request = _raw_mapping(node)
+        number = _raw_integer(pull_request, "number")
+        for connection, key in (
+            ("pull-request-comments", "comments"), ("pull-request-reviews", "reviews"),
+            ("pull-request-review-requests", "reviewRequests"),
+            ("pull-request-closing-references", "closingIssuesReferences"),
+        ):
+            _complete_repository_inventory_connection(request, runner, connection, pull_request.get(key), number=number)
+        _complete_repository_inventory_connection(
+            request, runner, "pull-request-commits", pull_request.get("commits"), number=number, maximum=100,
+        )
+    return _complete_repository_inventory_check_suites(request, raw, runner)
+
+
+def _complete_repository_inventory_check_suites(
+    request: GitHubReadRequest, raw: object, runner: _FixedGhReadRunner,
+) -> object:
+    """Complete bounded nested check-suite pages before public normalization.
+
+    The first inventory response establishes the retained pull-request commits.
+    Every non-terminal suite connection is then continued through a fixed query,
+    with repository, commit, cursor, cardinality, and duplicate checks on every
+    response.  A connection above its reviewed 100-item bound remains invalid.
+    """
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory repository does not match request")
+    default_ref = _raw_mapping(repository.get("defaultBranchRef"))
+    if _raw_text(_raw_mapping(default_ref.get("target")), "oid") != request.expected_sha:
+        raise GitHubRuntimeError("inventory default head does not match baseline")
+    pull_requests = _raw_mapping(repository.get("pullRequests"))
+    pull_request_nodes = _inventory_connection_nodes(
+        pull_requests, _raw_mapping(pull_requests.get("pageInfo")),
+    )
+    for pull_request_node in pull_request_nodes:
+        pull_request = _raw_mapping(pull_request_node)
+        commits = _raw_mapping(pull_request.get("commits"))
+        commit_page = _raw_mapping(commits.get("pageInfo"))
+        commit_nodes = _inventory_connection_nodes(commits, commit_page)
+        if _raw_integer(commits, "totalCount") > 100 or len(commit_nodes) > 100:
+            raise GitHubRuntimeError("inventory commit cardinality exceeds bound")
+        if (
+            _raw_bool(commit_page, "hasNextPage")
+            or _raw_integer(commits, "totalCount") != len(commit_nodes)
+        ):
+            raise GitHubRuntimeError("inventory commit pagination is incomplete")
+        for commit_node in commit_nodes:
+            commit = _raw_mapping(_raw_mapping(commit_node).get("commit"))
+            commit_oid = _raw_text(commit, "oid")
+            if re.fullmatch(r"[0-9a-f]{40}", commit_oid) is None:
+                raise GitHubRuntimeError("inventory commit identity is malformed")
+            suites = _raw_mapping(commit.get("checkSuites"))
+            if type(suites) is not dict:
+                raise GitHubRuntimeError("inventory check-suite collection is malformed")
+            total = _raw_integer(suites, "totalCount")
+            page = _raw_mapping(suites.get("pageInfo"))
+            has_next = _raw_bool(page, "hasNextPage")
+            initial_nodes = _inventory_connection_nodes(suites, page)
+            if total > 100 or len(initial_nodes) > 100:
+                raise GitHubRuntimeError("inventory check-suite cardinality exceeds bound")
+            if total < 0 or len(initial_nodes) > total:
+                raise GitHubRuntimeError("inventory check pagination is incomplete")
+            suite_nodes = list(initial_nodes)
+            seen_ids = {_raw_id(_raw_mapping(node), "id") for node in suite_nodes}
+            if len(seen_ids) != len(suite_nodes):
+                raise GitHubRuntimeError("inventory check-suite evidence has duplicates")
+            cursor = page.get("endCursor")
+            if not has_next:
+                if len(suite_nodes) != total:
+                    raise GitHubRuntimeError("inventory check pagination is incomplete")
+                suites["_roundwright_page_count"] = 1
+                continue
+            if type(cursor) is not str or _CURSOR.fullmatch(cursor) is None:
+                raise GitHubRuntimeError("inventory check-suite cursor is malformed")
+            seen_cursors = {cursor}
+            for _ in range(32):
+                outcome = runner.run(_repository_inventory_check_suites_command(request, commit_oid, cursor))
+                if outcome.exit_code != 0:
+                    raise _RepositoryInventoryDiagnosticError(
+                        RepositoryInventoryFailureStage.TRANSPORT,
+                        RepositoryInventoryTransportSubcategory.NONZERO_RETURN,
+                    )
+                page_total, page_nodes, has_next, next_cursor = _project_repository_inventory_check_suites_page(
+                    request, _decode_inventory_graphql(outcome.stdout), commit_oid,
+                )
+                if page_total != total or len(suite_nodes) + len(page_nodes) > total:
+                    raise GitHubRuntimeError("inventory check pagination is incomplete")
+                page_ids = {_raw_id(_raw_mapping(node), "id") for node in page_nodes}
+                if len(page_ids) != len(page_nodes) or seen_ids.intersection(page_ids):
+                    raise GitHubRuntimeError("inventory check-suite evidence has duplicates")
+                suite_nodes.extend(page_nodes)
+                seen_ids.update(page_ids)
+                if not has_next:
+                    if len(suite_nodes) != total:
+                        raise GitHubRuntimeError("inventory check pagination is incomplete")
+                    suites["nodes"] = suite_nodes
+                    suites["pageInfo"] = {"hasNextPage": False, "endCursor": next_cursor}
+                    suites["_roundwright_page_count"] = len(seen_cursors) + 1
+                    break
+                if type(next_cursor) is not str or _CURSOR.fullmatch(next_cursor) is None or next_cursor in seen_cursors:
+                    raise GitHubRuntimeError("inventory check-suite cursor is malformed")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise GitHubRuntimeError("inventory check-suite pagination exceeds bound")
+    return raw
+
+
+def _project_repository_inventory_check_suites_page(
+    request: GitHubReadRequest, raw: object, commit_oid: str,
+) -> tuple[int, list[object], bool, object]:
+    """Validate one continuation response without exposing its raw payload."""
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory continuation repository does not match request")
+    commit = _raw_mapping(repository.get("object"))
+    if _raw_text(commit, "oid") != commit_oid:
+        raise GitHubRuntimeError("inventory continuation commit does not match request")
+    suites = _raw_mapping(commit.get("checkSuites"))
+    page = _raw_mapping(suites.get("pageInfo"))
+    nodes = _inventory_connection_nodes(suites, page)
+    if len(nodes) > 100:
+        raise GitHubRuntimeError("inventory check pagination is incomplete")
+    return _raw_integer(suites, "totalCount"), nodes, _raw_bool(page, "hasNextPage"), page.get("endCursor")
+
+
+def _inventory_scheduling_facts(
+    subject: str, title: str, body: str,
+) -> tuple[RepositoryInventoryFact, ...]:
+    """Project bounded public scheduling markers without retaining title/body prose."""
+
+    if len(title) > 512 or len(body) > 65_536 or "\x00" in title or "\x00" in body:
+        raise GitHubRuntimeError("inventory issue scheduling text is malformed")
+    text = f"{title}\n{body}"
+    facts: list[RepositoryInventoryFact] = []
+    standalone = len(_STANDALONE_FIXTURE.findall(text))
+    malformed_parent = len(_MALFORMED_PARENT_CHILD_FIXTURE.findall(text))
+    owner_input = len(_OWNER_INPUT_FIXTURE.findall(text))
+    if standalone > 1 or malformed_parent > 1 or owner_input > 1:
+        raise GitHubRuntimeError("inventory scheduling fixture is ambiguous")
+    if standalone:
+        facts.append(RepositoryInventoryFact(subject, "standalone", "true"))
+    if malformed_parent:
+        facts.append(RepositoryInventoryFact(subject, "malformed-parent-child", "true"))
+    if owner_input:
+        facts.append(RepositoryInventoryFact(subject, "owner-input-fixture", "true"))
+    dependency_lines = tuple(match[0] for match in _BLOCKED_BY_DECLARATION.finditer(body))
+    dependencies = tuple(match["number"] for match in _BLOCKED_BY.finditer(body))
+    if len(dependencies) != len(dependency_lines) or len(dependencies) != len(set(dependencies)):
+        raise GitHubRuntimeError("inventory dependency scheduling is malformed")
+    facts.extend(RepositoryInventoryFact(subject, "depends-on", f"issue-{number}") for number in dependencies)
+    return tuple(facts)
+
+
+@dataclass(frozen=True)
+class RepositoryFixtureOutcome:
+    """One normalized repository scheduling result for the live fixture set."""
+
+    fixture: str
+    classification: str
+    dependencies: str
+    state: str
+    gates: str
+    blockers: str
+    next_action: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            type(value) is str and _INVENTORY_FACT_TOKEN.fullmatch(value)
+            for value in (
+                self.fixture, self.classification, self.dependencies, self.state,
+                self.gates, self.blockers, self.next_action,
+            )
+        ):
+            raise GitHubRuntimeError("repository fixture outcome is invalid")
+
+
+def project_repository_fixture_outcomes(
+    inventory: RepositoryInventorySnapshot,
+    selectors: Mapping[str, tuple[str, int]] | None = None,
+) -> tuple[RepositoryFixtureOutcome, ...]:
+    """Run the production inventory classifier and scheduler for each fixture.
+
+    This projection intentionally has no Roundlet expectation dependency.  It
+    consumes the normalized issue topology, labels, dependency declarations,
+    and PR state produced by the credentialed inventory normalizer.
+    """
+
+    facts_value = getattr(inventory, "facts", None)
+    if type(facts_value) is not tuple or any(type(item) is not RepositoryInventoryFact for item in facts_value):
+        raise GitHubRuntimeError("repository fixture inventory is invalid")
+    facts = {(item.subject, item.predicate, item.object) for item in facts_value}
+    if selectors is not None:
+        # The product classifier normally discovers its fixture subjects from
+        # a complete inventory.  A sealed external manifest may instead name
+        # the exact public subjects to classify.  It supplies only selectors,
+        # never outcomes, and a duplicate or conflicting subject fails before
+        # any scheduler result is produced.
+        if type(selectors) is not dict or set(selectors) != {
+            "umbrella", "standalone", "ignored", "malformed-parent-owner-input",
+            "dependency", "merged-pr",
+        }:
+            raise GitHubRuntimeError("repository fixture selectors are invalid")
+        subjects: dict[str, str] = {}
+        for fixture, value in selectors.items():
+            if (
+                type(value) is not tuple or len(value) != 2
+                or value[0] not in {"issue", "pull-request"}
+                or type(value[1]) is not int or value[1] < 1
+            ):
+                raise GitHubRuntimeError("repository fixture selectors are invalid")
+            subjects[fixture] = f"{value[0]}-{value[1]}"
+        if len(set(subjects.values())) != len(subjects.values()):
+            raise GitHubRuntimeError("repository fixture selectors conflict")
+
+        def state(subject: str) -> str:
+            values = {item.object for item in facts_value if item.subject == subject and item.predicate == "state"}
+            if len(values) != 1 or next(iter(values)) not in {"open", "closed", "merged"}:
+                raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+            return next(iter(values))
+
+        def outcome(fixture: str, classification: str, dependency: str, gates: str, blockers: str) -> RepositoryFixtureOutcome:
+            return RepositoryFixtureOutcome(
+                fixture, classification, dependency, state(subjects[fixture]), gates, blockers, "retain-readonly",
+            )
+
+        def has(subject: str, predicate: str, object_value: str | None = None) -> bool:
+            return any(
+                item.subject == subject and item.predicate == predicate
+                and (object_value is None or item.object == object_value)
+                for item in facts_value
+            )
+
+        umbrella = subjects["umbrella"]
+        standalone = subjects["standalone"]
+        ignored = subjects["ignored"]
+        malformed = subjects["malformed-parent-owner-input"]
+        dependency = subjects["dependency"]
+        merged = subjects["merged-pr"]
+        if not any(item.subject == umbrella and item.predicate == "child" for item in facts_value):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        if not has(standalone, "standalone", "true") or any(
+            item.predicate == "child" and item.object == standalone for item in facts_value
+        ):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        if not has(ignored, "label", "roundlet:ignore"):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        if not has(malformed, "malformed-parent", "owner-input"):
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        dependency_edges = [item for item in facts_value if item.subject == dependency and item.predicate == "depends-on"]
+        if len(dependency_edges) != 1:
+            raise GitHubRuntimeError("repository fixture selected subject is absent or conflicting")
+        return (
+            outcome("umbrella", "umbrella", "children-present", "not-applicable", "none"),
+            outcome("standalone", "standalone", "no-parent", "not-applicable", "none"),
+            outcome("ignored", "ignored", "not-applicable", "excluded", "roundlet-ignore"),
+            outcome("malformed-parent-owner-input", "malformed-parent", "owner-input", "blocked", "owner-input"),
+            outcome("dependency", "dependent", "blocked-by-parent", "blocked", "dependency"),
+            outcome("merged-pr", "merged-pr", "not-applicable", "passed", "none"),
+        )
+    state_by_subject = {
+        subject: value for subject, predicate, value in facts
+        if predicate == "state" and value in {"open", "closed", "merged"}
+    }
+    child_edges = tuple((subject, object) for subject, predicate, object in facts if predicate == "child")
+    dependencies = tuple((subject, object) for subject, predicate, object in facts if predicate == "depends-on")
+    def result(
+        fixture: str, classification: str, dependency: str, subject: str | None,
+        gates: str, blockers: str,
+    ) -> RepositoryFixtureOutcome:
+        state = state_by_subject.get(subject or "", "missing")
+        if state == "missing":
+            return RepositoryFixtureOutcome(fixture, classification, dependency, state, "blocked", "missing", "blocked")
+        return RepositoryFixtureOutcome(fixture, classification, dependency, state, gates, blockers, "retain-readonly")
+    umbrella_parent = child_edges[0][0] if len(child_edges) == 1 else None
+    standalone_subjects = tuple(subject for subject, predicate, value in facts if predicate == "standalone" and value == "true")
+    ignored_subjects = tuple(subject for subject, predicate, value in facts if predicate == "label" and value == "roundlet:ignore")
+    malformed_subjects = tuple(subject for subject, predicate, value in facts if predicate == "malformed-parent" and value == "owner-input")
+    dependency_subject = dependencies[0][0] if len(dependencies) == 1 else None
+    merged_subjects = tuple(subject for subject, predicate, value in facts if predicate == "state" and value == "merged")
+    values = (
+        result("umbrella", "umbrella" if umbrella_parent else "missing", "children-present" if umbrella_parent else "missing", umbrella_parent, "not-applicable", "none"),
+        result("standalone", "standalone" if len(standalone_subjects) == 1 else "missing", "no-parent" if len(standalone_subjects) == 1 else "missing", standalone_subjects[0] if len(standalone_subjects) == 1 else None, "not-applicable", "none"),
+        result("ignored", "ignored" if len(ignored_subjects) == 1 else "missing", "not-applicable" if len(ignored_subjects) == 1 else "missing", ignored_subjects[0] if len(ignored_subjects) == 1 else None, "excluded", "roundlet-ignore"),
+        result("malformed-parent-owner-input", "malformed-parent" if len(malformed_subjects) == 1 else "missing", "owner-input" if len(malformed_subjects) == 1 else "missing", malformed_subjects[0] if len(malformed_subjects) == 1 else None, "blocked", "owner-input"),
+        result("dependency", "dependent" if dependency_subject else "missing", "blocked-by-parent" if dependency_subject else "missing", dependency_subject, "blocked", "dependency"),
+        result("merged-pr", "merged-pr" if len(merged_subjects) == 1 else "missing", "not-applicable" if len(merged_subjects) == 1 else "missing", merged_subjects[0] if len(merged_subjects) == 1 else None, "passed", "none"),
+    )
+    return values
+
+
+def _inventory_label_fact_value(value: object) -> str:
+    """Project a label without treating provider display prose as a fact token.
+
+    ``RepositoryInventoryFact`` intentionally accepts only a small token
+    alphabet.  GitHub label names, however, are public display strings and can
+    legitimately contain spaces or punctuation.  Preserve labels that already
+    carry product semantics (such as ``roundlet:ignore``), while committing
+    every other valid label to a deterministic public-safe identity.  The
+    complete raw label collection remains bound by its evidence digest.
+    """
+
+    if type(value) is not str or not value or len(value) > 512 or "\x00" in value or "\x7f" in value:
+        raise GitHubRuntimeError("inventory label is malformed")
+    if _INVENTORY_FACT_TOKEN.fullmatch(value):
+        return value
+    return "label-" + _sha256(("repository-inventory-label", value)).removeprefix("sha256:")
+
+
+_ROUNDLET_FAILOVER_TRACE = re.compile(
+    r"ROUNDLET_LIFECYCLE\s+supervisor=(sol|terra)\s+reasoning=(xhigh|high)\s+disposition=(cancelled|invalid-context|pass)\s+round=(formal-round-1)\s+ready_at=([0-9]+)\s+candidate=([0-9a-f]{40})\Z"
+)
+
+
+def _inventory_connection_page_count(connection: Mapping[str, object]) -> int:
+    """Read the host-retained terminal page count without trusting raw input."""
+
+    value = connection.get("_roundwright_page_count", 1)
+    if type(value) is not int or not 1 <= value <= 32:
+        raise GitHubRuntimeError("inventory page count is invalid")
+    return value
+
+
+def _inventory_section_identity(section: RepositoryInventorySection, node: object) -> str:
+    value = _raw_mapping(node)
+    if section is RepositoryInventorySection.ISSUE_LABELS:
+        return _inventory_label_fact_value(value.get("name"))
+    if section in {RepositoryInventorySection.ISSUE_RELATIONSHIPS, RepositoryInventorySection.CLOSING_REFERENCES}:
+        return str(_raw_integer(value, "number"))
+    if section is RepositoryInventorySection.REMOTE_HEADS:
+        return _raw_text(value, "name")
+    return _raw_id(value, "id")
+
+
+def _inventory_roundlet_trace_facts(nodes: list[tuple[str, object]]) -> tuple[RepositoryInventoryFact, ...]:
+    """Project the complete ordered marker trace without retaining bodies."""
+
+    records: list[tuple[str, str, str, str, str, str, str, str]] = []
+    for surface, node in nodes:
+        value = _raw_mapping(node)
+        body = _raw_optional_text(value, "body")
+        if body is None:
+            continue
+        match = _ROUNDLET_FAILOVER_TRACE.fullmatch(body)
+        if match is None and body.startswith("ROUNDLET_LIFECYCLE"):
+            # Version-1/model-only markers cannot prove the exact configured
+            # Supervisor profile.  Reject them rather than treating them as
+            # absent evidence or upgrading them by inference.
+            raise GitHubRuntimeError("inventory Roundlet failover trace is legacy or malformed")
+        if match is not None:
+            records.append((surface, _raw_id(value, "id"), *match.groups()))
+    if not records:
+        return ()
+    if (
+        len(records) != 3
+        or len({identity for _surface, identity, *_rest in records}) != 3
+        or tuple((profile, reasoning, disposition) for _surface, _identity, profile, reasoning, disposition, _round, _ready_at, _candidate in records) != (
+        ("sol", "xhigh", "cancelled"), ("terra", "high", "invalid-context"), ("terra", "high", "pass"),
+        )
+    ):
+        raise GitHubRuntimeError("inventory Roundlet failover trace is incomplete")
+    rounds = {round_id for _surface, _identity, _profile, _reasoning, _disposition, round_id, _ready_at, _candidate in records}
+    ready_values = {ready_at for _surface, _identity, _profile, _reasoning, _disposition, _round_id, ready_at, _candidate in records}
+    candidates = {candidate for _surface, _identity, _profile, _reasoning, _disposition, _round_id, _ready_at, candidate in records}
+    if rounds != {"formal-round-1"} or len(ready_values) != 1 or len(candidates) != 1:
+        raise GitHubRuntimeError("inventory Roundlet failover trace is inconsistent")
+    facts: list[RepositoryInventoryFact] = []
+    for ordinal, (surface, identity, profile, reasoning, disposition, _round_id, _ready_at, _candidate) in enumerate(records, start=1):
+        facts.extend((
+            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "profile", profile),
+            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "reasoning", reasoning),
+            RepositoryInventoryFact(f"lifecycle-supervisor-{ordinal}", "disposition", disposition),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "surface", surface),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "marker", "lifecycle"),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "semantic", f"supervisor-{ordinal}"),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ordinal", str(ordinal)),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "profile", profile),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "reasoning", reasoning),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "disposition", disposition),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "formal-round", _round_id),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "ready-at", _ready_at),
+            RepositoryInventoryFact(f"roundlet-trace-{identity}", "candidate", _candidate),
+        ))
+    facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "candidate", next(iter(candidates))))
+    facts.append(RepositoryInventoryFact("lifecycle-formal-round-1", "ready-at", next(iter(ready_values))))
+    return tuple(facts)
+
+
+def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> RepositoryInventorySnapshot:
+    """Normalize terminal GraphQL inventory data into the core-only snapshot.
+
+    The projection rejects continuation pages and inconsistent totals instead
+    of inferring completeness.  It intentionally retains only IDs, state,
+    relationship labels and evidence digests.
+    """
+
+    root = _raw_mapping(raw)
+    repository = _raw_mapping(_raw_mapping(root.get("data")).get("repository"))
+    owner = _raw_mapping(repository.get("owner"))
+    if _raw_text(owner, "login") != request.repository.owner or _raw_text(repository, "name") != request.repository.name:
+        raise GitHubRuntimeError("inventory repository does not match request")
+    default_ref = _raw_mapping(repository.get("defaultBranchRef"))
+    target = _raw_mapping(default_ref.get("target"))
+    if _raw_text(target, "oid") != request.expected_sha:
+        raise GitHubRuntimeError("inventory default head does not match baseline")
+    collection_keys = {
+        RepositoryInventorySection.ISSUES: "issues",
+        RepositoryInventorySection.PULL_REQUESTS: "pullRequests",
+        RepositoryInventorySection.REMOTE_HEADS: "refs",
+    }
+    roots: dict[RepositoryInventorySection, Mapping[str, object]] = {}
+    root_nodes: dict[RepositoryInventorySection, list[object]] = {}
+    for section, key in collection_keys.items():
+        connection = _raw_mapping(repository.get(key))
+        page = _raw_mapping(connection.get("pageInfo"))
+        nodes = _inventory_connection_nodes(connection, page)
+        if _raw_bool(page, "hasNextPage"):
+            raise GitHubRuntimeError("inventory pagination is incomplete")
+        if _raw_integer(connection, "totalCount") != len(nodes) or len(nodes) > 3200:
+            raise GitHubRuntimeError("inventory collection is incomplete")
+        roots[section] = connection
+        root_nodes[section] = nodes
+    issues = roots[RepositoryInventorySection.ISSUES]
+    pull_requests = roots[RepositoryInventorySection.PULL_REQUESTS]
+    refs = roots[RepositoryInventorySection.REMOTE_HEADS]
+    nested: dict[RepositoryInventorySection, list[Mapping[str, object]]] = {
+        RepositoryInventorySection.ISSUE_RELATIONSHIPS: [],
+        RepositoryInventorySection.ISSUE_LABELS: [],
+        RepositoryInventorySection.COMMENTS: [],
+        RepositoryInventorySection.REVIEWS: [],
+        RepositoryInventorySection.REQUESTED_REVIEWERS: [],
+        RepositoryInventorySection.CHECKS: [],
+        RepositoryInventorySection.WORKFLOW_RUNS: [],
+        RepositoryInventorySection.MERGEABILITY: [],
+        RepositoryInventorySection.CLOSING_REFERENCES: [],
+    }
+    facts: list[RepositoryInventoryFact] = []
+    trace_nodes: list[tuple[str, object]] = []
+    for issue in root_nodes[RepositoryInventorySection.ISSUES]:
+        value = _raw_mapping(issue)
+        subject = f"issue-{_raw_integer(value, 'number')}"
+        facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
+        if "body" not in value:
+            raise GitHubRuntimeError("inventory issue scheduling body is malformed")
+        body = _raw_optional_text(value, "body")
+        facts.extend(_inventory_scheduling_facts(subject, _raw_text(value, "title"), "" if body is None else body))
+        comment_connection = _raw_mapping(value.get("comments")); comment_page = _raw_mapping(comment_connection.get("pageInfo")); comment_nodes = _inventory_connection_nodes(comment_connection, comment_page)
+        if _raw_bool(comment_page, "hasNextPage") or _raw_integer(comment_connection, "totalCount") != len(comment_nodes):
+            raise GitHubRuntimeError("inventory nested pagination is incomplete")
+        nested[RepositoryInventorySection.COMMENTS].append(comment_connection)
+        trace_nodes.extend(("issue", node) for node in comment_nodes)
+        for section, key, predicate in ((RepositoryInventorySection.ISSUE_LABELS, "labels", "label"), (RepositoryInventorySection.ISSUE_RELATIONSHIPS, "subIssues", "child")):
+            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
+            if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
+                raise GitHubRuntimeError("inventory nested pagination is incomplete")
+            nested[section].append(connection)
+            if section is RepositoryInventorySection.COMMENTS:
+                trace_nodes.extend(("pull-request", node) for node in nodes)
+            for node in nodes:
+                child = _raw_mapping(node)
+                fact_value = (
+                    _inventory_label_fact_value(child.get("name"))
+                    if predicate == "label"
+                    else f"issue-{_raw_integer(child, 'number')}"
+                )
+                facts.append(RepositoryInventoryFact(subject, predicate, fact_value))
+    issue_subjects = {item.subject for item in facts if item.predicate == "state" and item.subject.startswith("issue-")}
+    child_edges = [(item.subject, item.object) for item in facts if item.predicate == "child"]
+    child_subjects = {child for _, child in child_edges}
+    parent_counts = {child: sum(candidate == child for _, candidate in child_edges) for child in child_subjects}
+    malformed_children = {item.subject for item in facts if item.predicate == "malformed-parent-child"}
+    owner_input_parents = {item.subject for item in facts if item.predicate == "owner-input-fixture"}
+    if (
+        len(child_edges) != len(set(child_edges))
+        or any(parent == child or parent not in issue_subjects or child not in issue_subjects for parent, child in child_edges)
+        or any(count != 1 for count in parent_counts.values())
+        or any(item.subject not in issue_subjects or item.subject in child_subjects for item in facts if item.predicate == "standalone")
+        or any(
+            item.subject not in issue_subjects or item.object not in issue_subjects or item.subject == item.object
+            for item in facts if item.predicate == "depends-on"
+        )
+    ):
+        raise GitHubRuntimeError("inventory scheduling topology is malformed")
+    if malformed_children or owner_input_parents:
+        if len(malformed_children) != 1 or len(owner_input_parents) != 1:
+            raise GitHubRuntimeError("inventory malformed-parent topology is incomplete")
+        malformed_child = next(iter(malformed_children))
+        malformed_parents = {parent for parent, child in child_edges if child == malformed_child}
+        if len(malformed_parents) != 1 or malformed_parents != owner_input_parents:
+            raise GitHubRuntimeError("inventory malformed-parent topology is incomplete")
+        facts.append(RepositoryInventoryFact(malformed_child, "malformed-parent", "owner-input"))
+    for pull_request in root_nodes[RepositoryInventorySection.PULL_REQUESTS]:
+        value = _raw_mapping(pull_request); subject = f"pull-request-{_raw_integer(value, 'number')}"
+        facts.append(RepositoryInventoryFact(subject, "state", _raw_text(value, "state").lower()))
+        head_sha = _raw_optional_text(value, "headRefOid")
+        if head_sha is not None:
+            facts.append(RepositoryInventoryFact(subject, "head-sha", head_sha))
+        nested[RepositoryInventorySection.MERGEABILITY].append(value)
+        for section, key in ((RepositoryInventorySection.COMMENTS, "comments"), (RepositoryInventorySection.REVIEWS, "reviews"), (RepositoryInventorySection.REQUESTED_REVIEWERS, "reviewRequests"), (RepositoryInventorySection.CLOSING_REFERENCES, "closingIssuesReferences")):
+            connection = _raw_mapping(value.get(key)); page = _raw_mapping(connection.get("pageInfo")); nodes = _inventory_connection_nodes(connection, page)
+            if _raw_bool(page, "hasNextPage") or _raw_integer(connection, "totalCount") != len(nodes):
+                raise GitHubRuntimeError("inventory nested pagination is incomplete")
+            nested[section].append(connection)
+            # Trace markers may be split across issue and pull-request
+            # comments.  Keep terminal PR comments in the same bounded trace
+            # ledger, with their actual surface, before normalizing markers.
+            if section is RepositoryInventorySection.COMMENTS:
+                trace_nodes.extend(("pull-request", node) for node in nodes)
+        commits = _raw_mapping(value.get("commits")); commits_page = _raw_mapping(commits.get("pageInfo")); commit_nodes = _inventory_connection_nodes(commits, commits_page)
+        if (
+            _raw_bool(commits_page, "hasNextPage")
+            or _raw_integer(commits, "totalCount") != len(commit_nodes)
+            or len(commit_nodes) > 100
+        ):
+            raise GitHubRuntimeError("inventory commit pagination is incomplete")
+        for commit_node in commit_nodes:
+            commit = _raw_mapping(_raw_mapping(commit_node).get("commit"))
+            suites = _raw_mapping(commit.get("checkSuites")); suites_page = _raw_mapping(suites.get("pageInfo")); suite_nodes = _inventory_connection_nodes(suites, suites_page)
+            if _raw_bool(suites_page, "hasNextPage") or _raw_integer(suites, "totalCount") != len(suite_nodes):
+                raise GitHubRuntimeError("inventory check pagination is incomplete")
+            nested[RepositoryInventorySection.CHECKS].append(suites)
+            for suite in suite_nodes:
+                suite_value = _raw_mapping(suite)
+                workflow = suite_value.get("workflowRun")
+                if workflow is not None:
+                    nested[RepositoryInventorySection.WORKFLOW_RUNS].append(_raw_mapping(workflow))
+    facts.extend(_inventory_roundlet_trace_facts(trace_nodes))
+    collections: list[RepositoryInventoryEvidence] = []
+    for section in RepositoryInventorySection:
+        if section is RepositoryInventorySection.REPOSITORY:
+            source: object = repository
+            identities = [_raw_id(repository, "id")]
+            page_count = 1
+        elif section in roots:
+            connection = roots[section]
+            source = connection
+            identities = [_inventory_section_identity(section, node) for node in root_nodes[section]]
+            page_count = _inventory_connection_page_count(connection)
+        else:
+            connections = nested.get(section, [])
+            source = connections
+            identities = []
+            page_count = 0
+            if section in {RepositoryInventorySection.MERGEABILITY, RepositoryInventorySection.WORKFLOW_RUNS}:
+                identities = [_raw_id(connection, "id") for connection in connections]
+                if section is RepositoryInventorySection.MERGEABILITY:
+                    page_count = _inventory_connection_page_count(roots[RepositoryInventorySection.PULL_REQUESTS])
+                else:
+                    page_count = sum(_inventory_connection_page_count(item) for item in nested[RepositoryInventorySection.CHECKS]) or 1
+            else:
+                for connection in connections:
+                    page = _raw_mapping(connection.get("pageInfo"))
+                    nodes = _inventory_connection_nodes(connection, page)
+                    identities.extend(_inventory_section_identity(section, node) for node in nodes)
+                    page_count += _inventory_connection_page_count(connection)
+            if not connections:
+                page_count = 1
+        identities.sort()
+        if len(identities) != len(set(identities)):
+            raise GitHubRuntimeError("inventory collection has duplicate evidence")
+        collections.append(RepositoryInventoryEvidence(section, _sha256(source), tuple(identities), page_count, True))
+    return RepositoryInventorySnapshot(
+        request.repository, _raw_id(repository, "id"), _raw_text(default_ref, "name"), request.expected_sha,
+        _sha256({"id": repository.get("id"), "owner": owner.get("login"), "name": repository.get("name")} ),
+        _sha256({"name": default_ref.get("name"), "oid": target.get("oid")} ),
+        tuple(sorted(collections, key=lambda item: item.section.value)),
+        tuple(sorted(set(facts), key=lambda item: (item.subject, item.predicate, item.object))),
+    )
 
 
 def _repository_default_branch_command(repository: RepositoryRef, default_branch: str) -> tuple[str, ...]:

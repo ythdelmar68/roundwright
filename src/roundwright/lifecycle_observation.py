@@ -657,6 +657,7 @@ def project_lifecycle_events(
     started: dict[str, Mapping[str, Any]] = {}
     completed: dict[str, str] = {}
     accepted_attempt: str | None = None
+    accepted_disposition: str | None = None
     accepted_count = 0
     formal_advance_count = 0
     predecessor: str | None = None
@@ -709,6 +710,7 @@ def project_lifecycle_events(
             ):
                 raise LifecycleObservationError("accepted lifecycle result is invalid")
             accepted_attempt = attempt
+            accepted_disposition = completed[attempt]
             accepted_count += 1
         elif transition == "result_unaccepted":
             if (
@@ -721,6 +723,7 @@ def project_lifecycle_events(
         elif transition == "formal_round_advanced":
             if (
                 attempt != accepted_attempt
+                or accepted_disposition != "pass"
                 or event["role"] != "supervisor"
                 or event["disposition"] != "accepted"
                 or not event["accepted_result"]
@@ -749,7 +752,14 @@ def project_lifecycle_events(
         not projected
         or set(started) != set(completed)
         or not (
-            (accepted_attempt is not None and accepted_count == 1 and formal_advance_count == 1)
+            (
+                accepted_attempt is not None
+                and accepted_count == 1
+                and (
+                    (accepted_disposition == "pass" and formal_advance_count == 1)
+                    or (accepted_disposition == "findings" and formal_advance_count == 0)
+                )
+            )
             or (accepted_attempt is None and accepted_count == 0 and formal_advance_count == 0)
         )
         or seal.get("head_event_digest") != predecessor

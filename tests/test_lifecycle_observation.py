@@ -116,10 +116,12 @@ class LifecycleObservationTests(unittest.TestCase):
         plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
         findings = lifecycle._synthetic_events(plan)
         findings[-3]["disposition"] = "findings"
+        findings.pop()
         self.rechain(findings)
         accepted = lifecycle.project_lifecycle_events(plan, findings, self.seal(plan, findings))
-        self.assertEqual(accepted.events[-3].disposition, "findings")
-        self.assertTrue(accepted.events[-2].accepted_result)
+        self.assertEqual(accepted.events[-2].disposition, "findings")
+        self.assertEqual(accepted.events[-1].transition, "result_accepted")
+        self.assertTrue(accepted.events[-1].accepted_result)
 
         invalid = findings[:4]
         invalid.append({**invalid[-1], "transition": "result_unaccepted", "disposition": "unaccepted", "accepted_result": False})

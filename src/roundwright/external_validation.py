@@ -1799,6 +1799,44 @@ class _RoundwrightLifecycleProjection:
     supervisor_sequence_valid: bool
 
 
+@dataclass(frozen=True)
+class _RoundwrightTraceReceipt:
+    """Normalized, public-safe implementation-PR Conversation evidence."""
+
+    digest: str
+    differences: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            _DIGEST.fullmatch(self.digest) is None
+            or type(self.differences) is not tuple
+            or any(not _safe_token(value) for value in self.differences)
+            or self.differences != tuple(sorted(set(self.differences)))
+        ):
+            raise ExternalValidationAdapterError("Roundwright PR trace receipt is invalid")
+
+
+def _roundlet_pr_conversation_marker(
+    candidate_sha: str, review_epoch: int, formal_round: str, review_mode: str,
+    observation_window: str, ready_at: int,
+) -> str:
+    """Canonical marker whose digest safely crosses the generic comments boundary."""
+
+    if (
+        _SHA.fullmatch(candidate_sha) is None
+        or type(review_epoch) is not int or review_epoch < 1
+        or not _safe_token(formal_round) or not _safe_token(review_mode)
+        or not _safe_token(observation_window)
+        or type(ready_at) is not int or ready_at < 0
+    ):
+        raise ExternalValidationAdapterError("Roundwright PR trace marker is invalid")
+    return (
+        "ROUNDLET_LIFECYCLE event=formal-result"
+        f" candidate={candidate_sha} epoch={review_epoch} round={formal_round}"
+        f" mode={review_mode} window={observation_window} ready_at={ready_at}"
+    )
+
+
 def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[str, str]:
     """Decode one retained Supervisor profile only for the live comparator.
 
@@ -2054,6 +2092,7 @@ class _RoundwrightLiveLifecycleProvider:
 
     def __init__(self, capability: GitHubReadCapability, inputs: LiveLifecycleRequestInputs) -> None:
         owner, name = inputs.target_repository.split("/", 1)
+        self._inputs = inputs
         self._capability = _require_github_read_capability(capability)
         self._repository = RepositoryRef(owner, name)
         # #49's trace is a second, non-substitutable source: it is read from
@@ -2128,7 +2167,7 @@ class _RoundwrightLiveLifecycleProvider:
             if not any(item.startswith(f"fixture-{fixture}-") for item in differences)
         )
 
-    def _trace_receipt_digest(self, lifecycle: _RoundwrightLifecycleProjection) -> str:
+    def _trace_receipt(self, lifecycle: _RoundwrightLifecycleProjection) -> _RoundwrightTraceReceipt:
         pull_request = self._read(
             GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, self._trace_repository,
                 number=self._trace_pull_request, expected_sha=self._candidate_sha),
@@ -2143,20 +2182,41 @@ class _RoundwrightLiveLifecycleProvider:
         if (
             pull_request.repository != self._trace_repository
             or pull_request.number != self._trace_pull_request
+            or pull_request.base_repository != self._trace_repository
+            or pull_request.head_repository != self._trace_repository
             or pull_request.head_sha != self._candidate_sha
             or comments.repository != self._trace_repository
             or comments.issue_number != self._trace_pull_request
             or comments.target_kind != "PULL_REQUEST"
-            or not comments.comments
         ):
             raise ExternalValidationAdapterError("Roundwright PR trace read-back has drifted")
-        return _digest({
+        marker = _roundlet_pr_conversation_marker(
+            self._candidate_sha, lifecycle.review_epoch, lifecycle.formal_round,
+            lifecycle.review_mode, self._inputs.observation_window, lifecycle.ready_at,
+        )
+        expected_marker_digest = _digest(("comment-body", marker))
+        matching_comments = tuple(
+            item for item in comments.comments if item.body_digest == expected_marker_digest
+        )
+        differences: list[str] = []
+        if len(comments.comments) != 1:
+            differences.append("trace-conversation-drift")
+        if len(matching_comments) != 1:
+            differences.append("trace-marker-drift")
+        return _RoundwrightTraceReceipt(_digest({
             "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
             "candidate_sha": self._candidate_sha,
             "review_epoch": lifecycle.review_epoch, "formal_round": lifecycle.formal_round,
-            "review_mode": lifecycle.review_mode, "ready_at": lifecycle.ready_at,
-            "comments": [(item.comment_id, item.author_id, item.body_digest, item.created_at) for item in comments.comments],
-        })
+            "review_mode": lifecycle.review_mode, "window": self._inputs.observation_window,
+            "ready_at": lifecycle.ready_at, "marker_digest": expected_marker_digest,
+            "comments": [(item.comment_id, item.author_id, item.body_digest, item.created_at) for item in matching_comments],
+        }), tuple(sorted(set(differences))))
+
+    def _trace_receipt_digest(self, lifecycle: _RoundwrightLifecycleProjection) -> str:
+        receipt = self._trace_receipt(lifecycle)
+        if receipt.differences:
+            raise ExternalValidationAdapterError("Roundwright PR trace semantic evidence has drifted")
+        return receipt.digest
 
     @staticmethod
     def _observation(
@@ -2192,10 +2252,9 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        trace_differences = ()
         return _LiveLifecycleProviderObservation(
             snapshot_digests, fixtures,
-            tuple(sorted(set((*fixture_differences, *trace_differences)))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]),
+            tuple(sorted(set(fixture_differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]),
         )
 
     @staticmethod
@@ -2226,8 +2285,11 @@ class _RoundwrightLiveLifecycleProvider:
     ) -> _LiveLifecycleProviderObservation:
         self._armed = True
         observation = self._observation(self._inventory(), lifecycle, sealed_lifecycle, self._manifest)
+        trace = self._trace_receipt(lifecycle)
+        if trace.differences:
+            raise ExternalValidationAdapterError("Roundwright PR trace semantic evidence has drifted")
         return _LiveLifecycleProviderObservation(
-            {**observation.snapshot_digests, "roundlet-trace": self._trace_receipt_digest(lifecycle)},
+            {**observation.snapshot_digests, "roundlet-trace": trace.digest},
             observation.fixture_classes, observation.classified_differences,
         )
 

@@ -293,7 +293,13 @@ class ExternalValidationTests(unittest.TestCase):
         if request.operation is GitHubReadOperation.COMMENTS:
             return GitHubReadResult(request, CommentsSnapshot(
                 repository, 85, "PULL_REQUEST", (
-                    CommentSnapshot("comment-85", "roundwright-bot", "sha256:" + "e" * 64, "2026-08-23T000000Z"),
+                    CommentSnapshot(
+                        "comment-85", "roundwright-bot",
+                        external_validation._digest(("comment-body", external_validation._roundlet_pr_conversation_marker(
+                            candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
+                        ))),
+                        "2026-08-23T000000Z",
+                    ),
                 ),
             ))
         raise AssertionError("trace fixture received an unexpected read")
@@ -910,10 +916,15 @@ class ExternalValidationTests(unittest.TestCase):
         lifecycle = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
         trace_read_result = self.trace_read_result
 
+        def trace_comment(marker: str) -> CommentSnapshot:
+            return CommentSnapshot(
+                "comment-85", "roundwright-bot",
+                external_validation._digest(("comment-body", marker)), "2026-08-23T000000Z",
+            )
+
         class TraceCapability:
-            def __init__(self, *, candidate_sha: str = "a" * 40, comments: tuple[CommentSnapshot, ...] | None = None) -> None:
+            def __init__(self, *, comments: tuple[CommentSnapshot, ...] | None = None) -> None:
                 self.calls: list[GitHubReadRequest] = []
-                self.candidate_sha = candidate_sha
                 self.comments = comments
 
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
@@ -922,7 +933,7 @@ class ExternalValidationTests(unittest.TestCase):
                     return GitHubReadResult(request, CommentsSnapshot(
                         RepositoryRef("ythdelmar68", "roundwright"), 85, "PULL_REQUEST", self.comments,
                     ))
-                return trace_read_result(request, self.candidate_sha)
+                return trace_read_result(request, "a" * 40)
 
         capability = TraceCapability()
         provider = external_validation._RoundwrightLiveLifecycleProvider(capability, self.live_lifecycle_request_inputs())
@@ -934,13 +945,19 @@ class ExternalValidationTests(unittest.TestCase):
                 (GitHubReadOperation.COMMENTS, "ythdelmar68/roundwright", 85, None),
             ],
         )
-        for name, drifted, error, message in (
-            ("candidate", TraceCapability(candidate_sha="b" * 40), external_validation.RepositoryInventoryFirstReadBoundaryError, "host-failure"),
-            ("comments", TraceCapability(comments=()), external_validation.ExternalValidationAdapterError, "trace read-back has drifted"),
+        for name, drifted in (
+            ("missing", TraceCapability(comments=())),
+            ("wrong-marker", TraceCapability(comments=(trace_comment("ROUNDLET_LIFECYCLE event=unrelated"),))),
+            ("wrong-candidate", TraceCapability(comments=(trace_comment(external_validation._roundlet_pr_conversation_marker(
+                "b" * 40, 1, "formal-round-1", "complete", "window-49", 17,
+            )),))),
+            ("wrong-tuple", TraceCapability(comments=(trace_comment(external_validation._roundlet_pr_conversation_marker(
+                "a" * 40, 2, "formal-round-2", "converging", "window-49", 17,
+            )),))),
         ):
             with self.subTest(drift=name):
                 provider = external_validation._RoundwrightLiveLifecycleProvider(drifted, self.live_lifecycle_request_inputs())
-                with self.assertRaisesRegex(error, message):
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "trace semantic evidence has drifted"):
                     provider._trace_receipt_digest(lifecycle)
 
     def test_live_lifecycle_session_rejects_drift_before_transport_dispatch(self) -> None:
@@ -1186,7 +1203,9 @@ class ExternalValidationTests(unittest.TestCase):
                             "__typename": "PullRequest", "number": 85,
                             "comments": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
                                 "id": "comment-85", "author": {"__typename": "Bot", "login": "roundwright-bot"},
-                                "body": "sealed implementation trace", "createdAt": "2026-08-23T00:00:00Z",
+                                "body": external_validation._roundlet_pr_conversation_marker(
+                                    inputs.candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
+                                ), "createdAt": "2026-08-23T00:00:00Z",
                             }]},
                         },
                     }}}))

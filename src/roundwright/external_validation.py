@@ -1818,6 +1818,7 @@ class _RoundwrightLifecycleProjection:
     ready_at: int
     supervisor_attempts: tuple[tuple[str, str, str], ...]
     supervisor_sequence_valid: bool
+    accepted_pass_attempt_identity: str | None
 
 
 @dataclass(frozen=True)
@@ -1919,6 +1920,26 @@ def _roundwright_lifecycle_projection(
     attempts_by_ordinal = {
         event.review_attempt: event for event in completed
     } if sequence_valid else {}
+    completed_by_identity = {
+        event.attempt_identity: event for event in completed
+    }
+    accepted_passes = tuple(
+        event for event in lifecycle.events
+        if (
+            event.role == "supervisor"
+            and event.transition == "result_accepted"
+            and event.disposition == "accepted"
+            and event.accepted_result
+            and event.attempt_identity == lifecycle.accepted_attempt_identity
+            and (completed_event := completed_by_identity.get(event.attempt_identity)) is not None
+            and completed_event.disposition == "pass"
+            and (completed_event.task_identity, completed_event.review_attempt)
+            == (event.task_identity, event.review_attempt)
+        )
+    )
+    accepted_pass_attempt_identity = (
+        accepted_passes[0].attempt_identity if len(accepted_passes) == 1 else None
+    )
 
     def supervisor_outcome(ordinal: int) -> tuple[str, str, str]:
         event = attempts_by_ordinal.get(ordinal)
@@ -1935,6 +1956,7 @@ def _roundwright_lifecycle_projection(
         lifecycle.ready_at,
         tuple(supervisor_outcome(ordinal) for ordinal in expected_order),
         sequence_valid,
+        accepted_pass_attempt_identity,
     )
 
 
@@ -1988,16 +2010,19 @@ def _roundwright_fixture_outcomes(
         for item in (repository.get(fixture),)
         if item is not None
     ]
-    exact_attempts = lifecycle.supervisor_sequence_valid
+    accepted_pass = (
+        lifecycle.supervisor_sequence_valid
+        and lifecycle.accepted_pass_attempt_identity is not None
+    )
     outcomes.append(_FixtureOutcome(
         "supervisor-failover",
-        "supervisor-failover" if exact_attempts else "missing",
-        "not-applicable" if exact_attempts else "missing",
-        "actual-sealed-attempts" if exact_attempts else "missing",
-        "accepted" if exact_attempts else "missing",
-        "passed" if exact_attempts else "blocked",
-        "none" if exact_attempts else "missing",
-        "retain-readonly" if exact_attempts else "blocked",
+        "supervisor-failover" if lifecycle.supervisor_sequence_valid else "missing",
+        "not-applicable" if lifecycle.supervisor_sequence_valid else "missing",
+        "actual-sealed-attempts" if lifecycle.supervisor_sequence_valid else "missing",
+        "accepted" if lifecycle.supervisor_sequence_valid else "missing",
+        "passed" if accepted_pass else "blocked",
+        "none" if accepted_pass else "accepted-pass-required",
+        "retain-readonly" if accepted_pass else "blocked",
     ))
     return tuple(outcomes)
 
@@ -2017,10 +2042,13 @@ def _fixture_outcome_differences(
     differences: list[str] = []
     baseline_by_fixture = {item.fixture: item for item in expected}
     for fixture in _LIVE_LIFECYCLE_FIXTURES:
-        if fixture == "supervisor-failover":
+        fields = (
+            ("gates", "blockers", "next_action")
+            if fixture == "supervisor-failover"
             # The known three-attempt sequence is #82 synthetic evidence;
-            # live #49 evidence must preserve, not imitate, its real shape.
-            continue
+            # live #49 preserves its real shape but still requires accepted PASS.
+            else ("classification", "dependencies", "attempt_accounting", "state", "gates", "blockers", "next_action")
+        )
         baseline = baseline_by_fixture.get(fixture)
         if baseline is None:
             differences.append(f"fixture-{fixture}-expectation-missing")
@@ -2029,10 +2057,7 @@ def _fixture_outcome_differences(
         if item is None:
             differences.append(f"fixture-{fixture}-missing")
             continue
-        for field in (
-            "classification", "dependencies", "attempt_accounting", "state",
-            "gates", "blockers", "next_action",
-        ):
+        for field in fields:
             if getattr(baseline, field) != getattr(item, field):
                 differences.append(f"fixture-{fixture}-{field}-drift")
     return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])

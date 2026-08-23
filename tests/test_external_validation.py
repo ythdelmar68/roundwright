@@ -562,12 +562,80 @@ class ExternalValidationTests(unittest.TestCase):
 
         observed = external_validation._roundwright_lifecycle_projection(fresh)
         self.assertTrue(observed.supervisor_sequence_valid)
+        self.assertIsNotNone(observed.accepted_pass_attempt_identity)
         self.assertEqual(observed.supervisor_attempts, (("terra", "high", "pass"),))
         self.assertEqual(
             external_validation._classified_lifecycle_differences(
                 external_validation._roundlet_lifecycle_projection(fresh), observed,
             ), (),
         )
+
+    def test_supervisor_fixture_requires_accepted_pass(self) -> None:
+        """Real failed/finding sequences cannot inherit a passed fixture result."""
+
+        plan = lifecycle_observation._synthetic_plan("e" * 40, 73)
+
+        def project(selected: list[dict[str, object]]) -> lifecycle_observation.LifecycleShadowProjection:
+            predecessor: str | None = None
+            events: list[dict[str, object]] = []
+            for sequence, source in enumerate(selected):
+                event = dict(source)
+                event["sequence"] = sequence
+                event["occurred_at"] = plan["ready_at"] + sequence
+                event["predecessor_event_digest"] = predecessor
+                events.append(event)
+                predecessor = lifecycle_observation._digest(event)
+            core = {
+                "schema": lifecycle_observation.HARNESS_SEAL_RECEIPT_SCHEMA,
+                "status": "sealed", "event_schema": lifecycle_observation.HARNESS_EVENT_SCHEMA,
+                "plan_digest": lifecycle_observation._digest(plan),
+                "window_identity": plan["window_identity"], "repository_identity": plan["repository_identity"],
+                "candidate_sha": plan["candidate_sha"], "ready_at": plan["ready_at"],
+                "event_count": len(events), "head_event_digest": predecessor,
+                "head_entry_digest": "sha256:" + "1" * 64, "manifest_digest": "sha256:" + "2" * 64,
+                "ledger_digest": "sha256:" + "3" * 64, "retention_identity": "sha256:" + "4" * 64,
+            }
+            receipt = SimpleNamespace(as_dict=lambda: {**core, "receipt_digest": lifecycle_observation._digest(core)})
+            return lifecycle_observation.project_lifecycle_events(plan, events, receipt)
+
+        synthetic = lifecycle_observation._synthetic_events(plan)
+        invalid_only = project([event for event in synthetic if event["review_attempt"] == 2])
+        findings_events = [
+            dict(event) for event in synthetic if event["transition"] != "formal_round_advanced"
+        ]
+        for event in findings_events:
+            if event["review_attempt"] == 3 and event["transition"] == "attempt_completed":
+                event["disposition"] = "findings"
+        accepted_findings = project(findings_events)
+        manifest = self.fixture_manifest()
+        expected_repository_outcomes = external_validation._roundlet_fixture_outcomes(manifest)[:-1]
+
+        def fixture_outcome(lifecycle: external_validation._RoundwrightLifecycleProjection) -> object:
+            with patch.object(
+                external_validation, "project_repository_fixture_outcomes",
+                return_value=expected_repository_outcomes,
+            ):
+                return next(
+                    item for item in external_validation._roundwright_fixture_outcomes(
+                        SimpleNamespace(), lifecycle, manifest,
+                    ) if item.fixture == "supervisor-failover"
+                )
+
+        for sealed in (invalid_only, accepted_findings):
+            lifecycle = external_validation._roundwright_lifecycle_projection(sealed)
+            self.assertTrue(lifecycle.supervisor_sequence_valid)
+            self.assertIsNone(lifecycle.accepted_pass_attempt_identity)
+            outcome = fixture_outcome(lifecycle)
+            self.assertEqual(outcome.gates, "blocked")
+            self.assertEqual(outcome.blockers, "accepted-pass-required")
+            with patch.object(
+                external_validation, "project_repository_fixture_outcomes",
+                return_value=expected_repository_outcomes,
+            ):
+                with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
+                    external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(
+                        SimpleNamespace(), lifecycle, manifest,
+                    )
 
     def test_live_lifecycle_ledger_failure_blocks_before_any_inventory_read(self) -> None:
         class NeverCalledCapability:

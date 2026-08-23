@@ -131,6 +131,34 @@ class LifecycleObservationTests(unittest.TestCase):
         unaccepted = lifecycle.project_lifecycle_events(plan, invalid, self.seal(plan, invalid))
         self.assertFalse(unaccepted.events[-1].accepted_result)
 
+    def test_invalid_context_requires_one_unaccepted_result_before_failover(self) -> None:
+        plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
+        events = lifecycle._synthetic_events(plan)
+        unaccepted_index = next(index for index, event in enumerate(events) if event["transition"] == "result_unaccepted")
+
+        missing = [dict(event) for index, event in enumerate(events) if index != unaccepted_index]
+        for sequence, event in enumerate(missing):
+            event["sequence"] = sequence
+        self.rechain(missing)
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "attempt start"):
+            lifecycle.project_lifecycle_events(plan, missing, self.seal(plan, missing))
+
+        duplicate = [dict(event) for event in events]
+        duplicate.insert(unaccepted_index + 1, dict(duplicate[unaccepted_index]))
+        for sequence, event in enumerate(duplicate):
+            event["sequence"] = sequence
+        self.rechain(duplicate)
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "unaccepted"):
+            lifecycle.project_lifecycle_events(plan, duplicate, self.seal(plan, duplicate))
+
+        cross_attempt = [dict(event) for event in events]
+        third_attempt = next(event for event in cross_attempt if event["review_attempt"] == 3)
+        cross_attempt[unaccepted_index]["attempt_identity"] = third_attempt["attempt_identity"]
+        cross_attempt[unaccepted_index]["review_attempt"] = 3
+        self.rechain(cross_attempt)
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "unaccepted"):
+            lifecycle.project_lifecycle_events(plan, cross_attempt, self.seal(plan, cross_attempt))
+
     def test_v1_projection_keeps_its_pre_candidate_semantic_shape_and_identity(self) -> None:
         plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
         events = lifecycle._synthetic_events(plan)
@@ -152,7 +180,7 @@ class LifecycleObservationTests(unittest.TestCase):
         # fixture before profile-private decoding was introduced.
         self.assertEqual(
             lifecycle._digest(payload),
-            "sha256:cb4401bf39dfe698f7a634501a5701fc342ee55b14203dad9bfd8027dbf55e4c",
+            "sha256:ae4a7582dbda6b3c35ebf3fb92c9259ab7f89199415c02ff24d1994ed62c8cb3",
         )
         self.assertTrue(lifecycle.supervisor_profile_artifact("sol", "xhigh").startswith("sha256:"))
         with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "profile artifact"):

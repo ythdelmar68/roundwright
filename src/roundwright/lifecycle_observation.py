@@ -656,6 +656,7 @@ def project_lifecycle_events(
     projected: list[ProjectedLifecycleEvent] = []
     started: dict[str, Mapping[str, Any]] = {}
     completed: dict[str, str] = {}
+    unaccepted_attempts: set[str] = set()
     accepted_attempt: str | None = None
     accepted_disposition: str | None = None
     accepted_count = 0
@@ -684,7 +685,14 @@ def project_lifecycle_events(
         attempt = event["attempt_identity"]
         transition = event["transition"]
         if transition == "attempt_started":
-            if attempt in started or event["disposition"] != "pending":
+            if (
+                attempt in started
+                or event["disposition"] != "pending"
+                or any(
+                    disposition == "invalid_context" and identity not in unaccepted_attempts
+                    for identity, disposition in completed.items()
+                )
+            ):
                 raise LifecycleObservationError("lifecycle attempt start is invalid")
             started[attempt] = event
         elif transition == "attempt_completed":
@@ -716,10 +724,12 @@ def project_lifecycle_events(
             if (
                 event["role"] != "supervisor"
                 or completed.get(attempt) != "invalid_context"
+                or attempt in unaccepted_attempts
                 or event["disposition"] != "unaccepted"
                 or event["accepted_result"]
             ):
                 raise LifecycleObservationError("unaccepted lifecycle result is invalid")
+            unaccepted_attempts.add(attempt)
         elif transition == "formal_round_advanced":
             if (
                 attempt != accepted_attempt
@@ -751,6 +761,10 @@ def project_lifecycle_events(
     if (
         not projected
         or set(started) != set(completed)
+        or unaccepted_attempts != {
+            identity for identity, disposition in completed.items()
+            if disposition == "invalid_context"
+        }
         or not (
             (
                 accepted_attempt is not None
@@ -864,6 +878,7 @@ def _synthetic_events(plan: Mapping[str, object]) -> list[dict[str, object]]:
         (1, "attempt_completed", "cancelled", False),
         (2, "attempt_started", "pending", False),
         (2, "attempt_completed", "invalid_context", False),
+        (2, "result_unaccepted", "unaccepted", False),
         (3, "attempt_started", "pending", False),
         (3, "attempt_completed", "pass", False),
         (3, "result_accepted", "accepted", True),

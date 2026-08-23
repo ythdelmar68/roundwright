@@ -340,6 +340,12 @@ def _safe_token(value: object) -> bool:
     return not any(part in lowered for part in ("token", "secret", "credential", "password", "ghp_"))
 
 
+def _trace_publisher_identity(value: object) -> bool:
+    return type(value) is str and re.fullmatch(
+        r"(?:user|bot|organization|mannequin):[a-z0-9][a-z0-9-]{0,38}", value,
+    ) is not None
+
+
 @dataclass(frozen=True)
 class ProviderAttemptAccountingSnapshot:
     """Public-safe durable records required by the provider-accounting profile.
@@ -1395,6 +1401,7 @@ class LiveLifecycleRuntimeDescriptor:
     fixture_manifest: FixtureSelectionManifest
     trace_repository: str = "ythdelmar68/roundwright"
     trace_pull_request: int = 85
+    trace_publisher_identity: str = "bot:roundwright-bot"
     schema: str = "roundwright-live-lifecycle-runtime/v2"
 
     @classmethod
@@ -1405,7 +1412,7 @@ class LiveLifecycleRuntimeDescriptor:
         if set(raw) != {
             "schema", "target_repository", "target_baseline_sha", "candidate_sha",
             "capture_plan_digest", "case_id", "observation_window", "ready_at", "fixture_manifest", "fixture_manifest_digest",
-            "trace_repository", "trace_pull_request",
+            "trace_repository", "trace_pull_request", "trace_publisher_identity",
         }:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
         try:
@@ -1427,6 +1434,7 @@ class LiveLifecycleRuntimeDescriptor:
             or type(self.ready_at) is not int or self.ready_at < 0
             or self.trace_repository != "ythdelmar68/roundwright"
             or self.trace_pull_request != 85
+            or not _trace_publisher_identity(self.trace_publisher_identity)
             or type(self.fixture_manifest) is not FixtureSelectionManifest
             or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
             != (self.target_repository, self.target_baseline_sha)
@@ -1442,6 +1450,7 @@ class LiveLifecycleRuntimeDescriptor:
             "ready_at": self.ready_at, "fixture_manifest": self.fixture_manifest.payload(),
             "fixture_manifest_digest": self.fixture_manifest.manifest_digest,
             "trace_repository": self.trace_repository, "trace_pull_request": self.trace_pull_request,
+            "trace_publisher_identity": self.trace_publisher_identity,
         }
 
 
@@ -1498,6 +1507,7 @@ class LiveLifecycleRequestInputs:
     fixture_manifest: FixtureSelectionManifest | None = None
     trace_repository: str = "ythdelmar68/roundwright"
     trace_pull_request: int = 85
+    trace_publisher_identity: str = "bot:roundwright-bot"
 
     def __post_init__(self) -> None:
         if (
@@ -1515,6 +1525,7 @@ class LiveLifecycleRequestInputs:
             or (self.fixture_manifest is not None and type(self.fixture_manifest) is not FixtureSelectionManifest)
             or self.trace_repository != "ythdelmar68/roundwright"
             or self.trace_pull_request != 85
+            or not _trace_publisher_identity(self.trace_publisher_identity)
             or (
                 self.lifecycle_ledger.plan["candidate_sha"], self.lifecycle_ledger.plan["ready_at"]
             ) != (self.candidate_sha, self.ready_at)
@@ -1554,6 +1565,7 @@ class LiveLifecyclePreparedRequest:
             "candidate_sha": self.inputs.candidate_sha,
             "trace_repository": self.inputs.trace_repository,
             "trace_pull_request": self.inputs.trace_pull_request,
+            "trace_publisher_identity": self.inputs.trace_publisher_identity,
             "case_id": self.inputs.case_id,
             "observation_window": self.inputs.observation_window,
             "ready_at": self.inputs.ready_at,
@@ -2102,6 +2114,7 @@ class _RoundwrightLiveLifecycleProvider:
         trace_owner, trace_name = inputs.trace_repository.split("/", 1)
         self._trace_repository = RepositoryRef(trace_owner, trace_name)
         self._trace_pull_request = inputs.trace_pull_request
+        self._trace_publisher_identity = inputs.trace_publisher_identity
         self._baseline_sha = inputs.target_baseline_sha
         self._candidate_sha = inputs.candidate_sha
         self._ready_at = inputs.ready_at
@@ -2196,20 +2209,26 @@ class _RoundwrightLiveLifecycleProvider:
             lifecycle.review_mode, self._inputs.observation_window, lifecycle.ready_at,
         )
         expected_marker_digest = _digest(("comment-body", marker))
-        matching_comments = tuple(
+        marker_comments = tuple(
             item for item in comments.comments if item.body_digest == expected_marker_digest
         )
         differences: list[str] = []
-        if not matching_comments:
+        if not marker_comments:
             differences.append("trace-marker-missing")
-        elif len(matching_comments) != 1:
+        elif len(marker_comments) != 1:
             differences.append("trace-marker-duplicate")
+        elif marker_comments[0].author_id != self._trace_publisher_identity:
+            differences.append("trace-publisher-drift")
+        matching_comments = tuple(
+            item for item in marker_comments if item.author_id == self._trace_publisher_identity
+        )
         return _RoundwrightTraceReceipt(_digest({
             "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
             "candidate_sha": self._candidate_sha,
             "review_epoch": lifecycle.review_epoch, "formal_round": lifecycle.formal_round,
             "review_mode": lifecycle.review_mode, "window": self._inputs.observation_window,
             "ready_at": lifecycle.ready_at, "marker_digest": expected_marker_digest,
+            "publisher_identity": self._trace_publisher_identity,
             "comments": [(item.comment_id, item.author_id, item.body_digest, item.created_at) for item in matching_comments],
         }), tuple(sorted(set(differences))))
 
@@ -2357,6 +2376,7 @@ def _prepare_live_lifecycle_shadow_request(
         "target_baseline_sha": inputs.target_baseline_sha,
         "trace_repository": inputs.trace_repository,
         "trace_pull_request": inputs.trace_pull_request,
+        "trace_publisher_identity": inputs.trace_publisher_identity,
         "trace_candidate_sha": inputs.candidate_sha,
         "case_id": inputs.case_id,
         "observation_window": inputs.observation_window,
@@ -2391,7 +2411,7 @@ def _prepare_live_lifecycle_shadow_request(
     descriptor = LiveLifecycleRuntimeDescriptor(
         inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
         plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at, manifest,
-        inputs.trace_repository, inputs.trace_pull_request,
+        inputs.trace_repository, inputs.trace_pull_request, inputs.trace_publisher_identity,
     )
     request_value = {
         "schema": "roundwright-harness-profile-executor-request/v2",
@@ -2502,7 +2522,7 @@ def _validated_live_lifecycle_request(
     expected_descriptor = LiveLifecycleRuntimeDescriptor(
         inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
         prepared_request.capture_plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
-        inputs.fixture_manifest, inputs.trace_repository, inputs.trace_pull_request,
+        inputs.fixture_manifest, inputs.trace_repository, inputs.trace_pull_request, inputs.trace_publisher_identity,
     ).payload()
     if (
         _digest(request_value) != prepared_request.request_digest
@@ -2693,6 +2713,7 @@ def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[s
         "retention_namespace": inputs.retention_namespace,
         "trace_repository": inputs.trace_repository,
         "trace_pull_request": inputs.trace_pull_request,
+        "trace_publisher_identity": inputs.trace_publisher_identity,
         "lifecycle_ledger": inputs.lifecycle_ledger.public_payload(),
         "fixture_manifest": None if inputs.fixture_manifest is None else {
             "value": inputs.fixture_manifest.payload(),

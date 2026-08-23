@@ -294,7 +294,7 @@ class ExternalValidationTests(unittest.TestCase):
             return GitHubReadResult(request, CommentsSnapshot(
                 repository, 85, "PULL_REQUEST", (
                     CommentSnapshot(
-                        "comment-85", "roundwright-bot",
+                        "comment-85", "bot:roundwright-bot",
                         external_validation._digest(("comment-body", external_validation._roundlet_pr_conversation_marker(
                             candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
                         ))),
@@ -750,6 +750,7 @@ class ExternalValidationTests(unittest.TestCase):
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
             "trace_repository": "ythdelmar68/roundwright", "trace_pull_request": 85,
+            "trace_publisher_identity": "bot:roundwright-bot",
             "fixture_manifest": sealed.payload(), "fixture_manifest_digest": sealed.manifest_digest,
         }
         context = adapter.prepare_execution_context(SimpleNamespace(
@@ -916,9 +917,11 @@ class ExternalValidationTests(unittest.TestCase):
         lifecycle = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
         trace_read_result = self.trace_read_result
 
-        def trace_comment(marker: str, identifier: str = "comment-85") -> CommentSnapshot:
+        def trace_comment(
+            marker: str, identifier: str = "comment-85", author: str = "bot:roundwright-bot",
+        ) -> CommentSnapshot:
             return CommentSnapshot(
-                identifier, "roundwright-bot",
+                identifier, author,
                 external_validation._digest(("comment-body", marker)), "2026-08-23T000000Z",
             )
 
@@ -966,7 +969,11 @@ class ExternalValidationTests(unittest.TestCase):
             ("wrong-tuple", TraceCapability(comments=(trace_comment(external_validation._roundlet_pr_conversation_marker(
                 "a" * 40, 2, "formal-round-2", "converging", "window-49", 17,
             )),))),
+            ("wrong-author", TraceCapability(comments=(trace_comment(marker, author="user:untrusted"),))),
             ("duplicate", TraceCapability(comments=(trace_comment(marker), trace_comment(marker, "comment-86")))),
+            ("mixed-author", TraceCapability(comments=(
+                trace_comment(marker), trace_comment(marker, "comment-87", "user:untrusted"),
+            ))),
         ):
             with self.subTest(drift=name):
                 provider = external_validation._RoundwrightLiveLifecycleProvider(drifted, self.live_lifecycle_request_inputs())
@@ -2696,6 +2703,7 @@ class ExternalValidationTests(unittest.TestCase):
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
             "trace_repository": "ythdelmar68/roundwright", "trace_pull_request": 85,
+            "trace_publisher_identity": "bot:roundwright-bot",
             "fixture_manifest": self.fixture_manifest("b" * 40).payload(),
             "fixture_manifest_digest": self.fixture_manifest("b" * 40).manifest_digest,
         }

@@ -294,7 +294,7 @@ class ExternalValidationTests(unittest.TestCase):
             return GitHubReadResult(request, CommentsSnapshot(
                 repository, 85, "PULL_REQUEST", (
                     CommentSnapshot(
-                        "comment-85", "bot:roundwright-bot",
+                        "comment-85", "user:ythdelmar68",
                         external_validation._digest(("comment-body", external_validation._roundlet_pr_conversation_marker(
                             candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
                         ))),
@@ -750,7 +750,7 @@ class ExternalValidationTests(unittest.TestCase):
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
             "trace_repository": "ythdelmar68/roundwright", "trace_pull_request": 85,
-            "trace_publisher_identity": "bot:roundwright-bot",
+            "trace_publisher_identity": "user:ythdelmar68",
             "fixture_manifest": sealed.payload(), "fixture_manifest_digest": sealed.manifest_digest,
         }
         context = adapter.prepare_execution_context(SimpleNamespace(
@@ -918,7 +918,7 @@ class ExternalValidationTests(unittest.TestCase):
         trace_read_result = self.trace_read_result
 
         def trace_comment(
-            marker: str, identifier: str = "comment-85", author: str = "bot:roundwright-bot",
+            marker: str, identifier: str = "comment-85", author: str = "user:ythdelmar68",
         ) -> CommentSnapshot:
             return CommentSnapshot(
                 identifier, author,
@@ -960,6 +960,12 @@ class ExternalValidationTests(unittest.TestCase):
             complete_conversation, self.live_lifecycle_request_inputs(),
         )
         self.assertTrue(provider._trace_receipt_digest(lifecycle).startswith("sha256:"))
+        with tempfile.TemporaryDirectory() as temporary:
+            redefined = replace(
+                self.live_lifecycle_request_inputs(), trace_publisher_identity="user:untrusted",
+            )
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "owner-authorized"):
+                external_validation.preflight_live_lifecycle_shadow_session(redefined, Path(temporary).resolve())
         for name, drifted in (
             ("missing", TraceCapability(comments=())),
             ("wrong-marker", TraceCapability(comments=(trace_comment("ROUNDLET_LIFECYCLE event=unrelated"),))),
@@ -1222,13 +1228,13 @@ class ExternalValidationTests(unittest.TestCase):
                         "issueOrPullRequest": {
                             "__typename": "PullRequest", "number": 85,
                             "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
-                                {"id": "comment-81", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                {"id": "comment-81", "author": {"__typename": "User", "login": "ythdelmar68"},
                                  "body": "ordinary review note\n", "createdAt": "2026-08-22T00:00:00Z"},
-                                {"id": "comment-85", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                {"id": "comment-85", "author": {"__typename": "User", "login": "ythdelmar68"},
                                  "body": external_validation._roundlet_pr_conversation_marker(
                                      inputs.candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
                                  ), "createdAt": "2026-08-23T00:00:00Z"},
-                                {"id": "comment-84", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                {"id": "comment-84", "author": {"__typename": "User", "login": "ythdelmar68"},
                                  "body": "ROUNDLET_LIFECYCLE event=previous-run\n", "createdAt": "2026-08-23T00:01:00Z"},
                             ]},
                         },
@@ -2642,6 +2648,7 @@ class ExternalValidationTests(unittest.TestCase):
                 lifecycle_observation._synthetic_plan("a" * 40, 17), "sha256:" + "3" * 64,
             ),
             self.fixture_manifest(),
+            trace_publisher_identity="user:ythdelmar68",
         )
 
     @staticmethod
@@ -2664,7 +2671,7 @@ class ExternalValidationTests(unittest.TestCase):
             "run_id": "test-run-49", "contract_id": "d" * 64, "leaf": 49,
             "target": {"repository": "ythdelmar68/roundlet-forward-test", "baseline_sha": baseline},
             "binding": {"authoritative_extension_point": "roundwright-harness-profile-executor-request/v2.execution_context", "capture_observation_identity_must_commit_manifest_digest": True, "lifecycle_contract_identity": lifecycle_observation.lifecycle_observation_contract()["contract_identity"], "lifecycle_contract_identity_must_remain_unchanged": True},
-            "authority": {"effect": "external-owner-reviewed-reference-decision", "owner_allowlist": ["ythdelmar68"], "repository_mutation": False, "target_mutation": False},
+            "authority": {"effect": "external-owner-reviewed-reference-decision", "owner_allowlist": ["ythdelmar68"], "trace_publisher_identity": "user:ythdelmar68", "repository_mutation": False, "target_mutation": False},
             "fixtures": [
                 {"fixture": fixture, "selector": selector, "expectation": dict(zip(("classification", "dependencies", "attempt_accounting", "state", "gates", "blockers", "next_action"), expectation, strict=True))}
                 for fixture, selector, expectation in expectations
@@ -2703,7 +2710,7 @@ class ExternalValidationTests(unittest.TestCase):
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
             "trace_repository": "ythdelmar68/roundwright", "trace_pull_request": 85,
-            "trace_publisher_identity": "bot:roundwright-bot",
+            "trace_publisher_identity": "user:ythdelmar68",
             "fixture_manifest": self.fixture_manifest("b" * 40).payload(),
             "fixture_manifest_digest": self.fixture_manifest("b" * 40).manifest_digest,
         }

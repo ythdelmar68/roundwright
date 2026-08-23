@@ -159,6 +159,18 @@ class LifecycleObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "unaccepted"):
             lifecycle.project_lifecycle_events(plan, cross_attempt, self.seal(plan, cross_attempt))
 
+        wrong_task = [dict(event) for event in events]
+        wrong_task[unaccepted_index]["task_identity"] = "sha256:" + "f" * 64
+        self.rechain(wrong_task)
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "unaccepted"):
+            lifecycle.project_lifecycle_events(plan, wrong_task, self.seal(plan, wrong_task))
+
+        wrong_ordinal = [dict(event) for event in events]
+        wrong_ordinal[unaccepted_index]["review_attempt"] = 3
+        self.rechain(wrong_ordinal)
+        with self.assertRaisesRegex(lifecycle.LifecycleObservationError, "unaccepted"):
+            lifecycle.project_lifecycle_events(plan, wrong_ordinal, self.seal(plan, wrong_ordinal))
+
     def test_v1_projection_keeps_its_pre_candidate_semantic_shape_and_identity(self) -> None:
         plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
         events = lifecycle._synthetic_events(plan)

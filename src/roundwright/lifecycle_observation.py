@@ -709,9 +709,12 @@ def project_lifecycle_events(
                 raise LifecycleObservationError("lifecycle attempt completion is invalid")
             completed[attempt] = event["disposition"]
         elif transition == "result_accepted":
+            start = started.get(attempt)
             if (
                 event["role"] != "supervisor"
                 or completed.get(attempt) not in {"pass", "findings"}
+                or start is None
+                or any(event[field] != start[field] for field in ("role", "task_identity", "review_attempt"))
                 or accepted_attempt is not None
                 or event["disposition"] != "accepted"
                 or not event["accepted_result"]
@@ -721,9 +724,12 @@ def project_lifecycle_events(
             accepted_disposition = completed[attempt]
             accepted_count += 1
         elif transition == "result_unaccepted":
+            start = started.get(attempt)
             if (
                 event["role"] != "supervisor"
                 or completed.get(attempt) != "invalid_context"
+                or start is None
+                or any(event[field] != start[field] for field in ("role", "task_identity", "review_attempt"))
                 or attempt in unaccepted_attempts
                 or event["disposition"] != "unaccepted"
                 or event["accepted_result"]

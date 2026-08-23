@@ -1215,11 +1215,15 @@ class FixtureSelectionManifest:
             or raw["binding"].get("lifecycle_contract_identity") != contract["contract_identity"]
             or raw["binding"].get("lifecycle_contract_identity_must_remain_unchanged") is not True
             or type(raw.get("authority")) is not dict
+            or set(raw["authority"]) != {
+                "effect", "owner_allowlist", "repository_mutation", "target_mutation", "trace_publisher_identity",
+            }
             or raw["authority"].get("effect") != "external-owner-reviewed-reference-decision"
             or raw["authority"].get("repository_mutation") is not False
             or raw["authority"].get("target_mutation") is not False
             or type(raw["authority"].get("owner_allowlist")) is not list
             or raw["authority"]["owner_allowlist"] != ["ythdelmar68"]
+            or raw["authority"].get("trace_publisher_identity") != "user:ythdelmar68"
             or type(raw.get("fixtures")) is not list or len(raw["fixtures"]) != len(_LIVE_LIFECYCLE_FIXTURES)
         ):
             raise ExternalValidationAdapterError("fixture manifest is invalid")
@@ -1270,6 +1274,10 @@ class FixtureSelectionManifest:
     @property
     def target_baseline_sha(self) -> str:
         return self.value["target"]["baseline_sha"]  # type: ignore[index]
+
+    @property
+    def trace_publisher_identity(self) -> str:
+        return self.value["authority"]["trace_publisher_identity"]  # type: ignore[index]
 
     def selector_map(self) -> dict[str, tuple[str, int]]:
         return {
@@ -1401,7 +1409,7 @@ class LiveLifecycleRuntimeDescriptor:
     fixture_manifest: FixtureSelectionManifest
     trace_repository: str = "ythdelmar68/roundwright"
     trace_pull_request: int = 85
-    trace_publisher_identity: str = "bot:roundwright-bot"
+    trace_publisher_identity: str | None = None
     schema: str = "roundwright-live-lifecycle-runtime/v2"
 
     @classmethod
@@ -1438,6 +1446,7 @@ class LiveLifecycleRuntimeDescriptor:
             or type(self.fixture_manifest) is not FixtureSelectionManifest
             or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
             != (self.target_repository, self.target_baseline_sha)
+            or self.trace_publisher_identity != self.fixture_manifest.trace_publisher_identity
         ):
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
 
@@ -1507,7 +1516,7 @@ class LiveLifecycleRequestInputs:
     fixture_manifest: FixtureSelectionManifest | None = None
     trace_repository: str = "ythdelmar68/roundwright"
     trace_pull_request: int = 85
-    trace_publisher_identity: str = "bot:roundwright-bot"
+    trace_publisher_identity: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -2353,6 +2362,8 @@ def _prepare_live_lifecycle_shadow_request(
         inputs.target_repository, inputs.target_baseline_sha,
     ):
         raise ExternalValidationAdapterError("live lifecycle fixture manifest target has drifted")
+    if inputs.trace_publisher_identity != manifest.trace_publisher_identity:
+        raise ExternalValidationAdapterError("live lifecycle trace publisher is not owner-authorized")
     store_root_identity = _live_lifecycle_store_root_identity(store_root)
     recorder_identity = _digest({
         "schema": LIVE_LIFECYCLE_SHADOW_SCHEMA,

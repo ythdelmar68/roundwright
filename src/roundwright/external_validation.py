@@ -1908,9 +1908,11 @@ def _roundwright_lifecycle_projection(
         event for event in lifecycle.events
         if event.role == "supervisor" and event.transition == "attempt_completed"
     )
-    expected_order = tuple(range(1, len(completed) + 1))
+    first_ordinal = completed[0].review_attempt if completed else 0
+    expected_order = tuple(range(first_ordinal, first_ordinal + len(completed)))
     sequence_valid = (
         bool(completed)
+        and first_ordinal > 0
         and tuple(event.review_attempt for event in completed) == expected_order
         and len({event.attempt_identity for event in completed}) == len(completed)
     )

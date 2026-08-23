@@ -524,6 +524,51 @@ class ExternalValidationTests(unittest.TestCase):
             (),
         )
 
+    def test_live_lifecycle_projection_accepts_fresh_fallback_attempt_ordinal(self) -> None:
+        """A fresh round-seven window need not reconstruct earlier attempts."""
+
+        plan = lifecycle_observation._synthetic_plan("d" * 40, 71)
+        plan["review_round"] = 7
+        plan["review_mode"] = "converging"
+        predecessor: str | None = None
+        events: list[dict[str, object]] = []
+        for sequence, source in enumerate(
+            event for event in lifecycle_observation._synthetic_events(plan)
+            if event["review_attempt"] == 3
+        ):
+            event = dict(source)
+            event["sequence"] = sequence
+            event["occurred_at"] = plan["ready_at"] + sequence
+            event["review_attempt"] = 2
+            event["attempt_identity"] = lifecycle_observation._digest({
+                "schema": "roundwright-lifecycle-fresh-fallback-attempt/v1",
+                "candidate_sha": plan["candidate_sha"], "review_round": 7, "review_attempt": 2,
+            })
+            event["predecessor_event_digest"] = predecessor
+            events.append(event)
+            predecessor = lifecycle_observation._digest(event)
+        core = {
+            "schema": lifecycle_observation.HARNESS_SEAL_RECEIPT_SCHEMA,
+            "status": "sealed", "event_schema": lifecycle_observation.HARNESS_EVENT_SCHEMA,
+            "plan_digest": lifecycle_observation._digest(plan),
+            "window_identity": plan["window_identity"], "repository_identity": plan["repository_identity"],
+            "candidate_sha": plan["candidate_sha"], "ready_at": plan["ready_at"],
+            "event_count": len(events), "head_event_digest": predecessor,
+            "head_entry_digest": "sha256:" + "1" * 64, "manifest_digest": "sha256:" + "2" * 64,
+            "ledger_digest": "sha256:" + "3" * 64, "retention_identity": "sha256:" + "4" * 64,
+        }
+        receipt = SimpleNamespace(as_dict=lambda: {**core, "receipt_digest": lifecycle_observation._digest(core)})
+        fresh = lifecycle_observation.project_lifecycle_events(plan, events, receipt)
+
+        observed = external_validation._roundwright_lifecycle_projection(fresh)
+        self.assertTrue(observed.supervisor_sequence_valid)
+        self.assertEqual(observed.supervisor_attempts, (("terra", "high", "pass"),))
+        self.assertEqual(
+            external_validation._classified_lifecycle_differences(
+                external_validation._roundlet_lifecycle_projection(fresh), observed,
+            ), (),
+        )
+
     def test_live_lifecycle_ledger_failure_blocks_before_any_inventory_read(self) -> None:
         class NeverCalledCapability:
             def __init__(self) -> None: self.calls = 0

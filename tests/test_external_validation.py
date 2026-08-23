@@ -27,6 +27,8 @@ from roundwright.hosted_evidence import (
     HostedWorkflowRun,
 )
 from roundwright.github import (
+    CommentSnapshot,
+    CommentsSnapshot,
     GitHubContractError,
     GitHubReadOperation,
     GitHubMutationOperation,
@@ -37,6 +39,8 @@ from roundwright.github import (
     RepositoryInventoryFact,
     RepositoryInventorySection,
     RepositoryInventorySnapshot,
+    PullRequestSnapshot,
+    PullRequestState,
 )
 from roundwright.dependency_policy import (
     BootstrapPolicyReceipt,
@@ -275,6 +279,25 @@ def provider_binding(**updates: object) -> ExecutorBinding:
 
 
 class ExternalValidationTests(unittest.TestCase):
+    @staticmethod
+    def trace_read_result(request: GitHubReadRequest, candidate_sha: str) -> GitHubReadResult:
+        """Return the separately-bound implementation PR and Conversation evidence."""
+
+        repository = RepositoryRef("ythdelmar68", "roundwright")
+        if request.operation is GitHubReadOperation.PULL_REQUEST:
+            return GitHubReadResult(request, PullRequestSnapshot(
+                repository, repository, repository, "pull-request-85", 85,
+                PullRequestState.OPEN, "main", "b" * 40, "codex-issue-49",
+                candidate_sha, True,
+            ))
+        if request.operation is GitHubReadOperation.COMMENTS:
+            return GitHubReadResult(request, CommentsSnapshot(
+                repository, 85, "PULL_REQUEST", (
+                    CommentSnapshot("comment-85", "roundwright-bot", "sha256:" + "e" * 64, "2026-08-23T000000Z"),
+                ),
+            ))
+        raise AssertionError("trace fixture received an unexpected read")
+
     def setUp(self) -> None:
         self._prior_package, self._prior_module = fake_harness()
         self._lifecycle_projection = self.live_lifecycle_projection()
@@ -398,10 +421,14 @@ class ExternalValidationTests(unittest.TestCase):
                 "sha256:" + "a" * 64, "sha256:" + "b" * 64, collections, facts,
             )
 
+        trace_read_result = self.trace_read_result
+
         class MismatchCapability:
             def __init__(self) -> None: self.calls = 0
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls += 1
+                if request.operation in {GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.COMMENTS}:
+                    return trace_read_result(request, "a" * 40)
                 return GitHubReadResult(request, inventory(request.repository))
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -421,7 +448,7 @@ class ExternalValidationTests(unittest.TestCase):
         harness = sys.modules["roundwright_harness.executor"]
         snapshot = harness.run_calls[-1][0][2].snapshot
         self.assertEqual(result, {"status": "fake"})
-        self.assertEqual(capability.calls, 3)
+        self.assertEqual(capability.calls, 5)
         self.assertEqual(snapshot.classified_differences, ())
         self.assertEqual(snapshot.candidate_sha, "a" * 40)
         self.assertEqual(snapshot.ready_at, 17)
@@ -716,6 +743,7 @@ class ExternalValidationTests(unittest.TestCase):
             "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
+            "trace_repository": "ythdelmar68/roundwright", "trace_pull_request": 85,
             "fixture_manifest": sealed.payload(), "fixture_manifest_digest": sealed.manifest_digest,
         }
         context = adapter.prepare_execution_context(SimpleNamespace(
@@ -806,12 +834,16 @@ class ExternalValidationTests(unittest.TestCase):
             )
 
     def test_live_lifecycle_durable_session_owns_transport_projection_and_one_shot_execute(self) -> None:
+        trace_read_result = self.trace_read_result
+
         class GenericReadCapability:
             def __init__(self) -> None:
                 self.calls: list[GitHubReadRequest] = []
 
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls.append(request)
+                if request.operation in {GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.COMMENTS}:
+                    return trace_read_result(request, "a" * 40)
                 collections = tuple(sorted((
                     RepositoryInventoryEvidence(section, "sha256:" + format(index, "064x"), (f"{section.value}-1",), 1, True)
                     for index, section in enumerate(RepositoryInventorySection, 1)
@@ -861,6 +893,8 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual([item.operation for item in capability.calls], [
             GitHubReadOperation.REPOSITORY_INVENTORY,
             GitHubReadOperation.REPOSITORY_INVENTORY,
+            GitHubReadOperation.PULL_REQUEST,
+            GitHubReadOperation.COMMENTS,
             GitHubReadOperation.REPOSITORY_INVENTORY,
         ])
         self.assertFalse(hasattr(capability, "read_before"))
@@ -871,6 +905,43 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(snapshot.fixture_classes, external_validation._LIVE_LIFECYCLE_FIXTURES)
         self.assertEqual(snapshot.lifecycle_projection.ledger_digest, "sha256:" + "3" * 64)
         self.assertFalse(hasattr(snapshot, "event_graph"))
+
+    def test_live_lifecycle_trace_read_is_separately_bound_and_rejects_missing_or_drifted_evidence(self) -> None:
+        lifecycle = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
+        trace_read_result = self.trace_read_result
+
+        class TraceCapability:
+            def __init__(self, *, candidate_sha: str = "a" * 40, comments: tuple[CommentSnapshot, ...] | None = None) -> None:
+                self.calls: list[GitHubReadRequest] = []
+                self.candidate_sha = candidate_sha
+                self.comments = comments
+
+            def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+                self.calls.append(request)
+                if request.operation is GitHubReadOperation.COMMENTS and self.comments is not None:
+                    return GitHubReadResult(request, CommentsSnapshot(
+                        RepositoryRef("ythdelmar68", "roundwright"), 85, "PULL_REQUEST", self.comments,
+                    ))
+                return trace_read_result(request, self.candidate_sha)
+
+        capability = TraceCapability()
+        provider = external_validation._RoundwrightLiveLifecycleProvider(capability, self.live_lifecycle_request_inputs())
+        self.assertTrue(provider._trace_receipt_digest(lifecycle).startswith("sha256:"))
+        self.assertEqual(
+            [(request.operation, request.repository.slug, request.number, request.expected_sha) for request in capability.calls],
+            [
+                (GitHubReadOperation.PULL_REQUEST, "ythdelmar68/roundwright", 85, "a" * 40),
+                (GitHubReadOperation.COMMENTS, "ythdelmar68/roundwright", 85, None),
+            ],
+        )
+        for name, drifted, error, message in (
+            ("candidate", TraceCapability(candidate_sha="b" * 40), external_validation.RepositoryInventoryFirstReadBoundaryError, "host-failure"),
+            ("comments", TraceCapability(comments=()), external_validation.ExternalValidationAdapterError, "trace read-back has drifted"),
+        ):
+            with self.subTest(drift=name):
+                provider = external_validation._RoundwrightLiveLifecycleProvider(drifted, self.live_lifecycle_request_inputs())
+                with self.assertRaisesRegex(error, message):
+                    provider._trace_receipt_digest(lifecycle)
 
     def test_live_lifecycle_session_rejects_drift_before_transport_dispatch(self) -> None:
         class NeverCalledCapability:
@@ -948,11 +1019,18 @@ class ExternalValidationTests(unittest.TestCase):
                 tuple(sorted(facts, key=lambda item: (item.subject, item.predicate, item.object))),
             )
 
+        trace_read_result = self.trace_read_result
+
         class DriftingReadCapability:
-            def __init__(self) -> None: self.calls = 0
+            def __init__(self) -> None:
+                self.calls = 0
+                self.inventory_calls = 0
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls += 1
-                evidence = "sha256:" + ("c" if self.calls < 3 else "d") * 64
+                if request.operation in {GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.COMMENTS}:
+                    return trace_read_result(request, "a" * 40)
+                self.inventory_calls += 1
+                evidence = "sha256:" + ("c" if self.inventory_calls < 3 else "d") * 64
                 return GitHubReadResult(request, inventory(request.repository, evidence))
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -963,10 +1041,10 @@ class ExternalValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "zero-mutation"):
                 external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
-        self.assertEqual(capability.calls, 3)
+        self.assertEqual(capability.calls, 5)
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate"])
 
-    def test_public_credentialed_factory_drives_three_product_owned_inventory_reads(self) -> None:
+    def test_public_credentialed_factory_drives_inventory_and_bound_trace_reads(self) -> None:
         """The caller gives the factory only opaque host/evidence, never product data."""
 
         now = datetime(2026, 8, 19, tzinfo=timezone.utc)
@@ -989,7 +1067,11 @@ class ExternalValidationTests(unittest.TestCase):
         health = GitHubCapabilityHealth(tuple(
             OperationHealth(
                 operation,
-                CapabilityState.AVAILABLE if operation is GitHubReadOperation.REPOSITORY_INVENTORY else CapabilityState.UNAVAILABLE,
+                CapabilityState.AVAILABLE if operation in {
+                    GitHubReadOperation.REPOSITORY_INVENTORY,
+                    GitHubReadOperation.PULL_REQUEST,
+                    GitHubReadOperation.COMMENTS,
+                } else CapabilityState.UNAVAILABLE,
                 now, digest(format(index % 10, "x")), now + timedelta(minutes=1),
             )
             for index, operation in enumerate((*GitHubReadOperation, *GitHubMutationOperation))
@@ -1090,6 +1172,24 @@ class ExternalValidationTests(unittest.TestCase):
                 self.commands.append(arguments)
                 if self.exit_code:
                     return OpaqueResult(self.exit_code, "")
+                if arguments[-1:] == ("repos/ythdelmar68/roundwright/pulls/85",):
+                    return OpaqueResult(0, json.dumps({
+                        "id": "pull-request-85", "number": 85, "state": "open", "draft": True,
+                        "merged": False, "merge_commit_sha": None,
+                        "base": {"ref": "main", "sha": "b" * 40, "repo": {"full_name": "ythdelmar68/roundwright"}},
+                        "head": {"ref": "codex-issue-49", "sha": inputs.candidate_sha, "repo": {"full_name": "ythdelmar68/roundwright"}},
+                    }))
+                if "issueOrPullRequest(number:$number)" in arguments[4]:
+                    return OpaqueResult(0, json.dumps({"data": {"repository": {
+                        "name": "roundwright", "owner": {"login": "ythdelmar68"},
+                        "issueOrPullRequest": {
+                            "__typename": "PullRequest", "number": 85,
+                            "comments": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
+                                "id": "comment-85", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                "body": "sealed implementation trace", "createdAt": "2026-08-23T00:00:00Z",
+                            }]},
+                        },
+                    }}}))
                 if "pullRequests(first:100,states" in arguments[4] and type(self.payload) is dict and type(self.payload.get("data")) is dict and type(self.payload["data"].get("repository")) is dict and type(self.payload["data"]["repository"].get("pullRequests")) is dict:
                     initial = self.payload["data"]["repository"]["pullRequests"]
                     self.route_ledger.append(("pull-requests", None, None, initial["pageInfo"]["endCursor"], initial["pageInfo"]["hasNextPage"]))
@@ -1221,12 +1321,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertTrue(projected_labels[0].startswith("label-"))
         self.assertNotIn("needs triage", projected_labels)
         host = OpaqueCredentialHost(raw_inventory)
-        advancing_times = iter((
-            now,
-            now + timedelta(seconds=1),
-            now + timedelta(seconds=2),
-            now + timedelta(seconds=3),
-        ))
+        advancing_times = iter(now + timedelta(seconds=index) for index in range(8))
         capability = create_credentialed_github_read_capability(
             host, binding, dependency_control, health, clock=lambda: next(advancing_times),
         )
@@ -1241,7 +1336,7 @@ class ExternalValidationTests(unittest.TestCase):
                 result = external_validation.execute_live_lifecycle_shadow_session(confirmed.public_receipt(), root, capability)
         harness = sys.modules["roundwright_harness.executor"]
         self.assertEqual(result, {"status": "fake"})
-        inventory_commands = [command for command in host.commands if "object(expression:$oid)" not in command[4]]
+        inventory_commands = [command for command in host.commands if "pullRequests(first:100,states" in command[4]]
         continuation_commands = [command for command in host.commands if "object(expression:$oid)" in command[4]]
         self.assertEqual(len(inventory_commands), 3)
         self.assertEqual(inventory_commands, [inventory_commands[0]] * 3)
@@ -1282,10 +1377,10 @@ class ExternalValidationTests(unittest.TestCase):
         )
 
         class SubprocessLaunchHost(OpaqueCredentialHost):
-            """Hermetic process launcher: its argv must include the executable."""
+            """Hermetic process launcher: every bounded read uses the CLI executable."""
 
             def run(self, arguments: tuple[str, ...]) -> OpaqueResult:
-                if arguments[0:4] != ("gh", "api", "graphql", "-f"):
+                if arguments[0:2] != ("gh", "api"):
                     raise FileNotFoundError("private executable launch marker")
                 return super().run(arguments)
 
@@ -1306,7 +1401,7 @@ class ExternalValidationTests(unittest.TestCase):
                 )
         self.assertEqual(process_result, {"status": "fake"})
         self.assertTrue(process_host.commands)
-        self.assertTrue(all(command[0:4] == ("gh", "api", "graphql", "-f") for command in process_host.commands))
+        self.assertTrue(all(command[0:2] == ("gh", "api") for command in process_host.commands))
         self.assertEqual(
             [arguments[0] for arguments, _ in harness.run_calls],
             ["validate", "execute", "validate", "execute"],
@@ -2564,6 +2659,7 @@ class ExternalValidationTests(unittest.TestCase):
             "target_repository": "ythdelmar68/roundlet-forward-test", "target_baseline_sha": "b" * 40,
             "candidate_sha": plan.candidate_sha, "capture_plan_digest": plan.plan_digest,
             "case_id": plan.case_id, "observation_window": "window-49", "ready_at": plan.ready_at,
+            "trace_repository": "ythdelmar68/roundwright", "trace_pull_request": 85,
             "fixture_manifest": self.fixture_manifest("b" * 40).payload(),
             "fixture_manifest_digest": self.fixture_manifest("b" * 40).manifest_digest,
         }

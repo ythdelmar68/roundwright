@@ -813,6 +813,17 @@ class _OwnerGitHubReadControl:
             raise GitHubRuntimeError("owner read dependency control is invalid") from error
 
     def require(self, request: GitHubReadRequest, binding: CandidateBinding, *, now: datetime) -> None:
+        # The #49 lifecycle profile has one separately sealed source: the
+        # implementation PR Conversation.  Keep that exception narrower than
+        # a second repository authority: it admits only the fixed read-only
+        # PR/comments pair, from the fixed forward-test binding, and the PR
+        # read must still be candidate-bound below.
+        implementation_trace_read = (
+            self.binding.repository == "ythdelmar68/roundlet-forward-test"
+            and request.repository.slug == "ythdelmar68/roundwright"
+            and request.operation in {GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.COMMENTS}
+            and request.number == 85
+        )
         if (
             type(self) is not _OwnerGitHubReadControl
             or type(request) is not GitHubReadRequest
@@ -821,7 +832,7 @@ class _OwnerGitHubReadControl:
             or now.tzinfo is not timezone.utc
             or int(now.timestamp()) < self.now
             or self.binding != binding
-            or self.binding.repository != request.repository.slug
+            or (self.binding.repository != request.repository.slug and not implementation_trace_read)
         ):
             raise GitHubRuntimeError("owner read dependency control is invalid")
         if (

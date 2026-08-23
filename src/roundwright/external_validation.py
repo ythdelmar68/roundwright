@@ -1393,6 +1393,8 @@ class LiveLifecycleRuntimeDescriptor:
     observation_window: str
     ready_at: int
     fixture_manifest: FixtureSelectionManifest
+    trace_repository: str = "ythdelmar68/roundwright"
+    trace_pull_request: int = 85
     schema: str = "roundwright-live-lifecycle-runtime/v2"
 
     @classmethod
@@ -1403,6 +1405,7 @@ class LiveLifecycleRuntimeDescriptor:
         if set(raw) != {
             "schema", "target_repository", "target_baseline_sha", "candidate_sha",
             "capture_plan_digest", "case_id", "observation_window", "ready_at", "fixture_manifest", "fixture_manifest_digest",
+            "trace_repository", "trace_pull_request",
         }:
             raise ExternalValidationAdapterError("live lifecycle runtime descriptor is invalid")
         try:
@@ -1422,6 +1425,8 @@ class LiveLifecycleRuntimeDescriptor:
             or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or not _safe_token(self.case_id) or not _safe_token(self.observation_window)
             or type(self.ready_at) is not int or self.ready_at < 0
+            or self.trace_repository != "ythdelmar68/roundwright"
+            or self.trace_pull_request != 85
             or type(self.fixture_manifest) is not FixtureSelectionManifest
             or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
             != (self.target_repository, self.target_baseline_sha)
@@ -1436,6 +1441,7 @@ class LiveLifecycleRuntimeDescriptor:
             "case_id": self.case_id, "observation_window": self.observation_window,
             "ready_at": self.ready_at, "fixture_manifest": self.fixture_manifest.payload(),
             "fixture_manifest_digest": self.fixture_manifest.manifest_digest,
+            "trace_repository": self.trace_repository, "trace_pull_request": self.trace_pull_request,
         }
 
 
@@ -1490,6 +1496,8 @@ class LiveLifecycleRequestInputs:
     retention_namespace: str
     lifecycle_ledger: LiveLifecycleLedgerBinding
     fixture_manifest: FixtureSelectionManifest | None = None
+    trace_repository: str = "ythdelmar68/roundwright"
+    trace_pull_request: int = 85
 
     def __post_init__(self) -> None:
         if (
@@ -1505,6 +1513,8 @@ class LiveLifecycleRequestInputs:
             or not _safe_token(self.retention_namespace)
             or type(self.lifecycle_ledger) is not LiveLifecycleLedgerBinding
             or (self.fixture_manifest is not None and type(self.fixture_manifest) is not FixtureSelectionManifest)
+            or self.trace_repository != "ythdelmar68/roundwright"
+            or self.trace_pull_request != 85
             or (
                 self.lifecycle_ledger.plan["candidate_sha"], self.lifecycle_ledger.plan["ready_at"]
             ) != (self.candidate_sha, self.ready_at)
@@ -1542,6 +1552,8 @@ class LiveLifecyclePreparedRequest:
             "profile": LIVE_LIFECYCLE_SHADOW_PROFILE,
             "base_sha": self.inputs.base_sha,
             "candidate_sha": self.inputs.candidate_sha,
+            "trace_repository": self.inputs.trace_repository,
+            "trace_pull_request": self.inputs.trace_pull_request,
             "case_id": self.inputs.case_id,
             "observation_window": self.inputs.observation_window,
             "ready_at": self.inputs.ready_at,
@@ -2047,8 +2059,9 @@ class _RoundwrightLiveLifecycleProvider:
         # #49's trace is a second, non-substitutable source: it is read from
         # the exact Roundwright implementation PR, never from the forward
         # target inventory.
-        self._trace_repository = RepositoryRef("ythdelmar68", "roundwright")
-        self._trace_pull_request = 85
+        trace_owner, trace_name = inputs.trace_repository.split("/", 1)
+        self._trace_repository = RepositoryRef(trace_owner, trace_name)
+        self._trace_pull_request = inputs.trace_pull_request
         self._baseline_sha = inputs.target_baseline_sha
         self._candidate_sha = inputs.candidate_sha
         self._ready_at = inputs.ready_at
@@ -2279,8 +2292,8 @@ def _prepare_live_lifecycle_shadow_request(
         "candidate_sha": inputs.candidate_sha,
         "target_repository": inputs.target_repository,
         "target_baseline_sha": inputs.target_baseline_sha,
-        "trace_repository": "ythdelmar68/roundwright",
-        "trace_pull_request": 85,
+        "trace_repository": inputs.trace_repository,
+        "trace_pull_request": inputs.trace_pull_request,
         "trace_candidate_sha": inputs.candidate_sha,
         "case_id": inputs.case_id,
         "observation_window": inputs.observation_window,
@@ -2315,6 +2328,7 @@ def _prepare_live_lifecycle_shadow_request(
     descriptor = LiveLifecycleRuntimeDescriptor(
         inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
         plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at, manifest,
+        inputs.trace_repository, inputs.trace_pull_request,
     )
     request_value = {
         "schema": "roundwright-harness-profile-executor-request/v2",
@@ -2425,7 +2439,7 @@ def _validated_live_lifecycle_request(
     expected_descriptor = LiveLifecycleRuntimeDescriptor(
         inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
         prepared_request.capture_plan_digest, inputs.case_id, inputs.observation_window, inputs.ready_at,
-        inputs.fixture_manifest,
+        inputs.fixture_manifest, inputs.trace_repository, inputs.trace_pull_request,
     ).payload()
     if (
         _digest(request_value) != prepared_request.request_digest
@@ -2614,6 +2628,8 @@ def _live_lifecycle_inputs_payload(inputs: LiveLifecycleRequestInputs) -> dict[s
         "ready_at": inputs.ready_at, "recorder_commit": inputs.recorder_commit,
         "recorder_content": inputs.recorder_content, "recorder_tree": inputs.recorder_tree,
         "retention_namespace": inputs.retention_namespace,
+        "trace_repository": inputs.trace_repository,
+        "trace_pull_request": inputs.trace_pull_request,
         "lifecycle_ledger": inputs.lifecycle_ledger.public_payload(),
         "fixture_manifest": None if inputs.fixture_manifest is None else {
             "value": inputs.fixture_manifest.payload(),

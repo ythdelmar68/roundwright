@@ -702,7 +702,7 @@ def project_lifecycle_events(
         elif transition == "result_accepted":
             if (
                 event["role"] != "supervisor"
-                or completed.get(attempt) != "pass"
+                or completed.get(attempt) not in {"pass", "findings"}
                 or accepted_attempt is not None
                 or event["disposition"] != "accepted"
                 or not event["accepted_result"]
@@ -710,6 +710,14 @@ def project_lifecycle_events(
                 raise LifecycleObservationError("accepted lifecycle result is invalid")
             accepted_attempt = attempt
             accepted_count += 1
+        elif transition == "result_unaccepted":
+            if (
+                event["role"] != "supervisor"
+                or completed.get(attempt) != "invalid_context"
+                or event["disposition"] != "unaccepted"
+                or event["accepted_result"]
+            ):
+                raise LifecycleObservationError("unaccepted lifecycle result is invalid")
         elif transition == "formal_round_advanced":
             if (
                 attempt != accepted_attempt
@@ -740,9 +748,10 @@ def project_lifecycle_events(
     if (
         not projected
         or set(started) != set(completed)
-        or accepted_attempt is None
-        or accepted_count != 1
-        or formal_advance_count != 1
+        or not (
+            (accepted_attempt is not None and accepted_count == 1 and formal_advance_count == 1)
+            or (accepted_attempt is None and accepted_count == 0 and formal_advance_count == 0)
+        )
         or seal.get("head_event_digest") != predecessor
     ):
         raise LifecycleObservationError("lifecycle semantic chain is incomplete")
@@ -759,7 +768,7 @@ def project_lifecycle_events(
         plan["review_round"],
         plan["review_mode"],
         tuple(projected),
-        accepted_attempt,
+        accepted_attempt or _digest({"status": "unaccepted", "head_event": predecessor}),
         seal["ledger_digest"],
         seal["manifest_digest"],
         seal["retention_identity"],

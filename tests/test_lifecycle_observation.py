@@ -112,6 +112,23 @@ class LifecycleObservationTests(unittest.TestCase):
         self.assertEqual(projection.ready_at, self.ready_at)
         self.assertEqual(projection.classified_differences, ())
 
+    def test_live_projection_preserves_findings_and_unaccepted_invalid_context(self) -> None:
+        plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
+        findings = lifecycle._synthetic_events(plan)
+        findings[-3]["disposition"] = "findings"
+        self.rechain(findings)
+        accepted = lifecycle.project_lifecycle_events(plan, findings, self.seal(plan, findings))
+        self.assertEqual(accepted.events[-3].disposition, "findings")
+        self.assertTrue(accepted.events[-2].accepted_result)
+
+        invalid = findings[:4]
+        invalid.append({**invalid[-1], "transition": "result_unaccepted", "disposition": "unaccepted", "accepted_result": False})
+        for sequence, event in enumerate(invalid):
+            event["sequence"] = sequence
+        self.rechain(invalid)
+        unaccepted = lifecycle.project_lifecycle_events(plan, invalid, self.seal(plan, invalid))
+        self.assertFalse(unaccepted.events[-1].accepted_result)
+
     def test_v1_projection_keeps_its_pre_candidate_semantic_shape_and_identity(self) -> None:
         plan = lifecycle._synthetic_plan(self.candidate, self.ready_at)
         events = lifecycle._synthetic_events(plan)

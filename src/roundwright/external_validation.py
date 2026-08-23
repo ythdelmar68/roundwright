@@ -2115,7 +2115,7 @@ class _RoundwrightLiveLifecycleProvider:
             if not any(item.startswith(f"fixture-{fixture}-") for item in differences)
         )
 
-    def _trace_receipt_digest(self) -> str:
+    def _trace_receipt_digest(self, lifecycle: _RoundwrightLifecycleProjection) -> str:
         pull_request = self._read(
             GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, self._trace_repository,
                 number=self._trace_pull_request, expected_sha=self._candidate_sha),
@@ -2140,6 +2140,8 @@ class _RoundwrightLiveLifecycleProvider:
         return _digest({
             "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
             "candidate_sha": self._candidate_sha,
+            "review_epoch": lifecycle.review_epoch, "formal_round": lifecycle.formal_round,
+            "review_mode": lifecycle.review_mode, "ready_at": lifecycle.ready_at,
             "comments": [(item.comment_id, item.author_id, item.body_digest, item.created_at) for item in comments.comments],
         })
 
@@ -2210,7 +2212,11 @@ class _RoundwrightLiveLifecycleProvider:
         sealed_lifecycle: lifecycle_observation.LifecycleShadowProjection,
     ) -> _LiveLifecycleProviderObservation:
         self._armed = True
-        return self._observation(self._inventory(), lifecycle, sealed_lifecycle, self._manifest)
+        observation = self._observation(self._inventory(), lifecycle, sealed_lifecycle, self._manifest)
+        return _LiveLifecycleProviderObservation(
+            {**observation.snapshot_digests, "roundlet-trace": self._trace_receipt_digest(lifecycle)},
+            observation.fixture_classes, observation.classified_differences,
+        )
 
     def read_after(self) -> _LiveLifecycleTargetState:
         if not self._armed:
@@ -2273,6 +2279,9 @@ def _prepare_live_lifecycle_shadow_request(
         "candidate_sha": inputs.candidate_sha,
         "target_repository": inputs.target_repository,
         "target_baseline_sha": inputs.target_baseline_sha,
+        "trace_repository": "ythdelmar68/roundwright",
+        "trace_pull_request": 85,
+        "trace_candidate_sha": inputs.candidate_sha,
         "case_id": inputs.case_id,
         "observation_window": inputs.observation_window,
         "ready_at": inputs.ready_at,

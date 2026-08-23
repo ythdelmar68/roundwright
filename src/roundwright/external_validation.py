@@ -1834,6 +1834,7 @@ def _roundlet_pr_conversation_marker(
         "ROUNDLET_LIFECYCLE event=formal-result"
         f" candidate={candidate_sha} epoch={review_epoch} round={formal_round}"
         f" mode={review_mode} window={observation_window} ready_at={ready_at}"
+        "\n"
     )
 
 
@@ -2199,10 +2200,10 @@ class _RoundwrightLiveLifecycleProvider:
             item for item in comments.comments if item.body_digest == expected_marker_digest
         )
         differences: list[str] = []
-        if len(comments.comments) != 1:
-            differences.append("trace-conversation-drift")
-        if len(matching_comments) != 1:
-            differences.append("trace-marker-drift")
+        if not matching_comments:
+            differences.append("trace-marker-missing")
+        elif len(matching_comments) != 1:
+            differences.append("trace-marker-duplicate")
         return _RoundwrightTraceReceipt(_digest({
             "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
             "candidate_sha": self._candidate_sha,

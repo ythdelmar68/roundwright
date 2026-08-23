@@ -916,9 +916,9 @@ class ExternalValidationTests(unittest.TestCase):
         lifecycle = external_validation._roundwright_lifecycle_projection(self.live_lifecycle_projection())
         trace_read_result = self.trace_read_result
 
-        def trace_comment(marker: str) -> CommentSnapshot:
+        def trace_comment(marker: str, identifier: str = "comment-85") -> CommentSnapshot:
             return CommentSnapshot(
-                "comment-85", "roundwright-bot",
+                identifier, "roundwright-bot",
                 external_validation._digest(("comment-body", marker)), "2026-08-23T000000Z",
             )
 
@@ -945,6 +945,18 @@ class ExternalValidationTests(unittest.TestCase):
                 (GitHubReadOperation.COMMENTS, "ythdelmar68/roundwright", 85, None),
             ],
         )
+        marker = external_validation._roundlet_pr_conversation_marker(
+            "a" * 40, 1, "formal-round-1", "complete", "window-49", 17,
+        )
+        complete_conversation = TraceCapability(comments=(
+            trace_comment("ordinary review note\n", "comment-81"),
+            trace_comment(marker),
+            trace_comment("ROUNDLET_LIFECYCLE event=previous-run\n", "comment-84"),
+        ))
+        provider = external_validation._RoundwrightLiveLifecycleProvider(
+            complete_conversation, self.live_lifecycle_request_inputs(),
+        )
+        self.assertTrue(provider._trace_receipt_digest(lifecycle).startswith("sha256:"))
         for name, drifted in (
             ("missing", TraceCapability(comments=())),
             ("wrong-marker", TraceCapability(comments=(trace_comment("ROUNDLET_LIFECYCLE event=unrelated"),))),
@@ -954,6 +966,7 @@ class ExternalValidationTests(unittest.TestCase):
             ("wrong-tuple", TraceCapability(comments=(trace_comment(external_validation._roundlet_pr_conversation_marker(
                 "a" * 40, 2, "formal-round-2", "converging", "window-49", 17,
             )),))),
+            ("duplicate", TraceCapability(comments=(trace_comment(marker), trace_comment(marker, "comment-86")))),
         ):
             with self.subTest(drift=name):
                 provider = external_validation._RoundwrightLiveLifecycleProvider(drifted, self.live_lifecycle_request_inputs())
@@ -1201,12 +1214,16 @@ class ExternalValidationTests(unittest.TestCase):
                         "name": "roundwright", "owner": {"login": "ythdelmar68"},
                         "issueOrPullRequest": {
                             "__typename": "PullRequest", "number": 85,
-                            "comments": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{
-                                "id": "comment-85", "author": {"__typename": "Bot", "login": "roundwright-bot"},
-                                "body": external_validation._roundlet_pr_conversation_marker(
-                                    inputs.candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
-                                ), "createdAt": "2026-08-23T00:00:00Z",
-                            }]},
+                            "comments": {"totalCount": 3, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+                                {"id": "comment-81", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                 "body": "ordinary review note\n", "createdAt": "2026-08-22T00:00:00Z"},
+                                {"id": "comment-85", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                 "body": external_validation._roundlet_pr_conversation_marker(
+                                     inputs.candidate_sha, 1, "formal-round-1", "complete", "window-49", 17,
+                                 ), "createdAt": "2026-08-23T00:00:00Z"},
+                                {"id": "comment-84", "author": {"__typename": "Bot", "login": "roundwright-bot"},
+                                 "body": "ROUNDLET_LIFECYCLE event=previous-run\n", "createdAt": "2026-08-23T00:01:00Z"},
+                            ]},
                         },
                     }}}))
                 if "pullRequests(first:100,states" in arguments[4] and type(self.payload) is dict and type(self.payload.get("data")) is dict and type(self.payload["data"].get("repository")) is dict and type(self.payload["data"]["repository"].get("pullRequests")) is dict:

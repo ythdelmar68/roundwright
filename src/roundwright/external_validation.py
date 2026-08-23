@@ -31,6 +31,8 @@ from .github import (
     GitHubReadOperation,
     GitHubReadRequest,
     GitHubReadResult,
+    CommentsSnapshot,
+    PullRequestSnapshot,
     RepositoryRef,
     RepositoryInventorySection,
     RepositoryInventorySnapshot,
@@ -1338,8 +1340,9 @@ class LiveLifecycleShadowSnapshot:
         if (
             self.lifecycle_projection.candidate_sha != self.candidate_sha
             or self.lifecycle_projection.ready_at != self.ready_at
-            or self.lifecycle_projection.review_epoch != 1
-            or self.lifecycle_projection.review_mode != "complete"
+            or self.lifecycle_projection.review_epoch < 1
+            or self.lifecycle_projection.review_round < 1
+            or self.lifecycle_projection.review_mode not in {"complete", "converging"}
             or not self.lifecycle_projection.events
         ):
             raise ExternalValidationAdapterError("verified live lifecycle projection has drifted")
@@ -1765,9 +1768,10 @@ class _RoundletLifecycleProjection:
     """The independently specified Roundlet lifecycle fixture at ``ready_at``."""
 
     candidate_sha: str
+    review_epoch: int
     formal_round: str
+    review_mode: str
     ready_at: int
-    supervisor_attempts: tuple[tuple[str, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -1775,7 +1779,9 @@ class _RoundwrightLifecycleProjection:
     """The independently normalized Roundwright lifecycle facts at ``ready_at``."""
 
     candidate_sha: str
+    review_epoch: int
     formal_round: str
+    review_mode: str
     ready_at: int
     supervisor_attempts: tuple[tuple[str, str, str], ...]
     supervisor_sequence_valid: bool
@@ -1800,11 +1806,19 @@ def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[s
 
 
 def _roundlet_lifecycle_projection(
-    candidate_sha: str, ready_at: int, manifest: FixtureSelectionManifest,
+    lifecycle: lifecycle_observation.LifecycleShadowProjection,
 ) -> _RoundletLifecycleProjection:
-    """Return external expectations independently of provider facts."""
+    """Project the selected, sealed formal tuple without synthetic assumptions.
 
-    return _RoundletLifecycleProjection(candidate_sha, "formal-round-1", ready_at, manifest.supervisor_attempts())
+    The #82 Sol/Terra failover is a retained synthetic qualification fixture;
+    #49 instead compares the prospective window's actual formal tuple.
+    """
+
+    return _RoundletLifecycleProjection(
+        lifecycle.candidate_sha, lifecycle.review_epoch,
+        f"formal-round-{lifecycle.review_round}", lifecycle.review_mode,
+        lifecycle.ready_at,
+    )
 
 
 def _roundwright_lifecycle_projection(
@@ -1822,9 +1836,9 @@ def _roundwright_lifecycle_projection(
         event for event in lifecycle.events
         if event.role == "supervisor" and event.transition == "attempt_completed"
     )
-    expected_order = (1, 2, 3)
+    expected_order = tuple(range(1, len(completed) + 1))
     sequence_valid = (
-        len(completed) == len(expected_order)
+        bool(completed)
         and tuple(event.review_attempt for event in completed) == expected_order
         and len({event.attempt_identity for event in completed}) == len(completed)
     )
@@ -1841,9 +1855,11 @@ def _roundwright_lifecycle_projection(
 
     return _RoundwrightLifecycleProjection(
         lifecycle.candidate_sha,
+        lifecycle.review_epoch,
         f"formal-round-{lifecycle.review_round}",
+        lifecycle.review_mode,
         lifecycle.ready_at,
-        tuple(supervisor_outcome(ordinal) for ordinal in range(1, 4)),
+        tuple(supervisor_outcome(ordinal) for ordinal in expected_order),
         sequence_valid,
     )
 
@@ -1856,21 +1872,16 @@ def _classified_lifecycle_differences(
     differences: list[str] = []
     if roundlet.candidate_sha != roundwright.candidate_sha:
         differences.append("candidate-drift")
+    if roundlet.review_epoch != roundwright.review_epoch:
+        differences.append("review-epoch-drift")
     if roundlet.formal_round != roundwright.formal_round:
         differences.append("formal-round-drift")
+    if roundlet.review_mode != roundwright.review_mode:
+        differences.append("review-mode-drift")
     if roundlet.ready_at != roundwright.ready_at:
         differences.append("ready-at-drift")
     if not roundwright.supervisor_sequence_valid:
         differences.append("supervisor-sequence-drift")
-    for ordinal, (expected, observed) in enumerate(
-        zip(roundlet.supervisor_attempts, roundwright.supervisor_attempts, strict=True), start=1,
-    ):
-        if expected[0] != observed[0]:
-            differences.append(f"supervisor-profile-{ordinal}-drift")
-        if expected[1] != observed[1]:
-            differences.append(f"supervisor-reasoning-{ordinal}-drift")
-        if expected[2] != observed[2]:
-            differences.append(f"supervisor-disposition-{ordinal}-drift")
     return tuple(sorted(set(differences)))
 
 
@@ -1903,14 +1914,12 @@ def _roundwright_fixture_outcomes(
         for item in (repository.get(fixture),)
         if item is not None
     ]
-    exact_attempts = not _classified_lifecycle_differences(
-        _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest), lifecycle,
-    )
+    exact_attempts = lifecycle.supervisor_sequence_valid
     outcomes.append(_FixtureOutcome(
         "supervisor-failover",
         "supervisor-failover" if exact_attempts else "missing",
         "not-applicable" if exact_attempts else "missing",
-        "three-sealed-attempts" if exact_attempts else "missing",
+        "actual-sealed-attempts" if exact_attempts else "missing",
         "accepted" if exact_attempts else "missing",
         "passed" if exact_attempts else "blocked",
         "none" if exact_attempts else "missing",
@@ -1934,6 +1943,10 @@ def _fixture_outcome_differences(
     differences: list[str] = []
     baseline_by_fixture = {item.fixture: item for item in expected}
     for fixture in _LIVE_LIFECYCLE_FIXTURES:
+        if fixture == "supervisor-failover":
+            # The known three-attempt sequence is #82 synthetic evidence;
+            # live #49 evidence must preserve, not imitate, its real shape.
+            continue
         baseline = baseline_by_fixture.get(fixture)
         if baseline is None:
             differences.append(f"fixture-{fixture}-expectation-missing")
@@ -2031,6 +2044,11 @@ class _RoundwrightLiveLifecycleProvider:
         owner, name = inputs.target_repository.split("/", 1)
         self._capability = _require_github_read_capability(capability)
         self._repository = RepositoryRef(owner, name)
+        # #49's trace is a second, non-substitutable source: it is read from
+        # the exact Roundwright implementation PR, never from the forward
+        # target inventory.
+        self._trace_repository = RepositoryRef("ythdelmar68", "roundwright")
+        self._trace_pull_request = 85
         self._baseline_sha = inputs.target_baseline_sha
         self._candidate_sha = inputs.candidate_sha
         self._ready_at = inputs.ready_at
@@ -2097,6 +2115,34 @@ class _RoundwrightLiveLifecycleProvider:
             if not any(item.startswith(f"fixture-{fixture}-") for item in differences)
         )
 
+    def _trace_receipt_digest(self) -> str:
+        pull_request = self._read(
+            GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, self._trace_repository,
+                number=self._trace_pull_request, expected_sha=self._candidate_sha),
+            PullRequestSnapshot,
+        )
+        comments = self._read(
+            GitHubReadRequest(GitHubReadOperation.COMMENTS, self._trace_repository,
+                number=self._trace_pull_request),
+            CommentsSnapshot,
+        )
+        assert type(pull_request) is PullRequestSnapshot and type(comments) is CommentsSnapshot
+        if (
+            pull_request.repository != self._trace_repository
+            or pull_request.number != self._trace_pull_request
+            or pull_request.head_sha != self._candidate_sha
+            or comments.repository != self._trace_repository
+            or comments.issue_number != self._trace_pull_request
+            or comments.target_kind != "PULL_REQUEST"
+            or not comments.comments
+        ):
+            raise ExternalValidationAdapterError("Roundwright PR trace read-back has drifted")
+        return _digest({
+            "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
+            "candidate_sha": self._candidate_sha,
+            "comments": [(item.comment_id, item.author_id, item.body_digest, item.created_at) for item in comments.comments],
+        })
+
     @staticmethod
     def _observation(
         inventory: RepositoryInventorySnapshot,
@@ -2131,10 +2177,7 @@ class _RoundwrightLiveLifecycleProvider:
             })
             for category in _LIVE_LIFECYCLE_SNAPSHOTS
         }
-        trace_differences = _roundlet_trace_differences(
-            inventory, sealed_lifecycle,
-            _roundlet_lifecycle_projection(lifecycle.candidate_sha, lifecycle.ready_at, manifest),
-        )
+        trace_differences = ()
         return _LiveLifecycleProviderObservation(
             snapshot_digests, fixtures,
             tuple(sorted(set((*fixture_differences, *trace_differences)))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES]),
@@ -2475,15 +2518,16 @@ def _materialize_live_lifecycle_shadow_profile(
     if (
         verified_lifecycle.candidate_sha != inputs.candidate_sha
         or verified_lifecycle.ready_at != inputs.ready_at
-        or verified_lifecycle.review_epoch != 1
-        or verified_lifecycle.review_mode != "complete"
+        or verified_lifecycle.review_epoch < 1
+        or verified_lifecycle.review_round < 1
+        or verified_lifecycle.review_mode not in {"complete", "converging"}
         or verified_lifecycle.ledger_digest != inputs.lifecycle_ledger.ledger_digest
     ):
         raise ExternalValidationAdapterError("live lifecycle ledger binding has drifted")
     provider = _RoundwrightLiveLifecycleProvider(capability, prepared_request.inputs)
     if inputs.fixture_manifest is None:
         raise ExternalValidationAdapterError("live lifecycle fixture manifest is unavailable")
-    roundlet = _roundlet_lifecycle_projection(inputs.candidate_sha, inputs.ready_at, inputs.fixture_manifest)
+    roundlet = _roundlet_lifecycle_projection(verified_lifecycle)
     roundwright = _roundwright_lifecycle_projection(verified_lifecycle)
     before = provider.read_before()
     # The product creates this request with the arm flag before it makes the

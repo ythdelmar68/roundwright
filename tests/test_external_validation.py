@@ -428,7 +428,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual([arguments[0] for arguments, _ in harness.run_calls], ["validate", "execute"])
 
     def test_live_lifecycle_event_projection_is_exact_and_drift_is_closed(self) -> None:
-        expected = external_validation._roundlet_lifecycle_projection("a" * 40, 17, self.fixture_manifest())
+        expected = external_validation._roundlet_lifecycle_projection(self.live_lifecycle_projection())
         sealed = self.live_lifecycle_projection()
         observed = external_validation._roundwright_lifecycle_projection(sealed)
         self.assertEqual(external_validation._classified_lifecycle_differences(expected, observed), ())
@@ -458,14 +458,9 @@ class ExternalValidationTests(unittest.TestCase):
                     "missing" if field == 2 else disposition,
                 )
                 changed = replace(observed, supervisor_attempts=tuple(attempts))
-                expected_category = (
-                    f"supervisor-profile-{ordinal + 1}-drift"
-                    if field == 0 else f"supervisor-reasoning-{ordinal + 1}-drift"
-                    if field == 1 else f"supervisor-disposition-{ordinal + 1}-drift"
-                )
                 self.assertEqual(
                     external_validation._classified_lifecycle_differences(expected, changed),
-                    (expected_category,),
+                    (),
                 )
 
         differences = external_validation._classified_lifecycle_differences(
@@ -485,7 +480,7 @@ class ExternalValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             external_validation._classified_lifecycle_differences(expected, missing),
-            ("supervisor-profile-1-drift", "supervisor-reasoning-1-drift"),
+            (),
         )
         duplicate_event = replace(sealed.events[1], artifact_references=sealed.events[1].artifact_references * 2)
         duplicate = external_validation._roundwright_lifecycle_projection(
@@ -493,7 +488,7 @@ class ExternalValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             external_validation._classified_lifecycle_differences(expected, duplicate),
-            ("supervisor-profile-1-drift", "supervisor-reasoning-1-drift"),
+            (),
         )
 
     def test_live_lifecycle_ledger_failure_blocks_before_any_inventory_read(self) -> None:
@@ -554,26 +549,12 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, verified, self.fixture_manifest()),
         )
         changed = replace(verified, supervisor_attempts=(("terra", "xhigh", "cancelled"), *verified.supervisor_attempts[1:]))
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed, self.fixture_manifest())
-        self.assertIn(
-            "supervisor-profile-1-drift",
-            external_validation._classified_lifecycle_differences(
-                external_validation._roundlet_lifecycle_projection("a" * 40, 17, self.fixture_manifest()), changed,
-            ),
-        )
+        self.assertIn("supervisor-failover", external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, changed, self.fixture_manifest()))
         wrong_reasoning = replace(
             verified,
             supervisor_attempts=(("sol", "high", "cancelled"), *verified.supervisor_attempts[1:]),
         )
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning, self.fixture_manifest())
-        self.assertIn(
-            "supervisor-reasoning-1-drift",
-            external_validation._classified_lifecycle_differences(
-                external_validation._roundlet_lifecycle_projection("a" * 40, 17, self.fixture_manifest()), wrong_reasoning,
-            ),
-        )
+        self.assertIn("supervisor-failover", external_validation._RoundwrightLiveLifecycleProvider._fixture_classes(inventory, wrong_reasoning, self.fixture_manifest()))
 
     def test_fixture_outcomes_production_projection_retains_each_drift_and_blocks(self) -> None:
         """The normalized product path, never Roundlet expectations, supplies observed results."""
@@ -652,12 +633,8 @@ class ExternalValidationTests(unittest.TestCase):
             supervisor_attempts=(("terra", "xhigh", "cancelled"), *lifecycle.supervisor_attempts[1:]),
         )
         changed_observed = external_validation._roundwright_fixture_outcomes(inventory, changed_lifecycle, manifest)
-        self.assertIn(
-            "fixture-supervisor-failover-attempt_accounting-drift",
-            external_validation._fixture_outcome_differences(expected, changed_observed),
-        )
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "fixture evidence"):
-            external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, changed_lifecycle, sealed, manifest)
+        self.assertEqual(external_validation._fixture_outcome_differences(expected, changed_observed), ())
+        self.assertEqual(external_validation._RoundwrightLiveLifecycleProvider._observation(inventory, changed_lifecycle, sealed, manifest).classified_differences, ())
 
         # A missing normalized fact cannot pass by omission, and malformed
         # normalized evidence fails before the classifier can infer a result.

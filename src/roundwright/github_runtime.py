@@ -5487,11 +5487,23 @@ def _normalize_repository_inventory(request: GitHubReadRequest, raw: object) -> 
                 else:
                     page_count = sum(_inventory_connection_page_count(item) for item in nested[RepositoryInventorySection.CHECKS]) or 1
             else:
-                for connection in connections:
+                scoped_identities: list[tuple[int, str]] = []
+                for connection_index, connection in enumerate(connections, start=1):
                     page = _raw_mapping(connection.get("pageInfo"))
                     nodes = _inventory_connection_nodes(connection, page)
-                    identities.extend(_inventory_section_identity(section, node) for node in nodes)
+                    # Nested provider node IDs (especially labels and closing
+                    # references) are only unique within their parent
+                    # connection.  Preserve that scope in the aggregate
+                    # evidence rather than rejecting legitimate reuse.
+                    scoped_identities.extend(
+                        (connection_index, _inventory_section_identity(section, node)) for node in nodes
+                    )
                     page_count += _inventory_connection_page_count(connection)
+                counts = {identity: sum(item == identity for _, item in scoped_identities) for _, identity in scoped_identities}
+                identities.extend(
+                    identity if counts[identity] == 1 else f"connection-{connection_index}-{identity}"
+                    for connection_index, identity in scoped_identities
+                )
             if not connections:
                 page_count = 1
         identities.sort()

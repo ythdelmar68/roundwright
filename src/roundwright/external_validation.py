@@ -18,6 +18,7 @@ from .shadow import (
     HOSTED_CHECK_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -59,6 +60,7 @@ EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
 HOSTED_CHECK_SCHEMA = "roundwright-hosted-check-evidence/v1"
 LIVE_LIFECYCLE_SHADOW_SCHEMA = "roundwright-live-lifecycle-shadow/v1"
+READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA = "roundwright-read-only-external-observation/v1"
 _SHA = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -143,6 +145,27 @@ def synthetic_component_identities() -> tuple[str, str, str]:
         SYNTHETIC_PRODUCER_IDENTITY,
         SYNTHETIC_EXPORTER_IDENTITY,
         SYNTHETIC_COMPARATOR_IDENTITY,
+    )
+
+
+READ_ONLY_EXTERNAL_OBSERVATION_PRODUCER_IDENTITY = _digest(
+    {"schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA, "component": "typed-read-only-observer"}
+)
+READ_ONLY_EXTERNAL_OBSERVATION_EXPORTER_IDENTITY = _digest(
+    {"schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA, "component": "public-safe-observation-exporter"}
+)
+READ_ONLY_EXTERNAL_OBSERVATION_COMPARATOR_IDENTITY = _digest(
+    {"schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA, "component": "exact-candidate-read-only-comparator"}
+)
+
+
+def read_only_external_observation_component_identities() -> tuple[str, str, str]:
+    """Return the stable Lane A component identities."""
+
+    return (
+        READ_ONLY_EXTERNAL_OBSERVATION_PRODUCER_IDENTITY,
+        READ_ONLY_EXTERNAL_OBSERVATION_EXPORTER_IDENTITY,
+        READ_ONLY_EXTERNAL_OBSERVATION_COMPARATOR_IDENTITY,
     )
 
 
@@ -333,11 +356,146 @@ class SyntheticExecutorAdapter:
         return harness.ProfileComparison(status, result_identity)
 
 
+def _read_only_external_observation_binding_identity(binding: object) -> str:
+    """Bind Lane A to the same candidate-bound V2 plan used by its executor."""
+
+    try:
+        value = {
+            "schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA,
+            "profile": binding.profile,
+            "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at,
+            "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("read-only external observation binding is invalid") from error
+    if (
+        value["profile"] != READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
+        or type(value["case_id"]) is not str
+        or not value["case_id"]
+        or type(value["candidate_sha"]) is not str
+        or _SHA.fullmatch(value["candidate_sha"]) is None
+        or type(value["ready_at"]) is not int
+        or value["ready_at"] < 0
+        or type(value["plan_digest"]) is not str
+        or _DIGEST.fullmatch(value["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("read-only external observation binding is invalid")
+    return _digest(value)
+
+
+@dataclass(frozen=True)
+class ReadOnlyExternalObservationAdapter:
+    """Lane A's stable zero-mutation adapter over the existing V2 executor."""
+
+    provider: ReadOnlyExternalObservationProvider | None = None
+    profile_id: str = READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
+
+    def __post_init__(self) -> None:
+        if (
+            self.profile_id != READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
+            or (self.provider is not None and type(self.provider) is not ReadOnlyExternalObservationProvider)
+        ):
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(
+            *read_only_external_observation_component_identities(),
+        )
+
+    def validate(self, binding: object) -> None:
+        _read_only_external_observation_binding_identity(binding)
+        try:
+            components = (
+                binding.components.producer_identity,
+                binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("read-only external observation components are invalid") from error
+        if components != read_only_external_observation_component_identities():
+            raise ExternalValidationAdapterError("read-only external observation components have drifted")
+
+    def execute(self, binding: object) -> object:
+        identity = _read_only_external_observation_binding_identity(binding)
+        provider = self.provider
+        if provider is None:
+            raise ExternalValidationAdapterError("read-only external observation is unavailable")
+        snapshot = provider.observe()
+        if (snapshot.candidate_sha, snapshot.ready_at) != (binding.candidate_sha, binding.ready_at):
+            raise ExternalValidationAdapterError("read-only external observation has drifted")
+        return _harness_executor().ProfileExecution(
+            {
+                "schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA,
+                "status": "complete",
+                "action": "read-only-external-observation",
+                "binding_identity": identity,
+                "snapshot": snapshot,
+            },
+            mutation_count=0,
+        )
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        identity = _read_only_external_observation_binding_identity(binding)
+        try:
+            value, mutation_count, snapshot = execution.value, execution.mutation_count, execution.value["snapshot"]
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("read-only external observation result is invalid") from error
+        if value != {
+            "schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA,
+            "status": "complete",
+            "action": "read-only-external-observation",
+            "binding_identity": identity,
+            "snapshot": snapshot,
+        } or mutation_count != 0 or type(snapshot) is not ReadOnlyExternalObservationSnapshot:
+            raise ExternalValidationAdapterError("read-only external observation result has drifted")
+        if (snapshot.candidate_sha, snapshot.ready_at) != (binding.candidate_sha, binding.ready_at):
+            raise ExternalValidationAdapterError("read-only external observation has drifted")
+        return {
+            "schema": "roundwright-shadow-case/v2",
+            "profile": READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+            "ready_at": binding.ready_at,
+            "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha,
+            "capture_plan_digest": binding.plan.plan_digest,
+            "read_only_external_observation": {
+                "schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA,
+                "binding_identity": identity,
+                "producer_identity": READ_ONLY_EXTERNAL_OBSERVATION_PRODUCER_IDENTITY,
+                "exporter_identity": READ_ONLY_EXTERNAL_OBSERVATION_EXPORTER_IDENTITY,
+                "comparator_identity": READ_ONLY_EXTERNAL_OBSERVATION_COMPARATOR_IDENTITY,
+                "target_state_digest": snapshot.target_state_digest,
+                "trace_receipt_digest": snapshot.trace_receipt_digest,
+                "fixture_receipt_digest": snapshot.fixture_receipt_digest,
+                "mutation_count": 0,
+            },
+        }
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        expected = self.project(binding, self.execute(binding))
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        return _harness_executor().ProfileComparison(status, _digest({
+            "schema": READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA,
+            "status": status,
+            "ready_at": binding.ready_at,
+            "expected_identity": _digest(expected),
+            "observed_identity": _digest(evidence),
+        }))
+
+
 def _safe_token(value: object) -> bool:
     if type(value) is not str or _TOKEN.fullmatch(value) is None:
         return False
     lowered = value.lower()
     return not any(part in lowered for part in ("token", "secret", "credential", "password", "ghp_"))
+
+
+def _safe_repository(value: object) -> bool:
+    return type(value) is str and re.fullmatch(
+        r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}", value,
+    ) is not None
 
 
 def _trace_publisher_identity(value: object) -> bool:
@@ -2359,6 +2517,167 @@ class _RoundwrightLiveLifecycleProvider:
         )
 
 
+@dataclass(frozen=True)
+class ReadOnlyExternalObservationInputs:
+    """Closed Lane A inputs, intentionally independent of a lifecycle result."""
+
+    target_repository: str
+    target_baseline_sha: str
+    candidate_sha: str
+    trace_repository: str
+    trace_pull_request: int
+    trace_publisher_identity: str
+    review_epoch: int
+    formal_round: str
+    review_mode: str
+    observation_window: str
+    ready_at: int
+    fixture_manifest: FixtureSelectionManifest
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_repository(self.target_repository)
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_repository(self.trace_repository)
+            or type(self.trace_pull_request) is not int or self.trace_pull_request < 1
+            or not _trace_publisher_identity(self.trace_publisher_identity)
+            or type(self.review_epoch) is not int or self.review_epoch < 1
+            or not _safe_token(self.formal_round)
+            or self.review_mode not in {"complete", "converging"}
+            or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.fixture_manifest) is not FixtureSelectionManifest
+            or not self.fixture_manifest.is_owner_sealed
+            or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
+            != (self.target_repository, self.target_baseline_sha)
+            or self.fixture_manifest.trace_publisher_identity != self.trace_publisher_identity
+        ):
+            raise ExternalValidationAdapterError("read-only external observation inputs are invalid")
+
+
+@dataclass(frozen=True)
+class ReadOnlyExternalObservationSnapshot:
+    """Public-safe Lane A evidence from exact external read-back sources."""
+
+    candidate_sha: str
+    ready_at: int
+    target_state_digest: str
+    trace_receipt_digest: str
+    fixture_receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            _SHA.fullmatch(self.candidate_sha) is None
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or any(_DIGEST.fullmatch(item) is None for item in (
+                self.target_state_digest, self.trace_receipt_digest, self.fixture_receipt_digest,
+            ))
+        ):
+            raise ExternalValidationAdapterError("read-only external observation snapshot is invalid")
+
+
+def _lane_a_fixture_differences(
+    inventory: RepositoryInventorySnapshot, manifest: FixtureSelectionManifest,
+) -> tuple[str, ...]:
+    """Compare target-derived fixture facts without admitting Lane B semantics."""
+
+    try:
+        observed = {item.fixture: item for item in project_repository_fixture_outcomes(inventory, manifest.selector_map())}
+    except GitHubRuntimeError as error:
+        raise ExternalValidationAdapterError("read-only external fixture evidence is incomplete") from error
+    expected = {item.fixture: item for item in manifest.expected_outcomes()}
+    differences: list[str] = []
+    for fixture in _LIVE_LIFECYCLE_FIXTURES[:-1]:
+        actual, baseline = observed.get(fixture), expected.get(fixture)
+        if actual is None or baseline is None:
+            differences.append(f"fixture-{fixture}-missing")
+            continue
+        for field in ("classification", "dependencies", "state", "gates", "blockers", "next_action"):
+            if getattr(actual, field) != getattr(baseline, field):
+                differences.append(f"fixture-{fixture}-{field}-drift")
+    return tuple(sorted(set(differences))[:_LIVE_LIFECYCLE_MAX_CLASSIFIED_DIFFERENCES])
+
+
+class ReadOnlyExternalObservationProvider(_RoundwrightLiveLifecycleProvider):
+    """Lane A's exact target/PR read-back without lifecycle-result coupling."""
+
+    def __init__(self, capability: GitHubReadCapability, inputs: ReadOnlyExternalObservationInputs) -> None:
+        owner, name = inputs.target_repository.split("/", 1)
+        trace_owner, trace_name = inputs.trace_repository.split("/", 1)
+        self._capability = _require_github_read_capability(capability)
+        self._repository = RepositoryRef(owner, name)
+        self._trace_repository = RepositoryRef(trace_owner, trace_name)
+        self._baseline_sha = inputs.target_baseline_sha
+        self._candidate_sha = inputs.candidate_sha
+        self._trace_pull_request = inputs.trace_pull_request
+        self._trace_publisher_identity = inputs.trace_publisher_identity
+        self._inputs = inputs
+
+    def _trace_receipt_digest(self) -> str:
+        pull_request = self._read(
+            GitHubReadRequest(GitHubReadOperation.PULL_REQUEST, self._trace_repository,
+                number=self._trace_pull_request, expected_sha=self._candidate_sha), PullRequestSnapshot,
+        )
+        comments = self._read(
+            GitHubReadRequest(GitHubReadOperation.COMMENTS, self._trace_repository,
+                number=self._trace_pull_request), CommentsSnapshot,
+        )
+        assert type(pull_request) is PullRequestSnapshot and type(comments) is CommentsSnapshot
+        marker = _roundlet_pr_conversation_marker(
+            self._candidate_sha, self._inputs.review_epoch, self._inputs.formal_round,
+            self._inputs.review_mode, self._inputs.observation_window, self._inputs.ready_at,
+        )
+        marker_digest = _digest(("comment-body", marker))
+        matching = tuple(item for item in comments.comments if item.body_digest == marker_digest)
+        if (
+            pull_request.repository != self._trace_repository
+            or pull_request.number != self._trace_pull_request
+            or pull_request.base_repository != self._trace_repository
+            or pull_request.head_repository != self._trace_repository
+            or pull_request.head_sha != self._candidate_sha
+            or comments.repository != self._trace_repository
+            or comments.issue_number != self._trace_pull_request
+            or comments.target_kind != "PULL_REQUEST"
+            or len(matching) != 1
+            or matching[0].author_id != self._trace_publisher_identity
+        ):
+            raise ExternalValidationAdapterError("read-only external PR trace has drifted")
+        return _digest({
+            "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
+            "candidate_sha": self._candidate_sha, "review_epoch": self._inputs.review_epoch,
+            "formal_round": self._inputs.formal_round, "review_mode": self._inputs.review_mode,
+            "window": self._inputs.observation_window, "ready_at": self._inputs.ready_at,
+            "publisher": self._trace_publisher_identity, "marker_digest": marker_digest,
+            "comment": (matching[0].comment_id, matching[0].author_id, matching[0].body_digest, matching[0].created_at),
+        })
+
+    def observe(self) -> ReadOnlyExternalObservationSnapshot:
+        before = self._inventory()
+        differences = _lane_a_fixture_differences(before, self._inputs.fixture_manifest)
+        if differences:
+            raise ExternalValidationAdapterError("read-only external fixture evidence has drifted")
+        trace = self._trace_receipt_digest()
+        after = self._inventory()
+        before_digest = self._target_state_digest(before)
+        if before_digest != self._target_state_digest(after):
+            raise ExternalValidationAdapterError("read-only external target mutation has drifted")
+        return ReadOnlyExternalObservationSnapshot(
+            self._candidate_sha, self._inputs.ready_at, before_digest, trace,
+            _digest({"manifest": self._inputs.fixture_manifest.manifest_digest, "differences": differences}),
+        )
+
+
+def create_read_only_external_observation_adapter(
+    capability: GitHubReadCapability, inputs: ReadOnlyExternalObservationInputs,
+) -> ReadOnlyExternalObservationAdapter:
+    """Construct Lane A only around its exact, independently-read sources."""
+
+    return ReadOnlyExternalObservationAdapter(
+        provider=ReadOnlyExternalObservationProvider(capability, inputs),
+    )
+
+
 def _live_lifecycle_store_root_identity(store_root: Path) -> str:
     if not isinstance(store_root, Path) or not store_root.is_absolute():
         raise ExternalValidationAdapterError("live lifecycle store root is invalid")
@@ -3091,11 +3410,13 @@ class LiveLifecycleShadowProfileAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter:
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
         return SyntheticExecutorAdapter(profile_id)
+    if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
+        return ReadOnlyExternalObservationAdapter(profile_id=profile_id)
     if profile_id == PROVIDER_ATTEMPT_ACCOUNTING_PROFILE:
         return ProviderAttemptAccountingAdapter(profile_id)
     if profile_id == HOSTED_CHECK_PROFILE:
@@ -3103,6 +3424,95 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
     if profile_id == LIVE_LIFECYCLE_SHADOW_PROFILE:
         return LiveLifecycleShadowProfileAdapter(profile_id=profile_id)
     raise ExternalValidationAdapterError("executor profile is unsupported")
+
+
+@dataclass(frozen=True)
+class EvidenceLaneReceipt:
+    """One public-safe, candidate-bound Lane A or Lane B state observation."""
+
+    profile_id: str
+    candidate_sha: str
+    state: Literal["prepared", "armed", "verified", "stale"]
+    result: Literal["pass", "fail"] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.profile_id not in {
+                READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+                LIVE_LIFECYCLE_SHADOW_PROFILE,
+            }
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or self.state not in {"prepared", "armed", "verified", "stale"}
+            or (self.state == "verified") != (self.result in {"pass", "fail"})
+            or (self.state != "verified" and self.result is not None)
+        ):
+            raise ExternalValidationAdapterError("evidence lane receipt is invalid")
+
+    def stale(self) -> "EvidenceLaneReceipt":
+        return EvidenceLaneReceipt(self.profile_id, self.candidate_sha, "stale")
+
+
+@dataclass(frozen=True)
+class TwoStageQualification:
+    """Repository-specific Lane A/Supervisor/Lane B qualification ordering."""
+
+    candidate_sha: str
+    lane_a: EvidenceLaneReceipt | None = None
+    lane_b: EvidenceLaneReceipt | None = None
+    supervisor_pass: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            _SHA.fullmatch(self.candidate_sha) is None
+            or type(self.supervisor_pass) is not bool
+            or any(
+                receipt is not None and type(receipt) is not EvidenceLaneReceipt
+                for receipt in (self.lane_a, self.lane_b)
+            )
+            or self.lane_a is not None and self.lane_a.profile_id != READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
+            or self.lane_b is not None and self.lane_b.profile_id != LIVE_LIFECYCLE_SHADOW_PROFILE
+        ):
+            raise ExternalValidationAdapterError("two-stage qualification is invalid")
+
+    def _current(self, receipt: EvidenceLaneReceipt | None) -> bool:
+        return receipt is not None and receipt.candidate_sha == self.candidate_sha and receipt.state != "stale"
+
+    @property
+    def supervisor_dispatch_allowed(self) -> bool:
+        """Lane A passes and Lane B is armed before a Supervisor may start."""
+
+        return (
+            self._current(self.lane_a)
+            and self.lane_a.state == "verified"
+            and self.lane_a.result == "pass"
+            and self._current(self.lane_b)
+            and self.lane_b.state in {"armed", "verified"}
+        )
+
+    @property
+    def lane_b_seal_allowed(self) -> bool:
+        return self.supervisor_dispatch_allowed and self.supervisor_pass
+
+    def merge_qualified(self, *, ci_pass: bool, policy_pass: bool, provenance_pass: bool) -> bool:
+        """Require every current lane plus normal current qualification gates."""
+
+        return (
+            self.lane_b_seal_allowed
+            and self.lane_b is not None
+            and self.lane_b.state == "verified"
+            and self.lane_b.result == "pass"
+            and all(type(value) is bool and value for value in (ci_pass, policy_pass, provenance_pass))
+        )
+
+    def stale_for_candidate(self, candidate_sha: str) -> "TwoStageQualification":
+        if _SHA.fullmatch(candidate_sha) is None:
+            raise ExternalValidationAdapterError("two-stage qualification candidate is invalid")
+        return TwoStageQualification(
+            candidate_sha,
+            self.lane_a.stale() if self.lane_a is not None else None,
+            self.lane_b.stale() if self.lane_b is not None else None,
+            False,
+        )
 
 
 def run_hosted_check_profile(

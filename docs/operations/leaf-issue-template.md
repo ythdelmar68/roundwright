@@ -37,6 +37,24 @@ Roundlet binds the exact current base, candidate, harness, forward-test target,
 environment, case, and contract identities required by reviewed policy. A
 floating ref is never evidence.
 
+## Typed Evidence lanes
+
+A leaf declares `Evidence lanes: []` or an ordered list of one or more typed
+lanes. Each lane records its stable profile/schema, minimum route, capability
+intersection, exact-candidate plan/receipt, arm/seal boundary, consuming gate,
+and public-safe evidence projection. The planning transaction reconciles every
+lane into the leaf and umbrella gate language before the leaf becomes runnable.
+Missing capability intersection blocks the transaction; a Lane A receipt cannot
+substitute for Lane B. A zero-lane declaration loads no Roundwright adapter,
+Harness, Recorder, or lifecycle sink.
+
+For #49, Lane A's read-only external observation completes its full
+prepare→validate→execute→project→seal/verify/compare cycle before Supervisor.
+Lane B is armed before Supervisor and completes only after an accepted PASS.
+Final qualification is conjunctive: current Lane A pass, current Supervisor
+PASS, current Lane B pass, and current CI, policy, and provenance gates.
+Candidate movement stales every lane plan, receipt, and lifecycle window.
+
 Every declaration names `$run-roundwright-external-validation` and records
 whether historical replay uses immutable bundle `ready_at` or is not
 applicable. A current wall-clock timestamp is never a substitute for captured

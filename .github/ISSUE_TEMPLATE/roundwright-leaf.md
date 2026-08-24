@@ -22,6 +22,11 @@ Planning transaction state: `BLOCKED_SCHEDULING`
 
 ## External validation declaration
 
+- Evidence lanes: `[]` | ordered typed lanes below; a zero-lane leaf loads no
+  Roundwright adapter, Harness, Recorder, or lifecycle sink.
+- Lane <name>: <stable profile/schema>; route; required capability intersection;
+  exact-candidate readiness/receipt; arm/seal boundary; consuming gate; public-safe fields.
+- Lane substitution: <forbidden; each lane needs its own current receipt>
 - External validation: `none` | `harness` | `harness+forward-test`
 - Generic Roundlet route: `none` | `toolbox` | `toolbox+disposable-target`
 - External validation execution skill: `$run-roundwright-external-validation`
@@ -45,6 +50,8 @@ Planning transaction state: `BLOCKED_SCHEDULING`
 
 ## Capture-readiness preflight
 
+- Lane qualification order: <Lane A prepare→validate→execute→project→seal/verify/compare
+  before Supervisor; Lane B ARMED before Supervisor, then seal/project/compare after accepted PASS; or N/A>
 - Evidence profile: <schema/profile identity or N/A with reason>
 - Capture mode: <terminal-snapshot or profile-defined mode>
 - Producer: <durable typed source; never raw provider prose>

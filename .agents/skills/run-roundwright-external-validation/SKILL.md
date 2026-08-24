@@ -72,6 +72,32 @@ Record these bindings in the immutable Roundlet selection contract before an
 external process starts. Missing, duplicate, floating, stale, or conflicting
 identity is `BLOCKED`, not a prompt to guess or substitute.
 
+## Reconcile typed evidence lanes
+
+The selected leaf may declare zero, one, or multiple typed Evidence lanes.
+Resolve each lane independently: stable profile/schema, route, exact candidate,
+capability requirements, readiness/receipt contract, and consumer. The usable
+capabilities are the intersection of the lane declaration, root authority,
+selected route, phase, target policy, and exact repository bindings. A missing
+intersection blocks the entire gate; a receipt from one lane never substitutes
+for another. A zero-lane declaration loads neither a Roundwright adapter nor
+Harness, Recorder, or lifecycle behavior.
+
+For the #49 two-stage contract, Lane A is
+`roundwright-shadow-profile/read-only-external-observation/v1`: prepare,
+validate, execute, project, seal/verify/compare it before Supervisor dispatch.
+It is read-only, candidate-bound, and does not depend on a Supervisor result.
+Its execution must consume the exact forward-target inventory and fixture-manifest
+classification, implementation-PR curated trace, immutable `ready_at`, and
+independent before/after zero-mutation target read-back; a plan/binding-only
+projection is not Lane A evidence.
+Lane B is the separately selected generic lifecycle sink: prepare and arm it
+before Supervisor dispatch; only after an accepted Supervisor PASS may it
+seal, project, and compare. Final qualification requires current exact-candidate
+Lane A VERIFIED/pass, Supervisor PASS, Lane B VERIFIED/pass, and normal current
+CI, policy, and provenance gates. Candidate movement makes both lane receipts,
+plans, and lifecycle windows `STALE`; never replay, backfill, or stitch them.
+
 ## Capture-readiness preflight
 
 Before opening an ephemeral observation window, invoking a Recorder, or

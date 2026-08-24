@@ -185,6 +185,24 @@ class ExternalValidationContractTests(unittest.TestCase):
         self.assertNotIn("Capture-readiness preflight", root)
         self.assertNotIn("terminal-snapshot", root)
 
+    def test_typed_evidence_lane_contract_keeps_zero_lane_isolation(self) -> None:
+        paths = (
+            ROOT / ".agents" / "skills" / SKILL_NAME / "SKILL.md",
+            ROOT / ".agents" / "skills" / "create-roundwright-leaf" / "SKILL.md",
+            ROOT / ".github" / "ISSUE_TEMPLATE" / "roundwright-leaf.md",
+            ROOT / "docs" / "operations" / "leaf-issue-template.md",
+            ROOT / "docs" / "operations" / "qualification-test-infrastructure.md",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                value = " ".join(path.read_text(encoding="utf-8").split())
+                self.assertIn("Evidence lanes", value)
+                self.assertIn("zero-lane", value)
+        execution = paths[0].read_text(encoding="utf-8")
+        self.assertIn("read-only-external-observation/v1", execution)
+        self.assertIn("before Supervisor dispatch", execution)
+        self.assertIn("Lane B VERIFIED/pass", execution)
+
 
 if __name__ == "__main__":
     unittest.main()

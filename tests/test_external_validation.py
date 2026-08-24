@@ -73,12 +73,14 @@ from roundwright.shadow import (
     HOSTED_CHECK_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
     LifecycleAttemptKind,
     ShadowV2Event,
     ShadowV2EventGraph,
+    shadow_evidence_profile,
 )
 
 
@@ -338,6 +340,116 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.roundwright_profile_adapter_factory(
                 "roundwright-shadow-profile/unknown/v1"
             )
+
+    def test_lane_a_profile_is_stable_and_has_no_supervisor_dependency(self) -> None:
+        adapter = external_validation.roundwright_profile_adapter_factory(
+            READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+        )
+        components = external_validation.read_only_external_observation_component_identities()
+        exact = binding(
+            profile=READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+            components=SimpleNamespace(
+                producer_identity=components[0], exporter_identity=components[1], comparator_identity=components[2],
+            ),
+        )
+        self.assertEqual(shadow_evidence_profile(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE).arm_before, "before-supervisor-dispatch")
+        adapter.validate(exact)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unavailable"):
+            adapter.execute(exact)
+
+    def test_lane_a_requires_exact_external_sources_and_zero_mutation_read_back(self) -> None:
+        inputs = self.read_only_external_observation_inputs()
+        trace_read_result = self.trace_read_result
+
+        class Capability:
+            def __init__(
+                self, *, mutate_after: bool = False, missing_trace: bool = False,
+                classification_drift: bool = False,
+            ) -> None:
+                self.calls: list[GitHubReadRequest] = []
+                self.inventory_calls = 0
+                self.mutate_after = mutate_after
+                self.missing_trace = missing_trace
+                self.classification_drift = classification_drift
+
+            def read(self, request: GitHubReadRequest) -> GitHubReadResult:
+                self.calls.append(request)
+                if request.operation in {GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.COMMENTS}:
+                    if self.missing_trace and request.operation is GitHubReadOperation.COMMENTS:
+                        return GitHubReadResult(request, CommentsSnapshot(
+                            RepositoryRef("ythdelmar68", "roundwright"), 85, "PULL_REQUEST", (),
+                        ))
+                    return trace_read_result(request, "a" * 40)
+                self.inventory_calls += 1
+                suffix = "b" if self.mutate_after and self.inventory_calls == 2 else "a"
+                snapshot = ExternalValidationTests.read_only_external_observation_inventory(
+                    request.repository, suffix,
+                )
+                if self.classification_drift:
+                    snapshot = replace(snapshot, facts=tuple(
+                        fact for fact in snapshot.facts
+                        if (fact.subject, fact.predicate, fact.object) != ("issue-6", "standalone", "true")
+                    ))
+                return GitHubReadResult(request, snapshot)
+
+        capability = Capability()
+        adapter = external_validation.create_read_only_external_observation_adapter(capability, inputs)
+        components = external_validation.read_only_external_observation_component_identities()
+        exact = binding(
+            profile=READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+            components=SimpleNamespace(
+                producer_identity=components[0], exporter_identity=components[1], comparator_identity=components[2],
+            ),
+        )
+        adapter.validate(exact)
+        evidence = adapter.project(exact, adapter.execute(exact))
+        self.assertEqual(adapter.compare(exact, evidence).status, "pass")
+        self.assertEqual(evidence["read_only_external_observation"]["mutation_count"], 0)
+        self.assertEqual(
+            [request.operation for request in capability.calls],
+            [
+                GitHubReadOperation.REPOSITORY_INVENTORY, GitHubReadOperation.PULL_REQUEST,
+                GitHubReadOperation.COMMENTS, GitHubReadOperation.REPOSITORY_INVENTORY,
+                GitHubReadOperation.REPOSITORY_INVENTORY, GitHubReadOperation.PULL_REQUEST,
+                GitHubReadOperation.COMMENTS, GitHubReadOperation.REPOSITORY_INVENTORY,
+            ],
+        )
+        for name, drifted in (
+            ("missing-trace", Capability(missing_trace=True)),
+            ("target-mutation", Capability(mutate_after=True)),
+            ("fixture-classification", Capability(classification_drift=True)),
+        ):
+            with self.subTest(drift=name):
+                provider = external_validation.ReadOnlyExternalObservationProvider(drifted, inputs)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    provider.observe()
+
+    def test_two_stage_qualification_requires_distinct_current_lanes(self) -> None:
+        candidate = "a" * 40
+        lane_a = external_validation.EvidenceLaneReceipt(
+            READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, candidate, "verified", "pass",
+        )
+        lane_b = external_validation.EvidenceLaneReceipt(
+            LIVE_LIFECYCLE_SHADOW_PROFILE, candidate, "armed",
+        )
+        qualification = external_validation.TwoStageQualification(candidate, lane_a, lane_b)
+        self.assertTrue(qualification.supervisor_dispatch_allowed)
+        self.assertFalse(qualification.lane_b_seal_allowed)
+        self.assertFalse(qualification.merge_qualified(ci_pass=True, policy_pass=True, provenance_pass=True))
+        passed = replace(qualification, supervisor_pass=True, lane_b=external_validation.EvidenceLaneReceipt(
+            LIVE_LIFECYCLE_SHADOW_PROFILE, candidate, "verified", "pass",
+        ))
+        self.assertTrue(passed.lane_b_seal_allowed)
+        self.assertTrue(passed.merge_qualified(ci_pass=True, policy_pass=True, provenance_pass=True))
+        stale = passed.stale_for_candidate("b" * 40)
+        self.assertEqual((stale.lane_a.state, stale.lane_b.state), ("stale", "stale"))
+        self.assertFalse(stale.supervisor_dispatch_allowed)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.TwoStageQualification(candidate, lane_b, lane_a)
+        with patch.object(external_validation, "_harness_executor", side_effect=AssertionError("no external load")):
+            zero_lane = external_validation.TwoStageQualification(candidate)
+            self.assertFalse(zero_lane.supervisor_dispatch_allowed)
+            self.assertFalse(zero_lane.merge_qualified(ci_pass=True, policy_pass=True, provenance_pass=True))
 
     def test_hosted_check_profile_is_context_free_and_disabled_without_a_typed_snapshot(self) -> None:
         adapter = external_validation.roundwright_profile_adapter_factory(HOSTED_CHECK_PROFILE)
@@ -2762,6 +2874,43 @@ class ExternalValidationTests(unittest.TestCase):
             ),
             self.fixture_manifest(),
             trace_publisher_identity="user:ythdelmar68",
+        )
+
+    def read_only_external_observation_inputs(self) -> external_validation.ReadOnlyExternalObservationInputs:
+        return external_validation.ReadOnlyExternalObservationInputs(
+            "ythdelmar68/roundlet-forward-test", "d" * 40, "a" * 40,
+            "ythdelmar68/roundwright", 85, "user:ythdelmar68", 1,
+            "formal-round-1", "complete", "window-49", 17, self.fixture_manifest(),
+        )
+
+    @staticmethod
+    def read_only_external_observation_inventory(
+        repository: RepositoryRef, evidence_suffix: str,
+    ) -> RepositoryInventorySnapshot:
+        collections = tuple(sorted((
+            RepositoryInventoryEvidence(
+                section, "sha256:" + evidence_suffix * 64,
+                (f"{section.value}-1",), 1, True,
+            )
+            for section in RepositoryInventorySection
+        ), key=lambda item: item.section.value))
+        facts = tuple(sorted((
+            RepositoryInventoryFact("issue-1", "child", "issue-2"),
+            RepositoryInventoryFact("issue-1", "state", "open"),
+            RepositoryInventoryFact("issue-3", "depends-on", "issue-1"),
+            RepositoryInventoryFact("issue-3", "state", "closed"),
+            RepositoryInventoryFact("issue-6", "standalone", "true"),
+            RepositoryInventoryFact("issue-6", "state", "closed"),
+            RepositoryInventoryFact("issue-7", "label", "roundlet:ignore"),
+            RepositoryInventoryFact("issue-7", "state", "open"),
+            RepositoryInventoryFact("issue-9", "malformed-parent", "owner-input"),
+            RepositoryInventoryFact("issue-9", "state", "open"),
+            RepositoryInventoryFact("pull-request-10", "state", "merged"),
+        ), key=lambda item: (item.subject, item.predicate, item.object)))
+        return RepositoryInventorySnapshot(
+            repository, "forward-target", "main", "d" * 40,
+            "sha256:" + evidence_suffix * 64, "sha256:" + evidence_suffix * 64,
+            collections, facts,
         )
 
     @staticmethod

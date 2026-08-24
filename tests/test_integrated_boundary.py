@@ -131,6 +131,19 @@ class IntegratedBoundaryTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(IntegratedBoundaryError):
                 self.inputs(**changes)
 
+    def test_selection_expectation_is_closed_and_detects_post_construction_drift(self) -> None:
+        expectation = self.inputs().expectation
+        with self.assertRaises(AttributeError):
+            object.__setattr__(expectation, "unexpected_selection_pin", digest("f"))
+        self.assertIn("integrity_digest", expectation.public_payload())
+        for attribute in ("retention_manifest_digest", "lane_b_qualification_digest"):
+            altered = self.inputs().expectation
+            object.__setattr__(altered, attribute, digest("f"))
+            with self.subTest(attribute=attribute), self.assertRaises(IntegratedBoundaryError):
+                altered.public_payload()
+            with self.subTest(attribute=attribute), self.assertRaises(IntegratedBoundaryError):
+                self.inputs(expectation=altered)
+
     def test_lane_profile_substitution_and_nonzero_mutation_are_rejected(self) -> None:
         with self.assertRaises(IntegratedBoundaryError):
             self.source(RetainedSourceKind.LANE_A).__class__(
@@ -150,8 +163,8 @@ class IntegratedBoundaryTests(unittest.TestCase):
 
     def test_profile_and_public_capability_report_are_narrow(self) -> None:
         profile = shadow_evidence_profile(INTEGRATED_BOUNDARY_PROFILE)
-        self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
-        self.assertEqual(profile.event_kinds, ("composed-evidence-manifest",))
+        self.assertEqual(profile.capture_mode, CaptureMode.COMPOSED_EVIDENCE)
+        self.assertEqual(profile.event_kinds, ("composed-evidence-manifest", "composed-evidence-result"))
         self.assertEqual(dict(phase_3_capability_report()), {
             "codex-provider-runtime": "supported", "github-mutation-fakes": "test-only",
             "forward-target-observation": "read-only", "deployment-and-daemon": "deferred",

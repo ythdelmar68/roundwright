@@ -34,6 +34,7 @@ from .lifecycle_observation import (
 INTEGRATED_BOUNDARY_SCHEMA = "roundwright-integrated-boundary-composition/v1"
 COMPOSED_MANIFEST_SCHEMA = "roundwright-composed-evidence-manifest/v1"
 COMPOSED_RESULT_SCHEMA = "roundwright-composed-evidence-result/v1"
+RETAINED_EVIDENCE_EXPECTATION_SCHEMA = "roundwright-retained-evidence-expectation/v1"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -55,7 +56,7 @@ class RetainedSourceKind(StrEnum):
     SYNTHETIC_REFERENCE = "synthetic-reference"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RetainedEvidenceExpectation:
     """Immutable selection-time identities for the four retained sources."""
 
@@ -68,13 +69,49 @@ class RetainedEvidenceExpectation:
     lane_b_qualification_digest: str
     historical_reference_digest: str
     synthetic_reference_digest: str
+    integrity_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if any(not _DIGEST.fullmatch(value) for value in self.__dict__.values()):
+        if any(not _DIGEST.fullmatch(value) for value in self._pins_payload().values()):
             raise IntegratedBoundaryError("retained evidence expectation is invalid")
+        object.__setattr__(self, "integrity_digest", self._expected_integrity_digest())
+
+    def _pins_payload(self) -> dict[str, str]:
+        """Return exactly the selection-time identities, never instance state."""
+
+        return {
+            "retention_manifest_digest": self.retention_manifest_digest,
+            "lane_a_result_digest": self.lane_a_result_digest,
+            "lane_a_bundle_digest": self.lane_a_bundle_digest,
+            "lane_b_ledger_digest": self.lane_b_ledger_digest,
+            "lane_b_seal_digest": self.lane_b_seal_digest,
+            "lane_b_retention_identity": self.lane_b_retention_identity,
+            "lane_b_qualification_digest": self.lane_b_qualification_digest,
+            "historical_reference_digest": self.historical_reference_digest,
+            "synthetic_reference_digest": self.synthetic_reference_digest,
+        }
+
+    def _expected_integrity_digest(self) -> str:
+        return _digest({"schema": RETAINED_EVIDENCE_EXPECTATION_SCHEMA, "pins": self._pins_payload()})
+
+    def validate_integrity(self) -> None:
+        """Reject post-construction selection-pin drift before any execution."""
+
+        if (
+            type(self) is not RetainedEvidenceExpectation
+            or any(not _DIGEST.fullmatch(value) for value in self._pins_payload().values())
+            or not _DIGEST.fullmatch(self.integrity_digest)
+            or self.integrity_digest != self._expected_integrity_digest()
+        ):
+            raise IntegratedBoundaryError("retained evidence expectation has drifted")
 
     def public_payload(self) -> dict[str, str]:
-        return dict(self.__dict__)
+        self.validate_integrity()
+        return {
+            "schema": RETAINED_EVIDENCE_EXPECTATION_SCHEMA,
+            **self._pins_payload(),
+            "integrity_digest": self.integrity_digest,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,10 +381,12 @@ class IntegratedBoundaryInputs:
 
     def __post_init__(self) -> None:
         sources = (self.lane_a, self.lane_b, self.historical_reference, self.synthetic_reference)
+        if type(self.expectation) is not RetainedEvidenceExpectation:
+            raise IntegratedBoundaryError("integrated evidence inputs are missing, stale, or mixed")
+        self.expectation.validate_integrity()
         if (
             not _SHA.fullmatch(self.candidate_sha) or not _TOKEN.fullmatch(self.case_id)
             or not _DIGEST.fullmatch(self.capture_plan_digest)
-            or type(self.expectation) is not RetainedEvidenceExpectation
             or any(type(source) is not RetainedEvidenceSource for source in sources)
             or any(source.source_digest != _digest(source.public_payload()) for source in sources)
             or tuple(source.kind for source in sources) != tuple(RetainedSourceKind)

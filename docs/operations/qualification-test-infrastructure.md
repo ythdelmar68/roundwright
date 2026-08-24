@@ -239,7 +239,8 @@ capture-plan, immutable `ready_at`, result, bundle, manifest, receipt, and
 retention identities before emitting a new composed manifest. It never opens,
 replays, backfills, or records either lower-level window; it makes zero new
 provider calls and zero target actions, and its lifecycle sink is
-`NOT_SELECTED`. A missing, stale, mixed, duplicate, or unverifiable source
+`NOT_SELECTED`. The retained composition is then executed and read back only
+through the reviewed Harness V2/Recorder path. A missing, stale, mixed, duplicate, or unverifiable source
 fails closed and returns to its owning producer.
 
 Before invocation, persist the exact Roundwright base/candidate SHA, selected

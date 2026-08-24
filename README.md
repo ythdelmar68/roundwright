@@ -151,8 +151,9 @@ The integrated Phase 3 boundary is intentionally narrower still.  Its
 `roundwright-shadow-profile/integrated-boundary/v1` composition accepts only
 the separately retained #49 Lane A and Lane B receipts plus distinct historical
 and synthetic references.  It verifies and projects their public digests into
-one composed manifest, but never invokes a provider, Harness, GitHub, or the
-forward-test target.  The report labels supported, test-only, read-only,
+one composed manifest and result through the reviewed Harness V2/Recorder
+execution path, but never invokes a provider, GitHub, or the forward-test
+target.  The report labels supported, test-only, read-only,
 deferred, and prohibited capabilities without conferring authority.
 
 ## Development check

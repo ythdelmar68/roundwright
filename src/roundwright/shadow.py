@@ -953,6 +953,7 @@ class CaptureMode(StrEnum):
     LIFECYCLE_GRAPH = "lifecycle-graph"
     SYNTHETIC_ONE_SHOT = "synthetic-one-shot"
     ARMED_LIVE_EVENTS = "armed-live-events"
+    COMPOSED_EVIDENCE = "composed-evidence"
 
 
 class ShadowProducer(StrEnum):
@@ -1112,13 +1113,13 @@ _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = ShadowEvidenceProfile(
 
 _INTEGRATED_BOUNDARY_PROFILE = ShadowEvidenceProfile(
     INTEGRATED_BOUNDARY_PROFILE,
-    CaptureMode.TERMINAL_SNAPSHOT,
+    CaptureMode.COMPOSED_EVIDENCE,
     ShadowProducer.PROFILE_DEFINED,
-    "sealed-lower-level-manifests-and-comparison-readback-bound",
+    "reviewed-harness-v2-retained-composition-recorder-readback-bound",
     "after-every-required-lower-level-bundle-is-sealed",
     "append-only-content-addressed-readback",
     "missing-or-stale-source-returns-to-owning-producer",
-    ("composed-evidence-manifest",),
+    ("composed-evidence-manifest", "composed-evidence-result"),
 )
 
 

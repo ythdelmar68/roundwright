@@ -1080,8 +1080,8 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(read_only_external_observation.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(read_only_external_observation.arm_before, "before-supervisor-dispatch")
         self.assertEqual(read_only_external_observation.event_kinds, ("read-only-external-observation",))
-        self.assertEqual(integrated_boundary.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
-        self.assertEqual(integrated_boundary.event_kinds, ("composed-evidence-manifest",))
+        self.assertEqual(integrated_boundary.capture_mode, CaptureMode.COMPOSED_EVIDENCE)
+        self.assertEqual(integrated_boundary.event_kinds, ("composed-evidence-manifest", "composed-evidence-result"))
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

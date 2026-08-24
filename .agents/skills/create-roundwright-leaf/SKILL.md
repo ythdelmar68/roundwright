@@ -73,7 +73,7 @@ umbrella dependency or formal parent. If it blocks or reorders leaves, update
 every affected umbrella exactly as for a child issue. Reject "standalone" when
 the work actually belongs to an existing umbrella contract.
 
-## Select external validation
+## Select typed evidence lanes
 
 Choose the minimum route that can produce the required evidence after reading
 the qualification infrastructure document:
@@ -89,6 +89,16 @@ mutation Canary. A route name never grants a mutation. Mutation remains subject
 to the effective standing repository policy, Phase 4-or-later boundary, exact
 leaf and target allowlist, call budget, rollback, kill switch, and semantic
 read-back.
+
+A leaf declares an ordered `Evidence lanes` list containing zero, one, or
+multiple typed lanes. Each lane names its stable profile/schema identity, route,
+capability requirements, candidate-bound capture/readiness contract, arm/seal
+boundary, consuming gate, and public-safe receipt fields. `[]` is an explicit
+zero-lane declaration and must not load a Roundwright adapter, Harness,
+Recorder, or lifecycle sink. For one or more lanes, intersect every lane's
+required capabilities with root authority, selected route, phase, target policy,
+and live leaf. A missing capability blocks the transaction; never substitute a
+route, profile, receipt, or lane.
 
 At planning time, record the route, gate/evidence class, expected owner
 interaction, the `$run-roundwright-external-validation` execution skill,
@@ -118,7 +128,7 @@ content-addressed store, and immutable capture time. The selected profile's
 readiness preflight must pass before its arm-before boundary. Candidate movement
 requires recapture; planning must never reconstruct missing historical evidence.
 
-Record a separate lifecycle observation selection. Use `NOT_SELECTED` unless
+Record a separate lifecycle observation selection per lane. Use `NOT_SELECTED` unless
 the leaf requires transition-time facts that will not survive cleanup. When it
 is selected, name the exact authoritative
 `docs/operations/lifecycle-observation-contract.json`, the first transition
@@ -134,12 +144,13 @@ Start from the tracked GitHub template and fill every applicable field:
 - planning transaction state and leaf class;
 - formal/prose parent and phase ownership;
 - bounded purpose and exact numbered leaf or standalone dependencies;
-- external-validation declaration, generic route, evidence class, mutation
+- ordered typed Evidence lanes and, for each lane, external-validation
+  declaration, generic route, capability intersection, evidence class, mutation
   mode, execution-skill reference, historical evidence-time rule, owner-input
   expectation, selection-time bindings, and public-safe evidence boundary;
 - Shadow cycle, canonical references, evidence/comparison identity, or a
   concrete N/A reason;
-- lifecycle observation selection (`NOT_SELECTED` or the exact authoritative
+- lifecycle observation selection per lane (`NOT_SELECTED` or the exact authoritative
   contract), event source, arm-before transition, seal boundary, and recapture
   rule;
 - typed and bounded acceptance criteria;

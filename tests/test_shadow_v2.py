@@ -46,6 +46,7 @@ from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
     PROVENANCE_DECISION_PROFILE,
+    READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     ProviderAttemptManifest,
     RecorderBinding,
     ReviewedGitObservation,
@@ -1056,8 +1057,13 @@ class ShadowV2Tests(unittest.TestCase):
         synthetic = shadow_evidence_profile(EXECUTOR_CONTRACT_SYNTHETIC_PROFILE)
         provider_attempts = shadow_evidence_profile("roundwright-shadow-profile/provider-attempt-accounting/v1")
         hosted_checks = shadow_evidence_profile(HOSTED_CHECK_PROFILE)
+        live_lifecycle = shadow_evidence_profile("roundwright-shadow-profile/live-lifecycle-shadow/v1")
+        read_only_external_observation = shadow_evidence_profile(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)
         self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
-        self.assertEqual(shadow_evidence_profiles(), (profile, worker, synthetic, provider_attempts, hosted_checks))
+        self.assertEqual(
+            shadow_evidence_profiles(),
+            (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle, read_only_external_observation),
+        )
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
         self.assertEqual(worker.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
@@ -1066,6 +1072,12 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(synthetic.event_kinds, ("executor-contract-result",))
         self.assertEqual(provider_attempts.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
         self.assertEqual(provider_attempts.arm_before, "before-first-selected-provider-attempt")
+        self.assertEqual(live_lifecycle.capture_mode, CaptureMode.ARMED_LIVE_EVENTS)
+        self.assertEqual(live_lifecycle.arm_before, "before-first-live-lifecycle-event")
+        self.assertEqual(read_only_external_observation.profile_id, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)
+        self.assertEqual(read_only_external_observation.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
+        self.assertEqual(read_only_external_observation.arm_before, "before-supervisor-dispatch")
+        self.assertEqual(read_only_external_observation.event_kinds, ("read-only-external-observation",))
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

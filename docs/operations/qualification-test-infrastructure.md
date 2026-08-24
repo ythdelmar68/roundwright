@@ -199,6 +199,38 @@ candidate SHA, floating ref, missing action, or absent authority.
 
 ## Selection, replay, and evidence discipline
 
+### Typed Evidence lanes and two-stage qualification
+
+A leaf may declare zero, one, or multiple typed Evidence lanes. Each lane has
+its own stable profile/schema, route, capability intersection, candidate-bound
+plan, readiness/result receipt, and consuming gate. Intersect lane requirements
+with the exact leaf, root authority, selected route, phase, and target policy.
+Missing or conflicting capability blocks the full qualification; no receipt,
+profile, plan, or result may satisfy a different lane. A zero-lane declaration
+does not load Roundwright-specific Harness, Recorder, or lifecycle behavior.
+
+For #49, Lane A is
+`roundwright-shadow-profile/read-only-external-observation/v1`. It uses the
+existing reviewed V2 executor and completes prepare, validate, execute,
+project, seal/verify, and compare before Supervisor dispatch. It is read-only
+and has no dependency on accepted Supervisor PASS. Its receipt binds the exact
+forward-target inventory and fixture classification, implementation-PR curated
+trace, immutable `ready_at`, and before/after target zero-mutation read-back;
+a plan or candidate binding alone cannot qualify it. The Lane A trace is a
+pre-Supervisor `ROUNDLET_VALIDATION event=readiness` marker bound to candidate,
+plan, tuple, window, readiness, and publisher; the post-review formal-result
+marker is Lane B-only and is not substitutable. Lane A is invoked only through
+the product-hosted `run_read_only_external_observation_profile` V2 entrypoint,
+which receives the closed request, durable store, trusted typed host capability,
+and execute-time readiness receipt; the generic Harness CLI/factory is reserved
+for context-free profiles. Lane B is the opt-in generic
+lifecycle sink: it is ready and `ARMED` before Supervisor dispatch, and only an
+accepted PASS permits its later seal, projection, and comparison. Final merge
+qualification requires all current exact-candidate facts conjunctively: Lane A
+`VERIFIED/pass`, Supervisor PASS, Lane B `VERIFIED/pass`, CI/check, policy, and
+provenance. Candidate movement stales both lane plans/receipts and every
+lifecycle window; no replay, backfill, or stitching is permitted.
+
 Before invocation, persist the exact Roundwright base/candidate SHA, selected
 leaf, route, policy and skill blobs, contract/configuration, harness commit,
 target baseline when applicable, environment, observation window or action,

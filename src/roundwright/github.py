@@ -22,9 +22,19 @@ _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,255}\Z")
+_REMOTE_HEAD_IDENTITY = re.compile(r"(?=.{1,256}\Z)[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99})*\Z")
 _REVIEWER = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[[A-Za-z0-9-]{1,39}\])?|[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9-]{0,99})\Z")
 _PUBLIC_TEXT = re.compile(r"[^\x00-\x1f\x7f]{1,512}\Z")
 _COMMENT_TEXT = re.compile(r"(?s)[^\x00\x7f]{1,65536}\Z")
+
+
+def _is_safe_remote_head_identity(value: str) -> bool:
+    return bool(
+        _REMOTE_HEAD_IDENTITY.fullmatch(value)
+        and ".." not in value
+        and not value.endswith(".")
+        and all(not component.endswith(".lock") for component in value.split("/"))
+    )
 
 
 class GitHubContractError(ValueError):
@@ -33,6 +43,7 @@ class GitHubContractError(ValueError):
 
 class GitHubReadOperation(StrEnum):
     REPOSITORY = "repository"
+    REPOSITORY_INVENTORY = "repository-inventory"
     ISSUE = "issue"
     ISSUE_RELATIONSHIPS = "issue-relationships"
     COMMENTS = "comments"
@@ -67,6 +78,29 @@ class GitHubFailureKind(StrEnum):
     MALFORMED_RESPONSE = "malformed-response"
     STALE_RESPONSE = "stale-response"
     POLICY_DENIED = "policy-denied"
+
+
+class RepositoryInventorySection(StrEnum):
+    """Provider-neutral complete collections in a public repository inventory.
+
+    These names describe GitHub resources, not a Roundwright profile.  A
+    product profile can decide which resources it needs without making its
+    caller manufacture profile-shaped observations.
+    """
+
+    REPOSITORY = "repository"
+    ISSUES = "issues"
+    ISSUE_RELATIONSHIPS = "issue-relationships"
+    ISSUE_LABELS = "issue-labels"
+    PULL_REQUESTS = "pull-requests"
+    COMMENTS = "comments"
+    REVIEWS = "reviews"
+    REQUESTED_REVIEWERS = "requested-reviewers"
+    CHECKS = "checks"
+    WORKFLOW_RUNS = "workflow-runs"
+    MERGEABILITY = "mergeability"
+    CLOSING_REFERENCES = "closing-references"
+    REMOTE_HEADS = "remote-heads"
 
 
 class IssueState(StrEnum):
@@ -149,7 +183,7 @@ class GitHubReadRequest:
             _validate_sha(self.expected_sha, "expected sha")
         numbered = {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS, GitHubReadOperation.COMMENTS, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
         ref_required = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD}
-        candidate_bound = {GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
+        candidate_bound = {GitHubReadOperation.REPOSITORY_INVENTORY, GitHubReadOperation.BRANCH, GitHubReadOperation.REMOTE_HEAD, GitHubReadOperation.PULL_REQUEST, GitHubReadOperation.REVIEWS, GitHubReadOperation.REQUESTED_REVIEWERS, GitHubReadOperation.CHECKS, GitHubReadOperation.WORKFLOW_RUNS, GitHubReadOperation.MERGEABILITY, GitHubReadOperation.CLOSING_REFERENCES}
         if self.operation in numbered and self.number is None:
             raise GitHubContractError("read request requires a number")
         if self.operation not in numbered and self.number is not None:
@@ -495,7 +529,115 @@ class RemoteHeadSnapshot:
         _validate_sha(self.sha, "remote head sha")
 
 
-GitHubSnapshot: TypeAlias = RepositorySnapshot | IssueSnapshot | CommentsSnapshot | BranchSnapshot | PullRequestSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot | ChecksSnapshot | WorkflowRunsSnapshot | MergeabilitySnapshot | ClosingReferencesSnapshot | RemoteHeadSnapshot
+@dataclass(frozen=True)
+class RepositoryInventoryEvidence:
+    """One complete normalized repository collection.
+
+    ``item_identities`` are public-safe stable provider identities.  The host
+    must prove terminal pagination before constructing this value; callers can
+    neither supply partial pages nor smuggle raw provider objects into product
+    code.
+    """
+
+    section: RepositoryInventorySection
+    evidence_identity: str
+    item_identities: tuple[str, ...]
+    page_count: int
+    complete: bool
+
+    def __post_init__(self) -> None:
+        if type(self.section) is not RepositoryInventorySection:
+            raise GitHubContractError("inventory section is invalid")
+        _validate_digest(self.evidence_identity, "inventory evidence")
+        identity_pattern = _REMOTE_HEAD_IDENTITY if self.section is RepositoryInventorySection.REMOTE_HEADS else _TOKEN
+        if (
+            type(self.item_identities) is not tuple
+            or any(
+                type(item) is not str
+                or not (
+                    _is_safe_remote_head_identity(item)
+                    if self.section is RepositoryInventorySection.REMOTE_HEADS
+                    else identity_pattern.fullmatch(item)
+                )
+                for item in self.item_identities
+            )
+            or tuple(sorted(self.item_identities)) != self.item_identities
+            or len(set(self.item_identities)) != len(self.item_identities)
+            or type(self.page_count) is not int
+            # A section can aggregate terminal pages from many nested
+            # connections (for example, one comment connection per issue).
+            # Each individual connection remains bounded to 32 pages by the
+            # host; the normalized aggregate is bounded by its 3200-item cap.
+            or not 1 <= self.page_count <= 3200
+            or type(self.complete) is not bool
+            or not self.complete
+            or len(self.item_identities) > 3200
+        ):
+            raise GitHubContractError("inventory collection is incomplete or invalid")
+
+
+@dataclass(frozen=True)
+class RepositoryInventoryFact:
+    """A normalized public relationship emitted by the generic inventory host."""
+
+    subject: str
+    predicate: str
+    object: str
+
+    def __post_init__(self) -> None:
+        for value in (self.subject, self.predicate, self.object):
+            if type(value) is not str or not _TOKEN.fullmatch(value):
+                raise GitHubContractError("inventory fact is invalid")
+
+
+@dataclass(frozen=True)
+class RepositoryInventorySnapshot:
+    """Immutable, complete, read-only public repository inventory.
+
+    It binds all generic GitHub resource collections to a repository default
+    branch head.  Profiles derive their own projections from the inventory;
+    the generic caller never supplies issue/PR lists, labels, or fixtures.
+    """
+
+    repository: RepositoryRef
+    repository_id: str
+    default_branch: str
+    baseline_sha: str
+    repository_evidence_identity: str
+    default_branch_evidence_identity: str
+    collections: tuple[RepositoryInventoryEvidence, ...]
+    facts: tuple[RepositoryInventoryFact, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.repository) is not RepositoryRef:
+            raise GitHubContractError("inventory repository is invalid")
+        _validate_token(self.repository_id, "inventory repository id")
+        if type(self.default_branch) is not str or not _IDENTIFIER.fullmatch(self.default_branch):
+            raise GitHubContractError("inventory default branch is invalid")
+        _validate_sha(self.baseline_sha, "inventory baseline sha")
+        _validate_digest(self.repository_evidence_identity, "inventory repository evidence")
+        _validate_digest(self.default_branch_evidence_identity, "inventory branch evidence")
+        if (
+            type(self.collections) is not tuple
+            or any(type(item) is not RepositoryInventoryEvidence for item in self.collections)
+            or {item.section for item in self.collections} != set(RepositoryInventorySection)
+            or len(self.collections) != len(RepositoryInventorySection)
+            or tuple(sorted(self.collections, key=lambda item: item.section.value)) != self.collections
+            or type(self.facts) is not tuple
+            or any(type(item) is not RepositoryInventoryFact for item in self.facts)
+            or tuple(sorted(self.facts, key=lambda item: (item.subject, item.predicate, item.object))) != self.facts
+            or len(set(self.facts)) != len(self.facts)
+            or len(self.facts) > 6400
+        ):
+            raise GitHubContractError("repository inventory is incomplete or invalid")
+
+    def collection(self, section: RepositoryInventorySection) -> RepositoryInventoryEvidence:
+        if type(section) is not RepositoryInventorySection:
+            raise GitHubContractError("inventory section is invalid")
+        return next(item for item in self.collections if item.section is section)
+
+
+GitHubSnapshot: TypeAlias = RepositorySnapshot | RepositoryInventorySnapshot | IssueSnapshot | CommentsSnapshot | BranchSnapshot | PullRequestSnapshot | ReviewsSnapshot | RequestedReviewersSnapshot | ChecksSnapshot | WorkflowRunsSnapshot | MergeabilitySnapshot | ClosingReferencesSnapshot | RemoteHeadSnapshot
 
 
 @dataclass(frozen=True)
@@ -733,6 +875,20 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
                 _string(response, "default_branch_sha"), _string(response, "repository_evidence_identity"),
                 _string(response, "default_branch_evidence_identity"),
             )
+        if operation is GitHubReadOperation.REPOSITORY_INVENTORY:
+            _exact_shape(response, {"repository", "id", "default_branch", "baseline_sha", "repository_evidence_identity", "default_branch_evidence_identity", "collections", "facts"})
+            collections = tuple(RepositoryInventoryEvidence(
+                RepositoryInventorySection(_string(item, "section")), _string(item, "evidence_identity"),
+                tuple(_strings(item, "item_identities")), _integer(item, "page_count"), _boolean(item, "complete"),
+            ) for item in _mappings(response, "collections", {"section", "evidence_identity", "item_identities", "page_count", "complete"}))
+            facts = tuple(RepositoryInventoryFact(
+                _string(item, "subject"), _string(item, "predicate"), _string(item, "object"),
+            ) for item in _mappings(response, "facts", {"subject", "predicate", "object"}))
+            return RepositoryInventorySnapshot(
+                _repository(response), _string(response, "id"), _string(response, "default_branch"),
+                _string(response, "baseline_sha"), _string(response, "repository_evidence_identity"),
+                _string(response, "default_branch_evidence_identity"), collections, facts,
+            )
         if operation in {GitHubReadOperation.ISSUE, GitHubReadOperation.ISSUE_RELATIONSHIPS}:
             _exact_shape(response, {"repository", "id", "number", "state", "parent_number", "sub_issue_numbers", "issue_evidence_identity", "relationship_evidence_identity"})
             return IssueSnapshot(
@@ -797,6 +953,7 @@ def normalize_github_response(request: GitHubReadRequest, response: Mapping[str,
 def _validate_snapshot_for(request: GitHubReadRequest, snapshot: GitHubSnapshot) -> None:
     expected: dict[GitHubReadOperation, type[object]] = {
         GitHubReadOperation.REPOSITORY: RepositorySnapshot,
+        GitHubReadOperation.REPOSITORY_INVENTORY: RepositoryInventorySnapshot,
         GitHubReadOperation.ISSUE: IssueSnapshot,
         GitHubReadOperation.ISSUE_RELATIONSHIPS: IssueSnapshot,
         GitHubReadOperation.COMMENTS: CommentsSnapshot,
@@ -831,7 +988,7 @@ def _validate_snapshot_for(request: GitHubReadRequest, snapshot: GitHubSnapshot)
 
 
 def _snapshot_sha(snapshot: GitHubSnapshot) -> str | None:
-    for name in ("sha", "head_sha", "candidate_sha", "default_branch_sha"):
+    for name in ("sha", "head_sha", "candidate_sha", "baseline_sha", "default_branch_sha"):
         value = getattr(snapshot, name, None)
         if type(value) is str:
             return value
@@ -863,7 +1020,7 @@ def _mutation_failure(intent: GitHubMutationIntent, kind: GitHubFailureKind, rea
 
 
 def _is_snapshot(value: object) -> bool:
-    return type(value) in {RepositorySnapshot, IssueSnapshot, CommentsSnapshot, BranchSnapshot, PullRequestSnapshot, ReviewsSnapshot, RequestedReviewersSnapshot, ChecksSnapshot, WorkflowRunsSnapshot, MergeabilitySnapshot, ClosingReferencesSnapshot, RemoteHeadSnapshot}
+    return type(value) in {RepositorySnapshot, RepositoryInventorySnapshot, IssueSnapshot, CommentsSnapshot, BranchSnapshot, PullRequestSnapshot, ReviewsSnapshot, RequestedReviewersSnapshot, ChecksSnapshot, WorkflowRunsSnapshot, MergeabilitySnapshot, ClosingReferencesSnapshot, RemoteHeadSnapshot}
 
 
 def _string(mapping: Mapping[str, object], key: str) -> str:

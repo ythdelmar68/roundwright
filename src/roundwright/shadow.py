@@ -874,6 +874,8 @@ PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1
 EXECUTOR_CONTRACT_SYNTHETIC_PROFILE = "roundwright-shadow-profile/executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = "roundwright-shadow-profile/provider-attempt-accounting/v1"
 HOSTED_CHECK_PROFILE = "roundwright-shadow-profile/hosted-check/v1"
+LIVE_LIFECYCLE_SHADOW_PROFILE = "roundwright-shadow-profile/live-lifecycle-shadow/v1"
+READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = "roundwright-shadow-profile/read-only-external-observation/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -949,6 +951,7 @@ class CaptureMode(StrEnum):
     TERMINAL_SNAPSHOT = "terminal-snapshot"
     LIFECYCLE_GRAPH = "lifecycle-graph"
     SYNTHETIC_ONE_SHOT = "synthetic-one-shot"
+    ARMED_LIVE_EVENTS = "armed-live-events"
 
 
 class ShadowProducer(StrEnum):
@@ -1069,6 +1072,43 @@ _HOSTED_CHECK_PROFILE = ShadowEvidenceProfile(
     ("hosted-check-observation",),
 )
 
+_LIVE_LIFECYCLE_SHADOW_PROFILE = ShadowEvidenceProfile(
+    LIVE_LIFECYCLE_SHADOW_PROFILE,
+    CaptureMode.ARMED_LIVE_EVENTS,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-live-window-target-recorder-comparator-store-zero-mutation-readback-bound",
+    "before-first-live-lifecycle-event",
+    "append-only-content-addressed-readback",
+    "missing-history-requires-fresh-live-window",
+    (
+        "repository-snapshot",
+        "issue-snapshot",
+        "scheduling-snapshot",
+        "pull-request-snapshot",
+        "comment-snapshot",
+        "roundlet-trace",
+        "candidate-state",
+        "review-state",
+        "hosted-check-state",
+        "merge-state",
+        "cleanup-evidence",
+        "zero-mutation-readback",
+    ),
+    0,
+    64,
+)
+
+_READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = ShadowEvidenceProfile(
+    READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+    CaptureMode.TERMINAL_SNAPSHOT,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-read-only-external-observation-executor-recorder-store-readback-bound",
+    "before-supervisor-dispatch",
+    "append-only-content-addressed-readback",
+    "candidate-movement-requires-fresh-read-only-observation",
+    ("read-only-external-observation",),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
@@ -1079,6 +1119,8 @@ def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
         _EXECUTOR_CONTRACT_PROFILE,
         _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
         _HOSTED_CHECK_PROFILE,
+        _LIVE_LIFECYCLE_SHADOW_PROFILE,
+        _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     )
 
 
@@ -1091,6 +1133,10 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
     if profile_id == HOSTED_CHECK_PROFILE:
         return _HOSTED_CHECK_PROFILE
+    if profile_id == LIVE_LIFECYCLE_SHADOW_PROFILE:
+        return _LIVE_LIFECYCLE_SHADOW_PROFILE
+    if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
+        return _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE
@@ -3268,7 +3314,7 @@ def _validate_v2_case(case: object, *, verify_digest: bool) -> None:
         if type(case.event_graph) is not ShadowV2EventGraph:
             raise ShadowV2Error("Shadow v2 event graph is invalid")
         case.event_graph.validate(case.profile, case.decision.candidate_sha)
-    elif case.profile.capture_mode is CaptureMode.LIFECYCLE_GRAPH:
+    elif case.profile.capture_mode in {CaptureMode.LIFECYCLE_GRAPH, CaptureMode.ARMED_LIVE_EVENTS}:
         raise ShadowV2Error("profile event graph is missing")
     if verify_digest and case.case_digest != _v2_digest(case._payload()):
         raise ShadowV2Error("Shadow v2 case digest is invalid")

@@ -72,6 +72,43 @@ Record these bindings in the immutable Roundlet selection contract before an
 external process starts. Missing, duplicate, floating, stale, or conflicting
 identity is `BLOCKED`, not a prompt to guess or substitute.
 
+## Reconcile typed evidence lanes
+
+The selected leaf may declare zero, one, or multiple typed Evidence lanes.
+Resolve each lane independently: stable profile/schema, route, exact candidate,
+capability requirements, readiness/receipt contract, and consumer. The usable
+capabilities are the intersection of the lane declaration, root authority,
+selected route, phase, target policy, and exact repository bindings. A missing
+intersection blocks the entire gate; a receipt from one lane never substitutes
+for another. A zero-lane declaration loads neither a Roundwright adapter nor
+Harness, Recorder, or lifecycle behavior.
+
+For the #49 two-stage contract, Lane A is
+`roundwright-shadow-profile/read-only-external-observation/v1`: prepare,
+validate, execute, project, seal/verify/compare it before Supervisor dispatch.
+It is read-only, candidate-bound, and does not depend on a Supervisor result.
+Its execution must consume the exact forward-target inventory and fixture-manifest
+classification, implementation-PR curated trace, immutable `ready_at`, and
+independent before/after zero-mutation target read-back; a plan/binding-only
+projection is not Lane A evidence. The curated trace is the distinct
+pre-Supervisor `ROUNDLET_VALIDATION event=readiness` marker, bound to the
+candidate, plan, formal tuple, window, readiness point, and authorized
+publisher; a post-review `ROUNDLET_LIFECYCLE event=formal-result` marker belongs
+only to Lane B and cannot substitute for it.
+Lane A is not context-free: invoke only the public product-hosted
+`roundwright.external_validation:run_read_only_external_observation_profile`
+with the closed V2 request, durable Recorder store, trusted typed read host,
+and the execute-time readiness digest. The generic Harness CLI/factory cannot
+construct its provider or adapter. Validate and execute must retain the same
+request parser, plan, descriptor/context identity, store, host binding, and
+readiness receipt; any movement fails closed.
+Lane B is the separately selected generic lifecycle sink: prepare and arm it
+before Supervisor dispatch; only after an accepted Supervisor PASS may it
+seal, project, and compare. Final qualification requires current exact-candidate
+Lane A VERIFIED/pass, Supervisor PASS, Lane B VERIFIED/pass, and normal current
+CI, policy, and provenance gates. Candidate movement makes both lane receipts,
+plans, and lifecycle windows `STALE`; never replay, backfill, or stitch them.
+
 ## Capture-readiness preflight
 
 Before opening an ephemeral observation window, invoking a Recorder, or

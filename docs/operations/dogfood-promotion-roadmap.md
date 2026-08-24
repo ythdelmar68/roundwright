@@ -46,6 +46,19 @@ exact infrastructure commits; a floating branch or `main` reference is never
 evidence. These contracts do not activate Roundwright or widen the phase and
 repository boundaries below.
 
+Leaf qualification may compose typed Evidence lanes. Each lane is independently
+candidate-bound and capability-intersected; qualification remains conjunctive,
+not a route or receipt substitution. A zero-lane leaf keeps the existing zero
+Roundwright-specific external/lifecycle loading behavior. #49's Lane A is a
+read-only external observation before Supervisor; its Lane B lifecycle evidence
+is armed before Supervisor and verified only after an accepted PASS. Any
+candidate movement makes both lanes stale.
+
+Lane A evidence is an observed receipt, not a plan-only assertion: it reads the
+exact target inventory, fixture-manifest classification, implementation-PR
+curated trace, immutable readiness point, and a matching before/after
+zero-mutation target state.
+
 ## Phase plan
 
 | Phase | Entry criteria | Work and required evidence | Exit criteria | Authority and rollback | Owner decision |

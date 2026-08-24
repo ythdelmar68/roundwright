@@ -122,6 +122,8 @@ _DISPOSITIONS = {
     "unaccepted",
     "stale",
 }
+SUPERVISOR_PROFILE_ARTIFACT_SCHEMA = "roundwright-supervisor-profile-artifact/v2"
+_SUPERVISOR_PROFILES = (("sol", "xhigh"), ("terra", "high"))
 
 
 class LifecycleObservationError(ValueError):
@@ -154,6 +156,23 @@ def _safe_token(value: object) -> bool:
         word in lowered
         for word in ("token", "secret", "credential", "password", "ghp_")
     ) and not lowered.startswith("sk-")
+
+
+def supervisor_profile_artifact(model: str, reasoning: str) -> str:
+    """Return the sealed identity for one exact public Supervisor profile.
+
+    The generic Harness ledger retains artifact identities rather than raw
+    provider records.  This fixed vocabulary makes the selected profile a
+    typed, sealed lifecycle fact without exposing a provider payload.
+    """
+
+    if (model, reasoning) not in _SUPERVISOR_PROFILES:
+        raise LifecycleObservationError("supervisor profile artifact is invalid")
+    return _digest({
+        "schema": SUPERVISOR_PROFILE_ARTIFACT_SCHEMA,
+        "model": model,
+        "reasoning": reasoning,
+    })
 
 
 @dataclass(frozen=True)
@@ -637,7 +656,9 @@ def project_lifecycle_events(
     projected: list[ProjectedLifecycleEvent] = []
     started: dict[str, Mapping[str, Any]] = {}
     completed: dict[str, str] = {}
+    unaccepted_attempts: set[str] = set()
     accepted_attempt: str | None = None
+    accepted_disposition: str | None = None
     accepted_count = 0
     formal_advance_count = 0
     predecessor: str | None = None
@@ -664,7 +685,14 @@ def project_lifecycle_events(
         attempt = event["attempt_identity"]
         transition = event["transition"]
         if transition == "attempt_started":
-            if attempt in started or event["disposition"] != "pending":
+            if (
+                attempt in started
+                or event["disposition"] != "pending"
+                or any(
+                    disposition == "invalid_context" and identity not in unaccepted_attempts
+                    for identity, disposition in completed.items()
+                )
+            ):
                 raise LifecycleObservationError("lifecycle attempt start is invalid")
             started[attempt] = event
         elif transition == "attempt_completed":
@@ -681,19 +709,37 @@ def project_lifecycle_events(
                 raise LifecycleObservationError("lifecycle attempt completion is invalid")
             completed[attempt] = event["disposition"]
         elif transition == "result_accepted":
+            start = started.get(attempt)
             if (
                 event["role"] != "supervisor"
-                or completed.get(attempt) != "pass"
+                or completed.get(attempt) not in {"pass", "findings"}
+                or start is None
+                or any(event[field] != start[field] for field in ("role", "task_identity", "review_attempt"))
                 or accepted_attempt is not None
                 or event["disposition"] != "accepted"
                 or not event["accepted_result"]
             ):
                 raise LifecycleObservationError("accepted lifecycle result is invalid")
             accepted_attempt = attempt
+            accepted_disposition = completed[attempt]
             accepted_count += 1
+        elif transition == "result_unaccepted":
+            start = started.get(attempt)
+            if (
+                event["role"] != "supervisor"
+                or completed.get(attempt) != "invalid_context"
+                or start is None
+                or any(event[field] != start[field] for field in ("role", "task_identity", "review_attempt"))
+                or attempt in unaccepted_attempts
+                or event["disposition"] != "unaccepted"
+                or event["accepted_result"]
+            ):
+                raise LifecycleObservationError("unaccepted lifecycle result is invalid")
+            unaccepted_attempts.add(attempt)
         elif transition == "formal_round_advanced":
             if (
                 attempt != accepted_attempt
+                or accepted_disposition != "pass"
                 or event["role"] != "supervisor"
                 or event["disposition"] != "accepted"
                 or not event["accepted_result"]
@@ -721,9 +767,21 @@ def project_lifecycle_events(
     if (
         not projected
         or set(started) != set(completed)
-        or accepted_attempt is None
-        or accepted_count != 1
-        or formal_advance_count != 1
+        or unaccepted_attempts != {
+            identity for identity, disposition in completed.items()
+            if disposition == "invalid_context"
+        }
+        or not (
+            (
+                accepted_attempt is not None
+                and accepted_count == 1
+                and (
+                    (accepted_disposition == "pass" and formal_advance_count == 1)
+                    or (accepted_disposition == "findings" and formal_advance_count == 0)
+                )
+            )
+            or (accepted_attempt is None and accepted_count == 0 and formal_advance_count == 0)
+        )
         or seal.get("head_event_digest") != predecessor
     ):
         raise LifecycleObservationError("lifecycle semantic chain is incomplete")
@@ -740,7 +798,7 @@ def project_lifecycle_events(
         plan["review_round"],
         plan["review_mode"],
         tuple(projected),
-        accepted_attempt,
+        accepted_attempt or _digest({"status": "unaccepted", "head_event": predecessor}),
         seal["ledger_digest"],
         seal["manifest_digest"],
         seal["retention_identity"],
@@ -826,6 +884,7 @@ def _synthetic_events(plan: Mapping[str, object]) -> list[dict[str, object]]:
         (1, "attempt_completed", "cancelled", False),
         (2, "attempt_started", "pending", False),
         (2, "attempt_completed", "invalid_context", False),
+        (2, "result_unaccepted", "unaccepted", False),
         (3, "attempt_started", "pending", False),
         (3, "attempt_completed", "pass", False),
         (3, "result_accepted", "accepted", True),
@@ -859,7 +918,10 @@ def _synthetic_events(plan: Mapping[str, object]) -> list[dict[str, object]]:
             "accepted_result": accepted,
             "successor_candidate_sha": None,
             "predecessor_event_digest": predecessor,
-            "artifact_references": [],
+            "artifact_references": [
+                supervisor_profile_artifact("sol", "xhigh") if attempt == 1
+                else supervisor_profile_artifact("terra", "high"),
+            ],
         }
         events.append(event)
         predecessor = _digest(event)

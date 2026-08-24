@@ -1143,6 +1143,25 @@ class CandidateReviewTests(unittest.TestCase):
             with self.assertRaises(ProviderRecoveryError):
                 read_attempt(repository, identity, f"alias-worker-{failures[0][0]}")
 
+    def test_repair_alias_sqlite_reservation_failure_is_typed_without_provider_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("typed-lock-tests", VerificationKind.TEST, VerificationOutcome.PASS, "5" * 64),
+                CandidateVerification("typed-lock-build", VerificationKind.BUILD, VerificationOutcome.PASS, "6" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            review = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-typed-lock", implementation_attempt_id="implementation-25", provider_attempt_id="typed-lock-supervisor", supervisor_session_identity="typed-lock-session", external_turn_identity="typed-lock-review-turn", message_identity="typed-lock-message", process_lease_id="typed-lock-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            findings = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=DiffReviewOutput("diff-typed-lock", "typed-lock-supervisor", "typed-lock-session", "typed-lock-review-turn", "typed-lock-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("typed lock repair",)), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
+            with patch.object(candidate_review, "_claim_repair_parent", side_effect=sqlite3.OperationalError("database is locked")):
+                with self.assertRaisesRegex(CandidateReviewError, "implementation dispatch state is unavailable"):
+                    begin_implementation(repository, identity, context, implementation_attempt_id="repair-typed-lock", provider_attempt_id="typed-lock-worker", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", repair_diff_review_id=review.diff_review_attempt_id, repair_candidate_sha=seal.candidate_sha, routed_finding_ids=findings.routed_finding_ids, external_turn_identity="typed-lock-turn", process_lease_id="typed-lock-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, "typed-lock-worker")
+
     def test_concurrent_provider_replay_alias_cannot_release_the_claimant(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

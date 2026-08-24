@@ -3627,6 +3627,66 @@ def _integrated_boundary_binding_identity(binding: object) -> str:
 
 
 @dataclass(frozen=True)
+class MaterializedIntegratedBoundaryContext:
+    """Opaque retained inputs bound to one exact V2 composition descriptor."""
+
+    descriptor: dict[str, object]
+    inputs: IntegratedBoundaryInputs
+    input_digest: str
+    candidate_sha: str
+    case_id: str
+    capture_plan_digest: str
+    ready_at: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.descriptor) is not dict
+            or type(self.inputs) is not IntegratedBoundaryInputs
+            or self.descriptor != integrated_boundary_execution_context(self.inputs)
+            or self.input_digest != _digest(self.descriptor)
+            or (self.candidate_sha, self.case_id, self.capture_plan_digest)
+            != (self.inputs.candidate_sha, self.inputs.case_id, self.inputs.capture_plan_digest)
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_token(self.case_id)
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or type(self.ready_at) is not int or self.ready_at < 0
+        ):
+            raise ExternalValidationAdapterError("integrated boundary V2 execution context is invalid")
+
+    @property
+    def identity(self) -> str:
+        return _digest({
+            "schema": "roundwright-integrated-boundary-context-binding/v1",
+            "descriptor": self.descriptor, "input_digest": self.input_digest,
+            "candidate_sha": self.candidate_sha, "case_id": self.case_id,
+            "capture_plan_digest": self.capture_plan_digest, "ready_at": self.ready_at,
+        })
+
+
+def _integrated_boundary_context(
+    binding: object, inputs: IntegratedBoundaryInputs,
+) -> MaterializedIntegratedBoundaryContext:
+    try:
+        context = binding.execution_context
+        descriptor_digest = binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("integrated boundary V2 execution context is unavailable") from error
+    if (
+        type(value) is not MaterializedIntegratedBoundaryContext
+        or type(descriptor_digest) is not str
+        or value.inputs != inputs
+        or value.input_digest != descriptor_digest
+        or value.descriptor != integrated_boundary_execution_context(inputs)
+        or context.identity != value.identity
+        or (value.candidate_sha, value.case_id, value.capture_plan_digest, value.ready_at)
+        != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at)
+    ):
+        raise ExternalValidationAdapterError("integrated boundary V2 execution context has drifted")
+    return value
+
+
+@dataclass(frozen=True)
 class IntegratedBoundaryCompositionAdapter:
     """Reviewed V2 adapter that composes retained evidence without live access."""
 
@@ -3641,6 +3701,34 @@ class IntegratedBoundaryCompositionAdapter:
     def component_identities(self) -> object:
         return _harness_executor().ProfileComponentIdentities(*integrated_boundary_component_identities())
 
+    def prepare_execution_context(self, preparation: object) -> object:
+        """Bind the closed retained tuple to the exact Harness V2 descriptor."""
+
+        try:
+            inputs = self.inputs
+            if inputs is None:
+                raise ValueError
+            descriptor = integrated_boundary_execution_context(inputs)
+            if (
+                preparation.descriptor != descriptor
+                or preparation.input_digest != _digest(descriptor)
+                or preparation.components != self.component_identities
+                or (
+                    preparation.plan.candidate_sha,
+                    preparation.plan.case_id,
+                    preparation.plan.plan_digest,
+                ) != (inputs.candidate_sha, inputs.case_id, inputs.capture_plan_digest)
+            ):
+                raise ValueError
+            context = MaterializedIntegratedBoundaryContext(
+                descriptor, inputs, preparation.input_digest,
+                preparation.plan.candidate_sha, preparation.plan.case_id,
+                preparation.plan.plan_digest, preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, TypeError, ValueError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("integrated boundary V2 execution context is invalid") from error
+
     def validate(self, binding: object) -> None:
         _integrated_boundary_binding_identity(binding)
         try:
@@ -3654,6 +3742,7 @@ class IntegratedBoundaryCompositionAdapter:
             or self.inputs.capture_plan_digest != binding.plan.plan_digest
         ):
             raise ExternalValidationAdapterError("integrated retained evidence is unavailable or stale")
+        _integrated_boundary_context(binding, self.inputs)
 
     def execute(self, binding: object) -> object:
         self.validate(binding)

@@ -267,7 +267,7 @@ class ComposedEvidenceManifest:
             "capture_plan_digest": self.inputs.capture_plan_digest,
             "retention_manifest_digest": self.inputs.expectation.retention_manifest_digest,
             "expected_source_digests": self.inputs.expectation.public_payload(),
-            "sources": tuple({"source_digest": source.source_digest} | source.public_payload() for source in sources),
+            "sources": [{"source_digest": source.source_digest} | source.public_payload() for source in sources],
             "new_provider_calls": 0,
             "new_target_actions": 0,
             "lifecycle_observation_sink": "NOT_SELECTED",

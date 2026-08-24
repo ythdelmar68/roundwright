@@ -22,6 +22,13 @@ from .shadow import (
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
 )
+from .lifecycle_observation import (
+    LIFECYCLE_PROJECTION_SCHEMA,
+    LifecycleObservationError,
+    LifecycleProjectionComparison,
+    LifecycleShadowProjection,
+    ProjectedLifecycleEvent,
+)
 
 
 INTEGRATED_BOUNDARY_SCHEMA = "roundwright-integrated-boundary-composition/v1"
@@ -58,6 +65,7 @@ class RetainedEvidenceExpectation:
     lane_b_ledger_digest: str
     lane_b_seal_digest: str
     lane_b_retention_identity: str
+    lane_b_qualification_digest: str
     historical_reference_digest: str
     synthetic_reference_digest: str
 
@@ -154,6 +162,55 @@ def source_from_public_payload(value: object) -> RetainedEvidenceSource:
         raise IntegratedBoundaryError("retained evidence payload is invalid") from error
 
 
+def _projection_from_semantic_payload(value: object) -> LifecycleShadowProjection:
+    """Rehydrate an already-verified projection without reading its store.
+
+    The generic lifecycle projector owns event-sequence validation.  #50 only
+    accepts its closed semantic projection and the comparison it produced;
+    it never opens or replays the retained lifecycle window.
+    """
+
+    try:
+        if type(value) is not dict or set(value) != {
+            "schema", "profile", "candidate_sha", "ready_at", "window_identity",
+            "repository_identity", "producer_identity", "store_identity",
+            "capture_plan_digest", "plan_digest", "review_epoch", "review_round",
+            "review_mode", "events", "accepted_attempt_identity", "ledger_digest",
+            "manifest_digest", "retention_identity", "head_event_digest",
+            "head_entry_digest", "classified_differences",
+        }:
+            raise ValueError
+        events = value["events"]
+        if type(events) is not list:
+            raise ValueError
+        projected = tuple(
+            ProjectedLifecycleEvent(
+                item["sequence"], item["occurred_at"], item["role"], item["task_identity"],
+                item["attempt_identity"], item["review_attempt"], item["transition"],
+                item["disposition"], item["accepted_result"], item["successor_candidate_sha"],
+                item["predecessor_event_digest"], tuple(item["artifact_references"]), item["event_digest"],
+            )
+            for item in events
+            if type(item) is dict and set(item) == {
+                "sequence", "occurred_at", "role", "task_identity", "attempt_identity",
+                "review_attempt", "transition", "disposition", "accepted_result",
+                "successor_candidate_sha", "predecessor_event_digest", "artifact_references", "event_digest",
+            }
+        )
+        if len(projected) != len(events) or type(value["classified_differences"]) is not list:
+            raise ValueError
+        return LifecycleShadowProjection(
+            value["candidate_sha"], value["ready_at"], value["window_identity"], value["repository_identity"],
+            value["producer_identity"], value["store_identity"], value["capture_plan_digest"], value["plan_digest"],
+            value["review_epoch"], value["review_round"], value["review_mode"], projected,
+            value["accepted_attempt_identity"], value["ledger_digest"], value["manifest_digest"],
+            value["retention_identity"], value["head_event_digest"], value["head_entry_digest"],
+            tuple(value["classified_differences"]), value["schema"], value["profile"],
+        )
+    except (KeyError, TypeError, ValueError, LifecycleObservationError) as error:
+        raise IntegratedBoundaryError("lane-b lifecycle projection is invalid") from error
+
+
 def bind_issue_49_retained_evidence(
     *, candidate_sha: str, case_id: str, capture_plan_digest: str, expectation: RetainedEvidenceExpectation,
     lane_a_result: object, lane_a_recording: object, lane_b_seal: object, lane_b_qualification: object,
@@ -189,7 +246,8 @@ def bind_issue_49_retained_evidence(
         qualification_required = {
             "schema", "status", "state", "candidate_sha", "ready_at", "plan_digest",
             "ledger_digest", "seal_receipt_digest", "manifest_digest", "retention_identity",
-            "mutation_count", "classified_differences", "result_digest",
+            "mutation_count", "classified_differences", "projection", "projection_identity",
+            "comparison", "result_digest",
         }
         def receipt_is_canonical(value: dict[str, object], digest_key: str) -> bool:
             supplied = value.get(digest_key)
@@ -219,7 +277,40 @@ def bind_issue_49_retained_evidence(
             or not receipt_is_canonical(recording, "receipt_digest")
             or not receipt_is_canonical(lane_b, "receipt_digest")
             or not receipt_is_canonical(qualification, "result_digest")
+            or qualification["result_digest"] != expectation.lane_b_qualification_digest
         ):
+            raise ValueError
+        projection = _projection_from_semantic_payload(qualification["projection"])
+        projection_identity = _digest(projection.semantic_payload())
+        comparison = qualification["comparison"]
+        if (
+            type(comparison) is not dict
+            or set(comparison) != {
+                "schema", "status", "classified_differences", "expected_identity",
+                "observed_identity", "result_identity",
+            }
+            or projection.schema != LIFECYCLE_PROJECTION_SCHEMA
+            or projection.profile != LIVE_LIFECYCLE_SHADOW_PROFILE
+            or projection.candidate_sha != lane_b["candidate_sha"]
+            or projection.ready_at != lane_b["ready_at"]
+            or projection.window_identity != lane_b["window_identity"]
+            or projection.repository_identity != lane_b["repository_identity"]
+            or projection.plan_digest != lane_b["plan_digest"]
+            or projection.ledger_digest != lane_b["ledger_digest"]
+            or projection.manifest_digest != lane_b["manifest_digest"]
+            or projection.retention_identity != lane_b["retention_identity"]
+            or len(projection.events) != lane_b["event_count"]
+            or projection.head_event_digest != lane_b["head_event_digest"]
+            or projection.head_entry_digest != lane_b["head_entry_digest"]
+            or projection.classified_differences != ()
+            or qualification["projection_identity"] != projection_identity
+            or type(comparison["classified_differences"]) is not list
+        ):
+            raise ValueError
+        expected_comparison = LifecycleProjectionComparison(
+            "pass", (), projection_identity, projection_identity,
+        )
+        if comparison != expected_comparison.public_payload():
             raise ValueError
         historical = source_from_public_payload(historical_reference)
         synthetic = source_from_public_payload(synthetic_reference)

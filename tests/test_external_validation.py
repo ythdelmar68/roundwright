@@ -300,7 +300,8 @@ class ExternalValidationTests(unittest.TestCase):
         return IntegratedBoundaryInputs(
             candidate_sha, case_id, plan_digest,
             RetainedEvidenceExpectation("sha256:" + "f" * 64, lane_a.result_digest, lane_a.bundle_digest,
-                lane_b.result_digest, lane_b.receipt_digest, lane_b.retention_identity, historical.source_digest, synthetic.source_digest),
+                lane_b.result_digest, lane_b.receipt_digest, lane_b.retention_identity, "sha256:" + "e" * 64,
+                historical.source_digest, synthetic.source_digest),
             lane_a, lane_b, historical, synthetic,
         )
     @staticmethod

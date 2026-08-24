@@ -25,11 +25,54 @@ from roundwright.integrated_boundary import (
 from roundwright.configuration import (
     FinalFindingsPolicy, ReviewDisposition, ReviewMode, ReviewOutcome, ReviewPolicy,
 )
+from roundwright.lifecycle_observation import (
+    LifecycleProjectionComparison, LifecycleShadowProjection, ProjectedLifecycleEvent,
+)
 from roundwright.shadow import INTEGRATED_BOUNDARY_PROFILE, CaptureMode, shadow_evidence_profile
 
 
 def digest(character: str) -> str:
     return "sha256:" + character * 64
+
+
+def build_lane_b_qualification(seal: dict[str, object]) -> dict[str, object]:
+    """A public-safe accepted PASS projection from the sealed Lane B receipt."""
+
+    attempt = digest("a")
+    task = digest("b")
+    events = tuple(
+        ProjectedLifecycleEvent(
+            sequence, int(seal["ready_at"]) + sequence, "supervisor", task, attempt, 1,
+            transition, disposition, accepted, None,
+            None if sequence == 0 else digest("c" if sequence == 1 else "d" if sequence == 2 else "e"),
+            (), digest("c" if sequence == 0 else "d" if sequence == 1 else "e") if sequence < 3 else str(seal["head_event_digest"]),
+        )
+        for sequence, transition, disposition, accepted in (
+            (0, "attempt_started", "pending", False),
+            (1, "attempt_completed", "pass", False),
+            (2, "result_accepted", "accepted", True),
+            (3, "formal_round_advanced", "accepted", True),
+        )
+    )
+    projection = LifecycleShadowProjection(
+        str(seal["candidate_sha"]), int(seal["ready_at"]), str(seal["window_identity"]), str(seal["repository_identity"]), digest("3"), digest("4"),
+        digest("5"), str(seal["plan_digest"]), 2, 1, "complete", events, attempt,
+        str(seal["ledger_digest"]), str(seal["manifest_digest"]), str(seal["retention_identity"]),
+        str(seal["head_event_digest"]), str(seal["head_entry_digest"]),
+    )
+    projection_payload = projection.semantic_payload()
+    projection_identity = canonical_digest(projection_payload)
+    comparison = LifecycleProjectionComparison("pass", (), projection_identity, projection_identity)
+    qualification: dict[str, object] = {
+        "schema": "roundwright-integrated-lane-b-qualification/v1", "status": "pass", "state": "VERIFIED",
+        "candidate_sha": seal["candidate_sha"], "ready_at": seal["ready_at"], "plan_digest": seal["plan_digest"],
+        "ledger_digest": seal["ledger_digest"], "seal_receipt_digest": seal["receipt_digest"],
+        "manifest_digest": seal["manifest_digest"], "retention_identity": seal["retention_identity"],
+        "mutation_count": 0, "classified_differences": [], "projection": projection_payload,
+        "projection_identity": projection_identity, "comparison": comparison.public_payload(),
+    }
+    qualification["result_digest"] = canonical_digest(qualification)
+    return qualification
 
 
 class IntegratedBoundaryTests(unittest.TestCase):
@@ -64,7 +107,7 @@ class IntegratedBoundaryTests(unittest.TestCase):
         values["expectation"] = RetainedEvidenceExpectation(
             digest("a"), values["lane_a"].result_digest, values["lane_a"].bundle_digest,
             values["lane_b"].result_digest, values["lane_b"].receipt_digest, values["lane_b"].retention_identity,
-            values["historical_reference"].source_digest, values["synthetic_reference"].source_digest,
+            digest("c"), values["historical_reference"].source_digest, values["synthetic_reference"].source_digest,
         )
         values.update(changes)
         return IntegratedBoundaryInputs(**values)  # type: ignore[arg-type]
@@ -149,20 +192,14 @@ class IntegratedBoundaryTests(unittest.TestCase):
             "repository_identity": digest("7"), "event_count": 4, "head_event_digest": digest("8"), "head_entry_digest": digest("9"),
         }
         lane_b_seal["receipt_digest"] = canonical_digest(lane_b_seal)
-        lane_b_qualification = {
-            "schema": "roundwright-integrated-lane-b-qualification/v1", "status": "pass", "state": "VERIFIED",
-            "candidate_sha": source_candidate, "ready_at": lane_b_seal["ready_at"], "plan_digest": lane_b_seal["plan_digest"],
-            "ledger_digest": lane_b_seal["ledger_digest"], "seal_receipt_digest": lane_b_seal["receipt_digest"],
-            "manifest_digest": lane_b_seal["manifest_digest"], "retention_identity": lane_b_seal["retention_identity"],
-            "mutation_count": 0, "classified_differences": [],
-        }
-        lane_b_qualification["result_digest"] = canonical_digest(lane_b_qualification)
+        lane_b_qualification = build_lane_b_qualification(lane_b_seal)
         historical = replace(self.source(RetainedSourceKind.HISTORICAL_REFERENCE), candidate_sha="c" * 40)
         synthetic = replace(self.source(RetainedSourceKind.SYNTHETIC_REFERENCE), candidate_sha="d" * 40)
         expectation = RetainedEvidenceExpectation(
             "sha256:9ac20eb13933909e5689bd1e843abc61b7485d79659c1b40a17aaccad3675c91",
             lane_a_result["receipt_digest"], lane_a_result["bundle_digest"], lane_b_seal["ledger_digest"],
-            lane_b_seal["receipt_digest"], lane_b_seal["retention_identity"], historical.source_digest, synthetic.source_digest,
+            lane_b_seal["receipt_digest"], lane_b_seal["retention_identity"], lane_b_qualification["result_digest"],
+            historical.source_digest, synthetic.source_digest,
         )
         inputs = bind_issue_49_retained_evidence(
             candidate_sha="b" * 40, case_id="issue-50-composition", capture_plan_digest=digest("a"),
@@ -187,6 +224,23 @@ class IntegratedBoundaryTests(unittest.TestCase):
                     lane_a_result=lane_a, lane_a_recording=lane_a_recording, lane_b_seal=lane_b_seal,
                     lane_b_qualification=qualification, historical_reference=historical.public_payload(), synthetic_reference=synthetic.public_payload(),
                 )
+
+        substituted = dict(lane_b_qualification)
+        substituted_projection = dict(substituted["projection"])
+        substituted_projection["capture_plan_digest"] = digest("e")
+        substituted["projection"] = substituted_projection
+        substituted["projection_identity"] = canonical_digest(substituted_projection)
+        substituted["comparison"] = LifecycleProjectionComparison(
+            "pass", (), substituted["projection_identity"], substituted["projection_identity"],
+        ).public_payload()
+        substituted.pop("result_digest")
+        substituted["result_digest"] = canonical_digest(substituted)
+        with self.assertRaises(IntegratedBoundaryError):
+            bind_issue_49_retained_evidence(
+                candidate_sha="b" * 40, case_id="issue-50-composition", capture_plan_digest=digest("a"), expectation=expectation,
+                lane_a_result=lane_a_result, lane_a_recording=lane_a_recording, lane_b_seal=lane_b_seal,
+                lane_b_qualification=substituted, historical_reference=historical.public_payload(), synthetic_reference=synthetic.public_payload(),
+            )
 
     def test_review_policy_keeps_failover_separate_from_complete_and_converging_rounds(self) -> None:
         policy = ReviewPolicy(complete_rounds=1, max_rounds=2, max_supervisor_attempts_per_round=3,

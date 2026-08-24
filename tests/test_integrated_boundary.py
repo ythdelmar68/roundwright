@@ -18,6 +18,7 @@ from roundwright.integrated_boundary import (
     bind_issue_49_retained_evidence,
     compose_retained_evidence,
     phase_3_capability_report,
+    source_from_public_payload,
     verify_composed_evidence,
 )
 from roundwright.configuration import (
@@ -92,6 +93,16 @@ class IntegratedBoundaryTests(unittest.TestCase):
                 RetainedSourceKind.LANE_A, "roundwright-shadow-profile/live-lifecycle-shadow/v1", self.candidate,
                 "case-lane-a", 17, digest("b"), digest("c"), digest("d"), digest("e"), digest("f"), digest("0"), mutation_count=1,
             )
+
+    def test_reference_profile_substitution_is_rejected_during_rehydration(self) -> None:
+        baseline = self.inputs()
+        for source, substituted_profile in (
+            (baseline.historical_reference, "roundwright-shadow-profile/executor-contract-synthetic/v1"),
+            (baseline.synthetic_reference, "roundwright-shadow-profile/provider-attempt-accounting/v1"),
+        ):
+            payload = source.public_payload() | {"profile": substituted_profile}
+            with self.subTest(kind=source.kind), self.assertRaises(IntegratedBoundaryError):
+                source_from_public_payload(payload)
 
     def test_profile_and_public_capability_report_are_narrow(self) -> None:
         profile = shadow_evidence_profile(INTEGRATED_BOUNDARY_PROFILE)

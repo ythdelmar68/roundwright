@@ -427,6 +427,25 @@ class ExternalValidationTests(unittest.TestCase):
             ), {"status": "fake"},
         )
 
+    def test_integrated_hosted_entrypoint_rejects_forged_mixed_lane_candidates(self) -> None:
+        producer, exporter, comparator = external_validation.integrated_boundary_component_identities()
+        plan = {
+            "profile": INTEGRATED_BOUNDARY_PROFILE, "case_id": "issue-50-mixed-lanes", "candidate_sha": "b" * 40,
+            "ready_at": 17, "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+        }
+        inputs = self.integrated_inputs("b" * 40, "issue-50-mixed-lanes", external_validation._digest(plan))
+        object.__setattr__(inputs, "lane_b", replace(inputs.lane_b, candidate_sha="c" * 40))
+        request = {
+            "schema": "roundwright-harness-profile-executor-request/v2",
+            "capture_plan": plan,
+            "execution_context": integrated_boundary_execution_context(inputs),
+        }
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_integrated_boundary_composition_profile("validate", request, Path("store"), inputs)
+        self.assertEqual(len(harness.run_calls), before)
+
     def test_integrated_composition_runs_through_the_reviewed_harness_recorder(self) -> None:
         """Exercise V2 context preparation and Recorder read-back without live access."""
 

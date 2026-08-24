@@ -3934,13 +3934,25 @@ def run_integrated_boundary_composition_profile(
 
     harness = _harness_executor()
     try:
+        if type(retained_inputs) is not IntegratedBoundaryInputs:
+            raise ValueError
+        # Reconstruct the immutable tuple at the public boundary so a caller
+        # cannot bypass dataclass construction and inject mixed source lanes.
+        try:
+            retained_inputs = IntegratedBoundaryInputs(
+                retained_inputs.candidate_sha, retained_inputs.case_id,
+                retained_inputs.capture_plan_digest, retained_inputs.expectation,
+                retained_inputs.lane_a, retained_inputs.lane_b,
+                retained_inputs.historical_reference, retained_inputs.synthetic_reference,
+            )
+        except IntegratedBoundaryError as error:
+            raise ExternalValidationAdapterError("integrated retained evidence is invalid") from error
         request = harness.ExecutorRequest.parse(request_value)
         if (
             mode not in {"validate", "execute"}
             or request.schema != "roundwright-harness-profile-executor-request/v2"
             or request.capture_plan["profile"] != INTEGRATED_BOUNDARY_PROFILE
             or request.execution_context != integrated_boundary_execution_context(retained_inputs) or not isinstance(store_root, Path)
-            or type(retained_inputs) is not IntegratedBoundaryInputs
             or (mode == "validate" and expected_readiness_digest is not None)
             or (mode == "execute" and _DIGEST.fullmatch(expected_readiness_digest or "") is None)
         ):

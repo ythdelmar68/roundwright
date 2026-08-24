@@ -16,8 +16,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .shadow import (
+    EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     INTEGRATED_BOUNDARY_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
+    PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
 )
 
@@ -105,11 +107,11 @@ class RetainedEvidenceSource:
         expected_profile = {
             RetainedSourceKind.LANE_A: READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
             RetainedSourceKind.LANE_B: LIVE_LIFECYCLE_SHADOW_PROFILE,
+            RetainedSourceKind.HISTORICAL_REFERENCE: PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+            RetainedSourceKind.SYNTHETIC_REFERENCE: EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
         }.get(self.kind)
         if expected_profile is not None and self.profile_id != expected_profile:
-            raise IntegratedBoundaryError("retained evidence lane profile is invalid")
-        if self.kind in {RetainedSourceKind.HISTORICAL_REFERENCE, RetainedSourceKind.SYNTHETIC_REFERENCE} and self.profile_id == INTEGRATED_BOUNDARY_PROFILE:
-            raise IntegratedBoundaryError("reference may not substitute for composed evidence")
+            raise IntegratedBoundaryError("retained evidence source profile is invalid")
         object.__setattr__(self, "source_digest", _digest(self.public_payload()))
 
     def public_payload(self) -> dict[str, object]:
@@ -233,6 +235,7 @@ class IntegratedBoundaryInputs:
             or len({source.source_digest for source in sources}) != len(sources)
             or len({source.receipt_digest for source in sources}) != len(sources)
             or len({source.bundle_digest for source in sources}) != len(sources)
+            or self.lane_a.candidate_sha != self.lane_b.candidate_sha
             or self.lane_a.result_digest != self.expectation.lane_a_result_digest
             or self.lane_a.bundle_digest != self.expectation.lane_a_bundle_digest
             or self.lane_b.result_digest != self.expectation.lane_b_ledger_digest

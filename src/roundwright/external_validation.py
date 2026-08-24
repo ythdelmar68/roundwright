@@ -387,7 +387,7 @@ def _read_only_external_observation_binding_identity(binding: object) -> str:
 
 @dataclass(frozen=True)
 class ReadOnlyExternalObservationAdapter:
-    """Lane A's stable zero-mutation adapter over the existing V2 executor."""
+    """Lane A adapter installed only by the product-hosted V2 entrypoint."""
 
     provider: ReadOnlyExternalObservationProvider | None = None
     profile_id: str = READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
@@ -405,8 +405,20 @@ class ReadOnlyExternalObservationAdapter:
             *read_only_external_observation_component_identities(),
         )
 
+    def prepare_execution_context(self, preparation: object) -> object:
+        try:
+            context = prepare_read_only_external_observation_context(
+                preparation.descriptor, plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha, case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("read-only external observation V2 execution context is invalid") from error
+
     def validate(self, binding: object) -> None:
         _read_only_external_observation_binding_identity(binding)
+        _read_only_external_observation_context(binding)
         try:
             components = (
                 binding.components.producer_identity,
@@ -420,6 +432,7 @@ class ReadOnlyExternalObservationAdapter:
 
     def execute(self, binding: object) -> object:
         identity = _read_only_external_observation_binding_identity(binding)
+        _read_only_external_observation_context(binding)
         provider = self.provider
         if provider is None:
             raise ExternalValidationAdapterError("read-only external observation is unavailable")
@@ -2608,6 +2621,153 @@ class ReadOnlyExternalObservationSnapshot:
             raise ExternalValidationAdapterError("read-only external observation snapshot is invalid")
 
 
+@dataclass(frozen=True)
+class ReadOnlyExternalObservationRuntimeDescriptor:
+    """Closed Lane A V2 context, excluding the trusted read capability."""
+
+    target_repository: str
+    target_baseline_sha: str
+    candidate_sha: str
+    capture_plan_digest: str
+    case_id: str
+    trace_repository: str
+    trace_pull_request: int
+    trace_publisher_identity: str
+    review_epoch: int
+    formal_round: str
+    review_mode: str
+    observation_window: str
+    ready_at: int
+    fixture_manifest: FixtureSelectionManifest
+    schema: str = "roundwright-read-only-external-observation-runtime/v2"
+
+    @classmethod
+    def parse(cls, value: object) -> "ReadOnlyExternalObservationRuntimeDescriptor":
+        if type(value) not in (dict, MappingProxyType):
+            raise ExternalValidationAdapterError("read-only external observation runtime descriptor is invalid")
+        raw = dict(value)
+        if set(raw) != {
+            "schema", "target_repository", "target_baseline_sha", "candidate_sha", "capture_plan_digest",
+            "case_id", "trace_repository", "trace_pull_request", "trace_publisher_identity", "review_epoch",
+            "formal_round", "review_mode", "observation_window", "ready_at", "fixture_manifest", "fixture_manifest_digest",
+        }:
+            raise ExternalValidationAdapterError("read-only external observation runtime descriptor is invalid")
+        try:
+            raw["fixture_manifest"] = FixtureSelectionManifest.from_projection(
+                raw["fixture_manifest"], raw.pop("fixture_manifest_digest"),
+            )
+            return cls(**raw)
+        except (TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("read-only external observation runtime descriptor is invalid") from error
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema != "roundwright-read-only-external-observation-runtime/v2"
+            or not _safe_repository(self.target_repository)
+            or _SHA.fullmatch(self.target_baseline_sha) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or not _safe_token(self.case_id)
+            or not _safe_repository(self.trace_repository)
+            or type(self.trace_pull_request) is not int or self.trace_pull_request < 1
+            or not _trace_publisher_identity(self.trace_publisher_identity)
+            or type(self.review_epoch) is not int or self.review_epoch < 1
+            or not _safe_token(self.formal_round)
+            or self.review_mode not in {"complete", "converging"}
+            or not _safe_token(self.observation_window)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.fixture_manifest) is not FixtureSelectionManifest
+            or (self.fixture_manifest.target_repository, self.fixture_manifest.target_baseline_sha)
+            != (self.target_repository, self.target_baseline_sha)
+            or self.fixture_manifest.trace_publisher_identity != self.trace_publisher_identity
+        ):
+            raise ExternalValidationAdapterError("read-only external observation runtime descriptor is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema, "target_repository": self.target_repository,
+            "target_baseline_sha": self.target_baseline_sha, "candidate_sha": self.candidate_sha,
+            "capture_plan_digest": self.capture_plan_digest, "case_id": self.case_id,
+            "trace_repository": self.trace_repository, "trace_pull_request": self.trace_pull_request,
+            "trace_publisher_identity": self.trace_publisher_identity, "review_epoch": self.review_epoch,
+            "formal_round": self.formal_round, "review_mode": self.review_mode,
+            "observation_window": self.observation_window, "ready_at": self.ready_at,
+            "fixture_manifest": self.fixture_manifest.payload(),
+            "fixture_manifest_digest": self.fixture_manifest.manifest_digest,
+        }
+
+
+@dataclass(frozen=True)
+class MaterializedReadOnlyExternalObservationContext:
+    descriptor: ReadOnlyExternalObservationRuntimeDescriptor
+
+    @property
+    def identity(self) -> str:
+        return _digest({
+            "schema": "roundwright-read-only-external-observation-context/v1",
+            "descriptor": self.descriptor.payload(),
+        })
+
+
+@dataclass(frozen=True)
+class ReadOnlyExternalObservationHostInputs:
+    """Trusted product host inputs, never serialized into the V2 request."""
+
+    capability: GitHubReadCapability
+    fixture_manifest: FixtureSelectionManifest
+
+    def __post_init__(self) -> None:
+        if type(self.fixture_manifest) is not FixtureSelectionManifest or not self.fixture_manifest.is_owner_sealed:
+            raise ExternalValidationAdapterError("read-only external observation host inputs are invalid")
+        _require_github_read_capability(self.capability)
+
+
+def prepare_read_only_external_observation_context(
+    descriptor_value: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
+) -> MaterializedReadOnlyExternalObservationContext:
+    descriptor = ReadOnlyExternalObservationRuntimeDescriptor.parse(descriptor_value)
+    if (descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at) != (
+        plan_digest, candidate_sha, case_id, ready_at,
+    ):
+        raise ExternalValidationAdapterError("read-only external observation runtime descriptor does not match capture plan")
+    return MaterializedReadOnlyExternalObservationContext(descriptor)
+
+
+def _read_only_external_observation_context(binding: object) -> MaterializedReadOnlyExternalObservationContext:
+    try:
+        context, descriptor_digest = binding.execution_context, binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("read-only external observation V2 execution context is unavailable") from error
+    if (
+        type(value) is not MaterializedReadOnlyExternalObservationContext
+        or _DIGEST.fullmatch(descriptor_digest) is None
+        or descriptor_digest != _digest(value.descriptor.payload())
+        or getattr(context, "identity", None) != value.identity
+    ):
+        raise ExternalValidationAdapterError("read-only external observation V2 execution context has drifted")
+    descriptor = value.descriptor
+    if (descriptor.capture_plan_digest, descriptor.candidate_sha, descriptor.case_id, descriptor.ready_at) != (
+        binding.plan.plan_digest, binding.candidate_sha, binding.case_id, binding.ready_at,
+    ):
+        raise ExternalValidationAdapterError("read-only external observation V2 execution context has drifted")
+    return value
+
+
+def _materialize_read_only_external_observation_provider(
+    descriptor: ReadOnlyExternalObservationRuntimeDescriptor,
+    host_inputs: ReadOnlyExternalObservationHostInputs,
+) -> ReadOnlyExternalObservationProvider:
+    if descriptor.fixture_manifest != host_inputs.fixture_manifest:
+        raise ExternalValidationAdapterError("read-only external observation host inputs have drifted")
+    return ReadOnlyExternalObservationProvider(host_inputs.capability, ReadOnlyExternalObservationInputs(
+        descriptor.target_repository, descriptor.target_baseline_sha, descriptor.candidate_sha,
+        descriptor.capture_plan_digest, descriptor.trace_repository, descriptor.trace_pull_request,
+        descriptor.trace_publisher_identity, descriptor.review_epoch, descriptor.formal_round,
+        descriptor.review_mode, descriptor.observation_window, descriptor.ready_at, host_inputs.fixture_manifest,
+    ))
+
+
 def _lane_a_fixture_differences(
     inventory: RepositoryInventorySnapshot, manifest: FixtureSelectionManifest,
 ) -> tuple[str, ...]:
@@ -2698,16 +2858,6 @@ class ReadOnlyExternalObservationProvider(_RoundwrightLiveLifecycleProvider):
             self._candidate_sha, self._inputs.capture_plan_digest, self._inputs.ready_at, before_digest, trace,
             _digest({"manifest": self._inputs.fixture_manifest.manifest_digest, "differences": differences}),
         )
-
-
-def create_read_only_external_observation_adapter(
-    capability: GitHubReadCapability, inputs: ReadOnlyExternalObservationInputs,
-) -> ReadOnlyExternalObservationAdapter:
-    """Construct Lane A only around its exact, independently-read sources."""
-
-    return ReadOnlyExternalObservationAdapter(
-        provider=ReadOnlyExternalObservationProvider(capability, inputs),
-    )
 
 
 def _live_lifecycle_store_root_identity(store_root: Path) -> str:
@@ -3448,7 +3598,9 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
         return SyntheticExecutorAdapter(profile_id)
     if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
-        return ReadOnlyExternalObservationAdapter(profile_id=profile_id)
+        raise ExternalValidationAdapterError(
+            "read-only external observation requires the product-hosted V2 entrypoint"
+        )
     if profile_id == PROVIDER_ATTEMPT_ACCOUNTING_PROFILE:
         return ProviderAttemptAccountingAdapter(profile_id)
     if profile_id == HOSTED_CHECK_PROFILE:
@@ -3583,6 +3735,46 @@ def run_hosted_check_profile(
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("hosted check hosted entrypoint binding is invalid") from error
+
+
+def run_read_only_external_observation_profile(
+    mode: Literal["validate", "execute"],
+    request_value: Mapping[str, Any],
+    store_root: Path,
+    host_inputs: ReadOnlyExternalObservationHostInputs,
+    *,
+    expected_readiness_digest: str | None = None,
+) -> object:
+    """Run Lane A only through the product-hosted opaque V2 executor boundary."""
+
+    harness = _harness_executor()
+    try:
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            mode not in {"validate", "execute"}
+            or request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
+            or request.execution_context is None
+            or not isinstance(store_root, Path)
+            or type(host_inputs) is not ReadOnlyExternalObservationHostInputs
+            or (mode == "validate" and expected_readiness_digest is not None)
+            or (mode == "execute" and _DIGEST.fullmatch(expected_readiness_digest or "") is None)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        context = prepare_read_only_external_observation_context(
+            request.execution_context, plan_digest=plan.plan_digest, candidate_sha=plan.candidate_sha,
+            case_id=plan.case_id, ready_at=plan.ready_at,
+        )
+        provider = _materialize_read_only_external_observation_provider(context.descriptor, host_inputs)
+        return harness.run_profile_executor(
+            mode, request_value, ReadOnlyExternalObservationAdapter(provider), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except ExternalValidationAdapterError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("read-only external observation hosted entrypoint binding is invalid") from error
 
 
 def _run_prepared_live_lifecycle_shadow_profile(

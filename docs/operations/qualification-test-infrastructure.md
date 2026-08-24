@@ -219,7 +219,11 @@ trace, immutable `ready_at`, and before/after target zero-mutation read-back;
 a plan or candidate binding alone cannot qualify it. The Lane A trace is a
 pre-Supervisor `ROUNDLET_VALIDATION event=readiness` marker bound to candidate,
 plan, tuple, window, readiness, and publisher; the post-review formal-result
-marker is Lane B-only and is not substitutable. Lane B is the opt-in generic
+marker is Lane B-only and is not substitutable. Lane A is invoked only through
+the product-hosted `run_read_only_external_observation_profile` V2 entrypoint,
+which receives the closed request, durable store, trusted typed host capability,
+and execute-time readiness receipt; the generic Harness CLI/factory is reserved
+for context-free profiles. Lane B is the opt-in generic
 lifecycle sink: it is ready and `ARMED` before Supervisor dispatch, and only an
 accepted PASS permits its later seal, projection, and comparison. Final merge
 qualification requires all current exact-candidate facts conjunctively: Lane A

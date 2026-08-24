@@ -370,9 +370,6 @@ class ExternalValidationTests(unittest.TestCase):
             )
 
     def test_lane_a_profile_is_stable_and_has_no_supervisor_dependency(self) -> None:
-        adapter = external_validation.roundwright_profile_adapter_factory(
-            READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
-        )
         components = external_validation.read_only_external_observation_component_identities()
         exact = binding(
             profile=READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
@@ -381,12 +378,13 @@ class ExternalValidationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(shadow_evidence_profile(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE).arm_before, "before-supervisor-dispatch")
-        adapter.validate(exact)
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unavailable"):
-            adapter.execute(exact)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "product-hosted V2"):
+            external_validation.roundwright_profile_adapter_factory(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "execution context is unavailable"):
+            external_validation.ReadOnlyExternalObservationAdapter().validate(exact)
 
     def test_lane_a_requires_exact_external_sources_and_zero_mutation_read_back(self) -> None:
-        inputs = self.read_only_external_observation_inputs()
+        request_value, inputs = self.read_only_external_observation_request()
         trace_read_result = self.lane_a_trace_read_result
 
         class Capability:
@@ -408,8 +406,9 @@ class ExternalValidationTests(unittest.TestCase):
                         return GitHubReadResult(request, CommentsSnapshot(
                             RepositoryRef("ythdelmar68", "roundwright"), 85, "PULL_REQUEST", (),
                         ))
-                    reader = ExternalValidationTests.trace_read_result if self.formal_result_only else trace_read_result
-                    return reader(request, "a" * 40)
+                    if self.formal_result_only:
+                        return ExternalValidationTests.trace_read_result(request, "a" * 40)
+                    return trace_read_result(request, "a" * 40, inputs.capture_plan_digest)
                 self.inventory_calls += 1
                 suffix = "b" if self.mutate_after and self.inventory_calls == 2 else "a"
                 snapshot = ExternalValidationTests.read_only_external_observation_inventory(
@@ -423,14 +422,39 @@ class ExternalValidationTests(unittest.TestCase):
                 return GitHubReadResult(request, snapshot)
 
         capability = Capability()
-        adapter = external_validation.create_read_only_external_observation_adapter(capability, inputs)
+        host_inputs = external_validation.ReadOnlyExternalObservationHostInputs(
+            capability, inputs.fixture_manifest,
+        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "hosted entrypoint binding"):
+            external_validation.run_read_only_external_observation_profile(
+                "validate", {"schema": "roundwright-harness-profile-executor-request/v1"}, Path("store"), host_inputs,
+            )
+        readiness = external_validation.run_read_only_external_observation_profile(
+            "validate", request_value, Path("store"), host_inputs,
+        )
+        harness = sys.modules["roundwright_harness.executor"]
+        self.assertEqual(readiness.plan.plan_digest, inputs.capture_plan_digest)
+        adapter = harness.run_calls[-1][0][2]
         components = external_validation.read_only_external_observation_component_identities()
+        plan = SimpleNamespace(
+            plan_digest=inputs.capture_plan_digest, candidate_sha=inputs.candidate_sha,
+            case_id="read-only-external-observation-case", ready_at=inputs.ready_at,
+        )
         exact = binding(
             profile=READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+            case_id="read-only-external-observation-case",
+            candidate_sha=inputs.candidate_sha,
+            ready_at=inputs.ready_at,
+            plan=plan,
             components=SimpleNamespace(
                 producer_identity=components[0], exporter_identity=components[1], comparator_identity=components[2],
             ),
         )
+        context = adapter.prepare_execution_context(SimpleNamespace(
+            descriptor=request_value["execution_context"], plan=exact.plan,
+        ))
+        exact.execution_context = context
+        exact.execution_context_input_digest = external_validation._digest(request_value["execution_context"])
         adapter.validate(exact)
         evidence = adapter.project(exact, adapter.execute(exact))
         self.assertEqual(adapter.compare(exact, evidence).status, "pass")
@@ -444,6 +468,36 @@ class ExternalValidationTests(unittest.TestCase):
                 GitHubReadOperation.COMMENTS, GitHubReadOperation.REPOSITORY_INVENTORY,
             ],
         )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "hosted entrypoint binding"):
+            external_validation.run_read_only_external_observation_profile(
+                "execute", request_value, Path("store"), host_inputs,
+            )
+        self.assertEqual(
+            external_validation.run_read_only_external_observation_profile(
+                "execute", request_value, Path("store"), host_inputs,
+                expected_readiness_digest=readiness.as_dict()["receipt_digest"],
+            ),
+            {"status": "fake"},
+        )
+        self.assertEqual(
+            harness.run_calls[-1][1]["expected_readiness_digest"], readiness.as_dict()["receipt_digest"],
+        )
+        missing_context = dict(request_value); missing_context["execution_context"] = None
+        changed_context = json.loads(json.dumps(request_value))
+        changed_context["execution_context"]["candidate_sha"] = "b" * 40
+        mismatched_host = external_validation.ReadOnlyExternalObservationHostInputs(
+            capability, self.fixture_manifest("e" * 40),
+        )
+        for name, request, host in (
+            ("missing-context", missing_context, host_inputs),
+            ("changed-context", changed_context, host_inputs),
+            ("host-manifest", request_value, mismatched_host),
+        ):
+            with self.subTest(drift=name):
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_read_only_external_observation_profile(
+                        "validate", request, Path("store"), host,
+                    )
         for name, drifted in (
             ("missing-trace", Capability(missing_trace=True)),
             ("target-mutation", Capability(mutate_after=True)),
@@ -2919,6 +2973,33 @@ class ExternalValidationTests(unittest.TestCase):
             "ythdelmar68/roundwright", 85, "user:ythdelmar68", 1,
             "formal-round-1", "complete", "window-49", 17, self.fixture_manifest(),
         )
+
+    def read_only_external_observation_request(
+        self,
+    ) -> tuple[dict[str, object], external_validation.ReadOnlyExternalObservationInputs]:
+        producer, exporter, comparator = external_validation.read_only_external_observation_component_identities()
+        capture_plan = {
+            "schema": "roundwright-harness-capture-plan/v1",
+            "profile": READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+            "case_id": "read-only-external-observation-case", "candidate_sha": "a" * 40,
+            "ready_at": 17, "producer_identity": producer, "exporter_identity": exporter,
+            "comparator_identity": comparator,
+        }
+        inputs = replace(
+            self.read_only_external_observation_inputs(),
+            capture_plan_digest=external_validation._digest(capture_plan),
+        )
+        descriptor = external_validation.ReadOnlyExternalObservationRuntimeDescriptor(
+            inputs.target_repository, inputs.target_baseline_sha, inputs.candidate_sha,
+            inputs.capture_plan_digest, capture_plan["case_id"], inputs.trace_repository,
+            inputs.trace_pull_request, inputs.trace_publisher_identity, inputs.review_epoch,
+            inputs.formal_round, inputs.review_mode, inputs.observation_window,
+            inputs.ready_at, inputs.fixture_manifest,
+        )
+        return {
+            "schema": "roundwright-harness-profile-executor-request/v2",
+            "capture_plan": capture_plan, "execution_context": descriptor.payload(),
+        }, inputs
 
     @staticmethod
     def read_only_external_observation_inventory(

@@ -95,6 +95,13 @@ pre-Supervisor `ROUNDLET_VALIDATION event=readiness` marker, bound to the
 candidate, plan, formal tuple, window, readiness point, and authorized
 publisher; a post-review `ROUNDLET_LIFECYCLE event=formal-result` marker belongs
 only to Lane B and cannot substitute for it.
+Lane A is not context-free: invoke only the public product-hosted
+`roundwright.external_validation:run_read_only_external_observation_profile`
+with the closed V2 request, durable Recorder store, trusted typed read host,
+and the execute-time readiness digest. The generic Harness CLI/factory cannot
+construct its provider or adapter. Validate and execute must retain the same
+request parser, plan, descriptor/context identity, store, host binding, and
+readiness receipt; any movement fails closed.
 Lane B is the separately selected generic lifecycle sink: prepare and arm it
 before Supervisor dispatch; only after an accepted Supervisor PASS may it
 seal, project, and compare. Final qualification requires current exact-candidate

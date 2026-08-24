@@ -231,6 +231,17 @@ qualification requires all current exact-candidate facts conjunctively: Lane A
 provenance. Candidate movement stales both lane plans/receipts and every
 lifecycle window; no replay, backfill, or stitching is permitted.
 
+For #50, `roundwright-shadow-profile/integrated-boundary/v1` is a separate
+`composed-evidence` lane. It consumes the sealed #49 Lane A and Lane B
+receipts as distinct immutable sources, alongside their historical and
+synthetic references. Composition validates each source's candidate, profile,
+capture-plan, immutable `ready_at`, result, bundle, manifest, receipt, and
+retention identities before emitting a new composed manifest. It never opens,
+replays, backfills, or records either lower-level window; it makes zero new
+provider calls and zero target actions, and its lifecycle sink is
+`NOT_SELECTED`. A missing, stale, mixed, duplicate, or unverifiable source
+fails closed and returns to its owning producer.
+
 Before invocation, persist the exact Roundwright base/candidate SHA, selected
 leaf, route, policy and skill blobs, contract/configuration, harness commit,
 target baseline when applicable, environment, observation window or action,

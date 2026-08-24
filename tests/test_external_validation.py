@@ -71,6 +71,7 @@ from roundwright.github_runtime import (
 from roundwright.shadow import (
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
+    INTEGRATED_BOUNDARY_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
@@ -81,6 +82,10 @@ from roundwright.shadow import (
     ShadowV2Event,
     ShadowV2EventGraph,
     shadow_evidence_profile,
+)
+from roundwright.integrated_boundary import (
+    IntegratedBoundaryInputs, RetainedEvidenceExpectation, RetainedEvidenceSource, RetainedSourceKind,
+    integrated_boundary_execution_context,
 )
 
 
@@ -281,6 +286,21 @@ def provider_binding(**updates: object) -> ExecutorBinding:
 
 
 class ExternalValidationTests(unittest.TestCase):
+    def integrated_inputs(self, candidate_sha: str, case_id: str, plan_digest: str) -> IntegratedBoundaryInputs:
+        source_candidate = "a" * 40
+        def source(kind: RetainedSourceKind, profile: str, values: tuple[str, str, str, str, str, str]) -> RetainedEvidenceSource:
+            return RetainedEvidenceSource(kind, profile, source_candidate, f"retained-{kind.value}", 17, *("sha256:" + value * 64 for value in values))
+        lane_a = source(RetainedSourceKind.LANE_A, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, ("0", "1", "2", "3", "4", "5"))
+        lane_b = source(RetainedSourceKind.LANE_B, LIVE_LIFECYCLE_SHADOW_PROFILE, ("6", "7", "8", "9", "a", "b"))
+        lane_b = replace(lane_b, bundle_digest=lane_b.result_digest)
+        historical = source(RetainedSourceKind.HISTORICAL_REFERENCE, PROVIDER_ATTEMPT_ACCOUNTING_PROFILE, ("c", "d", "e", "f", "0", "1"))
+        synthetic = source(RetainedSourceKind.SYNTHETIC_REFERENCE, EXECUTOR_CONTRACT_SYNTHETIC_PROFILE, ("2", "3", "4", "5", "6", "7"))
+        return IntegratedBoundaryInputs(
+            candidate_sha, case_id, plan_digest,
+            RetainedEvidenceExpectation("sha256:" + "f" * 64, lane_a.result_digest, lane_a.bundle_digest,
+                lane_b.result_digest, lane_b.receipt_digest, lane_b.retention_identity, historical.source_digest, synthetic.source_digest),
+            lane_a, lane_b, historical, synthetic,
+        )
     @staticmethod
     def trace_read_result(request: GitHubReadRequest, candidate_sha: str) -> GitHubReadResult:
         """Return the separately-bound implementation PR and Conversation evidence."""
@@ -368,6 +388,36 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.roundwright_profile_adapter_factory(
                 "roundwright-shadow-profile/unknown/v1"
             )
+
+    def test_integrated_composition_uses_the_v2_executor_without_live_capabilities(self) -> None:
+        producer, exporter, comparator = external_validation.integrated_boundary_component_identities()
+        plan = {
+            "profile": INTEGRATED_BOUNDARY_PROFILE, "case_id": "issue-50-composition", "candidate_sha": "b" * 40,
+            "ready_at": 17, "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+        }
+        inputs = self.integrated_inputs("b" * 40, "issue-50-composition", external_validation._digest(plan))
+        request = {"schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan, "execution_context": integrated_boundary_execution_context(inputs)}
+        wrong_context = dict(request)
+        wrong_context["execution_context"] = {**request["execution_context"], "retention_manifest_digest": "sha256:" + "0" * 64}
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_integrated_boundary_composition_profile("validate", wrong_context, Path("store"), inputs)
+        readiness = external_validation.run_integrated_boundary_composition_profile("validate", request, Path("store"), inputs)
+        adapter = sys.modules["roundwright_harness.executor"].run_calls[-1][0][2]
+        exact = binding(
+            profile=INTEGRATED_BOUNDARY_PROFILE, case_id="issue-50-composition", candidate_sha="b" * 40,
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
+            components=SimpleNamespace(producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator),
+        )
+        adapter.validate(exact)
+        evidence = adapter.project(exact, adapter.execute(exact))
+        self.assertEqual(adapter.compare(exact, evidence).status, "pass")
+        self.assertEqual(evidence["integrated_boundary"]["manifest"]["new_provider_calls"], 0)
+        self.assertEqual(
+            external_validation.run_integrated_boundary_composition_profile(
+                "execute", request, Path("store"), inputs,
+                expected_readiness_digest=readiness.as_dict()["receipt_digest"],
+            ), {"status": "fake"},
+        )
 
     def test_lane_a_profile_is_stable_and_has_no_supervisor_dependency(self) -> None:
         components = external_validation.read_only_external_observation_component_identities()

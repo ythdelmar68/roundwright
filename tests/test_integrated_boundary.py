@@ -15,6 +15,7 @@ from roundwright.integrated_boundary import (
     RetainedEvidenceExpectation,
     RetainedEvidenceSource,
     RetainedSourceKind,
+    _digest as canonical_digest,
     bind_issue_49_retained_evidence,
     compose_retained_evidence,
     phase_3_capability_report,
@@ -120,27 +121,42 @@ class IntegratedBoundaryTests(unittest.TestCase):
             "schema": "roundwright-harness-profile-executor-result/v2", "profile": "roundwright-shadow-profile/read-only-external-observation/v1",
             "candidate_sha": source_candidate, "case_id": "issue-49-pr85-lane-a-57183ea-e2-r1-a2-retry-1", "ready_at": 1787551215,
             "plan_digest": "sha256:366ef9deae351370943231d6b581ceeb53961e4a0f3f7a23c926845fff9ffa48",
-            "receipt_digest": "sha256:645462107032cc30becc19c67c2d1e05990cb462a4d0598449faf884dcccf028",
             "bundle_digest": "sha256:92386f75f4a39886de6c087e03eb2e7c14bacaa89d74b50e778dde34fcc571bd",
             "retention_identity": "sha256:974b8ad2ec4d79eecb9e6458c24295b537b1ed11bdc19e62a8571e7c9e2eb8a6",
             "recording_receipt_digest": "sha256:7d6871df1cffe486251fcc9a0aabce0ed184f5e46345e4654329fd49fc5efa42",
             "result_identity": digest("1"), "status": "pass", "state": "VERIFIED", "mutation_count": 0,
+            "readiness_receipt_digest": digest("3"), "dispatch_count": 1, "record_count": 1, "verify_count": 1,
+            "execution_context_input_digest": digest("4"), "execution_context_identity": digest("5"),
         }
+        lane_a_result["receipt_digest"] = canonical_digest(lane_a_result)
         lane_a_recording = {
             "schema": "roundwright-harness-recording-receipt/v1", "profile": lane_a_result["profile"],
             "candidate_sha": source_candidate, "case_id": lane_a_result["case_id"], "ready_at": 1787551215,
-            "bundle_digest": lane_a_result["bundle_digest"], "receipt_digest": lane_a_result["recording_receipt_digest"],
+            "bundle_digest": lane_a_result["bundle_digest"],
             "retention_identity": lane_a_result["retention_identity"], "manifest_digest": "sha256:83bde279b1129f134957f859515b317de9de672a4808f4191284df5a753903e2",
             "evidence_digest": digest("2"), "evidence_schema": "roundwright-shadow-case/v2", "status": "sealed",
         }
+        lane_a_recording["receipt_digest"] = canonical_digest(lane_a_recording)
+        lane_a_result["recording_receipt_digest"] = lane_a_recording["receipt_digest"]
+        lane_a_result["receipt_digest"] = canonical_digest({key: value for key, value in lane_a_result.items() if key != "receipt_digest"})
         lane_b_seal = {
             "schema": "roundwright-harness-lifecycle-seal-receipt/v1", "candidate_sha": source_candidate,
             "ready_at": 1787552443, "plan_digest": "sha256:0ef36d978850e9bdcbbc8ee5a37394f5d25a0c39da9af45bf1ff6d1866e59887",
             "ledger_digest": "sha256:15392e2069f342ff8207a1a886346bd4b5d1f7c59ba8041251524cf073a59c6f",
             "manifest_digest": "sha256:6c0f88dba08a4f420750ad08284a7bffba4b860ba535aba8e85a58d1176d3db9",
-            "receipt_digest": "sha256:c157388ca674eaeace6963f14b302cef8270fd280fe725743cf99375c3c43457",
             "retention_identity": "sha256:16363b4efd227c22086743e9b9341de85263e32c1289fc9df0e75d0eda54a118", "status": "sealed",
+            "event_schema": "roundwright-harness-lifecycle-event/v1", "window_identity": digest("6"),
+            "repository_identity": digest("7"), "event_count": 4, "head_event_digest": digest("8"), "head_entry_digest": digest("9"),
         }
+        lane_b_seal["receipt_digest"] = canonical_digest(lane_b_seal)
+        lane_b_qualification = {
+            "schema": "roundwright-integrated-lane-b-qualification/v1", "status": "pass", "state": "VERIFIED",
+            "candidate_sha": source_candidate, "ready_at": lane_b_seal["ready_at"], "plan_digest": lane_b_seal["plan_digest"],
+            "ledger_digest": lane_b_seal["ledger_digest"], "seal_receipt_digest": lane_b_seal["receipt_digest"],
+            "manifest_digest": lane_b_seal["manifest_digest"], "retention_identity": lane_b_seal["retention_identity"],
+            "mutation_count": 0, "classified_differences": [],
+        }
+        lane_b_qualification["result_digest"] = canonical_digest(lane_b_qualification)
         historical = replace(self.source(RetainedSourceKind.HISTORICAL_REFERENCE), candidate_sha="c" * 40)
         synthetic = replace(self.source(RetainedSourceKind.SYNTHETIC_REFERENCE), candidate_sha="d" * 40)
         expectation = RetainedEvidenceExpectation(
@@ -152,19 +168,25 @@ class IntegratedBoundaryTests(unittest.TestCase):
             candidate_sha="b" * 40, case_id="issue-50-composition", capture_plan_digest=digest("a"),
             expectation=expectation,
             lane_a_result=lane_a_result, lane_a_recording=lane_a_recording, lane_b_seal=lane_b_seal,
+            lane_b_qualification=lane_b_qualification,
             historical_reference=historical.public_payload(), synthetic_reference=synthetic.public_payload(),
         )
         self.assertEqual(inputs.lane_a.result_digest, lane_a_result["receipt_digest"])
         self.assertEqual(inputs.lane_a.bundle_digest, lane_a_result["bundle_digest"])
         self.assertEqual(inputs.lane_b.result_digest, lane_b_seal["ledger_digest"])
         self.assertEqual((inputs.historical_reference.candidate_sha, inputs.synthetic_reference.candidate_sha), ("c" * 40, "d" * 40))
-        with self.assertRaises(IntegratedBoundaryError):
-            bind_issue_49_retained_evidence(
-                candidate_sha="b" * 40, case_id="issue-50-composition", capture_plan_digest=digest("a"),
-                expectation=expectation,
-                lane_a_result={**lane_a_result, "mutation_count": 1}, lane_a_recording=lane_a_recording,
-                lane_b_seal=lane_b_seal, historical_reference=historical.public_payload(), synthetic_reference=synthetic.public_payload(),
-            )
+        for lane_a, qualification in (
+            ({**lane_a_result, "mutation_count": 1}, lane_b_qualification),
+            (lane_a_result, {**lane_b_qualification, "status": "fail"}),
+            ({**lane_a_result, "unexpected": "field"}, lane_b_qualification),
+            ({**lane_a_result, "receipt_digest": digest("f")}, lane_b_qualification),
+        ):
+            with self.subTest(lane_a=lane_a, qualification=qualification), self.assertRaises(IntegratedBoundaryError):
+                bind_issue_49_retained_evidence(
+                    candidate_sha="b" * 40, case_id="issue-50-composition", capture_plan_digest=digest("a"), expectation=expectation,
+                    lane_a_result=lane_a, lane_a_recording=lane_a_recording, lane_b_seal=lane_b_seal,
+                    lane_b_qualification=qualification, historical_reference=historical.public_payload(), synthetic_reference=synthetic.public_payload(),
+                )
 
     def test_review_policy_keeps_failover_separate_from_complete_and_converging_rounds(self) -> None:
         policy = ReviewPolicy(complete_rounds=1, max_rounds=2, max_supervisor_attempts_per_round=3,

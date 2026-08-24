@@ -446,6 +446,26 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.run_integrated_boundary_composition_profile("validate", request, Path("store"), inputs)
         self.assertEqual(len(harness.run_calls), before)
 
+    def test_integrated_hosted_entrypoint_rejects_rewritten_or_failing_lane_b(self) -> None:
+        producer, exporter, comparator = external_validation.integrated_boundary_component_identities()
+        plan = {
+            "profile": INTEGRATED_BOUNDARY_PROFILE, "case_id": "issue-50-lane-b-adversarial", "candidate_sha": "b" * 40,
+            "ready_at": 17, "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+        }
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        for attribute, value in (("receipt_digest", "sha256:" + "f" * 64), ("result", "fail")):
+            inputs = self.integrated_inputs("b" * 40, plan["case_id"], external_validation._digest(plan))
+            object.__setattr__(inputs.lane_b, attribute, value)
+            request = {
+                "schema": "roundwright-harness-profile-executor-request/v2",
+                "capture_plan": plan,
+                "execution_context": integrated_boundary_execution_context(inputs),
+            }
+            with self.subTest(attribute=attribute), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation.run_integrated_boundary_composition_profile("validate", request, Path("store"), inputs)
+        self.assertEqual(len(harness.run_calls), before)
+
     def test_integrated_composition_runs_through_the_reviewed_harness_recorder(self) -> None:
         """Exercise V2 context preparation and Recorder read-back without live access."""
 

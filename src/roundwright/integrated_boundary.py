@@ -69,7 +69,7 @@ class RetainedEvidenceExpectation:
         return dict(self.__dict__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RetainedEvidenceSource:
     """A sealed, public-safe immutable source consumed by composition once."""
 
@@ -156,7 +156,7 @@ def source_from_public_payload(value: object) -> RetainedEvidenceSource:
 
 def bind_issue_49_retained_evidence(
     *, candidate_sha: str, case_id: str, capture_plan_digest: str, expectation: RetainedEvidenceExpectation,
-    lane_a_result: object, lane_a_recording: object, lane_b_seal: object,
+    lane_a_result: object, lane_a_recording: object, lane_b_seal: object, lane_b_qualification: object,
     historical_reference: object, synthetic_reference: object,
 ) -> IntegratedBoundaryInputs:
     """Bind the concrete #49 receipt shapes into one #50 composition request.
@@ -167,11 +167,15 @@ def bind_issue_49_retained_evidence(
     """
 
     try:
-        lane_a, recording, lane_b = (dict(value) for value in (lane_a_result, lane_a_recording, lane_b_seal))
+        lane_a, recording, lane_b, qualification = (
+            dict(value) for value in (lane_a_result, lane_a_recording, lane_b_seal, lane_b_qualification)
+        )
         result_required = {
-            "candidate_sha", "case_id", "mutation_count", "plan_digest", "profile",
-            "ready_at", "receipt_digest", "retention_identity", "schema", "state", "status",
-            "bundle_digest", "recording_receipt_digest", "result_identity",
+            "schema", "status", "state", "readiness_receipt_digest", "plan_digest", "profile",
+            "case_id", "candidate_sha", "ready_at", "result_identity", "bundle_digest",
+            "recording_receipt_digest", "retention_identity", "dispatch_count", "record_count",
+            "verify_count", "mutation_count", "execution_context_input_digest",
+            "execution_context_identity", "receipt_digest",
         }
         recording_required = {
             "bundle_digest", "candidate_sha", "case_id", "evidence_digest", "evidence_schema",
@@ -179,19 +183,42 @@ def bind_issue_49_retained_evidence(
         }
         seal_required = {
             "candidate_sha", "ledger_digest", "manifest_digest", "plan_digest", "ready_at",
-            "receipt_digest", "retention_identity", "schema", "status",
+            "receipt_digest", "retention_identity", "schema", "status", "event_schema",
+            "window_identity", "repository_identity", "event_count", "head_event_digest", "head_entry_digest",
         }
+        qualification_required = {
+            "schema", "status", "state", "candidate_sha", "ready_at", "plan_digest",
+            "ledger_digest", "seal_receipt_digest", "manifest_digest", "retention_identity",
+            "mutation_count", "classified_differences", "result_digest",
+        }
+        def receipt_is_canonical(value: dict[str, object], digest_key: str) -> bool:
+            supplied = value.get(digest_key)
+            return isinstance(supplied, str) and supplied == _digest({key: item for key, item in value.items() if key != digest_key})
         if (
-            not result_required.issubset(lane_a) or not recording_required.issubset(recording) or not seal_required.issubset(lane_b)
+            set(lane_a) != result_required or set(recording) != recording_required or set(lane_b) != seal_required
+            or set(qualification) != qualification_required
             or lane_a["schema"] != "roundwright-harness-profile-executor-result/v2"
             or recording["schema"] != "roundwright-harness-recording-receipt/v1"
             or lane_b["schema"] != "roundwright-harness-lifecycle-seal-receipt/v1"
+            or qualification["schema"] != "roundwright-integrated-lane-b-qualification/v1"
             or lane_a["profile"] != READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
-            or lane_a["status"] != "pass" or lane_a["state"] != "VERIFIED" or lane_a["mutation_count"] != 0
+            or lane_a["status"] != "pass" or lane_a["state"] != "VERIFIED"
+            or (lane_a["dispatch_count"], lane_a["record_count"], lane_a["verify_count"], lane_a["mutation_count"]) != (1, 1, 1, 0)
             or recording["status"] != "sealed" or lane_b["status"] != "sealed"
+            or qualification["status"] != "pass" or qualification["state"] != "VERIFIED"
+            or qualification["mutation_count"] != 0 or qualification["classified_differences"] != []
             or any(lane_a[key] != recording[key] for key in ("candidate_sha", "case_id", "ready_at", "profile", "bundle_digest", "retention_identity"))
             or lane_a["recording_receipt_digest"] != recording["receipt_digest"]
             or lane_a["candidate_sha"] != lane_b["candidate_sha"]
+            or any(qualification[key] != lane_b[value] for key, value in (
+                ("candidate_sha", "candidate_sha"), ("ready_at", "ready_at"), ("plan_digest", "plan_digest"),
+                ("ledger_digest", "ledger_digest"), ("seal_receipt_digest", "receipt_digest"),
+                ("manifest_digest", "manifest_digest"), ("retention_identity", "retention_identity"),
+            ))
+            or not receipt_is_canonical(lane_a, "receipt_digest")
+            or not receipt_is_canonical(recording, "receipt_digest")
+            or not receipt_is_canonical(lane_b, "receipt_digest")
+            or not receipt_is_canonical(qualification, "result_digest")
         ):
             raise ValueError
         historical = source_from_public_payload(historical_reference)
@@ -231,6 +258,7 @@ class IntegratedBoundaryInputs:
             or not _DIGEST.fullmatch(self.capture_plan_digest)
             or type(self.expectation) is not RetainedEvidenceExpectation
             or any(type(source) is not RetainedEvidenceSource for source in sources)
+            or any(source.source_digest != _digest(source.public_payload()) for source in sources)
             or tuple(source.kind for source in sources) != tuple(RetainedSourceKind)
             or len({source.source_digest for source in sources}) != len(sources)
             or len({source.receipt_digest for source in sources}) != len(sources)

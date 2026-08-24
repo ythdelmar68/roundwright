@@ -147,6 +147,15 @@ Roundwright owns typed profile/exporter/comparator semantics; Harness owns the
 single immutable execution/record/read-back path; generic Roundlet treats both
 as an opaque repository contract.
 
+The integrated Phase 3 boundary is intentionally narrower still.  Its
+`roundwright-shadow-profile/integrated-boundary/v1` composition accepts only
+the separately retained #49 Lane A and Lane B receipts plus distinct historical
+and synthetic references.  It verifies and projects their public digests into
+one composed manifest and result through the reviewed Harness V2/Recorder
+execution path, but never invokes a provider, GitHub, or the forward-test
+target.  The report labels supported, test-only, read-only,
+deferred, and prohibited capabilities without conferring authority.
+
 ## Development check
 
 The packaging gate uses the tracked, receipt-bound toolchain described in

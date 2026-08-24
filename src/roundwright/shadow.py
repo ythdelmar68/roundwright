@@ -876,6 +876,7 @@ PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = "roundwright-shadow-profile/provider-attem
 HOSTED_CHECK_PROFILE = "roundwright-shadow-profile/hosted-check/v1"
 LIVE_LIFECYCLE_SHADOW_PROFILE = "roundwright-shadow-profile/live-lifecycle-shadow/v1"
 READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = "roundwright-shadow-profile/read-only-external-observation/v1"
+INTEGRATED_BOUNDARY_PROFILE = "roundwright-shadow-profile/integrated-boundary/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -952,6 +953,7 @@ class CaptureMode(StrEnum):
     LIFECYCLE_GRAPH = "lifecycle-graph"
     SYNTHETIC_ONE_SHOT = "synthetic-one-shot"
     ARMED_LIVE_EVENTS = "armed-live-events"
+    COMPOSED_EVIDENCE = "composed-evidence"
 
 
 class ShadowProducer(StrEnum):
@@ -1109,6 +1111,17 @@ _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = ShadowEvidenceProfile(
     ("read-only-external-observation",),
 )
 
+_INTEGRATED_BOUNDARY_PROFILE = ShadowEvidenceProfile(
+    INTEGRATED_BOUNDARY_PROFILE,
+    CaptureMode.COMPOSED_EVIDENCE,
+    ShadowProducer.PROFILE_DEFINED,
+    "reviewed-harness-v2-retained-composition-recorder-readback-bound",
+    "after-every-required-lower-level-bundle-is-sealed",
+    "append-only-content-addressed-readback",
+    "missing-or-stale-source-returns-to-owning-producer",
+    ("composed-evidence-manifest", "composed-evidence-result"),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
@@ -1121,6 +1134,7 @@ def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
         _HOSTED_CHECK_PROFILE,
         _LIVE_LIFECYCLE_SHADOW_PROFILE,
         _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+        _INTEGRATED_BOUNDARY_PROFILE,
     )
 
 
@@ -1137,6 +1151,8 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _LIVE_LIFECYCLE_SHADOW_PROFILE
     if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
         return _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
+    if profile_id == INTEGRATED_BOUNDARY_PROFILE:
+        return _INTEGRATED_BOUNDARY_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

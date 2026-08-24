@@ -45,6 +45,7 @@ from roundwright.shadow import (
     LifecycleAttemptKind,
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
     HOSTED_CHECK_PROFILE,
+    INTEGRATED_BOUNDARY_PROFILE,
     PROVENANCE_DECISION_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     ProviderAttemptManifest,
@@ -1059,10 +1060,11 @@ class ShadowV2Tests(unittest.TestCase):
         hosted_checks = shadow_evidence_profile(HOSTED_CHECK_PROFILE)
         live_lifecycle = shadow_evidence_profile("roundwright-shadow-profile/live-lifecycle-shadow/v1")
         read_only_external_observation = shadow_evidence_profile(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)
+        integrated_boundary = shadow_evidence_profile(INTEGRATED_BOUNDARY_PROFILE)
         self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(
             shadow_evidence_profiles(),
-            (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle, read_only_external_observation),
+            (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary),
         )
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
@@ -1078,6 +1080,8 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(read_only_external_observation.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(read_only_external_observation.arm_before, "before-supervisor-dispatch")
         self.assertEqual(read_only_external_observation.event_kinds, ("read-only-external-observation",))
+        self.assertEqual(integrated_boundary.capture_mode, CaptureMode.COMPOSED_EVIDENCE)
+        self.assertEqual(integrated_boundary.event_kinds, ("composed-evidence-manifest", "composed-evidence-result"))
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

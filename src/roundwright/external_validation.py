@@ -19,6 +19,7 @@ from .shadow import (
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
+    INTEGRATED_BOUNDARY_PROFILE,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -27,6 +28,10 @@ from .shadow import (
     ShadowV2Error,
     ShadowV2EventGraph,
     shadow_evidence_profile,
+)
+from .integrated_boundary import (
+    ComposedEvidenceManifest, ComposedEvidenceResult, IntegratedBoundaryInputs,
+    IntegratedBoundaryError, compose_retained_evidence, integrated_boundary_execution_context,
 )
 from .github import (
     GitHubReadOperation,
@@ -136,6 +141,7 @@ PROVIDER_ATTEMPT_COMPARATOR_IDENTITY = _digest(
 PROVIDER_ATTEMPT_HISTORY_BLOCKER = "provider-attempt-runtime-unavailable"
 HOSTED_CHECK_OBSERVATION_BLOCKER = "hosted-check-observation-unavailable"
 LIVE_LIFECYCLE_OBSERVATION_BLOCKER = "live-lifecycle-shadow-observation-unavailable"
+INTEGRATED_BOUNDARY_SCHEMA = "roundwright-integrated-boundary-composition/v1"
 
 
 def synthetic_component_identities() -> tuple[str, str, str]:
@@ -226,6 +232,15 @@ def live_lifecycle_shadow_component_identities() -> tuple[str, str, str]:
         LIVE_LIFECYCLE_EXPORTER_IDENTITY,
         LIVE_LIFECYCLE_COMPARATOR_IDENTITY,
     )
+
+
+INTEGRATED_BOUNDARY_PRODUCER_IDENTITY = _digest({"schema": INTEGRATED_BOUNDARY_SCHEMA, "component": "retained-source-verifier"})
+INTEGRATED_BOUNDARY_EXPORTER_IDENTITY = _digest({"schema": INTEGRATED_BOUNDARY_SCHEMA, "component": "composed-manifest-exporter"})
+INTEGRATED_BOUNDARY_COMPARATOR_IDENTITY = _digest({"schema": INTEGRATED_BOUNDARY_SCHEMA, "component": "exact-composed-result-comparator"})
+
+
+def integrated_boundary_component_identities() -> tuple[str, str, str]:
+    return (INTEGRATED_BOUNDARY_PRODUCER_IDENTITY, INTEGRATED_BOUNDARY_EXPORTER_IDENTITY, INTEGRATED_BOUNDARY_COMPARATOR_IDENTITY)
 
 
 def _harness_executor() -> object:
@@ -3592,7 +3607,174 @@ class LiveLifecycleShadowProfileAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter:
+def _integrated_boundary_binding_identity(binding: object) -> str:
+    try:
+        payload = {
+            "schema": INTEGRATED_BOUNDARY_SCHEMA, "profile": binding.profile,
+            "case_id": binding.case_id, "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at, "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("integrated boundary binding is invalid") from error
+    if (
+        payload["profile"] != INTEGRATED_BOUNDARY_PROFILE or not isinstance(payload["case_id"], str)
+        or not payload["case_id"] or _SHA.fullmatch(payload["candidate_sha"]) is None
+        or type(payload["ready_at"]) is not int or payload["ready_at"] < 0
+        or _DIGEST.fullmatch(payload["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("integrated boundary binding is invalid")
+    return _digest(payload)
+
+
+@dataclass(frozen=True)
+class MaterializedIntegratedBoundaryContext:
+    """Opaque retained inputs bound to one exact V2 composition descriptor."""
+
+    descriptor: dict[str, object]
+    inputs: IntegratedBoundaryInputs
+    input_digest: str
+    candidate_sha: str
+    case_id: str
+    capture_plan_digest: str
+    ready_at: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.descriptor) is not dict
+            or type(self.inputs) is not IntegratedBoundaryInputs
+            or self.descriptor != integrated_boundary_execution_context(self.inputs)
+            or self.input_digest != _digest(self.descriptor)
+            or (self.candidate_sha, self.case_id, self.capture_plan_digest)
+            != (self.inputs.candidate_sha, self.inputs.case_id, self.inputs.capture_plan_digest)
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_token(self.case_id)
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or type(self.ready_at) is not int or self.ready_at < 0
+        ):
+            raise ExternalValidationAdapterError("integrated boundary V2 execution context is invalid")
+
+    @property
+    def identity(self) -> str:
+        return _digest({
+            "schema": "roundwright-integrated-boundary-context-binding/v1",
+            "descriptor": self.descriptor, "input_digest": self.input_digest,
+            "candidate_sha": self.candidate_sha, "case_id": self.case_id,
+            "capture_plan_digest": self.capture_plan_digest, "ready_at": self.ready_at,
+        })
+
+
+def _integrated_boundary_context(
+    binding: object, inputs: IntegratedBoundaryInputs,
+) -> MaterializedIntegratedBoundaryContext:
+    try:
+        context = binding.execution_context
+        descriptor_digest = binding.execution_context_input_digest
+        value = context.value
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("integrated boundary V2 execution context is unavailable") from error
+    if (
+        type(value) is not MaterializedIntegratedBoundaryContext
+        or type(descriptor_digest) is not str
+        or value.inputs != inputs
+        or value.input_digest != descriptor_digest
+        or value.descriptor != integrated_boundary_execution_context(inputs)
+        or context.identity != value.identity
+        or (value.candidate_sha, value.case_id, value.capture_plan_digest, value.ready_at)
+        != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at)
+    ):
+        raise ExternalValidationAdapterError("integrated boundary V2 execution context has drifted")
+    return value
+
+
+@dataclass(frozen=True)
+class IntegratedBoundaryCompositionAdapter:
+    """Reviewed V2 adapter that composes retained evidence without live access."""
+
+    inputs: IntegratedBoundaryInputs | None = None
+    profile_id: str = INTEGRATED_BOUNDARY_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile_id != INTEGRATED_BOUNDARY_PROFILE or (self.inputs is not None and type(self.inputs) is not IntegratedBoundaryInputs):
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(*integrated_boundary_component_identities())
+
+    def prepare_execution_context(self, preparation: object) -> object:
+        """Bind the closed retained tuple to the exact Harness V2 descriptor."""
+
+        try:
+            inputs = self.inputs
+            if inputs is None:
+                raise ValueError
+            descriptor = integrated_boundary_execution_context(inputs)
+            if (
+                preparation.descriptor != descriptor
+                or preparation.input_digest != _digest(descriptor)
+                or preparation.components != self.component_identities
+                or (
+                    preparation.plan.candidate_sha,
+                    preparation.plan.case_id,
+                    preparation.plan.plan_digest,
+                ) != (inputs.candidate_sha, inputs.case_id, inputs.capture_plan_digest)
+            ):
+                raise ValueError
+            context = MaterializedIntegratedBoundaryContext(
+                descriptor, inputs, preparation.input_digest,
+                preparation.plan.candidate_sha, preparation.plan.case_id,
+                preparation.plan.plan_digest, preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, TypeError, ValueError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("integrated boundary V2 execution context is invalid") from error
+
+    def validate(self, binding: object) -> None:
+        _integrated_boundary_binding_identity(binding)
+        try:
+            components = (binding.components.producer_identity, binding.components.exporter_identity, binding.components.comparator_identity)
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("integrated boundary components are invalid") from error
+        if components != integrated_boundary_component_identities():
+            raise ExternalValidationAdapterError("integrated boundary components have drifted")
+        if self.inputs is None or (
+            self.inputs.candidate_sha != binding.candidate_sha or self.inputs.case_id != binding.case_id
+            or self.inputs.capture_plan_digest != binding.plan.plan_digest
+        ):
+            raise ExternalValidationAdapterError("integrated retained evidence is unavailable or stale")
+        _integrated_boundary_context(binding, self.inputs)
+
+    def execute(self, binding: object) -> object:
+        self.validate(binding)
+        assert self.inputs is not None
+        manifest, result = compose_retained_evidence(self.inputs)
+        return _harness_executor().ProfileExecution({"manifest": manifest.public_payload(), "result": result.public_payload()}, mutation_count=0)
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        self.validate(binding)
+        assert self.inputs is not None
+        manifest, result = compose_retained_evidence(self.inputs)
+        try:
+            if execution.mutation_count != 0 or execution.value != {"manifest": manifest.public_payload(), "result": result.public_payload()}:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("integrated boundary execution has drifted") from error
+        return {
+            "schema": "roundwright-shadow-case/v2", "profile": INTEGRATED_BOUNDARY_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id, "candidate_sha": binding.candidate_sha,
+            "capture_plan_digest": binding.plan.plan_digest, "integrated_boundary": execution.value,
+        }
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        expected = self.project(binding, self.execute(binding))
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        return _harness_executor().ProfileComparison(status, _digest({
+            "schema": INTEGRATED_BOUNDARY_SCHEMA, "status": status, "ready_at": binding.ready_at,
+            "expected_identity": _digest(expected), "observed_identity": _digest(evidence),
+        }))
+
+
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
@@ -3607,6 +3789,8 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
         return HostedCheckProfileAdapter(profile_id=profile_id)
     if profile_id == LIVE_LIFECYCLE_SHADOW_PROFILE:
         return LiveLifecycleShadowProfileAdapter(profile_id=profile_id)
+    if profile_id == INTEGRATED_BOUNDARY_PROFILE:
+        return IntegratedBoundaryCompositionAdapter(profile_id=profile_id)
     raise ExternalValidationAdapterError("executor profile is unsupported")
 
 
@@ -3735,6 +3919,58 @@ def run_hosted_check_profile(
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("hosted check hosted entrypoint binding is invalid") from error
+
+
+def run_integrated_boundary_composition_profile(
+    mode: Literal["validate", "execute"], request_value: Mapping[str, Any], store_root: Path,
+    retained_inputs: IntegratedBoundaryInputs, *, expected_readiness_digest: str | None = None,
+) -> object:
+    """Run #50 composition through the reviewed V2 executor and Recorder path.
+
+    ``retained_inputs`` must come from the concrete receipt parser in
+    :mod:`roundwright.integrated_boundary`; this entrypoint never reads or
+    replays a lower-level source itself.
+    """
+
+    harness = _harness_executor()
+    try:
+        if type(retained_inputs) is not IntegratedBoundaryInputs:
+            raise ValueError
+        # Reconstruct the immutable tuple at the public boundary so a caller
+        # cannot bypass dataclass construction and inject mixed source lanes.
+        try:
+            retained_inputs = IntegratedBoundaryInputs(
+                retained_inputs.candidate_sha, retained_inputs.case_id,
+                retained_inputs.capture_plan_digest, retained_inputs.expectation,
+                retained_inputs.lane_a, retained_inputs.lane_b,
+                retained_inputs.historical_reference, retained_inputs.synthetic_reference,
+            )
+        except IntegratedBoundaryError as error:
+            raise ExternalValidationAdapterError("integrated retained evidence is invalid") from error
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            mode not in {"validate", "execute"}
+            or request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != INTEGRATED_BOUNDARY_PROFILE
+            or request.execution_context != integrated_boundary_execution_context(retained_inputs) or not isinstance(store_root, Path)
+            or (mode == "validate" and expected_readiness_digest is not None)
+            or (mode == "execute" and _DIGEST.fullmatch(expected_readiness_digest or "") is None)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        if (
+            (plan.candidate_sha, plan.case_id, plan.plan_digest)
+            != (retained_inputs.candidate_sha, retained_inputs.case_id, retained_inputs.capture_plan_digest)
+        ):
+            raise ValueError
+        return harness.run_profile_executor(
+            mode, request_value, IntegratedBoundaryCompositionAdapter(retained_inputs), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except (IntegratedBoundaryError, ExternalValidationAdapterError):
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("integrated boundary hosted entrypoint binding is invalid") from error
 
 
 def run_read_only_external_observation_profile(

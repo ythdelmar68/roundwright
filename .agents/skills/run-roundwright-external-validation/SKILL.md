@@ -90,7 +90,11 @@ It is read-only, candidate-bound, and does not depend on a Supervisor result.
 Its execution must consume the exact forward-target inventory and fixture-manifest
 classification, implementation-PR curated trace, immutable `ready_at`, and
 independent before/after zero-mutation target read-back; a plan/binding-only
-projection is not Lane A evidence.
+projection is not Lane A evidence. The curated trace is the distinct
+pre-Supervisor `ROUNDLET_VALIDATION event=readiness` marker, bound to the
+candidate, plan, formal tuple, window, readiness point, and authorized
+publisher; a post-review `ROUNDLET_LIFECYCLE event=formal-result` marker belongs
+only to Lane B and cannot substitute for it.
 Lane B is the separately selected generic lifecycle sink: prepare and arm it
 before Supervisor dispatch; only after an accepted Supervisor PASS may it
 seal, project, and compare. Final qualification requires current exact-candidate

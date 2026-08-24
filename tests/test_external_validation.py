@@ -306,6 +306,34 @@ class ExternalValidationTests(unittest.TestCase):
             ))
         raise AssertionError("trace fixture received an unexpected read")
 
+    @staticmethod
+    def lane_a_trace_read_result(
+        request: GitHubReadRequest, candidate_sha: str,
+        capture_plan_digest: str = "sha256:" + "1" * 64,
+    ) -> GitHubReadResult:
+        """Return the pre-Supervisor readiness marker, never a formal result."""
+
+        repository = RepositoryRef("ythdelmar68", "roundwright")
+        if request.operation is GitHubReadOperation.PULL_REQUEST:
+            return GitHubReadResult(request, PullRequestSnapshot(
+                repository, repository, repository, "pull-request-85", 85,
+                PullRequestState.OPEN, "main", "b" * 40, "codex-issue-49",
+                candidate_sha, True,
+            ))
+        if request.operation is GitHubReadOperation.COMMENTS:
+            return GitHubReadResult(request, CommentsSnapshot(
+                repository, 85, "PULL_REQUEST", (
+                    CommentSnapshot(
+                        "comment-ready-85", "user:ythdelmar68",
+                        external_validation._digest(("comment-body", external_validation._roundlet_validation_readiness_marker(
+                            candidate_sha, capture_plan_digest, 1, "formal-round-1", "complete", "window-49", 17,
+                        ))),
+                        "2026-08-23T000000Z",
+                    ),
+                ),
+            ))
+        raise AssertionError("Lane A trace fixture received an unexpected read")
+
     def setUp(self) -> None:
         self._prior_package, self._prior_module = fake_harness()
         self._lifecycle_projection = self.live_lifecycle_projection()
@@ -359,18 +387,19 @@ class ExternalValidationTests(unittest.TestCase):
 
     def test_lane_a_requires_exact_external_sources_and_zero_mutation_read_back(self) -> None:
         inputs = self.read_only_external_observation_inputs()
-        trace_read_result = self.trace_read_result
+        trace_read_result = self.lane_a_trace_read_result
 
         class Capability:
             def __init__(
                 self, *, mutate_after: bool = False, missing_trace: bool = False,
-                classification_drift: bool = False,
+                classification_drift: bool = False, formal_result_only: bool = False,
             ) -> None:
                 self.calls: list[GitHubReadRequest] = []
                 self.inventory_calls = 0
                 self.mutate_after = mutate_after
                 self.missing_trace = missing_trace
                 self.classification_drift = classification_drift
+                self.formal_result_only = formal_result_only
 
             def read(self, request: GitHubReadRequest) -> GitHubReadResult:
                 self.calls.append(request)
@@ -379,7 +408,8 @@ class ExternalValidationTests(unittest.TestCase):
                         return GitHubReadResult(request, CommentsSnapshot(
                             RepositoryRef("ythdelmar68", "roundwright"), 85, "PULL_REQUEST", (),
                         ))
-                    return trace_read_result(request, "a" * 40)
+                    reader = ExternalValidationTests.trace_read_result if self.formal_result_only else trace_read_result
+                    return reader(request, "a" * 40)
                 self.inventory_calls += 1
                 suffix = "b" if self.mutate_after and self.inventory_calls == 2 else "a"
                 snapshot = ExternalValidationTests.read_only_external_observation_inventory(
@@ -418,6 +448,7 @@ class ExternalValidationTests(unittest.TestCase):
             ("missing-trace", Capability(missing_trace=True)),
             ("target-mutation", Capability(mutate_after=True)),
             ("fixture-classification", Capability(classification_drift=True)),
+            ("post-review-formal-result", Capability(formal_result_only=True)),
         ):
             with self.subTest(drift=name):
                 provider = external_validation.ReadOnlyExternalObservationProvider(drifted, inputs)
@@ -1200,6 +1231,12 @@ class ExternalValidationTests(unittest.TestCase):
             ("wrong-tuple", TraceCapability(comments=(trace_comment(external_validation._roundlet_pr_conversation_marker(
                 "a" * 40, 2, "formal-round-2", "converging", "window-49", 17,
             )),))),
+            ("lane-a-readiness", TraceCapability(comments=(trace_comment(
+                external_validation._roundlet_validation_readiness_marker(
+                    "a" * 40, "sha256:" + "1" * 64, 1,
+                    "formal-round-1", "complete", "window-49", 17,
+                ),
+            ),))),
             ("wrong-author", TraceCapability(comments=(trace_comment(marker, author="user:untrusted"),))),
             ("duplicate", TraceCapability(comments=(trace_comment(marker), trace_comment(marker, "comment-86")))),
             ("mixed-author", TraceCapability(comments=(
@@ -2878,7 +2915,7 @@ class ExternalValidationTests(unittest.TestCase):
 
     def read_only_external_observation_inputs(self) -> external_validation.ReadOnlyExternalObservationInputs:
         return external_validation.ReadOnlyExternalObservationInputs(
-            "ythdelmar68/roundlet-forward-test", "d" * 40, "a" * 40,
+            "ythdelmar68/roundlet-forward-test", "d" * 40, "a" * 40, "sha256:" + "1" * 64,
             "ythdelmar68/roundwright", 85, "user:ythdelmar68", 1,
             "formal-round-1", "complete", "window-49", 17, self.fixture_manifest(),
         )

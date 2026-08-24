@@ -424,7 +424,9 @@ class ReadOnlyExternalObservationAdapter:
         if provider is None:
             raise ExternalValidationAdapterError("read-only external observation is unavailable")
         snapshot = provider.observe()
-        if (snapshot.candidate_sha, snapshot.ready_at) != (binding.candidate_sha, binding.ready_at):
+        if (snapshot.candidate_sha, snapshot.capture_plan_digest, snapshot.ready_at) != (
+            binding.candidate_sha, binding.plan.plan_digest, binding.ready_at,
+        ):
             raise ExternalValidationAdapterError("read-only external observation has drifted")
         return _harness_executor().ProfileExecution(
             {
@@ -451,7 +453,9 @@ class ReadOnlyExternalObservationAdapter:
             "snapshot": snapshot,
         } or mutation_count != 0 or type(snapshot) is not ReadOnlyExternalObservationSnapshot:
             raise ExternalValidationAdapterError("read-only external observation result has drifted")
-        if (snapshot.candidate_sha, snapshot.ready_at) != (binding.candidate_sha, binding.ready_at):
+        if (snapshot.candidate_sha, snapshot.capture_plan_digest, snapshot.ready_at) != (
+            binding.candidate_sha, binding.plan.plan_digest, binding.ready_at,
+        ):
             raise ExternalValidationAdapterError("read-only external observation has drifted")
         return {
             "schema": "roundwright-shadow-case/v2",
@@ -2018,6 +2022,29 @@ def _roundlet_pr_conversation_marker(
     )
 
 
+def _roundlet_validation_readiness_marker(
+    candidate_sha: str, capture_plan_digest: str, review_epoch: int, formal_round: str,
+    review_mode: str, observation_window: str, ready_at: int,
+) -> str:
+    """Canonical pre-review Lane A marker, distinct from a formal result."""
+
+    if (
+        _SHA.fullmatch(candidate_sha) is None
+        or _DIGEST.fullmatch(capture_plan_digest) is None
+        or type(review_epoch) is not int or review_epoch < 1
+        or not _safe_token(formal_round) or not _safe_token(review_mode)
+        or not _safe_token(observation_window)
+        or type(ready_at) is not int or ready_at < 0
+    ):
+        raise ExternalValidationAdapterError("Roundwright validation readiness marker is invalid")
+    return (
+        "ROUNDLET_VALIDATION event=readiness"
+        f" candidate={candidate_sha} plan={capture_plan_digest} epoch={review_epoch}"
+        f" round={formal_round} mode={review_mode} window={observation_window} ready_at={ready_at}"
+        "\n"
+    )
+
+
 def _private_supervisor_profile(artifact_references: tuple[str, ...]) -> tuple[str, str]:
     """Decode one retained Supervisor profile only for the live comparator.
 
@@ -2524,6 +2551,7 @@ class ReadOnlyExternalObservationInputs:
     target_repository: str
     target_baseline_sha: str
     candidate_sha: str
+    capture_plan_digest: str
     trace_repository: str
     trace_pull_request: int
     trace_publisher_identity: str
@@ -2539,6 +2567,7 @@ class ReadOnlyExternalObservationInputs:
             not _safe_repository(self.target_repository)
             or _SHA.fullmatch(self.target_baseline_sha) is None
             or _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or not _safe_repository(self.trace_repository)
             or type(self.trace_pull_request) is not int or self.trace_pull_request < 1
             or not _trace_publisher_identity(self.trace_publisher_identity)
@@ -2561,6 +2590,7 @@ class ReadOnlyExternalObservationSnapshot:
     """Public-safe Lane A evidence from exact external read-back sources."""
 
     candidate_sha: str
+    capture_plan_digest: str
     ready_at: int
     target_state_digest: str
     trace_receipt_digest: str
@@ -2569,6 +2599,7 @@ class ReadOnlyExternalObservationSnapshot:
     def __post_init__(self) -> None:
         if (
             _SHA.fullmatch(self.candidate_sha) is None
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or type(self.ready_at) is not int or self.ready_at < 0
             or any(_DIGEST.fullmatch(item) is None for item in (
                 self.target_state_digest, self.trace_receipt_digest, self.fixture_receipt_digest,
@@ -2624,8 +2655,8 @@ class ReadOnlyExternalObservationProvider(_RoundwrightLiveLifecycleProvider):
                 number=self._trace_pull_request), CommentsSnapshot,
         )
         assert type(pull_request) is PullRequestSnapshot and type(comments) is CommentsSnapshot
-        marker = _roundlet_pr_conversation_marker(
-            self._candidate_sha, self._inputs.review_epoch, self._inputs.formal_round,
+        marker = _roundlet_validation_readiness_marker(
+            self._candidate_sha, self._inputs.capture_plan_digest, self._inputs.review_epoch, self._inputs.formal_round,
             self._inputs.review_mode, self._inputs.observation_window, self._inputs.ready_at,
         )
         marker_digest = _digest(("comment-body", marker))
@@ -2645,7 +2676,8 @@ class ReadOnlyExternalObservationProvider(_RoundwrightLiveLifecycleProvider):
             raise ExternalValidationAdapterError("read-only external PR trace has drifted")
         return _digest({
             "repository": self._trace_repository.slug, "pull_request": self._trace_pull_request,
-            "candidate_sha": self._candidate_sha, "review_epoch": self._inputs.review_epoch,
+            "candidate_sha": self._candidate_sha, "capture_plan_digest": self._inputs.capture_plan_digest,
+            "review_epoch": self._inputs.review_epoch,
             "formal_round": self._inputs.formal_round, "review_mode": self._inputs.review_mode,
             "window": self._inputs.observation_window, "ready_at": self._inputs.ready_at,
             "publisher": self._trace_publisher_identity, "marker_digest": marker_digest,
@@ -2663,7 +2695,7 @@ class ReadOnlyExternalObservationProvider(_RoundwrightLiveLifecycleProvider):
         if before_digest != self._target_state_digest(after):
             raise ExternalValidationAdapterError("read-only external target mutation has drifted")
         return ReadOnlyExternalObservationSnapshot(
-            self._candidate_sha, self._inputs.ready_at, before_digest, trace,
+            self._candidate_sha, self._inputs.capture_plan_digest, self._inputs.ready_at, before_digest, trace,
             _digest({"manifest": self._inputs.fixture_manifest.manifest_digest, "differences": differences}),
         )
 

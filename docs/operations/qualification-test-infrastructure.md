@@ -216,7 +216,10 @@ project, seal/verify, and compare before Supervisor dispatch. It is read-only
 and has no dependency on accepted Supervisor PASS. Its receipt binds the exact
 forward-target inventory and fixture classification, implementation-PR curated
 trace, immutable `ready_at`, and before/after target zero-mutation read-back;
-a plan or candidate binding alone cannot qualify it. Lane B is the opt-in generic
+a plan or candidate binding alone cannot qualify it. The Lane A trace is a
+pre-Supervisor `ROUNDLET_VALIDATION event=readiness` marker bound to candidate,
+plan, tuple, window, readiness, and publisher; the post-review formal-result
+marker is Lane B-only and is not substitutable. Lane B is the opt-in generic
 lifecycle sink: it is ready and `ARMED` before Supervisor dispatch, and only an
 accepted PASS permits its later seal, projection, and comparison. Final merge
 qualification requires all current exact-candidate facts conjunctively: Lane A

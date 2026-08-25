@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +29,6 @@ from roundwright.qualification_gate import (
     TemporaryResourceKind,
     assess_phase_3_qualification,
     issue_51_selection_trace_correction,
-    qualification_gate_source_receipt,
     VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
 )
 from roundwright.shadow import LIVE_LIFECYCLE_SHADOW_PROFILE, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
@@ -35,6 +36,46 @@ from roundwright.shadow import LIVE_LIFECYCLE_SHADOW_PROFILE, READ_ONLY_EXTERNAL
 
 def digest(value: int) -> str:
     return f"sha256:{value:064x}"
+
+
+def canonical(value: dict[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, epoch: int, round_: int, identity: str) -> dict[str, object]:
+    value: dict[str, object] = {
+        "candidate_sha": candidate_sha, "case_id": case_id, "review_epoch": epoch,
+        "review_round": round_, "review_mode": "COMPLETE",
+    }
+    if kind is QualificationGateKind.FORMAL_REVIEW:
+        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_result_identity": identity}
+    elif kind is QualificationGateKind.HOSTED_CHECKS:
+        value |= {"schema": "roundwright-exact-head-check-receipt/v1", "head_sha": candidate_sha, "check_run_identity": identity, "conclusion": "success"}
+    elif kind is QualificationGateKind.POLICY:
+        value |= {"schema": "roundwright-policy-receipt/v1", "policy_snapshot_digest": identity, "policy_outcome": "pass"}
+    else:
+        value |= {"schema": "roundwright-provenance-receipt/v1", "source_sha": candidate_sha, "provenance_manifest_digest": identity, "verification": "pass"}
+    return value | {"receipt_digest": canonical(value)}
+
+
+def issue_50_bundle_receipt(candidate_sha: str, case_id: str, retention_manifest_digest: str, manifest_digest: str, result_digest: str, bundle_digest: str = VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST) -> RetainedIssue50BundleReceipt:
+    recording = {
+        "schema": "roundwright-harness-recording-receipt/v1", "status": "sealed",
+        "candidate_sha": candidate_sha, "case_id": case_id,
+        "retention_manifest_digest": retention_manifest_digest, "manifest_digest": manifest_digest,
+        "evidence_digest": result_digest, "bundle_digest": bundle_digest,
+        "retention_identity": digest(96),
+    }
+    recording["receipt_digest"] = canonical(recording)
+    result = {
+        "schema": "roundwright-harness-profile-executor-result/v2", "status": "pass", "state": "VERIFIED",
+        "candidate_sha": candidate_sha, "case_id": case_id,
+        "retention_manifest_digest": retention_manifest_digest, "manifest_digest": manifest_digest,
+        "result_digest": result_digest, "bundle_digest": bundle_digest,
+        "retention_identity": digest(96), "recording_receipt_digest": recording["receipt_digest"],
+    }
+    result["receipt_digest"] = canonical(result)
+    return RetainedIssue50BundleReceipt(result, recording)
 
 
 class Phase3QualificationGateTests(unittest.TestCase):
@@ -77,13 +118,13 @@ class Phase3QualificationGateTests(unittest.TestCase):
             "roundlet_commit": "d" * 40, "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
             "rollback_proposal_digest": digest(97), "kill_switch_proposal_digest": digest(98),
             "retained_evidence": RetainedEvidenceBinding(pins, RetainedEvidenceObservations(*pins.payload().values())),
-            "issue_50_bundle_receipt": RetainedIssue50BundleReceipt(self.issue_50_candidate, expectation.retention_manifest_digest, manifest.manifest_digest, result.result_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST),
+            "issue_50_bundle_receipt": issue_50_bundle_receipt(self.issue_50_candidate, "issue-50", expectation.retention_manifest_digest, manifest.manifest_digest, result.result_digest),
             "temporary_resources": resources, "integrated_inputs": retained, "composed_manifest": manifest, "composed_result": result,
             "lane_a": EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, self.issue_49_candidate, "verified", "pass"),
             "lane_b": EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, self.issue_49_candidate, "verified", "pass"),
             "current_gate_receipts": QualificationGateReceiptSet(tuple(
-                QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", qualification_gate_source_receipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE"))
-                for index, kind in enumerate(QualificationGateKind)
+                QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, authority_identity))
+                for kind, authority_identity in zip(QualificationGateKind, (digest(78), digest(79), digest(97), digest(98)), strict=True)
             )),
         }
         values.update(changes)
@@ -127,15 +168,18 @@ class Phase3QualificationGateTests(unittest.TestCase):
                 QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
                 "issue-51-qualification", 1, 1, "COMPLETE", "pass", digest(100),  # type: ignore[arg-type]
             )
-        source = qualification_gate_source_receipt(
-            QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
-            "issue-51-qualification", 1, 1, "COMPLETE",
-        )
+        source = gate_source(QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate, "issue-51-qualification", 1, 1, digest(100))
         with self.assertRaises(QualificationGateError):
             QualificationGateReceipt(
                 QualificationGateKind.HOSTED_CHECKS, self.qualification_candidate,
                 "issue-51-qualification", 1, 1, "COMPLETE", "pass", source,
             )
+        fabricated = QualificationGateReceiptSet(tuple(
+            QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, digest(110 + index)))
+            for index, kind in enumerate(QualificationGateKind)
+        ))
+        with self.assertRaises(QualificationGateError):
+            self.inputs(current_gate_receipts=fabricated)
 
     def test_trace_correction_uses_only_verified_issue_50_digest(self) -> None:
         correction = issue_51_selection_trace_correction()
@@ -149,9 +193,14 @@ class Phase3QualificationGateTests(unittest.TestCase):
     def test_retained_issue_50_bundle_and_blockers_are_closed(self) -> None:
         inputs = self.inputs()
         with self.assertRaises(QualificationGateError):
-            self.inputs(issue_50_bundle_receipt=RetainedIssue50BundleReceipt(
-                self.issue_50_candidate, inputs.issue_50_bundle_receipt.retention_manifest_digest,
+            self.inputs(issue_50_bundle_receipt=issue_50_bundle_receipt(
+                self.issue_50_candidate, "issue-50", inputs.issue_50_bundle_receipt.retention_manifest_digest,
                 inputs.composed_manifest.manifest_digest, inputs.composed_result.result_digest, digest(71),
+            ))
+        with self.assertRaises(QualificationGateError):
+            self.inputs(issue_50_bundle_receipt=issue_50_bundle_receipt(
+                self.issue_50_candidate, "issue-50", inputs.issue_50_bundle_receipt.retention_manifest_digest,
+                digest(72), inputs.composed_result.result_digest,
             ))
         with self.assertRaises(QualificationGateError):
             self.inputs(unresolved_blockers=("C:\\secret\nvalue",))  # type: ignore[arg-type]
@@ -159,10 +208,7 @@ class Phase3QualificationGateTests(unittest.TestCase):
         stale_first = QualificationGateReceipt(
             first.kind, first.candidate_sha, first.case_id, first.review_epoch,
             2, first.review_mode, first.result,
-            qualification_gate_source_receipt(
-                first.kind, first.candidate_sha, first.case_id, first.review_epoch,
-                2, first.review_mode,
-            ),
+            gate_source(first.kind, first.candidate_sha, first.case_id, first.review_epoch, 2, digest(78)),
         )
         stale_receipts = QualificationGateReceiptSet((
             stale_first, *inputs.current_gate_receipts.receipts[1:],

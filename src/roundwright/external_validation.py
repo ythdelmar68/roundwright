@@ -3811,7 +3811,7 @@ def _validate_phase_3_qualification_current_gates(current_gates: object, inputs:
     if current_gates != phase_3_qualification_current_gates(inputs):
         raise ExternalValidationAdapterError("phase-3 qualification current gates are invalid or stale")
     try:
-        current_gates.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id)
+        current_gates.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id, inputs.gate_authority_identities)
     except (AttributeError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("phase-3 qualification current gates are invalid or stale") from error
 

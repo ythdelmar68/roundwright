@@ -100,12 +100,52 @@ from roundwright.qualification_gate import (
     RetainedEvidencePins,
     RetainedIssue50BundleReceipt,
     VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
-    qualification_gate_source_receipt,
     TemporaryResourceDisposition,
     TemporaryResourceEntry,
     TemporaryResourceInventory,
     TemporaryResourceKind,
 )
+
+
+def canonical(value: dict[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, epoch: int, round_: int, identity: str) -> dict[str, object]:
+    value: dict[str, object] = {
+        "candidate_sha": candidate_sha, "case_id": case_id, "review_epoch": epoch,
+        "review_round": round_, "review_mode": "COMPLETE",
+    }
+    if kind is QualificationGateKind.FORMAL_REVIEW:
+        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_result_identity": identity}
+    elif kind is QualificationGateKind.HOSTED_CHECKS:
+        value |= {"schema": "roundwright-exact-head-check-receipt/v1", "head_sha": candidate_sha, "check_run_identity": identity, "conclusion": "success"}
+    elif kind is QualificationGateKind.POLICY:
+        value |= {"schema": "roundwright-policy-receipt/v1", "policy_snapshot_digest": identity, "policy_outcome": "pass"}
+    else:
+        value |= {"schema": "roundwright-provenance-receipt/v1", "source_sha": candidate_sha, "provenance_manifest_digest": identity, "verification": "pass"}
+    return value | {"receipt_digest": canonical(value)}
+
+
+def issue_50_bundle_receipt(candidate_sha: str, case_id: str, retention_manifest_digest: str, manifest_digest: str, result_digest: str) -> RetainedIssue50BundleReceipt:
+    retention_identity = "sha256:" + "f" * 64
+    recording = {
+        "schema": "roundwright-harness-recording-receipt/v1", "status": "sealed",
+        "candidate_sha": candidate_sha, "case_id": case_id,
+        "retention_manifest_digest": retention_manifest_digest, "manifest_digest": manifest_digest,
+        "evidence_digest": result_digest, "bundle_digest": VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+        "retention_identity": retention_identity,
+    }
+    recording["receipt_digest"] = canonical(recording)
+    result = {
+        "schema": "roundwright-harness-profile-executor-result/v2", "status": "pass", "state": "VERIFIED",
+        "candidate_sha": candidate_sha, "case_id": case_id,
+        "retention_manifest_digest": retention_manifest_digest, "manifest_digest": manifest_digest,
+        "result_digest": result_digest, "bundle_digest": VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+        "retention_identity": retention_identity, "recording_receipt_digest": recording["receipt_digest"],
+    }
+    result["receipt_digest"] = canonical(result)
+    return RetainedIssue50BundleReceipt(result, recording)
 
 
 @dataclass(frozen=True)
@@ -353,9 +393,9 @@ class ExternalValidationTests(unittest.TestCase):
             retained_evidence=RetainedEvidenceBinding(
                 pins, RetainedEvidenceObservations(*pins.payload().values()),
             ),
-            issue_50_bundle_receipt=RetainedIssue50BundleReceipt(
-                "b" * 40, retained.expectation.retention_manifest_digest,
-                manifest.manifest_digest, result.result_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+            issue_50_bundle_receipt=issue_50_bundle_receipt(
+                "b" * 40, retained.case_id, retained.expectation.retention_manifest_digest,
+                manifest.manifest_digest, result.result_digest,
             ),
             temporary_resources=TemporaryResourceInventory((
                 TemporaryResourceEntry("sha256:" + "d" * 64, TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
@@ -366,8 +406,8 @@ class ExternalValidationTests(unittest.TestCase):
             lane_a=external_validation.EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, "a" * 40, "verified", "pass"),
             lane_b=external_validation.EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, "a" * 40, "verified", "pass"),
             current_gate_receipts=QualificationGateReceiptSet(tuple(
-                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", qualification_gate_source_receipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE"))
-                for index, kind in enumerate(QualificationGateKind)
+                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", gate_source(kind, "c" * 40, "issue-51-qualification", 1, 1, authority_identity))
+                for kind, authority_identity in zip(QualificationGateKind, ("sha256:" + "7" * 64, qualification_plan_digest, "sha256:" + "b" * 64, "sha256:" + "c" * 64), strict=True)
             )),
         )
 
@@ -590,10 +630,7 @@ class ExternalValidationTests(unittest.TestCase):
         cross_candidate_first = QualificationGateReceipt(
             first.kind, "d" * 40, first.case_id, first.review_epoch,
             first.review_round, first.review_mode, first.result,
-            qualification_gate_source_receipt(
-                first.kind, "d" * 40, first.case_id, first.review_epoch,
-                first.review_round, first.review_mode,
-            ),
+            gate_source(first.kind, "d" * 40, first.case_id, first.review_epoch, first.review_round, "sha256:" + "7" * 64),
         )
         cross_candidate_gates = QualificationGateReceiptSet((
             cross_candidate_first, *gates.receipts[1:],

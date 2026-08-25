@@ -68,6 +68,12 @@ _GATE_RECEIPT_SCHEMAS = {
 }
 
 
+def _review_mode_for(epoch: object, round_: object) -> Literal["COMPLETE", "CONVERGING"]:
+    if type(epoch) is not int or epoch <= 0 or type(round_) is not int or not 1 <= round_ <= 10:
+        raise QualificationGateError("qualification review epoch or round is invalid")
+    return "COMPLETE" if round_ <= 3 else "CONVERGING"
+
+
 def _canonical_receipt(value: object, digest_key: str) -> dict[str, object]:
     if type(value) is not dict or type(value.get(digest_key)) is not str:
         raise QualificationGateError("qualification receipt is invalid")
@@ -93,10 +99,12 @@ def _validated_gate_source_receipt(
             "review_epoch": review_epoch, "review_round": review_round,
             "review_mode": review_mode,
         }
+        if review_mode != _review_mode_for(review_epoch, review_round):
+            raise ValueError
         required = {
             QualificationGateKind.FORMAL_REVIEW: {
                 "schema", "candidate_sha", "case_id", "review_epoch", "review_round", "review_mode",
-                "formal_result", "supervisor_result_identity", "receipt_digest",
+                "formal_result", "supervisor_verdict", "supervisor_result_identity", "receipt_digest",
             },
             QualificationGateKind.HOSTED_CHECKS: {
                 "schema", "candidate_sha", "case_id", "review_epoch", "review_round", "review_mode",
@@ -114,7 +122,8 @@ def _validated_gate_source_receipt(
         if set(receipt) != required or receipt["schema"] != _GATE_RECEIPT_SCHEMAS[kind] or any(receipt[key] != value for key, value in common.items()):
             raise ValueError
         if kind is QualificationGateKind.FORMAL_REVIEW:
-            valid = receipt["formal_result"] == "accepted" and _DIGEST.fullmatch(str(receipt["supervisor_result_identity"])) is not None
+            valid = (receipt["formal_result"] == "accepted" and receipt["supervisor_verdict"] == "PASS"
+                     and _DIGEST.fullmatch(str(receipt["supervisor_result_identity"])) is not None)
         elif kind is QualificationGateKind.HOSTED_CHECKS:
             valid = receipt["head_sha"] == candidate_sha and receipt["conclusion"] == "success" and _DIGEST.fullmatch(str(receipt["check_run_identity"])) is not None
         elif kind is QualificationGateKind.POLICY:
@@ -128,6 +137,15 @@ def _validated_gate_source_receipt(
     if receipt["receipt_digest"] != _digest({key: value for key, value in receipt.items() if key != "receipt_digest"}):
         raise QualificationGateError("qualification gate source receipt is invalid or stale")
     return receipt
+
+
+def _qualification_result_from_source(
+    kind: QualificationGateKind, source_receipt: dict[str, object],
+) -> Literal["pass"]:
+    if kind is QualificationGateKind.FORMAL_REVIEW:
+        if (source_receipt.get("formal_result"), source_receipt.get("supervisor_verdict")) != ("accepted", "PASS"):
+            raise QualificationGateError("formal review source does not authorize a passing gate")
+    return "pass"
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,14 +165,15 @@ class QualificationGateReceipt:
 
     def __post_init__(self) -> None:
         if (type(self.kind) is not QualificationGateKind or _SHA.fullmatch(self.candidate_sha) is None
-            or _TOKEN.fullmatch(self.case_id) is None or type(self.review_epoch) is not int or self.review_epoch < 0
-            or type(self.review_round) is not int or self.review_round < 0 or self.review_mode != "COMPLETE"
+            or _TOKEN.fullmatch(self.case_id) is None or self.review_mode != _review_mode_for(self.review_epoch, self.review_round)
             or self.result != "pass"):
             raise QualificationGateError("qualification gate receipt is invalid")
         source_receipt = _validated_gate_source_receipt(
             self.source_receipt, self.kind, self.candidate_sha, self.case_id,
             self.review_epoch, self.review_round, self.review_mode,
         )
+        if self.result != _qualification_result_from_source(self.kind, source_receipt):
+            raise QualificationGateError("qualification gate result does not match its source")
         object.__setattr__(self, "source_identity", str(source_receipt["receipt_digest"]))
         object.__setattr__(self, "receipt_digest", _digest(self.public_payload(include_digest=False)))
 
@@ -569,10 +588,11 @@ class Phase3QualificationInputs:
     input_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
+        expected_review_mode = _review_mode_for(self.qualification_review_epoch, self.qualification_review_round)
         if (
             any(_SHA.fullmatch(value) is None for value in (self.base_sha, self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha, self.roundlet_commit, self.harness_commit, self.forward_target_commit))
             or _TOKEN.fullmatch(self.qualification_case_id) is None or type(self.qualification_ready_at) is not int or self.qualification_ready_at < 0
-            or type(self.qualification_review_epoch) is not int or self.qualification_review_epoch < 0 or type(self.qualification_review_round) is not int or self.qualification_review_round < 0 or self.qualification_review_mode != "COMPLETE"
+            or self.qualification_review_mode != expected_review_mode
             or any(_DIGEST.fullmatch(value) is None for value in (self.qualification_capture_plan_digest, self.qualification_recorder_identity, self.qualification_store_identity, self.rollback_proposal_digest, self.kill_switch_proposal_digest))
             or len({self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha}) != 3
             or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.issue_50_bundle_receipt) is not RetainedIssue50BundleReceipt or type(self.temporary_resources) is not TemporaryResourceInventory

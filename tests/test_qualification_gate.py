@@ -48,10 +48,10 @@ def canonical(value: dict[str, object]) -> str:
 def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, epoch: int, round_: int, identity: str) -> dict[str, object]:
     value: dict[str, object] = {
         "candidate_sha": candidate_sha, "case_id": case_id, "review_epoch": epoch,
-        "review_round": round_, "review_mode": "COMPLETE",
+        "review_round": round_, "review_mode": "COMPLETE" if 1 <= round_ <= 3 else "CONVERGING",
     }
     if kind is QualificationGateKind.FORMAL_REVIEW:
-        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_result_identity": identity}
+        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_verdict": "PASS", "supervisor_result_identity": identity}
     elif kind is QualificationGateKind.HOSTED_CHECKS:
         value |= {"schema": "roundwright-exact-head-check-receipt/v1", "head_sha": candidate_sha, "check_run_identity": identity, "conclusion": "success"}
     elif kind is QualificationGateKind.POLICY:
@@ -216,6 +216,65 @@ class Phase3QualificationGateTests(unittest.TestCase):
         self.assertFalse(hasattr(inputs, "gate_authorities"))
         with self.assertRaises(QualificationGateError):
             assess_phase_3_qualification(inputs, self.gate_authority())
+
+    def test_formal_review_gate_derives_pass_only_from_supervisor_pass(self) -> None:
+        source = gate_source(
+            QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+            "issue-51-qualification", 1, 1, digest(100),
+        )
+        accepted_findings = {**source, "supervisor_verdict": "FINDINGS"}
+        accepted_findings["receipt_digest"] = canonical({
+            key: value for key, value in accepted_findings.items() if key != "receipt_digest"
+        })
+        with self.assertRaises(QualificationGateError):
+            QualificationGateReceipt(
+                QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                "issue-51-qualification", 1, 1, "COMPLETE", "pass", accepted_findings,
+            )
+        missing_verdict = {key: value for key, value in source.items() if key != "supervisor_verdict"}
+        missing_verdict["receipt_digest"] = canonical({
+            key: value for key, value in missing_verdict.items() if key != "receipt_digest"
+        })
+        with self.assertRaises(QualificationGateError):
+            QualificationGateReceipt(
+                QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                "issue-51-qualification", 1, 1, "COMPLETE", "pass", missing_verdict,
+            )
+
+    def test_review_epoch_round_modes_are_bounded_and_exact(self) -> None:
+        for round_, mode in ((1, "COMPLETE"), (3, "COMPLETE"), (4, "CONVERGING"), (10, "CONVERGING")):
+            with self.subTest(round=round_):
+                source = gate_source(
+                    QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                    "issue-51-qualification", 1, round_, digest(100 + round_),
+                )
+                receipt = QualificationGateReceipt(
+                    QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                    "issue-51-qualification", 1, round_, mode, "pass", source,
+                )
+                self.assertEqual(receipt.review_mode, mode)
+        for epoch, round_, mode in ((0, 1, "COMPLETE"), (1, 0, "COMPLETE"), (1, 11, "CONVERGING"), (1, 4, "COMPLETE")):
+            with self.subTest(epoch=epoch, round=round_, mode=mode), self.assertRaises(QualificationGateError):
+                QualificationGateReceipt(
+                    QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                    "issue-51-qualification", epoch, round_, mode, "pass",
+                    gate_source(QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                                "issue-51-qualification", epoch, round_, digest(120 + max(round_, 0))),
+                )
+        authority = QualificationGateAuthority(tuple(
+            gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 10, digest(140 + index))
+            for index, kind in enumerate(QualificationGateKind)
+        ))
+        current_gates = QualificationGateReceiptSet(tuple(
+            QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 10, "CONVERGING", "pass", source)
+            for kind, source in zip(QualificationGateKind, authority.receipts, strict=True)
+        ))
+        inputs = self.inputs(
+            qualification_review_round=10, qualification_review_mode="CONVERGING", current_gate_receipts=current_gates,
+        )
+        self.assertEqual(assess_phase_3_qualification(inputs, authority).disposition, PROMOTION_READY_FOR_CANARY_DECISION)
+        with self.assertRaises(QualificationGateError):
+            self.inputs(qualification_review_round=4, qualification_review_mode="COMPLETE")
 
     def test_trace_correction_uses_only_verified_issue_50_digest(self) -> None:
         correction = issue_51_selection_trace_correction()

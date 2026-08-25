@@ -116,10 +116,10 @@ def canonical(value: dict[str, object]) -> str:
 def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, epoch: int, round_: int, identity: str) -> dict[str, object]:
     value: dict[str, object] = {
         "candidate_sha": candidate_sha, "case_id": case_id, "review_epoch": epoch,
-        "review_round": round_, "review_mode": "COMPLETE",
+        "review_round": round_, "review_mode": "COMPLETE" if 1 <= round_ <= 3 else "CONVERGING",
     }
     if kind is QualificationGateKind.FORMAL_REVIEW:
-        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_result_identity": identity}
+        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_verdict": "PASS", "supervisor_result_identity": identity}
     elif kind is QualificationGateKind.HOSTED_CHECKS:
         value |= {"schema": "roundwright-exact-head-check-receipt/v1", "head_sha": candidate_sha, "check_run_identity": identity, "conclusion": "success"}
     elif kind is QualificationGateKind.POLICY:

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Literal
 
@@ -24,6 +24,7 @@ PROMOTION_READY_FOR_CANARY_DECISION = "PROMOTION_READY_FOR_CANARY_DECISION"
 QUALIFICATION_BLOCKED = "QUALIFICATION_BLOCKED"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
 class QualificationGateError(ValueError):
@@ -190,6 +191,11 @@ class Phase3QualificationInputs:
 
     base_sha: str
     qualification_candidate_sha: str
+    qualification_case_id: str
+    qualification_ready_at: int
+    qualification_capture_plan_digest: str
+    qualification_recorder_identity: str
+    qualification_store_identity: str
     issue_49_candidate_sha: str
     issue_50_candidate_sha: str
     roundlet_commit: str
@@ -214,7 +220,8 @@ class Phase3QualificationInputs:
     def __post_init__(self) -> None:
         if (
             any(_SHA.fullmatch(value) is None for value in (self.base_sha, self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha, self.roundlet_commit, self.harness_commit, self.forward_target_commit))
-            or any(_DIGEST.fullmatch(value) is None for value in (self.rollback_proposal_digest, self.kill_switch_proposal_digest))
+            or _TOKEN.fullmatch(self.qualification_case_id) is None or type(self.qualification_ready_at) is not int or self.qualification_ready_at < 0
+            or any(_DIGEST.fullmatch(value) is None for value in (self.qualification_capture_plan_digest, self.qualification_recorder_identity, self.qualification_store_identity, self.rollback_proposal_digest, self.kill_switch_proposal_digest))
             or len({self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha}) != 3
             or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.temporary_resources) is not TemporaryResourceInventory
             or type(self.integrated_inputs) is not IntegratedBoundaryInputs or type(self.composed_manifest) is not ComposedEvidenceManifest or type(self.composed_result) is not ComposedEvidenceResult
@@ -240,15 +247,30 @@ class Phase3QualificationInputs:
             raise QualificationGateError("phase-3 qualification evidence is not consumer-only")
         object.__setattr__(self, "input_digest", _digest(self.public_payload(include_digest=False)))
 
+    def validate(self) -> None:
+        """Reconstruct this closed input tuple to detect post-build drift."""
+
+        try:
+            rebuilt = replace(self)
+        except (AttributeError, TypeError, ValueError, QualificationGateError) as error:
+            raise QualificationGateError("phase-3 qualification evidence has drifted") from error
+        if rebuilt.input_digest != self.input_digest:
+            raise QualificationGateError("phase-3 qualification evidence has drifted")
+
     def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
         value: dict[str, object] = {
             "schema": QUALIFICATION_DECISION_SCHEMA, "profile": PHASE_3_QUALIFICATION_PROFILE,
             "base_sha": self.base_sha, "qualification_candidate_sha": self.qualification_candidate_sha,
+            "qualification_case_id": self.qualification_case_id, "qualification_ready_at": self.qualification_ready_at,
+            "qualification_capture_plan_digest": self.qualification_capture_plan_digest,
+            "qualification_recorder_identity": self.qualification_recorder_identity,
+            "qualification_store_identity": self.qualification_store_identity,
             "issue_49_candidate_sha": self.issue_49_candidate_sha, "issue_50_candidate_sha": self.issue_50_candidate_sha,
             "roundlet_commit": self.roundlet_commit, "harness_commit": self.harness_commit, "forward_target_commit": self.forward_target_commit,
             "rollback_proposal_digest": self.rollback_proposal_digest, "kill_switch_proposal_digest": self.kill_switch_proposal_digest,
             "retained_evidence": self.retained_evidence.public_payload(), "temporary_resources": self.temporary_resources.public_payload(),
-            "capture_plan_digest": self.integrated_inputs.capture_plan_digest, "composed_manifest_digest": self.composed_manifest.manifest_digest,
+            "retained_issue_50_capture_plan_digest": self.integrated_inputs.capture_plan_digest,
+            "composed_manifest_digest": self.composed_manifest.manifest_digest,
             "composed_result_digest": self.composed_result.result_digest,
             "retained_sources": [source.public_payload() | {"source_digest": source.source_digest} for source in (self.integrated_inputs.lane_a, self.integrated_inputs.lane_b, self.integrated_inputs.historical_reference, self.integrated_inputs.synthetic_reference)],
             "composed_manifest": self.composed_manifest.public_payload(), "composed_result": self.composed_result.public_payload(),

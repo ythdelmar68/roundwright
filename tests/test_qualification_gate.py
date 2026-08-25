@@ -64,6 +64,9 @@ class Phase3QualificationGateTests(unittest.TestCase):
         ))
         values = {
             "base_sha": "d" * 40, "qualification_candidate_sha": self.qualification_candidate,
+            "qualification_case_id": "issue-51-qualification", "qualification_ready_at": 23,
+            "qualification_capture_plan_digest": digest(79),
+            "qualification_recorder_identity": digest(78), "qualification_store_identity": digest(77),
             "issue_49_candidate_sha": self.issue_49_candidate, "issue_50_candidate_sha": self.issue_50_candidate,
             "roundlet_commit": "d" * 40, "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
             "rollback_proposal_digest": digest(97), "kill_switch_proposal_digest": digest(98),

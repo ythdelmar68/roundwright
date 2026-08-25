@@ -48,7 +48,10 @@ class Phase3QualificationGateTests(unittest.TestCase):
 
     def inputs(self, **changes: object) -> Phase3QualificationInputs:
         lane_a_source = self.source(RetainedSourceKind.LANE_A, 1)
-        lane_b_source = self.source(RetainedSourceKind.LANE_B, 2)
+        lane_b_source = replace(
+            self.source(RetainedSourceKind.LANE_B, 2),
+            bundle_digest=self.source(RetainedSourceKind.LANE_B, 2).result_digest,
+        )
         historical = self.source(RetainedSourceKind.HISTORICAL_REFERENCE, 3)
         synthetic = self.source(RetainedSourceKind.SYNTHETIC_REFERENCE, 4)
         expected = RetainedEvidenceExpectation(

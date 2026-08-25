@@ -520,7 +520,6 @@ class Phase3QualificationInputs:
     lane_a: EvidenceLaneReceipt
     lane_b: EvidenceLaneReceipt
     current_gate_receipts: QualificationGateReceiptSet
-    gate_authorities: QualificationGateAuthority
     unresolved_blockers: tuple[QualificationGateKind, ...] = ()
     input_digest: str = field(init=False)
 
@@ -533,12 +532,11 @@ class Phase3QualificationInputs:
             or len({self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha}) != 3
             or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.issue_50_bundle_receipt) is not RetainedIssue50BundleReceipt or type(self.temporary_resources) is not TemporaryResourceInventory
             or type(self.integrated_inputs) is not IntegratedBoundaryInputs or type(self.composed_manifest) is not ComposedEvidenceManifest or type(self.composed_result) is not ComposedEvidenceResult
-            or type(self.lane_a) is not EvidenceLaneReceipt or type(self.lane_b) is not EvidenceLaneReceipt or type(self.current_gate_receipts) is not QualificationGateReceiptSet or type(self.gate_authorities) is not QualificationGateAuthority
+            or type(self.lane_a) is not EvidenceLaneReceipt or type(self.lane_b) is not EvidenceLaneReceipt or type(self.current_gate_receipts) is not QualificationGateReceiptSet
             or type(self.unresolved_blockers) is not tuple or any(type(value) is not QualificationGateKind for value in self.unresolved_blockers) or len(set(self.unresolved_blockers)) != len(self.unresolved_blockers)
         ):
             raise QualificationGateError("phase-3 qualification evidence is invalid")
         self.retained_evidence.validate(); self.issue_50_bundle_receipt.validate(); self.temporary_resources.validate()
-        self.current_gate_receipts.validate_for(self.qualification_candidate_sha, self.qualification_case_id, self.gate_authorities)
         if any((item.review_epoch, item.review_round, item.review_mode) != (self.qualification_review_epoch, self.qualification_review_round, self.qualification_review_mode) for item in self.current_gate_receipts.receipts):
             raise QualificationGateError("qualification gate receipts have a stale formal review binding")
         if (
@@ -583,7 +581,7 @@ class Phase3QualificationInputs:
             "roundlet_commit": self.roundlet_commit, "harness_commit": self.harness_commit, "forward_target_commit": self.forward_target_commit,
             "rollback_proposal_digest": self.rollback_proposal_digest, "kill_switch_proposal_digest": self.kill_switch_proposal_digest,
             "retained_evidence": self.retained_evidence.public_payload(), "temporary_resources": self.temporary_resources.public_payload(),
-            "issue_50_bundle_receipt": self.issue_50_bundle_receipt.public_payload(), "current_gate_receipts": self.current_gate_receipts.public_payload(), "gate_authorities": self.gate_authorities.public_payload(),
+            "issue_50_bundle_receipt": self.issue_50_bundle_receipt.public_payload(), "current_gate_receipts": self.current_gate_receipts.public_payload(),
             "retained_issue_50_capture_plan_digest": self.integrated_inputs.capture_plan_digest,
             "composed_manifest_digest": self.composed_manifest.manifest_digest,
             "composed_result_digest": self.composed_result.result_digest,
@@ -622,12 +620,13 @@ class CanaryEntryDecisionPackage:
         return value | ({"decision_digest": self.decision_digest} if include_digest else {})
 
 
-def assess_phase_3_qualification(inputs: Phase3QualificationInputs) -> CanaryEntryDecisionPackage:
+def assess_phase_3_qualification(inputs: Phase3QualificationInputs, gate_authority: QualificationGateAuthority) -> CanaryEntryDecisionPackage:
     """Evaluate retained evidence without external calls, storage, or cleanup."""
 
-    if type(inputs) is not Phase3QualificationInputs:
+    if type(inputs) is not Phase3QualificationInputs or type(gate_authority) is not QualificationGateAuthority:
         raise QualificationGateError("phase-3 qualification inputs are invalid")
     inputs.validate()
+    inputs.current_gate_receipts.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id, gate_authority)
     lanes_pass = (inputs.lane_a.state, inputs.lane_a.result, inputs.lane_b.state, inputs.lane_b.result) == ("verified", "pass", "verified", "pass")
     ready = lanes_pass and inputs.temporary_resources.promotion_eligible and not inputs.unresolved_blockers
     return CanaryEntryDecisionPackage(inputs, PROMOTION_READY_FOR_CANARY_DECISION if ready else QUALIFICATION_BLOCKED)

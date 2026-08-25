@@ -99,16 +99,19 @@ class Phase3QualificationGateTests(unittest.TestCase):
         }[kind]
         return RetainedEvidenceSource(kind, profile, self.issue_49_candidate, f"case-{value}", value, *(digest(value + offset) for offset in (0, 10, 20, 30, 40, 50)))
 
+    def gate_authority(self) -> QualificationGateAuthority:
+        return QualificationGateAuthority(tuple(
+            gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, authority_identity)
+            for kind, authority_identity in zip(QualificationGateKind, (digest(78), digest(79), digest(97), digest(98)), strict=True)
+        ))
+
     def inputs(self, **changes: object) -> Phase3QualificationInputs:
         retained, manifest, result = retained_issue_50_inputs()
         pins = RetainedEvidencePins(retained.expectation.retention_manifest_digest, retained.expectation.retention_manifest_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST)
         resources = TemporaryResourceInventory((
             TemporaryResourceEntry(digest(94), TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
         ))
-        authorities = QualificationGateAuthority(tuple(
-            gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, authority_identity)
-            for kind, authority_identity in zip(QualificationGateKind, (digest(78), digest(79), digest(97), digest(98)), strict=True)
-        ))
+        authorities = self.gate_authority()
         values = {
             "base_sha": "d" * 40, "qualification_candidate_sha": self.qualification_candidate,
             "qualification_case_id": "issue-51-qualification", "qualification_ready_at": 23,
@@ -127,13 +130,12 @@ class Phase3QualificationGateTests(unittest.TestCase):
                 QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", receipt)
                 for kind, receipt in zip(QualificationGateKind, authorities.receipts, strict=True)
             )),
-            "gate_authorities": authorities,
         }
         values.update(changes)
         return Phase3QualificationInputs(**values)
 
     def test_distinct_generations_produce_only_owner_decision(self) -> None:
-        decision = assess_phase_3_qualification(self.inputs())
+        decision = assess_phase_3_qualification(self.inputs(), self.gate_authority())
         self.assertEqual(decision.disposition, PROMOTION_READY_FOR_CANARY_DECISION)
         payload = decision.public_payload()
         self.assertEqual(
@@ -154,7 +156,7 @@ class Phase3QualificationGateTests(unittest.TestCase):
         resources = TemporaryResourceInventory((
             TemporaryResourceEntry(digest(95), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.PRESERVED),
         ))
-        self.assertEqual(assess_phase_3_qualification(self.inputs(temporary_resources=resources)).disposition, QUALIFICATION_BLOCKED)
+        self.assertEqual(assess_phase_3_qualification(self.inputs(temporary_resources=resources), self.gate_authority()).disposition, QUALIFICATION_BLOCKED)
 
     def test_retained_expected_and_observed_pins_reject_substitution(self) -> None:
         inputs = self.inputs()
@@ -180,8 +182,10 @@ class Phase3QualificationGateTests(unittest.TestCase):
             QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, digest(110 + index)))
             for index, kind in enumerate(QualificationGateKind)
         ))
+        inputs = self.inputs(current_gate_receipts=fabricated)
+        self.assertFalse(hasattr(inputs, "gate_authorities"))
         with self.assertRaises(QualificationGateError):
-            self.inputs(current_gate_receipts=fabricated)
+            assess_phase_3_qualification(inputs, self.gate_authority())
 
     def test_trace_correction_uses_only_verified_issue_50_digest(self) -> None:
         correction = issue_51_selection_trace_correction()
@@ -239,7 +243,7 @@ class Phase3QualificationGateTests(unittest.TestCase):
         self.assertTrue(resources.fully_reconciled)
         self.assertFalse(resources.promotion_eligible)
         self.assertEqual(tuple(entry.disposition.value for entry in resources.entries), ("removed", "preserved", "preserved"))
-        self.assertEqual(assess_phase_3_qualification(self.inputs(temporary_resources=resources)).disposition, QUALIFICATION_BLOCKED)
+        self.assertEqual(assess_phase_3_qualification(self.inputs(temporary_resources=resources), self.gate_authority()).disposition, QUALIFICATION_BLOCKED)
         with self.assertRaises(QualificationGateError):
             TemporaryResourceEntry(digest(97), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.REMOVED)
         object.__setattr__(resources, "inventory_digest", digest(77))

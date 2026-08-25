@@ -409,8 +409,15 @@ class ExternalValidationTests(unittest.TestCase):
                 QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", receipt)
                 for kind, receipt in zip(QualificationGateKind, authorities.receipts, strict=True)
             )),
-            gate_authorities=authorities,
         )
+
+    @staticmethod
+    def qualification_gate_authority(inputs: Phase3QualificationInputs) -> QualificationGateAuthority:
+        """Model the repository-owned authority supplied beside the input graph."""
+
+        return QualificationGateAuthority(tuple(
+            receipt.source_receipt for receipt in inputs.current_gate_receipts.receipts
+        ))
 
     def qualification_v2_request(self) -> tuple[Phase3QualificationInputs, dict[str, object], dict[str, object]]:
         producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
@@ -422,9 +429,10 @@ class ExternalValidationTests(unittest.TestCase):
             "observation_identity": "sha256:" + "9" * 64,
         }
         inputs = self.qualification_inputs(external_validation._digest(plan))
+        authority = self.qualification_gate_authority(inputs)
         return inputs, plan, {
             "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
-            "execution_context": external_validation.phase_3_qualification_execution_context(inputs),
+            "execution_context": external_validation.phase_3_qualification_execution_context(inputs, authority),
         }
     @staticmethod
     def trace_read_result(request: GitHubReadRequest, candidate_sha: str) -> GitHubReadResult:
@@ -524,11 +532,12 @@ class ExternalValidationTests(unittest.TestCase):
 
     def test_phase_3_qualification_v2_validate_then_execute_is_zero_action(self) -> None:
         inputs, plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
         producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
         store = Path("qualification-recorder")
         harness = sys.modules["roundwright_harness.executor"]
         before = len(harness.run_calls)
-        readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
+        readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
         self.assertEqual(len(harness.run_calls), before + 1)
         self.assertFalse(store.exists())
         self.assertEqual(
@@ -560,7 +569,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual((evidence["qualification"]["new_provider_calls"], evidence["qualification"]["new_target_actions"], evidence["qualification"]["lifecycle_observation_sink"]), (0, 0, "NOT_SELECTED"))
         self.assertEqual(
             external_validation.run_phase_3_qualification_profile(
-                "execute", request, store, inputs,
+                "execute", request, store, inputs, authority,
                 expected_readiness_digest=readiness,
                 current_gates=external_validation.phase_3_qualification_current_gates(inputs),
             ),
@@ -580,11 +589,12 @@ class ExternalValidationTests(unittest.TestCase):
         for name, (field, changed) in request_changes.items():
             with self.subTest(request=name):
                 inputs, plan, request = self.qualification_v2_request()
+                authority = self.qualification_gate_authority(inputs)
                 changed_plan = dict(plan); changed_plan[field] = changed
                 changed_request = dict(request); changed_request["capture_plan"] = changed_plan
                 before = len(harness.run_calls)
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
-                    external_validation.run_phase_3_qualification_profile("validate", changed_request, store, inputs)
+                    external_validation.run_phase_3_qualification_profile("validate", changed_request, store, inputs, authority)
                 self.assertEqual(len(harness.run_calls), before)
                 self.assertFalse(store.exists())
         for name, changed in {
@@ -593,11 +603,12 @@ class ExternalValidationTests(unittest.TestCase):
         }.items():
             with self.subTest(context=name):
                 inputs, _plan, request = self.qualification_v2_request()
+                authority = self.qualification_gate_authority(inputs)
                 changed_context = dict(request["execution_context"]); changed_context[changed[0]] = changed[1]
                 changed_request = dict(request); changed_request["execution_context"] = changed_context
                 before = len(harness.run_calls)
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
-                    external_validation.run_phase_3_qualification_profile("validate", changed_request, store, inputs)
+                    external_validation.run_phase_3_qualification_profile("validate", changed_request, store, inputs, authority)
                 self.assertEqual(len(harness.run_calls), before)
                 self.assertFalse(store.exists())
         for name, field, changed in (
@@ -607,25 +618,28 @@ class ExternalValidationTests(unittest.TestCase):
         ):
             with self.subTest(input=name):
                 inputs, _plan, request = self.qualification_v2_request()
+                authority = self.qualification_gate_authority(inputs)
                 object.__setattr__(inputs, field, changed)
                 before = len(harness.run_calls)
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
-                    external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
+                    external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
                 self.assertEqual(len(harness.run_calls), before)
                 self.assertFalse(store.exists())
         inputs, _plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
         object.__setattr__(inputs.composed_result, "result_digest", "sha256:" + "0" * 64)
         before = len(harness.run_calls)
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
-            external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
+            external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
         self.assertEqual(len(harness.run_calls), before)
         self.assertFalse(store.exists())
 
     def test_phase_3_qualification_execute_rejects_receipt_gates_and_publication_drift(self) -> None:
         inputs, plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
         store = Path("qualification-rejected")
         harness = sys.modules["roundwright_harness.executor"]
-        readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
+        readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
         gates = external_validation.phase_3_qualification_current_gates(inputs)
         first = gates.receipts[0]
         cross_candidate_first = QualificationGateReceipt(
@@ -652,7 +666,7 @@ class ExternalValidationTests(unittest.TestCase):
                 before = len(harness.run_calls)
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
                     external_validation.run_phase_3_qualification_profile(
-                        "execute", request, store, inputs,
+                        "execute", request, store, inputs, authority,
                         expected_readiness_digest=receipt, current_gates=changed_gates,
                     )
                 self.assertEqual(len(harness.run_calls), before)
@@ -682,6 +696,38 @@ class ExternalValidationTests(unittest.TestCase):
                 adapter.project(exact, ProfileExecution({**execution.value, field: value}))
         self.assertEqual(adapter.compare(exact, {"forged": "publication"}).status, "fail")
 
+    def test_phase_3_qualification_authority_is_separate_and_bound_across_readiness(self) -> None:
+        inputs, _plan, request = self.qualification_v2_request()
+        canonical_authority = self.qualification_gate_authority(inputs)
+        fabricated_authority = QualificationGateAuthority(tuple(
+            gate_source(kind, "c" * 40, "issue-51-qualification", 1, 1, "sha256:" + f"{index + 1:x}" * 64)
+            for index, kind in enumerate(QualificationGateKind)
+        ))
+        fabricated_gates = QualificationGateReceiptSet(tuple(
+            QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", receipt)
+            for kind, receipt in zip(QualificationGateKind, fabricated_authority.receipts, strict=True)
+        ))
+        substituted_inputs = replace(inputs, current_gate_receipts=fabricated_gates)
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile(
+                "validate", request, Path("qualification-rejected"), substituted_inputs, canonical_authority,
+            )
+        self.assertEqual(len(harness.run_calls), before)
+
+        readiness = external_validation.run_phase_3_qualification_profile(
+            "validate", request, Path("qualification-rejected"), inputs, canonical_authority,
+        )
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile(
+                "execute", request, Path("qualification-rejected"), inputs, fabricated_authority,
+                expected_readiness_digest=readiness,
+                current_gates=external_validation.phase_3_qualification_current_gates(inputs),
+            )
+        self.assertEqual(len(harness.run_calls), before)
+
     def test_phase_3_qualification_runs_through_the_reviewed_harness_recorder(self) -> None:
         """Use the reviewed V2 Recorder only when its pinned source is supplied."""
 
@@ -710,20 +756,32 @@ class ExternalValidationTests(unittest.TestCase):
             }
             inputs = self.qualification_inputs(harness.prepare_capture(plan).plan_digest)
             inputs = replace(inputs, qualification_case_id=plan["case_id"])
+            authority = QualificationGateAuthority(tuple(
+                gate_source(kind, "c" * 40, plan["case_id"], 1, 1, identity)
+                for kind, identity in zip(
+                    QualificationGateKind,
+                    ("sha256:" + "7" * 64, external_validation._digest(plan), "sha256:" + "b" * 64, "sha256:" + "c" * 64),
+                    strict=True,
+                )
+            ))
+            inputs = replace(inputs, current_gate_receipts=QualificationGateReceiptSet(tuple(
+                QualificationGateReceipt(kind, "c" * 40, plan["case_id"], 1, 1, "COMPLETE", "pass", receipt)
+                for kind, receipt in zip(QualificationGateKind, authority.receipts, strict=True)
+            )))
             request = {
                 "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
-                "execution_context": external_validation.phase_3_qualification_execution_context(inputs),
+                "execution_context": external_validation.phase_3_qualification_execution_context(inputs, authority),
             }
             with tempfile.TemporaryDirectory() as temporary:
                 store = Path(temporary) / "recorder"
-                readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
+                readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
                 self.assertEqual(
                     tuple(readiness.as_dict()[key] for key in ("dispatch_count", "record_count", "verify_count")),
                     (0, 0, 0),
                 )
                 self.assertFalse(store.exists())
                 result = external_validation.run_phase_3_qualification_profile(
-                    "execute", request, store, inputs, expected_readiness_digest=readiness,
+                    "execute", request, store, inputs, authority, expected_readiness_digest=readiness,
                     current_gates=external_validation.phase_3_qualification_current_gates(inputs),
                 )
                 receipt = result.as_dict()

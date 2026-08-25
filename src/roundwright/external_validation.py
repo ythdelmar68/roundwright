@@ -258,6 +258,13 @@ def _phase_3_qualification_inputs_type() -> type:
     return Phase3QualificationInputs
 
 
+def _qualification_gate_authority_type() -> type:
+    """Resolve the separately-bound #51 gate authority without an import cycle."""
+
+    from .qualification_gate import QualificationGateAuthority
+    return QualificationGateAuthority
+
+
 def _harness_executor() -> object:
     """Resolve only the reviewed public Harness module at invocation time."""
 
@@ -3789,14 +3796,16 @@ class IntegratedBoundaryCompositionAdapter:
         }))
 
 
-def phase_3_qualification_execution_context(inputs: object) -> dict[str, object]:
-    if type(inputs) is not _phase_3_qualification_inputs_type():
+def phase_3_qualification_execution_context(inputs: object, gate_authority: object) -> dict[str, object]:
+    if type(inputs) is not _phase_3_qualification_inputs_type() or type(gate_authority) is not _qualification_gate_authority_type():
         raise ExternalValidationAdapterError("phase-3 qualification inputs are invalid")
     try:
         inputs.validate()
+        gate_authority.validate()
+        inputs.current_gate_receipts.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id, gate_authority)
     except (AttributeError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("phase-3 qualification inputs have drifted") from error
-    return {"schema": "roundwright-phase-3-qualification-context/v1", "inputs": inputs.public_payload(), "input_digest": inputs.input_digest, "zero_provider_calls": 0, "zero_target_actions": 0, "zero_lifecycle_actions": 0}
+    return {"schema": "roundwright-phase-3-qualification-context/v1", "inputs": inputs.public_payload(), "input_digest": inputs.input_digest, "gate_authority_digest": gate_authority.authority_digest, "zero_provider_calls": 0, "zero_target_actions": 0, "zero_lifecycle_actions": 0}
 
 
 def phase_3_qualification_current_gates(inputs: object) -> object:
@@ -3807,11 +3816,13 @@ def phase_3_qualification_current_gates(inputs: object) -> object:
     return inputs.current_gate_receipts
 
 
-def _validate_phase_3_qualification_current_gates(current_gates: object, inputs: object) -> None:
+def _validate_phase_3_qualification_current_gates(current_gates: object, inputs: object, gate_authority: object) -> None:
     if current_gates != phase_3_qualification_current_gates(inputs):
         raise ExternalValidationAdapterError("phase-3 qualification current gates are invalid or stale")
     try:
-        current_gates.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id, inputs.gate_authorities)
+        if type(gate_authority) is not _qualification_gate_authority_type():
+            raise ValueError
+        current_gates.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id, gate_authority)
     except (AttributeError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("phase-3 qualification current gates are invalid or stale") from error
 
@@ -3828,6 +3839,7 @@ class Phase3QualificationReadinessReceipt:
     components: tuple[str, str, str]
     execution_context_input_digest: str
     execution_context_identity: str
+    gate_authority_digest: str
 
     def as_dict(self) -> dict[str, object]:
         producer, exporter, comparator = self.components
@@ -3842,20 +3854,20 @@ class Phase3QualificationReadinessReceipt:
         }
         return core | {"receipt_digest": self.receipt_digest}
 
-    def validate(self, inputs: object) -> None:
+    def validate(self, inputs: object, gate_authority: object) -> None:
         receipt_value = self.as_dict()
         core = {key: value for key, value in receipt_value.items() if key != "receipt_digest"}
-        if type(inputs) is not _phase_3_qualification_inputs_type() or (
+        if type(inputs) is not _phase_3_qualification_inputs_type() or type(gate_authority) is not _qualification_gate_authority_type() or (
             self.candidate_sha, self.case_id, self.ready_at, self.capture_plan_digest, self.components,
-            self.execution_context_input_digest,
+            self.execution_context_input_digest, self.gate_authority_digest,
         ) != (
             inputs.qualification_candidate_sha, inputs.qualification_case_id, inputs.qualification_ready_at,
-            inputs.qualification_capture_plan_digest, phase_3_qualification_component_identities(), _digest(phase_3_qualification_execution_context(inputs)),
-        ) or self.receipt_digest != _digest(core) or _DIGEST.fullmatch(self.execution_context_identity) is None:
+            inputs.qualification_capture_plan_digest, phase_3_qualification_component_identities(), _digest(phase_3_qualification_execution_context(inputs, gate_authority)), gate_authority.authority_digest,
+        ) or self.receipt_digest != _digest(core) or _DIGEST.fullmatch(self.execution_context_identity) is None or _DIGEST.fullmatch(self.gate_authority_digest) is None:
             raise ExternalValidationAdapterError("phase-3 qualification readiness receipt is invalid or stale")
 
 
-def _phase_3_qualification_readiness_receipt(receipt: object, inputs: object) -> Phase3QualificationReadinessReceipt:
+def _phase_3_qualification_readiness_receipt(receipt: object, inputs: object, gate_authority: object) -> Phase3QualificationReadinessReceipt:
     """Copy only a reviewed V2 receipt that matches this exact validation request."""
 
     try:
@@ -3871,11 +3883,11 @@ def _phase_3_qualification_readiness_receipt(receipt: object, inputs: object) ->
         result = Phase3QualificationReadinessReceipt(
             value["receipt_digest"], value["candidate_sha"], value["case_id"], value["ready_at"], value["plan_digest"],
             (value["producer_identity"], value["exporter_identity"], value["comparator_identity"]),
-            value["execution_context_input_digest"], value["execution_context_identity"],
+            value["execution_context_input_digest"], value["execution_context_identity"], gate_authority.authority_digest,
         )
         if value["schema"] != "roundwright-harness-profile-executor-readiness/v2" or value["status"] != "ready" or value["state"] != "PREFLIGHT_READY" or (value["dispatch_count"], value["record_count"], value["verify_count"], value["mutation_count"]) != (0, 0, 0, 0) or value["receipt_digest"] != _digest(core):
             raise ValueError
-        result.validate(inputs)
+        result.validate(inputs, gate_authority)
         return result
     except (AttributeError, KeyError, TypeError, ValueError, ExternalValidationAdapterError) as error:
         raise ExternalValidationAdapterError("phase-3 qualification readiness receipt is invalid or stale") from error
@@ -3885,6 +3897,7 @@ def _phase_3_qualification_readiness_receipt(receipt: object, inputs: object) ->
 class MaterializedPhase3QualificationContext:
     descriptor: dict[str, object]
     inputs: object
+    gate_authority: object
     candidate_sha: str
     case_id: str
     capture_plan_digest: str
@@ -3892,21 +3905,22 @@ class MaterializedPhase3QualificationContext:
     store_identity: str
 
     def __post_init__(self) -> None:
-        if (type(self.descriptor) is not dict or type(self.inputs) is not _phase_3_qualification_inputs_type() or self.descriptor != phase_3_qualification_execution_context(self.inputs) or (self.candidate_sha, self.case_id, self.capture_plan_digest, self.ready_at, self.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity) or _SHA.fullmatch(self.candidate_sha) is None or not _safe_token(self.case_id) or _DIGEST.fullmatch(self.capture_plan_digest) is None or _DIGEST.fullmatch(self.store_identity) is None or type(self.ready_at) is not int or self.ready_at < 0):
+        if (type(self.descriptor) is not dict or type(self.inputs) is not _phase_3_qualification_inputs_type() or type(self.gate_authority) is not _qualification_gate_authority_type() or self.descriptor != phase_3_qualification_execution_context(self.inputs, self.gate_authority) or (self.candidate_sha, self.case_id, self.capture_plan_digest, self.ready_at, self.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity) or _SHA.fullmatch(self.candidate_sha) is None or not _safe_token(self.case_id) or _DIGEST.fullmatch(self.capture_plan_digest) is None or _DIGEST.fullmatch(self.store_identity) is None or type(self.ready_at) is not int or self.ready_at < 0):
             raise ExternalValidationAdapterError("phase-3 qualification V2 execution context is invalid")
 
     @property
     def identity(self) -> str:
-        return _digest({"descriptor": self.descriptor, "candidate_sha": self.candidate_sha, "case_id": self.case_id, "capture_plan_digest": self.capture_plan_digest, "ready_at": self.ready_at, "store_identity": self.store_identity})
+        return _digest({"descriptor": self.descriptor, "candidate_sha": self.candidate_sha, "case_id": self.case_id, "capture_plan_digest": self.capture_plan_digest, "ready_at": self.ready_at, "store_identity": self.store_identity, "gate_authority_digest": self.gate_authority.authority_digest})
 
 
 @dataclass(frozen=True)
 class Phase3QualificationAdapter:
     inputs: object | None = None
+    gate_authority: object | None = None
     profile_id: str = PHASE_3_QUALIFICATION_PROFILE
 
     def __post_init__(self) -> None:
-        if self.profile_id != PHASE_3_QUALIFICATION_PROFILE or (self.inputs is not None and type(self.inputs) is not _phase_3_qualification_inputs_type()):
+        if self.profile_id != PHASE_3_QUALIFICATION_PROFILE or (self.inputs is not None and type(self.inputs) is not _phase_3_qualification_inputs_type()) or (self.gate_authority is not None and type(self.gate_authority) is not _qualification_gate_authority_type()):
             raise ExternalValidationAdapterError("executor profile is unsupported")
 
     @property
@@ -3915,12 +3929,12 @@ class Phase3QualificationAdapter:
 
     def prepare_execution_context(self, preparation: object) -> object:
         try:
-            if self.inputs is None or preparation.descriptor != phase_3_qualification_execution_context(self.inputs) or preparation.input_digest != _digest(preparation.descriptor) or preparation.components != self.component_identities:
+            if self.inputs is None or self.gate_authority is None or preparation.descriptor != phase_3_qualification_execution_context(self.inputs, self.gate_authority) or preparation.input_digest != _digest(preparation.descriptor) or preparation.components != self.component_identities:
                 raise ValueError
             plan = preparation.plan
             if (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, preparation.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity):
                 raise ValueError
-            context = MaterializedPhase3QualificationContext(preparation.descriptor, self.inputs, plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, preparation.store_identity)
+            context = MaterializedPhase3QualificationContext(preparation.descriptor, self.inputs, self.gate_authority, plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, preparation.store_identity)
             return _harness_executor().ProfileExecutionContext(context.identity, context)
         except (AttributeError, TypeError, ValueError, ExternalValidationAdapterError) as error:
             raise ExternalValidationAdapterError("phase-3 qualification V2 execution context is invalid") from error
@@ -3930,22 +3944,22 @@ class Phase3QualificationAdapter:
             execution_context = binding.execution_context
             context = execution_context.value
             components = (binding.components.producer_identity, binding.components.exporter_identity, binding.components.comparator_identity)
-            if self.inputs is None or binding.profile != PHASE_3_QUALIFICATION_PROFILE or components != phase_3_qualification_component_identities() or type(context) is not MaterializedPhase3QualificationContext or context.inputs != self.inputs or context.descriptor != phase_3_qualification_execution_context(self.inputs) or binding.execution_context_input_digest != _digest(context.descriptor) or execution_context.identity != context.identity or (context.candidate_sha, context.case_id, context.capture_plan_digest, context.ready_at) != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at): raise ValueError
+            if self.inputs is None or self.gate_authority is None or binding.profile != PHASE_3_QUALIFICATION_PROFILE or components != phase_3_qualification_component_identities() or type(context) is not MaterializedPhase3QualificationContext or context.inputs != self.inputs or context.gate_authority != self.gate_authority or context.descriptor != phase_3_qualification_execution_context(self.inputs, self.gate_authority) or binding.execution_context_input_digest != _digest(context.descriptor) or execution_context.identity != context.identity or (context.candidate_sha, context.case_id, context.capture_plan_digest, context.ready_at) != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at): raise ValueError
         except (AttributeError, TypeError, ValueError) as error:
             raise ExternalValidationAdapterError("phase-3 qualification binding is invalid or stale") from error
 
     def execute(self, binding: object) -> object:
         self.validate(binding)
         from .qualification_gate import assess_phase_3_qualification
-        assert self.inputs is not None
-        result = assess_phase_3_qualification(self.inputs)
+        assert self.inputs is not None and self.gate_authority is not None
+        result = assess_phase_3_qualification(self.inputs, self.gate_authority)
         return _harness_executor().ProfileExecution(result.public_payload(), mutation_count=0)
 
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
         self.validate(binding)
         try:
             from .qualification_gate import assess_phase_3_qualification
-            if self.inputs is None or execution.mutation_count != 0 or execution.value != assess_phase_3_qualification(self.inputs).public_payload():
+            if self.inputs is None or self.gate_authority is None or execution.mutation_count != 0 or execution.value != assess_phase_3_qualification(self.inputs, self.gate_authority).public_payload():
                 raise ValueError
         except (AttributeError, TypeError, ValueError) as error:
             raise ExternalValidationAdapterError("phase-3 qualification execution has drifted") from error
@@ -4158,14 +4172,14 @@ def run_integrated_boundary_composition_profile(
         raise ExternalValidationAdapterError("integrated boundary hosted entrypoint binding is invalid") from error
 
 
-def run_phase_3_qualification_profile(mode: Literal["validate", "execute"], request_value: Mapping[str, Any], store_root: Path, qualification_inputs: object, *, expected_readiness_digest: Phase3QualificationReadinessReceipt | None = None, current_gates: Mapping[str, object] | None = None) -> object:
+def run_phase_3_qualification_profile(mode: Literal["validate", "execute"], request_value: Mapping[str, Any], store_root: Path, qualification_inputs: object, qualification_gate_authority: object, *, expected_readiness_digest: Phase3QualificationReadinessReceipt | None = None, current_gates: Mapping[str, object] | None = None) -> object:
     """Validate one fresh #51 consumer plan without opening a Recorder store."""
     harness = _harness_executor()
     try:
-        if mode not in {"validate", "execute"} or type(qualification_inputs) is not _phase_3_qualification_inputs_type() or not isinstance(store_root, Path):
+        if mode not in {"validate", "execute"} or type(qualification_inputs) is not _phase_3_qualification_inputs_type() or type(qualification_gate_authority) is not _qualification_gate_authority_type() or not isinstance(store_root, Path):
             raise ValueError
         request = harness.ExecutorRequest.parse(request_value)
-        if request.schema != "roundwright-harness-profile-executor-request/v2" or request.capture_plan["profile"] != PHASE_3_QUALIFICATION_PROFILE or request.execution_context != phase_3_qualification_execution_context(qualification_inputs):
+        if request.schema != "roundwright-harness-profile-executor-request/v2" or request.capture_plan["profile"] != PHASE_3_QUALIFICATION_PROFILE or request.execution_context != phase_3_qualification_execution_context(qualification_inputs, qualification_gate_authority):
             raise ValueError
         plan = harness.prepare_capture(request.capture_plan)
         producer, exporter, comparator = phase_3_qualification_component_identities()
@@ -4182,15 +4196,15 @@ def run_phase_3_qualification_profile(mode: Literal["validate", "execute"], requ
         if mode == "execute":
             if type(expected_readiness_digest) is not Phase3QualificationReadinessReceipt:
                 raise ValueError
-            expected_readiness_digest.validate(qualification_inputs)
-            _validate_phase_3_qualification_current_gates(current_gates, qualification_inputs)
+            expected_readiness_digest.validate(qualification_inputs, qualification_gate_authority)
+            _validate_phase_3_qualification_current_gates(current_gates, qualification_inputs, qualification_gate_authority)
         elif expected_readiness_digest is not None or current_gates is not None:
             raise ValueError
         result = harness.run_profile_executor(
-            mode, request_value, Phase3QualificationAdapter(qualification_inputs), store_root,
+            mode, request_value, Phase3QualificationAdapter(qualification_inputs, qualification_gate_authority), store_root,
             expected_readiness_digest=expected_readiness_digest.receipt_digest if expected_readiness_digest is not None else None,
         )
-        return _phase_3_qualification_readiness_receipt(result, qualification_inputs) if mode == "validate" else result
+        return _phase_3_qualification_readiness_receipt(result, qualification_inputs, qualification_gate_authority) if mode == "validate" else result
     except ExternalValidationAdapterError:
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:

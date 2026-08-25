@@ -99,6 +99,8 @@ from roundwright.qualification_gate import (
     RetainedEvidenceObservations,
     RetainedEvidencePins,
     RetainedIssue50BundleReceipt,
+    VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+    qualification_gate_source_receipt,
     TemporaryResourceDisposition,
     TemporaryResourceEntry,
     TemporaryResourceInventory,
@@ -328,7 +330,7 @@ class ExternalValidationTests(unittest.TestCase):
         pins = RetainedEvidencePins(
             retained.expectation.retention_manifest_digest,
             retained.expectation.retention_manifest_digest,
-            "sha256:" + "a" * 64,
+            VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
         )
         return Phase3QualificationInputs(
             base_sha="d" * 40,
@@ -353,7 +355,7 @@ class ExternalValidationTests(unittest.TestCase):
             ),
             issue_50_bundle_receipt=RetainedIssue50BundleReceipt(
                 "b" * 40, retained.expectation.retention_manifest_digest,
-                manifest.manifest_digest, result.result_digest, "sha256:" + "a" * 64,
+                manifest.manifest_digest, result.result_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
             ),
             temporary_resources=TemporaryResourceInventory((
                 TemporaryResourceEntry("sha256:" + "d" * 64, TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
@@ -364,7 +366,7 @@ class ExternalValidationTests(unittest.TestCase):
             lane_a=external_validation.EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, "a" * 40, "verified", "pass"),
             lane_b=external_validation.EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, "a" * 40, "verified", "pass"),
             current_gate_receipts=QualificationGateReceiptSet(tuple(
-                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", "sha256:" + f"{index + 10:x}" * 64)
+                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", qualification_gate_source_receipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE"))
                 for index, kind in enumerate(QualificationGateKind)
             )),
         )
@@ -584,8 +586,17 @@ class ExternalValidationTests(unittest.TestCase):
         harness = sys.modules["roundwright_harness.executor"]
         readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
         gates = external_validation.phase_3_qualification_current_gates(inputs)
-        cross_candidate_gates = replace(gates, receipts=(
-            replace(gates.receipts[0], candidate_sha="d" * 40), *gates.receipts[1:],
+        first = gates.receipts[0]
+        cross_candidate_first = QualificationGateReceipt(
+            first.kind, "d" * 40, first.case_id, first.review_epoch,
+            first.review_round, first.review_mode, first.result,
+            qualification_gate_source_receipt(
+                first.kind, "d" * 40, first.case_id, first.review_epoch,
+                first.review_round, first.review_mode,
+            ),
+        )
+        cross_candidate_gates = QualificationGateReceiptSet((
+            cross_candidate_first, *gates.receipts[1:],
         ))
         for name, receipt, changed_gates in (
             ("other-candidate", replace(readiness, candidate_sha="d" * 40), gates),

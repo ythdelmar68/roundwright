@@ -27,6 +27,8 @@ from roundwright.qualification_gate import (
     TemporaryResourceKind,
     assess_phase_3_qualification,
     issue_51_selection_trace_correction,
+    qualification_gate_source_receipt,
+    VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
 )
 from roundwright.shadow import LIVE_LIFECYCLE_SHADOW_PROFILE, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
 
@@ -61,7 +63,7 @@ class Phase3QualificationGateTests(unittest.TestCase):
         )
         retained = IntegratedBoundaryInputs(self.issue_50_candidate, "issue-50", digest(80), expectation, lane_a_source, lane_b_source, historical, synthetic)
         manifest, result = compose_retained_evidence(retained)
-        pins = RetainedEvidencePins(expectation.retention_manifest_digest, expectation.retention_manifest_digest, digest(93))
+        pins = RetainedEvidencePins(expectation.retention_manifest_digest, expectation.retention_manifest_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST)
         resources = TemporaryResourceInventory((
             TemporaryResourceEntry(digest(94), TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
         ))
@@ -75,12 +77,12 @@ class Phase3QualificationGateTests(unittest.TestCase):
             "roundlet_commit": "d" * 40, "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
             "rollback_proposal_digest": digest(97), "kill_switch_proposal_digest": digest(98),
             "retained_evidence": RetainedEvidenceBinding(pins, RetainedEvidenceObservations(*pins.payload().values())),
-            "issue_50_bundle_receipt": RetainedIssue50BundleReceipt(self.issue_50_candidate, expectation.retention_manifest_digest, manifest.manifest_digest, result.result_digest, digest(93)),
+            "issue_50_bundle_receipt": RetainedIssue50BundleReceipt(self.issue_50_candidate, expectation.retention_manifest_digest, manifest.manifest_digest, result.result_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST),
             "temporary_resources": resources, "integrated_inputs": retained, "composed_manifest": manifest, "composed_result": result,
             "lane_a": EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, self.issue_49_candidate, "verified", "pass"),
             "lane_b": EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, self.issue_49_candidate, "verified", "pass"),
             "current_gate_receipts": QualificationGateReceiptSet(tuple(
-                QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", digest(100 + index))
+                QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", qualification_gate_source_receipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE"))
                 for index, kind in enumerate(QualificationGateKind)
             )),
         }
@@ -119,6 +121,22 @@ class Phase3QualificationGateTests(unittest.TestCase):
         with self.assertRaises(QualificationGateError):
             replace(inputs)
 
+    def test_gate_receipts_reject_digest_only_and_duplicated_source_assertions(self) -> None:
+        with self.assertRaises(QualificationGateError):
+            QualificationGateReceipt(
+                QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                "issue-51-qualification", 1, 1, "COMPLETE", "pass", digest(100),  # type: ignore[arg-type]
+            )
+        source = qualification_gate_source_receipt(
+            QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+            "issue-51-qualification", 1, 1, "COMPLETE",
+        )
+        with self.assertRaises(QualificationGateError):
+            QualificationGateReceipt(
+                QualificationGateKind.HOSTED_CHECKS, self.qualification_candidate,
+                "issue-51-qualification", 1, 1, "COMPLETE", "pass", source,
+            )
+
     def test_trace_correction_uses_only_verified_issue_50_digest(self) -> None:
         correction = issue_51_selection_trace_correction()
         self.assertEqual(correction["verified_digest"], "sha256:5046fd4eed52db54f6b797464bf4faf4082290ec9cf12d3de194f624f8ca8d8a")
@@ -137,8 +155,17 @@ class Phase3QualificationGateTests(unittest.TestCase):
             ))
         with self.assertRaises(QualificationGateError):
             self.inputs(unresolved_blockers=("C:\\secret\nvalue",))  # type: ignore[arg-type]
-        stale_receipts = replace(inputs.current_gate_receipts, receipts=(
-            replace(inputs.current_gate_receipts.receipts[0], review_round=2), *inputs.current_gate_receipts.receipts[1:],
+        first = inputs.current_gate_receipts.receipts[0]
+        stale_first = QualificationGateReceipt(
+            first.kind, first.candidate_sha, first.case_id, first.review_epoch,
+            2, first.review_mode, first.result,
+            qualification_gate_source_receipt(
+                first.kind, first.candidate_sha, first.case_id, first.review_epoch,
+                2, first.review_mode,
+            ),
+        )
+        stale_receipts = QualificationGateReceiptSet((
+            stale_first, *inputs.current_gate_receipts.receipts[1:],
         ))
         with self.assertRaises(QualificationGateError):
             self.inputs(current_gate_receipts=stale_receipts)

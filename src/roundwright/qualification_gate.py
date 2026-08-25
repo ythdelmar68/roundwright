@@ -57,9 +57,60 @@ class QualificationGateKind(StrEnum):
     PROVENANCE = "provenance"
 
 
+_GATE_RECEIPT_SCHEMA = "roundwright-phase-3-gate-readback/v1"
+_GATE_RECEIPT_SOURCES = {
+    QualificationGateKind.FORMAL_REVIEW: "formal-review",
+    QualificationGateKind.HOSTED_CHECKS: "exact-head-check",
+    QualificationGateKind.POLICY: "policy",
+    QualificationGateKind.PROVENANCE: "provenance",
+}
+
+
+def qualification_gate_source_receipt(
+    kind: QualificationGateKind,
+    candidate_sha: str,
+    case_id: str,
+    review_epoch: int,
+    review_round: int,
+    review_mode: str,
+) -> dict[str, object]:
+    """Project one concrete public-safe gate read-back into its canonical form."""
+
+    if type(kind) is not QualificationGateKind:
+        raise QualificationGateError("qualification gate receipt is invalid")
+    return {
+        "schema": _GATE_RECEIPT_SCHEMA,
+        "source": _GATE_RECEIPT_SOURCES[kind],
+        "kind": kind.value,
+        "candidate_sha": candidate_sha,
+        "case_id": case_id,
+        "review_epoch": review_epoch,
+        "review_round": review_round,
+        "review_mode": review_mode,
+        "result": "pass",
+    }
+
+
+def _validated_gate_source_receipt(
+    source_receipt: object,
+    kind: QualificationGateKind,
+    candidate_sha: str,
+    case_id: str,
+    review_epoch: int,
+    review_round: int,
+    review_mode: str,
+) -> dict[str, object]:
+    expected = qualification_gate_source_receipt(
+        kind, candidate_sha, case_id, review_epoch, review_round, review_mode,
+    )
+    if type(source_receipt) is not dict or source_receipt != expected:
+        raise QualificationGateError("qualification gate source receipt is invalid or stale")
+    return expected
+
+
 @dataclass(frozen=True, slots=True)
 class QualificationGateReceipt:
-    """One independently read-back, candidate-bound normal-gate receipt."""
+    """One parsed, candidate-bound normal-gate read-back receipt."""
 
     kind: QualificationGateKind
     candidate_sha: str
@@ -68,22 +119,33 @@ class QualificationGateReceipt:
     review_round: int
     review_mode: str
     result: Literal["pass"]
-    source_identity: str
+    source_receipt: dict[str, object]
+    source_identity: str = field(init=False)
     receipt_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         if (type(self.kind) is not QualificationGateKind or _SHA.fullmatch(self.candidate_sha) is None
             or _TOKEN.fullmatch(self.case_id) is None or type(self.review_epoch) is not int or self.review_epoch < 0
             or type(self.review_round) is not int or self.review_round < 0 or self.review_mode != "COMPLETE"
-            or self.result != "pass" or _DIGEST.fullmatch(self.source_identity) is None):
+            or self.result != "pass"):
             raise QualificationGateError("qualification gate receipt is invalid")
+        source_receipt = _validated_gate_source_receipt(
+            self.source_receipt, self.kind, self.candidate_sha, self.case_id,
+            self.review_epoch, self.review_round, self.review_mode,
+        )
+        object.__setattr__(self, "source_identity", _digest(source_receipt))
         object.__setattr__(self, "receipt_digest", _digest(self.public_payload(include_digest=False)))
 
     def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
         value: dict[str, object] = {"kind": self.kind.value, "candidate_sha": self.candidate_sha, "case_id": self.case_id,
             "review_epoch": self.review_epoch, "review_round": self.review_round, "review_mode": self.review_mode,
-            "result": self.result, "source_identity": self.source_identity}
+            "result": self.result, "source_receipt": self.source_receipt, "source_identity": self.source_identity}
         return value | ({"receipt_digest": self.receipt_digest} if include_digest else {})
+
+    def validate(self) -> None:
+        rebuilt = replace(self)
+        if (rebuilt.source_identity, rebuilt.receipt_digest) != (self.source_identity, self.receipt_digest):
+            raise QualificationGateError("qualification gate receipt has drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +163,16 @@ class QualificationGateReceiptSet:
         object.__setattr__(self, "binding_digest", _digest(self.public_payload(include_digest=False)))
 
     def validate_for(self, candidate_sha: str, case_id: str) -> None:
-        if (type(self) is not QualificationGateReceiptSet or self.binding_digest != _digest(self.public_payload(include_digest=False))
-            or any((item.candidate_sha, item.case_id) != (candidate_sha, case_id) or item.receipt_digest != _digest(item.public_payload(include_digest=False)) for item in self.receipts)):
+        try:
+            if type(self) is not QualificationGateReceiptSet:
+                raise QualificationGateError
+            for item in self.receipts:
+                item.validate()
+                if (item.candidate_sha, item.case_id) != (candidate_sha, case_id):
+                    raise QualificationGateError
+        except (AttributeError, TypeError, QualificationGateError) as error:
+            raise QualificationGateError("qualification gate receipts have drifted") from error
+        if self.binding_digest != _digest(self.public_payload(include_digest=False)):
             raise QualificationGateError("qualification gate receipts have drifted")
 
     def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
@@ -122,7 +192,9 @@ class RetainedIssue50BundleReceipt:
     receipt_identity: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if _SHA.fullmatch(self.candidate_sha) is None or any(_DIGEST.fullmatch(value) is None for value in (self.retention_manifest_digest, self.composed_manifest_digest, self.composed_result_digest, self.bundle_digest)):
+        if (_SHA.fullmatch(self.candidate_sha) is None
+            or any(_DIGEST.fullmatch(value) is None for value in (self.retention_manifest_digest, self.composed_manifest_digest, self.composed_result_digest, self.bundle_digest))
+            or self.bundle_digest != VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST):
             raise QualificationGateError("retained issue-50 bundle receipt is invalid")
         object.__setattr__(self, "receipt_identity", _digest(self.public_payload(include_identity=False)))
 
@@ -158,7 +230,8 @@ class RetainedEvidencePins:
     integrity_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if any(_DIGEST.fullmatch(value) is None for value in self.payload().values()):
+        if (any(_DIGEST.fullmatch(value) is None for value in self.payload().values())
+            or self.issue_50_result_bundle_digest != VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST):
             raise QualificationGateError("retained evidence pins are invalid")
         object.__setattr__(self, "integrity_digest", _digest(self.payload()))
 
@@ -184,7 +257,8 @@ class RetainedEvidenceObservations:
     integrity_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if any(_DIGEST.fullmatch(value) is None for value in self.payload().values()):
+        if (any(_DIGEST.fullmatch(value) is None for value in self.payload().values())
+            or self.issue_50_result_bundle_digest != VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST):
             raise QualificationGateError("retained evidence observations are invalid")
         object.__setattr__(self, "integrity_digest", _digest(self.payload()))
 

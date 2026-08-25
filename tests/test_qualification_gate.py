@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.external_validation import EvidenceLaneReceipt
 from roundwright.integrated_boundary import (

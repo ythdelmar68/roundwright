@@ -36,6 +36,7 @@ def _digest(value: object) -> str:
 
 
 VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST = "sha256:5046fd4eed52db54f6b797464bf4faf4082290ec9cf12d3de194f624f8ca8d8a"
+VERIFIED_ISSUE_50_HARNESS_RESULT_RECEIPT_DIGEST = "sha256:856d1722e4072a355b01312dd60f5501b564e1f147e17082b953a229ffb38f0f"
 STALE_ISSUE_50_TRACE_DIGEST = "sha256:5046fd4e0c805cefacbe92dd28f72c95be164baad0caa35e7414cab198478d8a"
 
 
@@ -267,6 +268,7 @@ class RetainedIssue50BundleReceipt:
                 or any(result[key] != recording[key] for key in ("candidate_sha", "case_id", "ready_at", "profile", "bundle_digest", "retention_identity"))
                 or result["recording_receipt_digest"] != recording["receipt_digest"]
                 or result["bundle_digest"] != VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST
+                or result["receipt_digest"] != VERIFIED_ISSUE_50_HARNESS_RESULT_RECEIPT_DIGEST
             ):
                 raise ValueError
             if type(self.bundle_bytes) is not bytes:

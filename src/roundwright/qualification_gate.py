@@ -168,8 +168,38 @@ class QualificationGateReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class QualificationGateAuthority:
+    """Immutable read-back copies of the four accepted gate authorities."""
+
+    receipts: tuple[dict[str, object], ...]
+    authority_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        try:
+            if type(self.receipts) is not tuple or len(self.receipts) != len(QualificationGateKind):
+                raise ValueError
+            for kind, receipt in zip(QualificationGateKind, self.receipts, strict=True):
+                _validated_gate_source_receipt(
+                    receipt, kind, str(receipt["candidate_sha"]), str(receipt["case_id"]),
+                    receipt["review_epoch"], receipt["review_round"], str(receipt["review_mode"]),
+                )
+        except (AttributeError, KeyError, TypeError, ValueError, QualificationGateError) as error:
+            raise QualificationGateError("qualification gate authorities are invalid") from error
+        object.__setattr__(self, "authority_digest", _digest(self.public_payload(include_digest=False)))
+
+    def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
+        value: dict[str, object] = {"receipts": list(self.receipts)}
+        return value | ({"authority_digest": self.authority_digest} if include_digest else {})
+
+    def validate(self) -> None:
+        rebuilt = QualificationGateAuthority(self.receipts)
+        if rebuilt.authority_digest != self.authority_digest:
+            raise QualificationGateError("qualification gate authorities have drifted")
+
+
+@dataclass(frozen=True, slots=True)
 class QualificationGateReceiptSet:
-    """Exact four-gate read-back set; no caller booleans cross this boundary."""
+    """Exact four-gate read-back set, bound to independent authority payloads."""
 
     receipts: tuple[QualificationGateReceipt, ...]
     binding_digest: str = field(init=False)
@@ -181,21 +211,14 @@ class QualificationGateReceiptSet:
             raise QualificationGateError("qualification gate receipt set is invalid")
         object.__setattr__(self, "binding_digest", _digest(self.public_payload(include_digest=False)))
 
-    def validate_for(self, candidate_sha: str, case_id: str, authority_identities: tuple[str, str, str, str]) -> None:
+    def validate_for(self, candidate_sha: str, case_id: str, authorities: QualificationGateAuthority) -> None:
         try:
-            if (type(self) is not QualificationGateReceiptSet or type(authority_identities) is not tuple
-                or len(authority_identities) != len(QualificationGateKind)
-                or any(_DIGEST.fullmatch(value) is None for value in authority_identities)):
+            if type(self) is not QualificationGateReceiptSet or type(authorities) is not QualificationGateAuthority:
                 raise QualificationGateError
-            identity_fields = {
-                QualificationGateKind.FORMAL_REVIEW: "supervisor_result_identity",
-                QualificationGateKind.HOSTED_CHECKS: "check_run_identity",
-                QualificationGateKind.POLICY: "policy_snapshot_digest",
-                QualificationGateKind.PROVENANCE: "provenance_manifest_digest",
-            }
-            for item, authority_identity in zip(self.receipts, authority_identities, strict=True):
+            authorities.validate()
+            for item, authority_receipt in zip(self.receipts, authorities.receipts, strict=True):
                 item.validate()
-                if (item.candidate_sha, item.case_id) != (candidate_sha, case_id) or item.source_receipt[identity_fields[item.kind]] != authority_identity:
+                if (item.candidate_sha, item.case_id) != (candidate_sha, case_id) or item.source_receipt != authority_receipt:
                     raise QualificationGateError
         except (AttributeError, TypeError, QualificationGateError) as error:
             raise QualificationGateError("qualification gate receipts have drifted") from error
@@ -213,6 +236,7 @@ class RetainedIssue50BundleReceipt:
 
     harness_result: dict[str, object]
     recording_receipt: dict[str, object]
+    bundle_bytes: bytes
     receipt_identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -220,25 +244,45 @@ class RetainedIssue50BundleReceipt:
             result = _canonical_receipt(self.harness_result, "receipt_digest")
             recording = _canonical_receipt(self.recording_receipt, "receipt_digest")
             result_required = {
-                "schema", "status", "state", "candidate_sha", "case_id", "retention_manifest_digest", "manifest_digest",
-                "result_digest", "bundle_digest", "retention_identity", "recording_receipt_digest", "receipt_digest",
+                "schema", "status", "state", "candidate_sha", "case_id", "ready_at", "profile", "plan_digest",
+                "readiness_receipt_digest", "result_identity", "bundle_digest", "recording_receipt_digest", "retention_identity",
+                "dispatch_count", "record_count", "verify_count", "mutation_count", "execution_context_input_digest",
+                "execution_context_identity", "receipt_digest",
             }
             recording_required = {
-                "schema", "status", "candidate_sha", "case_id", "retention_manifest_digest", "manifest_digest", "evidence_digest",
-                "bundle_digest", "retention_identity", "receipt_digest",
+                "schema", "status", "candidate_sha", "case_id", "ready_at", "profile", "evidence_digest", "evidence_schema",
+                "manifest_digest", "bundle_digest", "retention_identity", "receipt_digest",
             }
             if (
                 set(result) != result_required or set(recording) != recording_required
                 or result["schema"] != "roundwright-harness-profile-executor-result/v2"
-                or result["status"] != "pass" or result["state"] != "VERIFIED"
+                or result["status"] != "pass" or result["state"] != "VERIFIED" or result["mutation_count"] != 0
                 or recording["schema"] != "roundwright-harness-recording-receipt/v1" or recording["status"] != "sealed"
+                or recording["evidence_schema"] != "roundwright-shadow-case/v2"
                 or _SHA.fullmatch(str(result["candidate_sha"])) is None
-                or any(_DIGEST.fullmatch(str(result[key])) is None for key in ("retention_manifest_digest", "manifest_digest", "result_digest", "bundle_digest", "retention_identity", "recording_receipt_digest"))
-                or any(_DIGEST.fullmatch(str(recording[key])) is None for key in ("retention_manifest_digest", "manifest_digest", "evidence_digest", "bundle_digest", "retention_identity"))
-                or any(result[key] != recording[key] for key in ("candidate_sha", "case_id", "retention_manifest_digest", "manifest_digest", "bundle_digest", "retention_identity"))
-                or result["result_digest"] != recording["evidence_digest"]
+                or type(result["ready_at"]) is not int or result["ready_at"] < 0
+                or any(_DIGEST.fullmatch(str(result[key])) is None for key in ("plan_digest", "readiness_receipt_digest", "result_identity", "bundle_digest", "recording_receipt_digest", "retention_identity", "execution_context_input_digest", "execution_context_identity"))
+                or any(_DIGEST.fullmatch(str(recording[key])) is None for key in ("evidence_digest", "manifest_digest", "bundle_digest", "retention_identity"))
+                or any(result[key] != recording[key] for key in ("candidate_sha", "case_id", "ready_at", "profile", "bundle_digest", "retention_identity"))
                 or result["recording_receipt_digest"] != recording["receipt_digest"]
                 or result["bundle_digest"] != VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST
+            ):
+                raise ValueError
+            if type(self.bundle_bytes) is not bytes:
+                raise ValueError
+            bundle = json.loads(self.bundle_bytes)
+            canonical_bundle = json.dumps(bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+            if "sha256:" + hashlib.sha256(canonical_bundle).hexdigest() != result["bundle_digest"]:
+                raise ValueError
+            manifest = bundle["manifest"]
+            evidence = bundle["evidence"]
+            if (
+                type(bundle) is not dict or set(bundle) != {"schema", "evidence", "manifest", "manifest_digest"}
+                or bundle["schema"] != "roundwright-harness-recording-bundle/v1" or type(manifest) is not dict or type(evidence) is not dict
+                or bundle["manifest_digest"] != recording["manifest_digest"] or _digest(manifest) != recording["manifest_digest"]
+                or _digest(evidence) != recording["evidence_digest"]
+                or set(manifest) != {"schema", "profile", "candidate_sha", "case_id", "ready_at", "evidence_schema", "evidence_digest"}
+                or any(manifest[key] != recording[key] for key in ("profile", "candidate_sha", "case_id", "ready_at", "evidence_schema", "evidence_digest"))
             ):
                 raise ValueError
         except (AttributeError, KeyError, TypeError, ValueError, QualificationGateError) as error:
@@ -253,29 +297,33 @@ class RetainedIssue50BundleReceipt:
 
     @property
     def retention_manifest_digest(self) -> str:
-        return str(self.harness_result["retention_manifest_digest"])
+        return str(self.bundle_document["evidence"]["integrated_boundary"]["manifest"]["retention_manifest_digest"])
 
     @property
     def composed_manifest_digest(self) -> str:
-        return str(self.harness_result["manifest_digest"])
+        return str(self.bundle_document["evidence"]["integrated_boundary"]["manifest"]["manifest_digest"])
 
     @property
     def composed_result_digest(self) -> str:
-        return str(self.harness_result["result_digest"])
+        return str(self.bundle_document["evidence"]["integrated_boundary"]["result"]["result_digest"])
 
     @property
     def bundle_digest(self) -> str:
         return str(self.harness_result["bundle_digest"])
 
+    @property
+    def bundle_document(self) -> dict[str, object]:
+        return json.loads(self.bundle_bytes)
+
     def public_payload(self, *, include_identity: bool = True) -> dict[str, object]:
-        value: dict[str, object] = {"harness_result": self.harness_result, "recording_receipt": self.recording_receipt}
+        value: dict[str, object] = {"harness_result": self.harness_result, "recording_receipt": self.recording_receipt, "bundle_digest": self.bundle_digest}
         return value | ({"receipt_identity": self.receipt_identity} if include_identity else {})
 
     def validate(self) -> None:
         if type(self) is not RetainedIssue50BundleReceipt or self.receipt_identity != _digest(self.public_payload(include_identity=False)):
             raise QualificationGateError("retained issue-50 bundle receipt has drifted")
         try:
-            RetainedIssue50BundleReceipt(self.harness_result, self.recording_receipt)
+            RetainedIssue50BundleReceipt(self.harness_result, self.recording_receipt, self.bundle_bytes)
         except (TypeError, QualificationGateError) as error:
             raise QualificationGateError("retained issue-50 bundle receipt has drifted") from error
 
@@ -471,6 +519,7 @@ class Phase3QualificationInputs:
     lane_a: EvidenceLaneReceipt
     lane_b: EvidenceLaneReceipt
     current_gate_receipts: QualificationGateReceiptSet
+    gate_authorities: QualificationGateAuthority
     unresolved_blockers: tuple[QualificationGateKind, ...] = ()
     input_digest: str = field(init=False)
 
@@ -483,12 +532,12 @@ class Phase3QualificationInputs:
             or len({self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha}) != 3
             or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.issue_50_bundle_receipt) is not RetainedIssue50BundleReceipt or type(self.temporary_resources) is not TemporaryResourceInventory
             or type(self.integrated_inputs) is not IntegratedBoundaryInputs or type(self.composed_manifest) is not ComposedEvidenceManifest or type(self.composed_result) is not ComposedEvidenceResult
-            or type(self.lane_a) is not EvidenceLaneReceipt or type(self.lane_b) is not EvidenceLaneReceipt or type(self.current_gate_receipts) is not QualificationGateReceiptSet
+            or type(self.lane_a) is not EvidenceLaneReceipt or type(self.lane_b) is not EvidenceLaneReceipt or type(self.current_gate_receipts) is not QualificationGateReceiptSet or type(self.gate_authorities) is not QualificationGateAuthority
             or type(self.unresolved_blockers) is not tuple or any(type(value) is not QualificationGateKind for value in self.unresolved_blockers) or len(set(self.unresolved_blockers)) != len(self.unresolved_blockers)
         ):
             raise QualificationGateError("phase-3 qualification evidence is invalid")
         self.retained_evidence.validate(); self.issue_50_bundle_receipt.validate(); self.temporary_resources.validate()
-        self.current_gate_receipts.validate_for(self.qualification_candidate_sha, self.qualification_case_id, self.gate_authority_identities)
+        self.current_gate_receipts.validate_for(self.qualification_candidate_sha, self.qualification_case_id, self.gate_authorities)
         if any((item.review_epoch, item.review_round, item.review_mode) != (self.qualification_review_epoch, self.qualification_review_round, self.qualification_review_mode) for item in self.current_gate_receipts.receipts):
             raise QualificationGateError("qualification gate receipts have a stale formal review binding")
         if (
@@ -520,17 +569,6 @@ class Phase3QualificationInputs:
         if rebuilt.input_digest != self.input_digest:
             raise QualificationGateError("phase-3 qualification evidence has drifted")
 
-    @property
-    def gate_authority_identities(self) -> tuple[str, str, str, str]:
-        """Selection-bound identities for the formal, checks, policy, and provenance receipts."""
-
-        return (
-            self.qualification_recorder_identity,
-            self.qualification_capture_plan_digest,
-            self.rollback_proposal_digest,
-            self.kill_switch_proposal_digest,
-        )
-
     def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
         value: dict[str, object] = {
             "schema": QUALIFICATION_DECISION_SCHEMA, "profile": PHASE_3_QUALIFICATION_PROFILE,
@@ -544,7 +582,7 @@ class Phase3QualificationInputs:
             "roundlet_commit": self.roundlet_commit, "harness_commit": self.harness_commit, "forward_target_commit": self.forward_target_commit,
             "rollback_proposal_digest": self.rollback_proposal_digest, "kill_switch_proposal_digest": self.kill_switch_proposal_digest,
             "retained_evidence": self.retained_evidence.public_payload(), "temporary_resources": self.temporary_resources.public_payload(),
-            "issue_50_bundle_receipt": self.issue_50_bundle_receipt.public_payload(), "current_gate_receipts": self.current_gate_receipts.public_payload(),
+            "issue_50_bundle_receipt": self.issue_50_bundle_receipt.public_payload(), "current_gate_receipts": self.current_gate_receipts.public_payload(), "gate_authorities": self.gate_authorities.public_payload(),
             "retained_issue_50_capture_plan_digest": self.integrated_inputs.capture_plan_digest,
             "composed_manifest_digest": self.composed_manifest.manifest_digest,
             "composed_result_digest": self.composed_result.result_digest,

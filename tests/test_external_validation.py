@@ -88,11 +88,12 @@ from roundwright.shadow import (
 )
 from roundwright.integrated_boundary import (
     IntegratedBoundaryInputs, RetainedEvidenceExpectation, RetainedEvidenceSource, RetainedSourceKind,
-    integrated_boundary_execution_context,
+    compose_retained_evidence, integrated_boundary_execution_context, source_from_public_payload,
 )
 from roundwright.qualification_gate import (
     Phase3QualificationInputs,
     QualificationGateKind,
+    QualificationGateAuthority,
     QualificationGateReceipt,
     QualificationGateReceiptSet,
     RetainedEvidenceBinding,
@@ -127,25 +128,24 @@ def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, e
     return value | {"receipt_digest": canonical(value)}
 
 
-def issue_50_bundle_receipt(candidate_sha: str, case_id: str, retention_manifest_digest: str, manifest_digest: str, result_digest: str) -> RetainedIssue50BundleReceipt:
-    retention_identity = "sha256:" + "f" * 64
-    recording = {
-        "schema": "roundwright-harness-recording-receipt/v1", "status": "sealed",
-        "candidate_sha": candidate_sha, "case_id": case_id,
-        "retention_manifest_digest": retention_manifest_digest, "manifest_digest": manifest_digest,
-        "evidence_digest": result_digest, "bundle_digest": VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
-        "retention_identity": retention_identity,
-    }
-    recording["receipt_digest"] = canonical(recording)
-    result = {
-        "schema": "roundwright-harness-profile-executor-result/v2", "status": "pass", "state": "VERIFIED",
-        "candidate_sha": candidate_sha, "case_id": case_id,
-        "retention_manifest_digest": retention_manifest_digest, "manifest_digest": manifest_digest,
-        "result_digest": result_digest, "bundle_digest": VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
-        "retention_identity": retention_identity, "recording_receipt_digest": recording["receipt_digest"],
-    }
-    result["receipt_digest"] = canonical(result)
-    return RetainedIssue50BundleReceipt(result, recording)
+def issue_50_bundle_receipt() -> RetainedIssue50BundleReceipt:
+    fixtures = Path(__file__).with_name("fixtures")
+    return RetainedIssue50BundleReceipt(
+        json.loads((fixtures / "issue_50_result_receipt.json").read_text()),
+        json.loads((fixtures / "issue_50_recording_receipt.json").read_text()),
+        (fixtures / "issue_50_retained_bundle.json").read_bytes(),
+    )
+
+
+def retained_issue_50_inputs() -> tuple[IntegratedBoundaryInputs, object, object]:
+    bundle = json.loads((Path(__file__).with_name("fixtures") / "issue_50_retained_bundle.json").read_text())
+    integrated = bundle["evidence"]["integrated_boundary"]
+    manifest = integrated["manifest"]
+    sources = {item["kind"]: source_from_public_payload(item) for item in manifest["sources"]}
+    expected = manifest["expected_source_digests"]
+    expectation = RetainedEvidenceExpectation(manifest["retention_manifest_digest"], expected["lane_a_result_digest"], expected["lane_a_bundle_digest"], expected["lane_b_ledger_digest"], expected["lane_b_seal_digest"], expected["lane_b_retention_identity"], expected["lane_b_qualification_digest"], expected["historical_reference_digest"], expected["synthetic_reference_digest"])
+    inputs = IntegratedBoundaryInputs(manifest["candidate_sha"], manifest["case_id"], manifest["capture_plan_digest"], expectation, sources["lane-a"], sources["lane-b"], sources["historical-reference"], sources["synthetic-reference"])
+    return (inputs, *compose_retained_evidence(inputs))
 
 
 @dataclass(frozen=True)
@@ -365,13 +365,16 @@ class ExternalValidationTests(unittest.TestCase):
     def qualification_inputs(self, qualification_plan_digest: str) -> Phase3QualificationInputs:
         """Return the three distinct immutable generations consumed by #51."""
 
-        retained = self.integrated_inputs("b" * 40, "issue-50-retained", "sha256:" + "8" * 64)
-        manifest, result = external_validation.compose_retained_evidence(retained)
+        retained, manifest, result = retained_issue_50_inputs()
         pins = RetainedEvidencePins(
             retained.expectation.retention_manifest_digest,
             retained.expectation.retention_manifest_digest,
             VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
         )
+        authorities = QualificationGateAuthority(tuple(
+            gate_source(kind, "c" * 40, "issue-51-qualification", 1, 1, authority_identity)
+            for kind, authority_identity in zip(QualificationGateKind, ("sha256:" + "7" * 64, qualification_plan_digest, "sha256:" + "b" * 64, "sha256:" + "c" * 64), strict=True)
+        ))
         return Phase3QualificationInputs(
             base_sha="d" * 40,
             qualification_candidate_sha="c" * 40,
@@ -383,8 +386,8 @@ class ExternalValidationTests(unittest.TestCase):
             qualification_capture_plan_digest=qualification_plan_digest,
             qualification_recorder_identity="sha256:" + "7" * 64,
             qualification_store_identity="sha256:" + "8" * 64,
-            issue_49_candidate_sha="a" * 40,
-            issue_50_candidate_sha="b" * 40,
+            issue_49_candidate_sha=retained.lane_a.candidate_sha,
+            issue_50_candidate_sha=retained.candidate_sha,
             roundlet_commit="d" * 40,
             harness_commit="e" * 40,
             forward_target_commit="f" * 40,
@@ -393,22 +396,20 @@ class ExternalValidationTests(unittest.TestCase):
             retained_evidence=RetainedEvidenceBinding(
                 pins, RetainedEvidenceObservations(*pins.payload().values()),
             ),
-            issue_50_bundle_receipt=issue_50_bundle_receipt(
-                "b" * 40, retained.case_id, retained.expectation.retention_manifest_digest,
-                manifest.manifest_digest, result.result_digest,
-            ),
+            issue_50_bundle_receipt=issue_50_bundle_receipt(),
             temporary_resources=TemporaryResourceInventory((
                 TemporaryResourceEntry("sha256:" + "d" * 64, TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
             )),
             integrated_inputs=retained,
             composed_manifest=manifest,
             composed_result=result,
-            lane_a=external_validation.EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, "a" * 40, "verified", "pass"),
-            lane_b=external_validation.EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, "a" * 40, "verified", "pass"),
+            lane_a=external_validation.EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, retained.lane_a.candidate_sha, "verified", "pass"),
+            lane_b=external_validation.EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, retained.lane_b.candidate_sha, "verified", "pass"),
             current_gate_receipts=QualificationGateReceiptSet(tuple(
-                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", gate_source(kind, "c" * 40, "issue-51-qualification", 1, 1, authority_identity))
-                for kind, authority_identity in zip(QualificationGateKind, ("sha256:" + "7" * 64, qualification_plan_digest, "sha256:" + "b" * 64, "sha256:" + "c" * 64), strict=True)
+                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", receipt)
+                for kind, receipt in zip(QualificationGateKind, authorities.receipts, strict=True)
             )),
+            gate_authorities=authorities,
         )
 
     def qualification_v2_request(self) -> tuple[Phase3QualificationInputs, dict[str, object], dict[str, object]]:

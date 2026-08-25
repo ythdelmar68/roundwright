@@ -97,6 +97,26 @@ window begins. It does not move #49's product profile or live evidence into the
 correction. The Phase 3 qualification
 result may produce `PROMOTION_READY` only; it cannot start a Canary by itself.
 
+## #51 consumer-only Canary-entry decision
+
+The final Phase 3 consumer uses
+`roundwright-shadow-profile/phase-3-qualification/v1` to recheck the complete
+sealed #49 lane inventory and #50 composed result for one exact candidate. It
+binds the retained manifests, receipt and bundle digests, immutable capture
+plan, current CI/policy/provenance gates, accepted Supervisor result, and any
+unresolved mismatch disposition. It also requires a public-safe temporary
+resource inventory to be reconciled before it can pass; it never deletes that
+inventory's resources itself, so ambiguous or unique work remains preserved.
+It opens no new observation window and makes
+zero provider calls, forward-target actions, or lifecycle-sink calls.
+
+Only complete, compatible evidence can produce
+`PROMOTION_READY_FOR_CANARY_DECISION`. This is a public-safe decision package
+for an owner; it never authorizes a Canary, runtime activation, Roundlet
+retirement, or a Phase 4 action. Missing, stale, altered, mixed, or unexplained
+evidence remains `QUALIFICATION_BLOCKED` and returns to its owning producer
+for a fresh policy-conforming capture rather than being recreated by #51.
+
 Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for
 canary and cross-environment work; Phase 5 for operations, migration, and
 promotion evaluation; and Phase 6 for release-readiness validation. These are

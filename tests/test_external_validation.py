@@ -211,7 +211,7 @@ class ExecutorBinding:
 class ExecutorRequest:
     schema: str
     capture_plan: dict[str, object]
-    execution_context: dict[str, object] | None
+    execution_context: object | None
 
     @classmethod
     def parse(cls, value: object) -> "ExecutorRequest":
@@ -220,7 +220,15 @@ class ExecutorRequest:
         raw = dict(value)
         if set(raw) != {"schema", "capture_plan", "execution_context"}:
             raise ValueError("request is invalid")
-        return cls(raw["schema"], raw["capture_plan"], raw["execution_context"])
+
+        def freeze_json(item: object) -> object:
+            if type(item) in (dict, MappingProxyType):
+                return MappingProxyType({key: freeze_json(value) for key, value in item.items()})
+            if type(item) in (list, tuple):
+                return tuple(freeze_json(value) for value in item)
+            return item
+
+        return cls(raw["schema"], raw["capture_plan"], freeze_json(raw["execution_context"]))
 
 
 @dataclass(frozen=True)
@@ -289,11 +297,33 @@ def fake_harness() -> tuple[object | None, object | None]:
             )
             context = request.execution_context
             assert context is not None
+            context_value = external_validation._canonical_json_materialize(context)
+            context_identity = external_validation._digest({
+                "schema": "roundwright-live-lifecycle-context/v1", "descriptor": context_value,
+            })
+            if plan.profile == PHASE_3_QUALIFICATION_PROFILE:
+                adapter = arguments[2]
+                prepared = adapter.prepare_execution_context(SimpleNamespace(
+                    descriptor=context,
+                    input_digest=external_validation._digest(context_value),
+                    plan=plan,
+                    components=components,
+                    store_identity=request.capture_plan["store_identity"],
+                ))
+                adapter.validate(SimpleNamespace(
+                    profile=plan.profile,
+                    components=components,
+                    execution_context=prepared,
+                    execution_context_input_digest=external_validation._digest(context_value),
+                    candidate_sha=plan.candidate_sha,
+                    case_id=plan.case_id,
+                    ready_at=plan.ready_at,
+                    plan=plan,
+                ))
+                context_identity = prepared.identity
             return ExecutorReadinessReceipt(
-                plan, components, request.schema, external_validation._digest(context),
-                external_validation._digest({
-                    "schema": "roundwright-live-lifecycle-context/v1", "descriptor": context,
-                }),
+                plan, components, request.schema,
+                external_validation._digest(context_value), context_identity,
             )
         return {"status": "fake"}
     module.prepare_capture = prepare_capture  # type: ignore[attr-defined]
@@ -577,18 +607,18 @@ class ExternalValidationTests(unittest.TestCase):
             {"status": "fake"},
         )
 
-    def test_phase_3_qualification_context_normalizes_executor_tuples_only(self) -> None:
-        """The V2 parser may freeze JSON arrays, without relaxing any identity binding."""
+    def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
+        """The V2 parser may freeze JSON collections, without relaxing any identity binding."""
 
         def freeze_json(value: object) -> object:
-            if type(value) is dict:
-                return {key: freeze_json(item) for key, item in value.items()}
-            if type(value) is list:
+            if type(value) in (dict, MappingProxyType):
+                return MappingProxyType({key: freeze_json(item) for key, item in value.items()})
+            if type(value) in (list, tuple):
                 return tuple(freeze_json(item) for item in value)
             return value
 
         def thaw_json(value: object) -> object:
-            if type(value) is dict:
+            if type(value) in (dict, MappingProxyType):
                 return {key: thaw_json(item) for key, item in value.items()}
             if type(value) is tuple:
                 return [thaw_json(item) for item in value]
@@ -596,15 +626,42 @@ class ExternalValidationTests(unittest.TestCase):
 
         inputs, _plan, request = self.qualification_v2_request()
         authority = self.qualification_gate_authority(inputs)
+        mixed_immutable_json = MappingProxyType({
+            "nested": MappingProxyType({"tuple": ("value",), "list": ["value"]}),
+        })
+        self.assertEqual(
+            external_validation._canonical_json_materialize(mixed_immutable_json),
+            {"nested": {"tuple": ["value"], "list": ["value"]}},
+        )
+        self.assertTrue(external_validation._canonical_json_equivalent(
+            mixed_immutable_json, {"nested": {"tuple": ["value"], "list": ("value",)}},
+        ))
         tuple_context = freeze_json(request["execution_context"])
         tuple_request = {**request, "execution_context": tuple_context}
+        self.assertIsInstance(tuple_context, MappingProxyType)
+        self.assertIsInstance(tuple_context["inputs"], MappingProxyType)  # type: ignore[index]
+        self.assertIsInstance(tuple_context["inputs"]["retained_sources"], tuple)  # type: ignore[index]
+        self.assertEqual(
+            external_validation._canonical_json_materialize(tuple_context), request["execution_context"],
+        )
+        self.assertEqual(
+            external_validation._digest(external_validation._canonical_json_materialize(tuple_context)),
+            external_validation._digest(request["execution_context"]),
+        )
         harness = sys.modules["roundwright_harness.executor"]
+        store = Path("qualification-rejected")
         before = len(harness.run_calls)
         readiness = external_validation.run_phase_3_qualification_profile(
-            "validate", tuple_request, Path("qualification-rejected"), inputs, authority,
+            "validate", tuple_request, store, inputs, authority,
         )
         self.assertEqual(len(harness.run_calls), before + 1)
-        self.assertEqual(readiness.execution_context_input_digest, external_validation._digest(tuple_context))
+        self.assertFalse(store.exists())
+        self.assertEqual(harness.run_calls[-1][0][0], "validate")
+        self.assertEqual(
+            tuple(readiness.as_dict()[key] for key in ("dispatch_count", "record_count", "verify_count", "mutation_count")),
+            (0, 0, 0, 0),
+        )
+        self.assertEqual(readiness.execution_context_input_digest, external_validation._digest(request["execution_context"]))
 
         def replaced_context() -> dict[str, object]:
             value = thaw_json(tuple_context)
@@ -613,6 +670,10 @@ class ExternalValidationTests(unittest.TestCase):
 
         changed_content = replaced_context()
         changed_content["zero_provider_calls"] = 1
+        changed_keys = replaced_context()
+        changed_keys["unexpected"] = 0
+        changed_scalar_type = replaced_context()
+        changed_scalar_type["zero_provider_calls"] = False
         changed_order = replaced_context()
         changed_order["inputs"]["retained_sources"].reverse()  # type: ignore[index]
         changed_order["inputs"]["input_digest"] = external_validation._digest({  # type: ignore[index]
@@ -633,7 +694,8 @@ class ExternalValidationTests(unittest.TestCase):
             key: value for key, value in changed_retained["inputs"].items() if key != "input_digest"  # type: ignore[index]
         })
         for name, context in (
-            ("content", changed_content), ("ordering", changed_order),
+            ("content", changed_content), ("object-key", changed_keys),
+            ("scalar-type", changed_scalar_type), ("ordering", changed_order),
             ("authority", changed_authority), ("retained", changed_retained),
         ):
             with self.subTest(context=name):
@@ -644,6 +706,15 @@ class ExternalValidationTests(unittest.TestCase):
                         Path("qualification-rejected"), inputs, authority,
                     )
                 self.assertEqual(len(harness.run_calls), before)
+        with self.assertRaises(ValueError):
+            external_validation._canonical_json_materialize({"unsupported": object()})
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile(
+                "validate", {**request, "execution_context": {"unsupported": object()}},
+                store, inputs, authority,
+            )
+        self.assertEqual(len(harness.run_calls), before)
 
     def test_phase_3_qualification_validate_rejects_all_drift_before_dispatch(self) -> None:
         """Every mutable #51 request/input edge fails before the Harness run seam."""

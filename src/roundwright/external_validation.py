@@ -9,6 +9,7 @@ import math
 import os
 import re
 import base64
+from collections.abc import Mapping as JsonMapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -122,32 +123,27 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _canonical_json_equivalent(left: object, right: object) -> bool:
-    """Compare JSON content after the Executor has frozen arrays into tuples."""
+def _canonical_json_materialize(value: object) -> object:
+    """Return strict JSON content from the immutable representation used by V2."""
 
-    def normalize(value: object) -> object:
-        if type(value) in (dict, MappingProxyType):
-            if any(type(key) is not str for key in value):
-                raise ValueError
-            return ("object", tuple((key, normalize(value[key])) for key in sorted(value)))
-        if type(value) in (list, tuple):
-            return ("array", tuple(normalize(item) for item in value))
-        if type(value) is float and not math.isfinite(value):
-            raise ValueError
-        if type(value) is str:
-            return ("string", value)
-        if type(value) is int:
-            return ("integer", value)
-        if type(value) is float:
-            return ("number", value)
-        if type(value) is bool:
-            return ("boolean", value)
-        if value is None:
-            return ("null",)
-        raise ValueError
+    if isinstance(value, JsonMapping):
+        if any(type(key) is not str for key in value):
+            raise ValueError("JSON object keys must be strings")
+        return {key: _canonical_json_materialize(item) for key, item in value.items()}
+    if type(value) in (list, tuple):
+        return [_canonical_json_materialize(item) for item in value]
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError("JSON numbers must be finite")
+    if type(value) in (str, int, float, bool, type(None)):
+        return value
+    raise ValueError("value is not JSON material")
+
+
+def _canonical_json_equivalent(left: object, right: object) -> bool:
+    """Compare V2 parser output by its exact materialized JSON content."""
 
     try:
-        return normalize(left) == normalize(right)
+        return _digest(_canonical_json_materialize(left)) == _digest(_canonical_json_materialize(right))
     except (AttributeError, TypeError, ValueError):
         return False
 
@@ -3926,7 +3922,7 @@ def _phase_3_qualification_readiness_receipt(receipt: object, inputs: object, ga
 
 @dataclass(frozen=True)
 class MaterializedPhase3QualificationContext:
-    descriptor: dict[str, object]
+    descriptor: Mapping[str, object]
     inputs: object
     gate_authority: object
     candidate_sha: str
@@ -3936,12 +3932,12 @@ class MaterializedPhase3QualificationContext:
     store_identity: str
 
     def __post_init__(self) -> None:
-        if (type(self.descriptor) is not dict or type(self.inputs) is not _phase_3_qualification_inputs_type() or type(self.gate_authority) is not _qualification_gate_authority_type() or not _canonical_json_equivalent(self.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or (self.candidate_sha, self.case_id, self.capture_plan_digest, self.ready_at, self.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity) or _SHA.fullmatch(self.candidate_sha) is None or not _safe_token(self.case_id) or _DIGEST.fullmatch(self.capture_plan_digest) is None or _DIGEST.fullmatch(self.store_identity) is None or type(self.ready_at) is not int or self.ready_at < 0):
+        if (not isinstance(self.descriptor, JsonMapping) or type(self.inputs) is not _phase_3_qualification_inputs_type() or type(self.gate_authority) is not _qualification_gate_authority_type() or not _canonical_json_equivalent(self.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or (self.candidate_sha, self.case_id, self.capture_plan_digest, self.ready_at, self.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity) or _SHA.fullmatch(self.candidate_sha) is None or not _safe_token(self.case_id) or _DIGEST.fullmatch(self.capture_plan_digest) is None or _DIGEST.fullmatch(self.store_identity) is None or type(self.ready_at) is not int or self.ready_at < 0):
             raise ExternalValidationAdapterError("phase-3 qualification V2 execution context is invalid")
 
     @property
     def identity(self) -> str:
-        return _digest({"descriptor": self.descriptor, "candidate_sha": self.candidate_sha, "case_id": self.case_id, "capture_plan_digest": self.capture_plan_digest, "ready_at": self.ready_at, "store_identity": self.store_identity, "gate_authority_digest": self.gate_authority.authority_digest})
+        return _digest({"descriptor": _canonical_json_materialize(self.descriptor), "candidate_sha": self.candidate_sha, "case_id": self.case_id, "capture_plan_digest": self.capture_plan_digest, "ready_at": self.ready_at, "store_identity": self.store_identity, "gate_authority_digest": self.gate_authority.authority_digest})
 
 
 @dataclass(frozen=True)
@@ -3960,7 +3956,7 @@ class Phase3QualificationAdapter:
 
     def prepare_execution_context(self, preparation: object) -> object:
         try:
-            if self.inputs is None or self.gate_authority is None or not _canonical_json_equivalent(preparation.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or preparation.input_digest != _digest(preparation.descriptor) or preparation.components != self.component_identities:
+            if self.inputs is None or self.gate_authority is None or not _canonical_json_equivalent(preparation.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or preparation.input_digest != _digest(_canonical_json_materialize(preparation.descriptor)) or preparation.components != self.component_identities:
                 raise ValueError
             plan = preparation.plan
             if (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, preparation.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity):
@@ -3975,7 +3971,7 @@ class Phase3QualificationAdapter:
             execution_context = binding.execution_context
             context = execution_context.value
             components = (binding.components.producer_identity, binding.components.exporter_identity, binding.components.comparator_identity)
-            if self.inputs is None or self.gate_authority is None or binding.profile != PHASE_3_QUALIFICATION_PROFILE or components != phase_3_qualification_component_identities() or type(context) is not MaterializedPhase3QualificationContext or context.inputs != self.inputs or context.gate_authority != self.gate_authority or not _canonical_json_equivalent(context.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or binding.execution_context_input_digest != _digest(context.descriptor) or execution_context.identity != context.identity or (context.candidate_sha, context.case_id, context.capture_plan_digest, context.ready_at) != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at): raise ValueError
+            if self.inputs is None or self.gate_authority is None or binding.profile != PHASE_3_QUALIFICATION_PROFILE or components != phase_3_qualification_component_identities() or type(context) is not MaterializedPhase3QualificationContext or context.inputs != self.inputs or context.gate_authority != self.gate_authority or not _canonical_json_equivalent(context.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or binding.execution_context_input_digest != _digest(_canonical_json_materialize(context.descriptor)) or execution_context.identity != context.identity or (context.candidate_sha, context.case_id, context.capture_plan_digest, context.ready_at) != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at): raise ValueError
         except (AttributeError, TypeError, ValueError) as error:
             raise ExternalValidationAdapterError("phase-3 qualification binding is invalid or stale") from error
 

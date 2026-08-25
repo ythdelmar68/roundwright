@@ -209,6 +209,13 @@ class Phase3QualificationGateTests(unittest.TestCase):
                 inputs.issue_50_bundle_receipt.recording_receipt,
                 inputs.issue_50_bundle_receipt.bundle_bytes,
             )
+        changed_result = {**inputs.issue_50_bundle_receipt.harness_result, "dispatch_count": 2}
+        changed_result["receipt_digest"] = canonical({key: value for key, value in changed_result.items() if key != "receipt_digest"})
+        with self.assertRaises(QualificationGateError):
+            RetainedIssue50BundleReceipt(
+                changed_result, inputs.issue_50_bundle_receipt.recording_receipt,
+                inputs.issue_50_bundle_receipt.bundle_bytes,
+            )
         with self.assertRaises(QualificationGateError):
             self.inputs(unresolved_blockers=("C:\\secret\nvalue",))  # type: ignore[arg-type]
         first = inputs.current_gate_receipts.receipts[0]

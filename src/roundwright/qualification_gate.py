@@ -257,6 +257,7 @@ class RetainedIssue50BundleReceipt:
                 set(result) != result_required or set(recording) != recording_required
                 or result["schema"] != "roundwright-harness-profile-executor-result/v2"
                 or result["status"] != "pass" or result["state"] != "VERIFIED" or result["mutation_count"] != 0
+                or (result["dispatch_count"], result["record_count"], result["verify_count"], result["mutation_count"]) != (1, 1, 1, 0)
                 or recording["schema"] != "roundwright-harness-recording-receipt/v1" or recording["status"] != "sealed"
                 or recording["evidence_schema"] != "roundwright-shadow-case/v2"
                 or _SHA.fullmatch(str(result["candidate_sha"])) is None

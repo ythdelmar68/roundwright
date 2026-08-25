@@ -65,7 +65,8 @@ class Phase3QualificationGateTests(unittest.TestCase):
         values = {
             "base_sha": "d" * 40, "qualification_candidate_sha": self.qualification_candidate,
             "issue_49_candidate_sha": self.issue_49_candidate, "issue_50_candidate_sha": self.issue_50_candidate,
-            "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
+            "roundlet_commit": "d" * 40, "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
+            "rollback_proposal_digest": digest(97), "kill_switch_proposal_digest": digest(98),
             "retained_evidence": RetainedEvidenceBinding(pins, RetainedEvidenceObservations(*pins.payload().values())),
             "temporary_resources": resources, "integrated_inputs": retained, "composed_manifest": manifest, "composed_result": result,
             "lane_a": EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, self.issue_49_candidate, "verified", "pass"),
@@ -85,6 +86,9 @@ class Phase3QualificationGateTests(unittest.TestCase):
         )
         self.assertFalse(payload["canary_action_authorized"])
         self.assertEqual((payload["new_provider_calls"], payload["new_target_actions"]), (0, 0))
+        self.assertEqual(payload["qualification"]["roundlet_commit"], "d" * 40)
+        self.assertEqual(payload["qualification"]["rollback_proposal_digest"], digest(97))
+        self.assertEqual(len(payload["qualification"]["retained_sources"]), 4)
 
     def test_cross_generation_substitution_and_current_gate_failure_fail_closed(self) -> None:
         with self.assertRaises(QualificationGateError):
@@ -100,6 +104,10 @@ class Phase3QualificationGateTests(unittest.TestCase):
         object.__setattr__(inputs.retained_evidence.observed, "issue_50_result_bundle_digest", digest(77))
         with self.assertRaises(QualificationGateError):
             replace(inputs)
+        inputs = self.inputs()
+        object.__setattr__(inputs.retained_evidence, "binding_digest", digest(77))
+        with self.assertRaises(QualificationGateError):
+            replace(inputs)
 
     def test_inventory_reconciles_replayable_and_preserves_unique_or_ambiguous_work(self) -> None:
         inputs = self.inputs()
@@ -108,5 +116,9 @@ class Phase3QualificationGateTests(unittest.TestCase):
         with self.assertRaises(QualificationGateError):
             TemporaryResourceEntry(digest(97), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.REMOVED)
         object.__setattr__(inputs.temporary_resources, "inventory_digest", digest(77))
+        with self.assertRaises(QualificationGateError):
+            replace(inputs)
+        inputs = self.inputs()
+        object.__setattr__(inputs.temporary_resources.entries[1], "disposition", TemporaryResourceDisposition.REMOVED)
         with self.assertRaises(QualificationGateError):
             replace(inputs)

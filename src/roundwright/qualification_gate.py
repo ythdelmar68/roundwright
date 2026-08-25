@@ -115,6 +115,9 @@ class RetainedEvidenceBinding:
         self.expected.validate(); self.observed.validate()
         if self.expected.payload() != self.observed.payload():
             raise QualificationGateError("retained evidence read-back does not match selection")
+        current = getattr(self, "binding_digest", None)
+        if current is not None and current != _digest(self.public_payload(include_digest=False)):
+            raise QualificationGateError("retained evidence binding has drifted")
 
     def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
         value: dict[str, object] = {
@@ -170,7 +173,14 @@ class TemporaryResourceInventory:
         return value | ({"inventory_digest": self.inventory_digest} if include_digest else {})
 
     def validate(self) -> None:
-        if type(self) is not TemporaryResourceInventory or self.inventory_digest != _digest(self.public_payload(include_digest=False)):
+        if type(self) is not TemporaryResourceInventory:
+            raise QualificationGateError("temporary resource inventory has drifted")
+        try:
+            for entry in self.entries:
+                TemporaryResourceEntry(entry.resource_identity, entry.kind, entry.disposition)
+        except (AttributeError, TypeError, QualificationGateError) as error:
+            raise QualificationGateError("temporary resource inventory has drifted") from error
+        if self.inventory_digest != _digest(self.public_payload(include_digest=False)):
             raise QualificationGateError("temporary resource inventory has drifted")
 
 
@@ -182,8 +192,11 @@ class Phase3QualificationInputs:
     qualification_candidate_sha: str
     issue_49_candidate_sha: str
     issue_50_candidate_sha: str
+    roundlet_commit: str
     harness_commit: str
     forward_target_commit: str
+    rollback_proposal_digest: str
+    kill_switch_proposal_digest: str
     retained_evidence: RetainedEvidenceBinding
     temporary_resources: TemporaryResourceInventory
     integrated_inputs: IntegratedBoundaryInputs
@@ -200,7 +213,8 @@ class Phase3QualificationInputs:
 
     def __post_init__(self) -> None:
         if (
-            any(_SHA.fullmatch(value) is None for value in (self.base_sha, self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha, self.harness_commit, self.forward_target_commit))
+            any(_SHA.fullmatch(value) is None for value in (self.base_sha, self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha, self.roundlet_commit, self.harness_commit, self.forward_target_commit))
+            or any(_DIGEST.fullmatch(value) is None for value in (self.rollback_proposal_digest, self.kill_switch_proposal_digest))
             or len({self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha}) != 3
             or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.temporary_resources) is not TemporaryResourceInventory
             or type(self.integrated_inputs) is not IntegratedBoundaryInputs or type(self.composed_manifest) is not ComposedEvidenceManifest or type(self.composed_result) is not ComposedEvidenceResult
@@ -231,10 +245,13 @@ class Phase3QualificationInputs:
             "schema": QUALIFICATION_DECISION_SCHEMA, "profile": PHASE_3_QUALIFICATION_PROFILE,
             "base_sha": self.base_sha, "qualification_candidate_sha": self.qualification_candidate_sha,
             "issue_49_candidate_sha": self.issue_49_candidate_sha, "issue_50_candidate_sha": self.issue_50_candidate_sha,
-            "harness_commit": self.harness_commit, "forward_target_commit": self.forward_target_commit,
+            "roundlet_commit": self.roundlet_commit, "harness_commit": self.harness_commit, "forward_target_commit": self.forward_target_commit,
+            "rollback_proposal_digest": self.rollback_proposal_digest, "kill_switch_proposal_digest": self.kill_switch_proposal_digest,
             "retained_evidence": self.retained_evidence.public_payload(), "temporary_resources": self.temporary_resources.public_payload(),
             "capture_plan_digest": self.integrated_inputs.capture_plan_digest, "composed_manifest_digest": self.composed_manifest.manifest_digest,
             "composed_result_digest": self.composed_result.result_digest,
+            "retained_sources": [source.public_payload() | {"source_digest": source.source_digest} for source in (self.integrated_inputs.lane_a, self.integrated_inputs.lane_b, self.integrated_inputs.historical_reference, self.integrated_inputs.synthetic_reference)],
+            "composed_manifest": self.composed_manifest.public_payload(), "composed_result": self.composed_result.public_payload(),
             "lane_a": {"state": self.lane_a.state, "result": self.lane_a.result}, "lane_b": {"state": self.lane_b.state, "result": self.lane_b.result},
             "supervisor_pass": self.supervisor_pass, "ci_pass": self.ci_pass, "policy_pass": self.policy_pass, "provenance_pass": self.provenance_pass,
             "unresolved_blockers": list(self.unresolved_blockers), "new_provider_calls": 0, "new_target_actions": 0, "lifecycle_observation_sink": "NOT_SELECTED",
@@ -262,6 +279,7 @@ class CanaryEntryDecisionPackage:
             "qualification_candidate_sha": self.inputs.qualification_candidate_sha, "issue_49_candidate_sha": self.inputs.issue_49_candidate_sha,
             "issue_50_candidate_sha": self.inputs.issue_50_candidate_sha, "composed_manifest_digest": self.inputs.composed_manifest.manifest_digest,
             "composed_result_digest": self.inputs.composed_result.result_digest, "canary_action_authorized": False,
+            "qualification": self.inputs.public_payload(),
             "runtime_activation_authorized": False, "roundlet_retirement_authorized": False,
             "new_provider_calls": 0, "new_target_actions": 0, "lifecycle_observation_sink": "NOT_SELECTED",
         }

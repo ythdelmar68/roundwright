@@ -3799,30 +3799,21 @@ def phase_3_qualification_execution_context(inputs: object) -> dict[str, object]
     return {"schema": "roundwright-phase-3-qualification-context/v1", "inputs": inputs.public_payload(), "input_digest": inputs.input_digest, "zero_provider_calls": 0, "zero_target_actions": 0, "zero_lifecycle_actions": 0}
 
 
-def phase_3_qualification_current_gates(inputs: object) -> dict[str, object]:
-    """Return the exact, current normal-gate projection required for execute."""
+def phase_3_qualification_current_gates(inputs: object) -> object:
+    """Return the independently captured typed gate receipts required for execute."""
 
     if type(inputs) is not _phase_3_qualification_inputs_type():
         raise ExternalValidationAdapterError("phase-3 qualification inputs are invalid")
-    return {
-        "schema": "roundwright-phase-3-qualification-current-gates/v1",
-        "candidate_sha": inputs.qualification_candidate_sha,
-        "case_id": inputs.qualification_case_id,
-        "ready_at": inputs.qualification_ready_at,
-        "capture_plan_digest": inputs.qualification_capture_plan_digest,
-        "input_digest": inputs.input_digest,
-        "formal_review": inputs.supervisor_pass,
-        "ci": inputs.ci_pass,
-        "policy": inputs.policy_pass,
-        "provenance": inputs.provenance_pass,
-    }
+    return inputs.current_gate_receipts
 
 
 def _validate_phase_3_qualification_current_gates(current_gates: object, inputs: object) -> None:
-    if type(current_gates) is not dict or current_gates != phase_3_qualification_current_gates(inputs):
+    if current_gates != phase_3_qualification_current_gates(inputs):
         raise ExternalValidationAdapterError("phase-3 qualification current gates are invalid or stale")
-    if any(current_gates[name] is not True for name in ("formal_review", "ci", "policy", "provenance")):
-        raise ExternalValidationAdapterError("phase-3 qualification current gates are not passing")
+    try:
+        current_gates.validate_for(inputs.qualification_candidate_sha, inputs.qualification_case_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("phase-3 qualification current gates are invalid or stale") from error
 
 
 @dataclass(frozen=True)
@@ -3953,7 +3944,9 @@ class Phase3QualificationAdapter:
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
         self.validate(binding)
         try:
-            if execution.mutation_count != 0 or type(execution.value) is not dict or execution.value.get("new_provider_calls") != 0 or execution.value.get("new_target_actions") != 0 or execution.value.get("lifecycle_observation_sink") != "NOT_SELECTED": raise ValueError
+            from .qualification_gate import assess_phase_3_qualification
+            if self.inputs is None or execution.mutation_count != 0 or execution.value != assess_phase_3_qualification(self.inputs).public_payload():
+                raise ValueError
         except (AttributeError, TypeError, ValueError) as error:
             raise ExternalValidationAdapterError("phase-3 qualification execution has drifted") from error
         return {"schema": "roundwright-shadow-case/v2", "profile": PHASE_3_QUALIFICATION_PROFILE, "ready_at": binding.ready_at, "case_id": binding.case_id, "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest, "qualification": execution.value}

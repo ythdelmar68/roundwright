@@ -13,15 +13,20 @@ from roundwright.qualification_gate import (
     PROMOTION_READY_FOR_CANARY_DECISION,
     QUALIFICATION_BLOCKED,
     Phase3QualificationInputs,
+    QualificationGateKind,
+    QualificationGateReceipt,
+    QualificationGateReceiptSet,
     QualificationGateError,
     RetainedEvidenceBinding,
     RetainedEvidenceObservations,
     RetainedEvidencePins,
+    RetainedIssue50BundleReceipt,
     TemporaryResourceDisposition,
     TemporaryResourceEntry,
     TemporaryResourceInventory,
     TemporaryResourceKind,
     assess_phase_3_qualification,
+    issue_51_selection_trace_correction,
 )
 from roundwright.shadow import LIVE_LIFECYCLE_SHADOW_PROFILE, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
 
@@ -56,25 +61,28 @@ class Phase3QualificationGateTests(unittest.TestCase):
         )
         retained = IntegratedBoundaryInputs(self.issue_50_candidate, "issue-50", digest(80), expectation, lane_a_source, lane_b_source, historical, synthetic)
         manifest, result = compose_retained_evidence(retained)
-        pins = RetainedEvidencePins(expectation.retention_manifest_digest, digest(92), digest(93))
+        pins = RetainedEvidencePins(expectation.retention_manifest_digest, expectation.retention_manifest_digest, digest(93))
         resources = TemporaryResourceInventory((
             TemporaryResourceEntry(digest(94), TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
-            TemporaryResourceEntry(digest(95), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.PRESERVED),
-            TemporaryResourceEntry(digest(96), TemporaryResourceKind.AMBIGUOUS, TemporaryResourceDisposition.PRESERVED),
         ))
         values = {
             "base_sha": "d" * 40, "qualification_candidate_sha": self.qualification_candidate,
             "qualification_case_id": "issue-51-qualification", "qualification_ready_at": 23,
+            "qualification_review_epoch": 1, "qualification_review_round": 1, "qualification_review_mode": "COMPLETE",
             "qualification_capture_plan_digest": digest(79),
             "qualification_recorder_identity": digest(78), "qualification_store_identity": digest(77),
             "issue_49_candidate_sha": self.issue_49_candidate, "issue_50_candidate_sha": self.issue_50_candidate,
             "roundlet_commit": "d" * 40, "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
             "rollback_proposal_digest": digest(97), "kill_switch_proposal_digest": digest(98),
             "retained_evidence": RetainedEvidenceBinding(pins, RetainedEvidenceObservations(*pins.payload().values())),
+            "issue_50_bundle_receipt": RetainedIssue50BundleReceipt(self.issue_50_candidate, expectation.retention_manifest_digest, manifest.manifest_digest, result.result_digest, digest(93)),
             "temporary_resources": resources, "integrated_inputs": retained, "composed_manifest": manifest, "composed_result": result,
             "lane_a": EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, self.issue_49_candidate, "verified", "pass"),
             "lane_b": EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, self.issue_49_candidate, "verified", "pass"),
-            "supervisor_pass": True, "ci_pass": True, "policy_pass": True, "provenance_pass": True,
+            "current_gate_receipts": QualificationGateReceiptSet(tuple(
+                QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 1, "COMPLETE", "pass", digest(100 + index))
+                for index, kind in enumerate(QualificationGateKind)
+            )),
         }
         values.update(changes)
         return Phase3QualificationInputs(**values)
@@ -98,7 +106,10 @@ class Phase3QualificationGateTests(unittest.TestCase):
             self.inputs(issue_50_candidate_sha=self.issue_49_candidate)
         with self.assertRaises(QualificationGateError):
             self.inputs(lane_b=EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, self.issue_50_candidate, "verified", "pass"))
-        self.assertEqual(assess_phase_3_qualification(self.inputs(ci_pass=False)).disposition, QUALIFICATION_BLOCKED)
+        resources = TemporaryResourceInventory((
+            TemporaryResourceEntry(digest(95), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.PRESERVED),
+        ))
+        self.assertEqual(assess_phase_3_qualification(self.inputs(temporary_resources=resources)).disposition, QUALIFICATION_BLOCKED)
 
     def test_retained_expected_and_observed_pins_reject_substitution(self) -> None:
         inputs = self.inputs()
@@ -107,21 +118,46 @@ class Phase3QualificationGateTests(unittest.TestCase):
         object.__setattr__(inputs.retained_evidence.observed, "issue_50_result_bundle_digest", digest(77))
         with self.assertRaises(QualificationGateError):
             replace(inputs)
+
+    def test_trace_correction_uses_only_verified_issue_50_digest(self) -> None:
+        correction = issue_51_selection_trace_correction()
+        self.assertEqual(correction["verified_digest"], "sha256:5046fd4eed52db54f6b797464bf4faf4082290ec9cf12d3de194f624f8ca8d8a")
+        self.assertNotEqual(correction["recorded_digest"], correction["verified_digest"])
         inputs = self.inputs()
         object.__setattr__(inputs.retained_evidence, "binding_digest", digest(77))
         with self.assertRaises(QualificationGateError):
             replace(inputs)
 
-    def test_inventory_reconciles_replayable_and_preserves_unique_or_ambiguous_work(self) -> None:
+    def test_retained_issue_50_bundle_and_blockers_are_closed(self) -> None:
         inputs = self.inputs()
-        self.assertTrue(inputs.temporary_resources.fully_reconciled)
-        self.assertEqual(tuple(entry.disposition.value for entry in inputs.temporary_resources.entries), ("removed", "preserved", "preserved"))
+        with self.assertRaises(QualificationGateError):
+            self.inputs(issue_50_bundle_receipt=RetainedIssue50BundleReceipt(
+                self.issue_50_candidate, inputs.issue_50_bundle_receipt.retention_manifest_digest,
+                inputs.composed_manifest.manifest_digest, inputs.composed_result.result_digest, digest(71),
+            ))
+        with self.assertRaises(QualificationGateError):
+            self.inputs(unresolved_blockers=("C:\\secret\nvalue",))  # type: ignore[arg-type]
+        stale_receipts = replace(inputs.current_gate_receipts, receipts=(
+            replace(inputs.current_gate_receipts.receipts[0], review_round=2), *inputs.current_gate_receipts.receipts[1:],
+        ))
+        with self.assertRaises(QualificationGateError):
+            self.inputs(current_gate_receipts=stale_receipts)
+
+    def test_inventory_reconciles_replayable_and_preserves_unique_or_ambiguous_work(self) -> None:
+        resources = TemporaryResourceInventory((
+            TemporaryResourceEntry(digest(94), TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
+            TemporaryResourceEntry(digest(95), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.PRESERVED),
+            TemporaryResourceEntry(digest(96), TemporaryResourceKind.AMBIGUOUS, TemporaryResourceDisposition.PRESERVED),
+        ))
+        self.assertTrue(resources.fully_reconciled)
+        self.assertFalse(resources.promotion_eligible)
+        self.assertEqual(tuple(entry.disposition.value for entry in resources.entries), ("removed", "preserved", "preserved"))
+        self.assertEqual(assess_phase_3_qualification(self.inputs(temporary_resources=resources)).disposition, QUALIFICATION_BLOCKED)
         with self.assertRaises(QualificationGateError):
             TemporaryResourceEntry(digest(97), TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.REMOVED)
-        object.__setattr__(inputs.temporary_resources, "inventory_digest", digest(77))
+        object.__setattr__(resources, "inventory_digest", digest(77))
         with self.assertRaises(QualificationGateError):
-            replace(inputs)
-        inputs = self.inputs()
-        object.__setattr__(inputs.temporary_resources.entries[1], "disposition", TemporaryResourceDisposition.REMOVED)
+            resources.validate()
+        object.__setattr__(resources.entries[1], "disposition", TemporaryResourceDisposition.REMOVED)
         with self.assertRaises(QualificationGateError):
-            replace(inputs)
+            resources.validate()

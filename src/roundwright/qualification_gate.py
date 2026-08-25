@@ -35,6 +35,108 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
+VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST = "sha256:5046fd4eed52db54f6b797464bf4faf4082290ec9cf12d3de194f624f8ca8d8a"
+STALE_ISSUE_50_TRACE_DIGEST = "sha256:5046fd4e0c805cefacbe92dd28f72c95be164baad0caa35e7414cab198478d8a"
+
+
+def issue_51_selection_trace_correction() -> dict[str, str]:
+    """Curated non-mutating disposition for the known #51 selection-trace drift."""
+
+    return {
+        "disposition": "ORCHESTRATOR_TRACE_CORRECTION_REQUIRED",
+        "recorded_digest": STALE_ISSUE_50_TRACE_DIGEST,
+        "verified_digest": VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+        "required_action": "publish-and-semantic-read-back-curated-trace-correction",
+    }
+
+
+class QualificationGateKind(StrEnum):
+    FORMAL_REVIEW = "formal-review"
+    HOSTED_CHECKS = "hosted-checks"
+    POLICY = "policy"
+    PROVENANCE = "provenance"
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationGateReceipt:
+    """One independently read-back, candidate-bound normal-gate receipt."""
+
+    kind: QualificationGateKind
+    candidate_sha: str
+    case_id: str
+    review_epoch: int
+    review_round: int
+    review_mode: str
+    result: Literal["pass"]
+    source_identity: str
+    receipt_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (type(self.kind) is not QualificationGateKind or _SHA.fullmatch(self.candidate_sha) is None
+            or _TOKEN.fullmatch(self.case_id) is None or type(self.review_epoch) is not int or self.review_epoch < 0
+            or type(self.review_round) is not int or self.review_round < 0 or self.review_mode != "COMPLETE"
+            or self.result != "pass" or _DIGEST.fullmatch(self.source_identity) is None):
+            raise QualificationGateError("qualification gate receipt is invalid")
+        object.__setattr__(self, "receipt_digest", _digest(self.public_payload(include_digest=False)))
+
+    def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
+        value: dict[str, object] = {"kind": self.kind.value, "candidate_sha": self.candidate_sha, "case_id": self.case_id,
+            "review_epoch": self.review_epoch, "review_round": self.review_round, "review_mode": self.review_mode,
+            "result": self.result, "source_identity": self.source_identity}
+        return value | ({"receipt_digest": self.receipt_digest} if include_digest else {})
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationGateReceiptSet:
+    """Exact four-gate read-back set; no caller booleans cross this boundary."""
+
+    receipts: tuple[QualificationGateReceipt, ...]
+    binding_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (type(self.receipts) is not tuple or any(type(item) is not QualificationGateReceipt for item in self.receipts)
+            or tuple(item.kind for item in self.receipts) != tuple(QualificationGateKind)
+            or len({item.receipt_digest for item in self.receipts}) != len(self.receipts)):
+            raise QualificationGateError("qualification gate receipt set is invalid")
+        object.__setattr__(self, "binding_digest", _digest(self.public_payload(include_digest=False)))
+
+    def validate_for(self, candidate_sha: str, case_id: str) -> None:
+        if (type(self) is not QualificationGateReceiptSet or self.binding_digest != _digest(self.public_payload(include_digest=False))
+            or any((item.candidate_sha, item.case_id) != (candidate_sha, case_id) or item.receipt_digest != _digest(item.public_payload(include_digest=False)) for item in self.receipts)):
+            raise QualificationGateError("qualification gate receipts have drifted")
+
+    def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
+        value: dict[str, object] = {"receipts": [item.public_payload() for item in self.receipts]}
+        return value | ({"binding_digest": self.binding_digest} if include_digest else {})
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedIssue50BundleReceipt:
+    """Public-safe verified Harness bundle binding for retained #50 composition."""
+
+    candidate_sha: str
+    retention_manifest_digest: str
+    composed_manifest_digest: str
+    composed_result_digest: str
+    bundle_digest: str
+    receipt_identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if _SHA.fullmatch(self.candidate_sha) is None or any(_DIGEST.fullmatch(value) is None for value in (self.retention_manifest_digest, self.composed_manifest_digest, self.composed_result_digest, self.bundle_digest)):
+            raise QualificationGateError("retained issue-50 bundle receipt is invalid")
+        object.__setattr__(self, "receipt_identity", _digest(self.public_payload(include_identity=False)))
+
+    def public_payload(self, *, include_identity: bool = True) -> dict[str, object]:
+        value: dict[str, object] = {"candidate_sha": self.candidate_sha, "retention_manifest_digest": self.retention_manifest_digest,
+            "composed_manifest_digest": self.composed_manifest_digest, "composed_result_digest": self.composed_result_digest,
+            "bundle_digest": self.bundle_digest}
+        return value | ({"receipt_identity": self.receipt_identity} if include_identity else {})
+
+    def validate(self) -> None:
+        if type(self) is not RetainedIssue50BundleReceipt or self.receipt_identity != _digest(self.public_payload(include_identity=False)):
+            raise QualificationGateError("retained issue-50 bundle receipt has drifted")
+
+
 class TemporaryResourceKind(StrEnum):
     REPLAYABLE = "replayable"
     UNIQUE = "unique"
@@ -169,6 +271,15 @@ class TemporaryResourceInventory:
             for entry in self.entries
         )
 
+    @property
+    def promotion_eligible(self) -> bool:
+        """Preserved unique/ambiguous work is safe, but blocks promotion."""
+
+        return self.fully_reconciled and not any(
+            entry.kind in {TemporaryResourceKind.UNIQUE, TemporaryResourceKind.AMBIGUOUS}
+            for entry in self.entries
+        )
+
     def public_payload(self, *, include_digest: bool = True) -> dict[str, object]:
         value: dict[str, object] = {"entries": [entry.public_payload() for entry in self.entries]}
         return value | ({"inventory_digest": self.inventory_digest} if include_digest else {})
@@ -193,6 +304,9 @@ class Phase3QualificationInputs:
     qualification_candidate_sha: str
     qualification_case_id: str
     qualification_ready_at: int
+    qualification_review_epoch: int
+    qualification_review_round: int
+    qualification_review_mode: str
     qualification_capture_plan_digest: str
     qualification_recorder_identity: str
     qualification_store_identity: str
@@ -204,37 +318,41 @@ class Phase3QualificationInputs:
     rollback_proposal_digest: str
     kill_switch_proposal_digest: str
     retained_evidence: RetainedEvidenceBinding
+    issue_50_bundle_receipt: RetainedIssue50BundleReceipt
     temporary_resources: TemporaryResourceInventory
     integrated_inputs: IntegratedBoundaryInputs
     composed_manifest: ComposedEvidenceManifest
     composed_result: ComposedEvidenceResult
     lane_a: EvidenceLaneReceipt
     lane_b: EvidenceLaneReceipt
-    supervisor_pass: bool
-    ci_pass: bool
-    policy_pass: bool
-    provenance_pass: bool
-    unresolved_blockers: tuple[str, ...] = ()
+    current_gate_receipts: QualificationGateReceiptSet
+    unresolved_blockers: tuple[QualificationGateKind, ...] = ()
     input_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         if (
             any(_SHA.fullmatch(value) is None for value in (self.base_sha, self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha, self.roundlet_commit, self.harness_commit, self.forward_target_commit))
             or _TOKEN.fullmatch(self.qualification_case_id) is None or type(self.qualification_ready_at) is not int or self.qualification_ready_at < 0
+            or type(self.qualification_review_epoch) is not int or self.qualification_review_epoch < 0 or type(self.qualification_review_round) is not int or self.qualification_review_round < 0 or self.qualification_review_mode != "COMPLETE"
             or any(_DIGEST.fullmatch(value) is None for value in (self.qualification_capture_plan_digest, self.qualification_recorder_identity, self.qualification_store_identity, self.rollback_proposal_digest, self.kill_switch_proposal_digest))
             or len({self.qualification_candidate_sha, self.issue_49_candidate_sha, self.issue_50_candidate_sha}) != 3
-            or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.temporary_resources) is not TemporaryResourceInventory
+            or type(self.retained_evidence) is not RetainedEvidenceBinding or type(self.issue_50_bundle_receipt) is not RetainedIssue50BundleReceipt or type(self.temporary_resources) is not TemporaryResourceInventory
             or type(self.integrated_inputs) is not IntegratedBoundaryInputs or type(self.composed_manifest) is not ComposedEvidenceManifest or type(self.composed_result) is not ComposedEvidenceResult
-            or type(self.lane_a) is not EvidenceLaneReceipt or type(self.lane_b) is not EvidenceLaneReceipt
-            or any(type(value) is not bool for value in (self.supervisor_pass, self.ci_pass, self.policy_pass, self.provenance_pass))
-            or type(self.unresolved_blockers) is not tuple or any(type(value) is not str or not value for value in self.unresolved_blockers) or len(set(self.unresolved_blockers)) != len(self.unresolved_blockers)
+            or type(self.lane_a) is not EvidenceLaneReceipt or type(self.lane_b) is not EvidenceLaneReceipt or type(self.current_gate_receipts) is not QualificationGateReceiptSet
+            or type(self.unresolved_blockers) is not tuple or any(type(value) is not QualificationGateKind for value in self.unresolved_blockers) or len(set(self.unresolved_blockers)) != len(self.unresolved_blockers)
         ):
             raise QualificationGateError("phase-3 qualification evidence is invalid")
-        self.retained_evidence.validate(); self.temporary_resources.validate()
+        self.retained_evidence.validate(); self.issue_50_bundle_receipt.validate(); self.temporary_resources.validate()
+        self.current_gate_receipts.validate_for(self.qualification_candidate_sha, self.qualification_case_id)
+        if any((item.review_epoch, item.review_round, item.review_mode) != (self.qualification_review_epoch, self.qualification_review_round, self.qualification_review_mode) for item in self.current_gate_receipts.receipts):
+            raise QualificationGateError("qualification gate receipts have a stale formal review binding")
         if (
             not verify_composed_evidence(self.composed_manifest, self.composed_result)
             or self.composed_manifest.inputs != self.integrated_inputs or self.composed_result.manifest != self.composed_manifest
             or self.integrated_inputs.expectation.retention_manifest_digest != self.retained_evidence.expected.issue_49_retention_manifest_digest
+            or (self.issue_50_bundle_receipt.candidate_sha, self.issue_50_bundle_receipt.retention_manifest_digest, self.issue_50_bundle_receipt.composed_manifest_digest, self.issue_50_bundle_receipt.composed_result_digest, self.issue_50_bundle_receipt.bundle_digest)
+            != (self.issue_50_candidate_sha, self.composed_manifest.inputs.expectation.retention_manifest_digest, self.composed_manifest.manifest_digest, self.composed_result.result_digest, self.retained_evidence.expected.issue_50_result_bundle_digest)
+            or self.retained_evidence.expected.issue_50_retention_manifest_digest != self.issue_50_bundle_receipt.retention_manifest_digest
             or self.composed_result.result != "pass"
             or self.composed_manifest.inputs.candidate_sha != self.issue_50_candidate_sha or self.composed_result.manifest.inputs.candidate_sha != self.issue_50_candidate_sha
             or self.integrated_inputs.lane_a.candidate_sha != self.issue_49_candidate_sha or self.integrated_inputs.lane_b.candidate_sha != self.issue_49_candidate_sha
@@ -262,6 +380,7 @@ class Phase3QualificationInputs:
             "schema": QUALIFICATION_DECISION_SCHEMA, "profile": PHASE_3_QUALIFICATION_PROFILE,
             "base_sha": self.base_sha, "qualification_candidate_sha": self.qualification_candidate_sha,
             "qualification_case_id": self.qualification_case_id, "qualification_ready_at": self.qualification_ready_at,
+            "qualification_review_epoch": self.qualification_review_epoch, "qualification_review_round": self.qualification_review_round, "qualification_review_mode": self.qualification_review_mode,
             "qualification_capture_plan_digest": self.qualification_capture_plan_digest,
             "qualification_recorder_identity": self.qualification_recorder_identity,
             "qualification_store_identity": self.qualification_store_identity,
@@ -269,14 +388,14 @@ class Phase3QualificationInputs:
             "roundlet_commit": self.roundlet_commit, "harness_commit": self.harness_commit, "forward_target_commit": self.forward_target_commit,
             "rollback_proposal_digest": self.rollback_proposal_digest, "kill_switch_proposal_digest": self.kill_switch_proposal_digest,
             "retained_evidence": self.retained_evidence.public_payload(), "temporary_resources": self.temporary_resources.public_payload(),
+            "issue_50_bundle_receipt": self.issue_50_bundle_receipt.public_payload(), "current_gate_receipts": self.current_gate_receipts.public_payload(),
             "retained_issue_50_capture_plan_digest": self.integrated_inputs.capture_plan_digest,
             "composed_manifest_digest": self.composed_manifest.manifest_digest,
             "composed_result_digest": self.composed_result.result_digest,
             "retained_sources": [source.public_payload() | {"source_digest": source.source_digest} for source in (self.integrated_inputs.lane_a, self.integrated_inputs.lane_b, self.integrated_inputs.historical_reference, self.integrated_inputs.synthetic_reference)],
             "composed_manifest": self.composed_manifest.public_payload(), "composed_result": self.composed_result.public_payload(),
             "lane_a": {"state": self.lane_a.state, "result": self.lane_a.result}, "lane_b": {"state": self.lane_b.state, "result": self.lane_b.result},
-            "supervisor_pass": self.supervisor_pass, "ci_pass": self.ci_pass, "policy_pass": self.policy_pass, "provenance_pass": self.provenance_pass,
-            "unresolved_blockers": list(self.unresolved_blockers), "new_provider_calls": 0, "new_target_actions": 0, "lifecycle_observation_sink": "NOT_SELECTED",
+            "unresolved_blockers": [item.value for item in self.unresolved_blockers], "new_provider_calls": 0, "new_target_actions": 0, "lifecycle_observation_sink": "NOT_SELECTED",
         }
         return value | ({"input_digest": self.input_digest} if include_digest else {})
 
@@ -313,6 +432,7 @@ def assess_phase_3_qualification(inputs: Phase3QualificationInputs) -> CanaryEnt
 
     if type(inputs) is not Phase3QualificationInputs:
         raise QualificationGateError("phase-3 qualification inputs are invalid")
-    lanes_pass = (inputs.lane_a.state, inputs.lane_a.result, inputs.lane_b.state, inputs.lane_b.result, inputs.supervisor_pass) == ("verified", "pass", "verified", "pass", True)
-    ready = lanes_pass and inputs.ci_pass and inputs.policy_pass and inputs.provenance_pass and inputs.temporary_resources.fully_reconciled and not inputs.unresolved_blockers
+    inputs.validate()
+    lanes_pass = (inputs.lane_a.state, inputs.lane_a.result, inputs.lane_b.state, inputs.lane_b.result) == ("verified", "pass", "verified", "pass")
+    ready = lanes_pass and inputs.temporary_resources.promotion_eligible and not inputs.unresolved_blockers
     return CanaryEntryDecisionPackage(inputs, PROMOTION_READY_FOR_CANARY_DECISION if ready else QUALIFICATION_BLOCKED)

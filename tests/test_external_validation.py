@@ -92,9 +92,13 @@ from roundwright.integrated_boundary import (
 )
 from roundwright.qualification_gate import (
     Phase3QualificationInputs,
+    QualificationGateKind,
+    QualificationGateReceipt,
+    QualificationGateReceiptSet,
     RetainedEvidenceBinding,
     RetainedEvidenceObservations,
     RetainedEvidencePins,
+    RetainedIssue50BundleReceipt,
     TemporaryResourceDisposition,
     TemporaryResourceEntry,
     TemporaryResourceInventory,
@@ -323,7 +327,7 @@ class ExternalValidationTests(unittest.TestCase):
         manifest, result = external_validation.compose_retained_evidence(retained)
         pins = RetainedEvidencePins(
             retained.expectation.retention_manifest_digest,
-            "sha256:" + "9" * 64,
+            retained.expectation.retention_manifest_digest,
             "sha256:" + "a" * 64,
         )
         return Phase3QualificationInputs(
@@ -331,6 +335,9 @@ class ExternalValidationTests(unittest.TestCase):
             qualification_candidate_sha="c" * 40,
             qualification_case_id="issue-51-qualification",
             qualification_ready_at=23,
+            qualification_review_epoch=1,
+            qualification_review_round=1,
+            qualification_review_mode="COMPLETE",
             qualification_capture_plan_digest=qualification_plan_digest,
             qualification_recorder_identity="sha256:" + "7" * 64,
             qualification_store_identity="sha256:" + "8" * 64,
@@ -344,20 +351,22 @@ class ExternalValidationTests(unittest.TestCase):
             retained_evidence=RetainedEvidenceBinding(
                 pins, RetainedEvidenceObservations(*pins.payload().values()),
             ),
+            issue_50_bundle_receipt=RetainedIssue50BundleReceipt(
+                "b" * 40, retained.expectation.retention_manifest_digest,
+                manifest.manifest_digest, result.result_digest, "sha256:" + "a" * 64,
+            ),
             temporary_resources=TemporaryResourceInventory((
                 TemporaryResourceEntry("sha256:" + "d" * 64, TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
-                TemporaryResourceEntry("sha256:" + "e" * 64, TemporaryResourceKind.UNIQUE, TemporaryResourceDisposition.PRESERVED),
-                TemporaryResourceEntry("sha256:" + "f" * 64, TemporaryResourceKind.AMBIGUOUS, TemporaryResourceDisposition.PRESERVED),
             )),
             integrated_inputs=retained,
             composed_manifest=manifest,
             composed_result=result,
             lane_a=external_validation.EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, "a" * 40, "verified", "pass"),
             lane_b=external_validation.EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, "a" * 40, "verified", "pass"),
-            supervisor_pass=True,
-            ci_pass=True,
-            policy_pass=True,
-            provenance_pass=True,
+            current_gate_receipts=QualificationGateReceiptSet(tuple(
+                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", "sha256:" + f"{index + 10:x}" * 64)
+                for index, kind in enumerate(QualificationGateKind)
+            )),
         )
 
     def qualification_v2_request(self) -> tuple[Phase3QualificationInputs, dict[str, object], dict[str, object]]:
@@ -575,6 +584,9 @@ class ExternalValidationTests(unittest.TestCase):
         harness = sys.modules["roundwright_harness.executor"]
         readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs)
         gates = external_validation.phase_3_qualification_current_gates(inputs)
+        cross_candidate_gates = replace(gates, receipts=(
+            replace(gates.receipts[0], candidate_sha="d" * 40), *gates.receipts[1:],
+        ))
         for name, receipt, changed_gates in (
             ("other-candidate", replace(readiness, candidate_sha="d" * 40), gates),
             ("other-case", replace(readiness, case_id="other-case"), gates),
@@ -584,8 +596,8 @@ class ExternalValidationTests(unittest.TestCase):
             ("other-context", replace(readiness, execution_context_input_digest="sha256:" + "0" * 64), gates),
             ("forged-digest", replace(readiness, receipt_digest="sha256:" + "0" * 64), gates),
             ("missing-gates", readiness, {}),
-            ("false-gates", readiness, {**gates, "ci": False}),
-            ("stale-gates", readiness, {**gates, "candidate_sha": "d" * 40}),
+            ("fabricated-gates", readiness, object()),
+            ("stale-gates", readiness, cross_candidate_gates),
         ):
             with self.subTest(execute=name):
                 before = len(harness.run_calls)
@@ -611,8 +623,14 @@ class ExternalValidationTests(unittest.TestCase):
             execution_context=prepared, execution_context_input_digest=external_validation._digest(request["execution_context"]),
         )
         execution = adapter.execute(exact)
-        with self.assertRaises(external_validation.ExternalValidationAdapterError):
-            adapter.project(exact, ProfileExecution({**execution.value, "new_provider_calls": 1}))
+        for field, value in (
+            ("new_provider_calls", 1), ("disposition", "QUALIFICATION_BLOCKED"),
+            ("qualification_candidate_sha", "d" * 40), ("canary_action_authorized", True),
+            ("runtime_activation_authorized", True), ("roundlet_retirement_authorized", True),
+            ("decision_digest", "sha256:" + "0" * 64),
+        ):
+            with self.subTest(publication_field=field), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                adapter.project(exact, ProfileExecution({**execution.value, field: value}))
         self.assertEqual(adapter.compare(exact, {"forged": "publication"}).status, "fail")
 
     def test_phase_3_qualification_runs_through_the_reviewed_harness_recorder(self) -> None:

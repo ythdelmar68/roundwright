@@ -37,6 +37,8 @@ def _digest(value: object) -> str:
 
 VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST = "sha256:5046fd4eed52db54f6b797464bf4faf4082290ec9cf12d3de194f624f8ca8d8a"
 VERIFIED_ISSUE_50_HARNESS_RESULT_RECEIPT_DIGEST = "sha256:856d1722e4072a355b01312dd60f5501b564e1f147e17082b953a229ffb38f0f"
+VERIFIED_ISSUE_49_RETENTION_MANIFEST_DIGEST = "sha256:9ac20eb13933909e5689bd1e843abc61b7485d79659c1b40a17aaccad3675c91"
+VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST = "sha256:2198caba23a2c0e2f0cb0deeeb64730c43c5bf0e3df6f65256da1c0fde21ed01"
 STALE_ISSUE_50_TRACE_DIGEST = "sha256:5046fd4e0c805cefacbe92dd28f72c95be164baad0caa35e7414cab198478d8a"
 
 
@@ -232,12 +234,35 @@ class QualificationGateReceiptSet:
 
 
 @dataclass(frozen=True, slots=True)
+class RetainedIssue50ManifestIdentities:
+    """The distinct immutable manifest identities consumed by #51."""
+
+    issue_49_retention_manifest_digest: str
+    issue_50_retention_manifest_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not RetainedIssue50ManifestIdentities
+            or (self.issue_49_retention_manifest_digest, self.issue_50_retention_manifest_digest)
+            != (VERIFIED_ISSUE_49_RETENTION_MANIFEST_DIGEST, VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST)
+        ):
+            raise QualificationGateError("retained issue-50 manifest identities are invalid")
+
+    def public_payload(self) -> dict[str, str]:
+        return {
+            "issue_49_retention_manifest_digest": self.issue_49_retention_manifest_digest,
+            "issue_50_retention_manifest_digest": self.issue_50_retention_manifest_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RetainedIssue50BundleReceipt:
     """Parsed retained #50 Harness result and its recording receipt."""
 
     harness_result: dict[str, object]
     recording_receipt: dict[str, object]
     bundle_bytes: bytes
+    manifest_identities: RetainedIssue50ManifestIdentities = field(init=False)
     receipt_identity: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -286,12 +311,17 @@ class RetainedIssue50BundleReceipt:
                 or _digest(evidence) != recording["evidence_digest"]
                 or set(manifest) != {"schema", "profile", "candidate_sha", "case_id", "ready_at", "evidence_schema", "evidence_digest"}
                 or any(manifest[key] != recording[key] for key in ("profile", "candidate_sha", "case_id", "ready_at", "evidence_schema", "evidence_digest"))
+                or evidence["integrated_boundary"]["manifest"]["retention_manifest_digest"] != VERIFIED_ISSUE_49_RETENTION_MANIFEST_DIGEST
             ):
                 raise ValueError
         except (AttributeError, KeyError, TypeError, ValueError, QualificationGateError) as error:
             raise QualificationGateError("retained issue-50 bundle receipt is invalid") from error
         if _digest({"harness_result": result, "recording_receipt": recording}) != _digest({"harness_result": self.harness_result, "recording_receipt": self.recording_receipt}):
             raise QualificationGateError("retained issue-50 bundle receipt is invalid")
+        object.__setattr__(self, "manifest_identities", RetainedIssue50ManifestIdentities(
+            str(evidence["integrated_boundary"]["manifest"]["retention_manifest_digest"]),
+            VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST,
+        ))
         object.__setattr__(self, "receipt_identity", _digest(self.public_payload(include_identity=False)))
 
     @property
@@ -299,8 +329,16 @@ class RetainedIssue50BundleReceipt:
         return str(self.harness_result["candidate_sha"])
 
     @property
-    def retention_manifest_digest(self) -> str:
-        return str(self.bundle_document["evidence"]["integrated_boundary"]["manifest"]["retention_manifest_digest"])
+    def issue_49_retention_manifest_digest(self) -> str:
+        """The #49 manifest embedded in the retained #50 composition."""
+
+        return self.manifest_identities.issue_49_retention_manifest_digest
+
+    @property
+    def issue_50_retention_manifest_digest(self) -> str:
+        """The separately retained #50 manifest bound to this exact receipt."""
+
+        return self.manifest_identities.issue_50_retention_manifest_digest
 
     @property
     def composed_manifest_digest(self) -> str:
@@ -319,7 +357,12 @@ class RetainedIssue50BundleReceipt:
         return json.loads(self.bundle_bytes)
 
     def public_payload(self, *, include_identity: bool = True) -> dict[str, object]:
-        value: dict[str, object] = {"harness_result": self.harness_result, "recording_receipt": self.recording_receipt, "bundle_digest": self.bundle_digest}
+        value: dict[str, object] = {
+            "harness_result": self.harness_result,
+            "recording_receipt": self.recording_receipt,
+            "bundle_digest": self.bundle_digest,
+            "manifest_identities": self.manifest_identities.public_payload(),
+        }
         return value | ({"receipt_identity": self.receipt_identity} if include_identity else {})
 
     def validate(self) -> None:
@@ -545,9 +588,9 @@ class Phase3QualificationInputs:
             not verify_composed_evidence(self.composed_manifest, self.composed_result)
             or self.composed_manifest.inputs != self.integrated_inputs or self.composed_result.manifest != self.composed_manifest
             or self.integrated_inputs.expectation.retention_manifest_digest != self.retained_evidence.expected.issue_49_retention_manifest_digest
-            or (self.issue_50_bundle_receipt.candidate_sha, self.issue_50_bundle_receipt.harness_result["case_id"], self.issue_50_bundle_receipt.retention_manifest_digest, self.issue_50_bundle_receipt.composed_manifest_digest, self.issue_50_bundle_receipt.composed_result_digest, self.issue_50_bundle_receipt.bundle_digest)
-            != (self.issue_50_candidate_sha, self.integrated_inputs.case_id, self.composed_manifest.inputs.expectation.retention_manifest_digest, self.composed_manifest.manifest_digest, self.composed_result.result_digest, self.retained_evidence.expected.issue_50_result_bundle_digest)
-            or self.retained_evidence.expected.issue_50_retention_manifest_digest != self.issue_50_bundle_receipt.retention_manifest_digest
+            or (self.issue_50_bundle_receipt.candidate_sha, self.issue_50_bundle_receipt.harness_result["case_id"], self.issue_50_bundle_receipt.issue_49_retention_manifest_digest, self.issue_50_bundle_receipt.composed_manifest_digest, self.issue_50_bundle_receipt.composed_result_digest, self.issue_50_bundle_receipt.bundle_digest)
+            != (self.issue_50_candidate_sha, self.integrated_inputs.case_id, self.retained_evidence.expected.issue_49_retention_manifest_digest, self.composed_manifest.manifest_digest, self.composed_result.result_digest, self.retained_evidence.expected.issue_50_result_bundle_digest)
+            or self.retained_evidence.expected.issue_50_retention_manifest_digest != self.issue_50_bundle_receipt.issue_50_retention_manifest_digest
             or self.composed_result.result != "pass"
             or self.composed_manifest.inputs.candidate_sha != self.issue_50_candidate_sha or self.composed_result.manifest.inputs.candidate_sha != self.issue_50_candidate_sha
             or self.integrated_inputs.lane_a.candidate_sha != self.issue_49_candidate_sha or self.integrated_inputs.lane_b.candidate_sha != self.issue_49_candidate_sha

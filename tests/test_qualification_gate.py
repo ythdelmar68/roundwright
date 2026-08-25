@@ -30,6 +30,8 @@ from roundwright.qualification_gate import (
     TemporaryResourceKind,
     assess_phase_3_qualification,
     issue_51_selection_trace_correction,
+    VERIFIED_ISSUE_49_RETENTION_MANIFEST_DIGEST,
+    VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST,
     VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
 )
 from roundwright.shadow import LIVE_LIFECYCLE_SHADOW_PROFILE, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE
@@ -107,7 +109,12 @@ class Phase3QualificationGateTests(unittest.TestCase):
 
     def inputs(self, **changes: object) -> Phase3QualificationInputs:
         retained, manifest, result = retained_issue_50_inputs()
-        pins = RetainedEvidencePins(retained.expectation.retention_manifest_digest, retained.expectation.retention_manifest_digest, VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST)
+        bundle_receipt = issue_50_bundle_receipt()
+        pins = RetainedEvidencePins(
+            retained.expectation.retention_manifest_digest,
+            bundle_receipt.issue_50_retention_manifest_digest,
+            VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+        )
         resources = TemporaryResourceInventory((
             TemporaryResourceEntry(digest(94), TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
         ))
@@ -122,7 +129,7 @@ class Phase3QualificationGateTests(unittest.TestCase):
             "roundlet_commit": "d" * 40, "harness_commit": "e" * 40, "forward_target_commit": "f" * 40,
             "rollback_proposal_digest": digest(97), "kill_switch_proposal_digest": digest(98),
             "retained_evidence": RetainedEvidenceBinding(pins, RetainedEvidenceObservations(*pins.payload().values())),
-            "issue_50_bundle_receipt": issue_50_bundle_receipt(),
+            "issue_50_bundle_receipt": bundle_receipt,
             "temporary_resources": resources, "integrated_inputs": retained, "composed_manifest": manifest, "composed_result": result,
             "lane_a": EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, self.issue_49_candidate, "verified", "pass"),
             "lane_b": EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, self.issue_49_candidate, "verified", "pass"),
@@ -165,6 +172,29 @@ class Phase3QualificationGateTests(unittest.TestCase):
         object.__setattr__(inputs.retained_evidence.observed, "issue_50_result_bundle_digest", digest(77))
         with self.assertRaises(QualificationGateError):
             replace(inputs)
+
+    def test_retained_manifest_generations_are_distinct_and_closed(self) -> None:
+        inputs = self.inputs()
+        expected = inputs.retained_evidence.expected
+        self.assertEqual(
+            (expected.issue_49_retention_manifest_digest, expected.issue_50_retention_manifest_digest),
+            (VERIFIED_ISSUE_49_RETENTION_MANIFEST_DIGEST, VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST),
+        )
+        self.assertEqual(
+            (inputs.issue_50_bundle_receipt.issue_49_retention_manifest_digest,
+             inputs.issue_50_bundle_receipt.issue_50_retention_manifest_digest),
+            (VERIFIED_ISSUE_49_RETENTION_MANIFEST_DIGEST, VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST),
+        )
+        for issue_49, issue_50 in (
+            (expected.issue_50_retention_manifest_digest, expected.issue_49_retention_manifest_digest),
+            (expected.issue_49_retention_manifest_digest, expected.issue_49_retention_manifest_digest),
+            (expected.issue_50_retention_manifest_digest, expected.issue_50_retention_manifest_digest),
+        ):
+            with self.subTest(issue_49=issue_49, issue_50=issue_50):
+                pins = RetainedEvidencePins(issue_49, issue_50, expected.issue_50_result_bundle_digest)
+                binding = RetainedEvidenceBinding(pins, RetainedEvidenceObservations(*pins.payload().values()))
+                with self.assertRaises(QualificationGateError):
+                    self.inputs(retained_evidence=binding)
 
     def test_gate_receipts_reject_digest_only_and_duplicated_source_assertions(self) -> None:
         with self.assertRaises(QualificationGateError):

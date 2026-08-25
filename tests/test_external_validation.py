@@ -100,6 +100,7 @@ from roundwright.qualification_gate import (
     RetainedEvidenceObservations,
     RetainedEvidencePins,
     RetainedIssue50BundleReceipt,
+    VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST,
     VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
     TemporaryResourceDisposition,
     TemporaryResourceEntry,
@@ -368,7 +369,7 @@ class ExternalValidationTests(unittest.TestCase):
         retained, manifest, result = retained_issue_50_inputs()
         pins = RetainedEvidencePins(
             retained.expectation.retention_manifest_digest,
-            retained.expectation.retention_manifest_digest,
+            VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST,
             VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
         )
         authorities = QualificationGateAuthority(tuple(

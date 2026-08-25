@@ -577,6 +577,74 @@ class ExternalValidationTests(unittest.TestCase):
             {"status": "fake"},
         )
 
+    def test_phase_3_qualification_context_normalizes_executor_tuples_only(self) -> None:
+        """The V2 parser may freeze JSON arrays, without relaxing any identity binding."""
+
+        def freeze_json(value: object) -> object:
+            if type(value) is dict:
+                return {key: freeze_json(item) for key, item in value.items()}
+            if type(value) is list:
+                return tuple(freeze_json(item) for item in value)
+            return value
+
+        def thaw_json(value: object) -> object:
+            if type(value) is dict:
+                return {key: thaw_json(item) for key, item in value.items()}
+            if type(value) is tuple:
+                return [thaw_json(item) for item in value]
+            return value
+
+        inputs, _plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
+        tuple_context = freeze_json(request["execution_context"])
+        tuple_request = {**request, "execution_context": tuple_context}
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        readiness = external_validation.run_phase_3_qualification_profile(
+            "validate", tuple_request, Path("qualification-rejected"), inputs, authority,
+        )
+        self.assertEqual(len(harness.run_calls), before + 1)
+        self.assertEqual(readiness.execution_context_input_digest, external_validation._digest(tuple_context))
+
+        def replaced_context() -> dict[str, object]:
+            value = thaw_json(tuple_context)
+            self.assertIsInstance(value, dict)
+            return value
+
+        changed_content = replaced_context()
+        changed_content["zero_provider_calls"] = 1
+        changed_order = replaced_context()
+        changed_order["inputs"]["retained_sources"].reverse()  # type: ignore[index]
+        changed_order["inputs"]["input_digest"] = external_validation._digest({  # type: ignore[index]
+            key: value for key, value in changed_order["inputs"].items() if key != "input_digest"  # type: ignore[index]
+        })
+        changed_authority = replaced_context()
+        changed_authority["gate_authority_digest"] = "sha256:" + "0" * 64
+        changed_retained = replaced_context()
+        retained = changed_retained["inputs"]["retained_evidence"]  # type: ignore[index]
+        for side in ("expected", "observed"):
+            retained[side]["issue_50_retention_manifest_digest"] = "sha256:" + "0" * 64  # type: ignore[index]
+            retained[f"{side}_integrity_digest"] = external_validation._digest(retained[side])  # type: ignore[index]
+        retained["binding_digest"] = external_validation._digest({  # type: ignore[index]
+            "expected": retained["expected"], "expected_integrity_digest": retained["expected_integrity_digest"],  # type: ignore[index]
+            "observed": retained["observed"], "observed_integrity_digest": retained["observed_integrity_digest"],  # type: ignore[index]
+        })
+        changed_retained["inputs"]["input_digest"] = external_validation._digest({  # type: ignore[index]
+            key: value for key, value in changed_retained["inputs"].items() if key != "input_digest"  # type: ignore[index]
+        })
+        for name, context in (
+            ("content", changed_content), ("ordering", changed_order),
+            ("authority", changed_authority), ("retained", changed_retained),
+        ):
+            with self.subTest(context=name):
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_phase_3_qualification_profile(
+                        "validate", {**request, "execution_context": freeze_json(context)},
+                        Path("qualification-rejected"), inputs, authority,
+                    )
+                self.assertEqual(len(harness.run_calls), before)
+
     def test_phase_3_qualification_validate_rejects_all_drift_before_dispatch(self) -> None:
         """Every mutable #51 request/input edge fails before the Harness run seam."""
 

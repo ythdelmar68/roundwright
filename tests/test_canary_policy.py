@@ -33,13 +33,19 @@ CONTRACT = "sha256:" + "d" * 64
 DIGEST = "sha256:" + "e" * 64
 
 
-def policy() -> BoundedCanaryPolicy:
-    operations = (GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH)
+def policy(
+    *, operations: tuple[GitHubMutationOperation, ...] = (
+        GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH,
+    ),
+    selected_target_policy: TrustedRepositoryPolicySnapshot | None = None,
+) -> BoundedCanaryPolicy:
+    selected_target_policy = selected_target_policy or target_policy(allowed=operations)
+    target = CanaryTarget("ythdelmar68/roundlet-forward-test", TARGET_BASE, 96)
     return BoundedCanaryPolicy(
         BASE, CANDIDATE, CONTRACT, 4, 87,
-        CanaryTarget("ythdelmar68/roundlet-forward-test", TARGET_BASE, 96),
+        target, canary_target_policy_identity(selected_target_policy, target),
         "roundlet/canary-87", ("canary/probe.txt",), operations,
-        CanaryBudget(((operations[0], 1), (operations[1], 1)), 2),
+        CanaryBudget(tuple((operation, 1) for operation in operations), len(operations)),
         CanaryRollbackPlan("semantic-readback-failure", "owner-kill-switch", "read-target-branch"),
     )
 
@@ -70,7 +76,7 @@ def context(
     return CanaryAuthorityContext(
         True, True, True, value.phase, value.leaf_number, FORWARD_TEST_ROUTE,
         value.base_sha, value.candidate_sha, value.contract_digest, value.target,
-        target, canary_target_policy_identity(target), value.policy_digest, value.branch,
+        target, canary_target_policy_identity(target, value.target), value.policy_digest, value.branch,
         chain[-1].receipt_digest if chain else None,
     )
 
@@ -94,6 +100,8 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
     def test_missing_authority_kill_switch_and_all_identity_drift_deny(self) -> None:
         contract = policy()
         chain = (genesis(contract),)
+        target_drift = context(contract, chain)
+        object.__setattr__(target_drift, "target", CanaryTarget("ythdelmar68/another-target", TARGET_BASE, 96))
         cases = (
             replace(context(contract, chain), roundlet_enabled=False),
             replace(context(contract, chain), read_only_external_validation_allowed=False),
@@ -104,7 +112,7 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
             replace(context(contract, chain), base_sha="f" * 40),
             replace(context(contract, chain), candidate_sha="f" * 40),
             replace(context(contract, chain), contract_digest="sha256:" + "f" * 64),
-            replace(context(contract, chain), target=CanaryTarget("ythdelmar68/another-target", TARGET_BASE, 96)),
+            target_drift,
             replace(context(contract, chain), policy_digest="sha256:" + "f" * 64),
             replace(context(contract, chain), branch="roundlet/wrong-branch"),
         )
@@ -117,13 +125,13 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         with self.assertRaises(CanaryPolicyError):
             CanaryTarget("ythdelmar68/roundlet-forward-test", "main", 96)
         with self.assertRaises(CanaryPolicyError):
-            BoundedCanaryPolicy(BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, "roundlet/canary", ("../escape",), (operation,), CanaryBudget(((operation, 1),), 1), policy().rollback)
+            BoundedCanaryPolicy(BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, policy().target_policy_identity, "roundlet/canary", ("../escape",), (operation,), CanaryBudget(((operation, 1),), 1), policy().rollback)
         with self.assertRaises(CanaryPolicyError):
-            BoundedCanaryPolicy(BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, "roundlet/canary", ("one", "one"), (operation,), CanaryBudget(((operation, 1),), 1), policy().rollback)
+            BoundedCanaryPolicy(BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, policy().target_policy_identity, "roundlet/canary", ("one", "one"), (operation,), CanaryBudget(((operation, 1),), 1), policy().rollback)
         with self.assertRaises(CanaryPolicyError):
             CanaryBudget(((operation, 1),), 2)
         with self.assertRaises(CanaryPolicyError):
-            BoundedCanaryPolicy(BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, "roundlet/canary", ("one",), (operation, operation), CanaryBudget(((operation, 1),), 1), policy().rollback)
+            BoundedCanaryPolicy(BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, policy().target_policy_identity, "roundlet/canary", ("one",), (operation, operation), CanaryBudget(((operation, 1),), 1), policy().rollback)
 
     def test_receipt_rejects_budget_exhaustion_and_preserves_ambiguous_resources(self) -> None:
         contract = policy()
@@ -176,23 +184,21 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
 
     def test_target_policy_requires_total_mapping_and_each_requested_operation_switch(self) -> None:
         operations = tuple(GitHubMutationOperation)
-        contract = BoundedCanaryPolicy(
-            BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, "roundlet/canary-87",
-            ("canary/probe.txt",), operations,
-            CanaryBudget(tuple((operation, 1) for operation in operations), len(operations)),
-            policy().rollback,
-        )
         validate_repository_mutation_vocabulary()
         self.assertEqual(set(GITHUB_REPOSITORY_OPERATION), set(GitHubMutationOperation))
         for operation in operations:
             with self.subTest(operation=operation):
+                selected = target_policy(allowed=(operation,))
+                contract = policy(operations=operations, selected_target_policy=selected)
                 chain = (genesis(contract),)
                 request = CanaryMutationRequest(operation, contract.branch, ("canary/probe.txt",))
-                allowed = context(contract, chain, target=target_policy(allowed=(operation,)))
+                allowed = context(contract, chain, target=selected)
                 denied = context(contract, chain, target=target_policy())
                 self.assertTrue(authorize_canary_request(contract, allowed, request, chain).authorized)
                 self.assertFalse(authorize_canary_request(contract, denied, request, chain).authorized)
-        disabled = context(contract, (genesis(contract),), target=target_policy(enabled=False, allowed=operations))
+        disabled_target = target_policy(enabled=False, allowed=operations)
+        contract = policy(operations=operations, selected_target_policy=disabled_target)
+        disabled = context(contract, (genesis(contract),), target=disabled_target)
         request = CanaryMutationRequest(operations[0], contract.branch, ("canary/probe.txt",))
         self.assertFalse(authorize_canary_request(contract, disabled, request, (genesis(contract),)).authorized)
 
@@ -206,6 +212,17 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         drifted = context(contract, chain)
         object.__setattr__(drifted, "target_policy_identity", "sha256:" + "f" * 64)
         self.assertFalse(authorize_canary_request(contract, drifted, request, chain).authorized)
+
+    def test_target_policy_identity_is_contract_bound_against_self_consistent_substitution(self) -> None:
+        denying = target_policy()
+        contract = policy(selected_target_policy=denying)
+        chain = (genesis(contract),)
+        request = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
+        self.assertFalse(authorize_canary_request(contract, context(contract, chain, target=denying), request, chain).authorized)
+        broader = target_policy(allowed=(GitHubMutationOperation.CREATE_BRANCH,))
+        substituted = context(contract, chain, target=broader)
+        self.assertNotEqual(substituted.target_policy_identity, contract.target_policy_identity)
+        self.assertFalse(authorize_canary_request(contract, substituted, request, chain).authorized)
 
     def test_genesis_is_deterministic_and_cannot_create_a_fresh_consumption_fence(self) -> None:
         contract = policy()
@@ -231,8 +248,8 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
             with self.subTest(branch=branch):
                 with self.assertRaises(CanaryPolicyError):
                     BoundedCanaryPolicy(
-                        BASE, CANDIDATE, CONTRACT, 4, 87, contract.target, branch,
-                        contract.allowed_paths, (operation,), CanaryBudget(((operation, 1),), 1), contract.rollback,
+                        BASE, CANDIDATE, CONTRACT, 4, 87, contract.target, contract.target_policy_identity,
+                        branch, contract.allowed_paths, (operation,), CanaryBudget(((operation, 1),), 1), contract.rollback,
                     )
                 with self.assertRaises(CanaryPolicyError):
                     CanaryMutationRequest(operation, branch, ("canary/probe.txt",))
@@ -257,11 +274,11 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         self.assertFalse(authorize_canary_request(contract, context(contract, (initial,)), request, (initial,)).authorized)
         wrong_policies = (
             BoundedCanaryPolicy(
-                BASE, "f" * 40, CONTRACT, 4, 87, contract.target, contract.branch,
+                BASE, "f" * 40, CONTRACT, 4, 87, contract.target, contract.target_policy_identity, contract.branch,
                 contract.allowed_paths, contract.requested_operations, contract.budget, contract.rollback,
             ),
             BoundedCanaryPolicy(
-                BASE, CANDIDATE, "sha256:" + "f" * 64, 4, 87, contract.target, contract.branch,
+                BASE, CANDIDATE, "sha256:" + "f" * 64, 4, 87, contract.target, contract.target_policy_identity, contract.branch,
                 contract.allowed_paths, contract.requested_operations, contract.budget, contract.rollback,
             ),
         )

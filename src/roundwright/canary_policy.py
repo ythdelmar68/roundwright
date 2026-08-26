@@ -27,7 +27,7 @@ from .repository_policy import (
 )
 
 
-CANARY_POLICY_SCHEMA = "roundwright-bounded-canary-policy/v1"
+CANARY_POLICY_SCHEMA = "roundwright-bounded-canary-policy/v2"
 CANARY_RECEIPT_SCHEMA = "roundwright-bounded-canary-receipt/v1"
 PHASE_4 = 4
 FORWARD_TEST_ROUTE = "harness+forward-test"
@@ -100,27 +100,42 @@ def _safe_branch(value: object) -> bool:
     )
 
 
-def canary_target_policy_identity(snapshot: TrustedRepositoryPolicySnapshot) -> str:
-    """Return the public-safe immutable identity of the target policy evidence."""
+def canary_target_policy_identity(
+    snapshot: TrustedRepositoryPolicySnapshot, target: CanaryTarget,
+) -> str:
+    """Return target-bound immutable identity for selected policy evidence."""
 
     if (
         type(snapshot) is not TrustedRepositoryPolicySnapshot
         or type(snapshot.source) is not RepositoryPolicySource
         or type(snapshot.document) is not RepositoryMutationPolicy
+        or type(target) is not CanaryTarget
     ):
         raise CanaryPolicyError("Canary target policy evidence is invalid")
     return _digest({
         "source_fingerprint": snapshot.source.source_fingerprint,
         "revision_fingerprint": snapshot.source.revision_fingerprint,
         "policy_digest": snapshot.document.digest,
+        "target": {
+            "repository": target.repository,
+            "baseline_sha": target.baseline_sha,
+            "leaf_number": target.leaf_number,
+        },
     })
 
 
-def _target_policy_for(context: CanaryAuthorityContext) -> RepositoryMutationPolicy:
+def _target_policy_for(
+    context: CanaryAuthorityContext, policy: BoundedCanaryPolicy | None = None,
+) -> RepositoryMutationPolicy:
     try:
         snapshot = context.target_policy
-        identity = canary_target_policy_identity(snapshot)
+        identity = canary_target_policy_identity(snapshot, context.target)
         if identity != context.target_policy_identity:
+            raise CanaryPolicyError
+        if policy is not None and (
+            context.target != policy.target
+            or context.target_policy_identity != policy.target_policy_identity
+        ):
             raise CanaryPolicyError
         policy = snapshot.document
         # Reconstruct the exact strict document to reject post-construction drift.
@@ -215,6 +230,7 @@ class BoundedCanaryPolicy:
     phase: int
     leaf_number: int
     target: CanaryTarget
+    target_policy_identity: str
     branch: str
     allowed_paths: tuple[str, ...]
     requested_operations: tuple[GitHubMutationOperation, ...]
@@ -233,6 +249,7 @@ class BoundedCanaryPolicy:
             raise CanaryPolicyError("Canary phase or leaf is invalid")
         if type(self.target) is not CanaryTarget or type(self.budget) is not CanaryBudget or type(self.rollback) is not CanaryRollbackPlan:
             raise CanaryPolicyError("Canary policy component is invalid")
+        _require_digest(self.target_policy_identity, "Canary target policy")
         if not _safe_branch(self.branch):
             raise CanaryPolicyError("Canary branch is invalid")
         if type(self.allowed_paths) is not tuple or not self.allowed_paths or len(set(self.allowed_paths)) != len(self.allowed_paths) or not all(_safe_path(path) for path in self.allowed_paths):
@@ -251,6 +268,7 @@ class BoundedCanaryPolicy:
             "contract_digest": self.contract_digest,
             "phase": self.phase, "leaf_number": self.leaf_number,
             "target": {"repository": self.target.repository, "baseline_sha": self.target.baseline_sha, "leaf_number": self.target.leaf_number},
+            "target_policy_identity": self.target_policy_identity,
             "branch": self.branch, "allowed_paths": list(self.allowed_paths),
             "requested_operations": [operation.value for operation in self.requested_operations],
             "budget": {"per_operation": {operation.value: count for operation, count in self.budget.per_operation}, "total_calls": self.budget.total_calls},
@@ -367,10 +385,10 @@ def evaluate_bounded_canary_policy(policy: BoundedCanaryPolicy | None, context: 
         return CanaryDecision(False, "standing Canary authority is disabled", policy.policy_digest, "preserve-for-owner")
     if context.kill_switch_active:
         return CanaryDecision(False, "Canary kill switch is active", policy.policy_digest, "preserve-for-owner")
-    if (context.phase, context.leaf_number, context.base_sha, context.candidate_sha, context.contract_digest, context.target, context.policy_digest, context.branch) != (policy.phase, policy.leaf_number, policy.base_sha, policy.candidate_sha, policy.contract_digest, policy.target, policy.policy_digest, policy.branch):
+    if (context.phase, context.leaf_number, context.base_sha, context.candidate_sha, context.contract_digest, context.target, context.target_policy_identity, context.policy_digest, context.branch) != (policy.phase, policy.leaf_number, policy.base_sha, policy.candidate_sha, policy.contract_digest, policy.target, policy.target_policy_identity, policy.policy_digest, policy.branch):
         return CanaryDecision(False, "Canary identity or policy binding is stale", policy.policy_digest, "preserve-for-owner")
     try:
-        _target_policy_for(context)
+        _target_policy_for(context, policy)
     except CanaryPolicyError:
         return CanaryDecision(False, "Canary target policy evidence is unavailable or stale", policy.policy_digest, "preserve-for-owner")
     return CanaryDecision(True, "exact bounded Canary policy is authorized", policy.policy_digest, "execute-through-mutation-broker")
@@ -565,7 +583,7 @@ def parse_bounded_canary_policy(contents: bytes | str) -> BoundedCanaryPolicy:
 
     try:
         raw = json.loads(contents, object_pairs_hook=_reject_duplicates)
-        required = {"schema", "base_sha", "candidate_sha", "contract_digest", "phase", "leaf_number", "target", "branch", "allowed_paths", "requested_operations", "budget", "rollback"}
+        required = {"schema", "base_sha", "candidate_sha", "contract_digest", "phase", "leaf_number", "target", "target_policy_identity", "branch", "allowed_paths", "requested_operations", "budget", "rollback"}
         if type(raw) is not dict or set(raw) != required or type(raw["target"]) is not dict or set(raw["target"]) != {"repository", "baseline_sha", "leaf_number"} or type(raw["budget"]) is not dict or set(raw["budget"]) != {"per_operation", "total_calls"} or type(raw["budget"]["per_operation"]) is not dict or type(raw["rollback"]) is not dict or set(raw["rollback"]) != {"rollback_trigger", "kill_switch", "semantic_readback"} or type(raw["allowed_paths"]) is not list or any(type(path) is not str for path in raw["allowed_paths"]):
             raise ValueError
         operations = raw["requested_operations"]
@@ -573,7 +591,7 @@ def parse_bounded_canary_policy(contents: bytes | str) -> BoundedCanaryPolicy:
             raise ValueError
         typed_operations = tuple(GitHubMutationOperation(value) for value in operations)
         budget = CanaryBudget(tuple((GitHubMutationOperation(name), count) for name, count in raw["budget"]["per_operation"].items()), raw["budget"]["total_calls"])
-        return BoundedCanaryPolicy(raw["base_sha"], raw["candidate_sha"], raw["contract_digest"], raw["phase"], raw["leaf_number"], CanaryTarget(**raw["target"]), raw["branch"], tuple(raw["allowed_paths"]), typed_operations, budget, CanaryRollbackPlan(**raw["rollback"]), raw["schema"])
+        return BoundedCanaryPolicy(raw["base_sha"], raw["candidate_sha"], raw["contract_digest"], raw["phase"], raw["leaf_number"], CanaryTarget(**raw["target"]), raw["target_policy_identity"], raw["branch"], tuple(raw["allowed_paths"]), typed_operations, budget, CanaryRollbackPlan(**raw["rollback"]), raw["schema"])
     except (KeyError, TypeError, ValueError, CanaryPolicyError) as error:
         raise CanaryPolicyError("bounded Canary policy document is malformed") from error
 

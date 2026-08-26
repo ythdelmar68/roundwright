@@ -75,6 +75,7 @@ from roundwright.shadow import (
     HOSTED_CHECK_PROFILE,
     INTEGRATED_BOUNDARY_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
+    PHASE_3_QUALIFICATION_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     EvidenceRole,
@@ -87,8 +88,65 @@ from roundwright.shadow import (
 )
 from roundwright.integrated_boundary import (
     IntegratedBoundaryInputs, RetainedEvidenceExpectation, RetainedEvidenceSource, RetainedSourceKind,
-    integrated_boundary_execution_context,
+    compose_retained_evidence, integrated_boundary_execution_context, source_from_public_payload,
 )
+from roundwright.qualification_gate import (
+    Phase3QualificationInputs,
+    QualificationGateKind,
+    QualificationGateAuthority,
+    QualificationGateReceipt,
+    QualificationGateReceiptSet,
+    RetainedEvidenceBinding,
+    RetainedEvidenceObservations,
+    RetainedEvidencePins,
+    RetainedIssue50BundleReceipt,
+    VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST,
+    VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+    TemporaryResourceDisposition,
+    TemporaryResourceEntry,
+    TemporaryResourceInventory,
+    TemporaryResourceKind,
+)
+
+
+def canonical(value: dict[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, epoch: int, round_: int, identity: str) -> dict[str, object]:
+    value: dict[str, object] = {
+        "candidate_sha": candidate_sha, "case_id": case_id, "review_epoch": epoch,
+        "review_round": round_, "review_mode": "COMPLETE" if 1 <= round_ <= 3 else "CONVERGING",
+    }
+    if kind is QualificationGateKind.FORMAL_REVIEW:
+        value |= {"schema": "roundwright-formal-review-receipt/v1", "formal_result": "accepted", "supervisor_verdict": "PASS", "supervisor_result_identity": identity}
+    elif kind is QualificationGateKind.HOSTED_CHECKS:
+        value |= {"schema": "roundwright-exact-head-check-receipt/v1", "head_sha": candidate_sha, "check_run_identity": identity, "conclusion": "success"}
+    elif kind is QualificationGateKind.POLICY:
+        value |= {"schema": "roundwright-policy-receipt/v1", "policy_snapshot_digest": identity, "policy_outcome": "pass"}
+    else:
+        value |= {"schema": "roundwright-provenance-receipt/v1", "source_sha": candidate_sha, "provenance_manifest_digest": identity, "verification": "pass"}
+    return value | {"receipt_digest": canonical(value)}
+
+
+def issue_50_bundle_receipt() -> RetainedIssue50BundleReceipt:
+    fixtures = Path(__file__).with_name("fixtures")
+    return RetainedIssue50BundleReceipt(
+        json.loads((fixtures / "issue_50_result_receipt.json").read_text()),
+        json.loads((fixtures / "issue_50_recording_receipt.json").read_text()),
+        (fixtures / "issue_50_retained_bundle.json").read_bytes(),
+    )
+
+
+def retained_issue_50_inputs() -> tuple[IntegratedBoundaryInputs, object, object]:
+    bundle = json.loads((Path(__file__).with_name("fixtures") / "issue_50_retained_bundle.json").read_text())
+    integrated = bundle["evidence"]["integrated_boundary"]
+    manifest = integrated["manifest"]
+    sources = {item["kind"]: source_from_public_payload(item) for item in manifest["sources"]}
+    expected = manifest["expected_source_digests"]
+    expectation = RetainedEvidenceExpectation(manifest["retention_manifest_digest"], expected["lane_a_result_digest"], expected["lane_a_bundle_digest"], expected["lane_b_ledger_digest"], expected["lane_b_seal_digest"], expected["lane_b_retention_identity"], expected["lane_b_qualification_digest"], expected["historical_reference_digest"], expected["synthetic_reference_digest"])
+    inputs = IntegratedBoundaryInputs(manifest["candidate_sha"], manifest["case_id"], manifest["capture_plan_digest"], expectation, sources["lane-a"], sources["lane-b"], sources["historical-reference"], sources["synthetic-reference"])
+    return (inputs, *compose_retained_evidence(inputs))
 
 
 @dataclass(frozen=True)
@@ -153,7 +211,7 @@ class ExecutorBinding:
 class ExecutorRequest:
     schema: str
     capture_plan: dict[str, object]
-    execution_context: dict[str, object] | None
+    execution_context: object | None
 
     @classmethod
     def parse(cls, value: object) -> "ExecutorRequest":
@@ -162,7 +220,15 @@ class ExecutorRequest:
         raw = dict(value)
         if set(raw) != {"schema", "capture_plan", "execution_context"}:
             raise ValueError("request is invalid")
-        return cls(raw["schema"], raw["capture_plan"], raw["execution_context"])
+
+        def freeze_json(item: object) -> object:
+            if type(item) in (dict, MappingProxyType):
+                return MappingProxyType({key: freeze_json(value) for key, value in item.items()})
+            if type(item) in (list, tuple):
+                return tuple(freeze_json(value) for value in item)
+            return item
+
+        return cls(raw["schema"], raw["capture_plan"], freeze_json(raw["execution_context"]))
 
 
 @dataclass(frozen=True)
@@ -231,11 +297,32 @@ def fake_harness() -> tuple[object | None, object | None]:
             )
             context = request.execution_context
             assert context is not None
+            context_value = external_validation._canonical_json_materialize(context)
+            context_identity = external_validation._digest({
+                "schema": "roundwright-live-lifecycle-context/v1", "descriptor": context_value,
+            })
+            if plan.profile == PHASE_3_QUALIFICATION_PROFILE:
+                adapter = arguments[2]
+                prepared = adapter.prepare_execution_context(SimpleNamespace(
+                    descriptor=context,
+                    input_digest=external_validation._digest(context_value),
+                    plan=plan,
+                    components=components,
+                ))
+                adapter.validate(SimpleNamespace(
+                    profile=plan.profile,
+                    components=components,
+                    execution_context=prepared,
+                    execution_context_input_digest=external_validation._digest(context_value),
+                    candidate_sha=plan.candidate_sha,
+                    case_id=plan.case_id,
+                    ready_at=plan.ready_at,
+                    plan=plan,
+                ))
+                context_identity = prepared.identity
             return ExecutorReadinessReceipt(
-                plan, components, request.schema, external_validation._digest(context),
-                external_validation._digest({
-                    "schema": "roundwright-live-lifecycle-context/v1", "descriptor": context,
-                }),
+                plan, components, request.schema,
+                external_validation._digest(context_value), context_identity,
             )
         return {"status": "fake"}
     module.prepare_capture = prepare_capture  # type: ignore[attr-defined]
@@ -304,6 +391,79 @@ class ExternalValidationTests(unittest.TestCase):
                 historical.source_digest, synthetic.source_digest),
             lane_a, lane_b, historical, synthetic,
         )
+
+    def qualification_inputs(self, qualification_plan_digest: str) -> Phase3QualificationInputs:
+        """Return the three distinct immutable generations consumed by #51."""
+
+        retained, manifest, result = retained_issue_50_inputs()
+        pins = RetainedEvidencePins(
+            retained.expectation.retention_manifest_digest,
+            VERIFIED_ISSUE_50_RETENTION_MANIFEST_DIGEST,
+            VERIFIED_ISSUE_50_RESULT_BUNDLE_DIGEST,
+        )
+        authorities = QualificationGateAuthority(tuple(
+            gate_source(kind, "c" * 40, "issue-51-qualification", 1, 1, authority_identity)
+            for kind, authority_identity in zip(QualificationGateKind, ("sha256:" + "7" * 64, qualification_plan_digest, "sha256:" + "b" * 64, "sha256:" + "c" * 64), strict=True)
+        ))
+        return Phase3QualificationInputs(
+            base_sha="d" * 40,
+            qualification_candidate_sha="c" * 40,
+            qualification_case_id="issue-51-qualification",
+            qualification_ready_at=23,
+            qualification_review_epoch=1,
+            qualification_review_round=1,
+            qualification_review_mode="COMPLETE",
+            qualification_capture_plan_digest=qualification_plan_digest,
+            qualification_recorder_identity="sha256:" + "7" * 64,
+            qualification_store_identity="sha256:" + "8" * 64,
+            issue_49_candidate_sha=retained.lane_a.candidate_sha,
+            issue_50_candidate_sha=retained.candidate_sha,
+            roundlet_commit="d" * 40,
+            harness_commit="e" * 40,
+            forward_target_commit="f" * 40,
+            rollback_proposal_digest="sha256:" + "b" * 64,
+            kill_switch_proposal_digest="sha256:" + "c" * 64,
+            retained_evidence=RetainedEvidenceBinding(
+                pins, RetainedEvidenceObservations(*pins.payload().values()),
+            ),
+            issue_50_bundle_receipt=issue_50_bundle_receipt(),
+            temporary_resources=TemporaryResourceInventory((
+                TemporaryResourceEntry("sha256:" + "d" * 64, TemporaryResourceKind.REPLAYABLE, TemporaryResourceDisposition.REMOVED),
+            )),
+            integrated_inputs=retained,
+            composed_manifest=manifest,
+            composed_result=result,
+            lane_a=external_validation.EvidenceLaneReceipt(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE, retained.lane_a.candidate_sha, "verified", "pass"),
+            lane_b=external_validation.EvidenceLaneReceipt(LIVE_LIFECYCLE_SHADOW_PROFILE, retained.lane_b.candidate_sha, "verified", "pass"),
+            current_gate_receipts=QualificationGateReceiptSet(tuple(
+                QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", receipt)
+                for kind, receipt in zip(QualificationGateKind, authorities.receipts, strict=True)
+            )),
+        )
+
+    @staticmethod
+    def qualification_gate_authority(inputs: Phase3QualificationInputs) -> QualificationGateAuthority:
+        """Model the repository-owned authority supplied beside the input graph."""
+
+        return QualificationGateAuthority(tuple(
+            receipt.source_receipt for receipt in inputs.current_gate_receipts.receipts
+        ))
+
+    def qualification_v2_request(self) -> tuple[Phase3QualificationInputs, dict[str, object], dict[str, object]]:
+        producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
+        plan: dict[str, object] = {
+            "schema": "roundwright-harness-capture-plan/v1", "profile": PHASE_3_QUALIFICATION_PROFILE,
+            "case_id": "issue-51-qualification", "candidate_sha": "c" * 40, "ready_at": 23,
+            "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+            "recorder_identity": "sha256:" + "7" * 64, "store_identity": "sha256:" + "8" * 64,
+            "observation_identity": "sha256:" + "9" * 64,
+        }
+        inputs = self.qualification_inputs(external_validation._digest(plan))
+        authority = self.qualification_gate_authority(inputs)
+        return inputs, plan, {
+            "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
+            "execution_context": external_validation.phase_3_qualification_execution_context(inputs, authority),
+        }
     @staticmethod
     def trace_read_result(request: GitHubReadRequest, candidate_sha: str) -> GitHubReadResult:
         """Return the separately-bound implementation PR and Conversation evidence."""
@@ -391,6 +551,392 @@ class ExternalValidationTests(unittest.TestCase):
             external_validation.roundwright_profile_adapter_factory(
                 "roundwright-shadow-profile/unknown/v1"
             )
+
+    def test_phase_3_qualification_factory_exposes_stable_typed_components(self) -> None:
+        producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
+        adapter = external_validation.roundwright_profile_adapter_factory(PHASE_3_QUALIFICATION_PROFILE)
+
+        self.assertEqual(external_validation.PHASE_3_QUALIFICATION_SCHEMA, "roundwright-phase-3-qualification/v1")
+        self.assertIsInstance(adapter, external_validation.Phase3QualificationAdapter)
+        self.assertEqual(adapter.component_identities, ProfileComponentIdentities(producer, exporter, comparator))
+
+    def test_phase_3_qualification_v2_validate_then_execute_is_zero_action(self) -> None:
+        inputs, plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
+        producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
+        store = Path("qualification-recorder")
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
+        self.assertEqual(len(harness.run_calls), before + 1)
+        self.assertFalse(store.exists())
+        self.assertEqual(
+            (request["execution_context"]["zero_provider_calls"], request["execution_context"]["zero_target_actions"], request["execution_context"]["zero_lifecycle_actions"]),
+            (0, 0, 0),
+        )
+
+        adapter = harness.run_calls[-1][0][2]
+        prepared = adapter.prepare_execution_context(SimpleNamespace(
+            descriptor=request["execution_context"],
+            input_digest=external_validation._digest(request["execution_context"]),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-51-qualification", ready_at=23),
+            components=adapter.component_identities,
+        ))
+        exact = binding(
+            profile=PHASE_3_QUALIFICATION_PROFILE,
+            case_id="issue-51-qualification",
+            candidate_sha="c" * 40,
+            ready_at=23,
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
+            components=SimpleNamespace(producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator),
+            execution_context=prepared,
+            execution_context_input_digest=external_validation._digest(request["execution_context"]),
+        )
+        adapter.validate(exact)
+        evidence = adapter.project(exact, adapter.execute(exact))
+        self.assertEqual(adapter.compare(exact, evidence).status, "pass")
+        self.assertEqual((evidence["qualification"]["new_provider_calls"], evidence["qualification"]["new_target_actions"], evidence["qualification"]["lifecycle_observation_sink"]), (0, 0, "NOT_SELECTED"))
+        self.assertEqual(
+            external_validation.run_phase_3_qualification_profile(
+                "execute", request, store, inputs, authority,
+                expected_readiness_digest=readiness,
+                current_gates=external_validation.phase_3_qualification_current_gates(inputs),
+            ),
+            {"status": "fake"},
+        )
+
+    def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
+        """The V2 parser may freeze JSON collections, without relaxing any identity binding."""
+
+        def freeze_json(value: object) -> object:
+            if type(value) in (dict, MappingProxyType):
+                return MappingProxyType({key: freeze_json(item) for key, item in value.items()})
+            if type(value) in (list, tuple):
+                return tuple(freeze_json(item) for item in value)
+            return value
+
+        def thaw_json(value: object) -> object:
+            if type(value) in (dict, MappingProxyType):
+                return {key: thaw_json(item) for key, item in value.items()}
+            if type(value) is tuple:
+                return [thaw_json(item) for item in value]
+            return value
+
+        inputs, _plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
+        mixed_immutable_json = MappingProxyType({
+            "nested": MappingProxyType({"tuple": ("value",), "list": ["value"]}),
+        })
+        self.assertEqual(
+            external_validation._canonical_json_materialize(mixed_immutable_json),
+            {"nested": {"tuple": ["value"], "list": ["value"]}},
+        )
+        self.assertTrue(external_validation._canonical_json_equivalent(
+            mixed_immutable_json, {"nested": {"tuple": ["value"], "list": ("value",)}},
+        ))
+        tuple_context = freeze_json(request["execution_context"])
+        tuple_request = {**request, "execution_context": tuple_context}
+        self.assertIsInstance(tuple_context, MappingProxyType)
+        self.assertIsInstance(tuple_context["inputs"], MappingProxyType)  # type: ignore[index]
+        self.assertIsInstance(tuple_context["inputs"]["retained_sources"], tuple)  # type: ignore[index]
+        self.assertEqual(
+            external_validation._canonical_json_materialize(tuple_context), request["execution_context"],
+        )
+        self.assertEqual(
+            external_validation._digest(external_validation._canonical_json_materialize(tuple_context)),
+            external_validation._digest(request["execution_context"]),
+        )
+        harness = sys.modules["roundwright_harness.executor"]
+        store = Path("qualification-rejected")
+        before = len(harness.run_calls)
+        readiness = external_validation.run_phase_3_qualification_profile(
+            "validate", tuple_request, store, inputs, authority,
+        )
+        self.assertEqual(len(harness.run_calls), before + 1)
+        self.assertFalse(store.exists())
+        self.assertEqual(harness.run_calls[-1][0][0], "validate")
+        self.assertEqual(
+            tuple(readiness.as_dict()[key] for key in ("dispatch_count", "record_count", "verify_count", "mutation_count")),
+            (0, 0, 0, 0),
+        )
+        self.assertEqual(readiness.execution_context_input_digest, external_validation._digest(request["execution_context"]))
+
+        def replaced_context() -> dict[str, object]:
+            value = thaw_json(tuple_context)
+            self.assertIsInstance(value, dict)
+            return value
+
+        changed_content = replaced_context()
+        changed_content["zero_provider_calls"] = 1
+        changed_keys = replaced_context()
+        changed_keys["unexpected"] = 0
+        changed_scalar_type = replaced_context()
+        changed_scalar_type["zero_provider_calls"] = False
+        changed_order = replaced_context()
+        changed_order["inputs"]["retained_sources"].reverse()  # type: ignore[index]
+        changed_order["inputs"]["input_digest"] = external_validation._digest({  # type: ignore[index]
+            key: value for key, value in changed_order["inputs"].items() if key != "input_digest"  # type: ignore[index]
+        })
+        changed_authority = replaced_context()
+        changed_authority["gate_authority_digest"] = "sha256:" + "0" * 64
+        changed_retained = replaced_context()
+        retained = changed_retained["inputs"]["retained_evidence"]  # type: ignore[index]
+        for side in ("expected", "observed"):
+            retained[side]["issue_50_retention_manifest_digest"] = "sha256:" + "0" * 64  # type: ignore[index]
+            retained[f"{side}_integrity_digest"] = external_validation._digest(retained[side])  # type: ignore[index]
+        retained["binding_digest"] = external_validation._digest({  # type: ignore[index]
+            "expected": retained["expected"], "expected_integrity_digest": retained["expected_integrity_digest"],  # type: ignore[index]
+            "observed": retained["observed"], "observed_integrity_digest": retained["observed_integrity_digest"],  # type: ignore[index]
+        })
+        changed_retained["inputs"]["input_digest"] = external_validation._digest({  # type: ignore[index]
+            key: value for key, value in changed_retained["inputs"].items() if key != "input_digest"  # type: ignore[index]
+        })
+        for name, context in (
+            ("content", changed_content), ("object-key", changed_keys),
+            ("scalar-type", changed_scalar_type), ("ordering", changed_order),
+            ("authority", changed_authority), ("retained", changed_retained),
+        ):
+            with self.subTest(context=name):
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_phase_3_qualification_profile(
+                        "validate", {**request, "execution_context": freeze_json(context)},
+                        Path("qualification-rejected"), inputs, authority,
+                    )
+                self.assertEqual(len(harness.run_calls), before)
+        with self.assertRaises(ValueError):
+            external_validation._canonical_json_materialize({"unsupported": object()})
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile(
+                "validate", {**request, "execution_context": {"unsupported": object()}},
+                store, inputs, authority,
+            )
+        self.assertEqual(len(harness.run_calls), before)
+
+    def test_phase_3_qualification_validate_rejects_all_drift_before_dispatch(self) -> None:
+        """Every mutable #51 request/input edge fails before the Harness run seam."""
+
+        store = Path("qualification-rejected")
+        harness = sys.modules["roundwright_harness.executor"]
+        request_changes = {
+            "candidate": ("candidate_sha", "d" * 40), "case": ("case_id", "other-case"),
+            "ready-at": ("ready_at", 24), "component": ("producer_identity", "sha256:" + "0" * 64),
+            "recorder": ("recorder_identity", "sha256:" + "0" * 64), "store": ("store_identity", "sha256:" + "0" * 64),
+        }
+        for name, (field, changed) in request_changes.items():
+            with self.subTest(request=name):
+                inputs, plan, request = self.qualification_v2_request()
+                authority = self.qualification_gate_authority(inputs)
+                changed_plan = dict(plan); changed_plan[field] = changed
+                changed_request = dict(request); changed_request["capture_plan"] = changed_plan
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_phase_3_qualification_profile("validate", changed_request, store, inputs, authority)
+                self.assertEqual(len(harness.run_calls), before)
+                self.assertFalse(store.exists())
+        for name, changed in {
+            "provider": ("zero_provider_calls", 1), "target": ("zero_target_actions", 1),
+            "lifecycle": ("zero_lifecycle_actions", 1), "store": ("store_identity", "sha256:" + "0" * 64),
+        }.items():
+            with self.subTest(context=name):
+                inputs, _plan, request = self.qualification_v2_request()
+                authority = self.qualification_gate_authority(inputs)
+                changed_context = dict(request["execution_context"]); changed_context[changed[0]] = changed[1]
+                changed_request = dict(request); changed_request["execution_context"] = changed_context
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_phase_3_qualification_profile("validate", changed_request, store, inputs, authority)
+                self.assertEqual(len(harness.run_calls), before)
+                self.assertFalse(store.exists())
+        for name, field, changed in (
+            ("fresh-plan", "qualification_capture_plan_digest", "sha256:" + "0" * 64),
+            ("recorder", "qualification_recorder_identity", "sha256:" + "0" * 64),
+            ("substituted-store", "qualification_store_identity", "sha256:" + "0" * 64),
+            ("missing-store", "qualification_store_identity", ""),
+            ("retained", "issue_49_candidate_sha", "d" * 40),
+        ):
+            with self.subTest(input=name):
+                inputs, _plan, request = self.qualification_v2_request()
+                authority = self.qualification_gate_authority(inputs)
+                object.__setattr__(inputs, field, changed)
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
+                self.assertEqual(len(harness.run_calls), before)
+                self.assertFalse(store.exists())
+        inputs, _plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
+        object.__setattr__(inputs.composed_result, "result_digest", "sha256:" + "0" * 64)
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
+        self.assertEqual(len(harness.run_calls), before)
+        self.assertFalse(store.exists())
+
+    def test_phase_3_qualification_execute_rejects_receipt_gates_and_publication_drift(self) -> None:
+        inputs, plan, request = self.qualification_v2_request()
+        authority = self.qualification_gate_authority(inputs)
+        store = Path("qualification-rejected")
+        harness = sys.modules["roundwright_harness.executor"]
+        readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
+        gates = external_validation.phase_3_qualification_current_gates(inputs)
+        first = gates.receipts[0]
+        cross_candidate_first = QualificationGateReceipt(
+            first.kind, "d" * 40, first.case_id, first.review_epoch,
+            first.review_round, first.review_mode, first.result,
+            gate_source(first.kind, "d" * 40, first.case_id, first.review_epoch, first.review_round, "sha256:" + "7" * 64),
+        )
+        cross_candidate_gates = QualificationGateReceiptSet((
+            cross_candidate_first, *gates.receipts[1:],
+        ))
+        for name, receipt, changed_gates in (
+            ("other-candidate", replace(readiness, candidate_sha="d" * 40), gates),
+            ("other-case", replace(readiness, case_id="other-case"), gates),
+            ("other-ready-at", replace(readiness, ready_at=24), gates),
+            ("other-plan", replace(readiness, capture_plan_digest="sha256:" + "0" * 64), gates),
+            ("other-component", replace(readiness, components=("sha256:" + "0" * 64,) * 3), gates),
+            ("other-context", replace(readiness, execution_context_input_digest="sha256:" + "0" * 64), gates),
+            ("forged-digest", replace(readiness, receipt_digest="sha256:" + "0" * 64), gates),
+            ("missing-gates", readiness, {}),
+            ("fabricated-gates", readiness, object()),
+            ("stale-gates", readiness, cross_candidate_gates),
+        ):
+            with self.subTest(execute=name):
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_phase_3_qualification_profile(
+                        "execute", request, store, inputs, authority,
+                        expected_readiness_digest=receipt, current_gates=changed_gates,
+                    )
+                self.assertEqual(len(harness.run_calls), before)
+                self.assertFalse(store.exists())
+
+        adapter = harness.run_calls[-1][0][2]
+        producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
+        prepared = adapter.prepare_execution_context(SimpleNamespace(
+            descriptor=request["execution_context"], input_digest=external_validation._digest(request["execution_context"]),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-51-qualification", ready_at=23),
+            components=adapter.component_identities,
+        ))
+        exact = binding(
+            profile=PHASE_3_QUALIFICATION_PROFILE, case_id="issue-51-qualification", candidate_sha="c" * 40, ready_at=23,
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
+            components=SimpleNamespace(producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator),
+            execution_context=prepared, execution_context_input_digest=external_validation._digest(request["execution_context"]),
+        )
+        execution = adapter.execute(exact)
+        for field, value in (
+            ("new_provider_calls", 1), ("disposition", "QUALIFICATION_BLOCKED"),
+            ("qualification_candidate_sha", "d" * 40), ("canary_action_authorized", True),
+            ("runtime_activation_authorized", True), ("roundlet_retirement_authorized", True),
+            ("decision_digest", "sha256:" + "0" * 64),
+        ):
+            with self.subTest(publication_field=field), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                adapter.project(exact, ProfileExecution({**execution.value, field: value}))
+        self.assertEqual(adapter.compare(exact, {"forged": "publication"}).status, "fail")
+
+    def test_phase_3_qualification_authority_is_separate_and_bound_across_readiness(self) -> None:
+        inputs, _plan, request = self.qualification_v2_request()
+        canonical_authority = self.qualification_gate_authority(inputs)
+        fabricated_authority = QualificationGateAuthority(tuple(
+            gate_source(kind, "c" * 40, "issue-51-qualification", 1, 1, "sha256:" + f"{index + 1:x}" * 64)
+            for index, kind in enumerate(QualificationGateKind)
+        ))
+        fabricated_gates = QualificationGateReceiptSet(tuple(
+            QualificationGateReceipt(kind, "c" * 40, "issue-51-qualification", 1, 1, "COMPLETE", "pass", receipt)
+            for kind, receipt in zip(QualificationGateKind, fabricated_authority.receipts, strict=True)
+        ))
+        substituted_inputs = replace(inputs, current_gate_receipts=fabricated_gates)
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile(
+                "validate", request, Path("qualification-rejected"), substituted_inputs, canonical_authority,
+            )
+        self.assertEqual(len(harness.run_calls), before)
+
+        readiness = external_validation.run_phase_3_qualification_profile(
+            "validate", request, Path("qualification-rejected"), inputs, canonical_authority,
+        )
+        before = len(harness.run_calls)
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.run_phase_3_qualification_profile(
+                "execute", request, Path("qualification-rejected"), inputs, fabricated_authority,
+                expected_readiness_digest=readiness,
+                current_gates=external_validation.phase_3_qualification_current_gates(inputs),
+            )
+        self.assertEqual(len(harness.run_calls), before)
+
+    def test_phase_3_qualification_runs_through_the_reviewed_harness_recorder(self) -> None:
+        """Use the reviewed V2 Recorder only when its pinned source is supplied."""
+
+        harness_source = os.environ.get("ROUNDWRIGHT_HARNESS_SOURCE")
+        if harness_source is None:
+            self.skipTest("reviewed Harness source is not supplied")
+        source = Path(harness_source)
+        if not (source / "roundwright_harness" / "executor.py").is_file():
+            self.fail("reviewed Harness source is invalid")
+        prior_modules = {
+            name: value for name, value in sys.modules.items()
+            if name == "roundwright_harness" or name.startswith("roundwright_harness.")
+        }
+        sys.path.insert(0, str(source))
+        for name in tuple(prior_modules):
+            sys.modules.pop(name, None)
+        try:
+            harness = importlib.import_module("roundwright_harness.executor")
+            producer, exporter, comparator = external_validation.phase_3_qualification_component_identities()
+            plan = {
+                "schema": "roundwright-harness-capture-plan/v1", "profile": PHASE_3_QUALIFICATION_PROFILE,
+                "case_id": "issue-51-reviewed-harness", "candidate_sha": "c" * 40, "ready_at": 23,
+                "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+                "recorder_identity": "sha256:" + "7" * 64, "store_identity": "sha256:" + "8" * 64,
+                "observation_identity": "sha256:" + "9" * 64,
+            }
+            inputs = self.qualification_inputs(harness.prepare_capture(plan).plan_digest)
+            inputs = replace(inputs, qualification_case_id=plan["case_id"])
+            authority = QualificationGateAuthority(tuple(
+                gate_source(kind, "c" * 40, plan["case_id"], 1, 1, identity)
+                for kind, identity in zip(
+                    QualificationGateKind,
+                    ("sha256:" + "7" * 64, external_validation._digest(plan), "sha256:" + "b" * 64, "sha256:" + "c" * 64),
+                    strict=True,
+                )
+            ))
+            inputs = replace(inputs, current_gate_receipts=QualificationGateReceiptSet(tuple(
+                QualificationGateReceipt(kind, "c" * 40, plan["case_id"], 1, 1, "COMPLETE", "pass", receipt)
+                for kind, receipt in zip(QualificationGateKind, authority.receipts, strict=True)
+            )))
+            request = {
+                "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
+                "execution_context": external_validation.phase_3_qualification_execution_context(inputs, authority),
+            }
+            with tempfile.TemporaryDirectory() as temporary:
+                store = Path(temporary) / "recorder"
+                readiness = external_validation.run_phase_3_qualification_profile("validate", request, store, inputs, authority)
+                self.assertEqual(
+                    tuple(readiness.as_dict()[key] for key in ("dispatch_count", "record_count", "verify_count")),
+                    (0, 0, 0),
+                )
+                self.assertFalse(store.exists())
+                result = external_validation.run_phase_3_qualification_profile(
+                    "execute", request, store, inputs, authority, expected_readiness_digest=readiness,
+                    current_gates=external_validation.phase_3_qualification_current_gates(inputs),
+                )
+                receipt = result.as_dict()
+                self.assertEqual((receipt["status"], receipt["mutation_count"]), ("pass", 0))
+                self.assertEqual(
+                    tuple(receipt[key] for key in ("dispatch_count", "record_count", "verify_count")), (1, 1, 1),
+                )
+                recording_identity = str(receipt["bundle_digest"]).removeprefix("sha256:")
+                self.assertTrue((store / f"{recording_identity}.bundle.json").is_file())
+        finally:
+            sys.path.remove(str(source))
+            for name in tuple(sys.modules):
+                if name == "roundwright_harness" or name.startswith("roundwright_harness."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(prior_modules)
 
     def test_integrated_composition_uses_the_v2_executor_without_live_capabilities(self) -> None:
         producer, exporter, comparator = external_validation.integrated_boundary_component_identities()

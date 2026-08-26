@@ -156,6 +156,11 @@ execution path, but never invokes a provider, GitHub, or the forward-test
 target.  The report labels supported, test-only, read-only,
 deferred, and prohibited capabilities without conferring authority.
 
+The Phase 3 qualification consumer then reads those sealed inventories only.
+It emits an owner-facing `PROMOTION_READY_FOR_CANARY_DECISION` package only
+when the exact candidate and every current gate reconcile. That package grants
+no Canary action, activation, authority transition, or Roundlet retirement.
+
 ## Development check
 
 The packaging gate uses the tracked, receipt-bound toolchain described in

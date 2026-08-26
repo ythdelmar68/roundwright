@@ -15,10 +15,15 @@ from roundwright.canary_policy import (
     BoundedCanaryPolicy, BoundedCanaryReceipt, CanaryAuthorityContext, CanaryBudget,
     CanaryMutationRequest, CanaryPolicyError, CanaryResult, CanaryRollbackPlan,
     CanaryTarget, CleanupDisposition, FORWARD_TEST_ROUTE, advance_canary_receipt,
-    authorize_canary_request, evaluate_bounded_canary_policy, genesis_canary_receipt,
+    authorize_canary_request, canary_target_policy_identity, evaluate_bounded_canary_policy, genesis_canary_receipt,
     parse_bounded_canary_policy, validate_canary_receipt_chain,
 )
 from roundwright.github import GitHubMutationOperation
+from roundwright.repository_policy import (
+    GITHUB_REPOSITORY_OPERATION, REPOSITORY_OPERATION_SWITCH,
+    REPOSITORY_POLICY_SCHEMA_VERSION, RepositoryMutationPolicy, RepositoryPolicySource,
+    TrustedRepositoryPolicySnapshot, validate_repository_mutation_vocabulary,
+)
 
 
 BASE = "a" * 40
@@ -40,14 +45,33 @@ def policy() -> BoundedCanaryPolicy:
 
 
 def genesis(value: BoundedCanaryPolicy) -> BoundedCanaryReceipt:
-    return genesis_canary_receipt(value, DIGEST)
+    return genesis_canary_receipt(value)
 
 
-def context(value: BoundedCanaryPolicy, chain: tuple[BoundedCanaryReceipt, ...] | None = None) -> CanaryAuthorityContext:
+def target_policy(*, enabled: bool = True, allowed: tuple[GitHubMutationOperation, ...] = ()) -> TrustedRepositoryPolicySnapshot:
+    fields: dict[str, object] = {
+        "schema_version": REPOSITORY_POLICY_SCHEMA_VERSION,
+        "enabled": enabled,
+        **{switch: False for switch in REPOSITORY_OPERATION_SWITCH.values()},
+    }
+    for operation in allowed:
+        fields[REPOSITORY_OPERATION_SWITCH[GITHUB_REPOSITORY_OPERATION[operation]]] = True
+    return TrustedRepositoryPolicySnapshot(
+        RepositoryPolicySource("1" * 64, "2" * 64),
+        RepositoryMutationPolicy(**fields),  # type: ignore[arg-type]
+    )
+
+
+def context(
+    value: BoundedCanaryPolicy, chain: tuple[BoundedCanaryReceipt, ...] | None = None,
+    *, target: TrustedRepositoryPolicySnapshot | None = None,
+) -> CanaryAuthorityContext:
+    target = target or target_policy(allowed=value.requested_operations)
     return CanaryAuthorityContext(
         True, True, True, value.phase, value.leaf_number, FORWARD_TEST_ROUTE,
         value.base_sha, value.candidate_sha, value.contract_digest, value.target,
-        value.policy_digest, value.branch, chain[-1].receipt_digest if chain else None,
+        target, canary_target_policy_identity(target), value.policy_digest, value.branch,
+        chain[-1].receipt_digest if chain else None,
     )
 
 
@@ -149,6 +173,56 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         self.assertTrue(successor.authorized)
         assert successor.authorization is not None
         self.assertNotEqual(first.authorization.consumption_key, successor.authorization.consumption_key)
+
+    def test_target_policy_requires_total_mapping_and_each_requested_operation_switch(self) -> None:
+        operations = tuple(GitHubMutationOperation)
+        contract = BoundedCanaryPolicy(
+            BASE, CANDIDATE, CONTRACT, 4, 87, policy().target, "roundlet/canary-87",
+            ("canary/probe.txt",), operations,
+            CanaryBudget(tuple((operation, 1) for operation in operations), len(operations)),
+            policy().rollback,
+        )
+        validate_repository_mutation_vocabulary()
+        self.assertEqual(set(GITHUB_REPOSITORY_OPERATION), set(GitHubMutationOperation))
+        for operation in operations:
+            with self.subTest(operation=operation):
+                chain = (genesis(contract),)
+                request = CanaryMutationRequest(operation, contract.branch, ("canary/probe.txt",))
+                allowed = context(contract, chain, target=target_policy(allowed=(operation,)))
+                denied = context(contract, chain, target=target_policy())
+                self.assertTrue(authorize_canary_request(contract, allowed, request, chain).authorized)
+                self.assertFalse(authorize_canary_request(contract, denied, request, chain).authorized)
+        disabled = context(contract, (genesis(contract),), target=target_policy(enabled=False, allowed=operations))
+        request = CanaryMutationRequest(operations[0], contract.branch, ("canary/probe.txt",))
+        self.assertFalse(authorize_canary_request(contract, disabled, request, (genesis(contract),)).authorized)
+
+    def test_missing_or_drifted_target_policy_evidence_fails_closed(self) -> None:
+        contract = policy()
+        chain = (genesis(contract),)
+        request = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
+        missing = context(contract, chain)
+        object.__setattr__(missing, "target_policy", None)
+        self.assertFalse(authorize_canary_request(contract, missing, request, chain).authorized)
+        drifted = context(contract, chain)
+        object.__setattr__(drifted, "target_policy_identity", "sha256:" + "f" * 64)
+        self.assertFalse(authorize_canary_request(contract, drifted, request, chain).authorized)
+
+    def test_genesis_is_deterministic_and_cannot_create_a_fresh_consumption_fence(self) -> None:
+        contract = policy()
+        first = genesis(contract)
+        second = genesis(contract)
+        self.assertEqual(first.receipt_digest, second.receipt_digest)
+        with self.assertRaises(CanaryPolicyError):
+            BoundedCanaryReceipt(
+                contract, CanaryResult.GENESIS,
+                tuple((operation, 0) for operation in contract.requested_operations),
+                "sha256:" + "f" * 64,
+            )
+        request = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
+        first_claim = authorize_canary_request(contract, context(contract, (first,)), request, (first,))
+        second_claim = authorize_canary_request(contract, context(contract, (second,)), request, (second,))
+        assert first_claim.authorization is not None and second_claim.authorization is not None
+        self.assertEqual(first_claim.authorization.consumption_key, second_claim.authorization.consumption_key)
 
     def test_branch_validation_rejects_noncanonical_git_ref_names(self) -> None:
         contract = policy()

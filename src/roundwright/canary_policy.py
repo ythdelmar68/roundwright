@@ -16,6 +16,15 @@ from enum import StrEnum
 from typing import Mapping
 
 from .github import GitHubMutationOperation
+from .repository_policy import (
+    GITHUB_REPOSITORY_OPERATION,
+    REPOSITORY_OPERATION_SWITCH,
+    RepositoryMutationOperation,
+    RepositoryMutationPolicy,
+    RepositoryPolicySource,
+    TrustedRepositoryPolicySnapshot,
+    validate_repository_mutation_vocabulary,
+)
 
 
 CANARY_POLICY_SCHEMA = "roundwright-bounded-canary-policy/v1"
@@ -89,6 +98,52 @@ def _safe_branch(value: object) -> bool:
         component and not component.startswith(".") and not component.endswith(".lock")
         for component in value.split("/")
     )
+
+
+def canary_target_policy_identity(snapshot: TrustedRepositoryPolicySnapshot) -> str:
+    """Return the public-safe immutable identity of the target policy evidence."""
+
+    if (
+        type(snapshot) is not TrustedRepositoryPolicySnapshot
+        or type(snapshot.source) is not RepositoryPolicySource
+        or type(snapshot.document) is not RepositoryMutationPolicy
+    ):
+        raise CanaryPolicyError("Canary target policy evidence is invalid")
+    return _digest({
+        "source_fingerprint": snapshot.source.source_fingerprint,
+        "revision_fingerprint": snapshot.source.revision_fingerprint,
+        "policy_digest": snapshot.document.digest,
+    })
+
+
+def _target_policy_for(context: CanaryAuthorityContext) -> RepositoryMutationPolicy:
+    try:
+        snapshot = context.target_policy
+        identity = canary_target_policy_identity(snapshot)
+        if identity != context.target_policy_identity:
+            raise CanaryPolicyError
+        policy = snapshot.document
+        # Reconstruct the exact strict document to reject post-construction drift.
+        fields = {
+            "schema_version": policy.schema_version,
+            "enabled": policy.enabled,
+            **{switch: getattr(policy, switch) for switch in REPOSITORY_OPERATION_SWITCH.values()},
+        }
+        validated = RepositoryMutationPolicy(**fields)
+        if validated.digest != policy.digest:
+            raise CanaryPolicyError
+        return validated
+    except (AttributeError, TypeError, ValueError, CanaryPolicyError) as error:
+        raise CanaryPolicyError("Canary target policy evidence is invalid or stale") from error
+
+
+def _genesis_identity(policy: BoundedCanaryPolicy) -> str:
+    return _digest({
+        "schema": CANARY_RECEIPT_SCHEMA,
+        "policy_digest": policy.policy_digest,
+        "contract_digest": policy.contract_digest,
+        "kind": CanaryResult.GENESIS.value,
+    })
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +278,8 @@ class CanaryAuthorityContext:
     candidate_sha: str
     contract_digest: str
     target: CanaryTarget
+    target_policy: TrustedRepositoryPolicySnapshot
+    target_policy_identity: str
     policy_digest: str
     branch: str
     prior_receipt_digest: str | None = None
@@ -243,6 +300,8 @@ class CanaryAuthorityContext:
         _require_digest(self.contract_digest, "selected contract")
         if type(self.target) is not CanaryTarget:
             raise CanaryPolicyError("selected Canary target is invalid")
+        _target_policy_for(self)
+        _require_digest(self.target_policy_identity, "selected target policy")
         _require_digest(self.policy_digest, "selected policy")
         if not _safe_branch(self.branch):
             raise CanaryPolicyError("selected Canary branch is invalid")
@@ -310,6 +369,10 @@ def evaluate_bounded_canary_policy(policy: BoundedCanaryPolicy | None, context: 
         return CanaryDecision(False, "Canary kill switch is active", policy.policy_digest, "preserve-for-owner")
     if (context.phase, context.leaf_number, context.base_sha, context.candidate_sha, context.contract_digest, context.target, context.policy_digest, context.branch) != (policy.phase, policy.leaf_number, policy.base_sha, policy.candidate_sha, policy.contract_digest, policy.target, policy.policy_digest, policy.branch):
         return CanaryDecision(False, "Canary identity or policy binding is stale", policy.policy_digest, "preserve-for-owner")
+    try:
+        _target_policy_for(context)
+    except CanaryPolicyError:
+        return CanaryDecision(False, "Canary target policy evidence is unavailable or stale", policy.policy_digest, "preserve-for-owner")
     return CanaryDecision(True, "exact bounded Canary policy is authorized", policy.policy_digest, "execute-through-mutation-broker")
 
 
@@ -358,6 +421,15 @@ def authorize_canary_request(
     counts = dict(prior_receipt.operation_counts)
     prior_operation_calls = counts[request.operation]
     prior_total_calls = sum(counts.values())
+    try:
+        validate_repository_mutation_vocabulary()
+        target_operation = GITHUB_REPOSITORY_OPERATION[request.operation]
+        target_policy = _target_policy_for(context)
+        target_switch = REPOSITORY_OPERATION_SWITCH[target_operation]
+    except (KeyError, CanaryPolicyError, ValueError):
+        return CanaryDecision(False, "Canary target operation mapping is unavailable", policy.policy_digest, "preserve-for-owner")
+    if not target_policy.enabled or not getattr(target_policy, target_switch):
+        return CanaryDecision(False, "Canary target policy denies the requested operation", policy.policy_digest, "preserve-for-owner")
     if prior_operation_calls >= policy.budget.limit_for(request.operation) or prior_total_calls >= policy.budget.total_calls:
         return CanaryDecision(False, "Canary call budget is exhausted", policy.policy_digest, "preserve-for-owner")
     authorization = CanaryAuthorization(
@@ -393,7 +465,11 @@ class BoundedCanaryReceipt:
         if self.predecessor_receipt_digest is not None:
             _require_digest(self.predecessor_receipt_digest, "receipt predecessor")
         if self.result is CanaryResult.GENESIS:
-            if self.predecessor_receipt_digest is not None or any(counts.values()):
+            if (
+                self.predecessor_receipt_digest is not None
+                or any(counts.values())
+                or self.semantic_readback_digest != _genesis_identity(self.policy)
+            ):
                 raise CanaryPolicyError("Canary genesis receipt is invalid")
         elif self.predecessor_receipt_digest is None:
             raise CanaryPolicyError("Canary non-genesis receipt has no predecessor")
@@ -420,7 +496,7 @@ class BoundedCanaryReceipt:
             raise CanaryPolicyError("Canary receipt has drifted")
 
 
-def genesis_canary_receipt(policy: BoundedCanaryPolicy, semantic_readback_digest: str) -> BoundedCanaryReceipt:
+def genesis_canary_receipt(policy: BoundedCanaryPolicy) -> BoundedCanaryReceipt:
     """Create the one explicit zero-count receipt that starts a Canary chain."""
 
     if type(policy) is not BoundedCanaryPolicy:
@@ -428,7 +504,7 @@ def genesis_canary_receipt(policy: BoundedCanaryPolicy, semantic_readback_digest
     return BoundedCanaryReceipt(
         policy, CanaryResult.GENESIS,
         tuple((operation, 0) for operation in policy.requested_operations),
-        semantic_readback_digest,
+        _genesis_identity(policy),
     )
 
 

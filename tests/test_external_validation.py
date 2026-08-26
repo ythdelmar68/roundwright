@@ -308,7 +308,6 @@ def fake_harness() -> tuple[object | None, object | None]:
                     input_digest=external_validation._digest(context_value),
                     plan=plan,
                     components=components,
-                    store_identity=request.capture_plan["store_identity"],
                 ))
                 adapter.validate(SimpleNamespace(
                     profile=plan.profile,
@@ -582,7 +581,6 @@ class ExternalValidationTests(unittest.TestCase):
             input_digest=external_validation._digest(request["execution_context"]),
             plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-51-qualification", ready_at=23),
             components=adapter.component_identities,
-            store_identity=plan["store_identity"],
         ))
         exact = binding(
             profile=PHASE_3_QUALIFICATION_PROFILE,
@@ -739,7 +737,7 @@ class ExternalValidationTests(unittest.TestCase):
                 self.assertFalse(store.exists())
         for name, changed in {
             "provider": ("zero_provider_calls", 1), "target": ("zero_target_actions", 1),
-            "lifecycle": ("zero_lifecycle_actions", 1),
+            "lifecycle": ("zero_lifecycle_actions", 1), "store": ("store_identity", "sha256:" + "0" * 64),
         }.items():
             with self.subTest(context=name):
                 inputs, _plan, request = self.qualification_v2_request()
@@ -754,6 +752,8 @@ class ExternalValidationTests(unittest.TestCase):
         for name, field, changed in (
             ("fresh-plan", "qualification_capture_plan_digest", "sha256:" + "0" * 64),
             ("recorder", "qualification_recorder_identity", "sha256:" + "0" * 64),
+            ("substituted-store", "qualification_store_identity", "sha256:" + "0" * 64),
+            ("missing-store", "qualification_store_identity", ""),
             ("retained", "issue_49_candidate_sha", "d" * 40),
         ):
             with self.subTest(input=name):
@@ -817,7 +817,7 @@ class ExternalValidationTests(unittest.TestCase):
         prepared = adapter.prepare_execution_context(SimpleNamespace(
             descriptor=request["execution_context"], input_digest=external_validation._digest(request["execution_context"]),
             plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-51-qualification", ready_at=23),
-            components=adapter.component_identities, store_identity=plan["store_identity"],
+            components=adapter.component_identities,
         ))
         exact = binding(
             profile=PHASE_3_QUALIFICATION_PROFILE, case_id="issue-51-qualification", candidate_sha="c" * 40, ready_at=23,

@@ -3959,9 +3959,10 @@ class Phase3QualificationAdapter:
             if self.inputs is None or self.gate_authority is None or not _canonical_json_equivalent(preparation.descriptor, phase_3_qualification_execution_context(self.inputs, self.gate_authority)) or preparation.input_digest != _digest(_canonical_json_materialize(preparation.descriptor)) or preparation.components != self.component_identities:
                 raise ValueError
             plan = preparation.plan
-            if (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, preparation.store_identity) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at, self.inputs.qualification_store_identity):
+            store_identity = self.inputs.qualification_store_identity
+            if (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at) != (self.inputs.qualification_candidate_sha, self.inputs.qualification_case_id, self.inputs.qualification_capture_plan_digest, self.inputs.qualification_ready_at):
                 raise ValueError
-            context = MaterializedPhase3QualificationContext(preparation.descriptor, self.inputs, self.gate_authority, plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, preparation.store_identity)
+            context = MaterializedPhase3QualificationContext(preparation.descriptor, self.inputs, self.gate_authority, plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at, store_identity)
             return _harness_executor().ProfileExecutionContext(context.identity, context)
         except (AttributeError, TypeError, ValueError, ExternalValidationAdapterError) as error:
             raise ExternalValidationAdapterError("phase-3 qualification V2 execution context is invalid") from error

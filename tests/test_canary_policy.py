@@ -128,6 +128,43 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         advanced_chain = (initial, advanced)
         self.assertFalse(authorize_canary_request(contract, context(contract, advanced_chain), exact, advanced_chain).authorized)
 
+    def test_authorization_claim_binds_request_and_chain_head_for_one_shot_consumption(self) -> None:
+        contract = policy()
+        initial = genesis(contract)
+        chain = (initial,)
+        create = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
+        delete = CanaryMutationRequest(GitHubMutationOperation.DELETE_BRANCH, contract.branch, ("canary/probe.txt",))
+        first = authorize_canary_request(contract, context(contract, chain), create, chain)
+        repeated = authorize_canary_request(contract, context(contract, chain), create, chain)
+        substituted = authorize_canary_request(contract, context(contract, chain), delete, chain)
+        self.assertTrue(first.authorized and repeated.authorized and substituted.authorized)
+        assert first.authorization is not None and repeated.authorization is not None and substituted.authorization is not None
+        self.assertEqual(first.authorization.claim_digest, repeated.authorization.claim_digest)
+        self.assertEqual(first.authorization.consumption_key, repeated.authorization.consumption_key)
+        self.assertNotEqual(first.authorization.claim_digest, substituted.authorization.claim_digest)
+        self.assertEqual(first.authorization.consumption_key, substituted.authorization.consumption_key)
+        advanced = advance_canary_receipt(initial, create.operation, DIGEST)
+        next_chain = (initial, advanced)
+        successor = authorize_canary_request(contract, context(contract, next_chain), delete, next_chain)
+        self.assertTrue(successor.authorized)
+        assert successor.authorization is not None
+        self.assertNotEqual(first.authorization.consumption_key, successor.authorization.consumption_key)
+
+    def test_branch_validation_rejects_noncanonical_git_ref_names(self) -> None:
+        contract = policy()
+        operation = GitHubMutationOperation.CREATE_BRANCH
+        for branch in ("roundlet/foo..bar", "roundlet/trailing.", "roundlet/", "roundlet/.hidden", "roundlet/hold.lock", "roundlet/foo@{bar"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(CanaryPolicyError):
+                    BoundedCanaryPolicy(
+                        BASE, CANDIDATE, CONTRACT, 4, 87, contract.target, branch,
+                        contract.allowed_paths, (operation,), CanaryBudget(((operation, 1),), 1), contract.rollback,
+                    )
+                with self.assertRaises(CanaryPolicyError):
+                    CanaryMutationRequest(operation, branch, ("canary/probe.txt",))
+                with self.assertRaises(CanaryPolicyError):
+                    replace(context(contract, (genesis(contract),)), branch=branch)
+
     def test_none_empty_and_repeated_fresh_contexts_cannot_reset_the_chain(self) -> None:
         contract = policy()
         request = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))

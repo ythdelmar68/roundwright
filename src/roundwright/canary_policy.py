@@ -72,6 +72,25 @@ def _safe_path(value: object) -> bool:
     )
 
 
+def _safe_branch(value: object) -> bool:
+    """Accept only the conservative Git ref subset used for target branches."""
+
+    if (
+        type(value) is not str
+        or _BRANCH.fullmatch(value) is None
+        or value.startswith(("refs/", "/"))
+        or value.endswith(("/", "."))
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+    ):
+        return False
+    return all(
+        component and not component.startswith(".") and not component.endswith(".lock")
+        for component in value.split("/")
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CanaryTarget:
     """One controlled target pinned to its baseline, never a floating ref."""
@@ -159,7 +178,7 @@ class BoundedCanaryPolicy:
             raise CanaryPolicyError("Canary phase or leaf is invalid")
         if type(self.target) is not CanaryTarget or type(self.budget) is not CanaryBudget or type(self.rollback) is not CanaryRollbackPlan:
             raise CanaryPolicyError("Canary policy component is invalid")
-        if type(self.branch) is not str or _BRANCH.fullmatch(self.branch) is None or self.branch.startswith(("refs/", "/")) or "//" in self.branch:
+        if not _safe_branch(self.branch):
             raise CanaryPolicyError("Canary branch is invalid")
         if type(self.allowed_paths) is not tuple or not self.allowed_paths or len(set(self.allowed_paths)) != len(self.allowed_paths) or not all(_safe_path(path) for path in self.allowed_paths):
             raise CanaryPolicyError("Canary path allowlist is invalid")
@@ -225,7 +244,7 @@ class CanaryAuthorityContext:
         if type(self.target) is not CanaryTarget:
             raise CanaryPolicyError("selected Canary target is invalid")
         _require_digest(self.policy_digest, "selected policy")
-        if type(self.branch) is not str or _BRANCH.fullmatch(self.branch) is None:
+        if not _safe_branch(self.branch):
             raise CanaryPolicyError("selected Canary branch is invalid")
         if self.prior_receipt_digest is not None:
             _require_digest(self.prior_receipt_digest, "selected prior receipt")
@@ -237,6 +256,39 @@ class CanaryDecision:
     reason: str
     policy_digest: str | None
     next_action: str
+    authorization: CanaryAuthorization | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanaryAuthorization:
+    """One typed claim that a future broker must consume once by its fence key."""
+
+    policy_digest: str
+    contract_digest: str
+    request_digest: str
+    receipt_chain_head_digest: str
+    consumption_key: str = field(init=False)
+    claim_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.policy_digest, "Canary policy"),
+            (self.contract_digest, "Canary contract"),
+            (self.request_digest, "Canary request"),
+            (self.receipt_chain_head_digest, "Canary receipt-chain head"),
+        ):
+            _require_digest(value, name)
+        consumption_key = _digest({
+            "policy_digest": self.policy_digest,
+            "contract_digest": self.contract_digest,
+            "receipt_chain_head_digest": self.receipt_chain_head_digest,
+        })
+        claim_digest = _digest({
+            "consumption_key": consumption_key,
+            "request_digest": self.request_digest,
+        })
+        object.__setattr__(self, "consumption_key", consumption_key)
+        object.__setattr__(self, "claim_digest", claim_digest)
 
 
 def evaluate_bounded_canary_policy(policy: BoundedCanaryPolicy | None, context: CanaryAuthorityContext | None) -> CanaryDecision:
@@ -268,12 +320,16 @@ class CanaryMutationRequest:
     operation: GitHubMutationOperation
     branch: str
     paths: tuple[str, ...]
+    request_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if type(self.operation) is not GitHubMutationOperation or type(self.branch) is not str or _BRANCH.fullmatch(self.branch) is None:
+        if type(self.operation) is not GitHubMutationOperation or not _safe_branch(self.branch):
             raise CanaryPolicyError("Canary request operation or branch is invalid")
         if type(self.paths) is not tuple or not self.paths or not all(_safe_path(path) for path in self.paths):
             raise CanaryPolicyError("Canary request paths are invalid")
+        object.__setattr__(self, "request_digest", _digest({
+            "operation": self.operation.value, "branch": self.branch, "paths": list(self.paths),
+        }))
 def authorize_canary_request(
     policy: BoundedCanaryPolicy | None,
     context: CanaryAuthorityContext | None,
@@ -304,7 +360,11 @@ def authorize_canary_request(
     prior_total_calls = sum(counts.values())
     if prior_operation_calls >= policy.budget.limit_for(request.operation) or prior_total_calls >= policy.budget.total_calls:
         return CanaryDecision(False, "Canary call budget is exhausted", policy.policy_digest, "preserve-for-owner")
-    return decision
+    authorization = CanaryAuthorization(
+        policy.policy_digest, policy.contract_digest, request.request_digest,
+        prior_receipt.receipt_digest,
+    )
+    return CanaryDecision(True, decision.reason, policy.policy_digest, decision.next_action, authorization)
 
 
 @dataclass(frozen=True, slots=True)

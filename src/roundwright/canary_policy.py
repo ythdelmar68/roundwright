@@ -191,6 +191,7 @@ class CanaryAuthorityContext:
     """Independent selection and standing-authority read-back for one call."""
 
     roundlet_enabled: bool
+    read_only_external_validation_allowed: bool
     disposable_target_mutation_allowed: bool
     phase: int
     leaf_number: int
@@ -200,10 +201,16 @@ class CanaryAuthorityContext:
     target: CanaryTarget
     policy_digest: str
     branch: str
+    prior_receipt_digest: str | None = None
     kill_switch_active: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.roundlet_enabled) is not bool or type(self.disposable_target_mutation_allowed) is not bool or type(self.kill_switch_active) is not bool:
+        if (
+            type(self.roundlet_enabled) is not bool
+            or type(self.read_only_external_validation_allowed) is not bool
+            or type(self.disposable_target_mutation_allowed) is not bool
+            or type(self.kill_switch_active) is not bool
+        ):
             raise CanaryPolicyError("Canary standing authority is invalid")
         if type(self.phase) is not int or type(self.leaf_number) is not int or self.route != FORWARD_TEST_ROUTE:
             raise CanaryPolicyError("Canary selection route is invalid")
@@ -214,6 +221,8 @@ class CanaryAuthorityContext:
         _require_digest(self.policy_digest, "selected policy")
         if type(self.branch) is not str or _BRANCH.fullmatch(self.branch) is None:
             raise CanaryPolicyError("selected Canary branch is invalid")
+        if self.prior_receipt_digest is not None:
+            _require_digest(self.prior_receipt_digest, "selected prior receipt")
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +242,11 @@ def evaluate_bounded_canary_policy(policy: BoundedCanaryPolicy | None, context: 
         policy.validate()
     except CanaryPolicyError:
         return CanaryDecision(False, "Canary policy has drifted", policy.policy_digest, "preserve-for-owner")
-    if not context.roundlet_enabled or not context.disposable_target_mutation_allowed:
+    if (
+        not context.roundlet_enabled
+        or not context.read_only_external_validation_allowed
+        or not context.disposable_target_mutation_allowed
+    ):
         return CanaryDecision(False, "standing Canary authority is disabled", policy.policy_digest, "preserve-for-owner")
     if context.kill_switch_active:
         return CanaryDecision(False, "Canary kill switch is active", policy.policy_digest, "preserve-for-owner")
@@ -249,20 +262,19 @@ class CanaryMutationRequest:
     operation: GitHubMutationOperation
     branch: str
     paths: tuple[str, ...]
-    prior_operation_calls: int
-    prior_total_calls: int
 
     def __post_init__(self) -> None:
         if type(self.operation) is not GitHubMutationOperation or type(self.branch) is not str or _BRANCH.fullmatch(self.branch) is None:
             raise CanaryPolicyError("Canary request operation or branch is invalid")
         if type(self.paths) is not tuple or not self.paths or not all(_safe_path(path) for path in self.paths):
             raise CanaryPolicyError("Canary request paths are invalid")
-        if type(self.prior_operation_calls) is not int or self.prior_operation_calls < 0 or type(self.prior_total_calls) is not int or self.prior_total_calls < 0:
-            raise CanaryPolicyError("Canary request call counts are invalid")
-
-
-def authorize_canary_request(policy: BoundedCanaryPolicy | None, context: CanaryAuthorityContext | None, request: CanaryMutationRequest | None) -> CanaryDecision:
-    """Enforce exact branch, path, operation, and call budget before a broker call."""
+def authorize_canary_request(
+    policy: BoundedCanaryPolicy | None,
+    context: CanaryAuthorityContext | None,
+    request: CanaryMutationRequest | None,
+    prior_receipt: BoundedCanaryReceipt | None,
+) -> CanaryDecision:
+    """Enforce scope and derive every subsequent call count from a receipt."""
 
     decision = evaluate_bounded_canary_policy(policy, context)
     if not decision.authorized or type(policy) is not BoundedCanaryPolicy or type(request) is not CanaryMutationRequest:
@@ -273,7 +285,25 @@ def authorize_canary_request(policy: BoundedCanaryPolicy | None, context: Canary
         return CanaryDecision(False, "Canary branch is outside the selected allowlist", policy.policy_digest, "preserve-for-owner")
     if any(path not in policy.allowed_paths for path in request.paths):
         return CanaryDecision(False, "Canary path is outside the selected allowlist", policy.policy_digest, "preserve-for-owner")
-    if request.prior_operation_calls >= policy.budget.limit_for(request.operation) or request.prior_total_calls >= policy.budget.total_calls:
+    if context.prior_receipt_digest is None:
+        if prior_receipt is not None:
+            return CanaryDecision(False, "Canary prior receipt conflicts with selection state", policy.policy_digest, "preserve-for-owner")
+        prior_operation_calls = prior_total_calls = 0
+    else:
+        if type(prior_receipt) is not BoundedCanaryReceipt:
+            return CanaryDecision(False, "Canary prior receipt is unavailable", policy.policy_digest, "preserve-for-owner")
+        try:
+            prior_receipt.validate_for(policy)
+        except CanaryPolicyError:
+            return CanaryDecision(False, "Canary prior receipt has drifted or is not bound to policy", policy.policy_digest, "preserve-for-owner")
+        if prior_receipt.receipt_digest != context.prior_receipt_digest:
+            return CanaryDecision(False, "Canary prior receipt conflicts with selection state", policy.policy_digest, "preserve-for-owner")
+        if prior_receipt.result is not CanaryResult.PASS:
+            return CanaryDecision(False, "Canary prior receipt does not permit a subsequent mutation", policy.policy_digest, "preserve-for-owner")
+        counts = dict(prior_receipt.operation_counts)
+        prior_operation_calls = counts[request.operation]
+        prior_total_calls = sum(counts.values())
+    if prior_operation_calls >= policy.budget.limit_for(request.operation) or prior_total_calls >= policy.budget.total_calls:
         return CanaryDecision(False, "Canary call budget is exhausted", policy.policy_digest, "preserve-for-owner")
     return decision
 
@@ -329,7 +359,7 @@ def parse_bounded_canary_policy(contents: bytes | str) -> BoundedCanaryPolicy:
     try:
         raw = json.loads(contents, object_pairs_hook=_reject_duplicates)
         required = {"schema", "base_sha", "candidate_sha", "phase", "leaf_number", "target", "branch", "allowed_paths", "requested_operations", "budget", "rollback"}
-        if type(raw) is not dict or set(raw) != required or type(raw["target"]) is not dict or set(raw["target"]) != {"repository", "baseline_sha", "leaf_number"} or type(raw["budget"]) is not dict or set(raw["budget"]) != {"per_operation", "total_calls"} or type(raw["budget"]["per_operation"]) is not dict or type(raw["rollback"]) is not dict or set(raw["rollback"]) != {"rollback_trigger", "kill_switch", "semantic_readback"}:
+        if type(raw) is not dict or set(raw) != required or type(raw["target"]) is not dict or set(raw["target"]) != {"repository", "baseline_sha", "leaf_number"} or type(raw["budget"]) is not dict or set(raw["budget"]) != {"per_operation", "total_calls"} or type(raw["budget"]["per_operation"]) is not dict or type(raw["rollback"]) is not dict or set(raw["rollback"]) != {"rollback_trigger", "kill_switch", "semantic_readback"} or type(raw["allowed_paths"]) is not list or any(type(path) is not str for path in raw["allowed_paths"]):
             raise ValueError
         operations = raw["requested_operations"]
         if type(operations) is not list or any(type(value) is not str for value in operations):

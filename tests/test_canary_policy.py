@@ -37,8 +37,8 @@ def policy() -> BoundedCanaryPolicy:
     )
 
 
-def context(value: BoundedCanaryPolicy) -> CanaryAuthorityContext:
-    return CanaryAuthorityContext(True, True, value.phase, value.leaf_number, FORWARD_TEST_ROUTE, value.base_sha, value.candidate_sha, value.target, value.policy_digest, value.branch)
+def context(value: BoundedCanaryPolicy, *, prior_receipt: BoundedCanaryReceipt | None = None) -> CanaryAuthorityContext:
+    return CanaryAuthorityContext(True, True, True, value.phase, value.leaf_number, FORWARD_TEST_ROUTE, value.base_sha, value.candidate_sha, value.target, value.policy_digest, value.branch, prior_receipt.receipt_digest if prior_receipt is not None else None)
 
 
 class BoundedCanaryPolicyTests(unittest.TestCase):
@@ -58,6 +58,7 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         contract = policy()
         cases = (
             replace(context(contract), roundlet_enabled=False),
+            replace(context(contract), read_only_external_validation_allowed=False),
             replace(context(contract), disposable_target_mutation_allowed=False),
             replace(context(contract), kill_switch_active=True),
             replace(context(contract), phase=3),
@@ -95,18 +96,43 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
 
     def test_each_broker_request_requires_exact_branch_path_operation_and_budget(self) -> None:
         contract = policy()
-        exact = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",), 0, 0)
-        self.assertTrue(authorize_canary_request(contract, context(contract), exact).authorized)
+        exact = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
+        self.assertTrue(authorize_canary_request(contract, context(contract), exact, None).authorized)
         invalid = (
             replace(exact, operation=GitHubMutationOperation.MARK_READY),
             replace(exact, branch="roundlet/wrong-branch"),
             replace(exact, paths=("canary/other.txt",)),
-            replace(exact, prior_operation_calls=1),
-            replace(exact, prior_total_calls=2),
         )
         for request in invalid:
             with self.subTest(request=request):
-                self.assertFalse(authorize_canary_request(contract, context(contract), request).authorized)
+                self.assertFalse(authorize_canary_request(contract, context(contract), request, None).authorized)
+
+    def test_subsequent_request_requires_the_exact_prior_receipt_and_derives_budget(self) -> None:
+        contract = policy()
+        prior = BoundedCanaryReceipt(
+            contract, CanaryResult.PASS,
+            ((GitHubMutationOperation.CREATE_BRANCH, 1), (GitHubMutationOperation.DELETE_BRANCH, 0)),
+            DIGEST,
+        )
+        next_request = CanaryMutationRequest(GitHubMutationOperation.DELETE_BRANCH, contract.branch, ("canary/probe.txt",))
+        self.assertTrue(authorize_canary_request(contract, context(contract, prior_receipt=prior), next_request, prior).authorized)
+        self.assertFalse(authorize_canary_request(contract, context(contract, prior_receipt=prior), next_request, None).authorized)
+        exhausted = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
+        self.assertFalse(authorize_canary_request(contract, context(contract, prior_receipt=prior), exhausted, prior).authorized)
+        self.assertFalse(authorize_canary_request(contract, replace(context(contract, prior_receipt=prior), prior_receipt_digest="sha256:" + "e" * 64), next_request, prior).authorized)
+        wrong_target_policy = BoundedCanaryPolicy(
+            BASE, "e" * 40, 4, 87,
+            CanaryTarget("ythdelmar68/another-target", TARGET_BASE, 96),
+            contract.branch, contract.allowed_paths, contract.requested_operations, contract.budget, contract.rollback,
+        )
+        wrong_receipt = BoundedCanaryReceipt(
+            wrong_target_policy, CanaryResult.PASS,
+            ((GitHubMutationOperation.CREATE_BRANCH, 1), (GitHubMutationOperation.DELETE_BRANCH, 0)),
+            DIGEST,
+        )
+        self.assertFalse(authorize_canary_request(contract, replace(context(contract), prior_receipt_digest=wrong_receipt.receipt_digest), next_request, wrong_receipt).authorized)
+        object.__setattr__(prior, "semantic_readback_digest", "sha256:" + "e" * 64)
+        self.assertFalse(authorize_canary_request(contract, context(contract, prior_receipt=prior), next_request, prior).authorized)
 
     def test_parser_rejects_unknown_duplicate_and_silent_operation_substitution(self) -> None:
         contract = policy()
@@ -123,6 +149,12 @@ class BoundedCanaryPolicyTests(unittest.TestCase):
         duplicate = '{"schema":"roundwright-bounded-canary-policy/v1","schema":"roundwright-bounded-canary-policy/v1"}'
         with self.assertRaises(CanaryPolicyError):
             parse_bounded_canary_policy(duplicate)
+        for value in ("ab", {"canary/probe.txt": True}, None):
+            with self.subTest(value=value):
+                raw = contract.public_payload(include_digest=False)
+                raw["allowed_paths"] = value
+                with self.assertRaises(CanaryPolicyError):
+                    parse_bounded_canary_policy(json.dumps(raw))
 
 
 if __name__ == "__main__":

@@ -61,6 +61,22 @@ def gate_source(kind: QualificationGateKind, candidate_sha: str, case_id: str, e
     return value | {"receipt_digest": canonical(value)}
 
 
+def final_repair_source(candidate_sha: str, supervisor_candidate_sha: str, case_id: str, identity: int) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema": "roundwright-formal-review-final-repair-receipt/v1",
+        "candidate_sha": candidate_sha, "resulting_candidate_sha": candidate_sha,
+        "supervisor_candidate_sha": supervisor_candidate_sha, "case_id": case_id,
+        "review_epoch": 1, "review_round": 10, "review_mode": "CONVERGING",
+        "formal_result": "accepted", "supervisor_verdict": "FINDINGS",
+        "supervisor_result_identity": digest(identity), "final_repair_handoff_identity": digest(identity + 1),
+        "terminal_receipt_identity": digest(identity + 2), "worker_identity": digest(identity + 3),
+        "configuration_identity": digest(identity + 4), "review_policy_identity": digest(identity + 5),
+        "candidate_lineage_identity": digest(identity + 6),
+        "terminal_state": "REVIEW_LIMIT_REACHED_WORKER_FINALIZED",
+    }
+    return value | {"receipt_digest": canonical(value)}
+
+
 _FIXTURES = Path(__file__).with_name("fixtures")
 
 
@@ -240,6 +256,93 @@ class Phase3QualificationGateTests(unittest.TestCase):
                 QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
                 "issue-51-qualification", 1, 1, "COMPLETE", "pass", missing_verdict,
             )
+
+    def test_round_ten_final_repair_source_is_a_distinct_valid_formal_path(self) -> None:
+        supervisor_candidate = "b" * 40
+        formal = final_repair_source(self.qualification_candidate, supervisor_candidate, "issue-51-qualification", 150)
+        authority = QualificationGateAuthority((
+            formal,
+            *(gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 10, digest(160 + index))
+              for index, kind in enumerate(tuple(QualificationGateKind)[1:])),
+        ))
+        current_gates = QualificationGateReceiptSet(tuple(
+            QualificationGateReceipt(kind, self.qualification_candidate, "issue-51-qualification", 1, 10, "CONVERGING", "pass", source)
+            for kind, source in zip(QualificationGateKind, authority.receipts, strict=True)
+        ))
+        inputs = self.inputs(
+            qualification_review_round=10, qualification_review_mode="CONVERGING", current_gate_receipts=current_gates,
+        )
+        self.assertEqual(assess_phase_3_qualification(inputs, authority).disposition, PROMOTION_READY_FOR_CANARY_DECISION)
+
+    def test_round_ten_final_repair_source_rejects_ambiguous_or_drifted_bindings(self) -> None:
+        source = final_repair_source(self.qualification_candidate, "b" * 40, "issue-51-qualification", 180)
+
+        def rebuilt(**changes: object) -> dict[str, object]:
+            value = {key: item for key, item in source.items() if key != "receipt_digest"}
+            value.update(changes)
+            return value | {"receipt_digest": canonical(value)}
+
+        def missing(field: str) -> dict[str, object]:
+            value = {key: item for key, item in source.items() if key not in {"receipt_digest", field}}
+            return value | {"receipt_digest": canonical(value)}
+
+        invalid = (
+            *(missing(field) for field in (
+                "candidate_sha", "resulting_candidate_sha", "supervisor_candidate_sha", "case_id",
+                "review_epoch", "review_round", "review_mode", "formal_result", "supervisor_verdict",
+                "supervisor_result_identity", "final_repair_handoff_identity", "terminal_receipt_identity",
+                "worker_identity", "configuration_identity", "review_policy_identity", "candidate_lineage_identity",
+                "terminal_state",
+            )),
+            rebuilt(candidate_sha="d" * 40),
+            rebuilt(resulting_candidate_sha="d" * 40),
+            rebuilt(supervisor_candidate_sha=self.qualification_candidate),
+            rebuilt(review_epoch=2),
+            rebuilt(review_round=9, review_mode="CONVERGING"),
+            rebuilt(review_mode="COMPLETE"),
+            rebuilt(supervisor_result_identity="sha256:" + "z" * 64),
+            rebuilt(final_repair_handoff_identity="sha256:" + "z" * 64),
+            rebuilt(supervisor_verdict="PASS"),
+            {"schema": source["schema"], "candidate_sha": self.qualification_candidate,
+             "review_epoch": 1, "review_round": 10, "review_mode": "CONVERGING",
+             "terminal_state": "REVIEW_LIMIT_REACHED_WORKER_FINALIZED", "receipt_digest": digest(199)},
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(QualificationGateError):
+                    QualificationGateReceipt(
+                        QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                        "issue-51-qualification", 1, 10, "CONVERGING", "pass", value,
+                    )
+
+        authority = QualificationGateAuthority((
+            source,
+            *(gate_source(kind, self.qualification_candidate, "issue-51-qualification", 1, 10, digest(220 + index))
+              for index, kind in enumerate(tuple(QualificationGateKind)[1:])),
+        ))
+        for field, value in (
+            ("supervisor_candidate_sha", "e" * 40),
+            ("supervisor_result_identity", digest(230)),
+            ("final_repair_handoff_identity", digest(231)),
+            ("terminal_receipt_identity", digest(232)),
+            ("worker_identity", digest(233)),
+            ("configuration_identity", digest(234)),
+            ("review_policy_identity", digest(235)),
+            ("candidate_lineage_identity", digest(236)),
+        ):
+            with self.subTest(substituted_field=field):
+                substituted = rebuilt(**{field: value})
+                receipts = QualificationGateReceiptSet((
+                    QualificationGateReceipt(
+                        QualificationGateKind.FORMAL_REVIEW, self.qualification_candidate,
+                        "issue-51-qualification", 1, 10, "CONVERGING", "pass", substituted,
+                    ),
+                    *(QualificationGateReceipt(
+                        kind, self.qualification_candidate, "issue-51-qualification", 1, 10, "CONVERGING", "pass", receipt,
+                    ) for kind, receipt in zip(tuple(QualificationGateKind)[1:], authority.receipts[1:], strict=True)),
+                ))
+                with self.assertRaises(QualificationGateError):
+                    receipts.validate_for(self.qualification_candidate, "issue-51-qualification", authority)
 
     def test_review_epoch_round_modes_are_bounded_and_exact(self) -> None:
         for round_, mode in ((1, "COMPLETE"), (3, "COMPLETE"), (4, "CONVERGING"), (10, "CONVERGING")):

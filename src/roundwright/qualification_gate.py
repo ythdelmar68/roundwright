@@ -66,6 +66,8 @@ _GATE_RECEIPT_SCHEMAS = {
     QualificationGateKind.POLICY: "roundwright-policy-receipt/v1",
     QualificationGateKind.PROVENANCE: "roundwright-provenance-receipt/v1",
 }
+_FINAL_REPAIR_FORMAL_REVIEW_SCHEMA = "roundwright-formal-review-final-repair-receipt/v1"
+_REVIEW_LIMIT_FINALIZED = "REVIEW_LIMIT_REACHED_WORKER_FINALIZED"
 
 
 def _review_mode_for(epoch: object, round_: object) -> Literal["COMPLETE", "CONVERGING"]:
@@ -102,10 +104,6 @@ def _validated_gate_source_receipt(
         if review_mode != _review_mode_for(review_epoch, review_round):
             raise ValueError
         required = {
-            QualificationGateKind.FORMAL_REVIEW: {
-                "schema", "candidate_sha", "case_id", "review_epoch", "review_round", "review_mode",
-                "formal_result", "supervisor_verdict", "supervisor_result_identity", "receipt_digest",
-            },
             QualificationGateKind.HOSTED_CHECKS: {
                 "schema", "candidate_sha", "case_id", "review_epoch", "review_round", "review_mode",
                 "head_sha", "check_run_identity", "conclusion", "receipt_digest",
@@ -118,18 +116,50 @@ def _validated_gate_source_receipt(
                 "schema", "candidate_sha", "case_id", "review_epoch", "review_round", "review_mode",
                 "source_sha", "provenance_manifest_digest", "verification", "receipt_digest",
             },
-        }[kind]
-        if set(receipt) != required or receipt["schema"] != _GATE_RECEIPT_SCHEMAS[kind] or any(receipt[key] != value for key, value in common.items()):
-            raise ValueError
+        }[kind] if kind is not QualificationGateKind.FORMAL_REVIEW else set()
         if kind is QualificationGateKind.FORMAL_REVIEW:
-            valid = (receipt["formal_result"] == "accepted" and receipt["supervisor_verdict"] == "PASS"
-                     and _DIGEST.fullmatch(str(receipt["supervisor_result_identity"])) is not None)
-        elif kind is QualificationGateKind.HOSTED_CHECKS:
-            valid = receipt["head_sha"] == candidate_sha and receipt["conclusion"] == "success" and _DIGEST.fullmatch(str(receipt["check_run_identity"])) is not None
-        elif kind is QualificationGateKind.POLICY:
-            valid = receipt["policy_outcome"] == "pass" and _DIGEST.fullmatch(str(receipt["policy_snapshot_digest"])) is not None
+            pass_required = {
+                "schema", "candidate_sha", "case_id", "review_epoch", "review_round", "review_mode",
+                "formal_result", "supervisor_verdict", "supervisor_result_identity", "receipt_digest",
+            }
+            final_repair_required = pass_required | {
+                "supervisor_candidate_sha", "resulting_candidate_sha", "final_repair_handoff_identity",
+                "terminal_receipt_identity", "worker_identity", "configuration_identity",
+                "review_policy_identity", "candidate_lineage_identity", "terminal_state",
+            }
+            if any(receipt[key] != value for key, value in common.items()):
+                raise ValueError
+            if receipt["schema"] == _GATE_RECEIPT_SCHEMAS[kind]:
+                valid = (
+                    set(receipt) == pass_required and receipt["formal_result"] == "accepted"
+                    and receipt["supervisor_verdict"] == "PASS"
+                    and _DIGEST.fullmatch(str(receipt["supervisor_result_identity"])) is not None
+                )
+            elif receipt["schema"] == _FINAL_REPAIR_FORMAL_REVIEW_SCHEMA:
+                valid = (
+                    set(receipt) == final_repair_required and receipt["formal_result"] == "accepted"
+                    and receipt["supervisor_verdict"] == "FINDINGS"
+                    and receipt["review_epoch"] == 1 and receipt["review_round"] == 10 and receipt["review_mode"] == "CONVERGING"
+                    and receipt["resulting_candidate_sha"] == candidate_sha
+                    and _SHA.fullmatch(str(receipt["supervisor_candidate_sha"])) is not None
+                    and receipt["supervisor_candidate_sha"] != candidate_sha
+                    and receipt["terminal_state"] == _REVIEW_LIMIT_FINALIZED
+                    and all(_DIGEST.fullmatch(str(receipt[key])) is not None for key in (
+                        "supervisor_result_identity", "final_repair_handoff_identity", "terminal_receipt_identity",
+                        "worker_identity", "configuration_identity", "review_policy_identity", "candidate_lineage_identity",
+                    ))
+                )
+            else:
+                valid = False
         else:
-            valid = receipt["source_sha"] == candidate_sha and receipt["verification"] == "pass" and _DIGEST.fullmatch(str(receipt["provenance_manifest_digest"])) is not None
+            if set(receipt) != required or receipt["schema"] != _GATE_RECEIPT_SCHEMAS[kind] or any(receipt[key] != value for key, value in common.items()):
+                raise ValueError
+            if kind is QualificationGateKind.HOSTED_CHECKS:
+                valid = receipt["head_sha"] == candidate_sha and receipt["conclusion"] == "success" and _DIGEST.fullmatch(str(receipt["check_run_identity"])) is not None
+            elif kind is QualificationGateKind.POLICY:
+                valid = receipt["policy_outcome"] == "pass" and _DIGEST.fullmatch(str(receipt["policy_snapshot_digest"])) is not None
+            else:
+                valid = receipt["source_sha"] == candidate_sha and receipt["verification"] == "pass" and _DIGEST.fullmatch(str(receipt["provenance_manifest_digest"])) is not None
         if not valid:
             raise ValueError
     except (AttributeError, KeyError, TypeError, ValueError, QualificationGateError) as error:
@@ -143,7 +173,16 @@ def _qualification_result_from_source(
     kind: QualificationGateKind, source_receipt: dict[str, object],
 ) -> Literal["pass"]:
     if kind is QualificationGateKind.FORMAL_REVIEW:
-        if (source_receipt.get("formal_result"), source_receipt.get("supervisor_verdict")) != ("accepted", "PASS"):
+        pass_source = (
+            source_receipt.get("schema") == _GATE_RECEIPT_SCHEMAS[kind]
+            and (source_receipt.get("formal_result"), source_receipt.get("supervisor_verdict")) == ("accepted", "PASS")
+        )
+        final_repair_source = (
+            source_receipt.get("schema") == _FINAL_REPAIR_FORMAL_REVIEW_SCHEMA
+            and (source_receipt.get("formal_result"), source_receipt.get("supervisor_verdict")) == ("accepted", "FINDINGS")
+            and source_receipt.get("terminal_state") == _REVIEW_LIMIT_FINALIZED
+        )
+        if not (pass_source or final_repair_source):
             raise QualificationGateError("formal review source does not authorize a passing gate")
     return "pass"
 

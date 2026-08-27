@@ -19,6 +19,8 @@ from roundwright.deployment_handoff import (
     DeploymentAuthorityHandoffReceipt,
     DeploymentAuthorityIdentity,
     DeploymentAuthorityReceiptVerification,
+    HandoffRecoveryClaim,
+    HandoffRecoveryStatus,
     HandoffPhase,
     HandoffReconciliation,
     InMemoryDeploymentAuthorityStore,
@@ -67,6 +69,12 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
         return HandoffReconciliation(
             fingerprint(handoff), fingerprint(old), self.store.state_store_fingerprint, self.state_id,
             True, True, True, fingerprint("8"),
+        )
+
+    def recovery(self, old: DeploymentAuthorityHandoffReceipt, *, status: HandoffRecoveryStatus = HandoffRecoveryStatus.STALE_OWNER) -> HandoffRecoveryClaim:
+        return HandoffRecoveryClaim(
+            fingerprint("6"), fingerprint("9"), old.receipt_fingerprint, old.binding_digest,
+            self.store.state_store_fingerprint, self.state_id, status,
         )
 
     def test_concurrent_initial_acquisition_has_exactly_one_active_authority(self) -> None:
@@ -123,10 +131,14 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
         old, new = self.receipt(old_identity), self.receipt(new_identity, "e")
         handoff = fingerprint("9")
         self.coordinator.activate_initial(old, self.verification(old), now=self.now)
+        self.coordinator.claim_orchestrator(old, now=self.now)
         self.coordinator.begin_handoff(old, new_identity, handoff_fingerprint=handoff)
         restarted = DeploymentAuthorityHandoffCoordinator(self.store)
         self.assertEqual(restarted.progress.phase, HandoffPhase.STOPPING)  # type: ignore[union-attr]
         self.assertFalse(restarted.authorize(old_identity, old, now=self.now).authorized)
+        self.assertFalse(restarted.reconcile(self.reconciliation()).authorized)
+        self.assertTrue(restarted.recover_handoff(self.recovery(old)).authorized)
+        self.assertFalse(DeploymentAuthorityHandoffCoordinator(self.store).recover_handoff(self.recovery(old)).authorized)
         self.assertTrue(restarted.reconcile(self.reconciliation()).authorized)
         self.assertTrue(restarted.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
         self.assertTrue(restarted.issue_new_receipt(new, self.verification(new), handoff_fingerprint=handoff, now=self.now).authorized)
@@ -140,7 +152,9 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
         self.assertTrue(self.coordinator.activate_initial(stale, self.verification(stale), now=self.now - timedelta(seconds=30)).authorized)
         self.assertFalse(self.coordinator.authorize(old_identity, stale, now=self.now).authorized)
         handoff = fingerprint("9")
-        self.assertTrue(self.coordinator.begin_handoff(stale, new_identity, handoff_fingerprint=handoff).authorized)
+        self.assertTrue(self.coordinator.begin_handoff(
+            stale, new_identity, handoff_fingerprint=handoff, recovery_claim=self.recovery(stale),
+        ).authorized)
         self.assertTrue(self.coordinator.reconcile(self.reconciliation()).authorized)
         self.assertTrue(self.coordinator.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
         self.assertTrue(self.coordinator.issue_new_receipt(new, self.verification(new), handoff_fingerprint=handoff, now=self.now).authorized)
@@ -158,6 +172,26 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
                 store = InMemoryDeploymentAuthorityStore(fingerprint("c"), self.state_id)
                 coordinator = DeploymentAuthorityHandoffCoordinator(store)
                 self.assertFalse(coordinator.activate_initial(receipt, self.verification(receipt, status=status), now=self.now).authorized)
+
+    def test_denied_claimant_cannot_take_over_or_advance_a_same_store_handoff(self) -> None:
+        old_identity, new_identity = self.identity(), self.identity(candidate="b")
+        old, new = self.receipt(old_identity), self.receipt(new_identity, "e")
+        handoff = fingerprint("9")
+        self.assertTrue(self.coordinator.activate_initial(old, self.verification(old), now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(old, now=self.now).authorized)
+        denied = DeploymentAuthorityHandoffCoordinator(self.store)
+        self.assertFalse(denied.claim_orchestrator(old, now=self.now).authorized)
+        self.assertFalse(denied.begin_handoff(old, new_identity, handoff_fingerprint=handoff).authorized)
+        self.assertTrue(self.coordinator.begin_handoff(old, new_identity, handoff_fingerprint=handoff).authorized)
+        self.assertFalse(denied.reconcile(self.reconciliation()).authorized)
+        self.assertFalse(denied.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
+        self.assertFalse(denied.issue_new_receipt(new, self.verification(new), handoff_fingerprint=handoff, now=self.now).authorized)
+        self.assertFalse(denied.recover_handoff(self.recovery(old, status=HandoffRecoveryStatus.MISSING)).authorized)
+        self.assertTrue(self.coordinator.reconcile(self.reconciliation()).authorized)
+        self.assertTrue(self.coordinator.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
+        self.assertTrue(self.coordinator.issue_new_receipt(new, self.verification(new), handoff_fingerprint=handoff, now=self.now).authorized)
+        self.assertFalse(denied.claim_orchestrator(new, now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(new, now=self.now).authorized)
 
 
 if __name__ == "__main__":

@@ -261,6 +261,7 @@ class CanaryExecutionLedger:
         self._chain: list[BoundedCanaryReceipt] = [genesis_canary_receipt(policy)]
         self._records: dict[str, _TransitionRecord] = {}
         self._lock = RLock()
+        self._hydrated = False
 
     def chain(self) -> tuple[BoundedCanaryReceipt, ...]:
         with self._lock:
@@ -269,6 +270,12 @@ class CanaryExecutionLedger:
     @property
     def policy_digest(self) -> str:
         return self._policy.policy_digest
+
+    @property
+    def requires_retry_lease_proof(self) -> bool:
+        """A replacement coordinator must re-establish the original fence."""
+
+        return self._hydrated
 
     def record(self, claim_digest: str) -> _TransitionRecord | None:
         _require_digest(claim_digest, "Canary claim digest")
@@ -461,6 +468,7 @@ class CanaryExecutionLedger:
             ledger = cls(policy)
             ledger._chain = list(chain)
             ledger._records = records
+            ledger._hydrated = True
             if chain[-1].predecessor_receipt_digest is not None:
                 ledger.predecessor()
             return ledger
@@ -533,10 +541,69 @@ class CanaryExecutionLedger:
             ]
             if len(candidates) != 1 or candidates[0].authorization.claim_digest in matched:
                 raise ValueError
-            matched.add(candidates[0].authorization.claim_digest)
+            record = candidates[0]
+            CanaryExecutionLedger._require_hydrated_policy_authorization(policy, record, previous)
+            if record.purpose is not CanaryTransitionPurpose.EXECUTE:
+                previous_record = next(
+                    (item for item in verified if item.canary_receipt is previous), None,
+                )
+                if (
+                    previous_record is None
+                    or record.predecessor_transition_receipt_digest != previous_record.receipt.receipt_digest
+                    or record.pre_state_readback_digest is None
+                    or record.request.operation is not _cleanup_action_for(previous_record.request.operation)
+                    or record.request.branch != previous_record.request.branch
+                    or record.request.paths != previous_record.request.paths
+                ):
+                    raise ValueError
+            matched.add(record.authorization.claim_digest)
             previous = receipt
         if len(matched) != len(verified):
             raise ValueError
+        for record in records.values():
+            predecessor = next(
+                (receipt for receipt in chain if receipt.receipt_digest == record.authorization.receipt_chain_head_digest),
+                None,
+            )
+            if predecessor is None:
+                raise ValueError
+            CanaryExecutionLedger._require_hydrated_policy_authorization(policy, record, predecessor)
+            if record.purpose is not CanaryTransitionPurpose.EXECUTE:
+                previous_record = next(
+                    (item for item in verified if item.canary_receipt is predecessor), None,
+                )
+                if (
+                    previous_record is None
+                    or record.predecessor_transition_receipt_digest != previous_record.receipt.receipt_digest
+                    or record.pre_state_readback_digest is None
+                    or record.request.operation is not _cleanup_action_for(previous_record.request.operation)
+                    or record.request.branch != previous_record.request.branch
+                    or record.request.paths != previous_record.request.paths
+                ):
+                    raise ValueError
+
+    @staticmethod
+    def _require_hydrated_policy_authorization(
+        policy: BoundedCanaryPolicy, record: _TransitionRecord,
+        predecessor: BoundedCanaryReceipt,
+    ) -> None:
+        """Reject self-consistent records that are outside the selected policy."""
+
+        request, authorization = record.request, record.authorization
+        expected = CanaryAuthorization(
+            policy.policy_digest, policy.contract_digest, request.request_digest,
+            predecessor.receipt_digest,
+        )
+        if (
+            request.operation not in policy.requested_operations
+            or request.branch != policy.branch
+            or any(path not in policy.allowed_paths for path in request.paths)
+            or authorization != expected
+        ):
+            raise ValueError
+        if record.purpose is CanaryTransitionPurpose.EXECUTE:
+            if record.predecessor_transition_receipt_digest is not None or record.pre_state_readback_digest is not None:
+                raise ValueError
 
     @staticmethod
     def _hydrate_record(
@@ -747,6 +814,19 @@ class CanaryOrchestrator:
             return CanaryExecutionResult(CanaryDecision(False, "Canary retry evidence has drifted", decision.policy_digest, "preserve-for-owner"), record.receipt, record.canary_receipt)
         if record.state is not CanaryTransitionState.RETRY_ALLOWED:
             return CanaryExecutionResult(CanaryDecision(False, "Canary retry requires an absent semantic read-back", decision.policy_digest, "preserve-for-owner"), record.receipt, None)
+        if self._ledger.requires_retry_lease_proof:
+            try:
+                owns_fence = self._lease.claim(
+                    record.authorization.consumption_key, record.authorization.claim_digest,
+                )
+            except Exception:
+                owns_fence = False
+            if not owns_fence:
+                record = self._ledger.update(record, CanaryTransitionState.PRESERVED_FOR_OWNER)
+                return CanaryExecutionResult(
+                    CanaryDecision(False, "replacement Orchestrator cannot prove the original retry fence", decision.policy_digest, "preserve-for-owner"),
+                    record.receipt, None,
+                )
         if not self._ledger.consume_retry(record):
             return CanaryExecutionResult(CanaryDecision(False, "Canary retry budget is exhausted", decision.policy_digest, "preserve-for-owner"), record.receipt, None)
         return self._dispatch(decision, record)

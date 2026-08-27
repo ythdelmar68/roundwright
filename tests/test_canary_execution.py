@@ -12,13 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.canary_execution import (
-    CanaryDispatchResult, CanaryExecutionError, CanaryExecutionLedger, CanaryOrchestrator,
+    CanaryDispatchResult, CanaryExecutionError, CanaryExecutionLedger, CanaryExecutionReceipt, CanaryOrchestrator,
     CanaryReadbackState, CanarySemanticReadback, CanaryTransitionPurpose,
     CanaryTransitionState,
 )
 from roundwright.canary_policy import (
     BoundedCanaryPolicy, CanaryAuthorityContext, CanaryBudget, CanaryRollbackPlan,
-    CanaryMutationRequest, CanaryTarget, FORWARD_TEST_ROUTE,
+    CanaryAuthorization, CanaryMutationRequest, CanaryTarget, FORWARD_TEST_ROUTE,
     canary_target_policy_identity, genesis_canary_receipt,
 )
 from roundwright.github import GitHubMutationOperation
@@ -290,10 +290,55 @@ class CanaryExecutionTests(unittest.TestCase):
         unknown_count["chain"][1]["operation_counts"]["unknown-operation"] = 0
         duplicate_record = copy.deepcopy(state)
         duplicate_record["records"].append(copy.deepcopy(duplicate_record["records"][0]))
-        for mutated in (missing, unknown_count, duplicate_record):
+        out_of_policy = copy.deepcopy(state)
+        invalid_request = CanaryMutationRequest(
+            GitHubMutationOperation.CREATE_BRANCH, "roundlet/out-of-policy", ("outside/policy.txt",),
+        )
+        head = genesis(self.policy)
+        invalid_authorization = CanaryAuthorization(
+            self.policy.policy_digest, self.policy.contract_digest, invalid_request.request_digest, head.receipt_digest,
+        )
+        original = out_of_policy["records"][0]
+        invalid_receipt = CanaryExecutionReceipt(
+            invalid_authorization.policy_digest, invalid_authorization.contract_digest,
+            invalid_authorization.claim_digest, invalid_authorization.request_digest,
+            invalid_authorization.receipt_chain_head_digest, CanaryTransitionPurpose.EXECUTE,
+            CanaryTransitionState.VERIFIED, original["receipt"]["semantic_readback_digest"],
+            original["canary_receipt_digest"],
+        )
+        out_of_policy["records"][0] = {
+            **original,
+            "authorization": {
+                "policy_digest": invalid_authorization.policy_digest,
+                "contract_digest": invalid_authorization.contract_digest,
+                "request_digest": invalid_authorization.request_digest,
+                "receipt_chain_head_digest": invalid_authorization.receipt_chain_head_digest,
+            },
+            "request": {
+                "operation": invalid_request.operation.value,
+                "branch": invalid_request.branch,
+                "paths": list(invalid_request.paths),
+            },
+            "receipt": invalid_receipt.public_payload(),
+        }
+        for mutated in (missing, unknown_count, duplicate_record, out_of_policy):
             with self.subTest(mutated=mutated):
                 with self.assertRaises(CanaryExecutionError):
                     CanaryExecutionLedger.hydrate(self.policy, mutated)
+
+    def test_rehydrated_retry_requires_a_fresh_lease_fence_before_dispatch(self) -> None:
+        initial_broker = FakeBroker(readback(CanaryReadbackState.ABSENT, "a"), accepted=False)
+        initial = self.orchestrator(initial_broker)
+        pending = initial.execute(self.request)
+        ledger = CanaryExecutionLedger.hydrate(self.policy, initial.ledger.sealed_state())
+        denying_lease, replacement_broker = FakeLease(claimed=False), FakeBroker()
+        replacement = CanaryOrchestrator(
+            self.policy, context(self.policy, ledger.chain()), denying_lease, replacement_broker, ledger=ledger,
+        )
+        denied = replacement.retry(pending.receipt.claim_digest)  # type: ignore[union-attr]
+        self.assertEqual(denied.receipt.state, CanaryTransitionState.PRESERVED_FOR_OWNER)  # type: ignore[union-attr]
+        self.assertEqual(len(denying_lease.calls), 1)
+        self.assertEqual(replacement_broker.dispatches, [])
 
     def test_absent_after_consumed_retry_is_preserved_for_owner(self) -> None:
         broker = FakeBroker(

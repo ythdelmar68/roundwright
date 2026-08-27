@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+import sys
 import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.canary_execution import (
     CanaryDispatchResult, CanaryExecutionLedger, CanaryOrchestrator,

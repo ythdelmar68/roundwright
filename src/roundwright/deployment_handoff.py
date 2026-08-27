@@ -229,9 +229,14 @@ class HandoffRecoveryClaim:
     handoff_fingerprint: str
     old_receipt_fingerprint: str
     receipt_binding_digest: str
+    prior_owner_claim_fingerprint: str
+    prior_owner_claim_generation: int
+    replacement_owner_claim_fingerprint: str
     state_store_fingerprint: str
     state_id: UUID
     status: HandoffRecoveryStatus
+    observed_at: datetime
+    expires_at: datetime
 
     def __post_init__(self) -> None:
         for value, description in (
@@ -239,11 +244,22 @@ class HandoffRecoveryClaim:
             (self.handoff_fingerprint, "handoff recovery"),
             (self.old_receipt_fingerprint, "recovery old receipt"),
             (self.receipt_binding_digest, "recovery receipt binding"),
+            (self.prior_owner_claim_fingerprint, "recovery prior owner claim"),
+            (self.replacement_owner_claim_fingerprint, "recovery replacement owner claim"),
             (self.state_store_fingerprint, "recovery state store"),
         ):
             _require_fingerprint(value, description)
-        if type(self.state_id) is not UUID or type(self.status) is not HandoffRecoveryStatus:
+        if (
+            type(self.state_id) is not UUID
+            or type(self.status) is not HandoffRecoveryStatus
+            or type(self.prior_owner_claim_generation) is not int
+            or self.prior_owner_claim_generation < 1
+        ):
             raise DeploymentHandoffError("handoff recovery claim is invalid")
+        _require_utc(self.observed_at, "handoff recovery observation time")
+        _require_utc(self.expires_at, "handoff recovery expiry")
+        if self.expires_at <= self.observed_at:
+            raise DeploymentHandoffError("handoff recovery validity window is invalid")
 
 
 @dataclass(frozen=True)
@@ -255,15 +271,25 @@ class HandoffProgress:
     new_identity: DeploymentAuthorityIdentity
     phase: HandoffPhase
     reconciliation: HandoffReconciliation | None = None
-    recovery_evidence_fingerprint: str | None = None
+    owner_claim_fingerprint: str = ""
+    owner_claim_generation: int = 0
+    consumed_recovery_evidence_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_fingerprint(self.handoff_fingerprint, "handoff")
         _require_fingerprint(self.old_receipt_fingerprint, "old receipt")
         if type(self.new_identity) is not DeploymentAuthorityIdentity or type(self.phase) is not HandoffPhase:
             raise DeploymentHandoffError("handoff progress is invalid")
-        if self.recovery_evidence_fingerprint is not None:
-            _require_fingerprint(self.recovery_evidence_fingerprint, "handoff recovery evidence")
+        _require_fingerprint(self.owner_claim_fingerprint, "handoff owner claim")
+        if type(self.owner_claim_generation) is not int or self.owner_claim_generation < 1:
+            raise DeploymentHandoffError("handoff owner claim generation is invalid")
+        if (
+            type(self.consumed_recovery_evidence_fingerprints) is not tuple
+            or len(set(self.consumed_recovery_evidence_fingerprints)) != len(self.consumed_recovery_evidence_fingerprints)
+        ):
+            raise DeploymentHandoffError("handoff recovery evidence history is invalid")
+        for value in self.consumed_recovery_evidence_fingerprints:
+            _require_fingerprint(value, "handoff recovery evidence")
         if self.phase is HandoffPhase.STOPPING and self.reconciliation is not None:
             raise DeploymentHandoffError("stopping handoff cannot have reconciliation evidence")
         if self.phase is HandoffPhase.RECONCILED:
@@ -315,9 +341,14 @@ class InMemoryDeploymentAuthorityStore:
         self._claim_owner_token: object | None = None
         self._claim_receipt_fingerprint: str | None = None
         self._claim_binding_digest: str | None = None
+        self._claim_fingerprint: str | None = None
+        self._claim_generation = 0
         self._handoff_owner_token: object | None = None
         self._handoff_fingerprint: str | None = None
         self._handoff_binding_digest: str | None = None
+        self._handoff_owner_claim_fingerprint: str | None = None
+        self._handoff_owner_claim_generation: int | None = None
+        self._consumed_recovery_evidence_fingerprints: set[str] = set()
 
 
 class DeploymentAuthorityHandoffCoordinator:
@@ -366,7 +397,7 @@ class DeploymentAuthorityHandoffCoordinator:
             return HandoffDecision(True, "initial receipt is the sole active authority", receipt.receipt_fingerprint)
 
     def claim_orchestrator(
-        self, receipt: DeploymentAuthorityHandoffReceipt, *, now: datetime
+        self, receipt: DeploymentAuthorityHandoffReceipt, *, claim_fingerprint: str, now: datetime
     ) -> HandoffDecision:
         """Atomically bind one authenticated coordinator to the fresh receipt.
 
@@ -375,6 +406,7 @@ class DeploymentAuthorityHandoffCoordinator:
         before it can reach authorization or wakeup handling.
         """
 
+        _require_fingerprint(claim_fingerprint, "orchestrator claim")
         with self._store._lock:
             if self._store._progress is not None:
                 return HandoffDecision(False, "authority handoff is incomplete; no orchestrator may claim it")
@@ -386,8 +418,10 @@ class DeploymentAuthorityHandoffCoordinator:
                 self._store._claim_owner_token = self._claim_owner_token
                 self._store._claim_receipt_fingerprint = receipt.receipt_fingerprint
                 self._store._claim_binding_digest = receipt.binding_digest
+                self._store._claim_fingerprint = claim_fingerprint
+                self._store._claim_generation += 1
                 return HandoffDecision(True, "exclusive canonical orchestrator claim acquired", receipt.receipt_fingerprint)
-            if self._holds_claim(receipt):
+            if self._holds_claim(receipt, claim_fingerprint):
                 return HandoffDecision(True, "exclusive canonical orchestrator claim remains current", receipt.receipt_fingerprint)
             return HandoffDecision(False, "receipt is copied or conflicting; another orchestrator holds the canonical claim")
 
@@ -407,7 +441,7 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "receipt was revoked")
             if not _verification_matches(receipt, self._store._verification):
                 return HandoffDecision(False, "receipt lacks fresh canonical verification")
-            if not self._holds_claim(receipt):
+            if not self._holds_claim(receipt, self._store._claim_fingerprint):
                 return HandoffDecision(False, "receipt has no exclusive canonical orchestrator claim")
             if receipt.identity != identity:
                 return HandoffDecision(False, "receipt does not match deployment candidate or environment")
@@ -427,7 +461,7 @@ class DeploymentAuthorityHandoffCoordinator:
 
     def begin_handoff(
         self, old_receipt: DeploymentAuthorityHandoffReceipt, new_identity: DeploymentAuthorityIdentity, *,
-        handoff_fingerprint: str, recovery_claim: HandoffRecoveryClaim | None = None,
+        handoff_fingerprint: str, now: datetime, recovery_claim: HandoffRecoveryClaim | None = None,
     ) -> HandoffDecision:
         """Stop dispatch first and retain the only resumable handoff identity."""
 
@@ -437,8 +471,14 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "another handoff is already incomplete")
             if self._store._active != old_receipt or not self._receipt_names_this_store(old_receipt):
                 return HandoffDecision(False, "old receipt is not the active canonical authority")
-            if not self._holds_claim(old_receipt) and not _recovery_matches(
+            if not (
+                self._holds_claim(old_receipt, self._store._claim_fingerprint)
+                and _receipt_current(old_receipt, now)
+            ) and not _recovery_matches(
                 recovery_claim, handoff_fingerprint, old_receipt, self._store,
+                prior_owner_claim_fingerprint=self._store._claim_fingerprint,
+                prior_owner_claim_generation=self._store._claim_generation,
+                now=now,
             ):
                 return HandoffDecision(False, "old authority claim is unavailable and lacks stale-owner recovery verification")
             if not self._identity_names_this_store(new_identity):
@@ -449,16 +489,28 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "handoff must select a distinct candidate or environment")
             self._store._progress = HandoffProgress(
                 handoff_fingerprint, old_receipt.receipt_fingerprint, new_identity, HandoffPhase.STOPPING,
-                recovery_evidence_fingerprint=(
-                    recovery_claim.evidence_fingerprint if recovery_claim is not None else None
+                owner_claim_fingerprint=(
+                    recovery_claim.replacement_owner_claim_fingerprint
+                    if recovery_claim is not None else self._store._claim_fingerprint
+                ),
+                owner_claim_generation=(
+                    recovery_claim.prior_owner_claim_generation + 1
+                    if recovery_claim is not None else self._store._claim_generation
+                ),
+                consumed_recovery_evidence_fingerprints=(
+                    (recovery_claim.evidence_fingerprint,) if recovery_claim is not None else ()
                 ),
             )
             self._store._handoff_owner_token = self._claim_owner_token
             self._store._handoff_fingerprint = handoff_fingerprint
             self._store._handoff_binding_digest = old_receipt.binding_digest
+            self._store._handoff_owner_claim_fingerprint = self._store._progress.owner_claim_fingerprint
+            self._store._handoff_owner_claim_generation = self._store._progress.owner_claim_generation
+            if recovery_claim is not None:
+                self._store._consumed_recovery_evidence_fingerprints.add(recovery_claim.evidence_fingerprint)
             return HandoffDecision(True, "old authority is now non-dispatching pending reconciliation", old_receipt.receipt_fingerprint)
 
-    def recover_handoff(self, claim: HandoffRecoveryClaim) -> HandoffDecision:
+    def recover_handoff(self, claim: HandoffRecoveryClaim, *, now: datetime) -> HandoffDecision:
         """Replace an interrupted owner only with exact stale-owner evidence."""
 
         with self._store._lock:
@@ -466,23 +518,30 @@ class DeploymentAuthorityHandoffCoordinator:
             active = self._store._active
             if progress is None:
                 return HandoffDecision(False, "no interrupted handoff can be recovered")
-            if progress.recovery_evidence_fingerprint is not None:
-                return HandoffDecision(False, "the handoff stale-owner recovery claim was already consumed")
             if (
                 not _recovery_matches(
                     claim, progress.handoff_fingerprint,
                     active if active is not None else self._store._handoff_binding_digest,
                     self._store,
                     old_receipt_fingerprint=progress.old_receipt_fingerprint,
+                    prior_owner_claim_fingerprint=progress.owner_claim_fingerprint,
+                    prior_owner_claim_generation=progress.owner_claim_generation,
+                    now=now,
                 )
+                or claim.evidence_fingerprint in self._store._consumed_recovery_evidence_fingerprints
             ):
                 return HandoffDecision(False, "handoff recovery lacks exact stale-owner verification")
             self._store._handoff_owner_token = self._claim_owner_token
             self._store._handoff_fingerprint = progress.handoff_fingerprint
             self._store._handoff_binding_digest = claim.receipt_binding_digest
+            self._store._handoff_owner_claim_fingerprint = claim.replacement_owner_claim_fingerprint
+            self._store._handoff_owner_claim_generation = claim.prior_owner_claim_generation + 1
+            self._store._consumed_recovery_evidence_fingerprints.add(claim.evidence_fingerprint)
             self._store._progress = HandoffProgress(
                 progress.handoff_fingerprint, progress.old_receipt_fingerprint, progress.new_identity,
-                progress.phase, progress.reconciliation, claim.evidence_fingerprint,
+                progress.phase, progress.reconciliation,
+                claim.replacement_owner_claim_fingerprint, claim.prior_owner_claim_generation + 1,
+                (*progress.consumed_recovery_evidence_fingerprints, claim.evidence_fingerprint),
             )
             return HandoffDecision(True, "independently verified stale-owner recovery claim acquired", progress.old_receipt_fingerprint)
 
@@ -505,7 +564,8 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "reconciliation evidence is incomplete or does not match machine truth")
             self._store._progress = HandoffProgress(
                 progress.handoff_fingerprint, progress.old_receipt_fingerprint, progress.new_identity,
-                HandoffPhase.RECONCILED, evidence, progress.recovery_evidence_fingerprint,
+                HandoffPhase.RECONCILED, evidence, progress.owner_claim_fingerprint,
+                progress.owner_claim_generation, progress.consumed_recovery_evidence_fingerprints,
             )
             return HandoffDecision(True, "old authority is reconciled and may be revoked", progress.old_receipt_fingerprint)
 
@@ -528,7 +588,8 @@ class DeploymentAuthorityHandoffCoordinator:
             self._clear_authority_claim()
             self._store._progress = HandoffProgress(
                 progress.handoff_fingerprint, progress.old_receipt_fingerprint, progress.new_identity,
-                HandoffPhase.REVOKED, progress.reconciliation, progress.recovery_evidence_fingerprint,
+                HandoffPhase.REVOKED, progress.reconciliation, progress.owner_claim_fingerprint,
+                progress.owner_claim_generation, progress.consumed_recovery_evidence_fingerprints,
             )
             return HandoffDecision(True, "old receipt is revoked; no authority is dispatching", active.receipt_fingerprint)
 
@@ -560,6 +621,8 @@ class DeploymentAuthorityHandoffCoordinator:
             self._store._claim_owner_token = self._claim_owner_token
             self._store._claim_receipt_fingerprint = receipt.receipt_fingerprint
             self._store._claim_binding_digest = receipt.binding_digest
+            self._store._claim_fingerprint = progress.owner_claim_fingerprint
+            self._store._claim_generation = progress.owner_claim_generation
             self._clear_handoff_claim()
             self._store._progress = None
             return HandoffDecision(True, "new receipt is the sole active authority", receipt.receipt_fingerprint)
@@ -574,11 +637,12 @@ class DeploymentAuthorityHandoffCoordinator:
     def _receipt_names_this_store(self, receipt: object) -> bool:
         return type(receipt) is DeploymentAuthorityHandoffReceipt and self._identity_names_this_store(receipt.identity)
 
-    def _holds_claim(self, receipt: DeploymentAuthorityHandoffReceipt) -> bool:
+    def _holds_claim(self, receipt: DeploymentAuthorityHandoffReceipt, claim_fingerprint: object) -> bool:
         return (
             self._store._claim_owner_token is self._claim_owner_token
             and self._store._claim_receipt_fingerprint == receipt.receipt_fingerprint
             and self._store._claim_binding_digest == receipt.binding_digest
+            and self._store._claim_fingerprint == claim_fingerprint
         )
 
     def _holds_handoff_claim(self, progress: HandoffProgress) -> bool:
@@ -586,17 +650,22 @@ class DeploymentAuthorityHandoffCoordinator:
             self._store._handoff_owner_token is self._claim_owner_token
             and self._store._handoff_fingerprint == progress.handoff_fingerprint
             and self._store._handoff_binding_digest is not None
+            and self._store._handoff_owner_claim_fingerprint == progress.owner_claim_fingerprint
+            and self._store._handoff_owner_claim_generation == progress.owner_claim_generation
         )
 
     def _clear_authority_claim(self) -> None:
         self._store._claim_owner_token = None
         self._store._claim_receipt_fingerprint = None
         self._store._claim_binding_digest = None
+        self._store._claim_fingerprint = None
 
     def _clear_handoff_claim(self) -> None:
         self._store._handoff_owner_token = None
         self._store._handoff_fingerprint = None
         self._store._handoff_binding_digest = None
+        self._store._handoff_owner_claim_fingerprint = None
+        self._store._handoff_owner_claim_generation = None
 
 
 def _receipt_current(receipt: object, now: object) -> bool:
@@ -631,6 +700,9 @@ def _recovery_matches(
     old_receipt: DeploymentAuthorityHandoffReceipt | str | None,
     store: InMemoryDeploymentAuthorityStore,
     *, old_receipt_fingerprint: str | None = None,
+    prior_owner_claim_fingerprint: object,
+    prior_owner_claim_generation: object,
+    now: object,
 ) -> bool:
     if type(claim) is not HandoffRecoveryClaim or claim.status is not HandoffRecoveryStatus.STALE_OWNER:
         return False
@@ -648,6 +720,11 @@ def _recovery_matches(
         and claim.receipt_binding_digest == binding_digest
         and claim.state_store_fingerprint == store.state_store_fingerprint
         and claim.state_id == store.state_id
+        and claim.prior_owner_claim_fingerprint == prior_owner_claim_fingerprint
+        and claim.prior_owner_claim_generation == prior_owner_claim_generation
+        and type(now) is datetime
+        and now.tzinfo is timezone.utc
+        and claim.observed_at <= now < claim.expires_at
     )
 
 

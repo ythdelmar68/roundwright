@@ -13,7 +13,7 @@ from enum import StrEnum
 import hashlib
 import json
 from threading import RLock
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from .canary_policy import (
     BoundedCanaryPolicy,
@@ -23,10 +23,13 @@ from .canary_policy import (
     CanaryDecision,
     CanaryMutationRequest,
     CanaryPolicyError,
+    CanaryResult,
     advance_canary_receipt,
     authorize_canary_request,
     genesis_canary_receipt,
+    validate_canary_receipt_chain,
 )
+from .github import GitHubMutationOperation
 
 
 class CanaryExecutionError(ValueError):
@@ -122,6 +125,12 @@ class CanaryMutationBroker(Protocol):
     ) -> CanarySemanticReadback:
         """Return only the exact postcondition's semantic state and digest."""
 
+    def semantic_pre_readback(
+        self, authorization: CanaryAuthorization, request: CanaryMutationRequest,
+        predecessor_receipt_digest: str,
+    ) -> CanarySemanticReadback:
+        """Prove a reversible predecessor state before rollback or cleanup."""
+
 
 @dataclass(frozen=True, slots=True)
 class CanaryExecutionReceipt:
@@ -136,6 +145,9 @@ class CanaryExecutionReceipt:
     state: CanaryTransitionState
     semantic_readback_digest: str | None = None
     canary_receipt_digest: str | None = None
+    predecessor_transition_receipt_digest: str | None = None
+    pre_state_readback_digest: str | None = None
+    retry_used: bool = False
     receipt_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -153,6 +165,21 @@ class CanaryExecutionReceipt:
             _require_digest(self.semantic_readback_digest, "Canary execution read-back digest")
         if self.canary_receipt_digest is not None:
             _require_digest(self.canary_receipt_digest, "Canary execution receipt digest")
+        for value, name in (
+            (self.predecessor_transition_receipt_digest, "Canary predecessor receipt digest"),
+            (self.pre_state_readback_digest, "Canary pre-state read-back digest"),
+        ):
+            if value is not None:
+                _require_digest(value, name)
+        if type(self.retry_used) is not bool:
+            raise CanaryExecutionError("Canary retry consumption is invalid")
+        if self.purpose is CanaryTransitionPurpose.EXECUTE:
+            if self.predecessor_transition_receipt_digest is not None or self.pre_state_readback_digest is not None:
+                raise CanaryExecutionError("ordinary Canary execution cannot carry cleanup preconditions")
+        elif self.predecessor_transition_receipt_digest is None or self.pre_state_readback_digest is None:
+            raise CanaryExecutionError("rollback or cleanup lacks reconciled predecessor evidence")
+        if self.retry_used and self.state is CanaryTransitionState.RETRY_ALLOWED:
+            raise CanaryExecutionError("consumed Canary retry cannot remain retry-allowed")
         if self.state is CanaryTransitionState.VERIFIED:
             if self.semantic_readback_digest is None or self.canary_receipt_digest is None:
                 raise CanaryExecutionError("verified Canary transition lacks semantic receipt evidence")
@@ -173,6 +200,9 @@ class CanaryExecutionReceipt:
             "state": self.state.value,
             "semantic_readback_digest": self.semantic_readback_digest,
             "canary_receipt_digest": self.canary_receipt_digest,
+            "predecessor_transition_receipt_digest": self.predecessor_transition_receipt_digest,
+            "pre_state_readback_digest": self.pre_state_readback_digest,
+            "retry_used": self.retry_used,
         }
         return value | ({"receipt_digest": self.receipt_digest} if include_digest else {})
 
@@ -199,14 +229,17 @@ class _TransitionRecord:
     receipt: CanaryExecutionReceipt
     canary_receipt: BoundedCanaryReceipt | None = None
     retry_used: bool = False
+    predecessor_transition_receipt_digest: str | None = None
+    pre_state_readback_digest: str | None = None
 
 
 class CanaryExecutionLedger:
-    """Coordinator state with idempotent local replay semantics.
+    """Coordinator state with validated, hydratable replay semantics.
 
     The owner-host lease is still required for cross-process exclusion.  This
-    ledger prevents duplicate delivery or request substitution within one
-    coordinator and retains every non-success outcome for reconciliation.
+    ledger prevents duplicate delivery or request substitution and retains a
+    sealed, local-only snapshot that a replacement coordinator can validate
+    before it reconciles a verified, quarantined, or retry-allowed transition.
     """
 
     def __init__(self, policy: BoundedCanaryPolicy) -> None:
@@ -246,9 +279,27 @@ class CanaryExecutionLedger:
                 raise CanaryExecutionError("Canary execution replay is ambiguous")
             return matches[0] if matches else None
 
+    def predecessor(self) -> _TransitionRecord | None:
+        """Return the exact record which advanced the retained chain head."""
+
+        with self._lock:
+            head = self._chain[-1]
+            if head.predecessor_receipt_digest is None:
+                return None
+            matches = [
+                record for record in self._records.values()
+                if record.state is CanaryTransitionState.VERIFIED
+                and record.canary_receipt is head
+                and record.receipt.canary_receipt_digest == head.receipt_digest
+            ]
+            if len(matches) != 1:
+                raise CanaryExecutionError("Canary retained predecessor is unavailable or ambiguous")
+            return matches[0]
+
     def reserve(
         self, authorization: CanaryAuthorization, request: CanaryMutationRequest,
-        purpose: CanaryTransitionPurpose,
+        purpose: CanaryTransitionPurpose, *, predecessor_transition_receipt_digest: str | None = None,
+        pre_state_readback_digest: str | None = None,
     ) -> tuple[_TransitionRecord, bool]:
         if type(authorization) is not CanaryAuthorization or type(request) is not CanaryMutationRequest or type(purpose) is not CanaryTransitionPurpose:
             raise CanaryExecutionError("Canary execution reservation is invalid")
@@ -262,15 +313,21 @@ class CanaryExecutionLedger:
                 authorization.policy_digest, authorization.contract_digest,
                 authorization.claim_digest, authorization.request_digest,
                 authorization.receipt_chain_head_digest, purpose,
-                CanaryTransitionState.CLAIMED,
+                CanaryTransitionState.CLAIMED, predecessor_transition_receipt_digest=predecessor_transition_receipt_digest,
+                pre_state_readback_digest=pre_state_readback_digest,
             )
-            record = _TransitionRecord(authorization, request, purpose, CanaryTransitionState.CLAIMED, receipt)
+            record = _TransitionRecord(
+                authorization, request, purpose, CanaryTransitionState.CLAIMED, receipt,
+                predecessor_transition_receipt_digest=predecessor_transition_receipt_digest,
+                pre_state_readback_digest=pre_state_readback_digest,
+            )
             self._records[authorization.claim_digest] = record
             return record, True
 
     def update(
         self, record: _TransitionRecord, state: CanaryTransitionState,
         *, readback_digest: str | None = None, canary_receipt: BoundedCanaryReceipt | None = None,
+        retry_used: bool | None = None,
     ) -> _TransitionRecord:
         if type(record) is not _TransitionRecord or type(state) is not CanaryTransitionState:
             raise CanaryExecutionError("Canary execution record is invalid")
@@ -288,11 +345,17 @@ class CanaryExecutionLedger:
                 raise CanaryExecutionError("unverified Canary transition cannot advance the chain")
             record.state = state
             record.canary_receipt = canary_receipt
+            if retry_used is not None:
+                if type(retry_used) is not bool:
+                    raise CanaryExecutionError("Canary retry consumption is invalid")
+                record.retry_used = retry_used
             record.receipt = CanaryExecutionReceipt(
                 record.authorization.policy_digest, record.authorization.contract_digest,
                 record.authorization.claim_digest, record.authorization.request_digest,
                 record.authorization.receipt_chain_head_digest, record.purpose, state,
                 readback_digest, canary_receipt.receipt_digest if canary_receipt is not None else None,
+                record.predecessor_transition_receipt_digest, record.pre_state_readback_digest,
+                record.retry_used,
             )
             return record
 
@@ -307,7 +370,192 @@ class CanaryExecutionLedger:
             ):
                 return False
             record.retry_used = True
+            record.state = CanaryTransitionState.CLAIMED
+            record.receipt = CanaryExecutionReceipt(
+                record.authorization.policy_digest, record.authorization.contract_digest,
+                record.authorization.claim_digest, record.authorization.request_digest,
+                record.authorization.receipt_chain_head_digest, record.purpose,
+                CanaryTransitionState.CLAIMED,
+                predecessor_transition_receipt_digest=record.predecessor_transition_receipt_digest,
+                pre_state_readback_digest=record.pre_state_readback_digest,
+                retry_used=True,
+            )
             return True
+
+    def sealed_state(self) -> dict[str, object]:
+        """Return local-only, validated hydration material; never publish it."""
+
+        with self._lock:
+            return {
+                "schema": "roundwright-canary-execution-ledger/v1",
+                "policy_digest": self._policy.policy_digest,
+                "contract_digest": self._policy.contract_digest,
+                "candidate_sha": self._policy.candidate_sha,
+                "chain": [receipt.public_payload() for receipt in self._chain],
+                "records": [
+                    {
+                        "authorization": {
+                            "policy_digest": record.authorization.policy_digest,
+                            "contract_digest": record.authorization.contract_digest,
+                            "request_digest": record.authorization.request_digest,
+                            "receipt_chain_head_digest": record.authorization.receipt_chain_head_digest,
+                        },
+                        "request": {
+                            "operation": record.request.operation.value,
+                            "branch": record.request.branch,
+                            "paths": list(record.request.paths),
+                        },
+                        "purpose": record.purpose.value,
+                        "state": record.state.value,
+                        "receipt": record.receipt.public_payload(),
+                        "canary_receipt_digest": record.canary_receipt.receipt_digest if record.canary_receipt is not None else None,
+                        "retry_used": record.retry_used,
+                        "predecessor_transition_receipt_digest": record.predecessor_transition_receipt_digest,
+                        "pre_state_readback_digest": record.pre_state_readback_digest,
+                    }
+                    for record in self._records.values()
+                ],
+            }
+
+    @classmethod
+    def hydrate(cls, policy: BoundedCanaryPolicy, sealed: object) -> "CanaryExecutionLedger":
+        """Recreate only an exact policy-bound ledger, failing closed on drift."""
+
+        try:
+            if type(policy) is not BoundedCanaryPolicy or type(sealed) is not dict or set(sealed) != {
+                "schema", "policy_digest", "contract_digest", "candidate_sha", "chain", "records",
+            }:
+                raise ValueError
+            if (
+                sealed["schema"] != "roundwright-canary-execution-ledger/v1"
+                or sealed["policy_digest"] != policy.policy_digest
+                or sealed["contract_digest"] != policy.contract_digest
+                or sealed["candidate_sha"] != policy.candidate_sha
+                or type(sealed["chain"]) is not list or type(sealed["records"]) is not list
+            ):
+                raise ValueError
+            chain = tuple(cls._hydrate_canary_receipt(policy, value) for value in sealed["chain"])
+            validate_canary_receipt_chain(policy, chain)
+            by_digest = {receipt.receipt_digest: receipt for receipt in chain}
+            if len(by_digest) != len(chain):
+                raise ValueError
+            records: dict[str, _TransitionRecord] = {}
+            for value in sealed["records"]:
+                record = cls._hydrate_record(policy, value, by_digest, chain[-1].receipt_digest)
+                if record.authorization.claim_digest in records:
+                    raise ValueError
+                records[record.authorization.claim_digest] = record
+            ledger = cls(policy)
+            ledger._chain = list(chain)
+            ledger._records = records
+            if chain[-1].predecessor_receipt_digest is not None:
+                ledger.predecessor()
+            return ledger
+        except (KeyError, TypeError, ValueError, CanaryExecutionError, CanaryPolicyError) as error:
+            raise CanaryExecutionError("Canary execution ledger hydration is invalid or stale") from error
+
+    @staticmethod
+    def _hydrate_canary_receipt(policy: BoundedCanaryPolicy, value: object) -> BoundedCanaryReceipt:
+        if type(value) is not dict or set(value) != {
+            "schema", "policy_digest", "contract_digest", "base_sha", "candidate_sha",
+            "target_repository", "target_baseline_sha", "target_leaf_number", "leaf_number",
+            "requested_operations", "operation_counts", "total_calls", "result",
+            "semantic_readback_digest", "predecessor_receipt_digest", "receipt_digest",
+        }:
+            raise ValueError
+        if (
+            value["schema"] != "roundwright-bounded-canary-receipt/v1"
+            or value["policy_digest"] != policy.policy_digest or value["contract_digest"] != policy.contract_digest
+            or value["base_sha"] != policy.base_sha or value["candidate_sha"] != policy.candidate_sha
+            or value["target_repository"] != policy.target.repository or value["target_baseline_sha"] != policy.target.baseline_sha
+            or value["target_leaf_number"] != policy.target.leaf_number or value["leaf_number"] != policy.leaf_number
+            or value["requested_operations"] != [operation.value for operation in policy.requested_operations]
+            or type(value["operation_counts"]) is not dict
+            or value["total_calls"] != sum(value["operation_counts"].values())
+        ):
+            raise ValueError
+        counts = tuple((operation, value["operation_counts"].get(operation.value)) for operation in policy.requested_operations)
+        receipt = BoundedCanaryReceipt(
+            policy, CanaryResult(value["result"]), counts, value["semantic_readback_digest"],
+            value["predecessor_receipt_digest"],
+        )
+        if receipt.receipt_digest != value["receipt_digest"]:
+            raise ValueError
+        return receipt
+
+    @staticmethod
+    def _hydrate_record(
+        policy: BoundedCanaryPolicy, value: object, by_digest: Mapping[str, BoundedCanaryReceipt],
+        chain_head: str,
+    ) -> _TransitionRecord:
+        if type(value) is not dict or set(value) != {
+            "authorization", "request", "purpose", "state", "receipt", "canary_receipt_digest",
+            "retry_used", "predecessor_transition_receipt_digest", "pre_state_readback_digest",
+        } or type(value["authorization"]) is not dict or type(value["request"]) is not dict:
+            raise ValueError
+        authorization_value, request_value = value["authorization"], value["request"]
+        if set(authorization_value) != {
+            "policy_digest", "contract_digest", "request_digest", "receipt_chain_head_digest",
+        } or set(request_value) != {"operation", "branch", "paths"} or type(request_value["paths"]) is not list:
+            raise ValueError
+        request = CanaryMutationRequest(
+            GitHubMutationOperation(request_value["operation"]), request_value["branch"],
+            tuple(request_value["paths"]),
+        )
+        authorization = CanaryAuthorization(
+            authorization_value["policy_digest"], authorization_value["contract_digest"],
+            authorization_value["request_digest"], authorization_value["receipt_chain_head_digest"],
+        )
+        if (
+            authorization.policy_digest != policy.policy_digest or authorization.contract_digest != policy.contract_digest
+            or authorization.request_digest != request.request_digest
+            or authorization.receipt_chain_head_digest not in by_digest
+        ):
+            raise ValueError
+        receipt = CanaryExecutionLedger._hydrate_execution_receipt(value["receipt"])
+        purpose, state = CanaryTransitionPurpose(value["purpose"]), CanaryTransitionState(value["state"])
+        if (
+            receipt.policy_digest != authorization.policy_digest or receipt.contract_digest != authorization.contract_digest
+            or receipt.claim_digest != authorization.claim_digest or receipt.request_digest != authorization.request_digest
+            or receipt.receipt_chain_head_digest != authorization.receipt_chain_head_digest
+            or receipt.purpose is not purpose or receipt.state is not state
+            or receipt.retry_used != value["retry_used"]
+            or receipt.predecessor_transition_receipt_digest != value["predecessor_transition_receipt_digest"]
+            or receipt.pre_state_readback_digest != value["pre_state_readback_digest"]
+        ):
+            raise ValueError
+        canary_digest = value["canary_receipt_digest"]
+        canary_receipt = by_digest.get(canary_digest) if canary_digest is not None else None
+        if state is CanaryTransitionState.VERIFIED:
+            if canary_receipt is None or receipt.canary_receipt_digest != canary_digest or canary_receipt.predecessor_receipt_digest != authorization.receipt_chain_head_digest:
+                raise ValueError
+        elif canary_receipt is not None or receipt.canary_receipt_digest is not None:
+            raise ValueError
+        if state is not CanaryTransitionState.VERIFIED and authorization.receipt_chain_head_digest != chain_head:
+            raise ValueError
+        return _TransitionRecord(
+            authorization, request, purpose, state, receipt, canary_receipt,
+            value["retry_used"], value["predecessor_transition_receipt_digest"],
+            value["pre_state_readback_digest"],
+        )
+
+    @staticmethod
+    def _hydrate_execution_receipt(value: object) -> CanaryExecutionReceipt:
+        if type(value) is not dict or set(value) != {
+            "policy_digest", "contract_digest", "claim_digest", "request_digest", "receipt_chain_head_digest",
+            "purpose", "state", "semantic_readback_digest", "canary_receipt_digest",
+            "predecessor_transition_receipt_digest", "pre_state_readback_digest", "retry_used", "receipt_digest",
+        }:
+            raise ValueError
+        receipt = CanaryExecutionReceipt(
+            value["policy_digest"], value["contract_digest"], value["claim_digest"], value["request_digest"],
+            value["receipt_chain_head_digest"], CanaryTransitionPurpose(value["purpose"]),
+            CanaryTransitionState(value["state"]), value["semantic_readback_digest"], value["canary_receipt_digest"],
+            value["predecessor_transition_receipt_digest"], value["pre_state_readback_digest"], value["retry_used"],
+        )
+        if receipt.receipt_digest != value["receipt_digest"]:
+            raise ValueError
+        return receipt
 
 
 class CanaryOrchestrator:
@@ -320,7 +568,7 @@ class CanaryOrchestrator:
     ) -> None:
         if type(policy) is not BoundedCanaryPolicy or type(context) is not CanaryAuthorityContext:
             raise CanaryExecutionError("Canary orchestration evidence is invalid")
-        if not hasattr(lease, "claim") or not hasattr(broker, "dispatch") or not hasattr(broker, "semantic_readback"):
+        if not all(hasattr(broker, name) for name in ("dispatch", "semantic_readback", "semantic_pre_readback")) or not hasattr(lease, "claim"):
             raise CanaryExecutionError("Canary owner-host capabilities are unavailable")
         self._policy = policy
         self._context = context
@@ -368,8 +616,34 @@ class CanaryOrchestrator:
             decision = CanaryDecision(False, "Canary execution evidence is unavailable", None, "preserve-for-owner")
         if not decision.authorized or decision.authorization is None:
             return CanaryExecutionResult(decision, None, None)
+        predecessor_transition_receipt_digest: str | None = None
+        pre_state_readback_digest: str | None = None
+        if purpose is not CanaryTransitionPurpose.EXECUTE:
+            try:
+                predecessor = self._ledger.predecessor()
+                if predecessor is None or predecessor.canary_receipt is None:
+                    raise CanaryExecutionError("Canary rollback has no retained predecessor transition")
+                pre_state = self._broker.semantic_pre_readback(
+                    decision.authorization, request, predecessor.receipt.receipt_digest,
+                )
+                disposition = self._policy.rollback.cleanup_disposition(
+                    resource_is_reversible=True,
+                    readback_is_unambiguous=type(pre_state) is CanarySemanticReadback and pre_state.state is CanaryReadbackState.APPLIED,
+                )
+                if disposition.value != "rollback":
+                    raise CanaryExecutionError("Canary rollback pre-state is absent or ambiguous")
+                predecessor_transition_receipt_digest = predecessor.receipt.receipt_digest
+                pre_state_readback_digest = pre_state.digest
+            except (AttributeError, TypeError, ValueError, CanaryExecutionError, CanaryPolicyError):
+                return CanaryExecutionResult(
+                    CanaryDecision(False, "Canary rollback or cleanup requires retained reversible semantic pre-state", decision.policy_digest, "preserve-for-owner"), None, None,
+                )
         try:
-            record, newly_reserved = self._ledger.reserve(decision.authorization, request, purpose)
+            record, newly_reserved = self._ledger.reserve(
+                decision.authorization, request, purpose,
+                predecessor_transition_receipt_digest=predecessor_transition_receipt_digest,
+                pre_state_readback_digest=pre_state_readback_digest,
+            )
         except CanaryExecutionError:
             return CanaryExecutionResult(
                 CanaryDecision(False, "Canary consumption fence conflicts", decision.policy_digest, "preserve-for-owner"), None, None,
@@ -454,7 +728,11 @@ class CanaryOrchestrator:
                 record = self._ledger.update(record, CanaryTransitionState.QUARANTINED)
                 return CanaryExecutionResult(CanaryDecision(False, "Canary receipt reconciliation failed", decision.policy_digest, "preserve-for-owner"), record.receipt, None)
             return CanaryExecutionResult(decision, record.receipt, record.canary_receipt)
-        state = CanaryTransitionState.RETRY_ALLOWED if allow_retry else CanaryTransitionState.QUARANTINED
+        state = (
+            CanaryTransitionState.RETRY_ALLOWED
+            if allow_retry and not record.retry_used
+            else CanaryTransitionState.PRESERVED_FOR_OWNER
+        )
         record = self._ledger.update(record, state, readback_digest=readback.digest)
         next_action = "retry-after-semantic-readback" if state is CanaryTransitionState.RETRY_ALLOWED else "preserve-for-owner"
         return CanaryExecutionResult(CanaryDecision(False, "Canary read-back does not prove the requested transition", decision.policy_digest, next_action), record.receipt, None)

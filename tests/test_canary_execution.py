@@ -83,12 +83,17 @@ class FakeLease:
 
 
 class FakeBroker:
-    def __init__(self, *readbacks: CanarySemanticReadback, accepted: bool = True, raises: bool = False) -> None:
+    def __init__(
+        self, *readbacks: CanarySemanticReadback, accepted: bool = True, raises: bool = False,
+        pre_readbacks: tuple[CanarySemanticReadback, ...] = (),
+    ) -> None:
         self.readbacks = list(readbacks)
+        self.pre_readbacks = list(pre_readbacks)
         self.accepted = accepted
         self.raises = raises
         self.dispatches: list[tuple[object, object, object]] = []
         self.reads: list[tuple[object, object]] = []
+        self.pre_reads: list[tuple[object, object, object]] = []
 
     def dispatch(self, authorization, request, purpose):
         self.dispatches.append((authorization, request, purpose))
@@ -99,6 +104,10 @@ class FakeBroker:
     def semantic_readback(self, authorization, request):
         self.reads.append((authorization, request))
         return self.readbacks.pop(0)
+
+    def semantic_pre_readback(self, authorization, request, predecessor_receipt_digest):
+        self.pre_reads.append((authorization, request, predecessor_receipt_digest))
+        return self.pre_readbacks.pop(0)
 
 
 def readback(state: CanaryReadbackState, suffix: str) -> CanarySemanticReadback:
@@ -166,15 +175,37 @@ class CanaryExecutionTests(unittest.TestCase):
         self.assertEqual(conflict.receipt.state, CanaryTransitionState.PRESERVED_FOR_OWNER)  # type: ignore[union-attr]
         self.assertEqual(broker.dispatches, [])
 
-    def test_rollback_and_cleanup_are_explicit_policy_bound_transitions(self) -> None:
+    def test_rollback_and_cleanup_require_reconciled_retained_predecessors(self) -> None:
         contract = policy(operations=(GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH))
         start = (genesis(contract),)
+        create = CanaryMutationRequest(GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",))
         delete = CanaryMutationRequest(GitHubMutationOperation.DELETE_BRANCH, contract.branch, ("canary/probe.txt",))
-        broker = FakeBroker(readback(CanaryReadbackState.APPLIED, "a"))
+        broker = FakeBroker(
+            readback(CanaryReadbackState.APPLIED, "a"), readback(CanaryReadbackState.APPLIED, "b"),
+            pre_readbacks=(readback(CanaryReadbackState.APPLIED, "c"),),
+        )
         executor = CanaryOrchestrator(contract, context(contract, start), FakeLease(), broker)
+        fresh_cleanup = executor.cleanup(delete)
+        self.assertFalse(fresh_cleanup.verified)
+        self.assertEqual(broker.dispatches, [])
+        executed = executor.execute(create)
+        self.assertTrue(executed.verified)
         result = executor.rollback(delete)
         self.assertTrue(result.verified)
-        self.assertEqual(broker.dispatches[0][2], CanaryTransitionPurpose.ROLLBACK)
+        self.assertEqual(broker.dispatches[1][2], CanaryTransitionPurpose.ROLLBACK)
+        self.assertEqual(len(broker.pre_reads), 1)
+        self.assertEqual(result.receipt.predecessor_transition_receipt_digest, executed.receipt.receipt_digest)  # type: ignore[union-attr]
+        self.assertEqual(result.receipt.pre_state_readback_digest, readback(CanaryReadbackState.APPLIED, "c").digest)  # type: ignore[union-attr]
+
+        cleanup_broker = FakeBroker(
+            readback(CanaryReadbackState.APPLIED, "d"), readback(CanaryReadbackState.APPLIED, "e"),
+            pre_readbacks=(readback(CanaryReadbackState.APPLIED, "f"),),
+        )
+        cleanup_executor = CanaryOrchestrator(contract, context(contract, start), FakeLease(), cleanup_broker)
+        self.assertTrue(cleanup_executor.execute(create).verified)
+        cleaned = cleanup_executor.cleanup(delete)
+        self.assertTrue(cleaned.verified)
+        self.assertEqual(cleanup_broker.dispatches[1][2], CanaryTransitionPurpose.CLEANUP)
 
     def test_ledger_rejects_substitution_at_the_same_consumption_fence(self) -> None:
         ledger = CanaryExecutionLedger(self.policy)
@@ -185,6 +216,53 @@ class CanaryExecutionTests(unittest.TestCase):
         denied = executor.cleanup(self.request)
         self.assertFalse(denied.verified)
         self.assertEqual(len(broker.dispatches), 1)
+
+    def test_restart_hydrates_verified_quarantined_retry_and_duplicate_records(self) -> None:
+        verified_broker = FakeBroker(readback(CanaryReadbackState.APPLIED, "a"))
+        verified_executor = self.orchestrator(verified_broker)
+        verified = verified_executor.execute(self.request)
+        verified_ledger = CanaryExecutionLedger.hydrate(self.policy, verified_executor.ledger.sealed_state())
+        verified_restart = CanaryOrchestrator(
+            self.policy, context(self.policy, verified_ledger.chain()), FakeLease(), FakeBroker(), ledger=verified_ledger,
+        )
+        duplicate = verified_restart.execute(self.request)
+        self.assertEqual(duplicate.receipt, verified.receipt)
+
+        quarantined_broker = FakeBroker(readback(CanaryReadbackState.AMBIGUOUS, "b"))
+        quarantined_executor = self.orchestrator(quarantined_broker)
+        quarantined = quarantined_executor.execute(self.request)
+        quarantined_ledger = CanaryExecutionLedger.hydrate(self.policy, quarantined_executor.ledger.sealed_state())
+        quarantined_restart = CanaryOrchestrator(
+            self.policy, context(self.policy, quarantined_ledger.chain()), FakeLease(),
+            FakeBroker(readback(CanaryReadbackState.APPLIED, "c")), ledger=quarantined_ledger,
+        )
+        reconciled = quarantined_restart.reconcile(quarantined.receipt.claim_digest)  # type: ignore[union-attr]
+        self.assertTrue(reconciled.verified)
+
+        retry_broker = FakeBroker(readback(CanaryReadbackState.ABSENT, "d"), accepted=False)
+        retry_executor = self.orchestrator(retry_broker)
+        retry_ready = retry_executor.execute(self.request)
+        retry_ledger = CanaryExecutionLedger.hydrate(self.policy, retry_executor.ledger.sealed_state())
+        retry_restart = CanaryOrchestrator(
+            self.policy, context(self.policy, retry_ledger.chain()), FakeLease(),
+            FakeBroker(readback(CanaryReadbackState.APPLIED, "e")), ledger=retry_ledger,
+        )
+        retried = retry_restart.retry(retry_ready.receipt.claim_digest)  # type: ignore[union-attr]
+        self.assertTrue(retried.verified)
+
+    def test_absent_after_consumed_retry_is_preserved_for_owner(self) -> None:
+        broker = FakeBroker(
+            readback(CanaryReadbackState.ABSENT, "a"), readback(CanaryReadbackState.ABSENT, "b"),
+            accepted=False,
+        )
+        executor = self.orchestrator(broker)
+        initial = executor.execute(self.request)
+        exhausted = executor.retry(initial.receipt.claim_digest)  # type: ignore[union-attr]
+        self.assertEqual(exhausted.receipt.state, CanaryTransitionState.PRESERVED_FOR_OWNER)  # type: ignore[union-attr]
+        self.assertEqual(exhausted.decision.next_action, "preserve-for-owner")
+        repeated = executor.retry(initial.receipt.claim_digest)  # type: ignore[union-attr]
+        self.assertFalse(repeated.verified)
+        self.assertEqual(len(broker.dispatches), 2)
 
 
 if __name__ == "__main__":

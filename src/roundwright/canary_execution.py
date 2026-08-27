@@ -59,6 +59,9 @@ class CanaryTransitionPurpose(StrEnum):
 
 
 _DIGEST_PREFIX = "sha256:"
+_INVERSE_CLEANUP_OPERATION = {
+    GitHubMutationOperation.CREATE_BRANCH: GitHubMutationOperation.DELETE_BRANCH,
+}
 
 
 def _digest(value: object) -> str:
@@ -75,6 +78,15 @@ def _require_digest(value: object, name: str) -> None:
         or any(character not in "0123456789abcdef" for character in value[len(_DIGEST_PREFIX):])
     ):
         raise CanaryExecutionError(f"{name} is invalid")
+
+
+def _cleanup_action_for(operation: GitHubMutationOperation) -> GitHubMutationOperation:
+    """Return the one reversible policy operation; all other actions fail closed."""
+
+    try:
+        return _INVERSE_CLEANUP_OPERATION[operation]
+    except (KeyError, TypeError) as error:
+        raise CanaryExecutionError("Canary predecessor has no reversible cleanup action") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,6 +457,7 @@ class CanaryExecutionLedger:
                 if record.authorization.claim_digest in records:
                     raise ValueError
                 records[record.authorization.claim_digest] = record
+            cls._require_verified_record_bijection(policy, chain, records)
             ledger = cls(policy)
             ledger._chain = list(chain)
             ledger._records = records
@@ -471,6 +484,9 @@ class CanaryExecutionLedger:
             or value["target_leaf_number"] != policy.target.leaf_number or value["leaf_number"] != policy.leaf_number
             or value["requested_operations"] != [operation.value for operation in policy.requested_operations]
             or type(value["operation_counts"]) is not dict
+            or set(value["operation_counts"]) != {operation.value for operation in policy.requested_operations}
+            or any(type(count) is not int or count < 0 for count in value["operation_counts"].values())
+            or type(value["total_calls"]) is not int
             or value["total_calls"] != sum(value["operation_counts"].values())
         ):
             raise ValueError
@@ -482,6 +498,45 @@ class CanaryExecutionLedger:
         if receipt.receipt_digest != value["receipt_digest"]:
             raise ValueError
         return receipt
+
+    @staticmethod
+    def _require_verified_record_bijection(
+        policy: BoundedCanaryPolicy, chain: tuple[BoundedCanaryReceipt, ...],
+        records: Mapping[str, _TransitionRecord],
+    ) -> None:
+        """Bind every non-genesis receipt to one exact verified action record."""
+
+        verified = [record for record in records.values() if record.state is CanaryTransitionState.VERIFIED]
+        if len(verified) != len(chain) - 1:
+            raise ValueError
+        previous = chain[0]
+        matched: set[str] = set()
+        for receipt in chain[1:]:
+            before, after = dict(previous.operation_counts), dict(receipt.operation_counts)
+            changed = [
+                operation for operation in policy.requested_operations
+                if after[operation] - before[operation] == 1
+            ]
+            if (
+                len(changed) != 1
+                or any(after[operation] - before[operation] not in {0, 1} for operation in policy.requested_operations)
+            ):
+                raise ValueError
+            operation = changed[0]
+            candidates = [
+                record for record in verified
+                if record.canary_receipt is receipt
+                and record.authorization.receipt_chain_head_digest == previous.receipt_digest
+                and record.request.operation is operation
+                and record.receipt.canary_receipt_digest == receipt.receipt_digest
+                and record.receipt.semantic_readback_digest == receipt.semantic_readback_digest
+            ]
+            if len(candidates) != 1 or candidates[0].authorization.claim_digest in matched:
+                raise ValueError
+            matched.add(candidates[0].authorization.claim_digest)
+            previous = receipt
+        if len(matched) != len(verified):
+            raise ValueError
 
     @staticmethod
     def _hydrate_record(
@@ -623,11 +678,18 @@ class CanaryOrchestrator:
                 predecessor = self._ledger.predecessor()
                 if predecessor is None or predecessor.canary_receipt is None:
                     raise CanaryExecutionError("Canary rollback has no retained predecessor transition")
+                inverse = _cleanup_action_for(predecessor.request.operation)
+                if (
+                    request.operation is not inverse
+                    or request.branch != predecessor.request.branch
+                    or request.paths != predecessor.request.paths
+                ):
+                    raise CanaryExecutionError("Canary rollback action does not exactly reverse its retained predecessor")
                 pre_state = self._broker.semantic_pre_readback(
                     decision.authorization, request, predecessor.receipt.receipt_digest,
                 )
                 disposition = self._policy.rollback.cleanup_disposition(
-                    resource_is_reversible=True,
+                    resource_is_reversible=request.operation is inverse,
                     readback_is_unambiguous=type(pre_state) is CanarySemanticReadback and pre_state.state is CanaryReadbackState.APPLIED,
                 )
                 if disposition.value != "rollback":

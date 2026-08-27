@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.canary_execution import (
-    CanaryDispatchResult, CanaryExecutionLedger, CanaryOrchestrator,
+    CanaryDispatchResult, CanaryExecutionError, CanaryExecutionLedger, CanaryOrchestrator,
     CanaryReadbackState, CanarySemanticReadback, CanaryTransitionPurpose,
     CanaryTransitionState,
 )
@@ -207,6 +208,35 @@ class CanaryExecutionTests(unittest.TestCase):
         self.assertTrue(cleaned.verified)
         self.assertEqual(cleanup_broker.dispatches[1][2], CanaryTransitionPurpose.CLEANUP)
 
+    def test_rollback_rejects_same_unrelated_and_irreversible_actions_before_dispatch(self) -> None:
+        operations = (GitHubMutationOperation.CREATE_BRANCH, GitHubMutationOperation.DELETE_BRANCH)
+        contract = replace(
+            policy(operations=operations),
+            budget=CanaryBudget(((GitHubMutationOperation.CREATE_BRANCH, 2), (GitHubMutationOperation.DELETE_BRANCH, 1)), 3),
+        )
+        start, create = (genesis(contract),), CanaryMutationRequest(
+            GitHubMutationOperation.CREATE_BRANCH, contract.branch, ("canary/probe.txt",),
+        )
+        broker = FakeBroker(readback(CanaryReadbackState.APPLIED, "a"))
+        executor = CanaryOrchestrator(contract, context(contract, start), FakeLease(), broker)
+        self.assertTrue(executor.execute(create).verified)
+        same_action = executor.rollback(create)
+        self.assertFalse(same_action.verified)
+        self.assertEqual(len(broker.dispatches), 1)
+        self.assertEqual(broker.pre_reads, [])
+
+        irreversible = policy(operations=(GitHubMutationOperation.COMMENT, GitHubMutationOperation.DELETE_BRANCH))
+        comment = CanaryMutationRequest(GitHubMutationOperation.COMMENT, irreversible.branch, ("canary/probe.txt",))
+        delete = CanaryMutationRequest(GitHubMutationOperation.DELETE_BRANCH, irreversible.branch, ("canary/probe.txt",))
+        irreversible_broker = FakeBroker(readback(CanaryReadbackState.APPLIED, "b"))
+        irreversible_executor = CanaryOrchestrator(
+            irreversible, context(irreversible, (genesis(irreversible),)), FakeLease(), irreversible_broker,
+        )
+        self.assertTrue(irreversible_executor.execute(comment).verified)
+        self.assertFalse(irreversible_executor.cleanup(delete).verified)
+        self.assertEqual(len(irreversible_broker.dispatches), 1)
+        self.assertEqual(irreversible_broker.pre_reads, [])
+
     def test_ledger_rejects_substitution_at_the_same_consumption_fence(self) -> None:
         ledger = CanaryExecutionLedger(self.policy)
         broker = FakeBroker(readback(CanaryReadbackState.AMBIGUOUS, "f"))
@@ -249,6 +279,21 @@ class CanaryExecutionTests(unittest.TestCase):
         )
         retried = retry_restart.retry(retry_ready.receipt.claim_digest)  # type: ignore[union-attr]
         self.assertTrue(retried.verified)
+
+    def test_hydration_requires_exact_receipt_record_bijection_and_nested_counts(self) -> None:
+        executor = self.orchestrator(FakeBroker(readback(CanaryReadbackState.APPLIED, "a")))
+        self.assertTrue(executor.execute(self.request).verified)
+        state = executor.ledger.sealed_state()
+        missing = copy.deepcopy(state)
+        missing["records"] = []
+        unknown_count = copy.deepcopy(state)
+        unknown_count["chain"][1]["operation_counts"]["unknown-operation"] = 0
+        duplicate_record = copy.deepcopy(state)
+        duplicate_record["records"].append(copy.deepcopy(duplicate_record["records"][0]))
+        for mutated in (missing, unknown_count, duplicate_record):
+            with self.subTest(mutated=mutated):
+                with self.assertRaises(CanaryExecutionError):
+                    CanaryExecutionLedger.hydrate(self.policy, mutated)
 
     def test_absent_after_consumed_retry_is_preserved_for_owner(self) -> None:
         broker = FakeBroker(

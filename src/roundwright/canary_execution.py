@@ -459,10 +459,15 @@ class CanaryExecutionLedger:
             if len(by_digest) != len(chain):
                 raise ValueError
             records: dict[str, _TransitionRecord] = {}
+            idempotency_identities: set[tuple[str, CanaryTransitionPurpose]] = set()
             for value in sealed["records"]:
                 record = cls._hydrate_record(policy, value, by_digest, chain[-1].receipt_digest)
                 if record.authorization.claim_digest in records:
                     raise ValueError
+                identity = (record.request.request_digest, record.purpose)
+                if identity in idempotency_identities:
+                    raise ValueError
+                idempotency_identities.add(identity)
                 records[record.authorization.claim_digest] = record
             cls._require_verified_record_bijection(policy, chain, records)
             ledger = cls(policy)
@@ -726,7 +731,10 @@ class CanaryOrchestrator:
         try:
             prior = self._ledger.matching(request, purpose)
         except CanaryExecutionError:
-            prior = None
+            return CanaryExecutionResult(
+                CanaryDecision(False, "Canary duplicate-delivery identity is ambiguous", self._policy.policy_digest, "preserve-for-owner"),
+                None, None,
+            )
         if prior is not None:
             return CanaryExecutionResult(
                 CanaryDecision(True, "duplicate Canary delivery converged on its retained receipt", self._policy.policy_digest, "reuse-receipt"),

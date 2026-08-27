@@ -19,7 +19,7 @@ from roundwright.canary_execution import (
 from roundwright.canary_policy import (
     BoundedCanaryPolicy, CanaryAuthorityContext, CanaryBudget, CanaryRollbackPlan,
     CanaryAuthorization, CanaryMutationRequest, CanaryTarget, FORWARD_TEST_ROUTE,
-    canary_target_policy_identity, genesis_canary_receipt,
+    advance_canary_receipt, canary_target_policy_identity, genesis_canary_receipt,
 )
 from roundwright.github import GitHubMutationOperation
 from roundwright.repository_policy import (
@@ -339,6 +339,32 @@ class CanaryExecutionTests(unittest.TestCase):
         self.assertEqual(denied.receipt.state, CanaryTransitionState.PRESERVED_FOR_OWNER)  # type: ignore[union-attr]
         self.assertEqual(len(denying_lease.calls), 1)
         self.assertEqual(replacement_broker.dispatches, [])
+
+    def test_duplicate_hydrated_idempotency_identity_is_rejected_and_never_dispatched(self) -> None:
+        operation = GitHubMutationOperation.CREATE_BRANCH
+        contract = replace(policy(), budget=CanaryBudget(((operation, 2),), 2))
+        request = CanaryMutationRequest(operation, contract.branch, ("canary/probe.txt",))
+        ledger = CanaryExecutionLedger(contract)
+        first_authorization = CanaryAuthorization(
+            contract.policy_digest, contract.contract_digest, request.request_digest, ledger.chain()[-1].receipt_digest,
+        )
+        first, _ = ledger.reserve(first_authorization, request, CanaryTransitionPurpose.EXECUTE)
+        first_receipt = advance_canary_receipt(ledger.chain()[-1], operation, readback(CanaryReadbackState.APPLIED, "a").digest)
+        ledger.update(first, CanaryTransitionState.VERIFIED, readback_digest=first_receipt.semantic_readback_digest, canary_receipt=first_receipt)
+        second_authorization = CanaryAuthorization(
+            contract.policy_digest, contract.contract_digest, request.request_digest, ledger.chain()[-1].receipt_digest,
+        )
+        second, _ = ledger.reserve(second_authorization, request, CanaryTransitionPurpose.EXECUTE)
+        second_receipt = advance_canary_receipt(ledger.chain()[-1], operation, readback(CanaryReadbackState.APPLIED, "b").digest)
+        ledger.update(second, CanaryTransitionState.VERIFIED, readback_digest=second_receipt.semantic_readback_digest, canary_receipt=second_receipt)
+        with self.assertRaises(CanaryExecutionError):
+            CanaryExecutionLedger.hydrate(contract, ledger.sealed_state())
+        broker, before = FakeBroker(), ledger.chain()
+        executor = CanaryOrchestrator(contract, context(contract, before), FakeLease(), broker, ledger=ledger)
+        denied = executor.execute(request)
+        self.assertFalse(denied.verified)
+        self.assertEqual(broker.dispatches, [])
+        self.assertEqual(ledger.chain(), before)
 
     def test_absent_after_consumed_retry_is_preserved_for_owner(self) -> None:
         broker = FakeBroker(

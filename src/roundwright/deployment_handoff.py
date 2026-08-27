@@ -471,16 +471,20 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "another handoff is already incomplete")
             if self._store._active != old_receipt or not self._receipt_names_this_store(old_receipt):
                 return HandoffDecision(False, "old receipt is not the active canonical authority")
-            if not (
+            fresh_owner_claim = (
                 self._holds_claim(old_receipt, self._store._claim_fingerprint)
                 and _receipt_current(old_receipt, now)
-            ) and not _recovery_matches(
+            )
+            if fresh_owner_claim and recovery_claim is not None:
+                return HandoffDecision(False, "fresh authority cannot begin a handoff with recovery evidence")
+            recovery_is_valid = _recovery_matches(
                 recovery_claim, handoff_fingerprint, old_receipt, self._store,
                 prior_owner_claim_fingerprint=self._store._claim_fingerprint,
                 prior_owner_claim_generation=self._store._claim_generation,
                 now=now,
-            ):
-                return HandoffDecision(False, "old authority claim is unavailable and lacks stale-owner recovery verification")
+            ) and recovery_claim.evidence_fingerprint not in self._store._consumed_recovery_evidence_fingerprints if recovery_claim is not None else False
+            if not fresh_owner_claim and not recovery_is_valid:
+                return HandoffDecision(False, "old authority claim is unavailable and lacks fresh unreplayed recovery verification")
             if not self._identity_names_this_store(new_identity):
                 return HandoffDecision(False, "new authority names another state store")
             if not _same_authority_domain(old_receipt.identity, new_identity):
@@ -491,14 +495,14 @@ class DeploymentAuthorityHandoffCoordinator:
                 handoff_fingerprint, old_receipt.receipt_fingerprint, new_identity, HandoffPhase.STOPPING,
                 owner_claim_fingerprint=(
                     recovery_claim.replacement_owner_claim_fingerprint
-                    if recovery_claim is not None else self._store._claim_fingerprint
+                    if recovery_is_valid else self._store._claim_fingerprint
                 ),
                 owner_claim_generation=(
                     recovery_claim.prior_owner_claim_generation + 1
-                    if recovery_claim is not None else self._store._claim_generation
+                    if recovery_is_valid else self._store._claim_generation
                 ),
                 consumed_recovery_evidence_fingerprints=(
-                    (recovery_claim.evidence_fingerprint,) if recovery_claim is not None else ()
+                    (recovery_claim.evidence_fingerprint,) if recovery_is_valid else ()
                 ),
             )
             self._store._handoff_owner_token = self._claim_owner_token
@@ -506,7 +510,7 @@ class DeploymentAuthorityHandoffCoordinator:
             self._store._handoff_binding_digest = old_receipt.binding_digest
             self._store._handoff_owner_claim_fingerprint = self._store._progress.owner_claim_fingerprint
             self._store._handoff_owner_claim_generation = self._store._progress.owner_claim_generation
-            if recovery_claim is not None:
+            if recovery_is_valid:
                 self._store._consumed_recovery_evidence_fingerprints.add(recovery_claim.evidence_fingerprint)
             return HandoffDecision(True, "old authority is now non-dispatching pending reconciliation", old_receipt.receipt_fingerprint)
 

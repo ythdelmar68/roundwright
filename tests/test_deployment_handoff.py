@@ -208,6 +208,25 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
         self.assertFalse(denied.claim_orchestrator(new, claim_fingerprint=fingerprint("4"), now=self.now).authorized)
         self.assertTrue(self.coordinator.claim_orchestrator(new, claim_fingerprint=fingerprint("5"), now=self.now).authorized)
 
+    def test_fresh_owner_rejects_expired_mismatched_and_replayed_recovery_claims(self) -> None:
+        old_identity, new_identity = self.identity(), self.identity(candidate="b")
+        old = self.receipt(old_identity)
+        self.assertTrue(self.coordinator.activate_initial(old, self.verification(old), now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(old, claim_fingerprint=fingerprint("5"), now=self.now).authorized)
+        expired = self.recovery(
+            old, observed_at=self.now - timedelta(minutes=2), expires_at=self.now - timedelta(minutes=1),
+        )
+        mismatched = self.recovery(old, prior_claim="4")
+        replayed = self.recovery(old, evidence="3")
+        self.store._consumed_recovery_evidence_fingerprints.add(replayed.evidence_fingerprint)
+        for claim in (expired, mismatched, replayed):
+            with self.subTest(claim=claim.evidence_fingerprint):
+                decision = self.coordinator.begin_handoff(
+                    old, new_identity, handoff_fingerprint=fingerprint("9"), now=self.now, recovery_claim=claim,
+                )
+                self.assertFalse(decision.authorized)
+                self.assertIsNone(self.coordinator.progress)
+
 
 if __name__ == "__main__":
     unittest.main()

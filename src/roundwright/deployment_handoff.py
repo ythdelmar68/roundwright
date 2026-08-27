@@ -33,6 +33,17 @@ class HandoffPhase(str, Enum):
     REVOKED = "revoked"
 
 
+class AuthorityReceiptVerificationStatus(str, Enum):
+    """Independent lifecycle states reported by the canonical authority store."""
+
+    FRESH = "fresh"
+    MISSING = "missing"
+    STALE = "stale"
+    COPIED = "copied"
+    CONFLICTING = "conflicting"
+    REVOKED = "revoked"
+
+
 _FINGERPRINT_LENGTH = 64
 _COMMIT_SHA_LENGTHS = frozenset((40, 64))
 
@@ -128,6 +139,43 @@ class DeploymentAuthorityHandoffReceipt:
 
 
 @dataclass(frozen=True)
+class DeploymentAuthorityReceiptVerification:
+    """Repository-external receipt observation required before an authority claim.
+
+    Receipt bytes cannot prove that they were not copied.  This observation is
+    supplied by the canonical authority store and is deliberately bound to the
+    receipt, state, candidate, and environment before a coordinator may claim
+    it.
+    """
+
+    evidence_fingerprint: str
+    receipt_fingerprint: str
+    receipt_binding_digest: str
+    repository_fingerprint: str
+    state_store_fingerprint: str
+    state_id: UUID
+    candidate_sha: str
+    environment_fingerprint: str
+    status: AuthorityReceiptVerificationStatus
+
+    def __post_init__(self) -> None:
+        for value, description in (
+            (self.evidence_fingerprint, "receipt verification evidence"),
+            (self.receipt_fingerprint, "verified receipt"),
+            (self.receipt_binding_digest, "verified receipt binding"),
+            (self.repository_fingerprint, "verified repository"),
+            (self.state_store_fingerprint, "verified state store"),
+            (self.environment_fingerprint, "verified environment"),
+        ):
+            _require_fingerprint(value, description)
+        if type(self.state_id) is not UUID:
+            raise DeploymentHandoffError("verified state UUID is invalid")
+        _require_candidate(self.candidate_sha, "verified")
+        if type(self.status) is not AuthorityReceiptVerificationStatus:
+            raise DeploymentHandoffError("authority receipt verification status is invalid")
+
+
+@dataclass(frozen=True)
 class HandoffReconciliation:
     """Bounded evidence that the old authority is safe to revoke."""
 
@@ -220,8 +268,12 @@ class InMemoryDeploymentAuthorityStore:
         self.state_id = state_id
         self._lock = RLock()
         self._active: DeploymentAuthorityHandoffReceipt | None = None
+        self._verification: DeploymentAuthorityReceiptVerification | None = None
         self._progress: HandoffProgress | None = None
         self._revoked: set[str] = set()
+        self._claim_owner_token: object | None = None
+        self._claim_receipt_fingerprint: str | None = None
+        self._claim_binding_digest: str | None = None
 
 
 class DeploymentAuthorityHandoffCoordinator:
@@ -231,6 +283,11 @@ class DeploymentAuthorityHandoffCoordinator:
         if type(store) is not InMemoryDeploymentAuthorityStore:
             raise DeploymentHandoffError("authority store is invalid")
         self._store = store
+        # This private capability represents an authenticated orchestrator
+        # session in the in-memory test adapter.  A production canonical store
+        # must enforce the equivalent claim with its own atomic identity-bound
+        # lease; receipt equality alone is never a claim.
+        self._claim_owner_token = object()
 
     @property
     def progress(self) -> HandoffProgress | None:
@@ -243,7 +300,7 @@ class DeploymentAuthorityHandoffCoordinator:
             return self._store._active
 
     def activate_initial(
-        self, receipt: DeploymentAuthorityHandoffReceipt, *, now: datetime
+        self, receipt: DeploymentAuthorityHandoffReceipt, verification: DeploymentAuthorityReceiptVerification, *, now: datetime
     ) -> HandoffDecision:
         """Atomically accept the one initial externally-issued receipt."""
 
@@ -252,12 +309,42 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "receipt does not name the canonical authority state")
             if not _receipt_current(receipt, now):
                 return HandoffDecision(False, "receipt is not current")
+            if not _verification_matches(receipt, verification):
+                return HandoffDecision(False, "receipt lacks fresh canonical verification")
             if self._store._active is not None or self._store._progress is not None:
                 return HandoffDecision(False, "an authority is already active or handing off")
             if receipt.receipt_fingerprint in self._store._revoked:
                 return HandoffDecision(False, "receipt was revoked")
             self._store._active = receipt
+            self._store._verification = verification
+            self._clear_claim()
             return HandoffDecision(True, "initial receipt is the sole active authority", receipt.receipt_fingerprint)
+
+    def claim_orchestrator(
+        self, receipt: DeploymentAuthorityHandoffReceipt, *, now: datetime
+    ) -> HandoffDecision:
+        """Atomically bind one authenticated coordinator to the fresh receipt.
+
+        This is intentionally separate from issuance.  A scheduler wakeup or a
+        copied receipt cannot create a claim, and a second coordinator loses
+        before it can reach authorization or wakeup handling.
+        """
+
+        with self._store._lock:
+            if self._store._progress is not None:
+                return HandoffDecision(False, "authority handoff is incomplete; no orchestrator may claim it")
+            if self._store._active != receipt or not self._receipt_names_this_store(receipt):
+                return HandoffDecision(False, "receipt is absent, copied, revoked, or not the active authority")
+            if not _receipt_current(receipt, now) or not _verification_matches(receipt, self._store._verification):
+                return HandoffDecision(False, "receipt lacks fresh canonical verification")
+            if self._store._claim_owner_token is None:
+                self._store._claim_owner_token = self._claim_owner_token
+                self._store._claim_receipt_fingerprint = receipt.receipt_fingerprint
+                self._store._claim_binding_digest = receipt.binding_digest
+                return HandoffDecision(True, "exclusive canonical orchestrator claim acquired", receipt.receipt_fingerprint)
+            if self._holds_claim(receipt):
+                return HandoffDecision(True, "exclusive canonical orchestrator claim remains current", receipt.receipt_fingerprint)
+            return HandoffDecision(False, "receipt is copied or conflicting; another orchestrator holds the canonical claim")
 
     def authorize(
         self, identity: DeploymentAuthorityIdentity, receipt: DeploymentAuthorityHandoffReceipt, *, now: datetime
@@ -273,6 +360,10 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "receipt is absent, copied, revoked, or not the active authority")
             if receipt.receipt_fingerprint in self._store._revoked:
                 return HandoffDecision(False, "receipt was revoked")
+            if not _verification_matches(receipt, self._store._verification):
+                return HandoffDecision(False, "receipt lacks fresh canonical verification")
+            if not self._holds_claim(receipt):
+                return HandoffDecision(False, "receipt has no exclusive canonical orchestrator claim")
             if receipt.identity != identity:
                 return HandoffDecision(False, "receipt does not match deployment candidate or environment")
             if not _receipt_current(receipt, now):
@@ -345,6 +436,8 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "machine truth no longer contains the old active receipt")
             self._store._revoked.add(active.receipt_fingerprint)
             self._store._active = None
+            self._store._verification = None
+            self._clear_claim()
             self._store._progress = HandoffProgress(
                 progress.handoff_fingerprint, progress.old_receipt_fingerprint, progress.new_identity,
                 HandoffPhase.REVOKED, progress.reconciliation,
@@ -352,7 +445,7 @@ class DeploymentAuthorityHandoffCoordinator:
             return HandoffDecision(True, "old receipt is revoked; no authority is dispatching", active.receipt_fingerprint)
 
     def issue_new_receipt(
-        self, receipt: DeploymentAuthorityHandoffReceipt, *, handoff_fingerprint: str, now: datetime
+        self, receipt: DeploymentAuthorityHandoffReceipt, verification: DeploymentAuthorityReceiptVerification, *, handoff_fingerprint: str, now: datetime
     ) -> HandoffDecision:
         """Activate the new externally-issued receipt only after revocation."""
 
@@ -363,9 +456,15 @@ class DeploymentAuthorityHandoffCoordinator:
                 return HandoffDecision(False, "new receipt cannot issue before old receipt revocation")
             if receipt.identity != progress.new_identity or not self._receipt_names_this_store(receipt):
                 return HandoffDecision(False, "new receipt does not match the reconciled handoff target")
-            if not _receipt_current(receipt, now) or receipt.receipt_fingerprint in self._store._revoked:
+            if (
+                not _receipt_current(receipt, now)
+                or receipt.receipt_fingerprint in self._store._revoked
+                or not _verification_matches(receipt, verification)
+            ):
                 return HandoffDecision(False, "new receipt is stale, revoked, or not yet active")
             self._store._active = receipt
+            self._store._verification = verification
+            self._clear_claim()
             self._store._progress = None
             return HandoffDecision(True, "new receipt is the sole active authority", receipt.receipt_fingerprint)
 
@@ -379,6 +478,18 @@ class DeploymentAuthorityHandoffCoordinator:
     def _receipt_names_this_store(self, receipt: object) -> bool:
         return type(receipt) is DeploymentAuthorityHandoffReceipt and self._identity_names_this_store(receipt.identity)
 
+    def _holds_claim(self, receipt: DeploymentAuthorityHandoffReceipt) -> bool:
+        return (
+            self._store._claim_owner_token is self._claim_owner_token
+            and self._store._claim_receipt_fingerprint == receipt.receipt_fingerprint
+            and self._store._claim_binding_digest == receipt.binding_digest
+        )
+
+    def _clear_claim(self) -> None:
+        self._store._claim_owner_token = None
+        self._store._claim_receipt_fingerprint = None
+        self._store._claim_binding_digest = None
+
 
 def _receipt_current(receipt: object, now: object) -> bool:
     return (
@@ -386,6 +497,23 @@ def _receipt_current(receipt: object, now: object) -> bool:
         and type(now) is datetime
         and now.tzinfo is timezone.utc
         and receipt.issued_at <= now < receipt.expires_at
+    )
+
+
+def _verification_matches(
+    receipt: object, verification: object,
+) -> bool:
+    return (
+        type(receipt) is DeploymentAuthorityHandoffReceipt
+        and type(verification) is DeploymentAuthorityReceiptVerification
+        and verification.status is AuthorityReceiptVerificationStatus.FRESH
+        and verification.receipt_fingerprint == receipt.receipt_fingerprint
+        and verification.receipt_binding_digest == receipt.binding_digest
+        and verification.repository_fingerprint == receipt.identity.repository_fingerprint
+        and verification.state_store_fingerprint == receipt.identity.state_store_fingerprint
+        and verification.state_id == receipt.identity.state_id
+        and verification.candidate_sha == receipt.identity.candidate_sha
+        and verification.environment_fingerprint == receipt.identity.environment_fingerprint
     )
 
 

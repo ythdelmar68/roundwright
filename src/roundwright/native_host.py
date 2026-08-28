@@ -48,7 +48,7 @@ class InvocationSource(str, Enum):
 
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_BRANCH_COMPONENT = re.compile(r"^[^ ~^:?*\\[\]@\x00-\x1f\x7f]+$")
+_BRANCH_COMPONENT = re.compile(r"^[^ ~^:?*\\[\]\x00-\x1f\x7f]+$")
 _DEFAULT_PROCESS_LEASE = timedelta(minutes=1)
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
@@ -166,7 +166,10 @@ class NativeHostPaths:
                 raise NativeHostError("native host worktree marker is invalid")
             git_directory = Path(line.removeprefix("gitdir: "))
             if not git_directory.is_absolute():
-                git_directory = (self.worktree / git_directory).resolve()
+                try:
+                    git_directory = (self.worktree / git_directory).resolve()
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise NativeHostError("native host worktree Git directory resolution is unavailable") from error
             head = git_directory / "HEAD"
         else:
             raise NativeHostError("native host worktree is not a Git worktree")
@@ -417,7 +420,12 @@ def _common_git_directory(git_directory: Path) -> Path:
     if not value:
         raise NativeHostError("native host linked worktree common directory is invalid")
     common = Path(value)
-    return common if common.is_absolute() else (git_directory / common).resolve()
+    if common.is_absolute():
+        return common
+    try:
+        return (git_directory / common).resolve()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise NativeHostError("native host linked worktree common directory resolution is unavailable") from error
 
 
 def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | None:
@@ -454,7 +462,7 @@ def _require_canonical_branch_reference(reference: object) -> str:
     if type(reference) is not str or not reference.startswith("refs/heads/"):
         raise NativeHostError("native host worktree reference is not a branch reference")
     parts = reference.split("/")
-    if len(parts) < 3 or any(part in {"", ".", ".."} or part.startswith(".") or ".." in part or part.endswith(".") or part.endswith(".lock") or not _BRANCH_COMPONENT.fullmatch(part) for part in parts):
+    if len(parts) < 3 or "@{" in reference or any(part in {"", ".", ".."} or part.startswith(".") or ".." in part or part.endswith(".") or part.endswith(".lock") or not _BRANCH_COMPONENT.fullmatch(part) for part in parts):
         raise NativeHostError("native host worktree reference is malformed")
     return reference
 

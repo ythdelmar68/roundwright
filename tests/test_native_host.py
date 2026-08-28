@@ -269,6 +269,12 @@ class NativeHostTests(unittest.TestCase):
                 paths.require_authoritative_worktree(self.identity.candidate_sha)
             loose.unlink()
             paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (metadata / "HEAD").write_text("ref: refs/heads/topic@backup\n", encoding="utf-8")
+            (common / "packed-refs").write_text(
+                "a" * 40 + " refs/heads/codex/issue-90\n" + "a" * 40 + " refs/heads/topic@backup\n",
+                encoding="utf-8",
+            )
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
             for reference in ("refs/heads/.hidden", "refs/heads/topic..backup"):
                 (metadata / "HEAD").write_text(f"ref: {reference}\n", encoding="utf-8")
                 with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
@@ -283,6 +289,17 @@ class NativeHostTests(unittest.TestCase):
 
             with mock.patch.object(Path, "resolve", new=cyclic_loose_ref):
                 with self.assertRaisesRegex(NativeHostError, "resolution is unavailable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (metadata / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            (metadata / "commondir").write_text("../cycle\n", encoding="utf-8")
+
+            def cyclic_common_directory(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "cycle":
+                    raise RuntimeError("symlink loop")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=cyclic_common_directory):
+                with self.assertRaisesRegex(NativeHostError, "common directory resolution is unavailable"):
                     paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_loose_worktree_refs_fail_closed_before_packed_ref_fallback(self) -> None:
@@ -336,6 +353,41 @@ class NativeHostTests(unittest.TestCase):
             with mock.patch.object(Path, "resolve", side_effect=OSError("state unavailable")):
                 with self.assertRaisesRegex(NativeHostError, "resolution is unavailable"):
                     paths.require_authoritative_worktree(self.identity.candidate_sha)
+            reference = worktree / ".git" / "refs" / "heads"
+            (reference / "topic@backup").write_text("a" * 40 + "\n", encoding="utf-8")
+            head.write_text("ref: refs/heads/topic@backup\n", encoding="utf-8")
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (reference / "@").write_text("a" * 40 + "\n", encoding="utf-8")
+            head.write_text("ref: refs/heads/@\n", encoding="utf-8")
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            head.write_text("ref: refs/heads/topic@{backup\n", encoding="utf-8")
+            with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                paths.require_authoritative_worktree(self.identity.candidate_sha)
+
+    def test_relative_gitdir_resolution_failure_is_a_public_safe_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            metadata = root / "metadata"
+            metadata.mkdir()
+            (metadata / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            (worktree / ".git").write_text("gitdir: ../metadata\n", encoding="utf-8")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            original_resolve = Path.resolve
+
+            def unavailable_gitdir(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "metadata":
+                    raise OSError("metadata unavailable")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=unavailable_gitdir):
+                self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+                self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+                host, decision = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+                self.assertIsNone(host)
+                self.assertFalse(decision.accepted)
+                self.assertIn("Git directory resolution is unavailable", decision.reason)
 
     def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:
         host = self.install()

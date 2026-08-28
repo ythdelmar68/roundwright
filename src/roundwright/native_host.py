@@ -111,6 +111,30 @@ class NativeHostPaths:
     state_database: PurePath
     worktree: PurePath
 
+    def __post_init__(self) -> None:
+        if type(self.platform) is not str or not self.platform:
+            raise NativeHostError("native host platform is invalid")
+        path_type = _declared_path_type(self.platform)
+        values = (
+            self.configuration, self.authentication, self.cache, self.state_directory,
+            self.state_database, self.worktree,
+        )
+        if not all(isinstance(value, PurePath) for value in values):
+            raise NativeHostError("native host paths are invalid")
+        configuration, authentication, cache, state_directory, state_database, worktree = (
+            _coerce_declared_path(path_type, value) for value in values
+        )
+        if not all(value.is_absolute() for value in (
+            configuration, authentication, cache, state_directory, state_database, worktree,
+        )):
+            raise NativeHostError("native host paths are not absolute for the declared platform")
+        if authentication != configuration.parent / "auth.toml":
+            raise NativeHostError("native host authentication path is not derived from configuration")
+        if cache == state_directory:
+            raise NativeHostError("native host cache and durable state paths must differ")
+        if state_database != state_directory / "native-host.sqlite3":
+            raise NativeHostError("native host state database is outside the declared state directory")
+
     @classmethod
     def resolve(
         cls,
@@ -534,16 +558,17 @@ class NativeHost:
                 return self._denied("native host is stopped", process)
             if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
                 return self._denied("native host process is not active", process)
-            authority = self._authorize_transition(process, now=timestamp)
-            if authority is not None:
-                return authority
-            if self._control_store is not None:
-                decision = self._control_store.finish(self._installation, process, "completed", now=timestamp)
-                if not decision.accepted:
-                    return decision
-            self._active_process_id = None
-            self._state = NativeHostState.IDLE
-            return self._accepted("native host process completed", process)
+
+            def transition() -> NativeHostDecision:
+                if self._control_store is not None:
+                    decision = self._control_store.finish(self._installation, process, "completed", now=timestamp)
+                    if not decision.accepted:
+                        return decision
+                self._active_process_id = None
+                self._state = NativeHostState.IDLE
+                return self._accepted("native host process completed", process)
+
+            return self._run_authorized_transition(process, now=timestamp, transition=transition)
 
     def cancel(self, process_id: str, *, now: datetime) -> NativeHostDecision:
         """Cancel only the current child; a repeated cancellation is idempotent."""
@@ -553,23 +578,27 @@ class NativeHost:
         with self._lock:
             if self._state is NativeHostState.STOPPED:
                 return self._denied("native host is stopped", process)
-            authority = self._authorize_transition(process, now=now)
-            if authority is not None:
-                return authority
             if self._state is NativeHostState.IDLE and self._control_store is not None and process in self._consumed_process_ids:
-                decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
-                if not decision.accepted:
-                    return decision
-                return self._accepted("native host process is already cancelled", process)
+                def transition() -> NativeHostDecision:
+                    decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
+                    if not decision.accepted:
+                        return decision
+                    return self._accepted("native host process is already cancelled", process)
+
+                return self._run_authorized_transition(process, now=now, transition=transition)
             if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
                 return self._denied("native host process is not active", process)
-            if self._control_store is not None:
-                decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
-                if not decision.accepted:
-                    return decision
-            self._active_process_id = None
-            self._state = NativeHostState.IDLE
-            return self._accepted("native host process cancelled", process)
+
+            def transition() -> NativeHostDecision:
+                if self._control_store is not None:
+                    decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
+                    if not decision.accepted:
+                        return decision
+                self._active_process_id = None
+                self._state = NativeHostState.IDLE
+                return self._accepted("native host process cancelled", process)
+
+            return self._run_authorized_transition(process, now=now, transition=transition)
 
     def renew_child_lease(self, process_id: str, *, now: datetime, lease_for: timedelta = _DEFAULT_PROCESS_LEASE) -> NativeHostDecision:
         """Renew only this host's active child lease before stale recovery."""
@@ -581,10 +610,12 @@ class NativeHost:
         with self._lock:
             if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
                 return self._denied("native host process is not active", process)
-            authority = self._authorize_transition(process, now=now)
-            if authority is not None:
-                return authority
-            return self._control_store.renew_lease(self._installation, process, now=now, lease_for=lease_for)
+            return self._run_authorized_transition(
+                process, now=now,
+                transition=lambda: self._control_store.renew_lease(
+                    self._installation, process, now=now, lease_for=lease_for,
+                ),
+            )
 
     def recover_stale_child(self, process_id: str, *, now: datetime, stale_after: timedelta) -> NativeHostDecision:
         """Release a persisted child only after the explicit stale interval."""
@@ -594,16 +625,16 @@ class NativeHost:
         if self._control_store is None:
             return self._denied("native host has no durable child state to recover", process)
         with self._lock:
-            authority = self._authorize_transition(process, now=now)
-            if authority is not None:
-                return authority
-            decision = self._control_store.recover_stale(self._installation, process, now=now, stale_after=stale_after)
-            if not decision.accepted:
+            def transition() -> NativeHostDecision:
+                decision = self._control_store.recover_stale(self._installation, process, now=now, stale_after=stale_after)
+                if not decision.accepted:
+                    return decision
+                if self._active_process_id == process:
+                    self._active_process_id = None
+                    self._state = NativeHostState.IDLE
                 return decision
-            if self._active_process_id == process:
-                self._active_process_id = None
-                self._state = NativeHostState.IDLE
-            return decision
+
+            return self._run_authorized_transition(process, now=now, transition=transition)
 
     def execute_one_shot(self, process_id: str, action: Callable[[], None], *, now: datetime) -> NativeHostDecision:
         """Run an injected native child behind durable admission and cleanup.
@@ -635,9 +666,17 @@ class NativeHost:
             self._state = NativeHostState.STOPPED
             return self._accepted("native host stopped", None)
 
-    def _authorize_transition(self, process_id: str, *, now: datetime) -> NativeHostDecision | None:
-        authority = self._coordinator.authorize(self._installation.identity, self._installation.receipt, now=now)
-        return None if authority.authorized else self._denied(authority.reason, process_id)
+    def _run_authorized_transition(
+        self, process_id: str, *, now: datetime, transition: Callable[[], NativeHostDecision],
+    ) -> NativeHostDecision:
+        authority, decision = self._coordinator.transition_if_authorized(
+            self._installation.identity, self._installation.receipt, now=now, transition=transition,
+        )
+        if not authority.authorized:
+            return self._denied(authority.reason, process_id)
+        if type(decision) is not NativeHostDecision:
+            raise NativeHostError("native host authority transition returned an invalid decision")
+        return decision
 
     def _start(self, process_id: str, source: InvocationSource, *, now: object) -> NativeHostDecision:
         process = _require_process_id(process_id)

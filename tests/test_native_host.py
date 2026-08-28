@@ -5,13 +5,14 @@ from __future__ import annotations
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
 from unittest import mock
+from threading import Event, Thread
 from uuid import UUID
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +140,30 @@ class NativeHostTests(unittest.TestCase):
         with self.assertRaisesRegex(NativeHostError, "worktree path is not absolute"):
             NativeHostPaths.resolve(platform="linux", environment={}, home=Path("/home/roundwright"), worktree=Path("relative-worktree"))
 
+    def test_direct_native_host_paths_cannot_bypass_the_path_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            with mock.patch.object(Path, "is_dir", side_effect=AssertionError("filesystem access")):
+                with self.assertRaisesRegex(NativeHostError, "not absolute"):
+                    replace(paths, worktree=Path("relative-worktree"))
+                with self.assertRaisesRegex(NativeHostError, "outside the declared state directory"):
+                    replace(paths, state_database=root / "unrelated" / "native-host.sqlite3")
+                with self.assertRaisesRegex(NativeHostError, "unsupported"):
+                    NativeHostPaths(
+                        "plan9", paths.configuration, paths.authentication, paths.cache,
+                        paths.state_directory, paths.state_database, paths.worktree,
+                    )
+                with self.assertRaisesRegex(NativeHostError, "not absolute"):
+                    NativeHostPaths(
+                        "linux", PureWindowsPath("C:/config.toml"), PureWindowsPath("C:/auth.toml"),
+                        PureWindowsPath("C:/cache"), PureWindowsPath("C:/state"),
+                        PureWindowsPath("C:/state/native-host.sqlite3"), PureWindowsPath("C:/worktree"),
+                    )
+
     def test_durable_sqlite_lifecycle_serializes_children_and_recovers_stale_ones(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -227,12 +252,16 @@ class NativeHostTests(unittest.TestCase):
                                 (process,),
                             ).fetchone()
                         with mock.patch.object(
-                            self.coordinator, "authorize", return_value=HandoffDecision(False, reason),
+                            self.coordinator, "transition_if_authorized",
+                            return_value=(HandoffDecision(False, reason), None),
                         ) as authorize:
                             denied = operation(host, process, moment)
                         self.assertFalse(denied.accepted)
                         self.assertEqual(denied.reason, reason)
-                        authorize.assert_called_once_with(self.identity, self.receipt, now=moment)
+                        self.assertEqual(authorize.call_count, 1)
+                        self.assertEqual(authorize.call_args.args, (self.identity, self.receipt))
+                        self.assertEqual(authorize.call_args.kwargs["now"], moment)
+                        self.assertTrue(callable(authorize.call_args.kwargs["transition"]))
                         with closing(sqlite3.connect(paths.state_database)) as connection:
                             after = connection.execute(
                                 "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
@@ -240,6 +269,134 @@ class NativeHostTests(unittest.TestCase):
                             ).fetchone()
                         self.assertEqual(after, before)
                         self.assertEqual(host.state, NativeHostState.RUNNING)
+
+    def test_authority_bound_completion_linearizes_before_open_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None and host._control_store is not None
+            self.assertTrue(host.run_once("barrier-child", now=self.now).accepted)
+            entered = Event()
+            release = Event()
+            completed: list[object] = []
+            handoff: list[HandoffDecision] = []
+            handoff_done = Event()
+            original_finish = host._control_store.finish
+
+            def blocking_finish(*args: object, **kwargs: object) -> object:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_finish(*args, **kwargs)
+
+            with mock.patch.object(host._control_store, "finish", new=blocking_finish):
+                completion = Thread(
+                    target=lambda: completed.append(host.complete("barrier-child", now=self.now)),
+                    daemon=True,
+                )
+                completion.start()
+                self.assertTrue(entered.wait(2))
+                replacement = replace(self.identity, candidate_sha="b" * 40)
+
+                def begin_handoff() -> None:
+                    handoff.append(self.coordinator.begin_handoff(
+                        self.receipt, replacement, handoff_fingerprint=fingerprint("a"), now=self.now,
+                    ))
+                    handoff_done.set()
+
+                contender = Thread(target=begin_handoff, daemon=True)
+                contender.start()
+                self.assertFalse(handoff_done.wait(0.2))
+                release.set()
+                completion.join(2)
+                contender.join(2)
+            self.assertEqual(len(completed), 1)
+            self.assertTrue(completed[0].accepted)
+            self.assertEqual(host.state, NativeHostState.IDLE)
+            self.assertTrue(handoff_done.is_set())
+            self.assertTrue(handoff[0].authorized)
+
+    def test_authority_bound_completion_linearizes_before_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None and host._control_store is not None
+            self.assertTrue(host.run_once("revocation-child", now=self.now).accepted)
+            entered = Event()
+            release = Event()
+            completed: list[object] = []
+            revoked = Event()
+            original_finish = host._control_store.finish
+
+            def blocking_finish(*args: object, **kwargs: object) -> object:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_finish(*args, **kwargs)
+
+            def revoke() -> None:
+                with self.store._lock:
+                    self.store._revoked.add(self.receipt.receipt_fingerprint)
+                revoked.set()
+
+            with mock.patch.object(host._control_store, "finish", new=blocking_finish):
+                completion = Thread(
+                    target=lambda: completed.append(host.complete("revocation-child", now=self.now)),
+                    daemon=True,
+                )
+                completion.start()
+                self.assertTrue(entered.wait(2))
+                contender = Thread(target=revoke, daemon=True)
+                contender.start()
+                self.assertFalse(revoked.wait(0.2))
+                release.set()
+                completion.join(2)
+                contender.join(2)
+            self.assertEqual(len(completed), 1)
+            self.assertTrue(completed[0].accepted)
+            self.assertEqual(host.state, NativeHostState.IDLE)
+            self.assertTrue(revoked.is_set())
+
+    def test_expired_authority_denies_completion_before_durable_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None
+            self.assertTrue(host.run_once("expired-child", now=self.now).accepted)
+            with closing(sqlite3.connect(paths.state_database)) as connection:
+                before = connection.execute(
+                    "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                    ("expired-child",),
+                ).fetchone()
+            denied = host.complete("expired-child", now=self.receipt.expires_at)
+            self.assertFalse(denied.accepted)
+            self.assertIn("stale", denied.reason)
+            with closing(sqlite3.connect(paths.state_database)) as connection:
+                after = connection.execute(
+                    "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                    ("expired-child",),
+                ).fetchone()
+            self.assertEqual(after, before)
+            self.assertEqual(host.state, NativeHostState.RUNNING)
 
     def test_cache_removal_cannot_remove_durable_process_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

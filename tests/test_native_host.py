@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -21,6 +23,7 @@ from roundwright.deployment_handoff import (
     DeploymentAuthorityHandoffReceipt,
     DeploymentAuthorityIdentity,
     DeploymentAuthorityReceiptVerification,
+    HandoffDecision,
     InMemoryDeploymentAuthorityStore,
 )
 from roundwright.native_host import (
@@ -52,7 +55,7 @@ class NativeHostTests(unittest.TestCase):
             RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,)),
         )
         self.receipt = DeploymentAuthorityHandoffReceipt(
-            fingerprint("f"), self.identity, self.now - timedelta(minutes=1), self.now + timedelta(minutes=1),
+            fingerprint("f"), self.identity, self.now - timedelta(minutes=1), self.now + timedelta(minutes=5),
         )
         self.verification = DeploymentAuthorityReceiptVerification(
             fingerprint("7"), self.receipt.receipt_fingerprint, self.receipt.binding_digest,
@@ -82,17 +85,17 @@ class NativeHostTests(unittest.TestCase):
         self.assertTrue(direct.accepted)
         self.assertEqual(host.state, NativeHostState.RUNNING)
         self.assertFalse(host.request_scheduler_wake("wake-1", now=self.now).accepted)
-        self.assertTrue(host.complete("one-shot-1").accepted)
+        self.assertTrue(host.complete("one-shot-1", now=self.now).accepted)
         wake = host.request_scheduler_wake("wake-1", now=self.now)
         self.assertTrue(wake.accepted)
         self.assertIn("scheduler-wake", wake.reason)
-        self.assertTrue(host.complete("wake-1").accepted)
+        self.assertTrue(host.complete("wake-1", now=self.now).accepted)
         self.assertFalse(host.run_once("wake-1", now=self.now).accepted)
         self.assertEqual(host.state, NativeHostState.IDLE)
 
     def test_stale_authority_cannot_start_or_wake_a_process(self) -> None:
         host = self.install()
-        stale = self.now + timedelta(minutes=2)
+        stale = self.now + timedelta(minutes=6)
         self.assertFalse(host.run_once("stale-direct", now=stale).accepted)
         self.assertFalse(host.request_scheduler_wake("stale-wake", now=stale).accepted)
         self.assertEqual(host.state, NativeHostState.IDLE)
@@ -101,7 +104,7 @@ class NativeHostTests(unittest.TestCase):
         host = self.install()
         self.assertTrue(host.run_once("process-1", now=self.now).accepted)
         self.assertFalse(host.stop().accepted)
-        self.assertTrue(host.complete("process-1").accepted)
+        self.assertTrue(host.complete("process-1", now=self.now).accepted)
         self.assertTrue(host.stop().accepted)
         self.assertEqual(host.state, NativeHostState.STOPPED)
         self.assertFalse(host.run_once("process-2", now=self.now).accepted)
@@ -181,6 +184,62 @@ class NativeHostTests(unittest.TestCase):
             self.assertFalse(peer.recover_stale_child("live-child", now=self.now + timedelta(minutes=1), stale_after=timedelta(seconds=1)).accepted)
             self.assertFalse(peer.run_once("replacement-child", now=self.now + timedelta(minutes=1)).accepted)
             self.assertEqual(host.state, NativeHostState.RUNNING)
+
+    def test_post_admission_transitions_revalidate_authority_before_mutation(self) -> None:
+        """Expiry, revocation, and open handoff deny every durable transition."""
+
+        self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+        denials = (
+            ("expiry", "receipt is stale or not yet active"),
+            ("revocation", "receipt was revoked"),
+            ("open-handoff", "authority handoff is incomplete; dispatch remains blocked"),
+        )
+        operations = (
+            ("complete", lambda host, process, moment: host.complete(process, now=moment), self.now),
+            ("cancel", lambda host, process, moment: host.cancel(process, now=moment), self.now),
+            ("renew", lambda host, process, moment: host.renew_child_lease(process, now=moment), self.now),
+            (
+                "recover",
+                lambda host, process, moment: host.recover_stale_child(
+                    process, now=moment, stale_after=timedelta(seconds=1),
+                ),
+                self.now + timedelta(minutes=2),
+            ),
+        )
+        for denial_name, reason in denials:
+            for operation_name, operation, moment in operations:
+                with self.subTest(denial=denial_name, operation=operation_name):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        paths = NativeHostPaths.resolve(
+                            platform=sys.platform, environment={}, home=root / "home",
+                            worktree=self._bound_worktree(root / "repository"),
+                        )
+                        host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+                        self.assertTrue(installed.accepted)
+                        assert host is not None
+                        process = f"{denial_name}-{operation_name}"
+                        self.assertTrue(host.run_once(process, now=self.now).accepted)
+                        with closing(sqlite3.connect(paths.state_database)) as connection:
+                            before = connection.execute(
+                                "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                                (process,),
+                            ).fetchone()
+                        with mock.patch.object(
+                            self.coordinator, "authorize", return_value=HandoffDecision(False, reason),
+                        ) as authorize:
+                            denied = operation(host, process, moment)
+                        self.assertFalse(denied.accepted)
+                        self.assertEqual(denied.reason, reason)
+                        authorize.assert_called_once_with(self.identity, self.receipt, now=moment)
+                        with closing(sqlite3.connect(paths.state_database)) as connection:
+                            after = connection.execute(
+                                "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                                (process,),
+                            ).fetchone()
+                        self.assertEqual(after, before)
+                        self.assertEqual(host.state, NativeHostState.RUNNING)
 
     def test_cache_removal_cannot_remove_durable_process_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

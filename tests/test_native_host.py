@@ -120,10 +120,13 @@ class NativeHostTests(unittest.TestCase):
         self.assertTrue(str(windows.configuration).replace("\\", "/").endswith("profile/roaming/Roundwright/config.toml"))
         self.assertTrue(str(windows.cache).replace("\\", "/").endswith("profile/local/Roundwright/Cache"))
         self.assertTrue(str(windows.authentication).replace("\\", "/").endswith("Roundwright/auth.toml"))
-        macos = NativeHostPaths.resolve(platform="darwin", environment={}, home=home, worktree=worktree)
+        self.assertTrue(windows.configuration.is_absolute())
+        macos = NativeHostPaths.resolve(platform="darwin", environment={}, home=Path("/Users/roundwright"), worktree=Path("/repositories/roundwright"))
         self.assertTrue(str(macos.configuration).replace("\\", "/").endswith("Library/Application Support/roundwright/config.toml"))
-        linux = NativeHostPaths.resolve(platform="linux", environment={}, home=home, worktree=worktree)
+        self.assertTrue(macos.configuration.is_absolute())
+        linux = NativeHostPaths.resolve(platform="linux", environment={}, home=Path("/home/roundwright"), worktree=Path("/repositories/roundwright"))
         self.assertTrue(str(linux.cache).replace("\\", "/").endswith(".cache/roundwright"))
+        self.assertTrue(linux.cache.is_absolute())
         with self.assertRaisesRegex(NativeHostError, "unsupported"):
             NativeHostPaths.resolve(platform="plan9", environment={}, home=home, worktree=worktree)
 
@@ -144,13 +147,15 @@ class NativeHostTests(unittest.TestCase):
             assert peer is not None
             self.assertTrue(host.run_once("owned-child", now=self.now).accepted)
             self.assertFalse(peer.run_once("competing-child", now=self.now).accepted)
+            self.assertFalse(peer.complete("owned-child", now=self.now).accepted)
             self.assertTrue(host.cancel("owned-child", now=self.now).accepted)
             self.assertTrue(host.cancel("owned-child", now=self.now).accepted)
             self.assertTrue(peer.run_once("stale-child", now=self.now).accepted)
-            self.assertFalse(host.recover_stale_child("stale-child", now=self.now, stale_after=timedelta(minutes=1)).accepted)
-            self.assertTrue(host.recover_stale_child("stale-child", now=self.now + timedelta(minutes=2), stale_after=timedelta(minutes=1)).accepted)
+            interval = timedelta(seconds=1, microseconds=500000)
+            self.assertFalse(host.recover_stale_child("stale-child", now=self.now + timedelta(seconds=1, microseconds=499999), stale_after=interval).accepted)
+            self.assertTrue(host.recover_stale_child("stale-child", now=self.now + interval, stale_after=interval).accepted)
             self.assertTrue(host.run_once("replacement-child", now=self.now).accepted)
-            self.assertTrue(host.complete("replacement-child").accepted)
+            self.assertTrue(host.complete("replacement-child", now=self.now).accepted)
             self.assertTrue(paths.state_database.is_file())
 
     def test_durable_install_rejects_detached_worktree_and_candidate_drift(self) -> None:
@@ -167,11 +172,32 @@ class NativeHostTests(unittest.TestCase):
             drifted_receipt = replace(self.receipt, identity=drifted_identity)
             drifted = NativeHostInstallation(fingerprint("6"), drifted_identity, drifted_receipt)
             self.assertFalse(NativeHostControlStore(paths.state_database).install(drifted).accepted)
+            (worktree / ".git" / "refs" / "heads" / "codex" / "issue-90").write_text("b" * 40 + "\n", encoding="utf-8")
+            drifted_host, drifted_decision = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertIsNone(drifted_host)
+            self.assertFalse(drifted_decision.accepted)
+            self.assertIn("candidate SHA", drifted_decision.reason)
             (worktree / ".git" / "HEAD").write_text("a" * 40 + "\n", encoding="utf-8")
             detached_host, detached = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
             self.assertIsNone(detached_host)
             self.assertFalse(detached.accepted)
             self.assertIn("detached", detached.reason)
+
+    def test_linked_worktree_resolves_its_common_head_to_the_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            metadata = root / "metadata"
+            metadata.mkdir()
+            common = root / "common"
+            (common / "refs" / "heads" / "codex").mkdir(parents=True)
+            (common / "refs" / "heads" / "codex" / "issue-90").write_text("a" * 40 + "\n", encoding="utf-8")
+            (metadata / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            (metadata / "commondir").write_text("../common\n", encoding="utf-8")
+            (worktree / ".git").write_text("gitdir: ../metadata\n", encoding="utf-8")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:
         host = self.install()
@@ -187,6 +213,9 @@ class NativeHostTests(unittest.TestCase):
         git = root / ".git"
         git.mkdir()
         (git / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+        reference = git / "refs" / "heads" / "codex"
+        reference.mkdir(parents=True)
+        (reference / "issue-90").write_text("a" * 40 + "\n", encoding="utf-8")
         return root
 
 

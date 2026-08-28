@@ -15,12 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from contextlib import closing
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import sqlite3
 from threading import RLock
 from typing import Callable
-
-from .configuration import ConfigurationError, user_cache_path, user_config_path
 
 from .deployment_handoff import (
     DeploymentAuthorityHandoffCoordinator,
@@ -49,6 +47,7 @@ class InvocationSource(str, Enum):
 
 
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
@@ -103,11 +102,11 @@ class NativeHostPaths:
     """
 
     platform: str
-    configuration: Path
-    authentication: Path
-    cache: Path
-    state_database: Path
-    worktree: Path
+    configuration: PurePath
+    authentication: PurePath
+    cache: PurePath
+    state_database: PurePath
+    worktree: PurePath
 
     @classmethod
     def resolve(
@@ -115,29 +114,41 @@ class NativeHostPaths:
         *,
         platform: str,
         environment: dict[str, str],
-        home: Path,
-        worktree: Path,
+        home: PurePath,
+        worktree: PurePath,
     ) -> "NativeHostPaths":
         if type(platform) is not str or not platform:
             raise NativeHostError("native host platform is invalid")
         if type(environment) is not dict or not all(type(key) is str and type(value) is str for key, value in environment.items()):
             raise NativeHostError("native host environment is invalid")
-        if not isinstance(home, Path) or not isinstance(worktree, Path):
+        if not isinstance(home, PurePath) or not isinstance(worktree, PurePath):
             raise NativeHostError("native host paths are invalid")
-        try:
-            configuration = user_config_path(platform=platform, environment=environment, home=home)
-            cache = user_cache_path(platform=platform, environment=environment, home=home)
-        except ConfigurationError as error:
-            raise NativeHostError("native host platform is unsupported") from error
-        return cls(platform, configuration, configuration.parent / "auth.toml", cache, cache / "native-host.sqlite3", worktree)
+        path_type = _declared_path_type(platform)
+        declared_home = _coerce_declared_path(path_type, home)
+        if not declared_home.is_absolute():
+            raise NativeHostError("native host home path is not absolute for the declared platform")
+        configuration, cache = _declared_host_paths(platform, path_type, declared_home, environment)
+        return cls(
+            platform,
+            _native_path_if_compatible(platform, configuration),
+            _native_path_if_compatible(platform, configuration.parent / "auth.toml"),
+            _native_path_if_compatible(platform, cache),
+            _native_path_if_compatible(platform, cache / "native-host.sqlite3"),
+            _native_path_if_compatible(platform, _coerce_declared_path(path_type, worktree)),
+        )
 
-    def require_authoritative_worktree(self) -> None:
+    def require_authoritative_worktree(self, candidate_sha: str) -> None:
         """Reject unavailable and detached Git worktrees before state mutation."""
 
+        if not _COMMIT.fullmatch(candidate_sha):
+            raise NativeHostError("native host candidate SHA is invalid")
+        if not isinstance(self.worktree, Path):
+            raise NativeHostError("native host worktree targets a different platform")
         if not self.worktree.is_dir():
             raise NativeHostError("native host worktree is unavailable")
         marker = self.worktree / ".git"
         if marker.is_dir():
+            git_directory = marker
             head = marker / "HEAD"
         elif marker.is_file():
             try:
@@ -158,6 +169,12 @@ class NativeHostPaths:
             raise NativeHostError("native host worktree HEAD is unavailable") from error
         if not value.startswith("ref: refs/heads/"):
             raise NativeHostError("native host worktree is detached; select a bound branch before installation")
+        reference = value.removeprefix("ref: ")
+        resolved = _resolve_worktree_reference(_common_git_directory(git_directory), reference)
+        if resolved is None:
+            raise NativeHostError("native host worktree HEAD cannot resolve to a full SHA")
+        if resolved != candidate_sha:
+            raise NativeHostError("native host worktree HEAD does not match the installation candidate SHA")
 
 
 class NativeHostControlStore:
@@ -260,7 +277,7 @@ class NativeHostControlStore:
                     ).fetchone()
                     if row is None or row[0] != "running":
                         return self._denied(installation, "native host process is not an active stale child", process_id)
-                    if _timestamp(now) < row[1] + int(stale_after.total_seconds()):
+                    if _timestamp(now) < row[1] + stale_after.total_seconds():
                         return self._denied(installation, "native host child is not stale", process_id)
                     connection.execute(
                         "UPDATE native_host_process SET state = 'recovered', updated_at = ? WHERE process_id = ?",
@@ -299,10 +316,93 @@ class NativeHostControlStore:
         return NativeHostDecision(False, reason, installation.installation_fingerprint, installation.receipt.receipt_fingerprint, process_id)
 
 
-def _timestamp(value: object) -> int:
+def _timestamp(value: object) -> float:
     if type(value) is not datetime or value.tzinfo is not timezone.utc:
         raise NativeHostError("native host timestamp must be an aware UTC datetime")
-    return int(value.timestamp())
+    return value.timestamp()
+
+
+def _declared_path_type(platform: str) -> type[PureWindowsPath] | type[PurePosixPath]:
+    if platform.startswith("win"):
+        return PureWindowsPath
+    if platform == "darwin" or platform.startswith("linux"):
+        return PurePosixPath
+    raise NativeHostError("native host platform is unsupported")
+
+
+def _declared_host_paths(
+    platform: str,
+    path_type: type[PureWindowsPath] | type[PurePosixPath],
+    home: PurePath,
+    environment: dict[str, str],
+) -> tuple[PurePath, PurePath]:
+    if platform.startswith("win"):
+        configuration_root = _declared_environment_directory(
+            environment, "APPDATA", home / "AppData" / "Roaming", path_type
+        )
+        cache_root = _declared_environment_directory(
+            environment, "LOCALAPPDATA", home / "AppData" / "Local", path_type
+        )
+        return configuration_root / "Roundwright" / "config.toml", cache_root / "Roundwright" / "Cache"
+    if platform == "darwin":
+        return home / "Library" / "Application Support" / "roundwright" / "config.toml", home / "Library" / "Caches" / "roundwright"
+    configuration_root = _declared_environment_directory(environment, "XDG_CONFIG_HOME", home / ".config", path_type)
+    cache_root = _declared_environment_directory(environment, "XDG_CACHE_HOME", home / ".cache", path_type)
+    return configuration_root / "roundwright" / "config.toml", cache_root / "roundwright"
+
+
+def _coerce_declared_path(path_type: type[PureWindowsPath] | type[PurePosixPath], value: PurePath) -> PurePath:
+    text = str(value)
+    return path_type(text.replace("\\", "/") if path_type is PurePosixPath else text)
+
+
+def _declared_environment_directory(
+    environment: dict[str, str], key: str, default: PurePath, path_type: type[PureWindowsPath] | type[PurePosixPath]
+) -> PurePath:
+    value = path_type(environment[key]) if key in environment else default
+    if not value.is_absolute():
+        raise NativeHostError(f"native host {key} path is not absolute for the declared platform")
+    return value
+
+
+def _native_path_if_compatible(platform: str, value: PurePath) -> PurePath:
+    host_is_windows = Path("C:/").is_absolute()
+    declared_is_windows = platform.startswith("win")
+    return Path(str(value)) if host_is_windows == declared_is_windows else value
+
+
+def _common_git_directory(git_directory: Path) -> Path:
+    marker = git_directory / "commondir"
+    if not marker.is_file():
+        return git_directory
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise NativeHostError("native host linked worktree common directory is unavailable") from error
+    if not value:
+        raise NativeHostError("native host linked worktree common directory is invalid")
+    common = Path(value)
+    return common if common.is_absolute() else (git_directory / common).resolve()
+
+
+def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | None:
+    if not reference.startswith("refs/heads/"):
+        return None
+    try:
+        value = (git_directory / reference).read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    if _COMMIT.fullmatch(value):
+        return value
+    try:
+        packed = (git_directory / "packed-refs").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in packed:
+        parts = line.split(" ", 1)
+        if len(parts) == 2 and parts[1] == reference and _COMMIT.fullmatch(parts[0]):
+            return parts[0]
+    return None
 
 
 class NativeHost:
@@ -361,19 +461,19 @@ class NativeHost:
             return self._denied(wake.reason, process)
         return self._start(process, InvocationSource.SCHEDULER_WAKE, now=now)
 
-    def complete(self, process_id: str) -> NativeHostDecision:
+    def complete(self, process_id: str, *, now: datetime | None = None) -> NativeHostDecision:
         """Finish exactly the active process and return the host to idle."""
 
         process = _require_process_id(process_id)
         with self._lock:
-            if self._control_store is not None:
-                decision = self._control_store.finish(self._installation, process, "completed", now=_now_utc())
-                if not decision.accepted:
-                    return decision
             if self._state is NativeHostState.STOPPED:
                 return self._denied("native host is stopped", process)
             if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
                 return self._denied("native host process is not active", process)
+            if self._control_store is not None:
+                decision = self._control_store.finish(self._installation, process, "completed", now=_now_utc() if now is None else now)
+                if not decision.accepted:
+                    return decision
             self._active_process_id = None
             self._state = NativeHostState.IDLE
             return self._accepted("native host process completed", process)
@@ -384,16 +484,19 @@ class NativeHost:
         process = _require_process_id(process_id)
         _timestamp(now)
         with self._lock:
+            if self._state is NativeHostState.STOPPED:
+                return self._denied("native host is stopped", process)
+            if self._state is NativeHostState.IDLE and self._control_store is not None and process in self._consumed_process_ids:
+                decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
+                if not decision.accepted:
+                    return decision
+                return self._accepted("native host process is already cancelled", process)
+            if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
+                return self._denied("native host process is not active", process)
             if self._control_store is not None:
                 decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
                 if not decision.accepted:
                     return decision
-            if self._state is NativeHostState.STOPPED:
-                return self._denied("native host is stopped", process)
-            if self._state is NativeHostState.IDLE and self._control_store is not None:
-                return self._accepted("native host process is already cancelled", process)
-            if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
-                return self._denied("native host process is not active", process)
             self._active_process_id = None
             self._state = NativeHostState.IDLE
             return self._accepted("native host process cancelled", process)
@@ -431,7 +534,7 @@ class NativeHost:
         except BaseException:
             self.cancel(process_id, now=now)
             raise
-        return self.complete(process_id)
+        return self.complete(process_id, now=now)
 
     def stop(self) -> NativeHostDecision:
         """Stop only an idle host; a running process must reconcile first."""
@@ -512,7 +615,7 @@ def install_native_host(
     if paths is None:
         return NativeHost(coordinator, installation), decision
     try:
-        paths.require_authoritative_worktree()
+        paths.require_authoritative_worktree(installation.identity.candidate_sha)
     except NativeHostError as error:
         return None, NativeHostDecision(False, str(error), installation.installation_fingerprint, installation.receipt.receipt_fingerprint)
     control_store = NativeHostControlStore(paths.state_database)

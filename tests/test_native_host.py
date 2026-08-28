@@ -282,9 +282,10 @@ class NativeHostTests(unittest.TestCase):
             with self.assertRaisesRegex(NativeHostError, "loose worktree reference is malformed"):
                 paths.require_authoritative_worktree(self.identity.candidate_sha)
             original_read = Path.read_text
+            canonical_loose = loose.resolve()
 
             def deny_loose(path: Path, *args: object, **kwargs: object) -> str:
-                if path == loose:
+                if path.resolve() == canonical_loose:
                     raise PermissionError("denied")
                 return original_read(path, *args, **kwargs)
 

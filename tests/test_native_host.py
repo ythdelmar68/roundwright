@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from uuid import UUID
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ from roundwright.native_host import (
     NativeHostInstallation,
     NativeHostPaths,
     NativeHostState,
+    InvocationSource,
     install_native_host,
 )
 from roundwright.runtime_binding import RuntimeBinding
@@ -129,6 +131,8 @@ class NativeHostTests(unittest.TestCase):
         self.assertTrue(linux.cache.is_absolute())
         with self.assertRaisesRegex(NativeHostError, "unsupported"):
             NativeHostPaths.resolve(platform="plan9", environment={}, home=home, worktree=worktree)
+        with self.assertRaisesRegex(NativeHostError, "worktree path is not absolute"):
+            NativeHostPaths.resolve(platform="linux", environment={}, home=Path("/home/roundwright"), worktree=Path("relative-worktree"))
 
     def test_durable_sqlite_lifecycle_serializes_children_and_recovers_stale_ones(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -157,6 +161,26 @@ class NativeHostTests(unittest.TestCase):
             self.assertTrue(host.run_once("replacement-child", now=self.now).accepted)
             self.assertTrue(host.complete("replacement-child", now=self.now).accepted)
             self.assertTrue(paths.state_database.is_file())
+
+    def test_stale_deadline_uses_exact_microseconds_at_far_future_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            store = NativeHostControlStore(paths.state_database)
+            self.assertTrue(store.install(self.installation).accepted)
+            far_future = datetime(9999, 1, 1, 12, 0, tzinfo=timezone.utc)
+            self.assertTrue(store.admit(self.installation, "future-child", source=InvocationSource.ONE_SHOT, now=far_future).accepted)
+            self.assertFalse(store.recover_stale(self.installation, "future-child", now=far_future, stale_after=timedelta(microseconds=1)).accepted)
+            self.assertTrue(store.recover_stale(self.installation, "future-child", now=far_future + timedelta(microseconds=1), stale_after=timedelta(microseconds=1)).accepted)
+
+    def test_state_database_filesystem_failures_are_public_safe_denials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            with mock.patch.object(Path, "mkdir", side_effect=OSError("denied")):
+                decision = NativeHostControlStore(paths.state_database).install(self.installation)
+            self.assertFalse(decision.accepted)
+            self.assertEqual(decision.reason, "native host state database is unavailable")
 
     def test_durable_install_rejects_detached_worktree_and_candidate_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,6 +221,38 @@ class NativeHostTests(unittest.TestCase):
             (metadata / "commondir").write_text("../common\n", encoding="utf-8")
             (worktree / ".git").write_text("gitdir: ../metadata\n", encoding="utf-8")
             paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            loose = common / "refs" / "heads" / "codex" / "issue-90"
+            (common / "packed-refs").write_text("a" * 40 + " refs/heads/codex/issue-90\n", encoding="utf-8")
+            loose.write_text("malformed\n", encoding="utf-8")
+            with self.assertRaisesRegex(NativeHostError, "loose worktree reference is malformed"):
+                paths.require_authoritative_worktree(self.identity.candidate_sha)
+            loose.unlink()
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+
+    def test_loose_worktree_refs_fail_closed_before_packed_ref_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            loose = worktree / ".git" / "refs" / "heads" / "codex" / "issue-90"
+            packed = worktree / ".git" / "packed-refs"
+            packed.write_text("a" * 40 + " refs/heads/codex/issue-90\n", encoding="utf-8")
+            loose.write_text("malformed\n", encoding="utf-8")
+            with self.assertRaisesRegex(NativeHostError, "loose worktree reference is malformed"):
+                paths.require_authoritative_worktree(self.identity.candidate_sha)
+            original_read = Path.read_text
+
+            def deny_loose(path: Path, *args: object, **kwargs: object) -> str:
+                if path == loose:
+                    raise PermissionError("denied")
+                return original_read(path, *args, **kwargs)
+
+            loose.write_text("a" * 40 + "\n", encoding="utf-8")
+            with mock.patch.object(Path, "read_text", new=deny_loose):
+                with self.assertRaisesRegex(NativeHostError, "loose worktree reference is unreadable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            loose.unlink()
             paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:

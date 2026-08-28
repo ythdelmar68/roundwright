@@ -127,6 +127,9 @@ class NativeHostPaths:
         declared_home = _coerce_declared_path(path_type, home)
         if not declared_home.is_absolute():
             raise NativeHostError("native host home path is not absolute for the declared platform")
+        declared_worktree = _coerce_declared_path(path_type, worktree)
+        if not declared_worktree.is_absolute():
+            raise NativeHostError("native host worktree path is not absolute for the declared platform")
         configuration, cache = _declared_host_paths(platform, path_type, declared_home, environment)
         return cls(
             platform,
@@ -134,7 +137,7 @@ class NativeHostPaths:
             _native_path_if_compatible(platform, configuration.parent / "auth.toml"),
             _native_path_if_compatible(platform, cache),
             _native_path_if_compatible(platform, cache / "native-host.sqlite3"),
-            _native_path_if_compatible(platform, _coerce_declared_path(path_type, worktree)),
+            _native_path_if_compatible(platform, declared_worktree),
         )
 
     def require_authoritative_worktree(self, candidate_sha: str) -> None:
@@ -208,7 +211,7 @@ class NativeHostControlStore:
                         connection.executemany(
                             "INSERT INTO native_host_metadata(key, value) VALUES (?, ?)", expected.items()
                         )
-        except sqlite3.Error as error:
+        except (OSError, sqlite3.Error):
             return self._denied(installation, "native host state database is unavailable")
         return self._accepted(installation, "native host installation recorded")
 
@@ -233,7 +236,7 @@ class NativeHostControlStore:
                         "INSERT INTO native_host_process(process_id, receipt_fingerprint, candidate_sha, source, state, started_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?)",
                         (process_id, installation.receipt.receipt_fingerprint, installation.identity.candidate_sha, source.value, _timestamp(now), _timestamp(now)),
                     )
-        except sqlite3.Error:
+        except (OSError, sqlite3.Error):
             return self._denied(installation, "native host state database is unavailable", process_id)
         return self._accepted(installation, f"native host {source.value} process admitted", process_id)
 
@@ -259,7 +262,7 @@ class NativeHostControlStore:
                         "UPDATE native_host_process SET state = ?, updated_at = ? WHERE process_id = ?",
                         (state, _timestamp(now), process_id),
                     )
-        except sqlite3.Error:
+        except (OSError, sqlite3.Error):
             return self._denied(installation, "native host state database is unavailable", process_id)
         return self._accepted(installation, f"native host process {state}", process_id)
 
@@ -277,13 +280,13 @@ class NativeHostControlStore:
                     ).fetchone()
                     if row is None or row[0] != "running":
                         return self._denied(installation, "native host process is not an active stale child", process_id)
-                    if _timestamp(now) < row[1] + stale_after.total_seconds():
+                    if _timestamp(now) < row[1] + _timedelta_microseconds(stale_after):
                         return self._denied(installation, "native host child is not stale", process_id)
                     connection.execute(
                         "UPDATE native_host_process SET state = 'recovered', updated_at = ? WHERE process_id = ?",
                         (_timestamp(now), process_id),
                     )
-        except sqlite3.Error:
+        except (OSError, sqlite3.Error):
             return self._denied(installation, "native host state database is unavailable", process_id)
         return self._accepted(installation, "native host stale child recovered", process_id)
 
@@ -316,10 +319,15 @@ class NativeHostControlStore:
         return NativeHostDecision(False, reason, installation.installation_fingerprint, installation.receipt.receipt_fingerprint, process_id)
 
 
-def _timestamp(value: object) -> float:
+def _timestamp(value: object) -> int:
     if type(value) is not datetime or value.tzinfo is not timezone.utc:
         raise NativeHostError("native host timestamp must be an aware UTC datetime")
-    return value.timestamp()
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return _timedelta_microseconds(value - epoch)
+
+
+def _timedelta_microseconds(value: timedelta) -> int:
+    return value.days * 86_400_000_000 + value.seconds * 1_000_000 + value.microseconds
 
 
 def _declared_path_type(platform: str) -> type[PureWindowsPath] | type[PurePosixPath]:
@@ -390,9 +398,13 @@ def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | No
         return None
     try:
         value = (git_directory / reference).read_text(encoding="utf-8").strip()
-    except OSError:
-        value = ""
-    if _COMMIT.fullmatch(value):
+    except FileNotFoundError:
+        value = None
+    except OSError as error:
+        raise NativeHostError("native host loose worktree reference is unreadable") from error
+    if value is not None and not _COMMIT.fullmatch(value):
+        raise NativeHostError("native host loose worktree reference is malformed")
+    if value is not None:
         return value
     try:
         packed = (git_directory / "packed-refs").read_text(encoding="utf-8").splitlines()

@@ -12,8 +12,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from contextlib import closing
+from pathlib import Path
+import sqlite3
 from threading import RLock
+from typing import Callable
+
+from .configuration import ConfigurationError, user_cache_path, user_config_path
 
 from .deployment_handoff import (
     DeploymentAuthorityHandoffCoordinator,
@@ -86,6 +93,218 @@ class NativeHostDecision:
     process_id: str | None = None
 
 
+@dataclass(frozen=True)
+class NativeHostPaths:
+    """Platform-aware, public-safe locations used by a native-host wrapper.
+
+    Resolving paths does not create them.  In particular, the authentication
+    path is only a location for a later credential adapter; this module never
+    reads it or accepts a credential value.
+    """
+
+    platform: str
+    configuration: Path
+    authentication: Path
+    cache: Path
+    state_database: Path
+    worktree: Path
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        platform: str,
+        environment: dict[str, str],
+        home: Path,
+        worktree: Path,
+    ) -> "NativeHostPaths":
+        if type(platform) is not str or not platform:
+            raise NativeHostError("native host platform is invalid")
+        if type(environment) is not dict or not all(type(key) is str and type(value) is str for key, value in environment.items()):
+            raise NativeHostError("native host environment is invalid")
+        if not isinstance(home, Path) or not isinstance(worktree, Path):
+            raise NativeHostError("native host paths are invalid")
+        try:
+            configuration = user_config_path(platform=platform, environment=environment, home=home)
+            cache = user_cache_path(platform=platform, environment=environment, home=home)
+        except ConfigurationError as error:
+            raise NativeHostError("native host platform is unsupported") from error
+        return cls(platform, configuration, configuration.parent / "auth.toml", cache, cache / "native-host.sqlite3", worktree)
+
+    def require_authoritative_worktree(self) -> None:
+        """Reject unavailable and detached Git worktrees before state mutation."""
+
+        if not self.worktree.is_dir():
+            raise NativeHostError("native host worktree is unavailable")
+        marker = self.worktree / ".git"
+        if marker.is_dir():
+            head = marker / "HEAD"
+        elif marker.is_file():
+            try:
+                line = marker.read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise NativeHostError("native host worktree marker is unreadable") from error
+            if not line.startswith("gitdir: "):
+                raise NativeHostError("native host worktree marker is invalid")
+            git_directory = Path(line.removeprefix("gitdir: "))
+            if not git_directory.is_absolute():
+                git_directory = (self.worktree / git_directory).resolve()
+            head = git_directory / "HEAD"
+        else:
+            raise NativeHostError("native host worktree is not a Git worktree")
+        try:
+            value = head.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raise NativeHostError("native host worktree HEAD is unavailable") from error
+        if not value.startswith("ref: refs/heads/"):
+            raise NativeHostError("native host worktree is detached; select a bound branch before installation")
+
+
+class NativeHostControlStore:
+    """SQLite-backed host lifecycle truth for one platform installation.
+
+    The store owns only local process bookkeeping.  It cannot issue, refresh,
+    or inspect deployment authority; callers must pass authority through the
+    handoff coordinator before every state transition.
+    """
+
+    def __init__(self, database: Path) -> None:
+        if not isinstance(database, Path) or database.name != "native-host.sqlite3":
+            raise NativeHostError("native host state database path is invalid")
+        self._database = database
+
+    def install(self, installation: NativeHostInstallation) -> NativeHostDecision:
+        try:
+            self._database.parent.mkdir(parents=True, exist_ok=True)
+            with closing(self._connection()) as connection:
+                with connection:
+                    self._prepare(connection)
+                    expected = {
+                        "installation_fingerprint": installation.installation_fingerprint,
+                        "receipt_fingerprint": installation.receipt.receipt_fingerprint,
+                        "candidate_sha": installation.identity.candidate_sha,
+                    }
+                    current = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+                    if current and current != expected:
+                        return self._denied(installation, "native host state belongs to a different receipt or candidate")
+                    if not current:
+                        connection.executemany(
+                            "INSERT INTO native_host_metadata(key, value) VALUES (?, ?)", expected.items()
+                        )
+        except sqlite3.Error as error:
+            return self._denied(installation, "native host state database is unavailable")
+        return self._accepted(installation, "native host installation recorded")
+
+    def admit(self, installation: NativeHostInstallation, process_id: str, source: InvocationSource, *, now: datetime) -> NativeHostDecision:
+        try:
+            with closing(self._connection()) as connection:
+                with connection:
+                    self._prepare(connection)
+                    if not self._matches(connection, installation):
+                        return self._denied(installation, "native host state is not authoritative for this candidate", process_id)
+                    active = connection.execute(
+                        "SELECT process_id FROM native_host_process WHERE state = 'running'"
+                    ).fetchone()
+                    if active is not None:
+                        return self._denied(installation, "native host lock has an active process", process_id)
+                    previous = connection.execute(
+                        "SELECT process_id FROM native_host_process WHERE process_id = ?", (process_id,)
+                    ).fetchone()
+                    if previous is not None:
+                        return self._denied(installation, "native host process identity was already consumed", process_id)
+                    connection.execute(
+                        "INSERT INTO native_host_process(process_id, receipt_fingerprint, candidate_sha, source, state, started_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?)",
+                        (process_id, installation.receipt.receipt_fingerprint, installation.identity.candidate_sha, source.value, _timestamp(now), _timestamp(now)),
+                    )
+        except sqlite3.Error:
+            return self._denied(installation, "native host state database is unavailable", process_id)
+        return self._accepted(installation, f"native host {source.value} process admitted", process_id)
+
+    def finish(self, installation: NativeHostInstallation, process_id: str, state: str, *, now: datetime) -> NativeHostDecision:
+        if state not in {"completed", "cancelled", "recovered"}:
+            raise NativeHostError("native host terminal state is invalid")
+        try:
+            with closing(self._connection()) as connection:
+                with connection:
+                    self._prepare(connection)
+                    if not self._matches(connection, installation):
+                        return self._denied(installation, "native host state is not authoritative for this candidate", process_id)
+                    row = connection.execute(
+                        "SELECT state FROM native_host_process WHERE process_id = ?", (process_id,)
+                    ).fetchone()
+                    if row is None:
+                        return self._denied(installation, "native host process is not active", process_id)
+                    if row[0] != "running":
+                        if state == "cancelled" and row[0] == "cancelled":
+                            return self._accepted(installation, "native host process is already cancelled", process_id)
+                        return self._denied(installation, "native host process is not active", process_id)
+                    connection.execute(
+                        "UPDATE native_host_process SET state = ?, updated_at = ? WHERE process_id = ?",
+                        (state, _timestamp(now), process_id),
+                    )
+        except sqlite3.Error:
+            return self._denied(installation, "native host state database is unavailable", process_id)
+        return self._accepted(installation, f"native host process {state}", process_id)
+
+    def recover_stale(self, installation: NativeHostInstallation, process_id: str, *, now: datetime, stale_after: timedelta) -> NativeHostDecision:
+        if type(stale_after) is not timedelta or stale_after <= timedelta():
+            raise NativeHostError("native host stale-child interval is invalid")
+        try:
+            with closing(self._connection()) as connection:
+                with connection:
+                    self._prepare(connection)
+                    if not self._matches(connection, installation):
+                        return self._denied(installation, "native host state is not authoritative for this candidate", process_id)
+                    row = connection.execute(
+                        "SELECT state, started_at FROM native_host_process WHERE process_id = ?", (process_id,)
+                    ).fetchone()
+                    if row is None or row[0] != "running":
+                        return self._denied(installation, "native host process is not an active stale child", process_id)
+                    if _timestamp(now) < row[1] + int(stale_after.total_seconds()):
+                        return self._denied(installation, "native host child is not stale", process_id)
+                    connection.execute(
+                        "UPDATE native_host_process SET state = 'recovered', updated_at = ? WHERE process_id = ?",
+                        (_timestamp(now), process_id),
+                    )
+        except sqlite3.Error:
+            return self._denied(installation, "native host state database is unavailable", process_id)
+        return self._accepted(installation, "native host stale child recovered", process_id)
+
+    def _connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._database, isolation_level=None)
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 1000")
+        connection.execute("BEGIN IMMEDIATE")
+        return connection
+
+    @staticmethod
+    def _prepare(connection: sqlite3.Connection) -> None:
+        connection.execute("CREATE TABLE IF NOT EXISTS native_host_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS native_host_process (process_id TEXT PRIMARY KEY, receipt_fingerprint TEXT NOT NULL, candidate_sha TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+
+    @staticmethod
+    def _matches(connection: sqlite3.Connection, installation: NativeHostInstallation) -> bool:
+        return dict(connection.execute("SELECT key, value FROM native_host_metadata")) == {
+            "installation_fingerprint": installation.installation_fingerprint,
+            "receipt_fingerprint": installation.receipt.receipt_fingerprint,
+            "candidate_sha": installation.identity.candidate_sha,
+        }
+
+    @staticmethod
+    def _accepted(installation: NativeHostInstallation, reason: str, process_id: str | None = None) -> NativeHostDecision:
+        return NativeHostDecision(True, reason, installation.installation_fingerprint, installation.receipt.receipt_fingerprint, process_id)
+
+    @staticmethod
+    def _denied(installation: NativeHostInstallation, reason: str, process_id: str | None = None) -> NativeHostDecision:
+        return NativeHostDecision(False, reason, installation.installation_fingerprint, installation.receipt.receipt_fingerprint, process_id)
+
+
+def _timestamp(value: object) -> int:
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
+        raise NativeHostError("native host timestamp must be an aware UTC datetime")
+    return int(value.timestamp())
+
+
 class NativeHost:
     """Serialize one host's installation and process lifecycle in memory.
 
@@ -94,11 +313,19 @@ class NativeHost:
     revalidates the already-claimed receipt through the handoff coordinator.
     """
 
-    def __init__(self, coordinator: DeploymentAuthorityHandoffCoordinator, installation: NativeHostInstallation) -> None:
+    def __init__(
+        self,
+        coordinator: DeploymentAuthorityHandoffCoordinator,
+        installation: NativeHostInstallation,
+        control_store: NativeHostControlStore | None = None,
+    ) -> None:
         if type(coordinator) is not DeploymentAuthorityHandoffCoordinator or type(installation) is not NativeHostInstallation:
             raise NativeHostError("native host installation is invalid")
+        if control_store is not None and type(control_store) is not NativeHostControlStore:
+            raise NativeHostError("native host control store is invalid")
         self._coordinator = coordinator
         self._installation = installation
+        self._control_store = control_store
         self._lock = RLock()
         self._state = NativeHostState.IDLE
         self._active_process_id: str | None = None
@@ -139,6 +366,10 @@ class NativeHost:
 
         process = _require_process_id(process_id)
         with self._lock:
+            if self._control_store is not None:
+                decision = self._control_store.finish(self._installation, process, "completed", now=_now_utc())
+                if not decision.accepted:
+                    return decision
             if self._state is NativeHostState.STOPPED:
                 return self._denied("native host is stopped", process)
             if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
@@ -146,6 +377,61 @@ class NativeHost:
             self._active_process_id = None
             self._state = NativeHostState.IDLE
             return self._accepted("native host process completed", process)
+
+    def cancel(self, process_id: str, *, now: datetime) -> NativeHostDecision:
+        """Cancel only the current child; a repeated cancellation is idempotent."""
+
+        process = _require_process_id(process_id)
+        _timestamp(now)
+        with self._lock:
+            if self._control_store is not None:
+                decision = self._control_store.finish(self._installation, process, "cancelled", now=now)
+                if not decision.accepted:
+                    return decision
+            if self._state is NativeHostState.STOPPED:
+                return self._denied("native host is stopped", process)
+            if self._state is NativeHostState.IDLE and self._control_store is not None:
+                return self._accepted("native host process is already cancelled", process)
+            if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
+                return self._denied("native host process is not active", process)
+            self._active_process_id = None
+            self._state = NativeHostState.IDLE
+            return self._accepted("native host process cancelled", process)
+
+    def recover_stale_child(self, process_id: str, *, now: datetime, stale_after: timedelta) -> NativeHostDecision:
+        """Release a persisted child only after the explicit stale interval."""
+
+        process = _require_process_id(process_id)
+        _timestamp(now)
+        if self._control_store is None:
+            return self._denied("native host has no durable child state to recover", process)
+        with self._lock:
+            decision = self._control_store.recover_stale(self._installation, process, now=now, stale_after=stale_after)
+            if not decision.accepted:
+                return decision
+            if self._active_process_id == process:
+                self._active_process_id = None
+                self._state = NativeHostState.IDLE
+            return decision
+
+    def execute_one_shot(self, process_id: str, action: Callable[[], None], *, now: datetime) -> NativeHostDecision:
+        """Run an injected native child behind durable admission and cleanup.
+
+        The action is intentionally supplied by the platform wrapper.  This
+        boundary never selects an executable, credentials, or a provider.
+        """
+
+        if not callable(action):
+            raise NativeHostError("native host one-shot action is invalid")
+        decision = self.run_once(process_id, now=now)
+        if not decision.accepted:
+            return decision
+        try:
+            action()
+        except BaseException:
+            self.cancel(process_id, now=now)
+            raise
+        return self.complete(process_id)
 
     def stop(self) -> NativeHostDecision:
         """Stop only an idle host; a running process must reconcile first."""
@@ -174,6 +460,10 @@ class NativeHost:
             )
             if not authority.authorized:
                 return self._denied(authority.reason, process)
+            if self._control_store is not None:
+                durable = self._control_store.admit(self._installation, process, source, now=now)
+                if not durable.accepted:
+                    return durable
             self._consumed_process_ids.add(process)
             self._active_process_id = process
             self._state = NativeHostState.RUNNING
@@ -197,16 +487,19 @@ def install_native_host(
     installation: NativeHostInstallation,
     *,
     now: object,
+    paths: NativeHostPaths | None = None,
 ) -> tuple[NativeHost | None, NativeHostDecision]:
     """Install a host only after its exact receipt is already authorized.
 
-    This performs no filesystem installation. The returned host is the
-    process-local policy boundary a native installer or service wrapper must
-    retain after it completes its own platform-specific work.
+    When platform paths are supplied, installation records local SQLite
+    machine truth only after authority admission and a bound worktree check.
+    It does not create a service, read credentials, or start a scheduler.
     """
 
     if type(coordinator) is not DeploymentAuthorityHandoffCoordinator or type(installation) is not NativeHostInstallation:
         raise NativeHostError("native host installation is invalid")
+    if paths is not None and type(paths) is not NativeHostPaths:
+        raise NativeHostError("native host paths are invalid")
     authority = coordinator.authorize(installation.identity, installation.receipt, now=now)
     decision = NativeHostDecision(
         authority.authorized,
@@ -214,4 +507,22 @@ def install_native_host(
         installation.installation_fingerprint,
         installation.receipt.receipt_fingerprint,
     )
-    return (NativeHost(coordinator, installation) if authority.authorized else None, decision)
+    if not authority.authorized:
+        return None, decision
+    if paths is None:
+        return NativeHost(coordinator, installation), decision
+    try:
+        paths.require_authoritative_worktree()
+    except NativeHostError as error:
+        return None, NativeHostDecision(False, str(error), installation.installation_fingerprint, installation.receipt.receipt_fingerprint)
+    control_store = NativeHostControlStore(paths.state_database)
+    durable = control_store.install(installation)
+    if not durable.accepted:
+        return None, durable
+    return NativeHost(coordinator, installation, control_store), durable
+
+
+def _now_utc() -> datetime:
+    """Use a UTC timestamp for compatibility-only completion calls."""
+
+    return datetime.now(timezone.utc)

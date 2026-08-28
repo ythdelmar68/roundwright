@@ -11,9 +11,11 @@ wake a shell but cannot grant authority or own workflow state.
 `roundwright.native_host` records the corresponding native-host contract without
 creating a service: an installed host requires an already claimed receipt,
 direct one-shot invocation and scheduler wakeups use the same admission rule,
-and one process-local host cannot overlap or replay process identities. It does
-not install software, start processes, discover credentials, or grant dispatch
-authority.
+and a local SQLite control record serializes, cancels, and recovers child
+identities. Its installer resolves Windows, macOS, and Linux configuration,
+authentication-location, cache, state, and worktree paths without reading a
+credential. It does not install software, discover credentials, start a
+scheduler, or grant dispatch authority.
 
 Read-only and test-only modes require no receipt. Authoritative mode requires
 one fresh external designation; missing, expired, copied, conflicting, or

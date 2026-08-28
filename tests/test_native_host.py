@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from uuid import UUID
 
@@ -19,7 +21,14 @@ from roundwright.deployment_handoff import (
     DeploymentAuthorityReceiptVerification,
     InMemoryDeploymentAuthorityStore,
 )
-from roundwright.native_host import NativeHostInstallation, NativeHostState, install_native_host
+from roundwright.native_host import (
+    NativeHostControlStore,
+    NativeHostError,
+    NativeHostInstallation,
+    NativeHostPaths,
+    NativeHostState,
+    install_native_host,
+)
 from roundwright.runtime_binding import RuntimeBinding
 
 
@@ -101,6 +110,84 @@ class NativeHostTests(unittest.TestCase):
         other_host, installation = install_native_host(competitor, self.installation, now=self.now)
         self.assertIsNone(other_host)
         self.assertFalse(installation.accepted)
+
+    def test_platform_paths_are_explicit_and_unsupported_platforms_fail_closed(self) -> None:
+        home = Path("C:/profiles/roundwright")
+        worktree = Path("C:/repositories/roundwright")
+        windows = NativeHostPaths.resolve(
+            platform="win32", environment={"APPDATA": "C:/profile/roaming", "LOCALAPPDATA": "C:/profile/local"}, home=home, worktree=worktree
+        )
+        self.assertTrue(str(windows.configuration).replace("\\", "/").endswith("profile/roaming/Roundwright/config.toml"))
+        self.assertTrue(str(windows.cache).replace("\\", "/").endswith("profile/local/Roundwright/Cache"))
+        self.assertTrue(str(windows.authentication).replace("\\", "/").endswith("Roundwright/auth.toml"))
+        macos = NativeHostPaths.resolve(platform="darwin", environment={}, home=home, worktree=worktree)
+        self.assertTrue(str(macos.configuration).replace("\\", "/").endswith("Library/Application Support/roundwright/config.toml"))
+        linux = NativeHostPaths.resolve(platform="linux", environment={}, home=home, worktree=worktree)
+        self.assertTrue(str(linux.cache).replace("\\", "/").endswith(".cache/roundwright"))
+        with self.assertRaisesRegex(NativeHostError, "unsupported"):
+            NativeHostPaths.resolve(platform="plan9", environment={}, home=home, worktree=worktree)
+
+    def test_durable_sqlite_lifecycle_serializes_children_and_recovers_stale_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            self.assertIsNotNone(host)
+            assert host is not None
+            peer, peer_installation = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(peer_installation.accepted)
+            self.assertIsNotNone(peer)
+            assert peer is not None
+            self.assertTrue(host.run_once("owned-child", now=self.now).accepted)
+            self.assertFalse(peer.run_once("competing-child", now=self.now).accepted)
+            self.assertTrue(host.cancel("owned-child", now=self.now).accepted)
+            self.assertTrue(host.cancel("owned-child", now=self.now).accepted)
+            self.assertTrue(peer.run_once("stale-child", now=self.now).accepted)
+            self.assertFalse(host.recover_stale_child("stale-child", now=self.now, stale_after=timedelta(minutes=1)).accepted)
+            self.assertTrue(host.recover_stale_child("stale-child", now=self.now + timedelta(minutes=2), stale_after=timedelta(minutes=1)).accepted)
+            self.assertTrue(host.run_once("replacement-child", now=self.now).accepted)
+            self.assertTrue(host.complete("replacement-child").accepted)
+            self.assertTrue(paths.state_database.is_file())
+
+    def test_durable_install_rejects_detached_worktree_and_candidate_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            self.assertIsNotNone(host)
+            drifted_identity = replace(self.identity, candidate_sha="b" * 40)
+            drifted_receipt = replace(self.receipt, identity=drifted_identity)
+            drifted = NativeHostInstallation(fingerprint("6"), drifted_identity, drifted_receipt)
+            self.assertFalse(NativeHostControlStore(paths.state_database).install(drifted).accepted)
+            (worktree / ".git" / "HEAD").write_text("a" * 40 + "\n", encoding="utf-8")
+            detached_host, detached = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertIsNone(detached_host)
+            self.assertFalse(detached.accepted)
+            self.assertIn("detached", detached.reason)
+
+    def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:
+        host = self.install()
+        invoked: list[str] = []
+        decision = host.execute_one_shot("wrapped-child", lambda: invoked.append("ran"), now=self.now)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(invoked, ["ran"])
+        self.assertEqual(host.state, NativeHostState.IDLE)
+
+    @staticmethod
+    def _bound_worktree(root: Path) -> Path:
+        root.mkdir()
+        git = root / ".git"
+        git.mkdir()
+        (git / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+        return root
 
 
 if __name__ == "__main__":

@@ -152,6 +152,14 @@ class NativeHostTests(unittest.TestCase):
                     replace(paths, worktree=Path("relative-worktree"))
                 with self.assertRaisesRegex(NativeHostError, "outside the declared state directory"):
                     replace(paths, state_database=root / "unrelated" / "native-host.sqlite3")
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_directory.parent)
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_directory / "evictable")
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_database)
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_database / "evictable")
                 with self.assertRaisesRegex(NativeHostError, "unsupported"):
                     NativeHostPaths(
                         "plan9", paths.configuration, paths.authentication, paths.cache,
@@ -321,6 +329,102 @@ class NativeHostTests(unittest.TestCase):
             self.assertEqual(host.state, NativeHostState.IDLE)
             self.assertTrue(handoff_done.is_set())
             self.assertTrue(handoff[0].authorized)
+
+    def test_authority_bound_installation_linearizes_before_open_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            entered = Event()
+            release = Event()
+            installed: list[tuple[object, NativeHostDecision]] = []
+            handoff: list[HandoffDecision] = []
+            handoff_done = Event()
+            original_install = NativeHostControlStore.install
+
+            def blocking_install(store: NativeHostControlStore, installation: NativeHostInstallation) -> NativeHostDecision:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_install(store, installation)
+
+            with mock.patch.object(NativeHostControlStore, "install", new=blocking_install):
+                installation_thread = Thread(
+                    target=lambda: installed.append(
+                        install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+                    ),
+                    daemon=True,
+                )
+                installation_thread.start()
+                self.assertTrue(entered.wait(2))
+                replacement = replace(self.identity, candidate_sha="b" * 40)
+
+                def begin_handoff() -> None:
+                    handoff.append(self.coordinator.begin_handoff(
+                        self.receipt, replacement, handoff_fingerprint=fingerprint("a"), now=self.now,
+                    ))
+                    handoff_done.set()
+
+                contender = Thread(target=begin_handoff, daemon=True)
+                contender.start()
+                self.assertFalse(handoff_done.wait(0.2))
+                release.set()
+                installation_thread.join(2)
+                contender.join(2)
+            self.assertEqual(len(installed), 1)
+            self.assertIsNotNone(installed[0][0])
+            self.assertTrue(installed[0][1].accepted)
+            self.assertTrue(handoff_done.is_set())
+            self.assertTrue(handoff[0].authorized)
+
+    def test_authority_bound_admission_linearizes_before_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None and host._control_store is not None
+            entered = Event()
+            release = Event()
+            admitted: list[NativeHostDecision] = []
+            revoked = Event()
+            original_admit = host._control_store.admit
+
+            def blocking_admit(*args: object, **kwargs: object) -> object:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_admit(*args, **kwargs)
+
+            def revoke() -> None:
+                with self.store._lock:
+                    self.store._revoked.add(self.receipt.receipt_fingerprint)
+                revoked.set()
+
+            with mock.patch.object(host._control_store, "admit", new=blocking_admit):
+                admission = Thread(
+                    target=lambda: admitted.append(host.run_once("admission-child", now=self.now)),
+                    daemon=True,
+                )
+                admission.start()
+                self.assertTrue(entered.wait(2))
+                contender = Thread(target=revoke, daemon=True)
+                contender.start()
+                self.assertFalse(revoked.wait(0.2))
+                release.set()
+                admission.join(2)
+                contender.join(2)
+            self.assertEqual(len(admitted), 1)
+            self.assertTrue(admitted[0].accepted)
+            self.assertEqual(host.state, NativeHostState.RUNNING)
+            self.assertTrue(revoked.is_set())
 
     def test_authority_bound_completion_linearizes_before_revocation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

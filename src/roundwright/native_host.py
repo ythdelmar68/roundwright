@@ -130,8 +130,8 @@ class NativeHostPaths:
             raise NativeHostError("native host paths are not absolute for the declared platform")
         if authentication != configuration.parent / "auth.toml":
             raise NativeHostError("native host authentication path is not derived from configuration")
-        if cache == state_directory:
-            raise NativeHostError("native host cache and durable state paths must differ")
+        if _paths_overlap(cache, state_directory) or _paths_overlap(cache, state_database):
+            raise NativeHostError("native host cache and durable state paths must not overlap")
         if state_database != state_directory / "native-host.sqlite3":
             raise NativeHostError("native host state database is outside the declared state directory")
 
@@ -418,6 +418,21 @@ def _coerce_declared_path(path_type: type[PureWindowsPath] | type[PurePosixPath]
     return path_type(text.replace("\\", "/") if path_type is PurePosixPath else text)
 
 
+def _paths_overlap(left: PurePath, right: PurePath) -> bool:
+    """Return whether either declared-platform path contains the other."""
+
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
+
+
 def _declared_environment_directory(
     environment: dict[str, str], key: str, default: PurePath, path_type: type[PureWindowsPath] | type[PurePosixPath]
 ) -> PurePath:
@@ -689,19 +704,18 @@ class NativeHost:
                 return self._denied("native host already has an active process", process)
             if process in self._consumed_process_ids:
                 return self._denied("native host process identity was already consumed", process)
-            authority = self._coordinator.authorize(
-                self._installation.identity, self._installation.receipt, now=now
-            )
-            if not authority.authorized:
-                return self._denied(authority.reason, process)
-            if self._control_store is not None:
-                durable = self._control_store.admit(self._installation, process, source, now=now)
-                if not durable.accepted:
-                    return durable
-            self._consumed_process_ids.add(process)
-            self._active_process_id = process
-            self._state = NativeHostState.RUNNING
-            return self._accepted(f"native host {source.value} process admitted", process)
+
+            def transition() -> NativeHostDecision:
+                if self._control_store is not None:
+                    durable = self._control_store.admit(self._installation, process, source, now=now)
+                    if not durable.accepted:
+                        return durable
+                self._consumed_process_ids.add(process)
+                self._active_process_id = process
+                self._state = NativeHostState.RUNNING
+                return self._accepted(f"native host {source.value} process admitted", process)
+
+            return self._run_authorized_transition(process, now=now, transition=transition)
 
     def _accepted(self, reason: str, process_id: str | None) -> NativeHostDecision:
         return NativeHostDecision(
@@ -734,26 +748,41 @@ def install_native_host(
         raise NativeHostError("native host installation is invalid")
     if paths is not None and type(paths) is not NativeHostPaths:
         raise NativeHostError("native host paths are invalid")
-    authority = coordinator.authorize(installation.identity, installation.receipt, now=now)
-    decision = NativeHostDecision(
-        authority.authorized,
-        "native host installation admitted" if authority.authorized else authority.reason,
-        installation.installation_fingerprint,
-        installation.receipt.receipt_fingerprint,
+    def transition() -> tuple[NativeHost | None, NativeHostDecision]:
+        admitted = NativeHostDecision(
+            True, "native host installation admitted",
+            installation.installation_fingerprint, installation.receipt.receipt_fingerprint,
+        )
+        if paths is None:
+            return NativeHost(coordinator, installation), admitted
+        try:
+            paths.require_authoritative_worktree(installation.identity.candidate_sha)
+        except NativeHostError as error:
+            return None, NativeHostDecision(
+                False, str(error), installation.installation_fingerprint,
+                installation.receipt.receipt_fingerprint,
+            )
+        control_store = NativeHostControlStore(paths.state_database)
+        durable = control_store.install(installation)
+        if not durable.accepted:
+            return None, durable
+        return NativeHost(coordinator, installation, control_store), durable
+
+    authority, result = coordinator.transition_if_authorized(
+        installation.identity, installation.receipt, now=now, transition=transition,
     )
     if not authority.authorized:
-        return None, decision
-    if paths is None:
-        return NativeHost(coordinator, installation), decision
-    try:
-        paths.require_authoritative_worktree(installation.identity.candidate_sha)
-    except NativeHostError as error:
-        return None, NativeHostDecision(False, str(error), installation.installation_fingerprint, installation.receipt.receipt_fingerprint)
-    control_store = NativeHostControlStore(paths.state_database)
-    durable = control_store.install(installation)
-    if not durable.accepted:
-        return None, durable
-    return NativeHost(coordinator, installation, control_store), durable
+        return None, NativeHostDecision(
+            False, authority.reason, installation.installation_fingerprint,
+            installation.receipt.receipt_fingerprint,
+        )
+    if (
+        type(result) is not tuple or len(result) != 2
+        or (result[0] is not None and type(result[0]) is not NativeHost)
+        or type(result[1]) is not NativeHostDecision
+    ):
+        raise NativeHostError("native host authority transition returned an invalid installation result")
+    return result
 
 
 def _now_utc() -> datetime:

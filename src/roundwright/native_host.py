@@ -48,6 +48,8 @@ class InvocationSource(str, Enum):
 
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_BRANCH_COMPONENT = re.compile(r"^[^ ~^:?*\\[\]@\x00-\x1f\x7f]+$")
+_DEFAULT_PROCESS_LEASE = timedelta(minutes=1)
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
@@ -105,6 +107,7 @@ class NativeHostPaths:
     configuration: PurePath
     authentication: PurePath
     cache: PurePath
+    state_directory: PurePath
     state_database: PurePath
     worktree: PurePath
 
@@ -130,13 +133,14 @@ class NativeHostPaths:
         declared_worktree = _coerce_declared_path(path_type, worktree)
         if not declared_worktree.is_absolute():
             raise NativeHostError("native host worktree path is not absolute for the declared platform")
-        configuration, cache = _declared_host_paths(platform, path_type, declared_home, environment)
+        configuration, cache, state_directory = _declared_host_paths(platform, path_type, declared_home, environment)
         return cls(
             platform,
             _native_path_if_compatible(platform, configuration),
             _native_path_if_compatible(platform, configuration.parent / "auth.toml"),
             _native_path_if_compatible(platform, cache),
-            _native_path_if_compatible(platform, cache / "native-host.sqlite3"),
+            _native_path_if_compatible(platform, state_directory),
+            _native_path_if_compatible(platform, state_directory / "native-host.sqlite3"),
             _native_path_if_compatible(platform, declared_worktree),
         )
 
@@ -173,6 +177,7 @@ class NativeHostPaths:
         if not value.startswith("ref: refs/heads/"):
             raise NativeHostError("native host worktree is detached; select a bound branch before installation")
         reference = value.removeprefix("ref: ")
+        _require_canonical_branch_reference(reference)
         resolved = _resolve_worktree_reference(_common_git_directory(git_directory), reference)
         if resolved is None:
             raise NativeHostError("native host worktree HEAD cannot resolve to a full SHA")
@@ -215,7 +220,9 @@ class NativeHostControlStore:
             return self._denied(installation, "native host state database is unavailable")
         return self._accepted(installation, "native host installation recorded")
 
-    def admit(self, installation: NativeHostInstallation, process_id: str, source: InvocationSource, *, now: datetime) -> NativeHostDecision:
+    def admit(self, installation: NativeHostInstallation, process_id: str, source: InvocationSource, *, now: datetime, lease_for: timedelta = _DEFAULT_PROCESS_LEASE) -> NativeHostDecision:
+        if type(lease_for) is not timedelta or lease_for <= timedelta():
+            raise NativeHostError("native host process lease is invalid")
         try:
             with closing(self._connection()) as connection:
                 with connection:
@@ -233,12 +240,31 @@ class NativeHostControlStore:
                     if previous is not None:
                         return self._denied(installation, "native host process identity was already consumed", process_id)
                     connection.execute(
-                        "INSERT INTO native_host_process(process_id, receipt_fingerprint, candidate_sha, source, state, started_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?)",
-                        (process_id, installation.receipt.receipt_fingerprint, installation.identity.candidate_sha, source.value, _timestamp(now), _timestamp(now)),
+                        "INSERT INTO native_host_process(process_id, receipt_fingerprint, candidate_sha, source, state, started_at, lease_expires_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
+                        (process_id, installation.receipt.receipt_fingerprint, installation.identity.candidate_sha, source.value, _timestamp(now), _timestamp(now) + _timedelta_microseconds(lease_for), _timestamp(now)),
                     )
         except (OSError, sqlite3.Error):
             return self._denied(installation, "native host state database is unavailable", process_id)
         return self._accepted(installation, f"native host {source.value} process admitted", process_id)
+
+    def renew_lease(self, installation: NativeHostInstallation, process_id: str, *, now: datetime, lease_for: timedelta) -> NativeHostDecision:
+        if type(lease_for) is not timedelta or lease_for <= timedelta():
+            raise NativeHostError("native host process lease is invalid")
+        try:
+            with closing(self._connection()) as connection:
+                with connection:
+                    self._prepare(connection)
+                    if not self._matches(connection, installation):
+                        return self._denied(installation, "native host state is not authoritative for this candidate", process_id)
+                    result = connection.execute(
+                        "UPDATE native_host_process SET lease_expires_at = ?, updated_at = ? WHERE process_id = ? AND state = 'running'",
+                        (_timestamp(now) + _timedelta_microseconds(lease_for), _timestamp(now), process_id),
+                    )
+                    if result.rowcount != 1:
+                        return self._denied(installation, "native host process is not active", process_id)
+        except (OSError, sqlite3.Error):
+            return self._denied(installation, "native host state database is unavailable", process_id)
+        return self._accepted(installation, "native host process lease renewed", process_id)
 
     def finish(self, installation: NativeHostInstallation, process_id: str, state: str, *, now: datetime) -> NativeHostDecision:
         if state not in {"completed", "cancelled", "recovered"}:
@@ -276,12 +302,12 @@ class NativeHostControlStore:
                     if not self._matches(connection, installation):
                         return self._denied(installation, "native host state is not authoritative for this candidate", process_id)
                     row = connection.execute(
-                        "SELECT state, started_at FROM native_host_process WHERE process_id = ?", (process_id,)
+                        "SELECT state, started_at, lease_expires_at FROM native_host_process WHERE process_id = ?", (process_id,)
                     ).fetchone()
                     if row is None or row[0] != "running":
                         return self._denied(installation, "native host process is not an active stale child", process_id)
-                    if _timestamp(now) < row[1] + _timedelta_microseconds(stale_after):
-                        return self._denied(installation, "native host child is not stale", process_id)
+                    if _timestamp(now) < row[1] + _timedelta_microseconds(stale_after) or _timestamp(now) < row[2]:
+                        return self._denied(installation, "native host child has a live lease or is not stale", process_id)
                     connection.execute(
                         "UPDATE native_host_process SET state = 'recovered', updated_at = ? WHERE process_id = ?",
                         (_timestamp(now), process_id),
@@ -300,7 +326,7 @@ class NativeHostControlStore:
     @staticmethod
     def _prepare(connection: sqlite3.Connection) -> None:
         connection.execute("CREATE TABLE IF NOT EXISTS native_host_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        connection.execute("CREATE TABLE IF NOT EXISTS native_host_process (process_id TEXT PRIMARY KEY, receipt_fingerprint TEXT NOT NULL, candidate_sha TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS native_host_process (process_id TEXT PRIMARY KEY, receipt_fingerprint TEXT NOT NULL, candidate_sha TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL, lease_expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
 
     @staticmethod
     def _matches(connection: sqlite3.Connection, installation: NativeHostInstallation) -> bool:
@@ -343,7 +369,7 @@ def _declared_host_paths(
     path_type: type[PureWindowsPath] | type[PurePosixPath],
     home: PurePath,
     environment: dict[str, str],
-) -> tuple[PurePath, PurePath]:
+) -> tuple[PurePath, PurePath, PurePath]:
     if platform.startswith("win"):
         configuration_root = _declared_environment_directory(
             environment, "APPDATA", home / "AppData" / "Roaming", path_type
@@ -351,12 +377,13 @@ def _declared_host_paths(
         cache_root = _declared_environment_directory(
             environment, "LOCALAPPDATA", home / "AppData" / "Local", path_type
         )
-        return configuration_root / "Roundwright" / "config.toml", cache_root / "Roundwright" / "Cache"
+        return configuration_root / "Roundwright" / "config.toml", cache_root / "Roundwright" / "Cache", cache_root / "Roundwright" / "State"
     if platform == "darwin":
-        return home / "Library" / "Application Support" / "roundwright" / "config.toml", home / "Library" / "Caches" / "roundwright"
+        return home / "Library" / "Application Support" / "roundwright" / "config.toml", home / "Library" / "Caches" / "roundwright", home / "Library" / "Application Support" / "roundwright" / "state"
     configuration_root = _declared_environment_directory(environment, "XDG_CONFIG_HOME", home / ".config", path_type)
     cache_root = _declared_environment_directory(environment, "XDG_CACHE_HOME", home / ".cache", path_type)
-    return configuration_root / "roundwright" / "config.toml", cache_root / "roundwright"
+    state_root = _declared_environment_directory(environment, "XDG_STATE_HOME", home / ".local" / "state", path_type)
+    return configuration_root / "roundwright" / "config.toml", cache_root / "roundwright", state_root / "roundwright"
 
 
 def _coerce_declared_path(path_type: type[PureWindowsPath] | type[PurePosixPath], value: PurePath) -> PurePath:
@@ -394,10 +421,15 @@ def _common_git_directory(git_directory: Path) -> Path:
 
 
 def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | None:
-    if not reference.startswith("refs/heads/"):
-        return None
+    _require_canonical_branch_reference(reference)
+    root = git_directory.resolve()
+    loose_path = root.joinpath(*reference.split("/"))
     try:
-        value = (git_directory / reference).read_text(encoding="utf-8").strip()
+        loose_path.relative_to(root)
+    except ValueError as error:
+        raise NativeHostError("native host worktree reference escapes the Git directory") from error
+    try:
+        value = loose_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         value = None
     except OSError as error:
@@ -415,6 +447,15 @@ def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | No
         if len(parts) == 2 and parts[1] == reference and _COMMIT.fullmatch(parts[0]):
             return parts[0]
     return None
+
+
+def _require_canonical_branch_reference(reference: object) -> str:
+    if type(reference) is not str or not reference.startswith("refs/heads/"):
+        raise NativeHostError("native host worktree reference is not a branch reference")
+    parts = reference.split("/")
+    if len(parts) < 3 or any(part in {"", ".", ".."} or part.endswith(".") or part.endswith(".lock") or not _BRANCH_COMPONENT.fullmatch(part) for part in parts):
+        raise NativeHostError("native host worktree reference is malformed")
+    return reference
 
 
 class NativeHost:
@@ -512,6 +553,18 @@ class NativeHost:
             self._active_process_id = None
             self._state = NativeHostState.IDLE
             return self._accepted("native host process cancelled", process)
+
+    def renew_child_lease(self, process_id: str, *, now: datetime, lease_for: timedelta = _DEFAULT_PROCESS_LEASE) -> NativeHostDecision:
+        """Renew only this host's active child lease before stale recovery."""
+
+        process = _require_process_id(process_id)
+        _timestamp(now)
+        if self._control_store is None:
+            return self._denied("native host has no durable child lease", process)
+        with self._lock:
+            if self._state is not NativeHostState.RUNNING or self._active_process_id != process:
+                return self._denied("native host process is not active", process)
+            return self._control_store.renew_lease(self._installation, process, now=now, lease_for=lease_for)
 
     def recover_stale_child(self, process_id: str, *, now: datetime, stale_after: timedelta) -> NativeHostDecision:
         """Release a persisted child only after the explicit stale interval."""

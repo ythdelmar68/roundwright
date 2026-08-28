@@ -69,6 +69,15 @@ class CiVerificationTests(unittest.TestCase):
         self.assertLess(workflow.index(provision), workflow.index(build))
         self.assertNotIn('setuptools>=69" pipx uv', workflow)
 
+    def test_platform_matrix_qualifies_one_uploaded_content_addressed_package(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("build-package:", workflow)
+        self.assertIn("needs: build-package", workflow)
+        self.assertIn("roundwright-package-${{ github.sha }}", workflow)
+        self.assertIn("actions/download-artifact@v4", workflow)
+        self.assertIn("ci/verify_package_digest.py verify dist", workflow)
+        self.assertIn("ci/verify_package_digest.py qualify dist", workflow)
+
     def test_workflow_does_not_restore_nonportable_windows_junctions(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         cache_step = """- name: Restore portable validation toolchain cache

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -123,6 +124,7 @@ class NativeHostTests(unittest.TestCase):
         self.assertTrue(str(windows.cache).replace("\\", "/").endswith("profile/local/Roundwright/Cache"))
         self.assertTrue(str(windows.authentication).replace("\\", "/").endswith("Roundwright/auth.toml"))
         self.assertTrue(windows.configuration.is_absolute())
+        self.assertNotEqual(windows.cache, windows.state_directory)
         macos = NativeHostPaths.resolve(platform="darwin", environment={}, home=Path("/Users/roundwright"), worktree=Path("/repositories/roundwright"))
         self.assertTrue(str(macos.configuration).replace("\\", "/").endswith("Library/Application Support/roundwright/config.toml"))
         self.assertTrue(macos.configuration.is_absolute())
@@ -157,10 +159,48 @@ class NativeHostTests(unittest.TestCase):
             self.assertTrue(peer.run_once("stale-child", now=self.now).accepted)
             interval = timedelta(seconds=1, microseconds=500000)
             self.assertFalse(host.recover_stale_child("stale-child", now=self.now + timedelta(seconds=1, microseconds=499999), stale_after=interval).accepted)
-            self.assertTrue(host.recover_stale_child("stale-child", now=self.now + interval, stale_after=interval).accepted)
+            self.assertTrue(host.recover_stale_child("stale-child", now=self.now + timedelta(minutes=2), stale_after=interval).accepted)
             self.assertTrue(host.run_once("replacement-child", now=self.now).accepted)
             self.assertTrue(host.complete("replacement-child", now=self.now).accepted)
             self.assertTrue(paths.state_database.is_file())
+
+    def test_live_child_lease_blocks_peer_recovery_and_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None
+            peer, peer_installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(peer_installed.accepted)
+            assert peer is not None
+            self.assertTrue(host.run_once("live-child", now=self.now).accepted)
+            self.assertTrue(host.renew_child_lease("live-child", now=self.now + timedelta(seconds=30), lease_for=timedelta(minutes=2)).accepted)
+            self.assertFalse(peer.recover_stale_child("live-child", now=self.now + timedelta(minutes=1), stale_after=timedelta(seconds=1)).accepted)
+            self.assertFalse(peer.run_once("replacement-child", now=self.now + timedelta(minutes=1)).accepted)
+            self.assertEqual(host.state, NativeHostState.RUNNING)
+
+    def test_cache_removal_cannot_remove_durable_process_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None
+            peer, peer_installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(peer_installed.accepted)
+            assert peer is not None
+            self.assertTrue(host.run_once("durable-child", now=self.now).accepted)
+            assert isinstance(paths.cache, Path)
+            paths.cache.mkdir(parents=True, exist_ok=True)
+            (paths.cache / "evictable").write_text("cache", encoding="utf-8")
+            shutil.rmtree(paths.cache)
+            self.assertTrue(paths.state_database.is_file())
+            self.assertFalse(peer.run_once("replacement-child", now=self.now).accepted)
 
     def test_stale_deadline_uses_exact_microseconds_at_far_future_dates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -169,7 +209,7 @@ class NativeHostTests(unittest.TestCase):
             store = NativeHostControlStore(paths.state_database)
             self.assertTrue(store.install(self.installation).accepted)
             far_future = datetime(9999, 1, 1, 12, 0, tzinfo=timezone.utc)
-            self.assertTrue(store.admit(self.installation, "future-child", source=InvocationSource.ONE_SHOT, now=far_future).accepted)
+            self.assertTrue(store.admit(self.installation, "future-child", source=InvocationSource.ONE_SHOT, now=far_future, lease_for=timedelta(microseconds=1)).accepted)
             self.assertFalse(store.recover_stale(self.installation, "future-child", now=far_future, stale_after=timedelta(microseconds=1)).accepted)
             self.assertTrue(store.recover_stale(self.installation, "future-child", now=far_future + timedelta(microseconds=1), stale_after=timedelta(microseconds=1)).accepted)
 
@@ -254,6 +294,17 @@ class NativeHostTests(unittest.TestCase):
                     paths.require_authoritative_worktree(self.identity.candidate_sha)
             loose.unlink()
             paths.require_authoritative_worktree(self.identity.candidate_sha)
+
+    def test_worktree_branch_references_reject_traversal_absolute_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            head = worktree / ".git" / "HEAD"
+            for reference in ("refs/heads/../../candidate", "refs/heads//candidate", "refs/heads/C:/candidate", "refs/heads/candidate\x01"):
+                head.write_text(f"ref: {reference}\n", encoding="utf-8")
+                with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:
         host = self.install()

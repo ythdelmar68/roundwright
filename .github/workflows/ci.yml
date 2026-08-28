@@ -10,7 +10,35 @@ permissions:
   contents: read
 
 jobs:
+  build-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Restore portable validation toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: .roundlet/validation-tools
+          key: validation-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/validation-toolchain.lock.toml', 'ci/validation-build.requirements.txt', 'ci/validation-toolchain.requirements.txt', 'ci/validation_toolchain.py', 'ci/resolve_validation_toolchain.py') }}
+      - name: Provision receipt-bound validation toolchain
+        run: python ci/resolve_validation_toolchain.py provision
+      - name: Build one clean wheel and sdist
+        run: |
+          python ci/resolve_validation_toolchain.py exec-python -- -m pip wheel --no-build-isolation --no-deps --wheel-dir dist .
+          python ci/resolve_validation_toolchain.py exec-python -- -c "from setuptools.build_meta import build_sdist; build_sdist('dist')"
+          python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py write dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roundwright-package-${{ github.sha }}
+          path: dist/
+
   verify-package:
+    needs: build-package
     strategy:
       fail-fast: false
       matrix:
@@ -33,14 +61,18 @@ jobs:
           key: validation-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/validation-toolchain.lock.toml', 'ci/validation-build.requirements.txt', 'ci/validation-toolchain.requirements.txt', 'ci/validation_toolchain.py', 'ci/resolve_validation_toolchain.py') }}
       - name: Provision receipt-bound validation toolchain
         run: python ci/resolve_validation_toolchain.py provision
-      - name: Build clean wheel and sdist
-        run: |
-          python ci/resolve_validation_toolchain.py exec-python -- -m pip wheel --no-build-isolation --no-deps --wheel-dir dist .
-          python ci/resolve_validation_toolchain.py exec-python -- -c "from setuptools.build_meta import build_sdist; build_sdist('dist')"
+      - uses: actions/download-artifact@v4
+        with:
+          name: roundwright-package-${{ github.sha }}
+          path: dist/
+      - name: Verify the one uploaded package digest
+        run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py verify dist
       - name: Run deterministic offline tests
         run: python ci/resolve_validation_toolchain.py exec-python -- -m unittest discover -s tests -v
       - name: Verify isolated pip, pipx, and uv installations
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_installs.py dist
+      - name: Record host qualification bound to package digest
+        run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py qualify dist --output dist/qualification-receipt.json
       - name: Record and validate exact push evidence
         if: github.event_name == 'push'
         shell: bash
@@ -49,5 +81,5 @@ jobs:
           python ci/resolve_validation_toolchain.py exec-python -- ci/validate_hosted_evidence.py --record dist/hosted-evidence.json --repository "$GITHUB_REPOSITORY" --workflow "CI" --head "$GITHUB_SHA" --branch "$GITHUB_REF_NAME"
       - uses: actions/upload-artifact@v4
         with:
-          name: roundwright-${{ matrix.os }}-${{ github.sha }}
-          path: dist/
+          name: roundwright-qualification-${{ matrix.os }}-${{ github.sha }}
+          path: dist/qualification-receipt.json

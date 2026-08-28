@@ -269,6 +269,10 @@ class NativeHostTests(unittest.TestCase):
                 paths.require_authoritative_worktree(self.identity.candidate_sha)
             loose.unlink()
             paths.require_authoritative_worktree(self.identity.candidate_sha)
+            for reference in ("refs/heads/.hidden", "refs/heads/topic..backup"):
+                (metadata / "HEAD").write_text(f"ref: {reference}\n", encoding="utf-8")
+                with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_loose_worktree_refs_fail_closed_before_packed_ref_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -302,9 +306,20 @@ class NativeHostTests(unittest.TestCase):
             worktree = self._bound_worktree(root / "repository")
             paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
             head = worktree / ".git" / "HEAD"
-            for reference in ("refs/heads/../../candidate", "refs/heads//candidate", "refs/heads/C:/candidate", "refs/heads/candidate\x01"):
+            for reference in ("refs/heads/../../candidate", "refs/heads//candidate", "refs/heads/C:/candidate", "refs/heads/candidate\x01", "refs/heads/.hidden", "refs/heads/topic..backup"):
                 head.write_text(f"ref: {reference}\n", encoding="utf-8")
                 with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            head.write_text("ref: refs/heads/escape\n", encoding="utf-8")
+            original_resolve = Path.resolve
+
+            def escape_loose_ref(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "escape" and "refs" in path.parts:
+                    return root.parent / "outside"
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=escape_loose_ref):
+                with self.assertRaisesRegex(NativeHostError, "escapes the Git directory"):
                     paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:

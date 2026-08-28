@@ -425,11 +425,12 @@ def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | No
     root = git_directory.resolve()
     loose_path = root.joinpath(*reference.split("/"))
     try:
-        loose_path.relative_to(root)
+        resolved_loose_path = loose_path.resolve()
+        resolved_loose_path.relative_to(root)
     except ValueError as error:
         raise NativeHostError("native host worktree reference escapes the Git directory") from error
     try:
-        value = loose_path.read_text(encoding="utf-8").strip()
+        value = resolved_loose_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         value = None
     except OSError as error:
@@ -453,7 +454,7 @@ def _require_canonical_branch_reference(reference: object) -> str:
     if type(reference) is not str or not reference.startswith("refs/heads/"):
         raise NativeHostError("native host worktree reference is not a branch reference")
     parts = reference.split("/")
-    if len(parts) < 3 or any(part in {"", ".", ".."} or part.endswith(".") or part.endswith(".lock") or not _BRANCH_COMPONENT.fullmatch(part) for part in parts):
+    if len(parts) < 3 or any(part in {"", ".", ".."} or part.startswith(".") or ".." in part or part.endswith(".") or part.endswith(".lock") or not _BRANCH_COMPONENT.fullmatch(part) for part in parts):
         raise NativeHostError("native host worktree reference is malformed")
     return reference
 

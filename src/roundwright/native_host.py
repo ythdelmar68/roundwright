@@ -422,13 +422,13 @@ def _common_git_directory(git_directory: Path) -> Path:
 
 def _resolve_worktree_reference(git_directory: Path, reference: str) -> str | None:
     _require_canonical_branch_reference(reference)
-    root = git_directory.resolve()
-    loose_path = root.joinpath(*reference.split("/"))
     try:
+        root = git_directory.resolve()
+        loose_path = root.joinpath(*reference.split("/"))
         resolved_loose_path = loose_path.resolve()
         resolved_loose_path.relative_to(root)
-    except ValueError as error:
-        raise NativeHostError("native host worktree reference escapes the Git directory") from error
+    except (OSError, RuntimeError, ValueError) as error:
+        raise NativeHostError("native host worktree reference resolution is unavailable or escapes the Git directory") from error
     try:
         value = resolved_loose_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:

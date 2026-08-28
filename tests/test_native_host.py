@@ -273,6 +273,17 @@ class NativeHostTests(unittest.TestCase):
                 (metadata / "HEAD").write_text(f"ref: {reference}\n", encoding="utf-8")
                 with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
                     paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (metadata / "HEAD").write_text("ref: refs/heads/cycle\n", encoding="utf-8")
+            original_resolve = Path.resolve
+
+            def cyclic_loose_ref(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "cycle" and "refs" in path.parts:
+                    raise RuntimeError("symlink loop")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=cyclic_loose_ref):
+                with self.assertRaisesRegex(NativeHostError, "resolution is unavailable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_loose_worktree_refs_fail_closed_before_packed_ref_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -320,6 +331,10 @@ class NativeHostTests(unittest.TestCase):
 
             with mock.patch.object(Path, "resolve", new=escape_loose_ref):
                 with self.assertRaisesRegex(NativeHostError, "escapes the Git directory"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            head.write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            with mock.patch.object(Path, "resolve", side_effect=OSError("state unavailable")):
+                with self.assertRaisesRegex(NativeHostError, "resolution is unavailable"):
                     paths.require_authoritative_worktree(self.identity.candidate_sha)
 
     def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:

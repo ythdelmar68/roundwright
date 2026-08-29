@@ -128,6 +128,10 @@ class NativeHostPaths:
             configuration, authentication, cache, state_directory, state_database, worktree,
         )):
             raise NativeHostError("native host paths are not absolute for the declared platform")
+        if any(".." in value.parts for value in (
+            configuration, authentication, cache, state_directory, state_database, worktree,
+        )):
+            raise NativeHostError("native host paths must not contain parent segments")
         if authentication != configuration.parent / "auth.toml":
             raise NativeHostError("native host authentication path is not derived from configuration")
         if _paths_overlap(cache, state_directory) or _paths_overlap(cache, state_database):

@@ -160,6 +160,16 @@ class NativeHostTests(unittest.TestCase):
                     replace(paths, cache=paths.state_database)
                 with self.assertRaisesRegex(NativeHostError, "must not overlap"):
                     replace(paths, cache=paths.state_database / "evictable")
+                with self.assertRaisesRegex(NativeHostError, "parent segments"):
+                    replace(
+                        paths,
+                        cache=paths.state_directory.parent / "cache-alias" / ".." / paths.state_directory.name,
+                    )
+                with self.assertRaisesRegex(NativeHostError, "parent segments"):
+                    replace(
+                        paths,
+                        cache=paths.state_database.parent / "cache-alias" / ".." / paths.state_database.name,
+                    )
                 with self.assertRaisesRegex(NativeHostError, "unsupported"):
                     NativeHostPaths(
                         "plan9", paths.configuration, paths.authentication, paths.cache,
@@ -506,6 +516,12 @@ class NativeHostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            for durable_path in (paths.state_directory, paths.state_database):
+                with self.assertRaisesRegex(NativeHostError, "parent segments"):
+                    replace(
+                        paths,
+                        cache=durable_path.parent / "cache-alias" / ".." / durable_path.name,
+                    )
             self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
             self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
             host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)

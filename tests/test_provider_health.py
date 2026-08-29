@@ -352,6 +352,32 @@ class ProviderHealthTests(unittest.TestCase):
         for forbidden in ("token", "path", "payload", "gpt-5.6-terra", profile_fingerprint(self.profile)):
             self.assertNotIn(forbidden, diagnostic)
 
+    def test_exact_operator_recovery_classes_are_preserved_without_fallback(self):
+        for failure in (
+            CodexFailure.AUTH_REJECTED, CodexFailure.RATE_LIMITED, CodexFailure.QUOTA_LIMITED,
+            CodexFailure.UNSUPPORTED_CAPABILITY, CodexFailure.PROVIDER_OUTAGE,
+        ):
+            with self.subTest(failure=failure):
+                outcomes = (ProbeOutcome(False, failure),) * 3 if failure in {CodexFailure.RATE_LIMITED, CodexFailure.QUOTA_LIMITED, CodexFailure.PROVIDER_OUTAGE} else (ProbeOutcome(False, failure),)
+                result = self.qualify(self.service(outcomes), ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+                diagnostic = render_health_diagnostic(result)
+                self.assertEqual(result.failure, failure)
+                self.assertIn(f"classification: {failure.value}", diagnostic)
+                self.assertIn("operator action:", diagnostic)
+                self.assertNotIn("token", diagnostic.lower())
+
+    def test_missing_model_and_missing_reasoning_capability_are_not_conflated(self):
+        unavailable = self.qualify(
+            self.service(audit=CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability("gpt-5.6-sol", "high"),))),
+            ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100,
+        )
+        unsupported = self.qualify(
+            self.service(audit=CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability("gpt-5.6-terra", "medium"),))),
+            ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100,
+        )
+        self.assertEqual((unavailable.failure, unsupported.failure), (CodexFailure.MODEL_UNAVAILABLE, CodexFailure.UNSUPPORTED_CAPABILITY))
+        self.assertEqual((self.channel.audit_calls, self.channel.requests), (1, []))
+
     def test_missing_or_wrong_role_credential_evidence_blocks_before_the_adapter_is_opened(self):
         blocked = self.qualify(self.service(isolation=RuntimeError("secret path unavailable")), ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
         self.assertEqual(blocked.failure, CodexFailure.MALFORMED_RESPONSE)

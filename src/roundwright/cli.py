@@ -8,7 +8,8 @@ from pathlib import Path
 from collections.abc import Sequence
 
 from .deployment import blocked_command_shell_preflight
-from .doctor import collect_diagnostics, render_diagnostics
+from .doctor import collect_diagnostics, render_diagnostics, render_provider_recovery_status
+from .provider_health import CodexFailure
 from .identity import UnsafeEntrypointIdentityError, require_safe_entrypoint_identity
 from .configuration import ConfigurationError, RepositoryIdentity, discover_repository, load_configuration, parse_cli_overrides, preflight, PreflightMode
 from .state import StateError, check_database, initialize
@@ -20,8 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Roundwright read-only diagnostics and blocked command shells.",
     )
     subcommands = parser.add_subparsers(dest="command")
-    subcommands.add_parser("doctor", help="report read-only package diagnostics")
-    subcommands.add_parser("status", help="report deployment modes without dispatching")
+    for name, help_text in (("doctor", "report read-only package diagnostics"), ("status", "report deployment modes without dispatching")):
+        command = subcommands.add_parser(name, help=help_text)
+        command.add_argument("--provider-failure", choices=tuple(item.value for item in CodexFailure), help="render sanitized operator recovery guidance without contacting a provider")
     configuration = subcommands.add_parser("config", help="validate or inspect resolved runtime configuration")
     config_commands = configuration.add_subparsers(dest="config_command")
     for name, help_text in (("validate", "validate runtime configuration without writing"), ("show", "show public-safe configuration sources")):
@@ -42,11 +44,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     if arguments.command == "doctor":
-        report = collect_diagnostics(sys.argv[0])
+        report = collect_diagnostics(sys.argv[0], provider_failure=_provider_failure(arguments))
         render_diagnostics(report, sys.stdout)
         return report.exit_code
     if arguments.command == "status":
-        return _render_status(sys.stdout)
+        return _render_status(sys.stdout, provider_failure=_provider_failure(arguments))
     if arguments.command == "config" and arguments.config_command in {"validate", "show"}:
         return _configuration_command(arguments, sys.stdout)
     if arguments.command == "init":
@@ -118,7 +120,7 @@ def _check_database(output: object) -> int:
     return 0 if status.healthy else 2
 
 
-def _render_status(output: object) -> int:
+def _render_status(output: object, *, provider_failure: CodexFailure | None = None) -> int:
     """Render deployment status without reading state or authority receipts."""
 
     output.write("roundwright status\n")  # type: ignore[attr-defined]
@@ -126,6 +128,7 @@ def _render_status(output: object) -> int:
     output.write("test-only: available (no dispatch authority)\n")  # type: ignore[attr-defined]
     output.write("authoritative: unavailable (requires an exact external receipt)\n")  # type: ignore[attr-defined]
     output.write("blocked: active for dispatch command shells\n")  # type: ignore[attr-defined]
+    render_provider_recovery_status(provider_failure, output)  # type: ignore[arg-type]
     try:
         status = check_database(_repository())
         output.write(f"local state: {status.state}\n")  # type: ignore[attr-defined]
@@ -136,6 +139,11 @@ def _render_status(output: object) -> int:
     except ConfigurationError:
         output.write("local state: unavailable\n")  # type: ignore[attr-defined]
         return 0
+
+
+def _provider_failure(arguments: argparse.Namespace) -> CodexFailure | None:
+    value = getattr(arguments, "provider_failure", None)
+    return None if value is None else CodexFailure(value)
 
 
 def _render_blocked_shell(command: str, reason: str, output: object) -> None:

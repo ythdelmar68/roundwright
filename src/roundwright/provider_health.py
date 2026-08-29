@@ -28,10 +28,15 @@ class ProviderHealthError(ValueError):
 class CodexFailure(StrEnum):
     AUTH_MISSING = "auth-missing"
     AUTH_EXPIRED = "auth-expired"
+    AUTH_REJECTED = "auth-rejected"
+    RATE_LIMITED = "rate-limited"
+    QUOTA_LIMITED = "quota-limited"
     QUOTA_OR_RATE_LIMIT = "quota-or-rate-limit"
     MODEL_UNAVAILABLE = "model-unavailable"
+    UNSUPPORTED_CAPABILITY = "unsupported-capability"
     SDK_INCOMPATIBLE = "sdk-incompatible"
     SANDBOX_OR_APPROVAL_DENIED = "sandbox-or-approval-denied"
+    PROVIDER_OUTAGE = "provider-outage"
     TRANSPORT_OR_PROVIDER_OUTAGE = "transport-or-provider-outage"
     MALFORMED_RESPONSE = "malformed-response"
     UNKNOWN = "unknown"
@@ -726,8 +731,10 @@ class CodexProviderHealth:
             return self._record(role, profile_identity, contract_identity, _unknown_runtime_fingerprint(), CodexFailure.MALFORMED_RESPONSE, now, freshness_seconds, 1)
         if not self._contract.accepts(audit):
             return self._record(role, profile_identity, contract_identity, audit.fingerprint, CodexFailure.SDK_INCOMPATIBLE, now, freshness_seconds, 1)
-        if not audit.supports(profile):
+        if profile.model not in {item.model for item in audit.capabilities}:
             return self._record(role, profile_identity, contract_identity, audit.fingerprint, CodexFailure.MODEL_UNAVAILABLE, now, freshness_seconds, 1)
+        if not audit.supports(profile):
+            return self._record(role, profile_identity, contract_identity, audit.fingerprint, CodexFailure.UNSUPPORTED_CAPABILITY, now, freshness_seconds, 1)
         request = ReadOnlyQualification(role, profile.model, profile.reasoning_effort.value)
         failure: CodexFailure | None = None
         attempts = 0
@@ -744,7 +751,10 @@ class CodexProviderHealth:
                 failure = error.failure
             except Exception:
                 failure = CodexFailure.UNKNOWN
-            if failure not in {CodexFailure.QUOTA_OR_RATE_LIMIT, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE}:
+            if failure not in {
+                CodexFailure.RATE_LIMITED, CodexFailure.QUOTA_LIMITED, CodexFailure.QUOTA_OR_RATE_LIMIT,
+                CodexFailure.PROVIDER_OUTAGE, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+            }:
                 break
         return self._record(role, profile_identity, contract_identity, audit.fingerprint, failure or CodexFailure.UNKNOWN, now, freshness_seconds, attempts)
 
@@ -792,18 +802,41 @@ def render_health_diagnostic(observation: ProviderHealthObservation) -> str:
 
     if type(observation) is not ProviderHealthObservation:
         raise ProviderHealthError("provider health observation is invalid")
-    detail = "ready" if observation.failure is None else {
-        CodexFailure.AUTH_MISSING: "authentication required",
-        CodexFailure.AUTH_EXPIRED: "authentication renewal required",
-        CodexFailure.QUOTA_OR_RATE_LIMIT: "provider capacity temporarily unavailable",
-        CodexFailure.MODEL_UNAVAILABLE: "configured model capability unavailable",
-        CodexFailure.SDK_INCOMPATIBLE: "configured runtime version incompatible",
-        CodexFailure.SANDBOX_OR_APPROVAL_DENIED: "provider qualification denied",
-        CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE: "provider transport temporarily unavailable",
-        CodexFailure.MALFORMED_RESPONSE: "provider qualification response invalid",
-        CodexFailure.UNKNOWN: "provider qualification unavailable",
-    }[observation.failure]
-    return f"codex provider health\nrole: {observation.role.value}\nstate: {observation.state.value}\ndetail: {detail}\nresult: {'ready' if observation.state is HealthState.READY else 'blocked'}\n"
+    if observation.failure is None:
+        return "codex provider health\nrole: %s\nstate: ready\ndetail: qualification ready\noperator action: none\nresult: ready\n" % observation.role.value
+    classification, detail, action = provider_recovery_guidance(observation.failure)
+    return (
+        f"codex provider health\nrole: {observation.role.value}\nstate: blocked\n"
+        f"classification: {classification}\ndetail: {detail}\noperator action: {action}\nresult: blocked\n"
+    )
+
+
+def provider_recovery_guidance(failure: CodexFailure) -> tuple[str, str, str]:
+    """Return fixed, secret-free operator guidance for one typed failure.
+
+    This projection deliberately accepts only the closed enum.  It neither reads
+    configuration nor invokes a provider, so rendering recovery guidance cannot
+    become an implicit login, credential refresh, or fallback route.
+    """
+
+    if type(failure) is not CodexFailure:
+        raise ProviderHealthError("provider failure is invalid")
+    return {
+        CodexFailure.AUTH_MISSING: ("auth-missing", "authentication is not available", "sign in with the approved provider tool, then rerun qualification"),
+        CodexFailure.AUTH_EXPIRED: ("auth-expired", "authentication is no longer valid", "renew authentication with the approved provider tool, then rerun qualification"),
+        CodexFailure.AUTH_REJECTED: ("auth-rejected", "authentication was rejected", "verify the approved account and authorization, then rerun qualification"),
+        CodexFailure.RATE_LIMITED: ("rate-limited", "provider rate limit is active", "wait for the provider limit to clear, then rerun qualification"),
+        CodexFailure.QUOTA_LIMITED: ("quota-limited", "provider quota is exhausted", "restore provider quota through the approved account process, then rerun qualification"),
+        CodexFailure.QUOTA_OR_RATE_LIMIT: ("quota-or-rate-limit", "provider capacity is unavailable", "check provider quota or rate-limit status, then rerun qualification"),
+        CodexFailure.MODEL_UNAVAILABLE: ("model-unavailable", "the requested model is unavailable", "make the requested model available; do not select a fallback model"),
+        CodexFailure.UNSUPPORTED_CAPABILITY: ("unsupported-capability", "the requested model capability is unavailable", "enable the exact requested capability; do not change model or reasoning settings"),
+        CodexFailure.SDK_INCOMPATIBLE: ("sdk-incompatible", "the configured runtime version is incompatible", "install the approved runtime version, then rerun qualification"),
+        CodexFailure.SANDBOX_OR_APPROVAL_DENIED: ("sandbox-or-approval-denied", "provider qualification was denied", "obtain the required approval or sandbox access, then rerun qualification"),
+        CodexFailure.PROVIDER_OUTAGE: ("provider-outage", "the provider is unavailable", "wait for provider recovery, then rerun qualification"),
+        CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE: ("transport-or-provider-outage", "provider transport is unavailable", "check provider availability, then rerun qualification"),
+        CodexFailure.MALFORMED_RESPONSE: ("malformed-response", "the qualification response was invalid", "rerun qualification; if it repeats, contact the provider operator"),
+        CodexFailure.UNKNOWN: ("unknown", "provider qualification is unavailable", "rerun qualification; do not dispatch until a typed ready result exists"),
+    }[failure]
 
 
 def _safe_identifier(value: object) -> bool:

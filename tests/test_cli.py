@@ -21,6 +21,7 @@ from roundwright.identity import (
     inspect_entrypoint_identity,
     require_safe_entrypoint_identity,
 )
+from roundwright.provider_health import CodexFailure
 
 
 def executable_name() -> str:
@@ -234,3 +235,15 @@ class CliTests(unittest.TestCase):
             after = {path.name for path in root.iterdir()}
         self.assertTrue(report.healthy)
         self.assertEqual(before, after)
+
+    def test_doctor_and_status_render_typed_operator_recovery_without_provider_access(self) -> None:
+        for command in ("doctor", "status"):
+            for failure in (CodexFailure.AUTH_MISSING, CodexFailure.AUTH_EXPIRED, CodexFailure.AUTH_REJECTED, CodexFailure.RATE_LIMITED, CodexFailure.QUOTA_LIMITED, CodexFailure.MODEL_UNAVAILABLE, CodexFailure.PROVIDER_OUTAGE, CodexFailure.UNSUPPORTED_CAPABILITY, CodexFailure.UNKNOWN):
+                output = io.StringIO()
+                with self.subTest(command=command, failure=failure), contextlib.redirect_stdout(output):
+                    main([command, "--provider-failure", failure.value])
+                rendered = output.getvalue().lower()
+                self.assertIn(f"blocked ({failure.value})", rendered)
+                self.assertIn("provider next action:", rendered)
+                self.assertIn("operator", rendered)
+                self.assertFalse(any(value in rendered for value in ("token", "credential", "payload", "c:/")))

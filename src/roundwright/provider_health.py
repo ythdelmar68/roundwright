@@ -823,7 +823,7 @@ def provider_recovery_guidance(failure: CodexFailure) -> tuple[str, str, str]:
         raise ProviderHealthError("provider failure is invalid")
     return {
         CodexFailure.AUTH_MISSING: ("auth-missing", "authentication is not available", "sign in with the approved provider tool, then rerun qualification"),
-        CodexFailure.AUTH_EXPIRED: ("auth-expired", "authentication is no longer valid", "renew authentication with the approved provider tool, then rerun qualification"),
+        CodexFailure.AUTH_EXPIRED: ("auth-expired", "authentication renewal required", "renew authentication with the approved provider tool, then rerun qualification"),
         CodexFailure.AUTH_REJECTED: ("auth-rejected", "authentication was rejected", "verify the approved account and authorization, then rerun qualification"),
         CodexFailure.RATE_LIMITED: ("rate-limited", "provider rate limit is active", "wait for the provider limit to clear, then rerun qualification"),
         CodexFailure.QUOTA_LIMITED: ("quota-limited", "provider quota is exhausted", "restore provider quota through the approved account process, then rerun qualification"),

@@ -358,7 +358,8 @@ class ProviderHealthTests(unittest.TestCase):
             CodexFailure.UNSUPPORTED_CAPABILITY, CodexFailure.PROVIDER_OUTAGE,
         ):
             with self.subTest(failure=failure):
-                result = self.qualify(self.service((ProbeOutcome(False, failure),)), ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
+                outcomes = (ProbeOutcome(False, failure),) * 3 if failure in {CodexFailure.RATE_LIMITED, CodexFailure.QUOTA_LIMITED, CodexFailure.PROVIDER_OUTAGE} else (ProbeOutcome(False, failure),)
+                result = self.qualify(self.service(outcomes), ProviderRole.WORKER, self.profile, freshness_seconds=30, now=100)
                 diagnostic = render_health_diagnostic(result)
                 self.assertEqual(result.failure, failure)
                 self.assertIn(f"classification: {failure.value}", diagnostic)

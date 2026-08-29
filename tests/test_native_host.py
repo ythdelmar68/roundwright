@@ -1,0 +1,749 @@
+"""Hermetic native-host installation and lifecycle parity coverage."""
+
+from __future__ import annotations
+
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from pathlib import Path, PureWindowsPath
+import shutil
+import sqlite3
+import sys
+import tempfile
+import unittest
+from unittest import mock
+from threading import Event, Thread
+from uuid import UUID
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from roundwright.deployment_handoff import (
+    AuthorityReceiptVerificationStatus,
+    DeploymentAuthorityHandoffCoordinator,
+    DeploymentAuthorityHandoffReceipt,
+    DeploymentAuthorityIdentity,
+    DeploymentAuthorityReceiptVerification,
+    HandoffDecision,
+    InMemoryDeploymentAuthorityStore,
+)
+from roundwright.native_host import (
+    NativeHostControlStore,
+    NativeHostError,
+    NativeHostInstallation,
+    NativeHostPaths,
+    NativeHostState,
+    InvocationSource,
+    install_native_host,
+)
+from roundwright.runtime_binding import RuntimeBinding
+
+
+def fingerprint(character: str) -> str:
+    return character * 64
+
+
+class NativeHostTests(unittest.TestCase):
+    now = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self) -> None:
+        self.state_id = UUID("12345678-1234-5678-1234-567812345678")
+        self.store = InMemoryDeploymentAuthorityStore(fingerprint("c"), self.state_id)
+        self.coordinator = DeploymentAuthorityHandoffCoordinator(self.store)
+        self.identity = DeploymentAuthorityIdentity(
+            fingerprint("0"), fingerprint("1"), fingerprint("c"), self.state_id,
+            fingerprint("d"), "a" * 40, fingerprint("e"),
+            RuntimeBinding("roundwright-runtime/v1", "sha256:" + "0" * 64, "sha256:" + "1" * 64, ("sha256:" + "2" * 64,)),
+        )
+        self.receipt = DeploymentAuthorityHandoffReceipt(
+            fingerprint("f"), self.identity, self.now - timedelta(minutes=1), self.now + timedelta(minutes=5),
+        )
+        self.verification = DeploymentAuthorityReceiptVerification(
+            fingerprint("7"), self.receipt.receipt_fingerprint, self.receipt.binding_digest,
+            self.identity.repository_fingerprint, self.identity.state_store_fingerprint, self.identity.state_id,
+            self.identity.candidate_sha, self.identity.environment_fingerprint, AuthorityReceiptVerificationStatus.FRESH,
+        )
+        self.installation = NativeHostInstallation(fingerprint("8"), self.identity, self.receipt)
+
+    def install(self):
+        self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+        host, decision = install_native_host(self.coordinator, self.installation, now=self.now)
+        self.assertTrue(decision.accepted)
+        self.assertIsNotNone(host)
+        assert host is not None
+        return host
+
+    def test_install_requires_an_existing_exclusive_authority_claim(self) -> None:
+        self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+        host, decision = install_native_host(self.coordinator, self.installation, now=self.now)
+        self.assertIsNone(host)
+        self.assertFalse(decision.accepted)
+
+    def test_one_shot_and_scheduler_wake_share_admission_and_lifecycle(self) -> None:
+        host = self.install()
+        direct = host.run_once("one-shot-1", now=self.now)
+        self.assertTrue(direct.accepted)
+        self.assertEqual(host.state, NativeHostState.RUNNING)
+        self.assertFalse(host.request_scheduler_wake("wake-1", now=self.now).accepted)
+        self.assertTrue(host.complete("one-shot-1", now=self.now).accepted)
+        wake = host.request_scheduler_wake("wake-1", now=self.now)
+        self.assertTrue(wake.accepted)
+        self.assertIn("scheduler-wake", wake.reason)
+        self.assertTrue(host.complete("wake-1", now=self.now).accepted)
+        self.assertFalse(host.run_once("wake-1", now=self.now).accepted)
+        self.assertEqual(host.state, NativeHostState.IDLE)
+
+    def test_stale_authority_cannot_start_or_wake_a_process(self) -> None:
+        host = self.install()
+        stale = self.now + timedelta(minutes=6)
+        self.assertFalse(host.run_once("stale-direct", now=stale).accepted)
+        self.assertFalse(host.request_scheduler_wake("stale-wake", now=stale).accepted)
+        self.assertEqual(host.state, NativeHostState.IDLE)
+
+    def test_stop_requires_process_reconciliation_and_is_terminal(self) -> None:
+        host = self.install()
+        self.assertTrue(host.run_once("process-1", now=self.now).accepted)
+        self.assertFalse(host.stop().accepted)
+        self.assertTrue(host.complete("process-1", now=self.now).accepted)
+        self.assertTrue(host.stop().accepted)
+        self.assertEqual(host.state, NativeHostState.STOPPED)
+        self.assertFalse(host.run_once("process-2", now=self.now).accepted)
+        self.assertTrue(host.stop().accepted)
+
+    def test_competing_coordinator_cannot_install_with_a_copied_receipt(self) -> None:
+        self.install()
+        competitor = DeploymentAuthorityHandoffCoordinator(self.store)
+        other_host, installation = install_native_host(competitor, self.installation, now=self.now)
+        self.assertIsNone(other_host)
+        self.assertFalse(installation.accepted)
+
+    def test_platform_paths_are_explicit_and_unsupported_platforms_fail_closed(self) -> None:
+        home = Path("C:/profiles/roundwright")
+        worktree = Path("C:/repositories/roundwright")
+        windows = NativeHostPaths.resolve(
+            platform="win32", environment={"APPDATA": "C:/profile/roaming", "LOCALAPPDATA": "C:/profile/local"}, home=home, worktree=worktree
+        )
+        self.assertTrue(str(windows.configuration).replace("\\", "/").endswith("profile/roaming/Roundwright/config.toml"))
+        self.assertTrue(str(windows.cache).replace("\\", "/").endswith("profile/local/Roundwright/Cache"))
+        self.assertTrue(str(windows.authentication).replace("\\", "/").endswith("Roundwright/auth.toml"))
+        self.assertTrue(windows.configuration.is_absolute())
+        self.assertNotEqual(windows.cache, windows.state_directory)
+        macos = NativeHostPaths.resolve(platform="darwin", environment={}, home=Path("/Users/roundwright"), worktree=Path("/repositories/roundwright"))
+        self.assertTrue(str(macos.configuration).replace("\\", "/").endswith("Library/Application Support/roundwright/config.toml"))
+        self.assertTrue(macos.configuration.is_absolute())
+        linux = NativeHostPaths.resolve(platform="linux", environment={}, home=Path("/home/roundwright"), worktree=Path("/repositories/roundwright"))
+        self.assertTrue(str(linux.cache).replace("\\", "/").endswith(".cache/roundwright"))
+        self.assertTrue(linux.cache.is_absolute())
+        with self.assertRaisesRegex(NativeHostError, "unsupported"):
+            NativeHostPaths.resolve(platform="plan9", environment={}, home=home, worktree=worktree)
+        with self.assertRaisesRegex(NativeHostError, "worktree path is not absolute"):
+            NativeHostPaths.resolve(platform="linux", environment={}, home=Path("/home/roundwright"), worktree=Path("relative-worktree"))
+
+    def test_direct_native_host_paths_cannot_bypass_the_path_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            with mock.patch.object(Path, "is_dir", side_effect=AssertionError("filesystem access")):
+                with self.assertRaisesRegex(NativeHostError, "not absolute"):
+                    replace(paths, worktree=Path("relative-worktree"))
+                with self.assertRaisesRegex(NativeHostError, "outside the declared state directory"):
+                    replace(paths, state_database=root / "unrelated" / "native-host.sqlite3")
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_directory.parent)
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_directory / "evictable")
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_database)
+                with self.assertRaisesRegex(NativeHostError, "must not overlap"):
+                    replace(paths, cache=paths.state_database / "evictable")
+                with self.assertRaisesRegex(NativeHostError, "parent segments"):
+                    replace(
+                        paths,
+                        cache=paths.state_directory.parent / "cache-alias" / ".." / paths.state_directory.name,
+                    )
+                with self.assertRaisesRegex(NativeHostError, "parent segments"):
+                    replace(
+                        paths,
+                        cache=paths.state_database.parent / "cache-alias" / ".." / paths.state_database.name,
+                    )
+                with self.assertRaisesRegex(NativeHostError, "unsupported"):
+                    NativeHostPaths(
+                        "plan9", paths.configuration, paths.authentication, paths.cache,
+                        paths.state_directory, paths.state_database, paths.worktree,
+                    )
+                with self.assertRaisesRegex(NativeHostError, "not absolute"):
+                    NativeHostPaths(
+                        "linux", PureWindowsPath("C:/config.toml"), PureWindowsPath("C:/auth.toml"),
+                        PureWindowsPath("C:/cache"), PureWindowsPath("C:/state"),
+                        PureWindowsPath("C:/state/native-host.sqlite3"), PureWindowsPath("C:/worktree"),
+                    )
+
+    def test_durable_sqlite_lifecycle_serializes_children_and_recovers_stale_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            self.assertIsNotNone(host)
+            assert host is not None
+            peer, peer_installation = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(peer_installation.accepted)
+            self.assertIsNotNone(peer)
+            assert peer is not None
+            self.assertTrue(host.run_once("owned-child", now=self.now).accepted)
+            self.assertFalse(peer.run_once("competing-child", now=self.now).accepted)
+            self.assertFalse(peer.complete("owned-child", now=self.now).accepted)
+            self.assertTrue(host.cancel("owned-child", now=self.now).accepted)
+            self.assertTrue(host.cancel("owned-child", now=self.now).accepted)
+            self.assertTrue(peer.run_once("stale-child", now=self.now).accepted)
+            interval = timedelta(seconds=1, microseconds=500000)
+            self.assertFalse(host.recover_stale_child("stale-child", now=self.now + timedelta(seconds=1, microseconds=499999), stale_after=interval).accepted)
+            self.assertTrue(host.recover_stale_child("stale-child", now=self.now + timedelta(minutes=2), stale_after=interval).accepted)
+            self.assertTrue(host.run_once("replacement-child", now=self.now).accepted)
+            self.assertTrue(host.complete("replacement-child", now=self.now).accepted)
+            self.assertTrue(paths.state_database.is_file())
+
+    def test_live_child_lease_blocks_peer_recovery_and_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None
+            peer, peer_installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(peer_installed.accepted)
+            assert peer is not None
+            self.assertTrue(host.run_once("live-child", now=self.now).accepted)
+            self.assertTrue(host.renew_child_lease("live-child", now=self.now + timedelta(seconds=30), lease_for=timedelta(minutes=2)).accepted)
+            self.assertFalse(peer.recover_stale_child("live-child", now=self.now + timedelta(minutes=1), stale_after=timedelta(seconds=1)).accepted)
+            self.assertFalse(peer.run_once("replacement-child", now=self.now + timedelta(minutes=1)).accepted)
+            self.assertEqual(host.state, NativeHostState.RUNNING)
+
+    def test_post_admission_transitions_revalidate_authority_before_mutation(self) -> None:
+        """Expiry, revocation, and open handoff deny every durable transition."""
+
+        self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+        denials = (
+            ("expiry", "receipt is stale or not yet active"),
+            ("revocation", "receipt was revoked"),
+            ("open-handoff", "authority handoff is incomplete; dispatch remains blocked"),
+        )
+        operations = (
+            ("complete", lambda host, process, moment: host.complete(process, now=moment), self.now),
+            ("cancel", lambda host, process, moment: host.cancel(process, now=moment), self.now),
+            ("renew", lambda host, process, moment: host.renew_child_lease(process, now=moment), self.now),
+            (
+                "recover",
+                lambda host, process, moment: host.recover_stale_child(
+                    process, now=moment, stale_after=timedelta(seconds=1),
+                ),
+                self.now + timedelta(minutes=2),
+            ),
+        )
+        for denial_name, reason in denials:
+            for operation_name, operation, moment in operations:
+                with self.subTest(denial=denial_name, operation=operation_name):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        paths = NativeHostPaths.resolve(
+                            platform=sys.platform, environment={}, home=root / "home",
+                            worktree=self._bound_worktree(root / "repository"),
+                        )
+                        host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+                        self.assertTrue(installed.accepted)
+                        assert host is not None
+                        process = f"{denial_name}-{operation_name}"
+                        self.assertTrue(host.run_once(process, now=self.now).accepted)
+                        with closing(sqlite3.connect(paths.state_database)) as connection:
+                            before = connection.execute(
+                                "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                                (process,),
+                            ).fetchone()
+                        with mock.patch.object(
+                            self.coordinator, "transition_if_authorized",
+                            return_value=(HandoffDecision(False, reason), None),
+                        ) as authorize:
+                            denied = operation(host, process, moment)
+                        self.assertFalse(denied.accepted)
+                        self.assertEqual(denied.reason, reason)
+                        self.assertEqual(authorize.call_count, 1)
+                        self.assertEqual(authorize.call_args.args, (self.identity, self.receipt))
+                        self.assertEqual(authorize.call_args.kwargs["now"], moment)
+                        self.assertTrue(callable(authorize.call_args.kwargs["transition"]))
+                        with closing(sqlite3.connect(paths.state_database)) as connection:
+                            after = connection.execute(
+                                "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                                (process,),
+                            ).fetchone()
+                        self.assertEqual(after, before)
+                        self.assertEqual(host.state, NativeHostState.RUNNING)
+
+    def test_authority_bound_completion_linearizes_before_open_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None and host._control_store is not None
+            self.assertTrue(host.run_once("barrier-child", now=self.now).accepted)
+            entered = Event()
+            release = Event()
+            completed: list[object] = []
+            handoff: list[HandoffDecision] = []
+            handoff_done = Event()
+            original_finish = host._control_store.finish
+
+            def blocking_finish(*args: object, **kwargs: object) -> object:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_finish(*args, **kwargs)
+
+            with mock.patch.object(host._control_store, "finish", new=blocking_finish):
+                completion = Thread(
+                    target=lambda: completed.append(host.complete("barrier-child", now=self.now)),
+                    daemon=True,
+                )
+                completion.start()
+                self.assertTrue(entered.wait(2))
+                replacement = replace(self.identity, candidate_sha="b" * 40)
+
+                def begin_handoff() -> None:
+                    handoff.append(self.coordinator.begin_handoff(
+                        self.receipt, replacement, handoff_fingerprint=fingerprint("a"), now=self.now,
+                    ))
+                    handoff_done.set()
+
+                contender = Thread(target=begin_handoff, daemon=True)
+                contender.start()
+                self.assertFalse(handoff_done.wait(0.2))
+                release.set()
+                completion.join(2)
+                contender.join(2)
+            self.assertEqual(len(completed), 1)
+            self.assertTrue(completed[0].accepted)
+            self.assertEqual(host.state, NativeHostState.IDLE)
+            self.assertTrue(handoff_done.is_set())
+            self.assertTrue(handoff[0].authorized)
+
+    def test_authority_bound_installation_linearizes_before_open_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            entered = Event()
+            release = Event()
+            installed: list[tuple[object, NativeHostDecision]] = []
+            handoff: list[HandoffDecision] = []
+            handoff_done = Event()
+            original_install = NativeHostControlStore.install
+
+            def blocking_install(store: NativeHostControlStore, installation: NativeHostInstallation) -> NativeHostDecision:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_install(store, installation)
+
+            with mock.patch.object(NativeHostControlStore, "install", new=blocking_install):
+                installation_thread = Thread(
+                    target=lambda: installed.append(
+                        install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+                    ),
+                    daemon=True,
+                )
+                installation_thread.start()
+                self.assertTrue(entered.wait(2))
+                replacement = replace(self.identity, candidate_sha="b" * 40)
+
+                def begin_handoff() -> None:
+                    handoff.append(self.coordinator.begin_handoff(
+                        self.receipt, replacement, handoff_fingerprint=fingerprint("a"), now=self.now,
+                    ))
+                    handoff_done.set()
+
+                contender = Thread(target=begin_handoff, daemon=True)
+                contender.start()
+                self.assertFalse(handoff_done.wait(0.2))
+                release.set()
+                installation_thread.join(2)
+                contender.join(2)
+            self.assertEqual(len(installed), 1)
+            self.assertIsNotNone(installed[0][0])
+            self.assertTrue(installed[0][1].accepted)
+            self.assertTrue(handoff_done.is_set())
+            self.assertTrue(handoff[0].authorized)
+
+    def test_authority_bound_admission_linearizes_before_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None and host._control_store is not None
+            entered = Event()
+            release = Event()
+            admitted: list[NativeHostDecision] = []
+            revoked = Event()
+            original_admit = host._control_store.admit
+
+            def blocking_admit(*args: object, **kwargs: object) -> object:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_admit(*args, **kwargs)
+
+            def revoke() -> None:
+                with self.store._lock:
+                    self.store._revoked.add(self.receipt.receipt_fingerprint)
+                revoked.set()
+
+            with mock.patch.object(host._control_store, "admit", new=blocking_admit):
+                admission = Thread(
+                    target=lambda: admitted.append(host.run_once("admission-child", now=self.now)),
+                    daemon=True,
+                )
+                admission.start()
+                self.assertTrue(entered.wait(2))
+                contender = Thread(target=revoke, daemon=True)
+                contender.start()
+                self.assertFalse(revoked.wait(0.2))
+                release.set()
+                admission.join(2)
+                contender.join(2)
+            self.assertEqual(len(admitted), 1)
+            self.assertTrue(admitted[0].accepted)
+            self.assertEqual(host.state, NativeHostState.RUNNING)
+            self.assertTrue(revoked.is_set())
+
+    def test_authority_bound_completion_linearizes_before_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None and host._control_store is not None
+            self.assertTrue(host.run_once("revocation-child", now=self.now).accepted)
+            entered = Event()
+            release = Event()
+            completed: list[object] = []
+            revoked = Event()
+            original_finish = host._control_store.finish
+
+            def blocking_finish(*args: object, **kwargs: object) -> object:
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return original_finish(*args, **kwargs)
+
+            def revoke() -> None:
+                with self.store._lock:
+                    self.store._revoked.add(self.receipt.receipt_fingerprint)
+                revoked.set()
+
+            with mock.patch.object(host._control_store, "finish", new=blocking_finish):
+                completion = Thread(
+                    target=lambda: completed.append(host.complete("revocation-child", now=self.now)),
+                    daemon=True,
+                )
+                completion.start()
+                self.assertTrue(entered.wait(2))
+                contender = Thread(target=revoke, daemon=True)
+                contender.start()
+                self.assertFalse(revoked.wait(0.2))
+                release.set()
+                completion.join(2)
+                contender.join(2)
+            self.assertEqual(len(completed), 1)
+            self.assertTrue(completed[0].accepted)
+            self.assertEqual(host.state, NativeHostState.IDLE)
+            self.assertTrue(revoked.is_set())
+
+    def test_expired_authority_denies_completion_before_durable_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(
+                platform=sys.platform, environment={}, home=root / "home",
+                worktree=self._bound_worktree(root / "repository"),
+            )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None
+            self.assertTrue(host.run_once("expired-child", now=self.now).accepted)
+            with closing(sqlite3.connect(paths.state_database)) as connection:
+                before = connection.execute(
+                    "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                    ("expired-child",),
+                ).fetchone()
+            denied = host.complete("expired-child", now=self.receipt.expires_at)
+            self.assertFalse(denied.accepted)
+            self.assertIn("stale", denied.reason)
+            with closing(sqlite3.connect(paths.state_database)) as connection:
+                after = connection.execute(
+                    "SELECT state, lease_expires_at, updated_at FROM native_host_process WHERE process_id = ?",
+                    ("expired-child",),
+                ).fetchone()
+            self.assertEqual(after, before)
+            self.assertEqual(host.state, NativeHostState.RUNNING)
+
+    def test_cache_removal_cannot_remove_durable_process_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            for durable_path in (paths.state_directory, paths.state_database):
+                with self.assertRaisesRegex(NativeHostError, "parent segments"):
+                    replace(
+                        paths,
+                        cache=durable_path.parent / "cache-alias" / ".." / durable_path.name,
+                    )
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            assert host is not None
+            peer, peer_installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(peer_installed.accepted)
+            assert peer is not None
+            self.assertTrue(host.run_once("durable-child", now=self.now).accepted)
+            assert isinstance(paths.cache, Path)
+            paths.cache.mkdir(parents=True, exist_ok=True)
+            (paths.cache / "evictable").write_text("cache", encoding="utf-8")
+            shutil.rmtree(paths.cache)
+            self.assertTrue(paths.state_database.is_file())
+            self.assertFalse(peer.run_once("replacement-child", now=self.now).accepted)
+
+    def test_stale_deadline_uses_exact_microseconds_at_far_future_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            store = NativeHostControlStore(paths.state_database)
+            self.assertTrue(store.install(self.installation).accepted)
+            far_future = datetime(9999, 1, 1, 12, 0, tzinfo=timezone.utc)
+            self.assertTrue(store.admit(self.installation, "future-child", source=InvocationSource.ONE_SHOT, now=far_future, lease_for=timedelta(microseconds=1)).accepted)
+            self.assertFalse(store.recover_stale(self.installation, "future-child", now=far_future, stale_after=timedelta(microseconds=1)).accepted)
+            self.assertTrue(store.recover_stale(self.installation, "future-child", now=far_future + timedelta(microseconds=1), stale_after=timedelta(microseconds=1)).accepted)
+
+    def test_state_database_filesystem_failures_are_public_safe_denials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=self._bound_worktree(root / "repository"))
+            with mock.patch.object(Path, "mkdir", side_effect=OSError("denied")):
+                decision = NativeHostControlStore(paths.state_database).install(self.installation)
+            self.assertFalse(decision.accepted)
+            self.assertEqual(decision.reason, "native host state database is unavailable")
+
+    def test_durable_install_rejects_detached_worktree_and_candidate_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+            self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+            host, installed = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertTrue(installed.accepted)
+            self.assertIsNotNone(host)
+            drifted_identity = replace(self.identity, candidate_sha="b" * 40)
+            drifted_receipt = replace(self.receipt, identity=drifted_identity)
+            drifted = NativeHostInstallation(fingerprint("6"), drifted_identity, drifted_receipt)
+            self.assertFalse(NativeHostControlStore(paths.state_database).install(drifted).accepted)
+            (worktree / ".git" / "refs" / "heads" / "codex" / "issue-90").write_text("b" * 40 + "\n", encoding="utf-8")
+            drifted_host, drifted_decision = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertIsNone(drifted_host)
+            self.assertFalse(drifted_decision.accepted)
+            self.assertIn("candidate SHA", drifted_decision.reason)
+            (worktree / ".git" / "HEAD").write_text("a" * 40 + "\n", encoding="utf-8")
+            detached_host, detached = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+            self.assertIsNone(detached_host)
+            self.assertFalse(detached.accepted)
+            self.assertIn("detached", detached.reason)
+
+    def test_linked_worktree_resolves_its_common_head_to_the_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            metadata = root / "metadata"
+            metadata.mkdir()
+            common = root / "common"
+            (common / "refs" / "heads" / "codex").mkdir(parents=True)
+            (common / "refs" / "heads" / "codex" / "issue-90").write_text("a" * 40 + "\n", encoding="utf-8")
+            (metadata / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            (metadata / "commondir").write_text("../common\n", encoding="utf-8")
+            (worktree / ".git").write_text("gitdir: ../metadata\n", encoding="utf-8")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            loose = common / "refs" / "heads" / "codex" / "issue-90"
+            (common / "packed-refs").write_text("a" * 40 + " refs/heads/codex/issue-90\n", encoding="utf-8")
+            loose.write_text("malformed\n", encoding="utf-8")
+            with self.assertRaisesRegex(NativeHostError, "loose worktree reference is malformed"):
+                paths.require_authoritative_worktree(self.identity.candidate_sha)
+            loose.unlink()
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (metadata / "HEAD").write_text("ref: refs/heads/topic@backup\n", encoding="utf-8")
+            (common / "packed-refs").write_text(
+                "a" * 40 + " refs/heads/codex/issue-90\n" + "a" * 40 + " refs/heads/topic@backup\n",
+                encoding="utf-8",
+            )
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            for reference in ("refs/heads/.hidden", "refs/heads/topic..backup"):
+                (metadata / "HEAD").write_text(f"ref: {reference}\n", encoding="utf-8")
+                with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (metadata / "HEAD").write_text("ref: refs/heads/cycle\n", encoding="utf-8")
+            original_resolve = Path.resolve
+
+            def cyclic_loose_ref(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "cycle" and "refs" in path.parts:
+                    raise RuntimeError("symlink loop")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=cyclic_loose_ref):
+                with self.assertRaisesRegex(NativeHostError, "resolution is unavailable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (metadata / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            (metadata / "commondir").write_text("../cycle\n", encoding="utf-8")
+
+            def cyclic_common_directory(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "cycle":
+                    raise RuntimeError("symlink loop")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=cyclic_common_directory):
+                with self.assertRaisesRegex(NativeHostError, "common directory resolution is unavailable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+
+    def test_loose_worktree_refs_fail_closed_before_packed_ref_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            loose = worktree / ".git" / "refs" / "heads" / "codex" / "issue-90"
+            packed = worktree / ".git" / "packed-refs"
+            packed.write_text("a" * 40 + " refs/heads/codex/issue-90\n", encoding="utf-8")
+            loose.write_text("malformed\n", encoding="utf-8")
+            with self.assertRaisesRegex(NativeHostError, "loose worktree reference is malformed"):
+                paths.require_authoritative_worktree(self.identity.candidate_sha)
+            original_read = Path.read_text
+            canonical_loose = loose.resolve()
+
+            def deny_loose(path: Path, *args: object, **kwargs: object) -> str:
+                if path.resolve() == canonical_loose:
+                    raise PermissionError("denied")
+                return original_read(path, *args, **kwargs)
+
+            loose.write_text("a" * 40 + "\n", encoding="utf-8")
+            with mock.patch.object(Path, "read_text", new=deny_loose):
+                with self.assertRaisesRegex(NativeHostError, "loose worktree reference is unreadable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            loose.unlink()
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+
+    def test_worktree_branch_references_reject_traversal_absolute_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = self._bound_worktree(root / "repository")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            head = worktree / ".git" / "HEAD"
+            for reference in ("refs/heads/../../candidate", "refs/heads//candidate", "refs/heads/C:/candidate", "refs/heads/candidate\x01", "refs/heads/.hidden", "refs/heads/topic..backup"):
+                head.write_text(f"ref: {reference}\n", encoding="utf-8")
+                with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            head.write_text("ref: refs/heads/escape\n", encoding="utf-8")
+            original_resolve = Path.resolve
+
+            def escape_loose_ref(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "escape" and "refs" in path.parts:
+                    return root.parent / "outside"
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=escape_loose_ref):
+                with self.assertRaisesRegex(NativeHostError, "escapes the Git directory"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            head.write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            with mock.patch.object(Path, "resolve", side_effect=OSError("state unavailable")):
+                with self.assertRaisesRegex(NativeHostError, "resolution is unavailable"):
+                    paths.require_authoritative_worktree(self.identity.candidate_sha)
+            reference = worktree / ".git" / "refs" / "heads"
+            (reference / "topic@backup").write_text("a" * 40 + "\n", encoding="utf-8")
+            head.write_text("ref: refs/heads/topic@backup\n", encoding="utf-8")
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            (reference / "@").write_text("a" * 40 + "\n", encoding="utf-8")
+            head.write_text("ref: refs/heads/@\n", encoding="utf-8")
+            paths.require_authoritative_worktree(self.identity.candidate_sha)
+            head.write_text("ref: refs/heads/topic@{backup\n", encoding="utf-8")
+            with self.assertRaisesRegex(NativeHostError, "reference is malformed"):
+                paths.require_authoritative_worktree(self.identity.candidate_sha)
+
+    def test_relative_gitdir_resolution_failure_is_a_public_safe_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            metadata = root / "metadata"
+            metadata.mkdir()
+            (metadata / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+            (worktree / ".git").write_text("gitdir: ../metadata\n", encoding="utf-8")
+            paths = NativeHostPaths.resolve(platform=sys.platform, environment={}, home=root / "home", worktree=worktree)
+            original_resolve = Path.resolve
+
+            def unavailable_gitdir(path: Path, *args: object, **kwargs: object) -> Path:
+                if path.name == "metadata":
+                    raise OSError("metadata unavailable")
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", new=unavailable_gitdir):
+                self.assertTrue(self.coordinator.activate_initial(self.receipt, self.verification, now=self.now).authorized)
+                self.assertTrue(self.coordinator.claim_orchestrator(self.receipt, claim_fingerprint=fingerprint("9"), now=self.now).authorized)
+                host, decision = install_native_host(self.coordinator, self.installation, now=self.now, paths=paths)
+                self.assertIsNone(host)
+                self.assertFalse(decision.accepted)
+                self.assertIn("Git directory resolution is unavailable", decision.reason)
+
+    def test_one_shot_wrapper_cleans_up_an_injected_child_action(self) -> None:
+        host = self.install()
+        invoked: list[str] = []
+        decision = host.execute_one_shot("wrapped-child", lambda: invoked.append("ran"), now=self.now)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(invoked, ["ran"])
+        self.assertEqual(host.state, NativeHostState.IDLE)
+
+    @staticmethod
+    def _bound_worktree(root: Path) -> Path:
+        root.mkdir()
+        git = root / ".git"
+        git.mkdir()
+        (git / "HEAD").write_text("ref: refs/heads/codex/issue-90\n", encoding="utf-8")
+        reference = git / "refs" / "heads" / "codex"
+        reference.mkdir(parents=True)
+        (reference / "issue-90").write_text("a" * 40 + "\n", encoding="utf-8")
+        return root
+
+
+if __name__ == "__main__":
+    unittest.main()

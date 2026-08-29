@@ -16,6 +16,7 @@ from enum import Enum
 import hashlib
 import json
 from threading import RLock
+from typing import Callable
 from uuid import UUID
 
 from .runtime_binding import RuntimeBinding
@@ -431,23 +432,21 @@ class DeploymentAuthorityHandoffCoordinator:
         """Authorize only the exact current receipt while no handoff is open."""
 
         with self._store._lock:
-            if type(identity) is not DeploymentAuthorityIdentity or not self._receipt_names_this_store(receipt):
-                return HandoffDecision(False, "authority identity is unavailable or names another state store")
-            if self._store._progress is not None:
-                return HandoffDecision(False, "authority handoff is incomplete; dispatch remains blocked")
-            if self._store._active != receipt:
-                return HandoffDecision(False, "receipt is absent, copied, revoked, or not the active authority")
-            if receipt.receipt_fingerprint in self._store._revoked:
-                return HandoffDecision(False, "receipt was revoked")
-            if not _verification_matches(receipt, self._store._verification):
-                return HandoffDecision(False, "receipt lacks fresh canonical verification")
-            if not self._holds_claim(receipt, self._store._claim_fingerprint):
-                return HandoffDecision(False, "receipt has no exclusive canonical orchestrator claim")
-            if receipt.identity != identity:
-                return HandoffDecision(False, "receipt does not match deployment candidate or environment")
-            if not _receipt_current(receipt, now):
-                return HandoffDecision(False, "receipt is stale or not yet active")
-            return HandoffDecision(True, "one exact authority receipt is current", receipt.receipt_fingerprint)
+            return self._authorize_locked(identity, receipt, now=now)
+
+    def transition_if_authorized(
+        self, identity: DeploymentAuthorityIdentity, receipt: DeploymentAuthorityHandoffReceipt, *,
+        now: datetime, transition: Callable[[], object],
+    ) -> tuple[HandoffDecision, object | None]:
+        """Run one local transition while its exact authority remains locked."""
+
+        if not callable(transition):
+            raise DeploymentHandoffError("authority transition is invalid")
+        with self._store._lock:
+            authority = self._authorize_locked(identity, receipt, now=now)
+            if not authority.authorized:
+                return authority, None
+            return authority, transition()
 
     def request_scheduler_wakeup(
         self, identity: DeploymentAuthorityIdentity, receipt: DeploymentAuthorityHandoffReceipt, *, now: datetime
@@ -458,6 +457,27 @@ class DeploymentAuthorityHandoffCoordinator:
         if not decision.authorized:
             return SchedulerWakeupDecision(False, decision.reason, decision.receipt_fingerprint)
         return SchedulerWakeupDecision(True, "work may be requested from the receipt-bound orchestrator", decision.receipt_fingerprint)
+
+    def _authorize_locked(
+        self, identity: DeploymentAuthorityIdentity, receipt: DeploymentAuthorityHandoffReceipt, *, now: datetime
+    ) -> HandoffDecision:
+        if type(identity) is not DeploymentAuthorityIdentity or not self._receipt_names_this_store(receipt):
+            return HandoffDecision(False, "authority identity is unavailable or names another state store")
+        if self._store._progress is not None:
+            return HandoffDecision(False, "authority handoff is incomplete; dispatch remains blocked")
+        if self._store._active != receipt:
+            return HandoffDecision(False, "receipt is absent, copied, revoked, or not the active authority")
+        if receipt.receipt_fingerprint in self._store._revoked:
+            return HandoffDecision(False, "receipt was revoked")
+        if not _verification_matches(receipt, self._store._verification):
+            return HandoffDecision(False, "receipt lacks fresh canonical verification")
+        if not self._holds_claim(receipt, self._store._claim_fingerprint):
+            return HandoffDecision(False, "receipt has no exclusive canonical orchestrator claim")
+        if receipt.identity != identity:
+            return HandoffDecision(False, "receipt does not match deployment candidate or environment")
+        if not _receipt_current(receipt, now):
+            return HandoffDecision(False, "receipt is stale or not yet active")
+        return HandoffDecision(True, "one exact authority receipt is current", receipt.receipt_fingerprint)
 
     def begin_handoff(
         self, old_receipt: DeploymentAuthorityHandoffReceipt, new_identity: DeploymentAuthorityIdentity, *,

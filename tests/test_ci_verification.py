@@ -265,9 +265,11 @@ class CiVerificationTests(unittest.TestCase):
             "repository mount: evidence-mismatch", "configuration mount: missing", "authentication mount: missing",
             "repository mount: permission-mismatch", "configuration mount: permission-mismatch",
             "authentication mount: permission-mismatch", "authority-receipt mount: permission-mismatch",
-            "authority receipt: missing", "authority receipt: mismatch",
+            "authority receipt: mismatch",
         ):
             self.assertIn(f'expect_blocked "{diagnostic}"', workflow)
+        self.assertNotIn('expect_blocked "authority receipt: missing"', workflow)
+        self.assertEqual(workflow.count('expect_blocked "authority receipt: mismatch"'), 4)
         self.assertNotIn('expect_blocked "repository mount: missing"', workflow)
         self.assertIn('if [ "$exit_code" -ne 2 ]; then', workflow)
         self.assertIn("printf '%s\\n' \"$output\" >&2", workflow)

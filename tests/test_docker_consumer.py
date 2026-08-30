@@ -456,6 +456,58 @@ class DockerConsumerTests(unittest.TestCase):
             self.assertEqual(report.exit_code, 2)
             self.assertIn("state mount is evidence-mismatch", report.reason)
 
+    def test_entrypoint_renders_every_present_invalid_authority_variant_as_mismatch(self) -> None:
+        """Present authority evidence is never rendered as an absent mount."""
+
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            identity = root / "identity.json"
+            candidate = "a" * 40
+            identity.write_text(
+                json.dumps({"candidate_sha": candidate, "package_digest": digest("b"), "base_image_digest": digest("c")} ),
+                encoding="utf-8",
+            )
+
+            def mounted_access(path: Path, mode: int) -> bool:
+                return mode == os.R_OK or path is paths[DockerMountName.STATE]
+
+            def evaluate_variant(name: str, mutate, *, declared_digest: str | None = None) -> None:
+                write_typed_mounted_evidence(paths, candidate, now=now)
+                receipt_path = paths[DockerMountName.AUTHORITY_RECEIPT]
+                mutate(receipt_path)
+                environment = {
+                    "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
+                    "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                    "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                    "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                    "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": declared_digest or hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                    **mounted_runtime_environment(),
+                }
+                with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value=candidate):
+                    report = preflight(environment, paths=paths, identity_path=identity)
+                output = io.StringIO()
+                render_docker_consumer_diagnostics(report, output)
+                rendered = output.getvalue().lower()
+                self.assertEqual(report.exit_code, 2, name)
+                self.assertFalse(report.ready, name)
+                self.assertIn("authority receipt: mismatch", rendered, name)
+                self.assertIn("result: blocked (authority receipt identity is missing or mismatched)", rendered, name)
+
+            def mutate_payload(receipt_path: Path, update) -> None:
+                payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+                update(payload)
+                receipt_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+
+            evaluate_variant("malformed", lambda receipt_path: receipt_path.write_text("{}\n", encoding="utf-8"))
+            evaluate_variant("digest-mismatch", lambda receipt_path: None, declared_digest="0" * 64)
+            for status in ("expired", "copied", "conflicting", "revoked"):
+                evaluate_variant(status, lambda receipt_path, status=status: mutate_payload(receipt_path, lambda payload: payload["verification"].update({"status": status})))
+            evaluate_variant("wrong-candidate", lambda receipt_path: mutate_payload(receipt_path, lambda payload: payload.update({"candidate_sha": "0" * 40})))
+
     def test_entrypoint_treats_unbound_image_workspace_as_repository_evidence_drift(self) -> None:
         """The image's declared workspace is not proof of a host checkout mount."""
 

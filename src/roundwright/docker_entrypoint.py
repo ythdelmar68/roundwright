@@ -104,7 +104,9 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
 
     result: dict[DockerMountName, DockerMountStatus] = {}
     repository = paths[DockerMountName.REPOSITORY]
-    if _checkout_candidate(repository) is None:
+    # The mounted checkout is independent evidence.  A well-formed detached
+    # repository for a different candidate is just as unsafe as no checkout.
+    if _checkout_candidate(repository) != candidate:
         result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
     try:
         configuration = tomllib.loads(paths[DockerMountName.CONFIGURATION].read_text(encoding="utf-8"))

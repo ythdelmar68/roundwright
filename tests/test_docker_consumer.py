@@ -333,6 +333,10 @@ class DockerConsumerTests(unittest.TestCase):
 
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
                 self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="b" * 40):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertFalse(report.ready)
+            self.assertIn("repository mount is evidence-mismatch", report.reason)
 
     def test_entrypoint_blocks_state_ownership_before_database_access(self) -> None:
         """An inaccessible authoritative database must never escape preflight."""

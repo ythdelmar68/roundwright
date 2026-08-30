@@ -137,6 +137,12 @@ jobs:
           test -d "$fixtures/repository/.git"
           test ! -e "$fixtures/repository/.git/objects/info/alternates"
           test "$(git -C "$fixtures/repository" rev-parse HEAD)" = "$CANDIDATE_SHA"
+          # Git refuses a repository owned by another UID.  Transfer both
+          # the checkout and its internal metadata before mounting it
+          # read-only into the non-root consumer image.
+          sudo chown -R 65532:65532 "$fixtures/repository"
+          test "$(stat -c '%u:%g' "$fixtures/repository")" = "65532:65532"
+          test "$(stat -c '%u:%g' "$fixtures/repository/.git")" = "65532:65532"
           python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state" --configuration "$fixtures/etc/config.toml" --authentication "$fixtures/run/auth.toml" --output "$fixtures/run/authority-receipt.json"
           sudo chown -R 65532:65532 "$fixtures/state"
           sudo find "$fixtures/state" -type d -exec chmod 0750 {} +

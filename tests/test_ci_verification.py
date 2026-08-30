@@ -123,6 +123,12 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('test ! -e "$fixtures/repository/.git/objects/info/alternates"', workflow)
         self.assertNotIn('worktree add --detach "$fixtures/repository"', workflow)
         self.assertIn('git -C "$fixtures/repository" rev-parse HEAD', workflow)
+        repository_owner = 'sudo chown -R 65532:65532 "$fixtures/repository"'
+        self.assertIn(repository_owner, workflow)
+        self.assertIn('test "$(stat -c \'%u:%g\' "$fixtures/repository")" = "65532:65532"', workflow)
+        self.assertIn('test "$(stat -c \'%u:%g\' "$fixtures/repository/.git")" = "65532:65532"', workflow)
+        self.assertLess(workflow.index('git -C "$fixtures/repository" checkout --detach "$CANDIDATE_SHA"'), workflow.index(repository_owner))
+        self.assertLess(workflow.index(repository_owner), workflow.index('common=(--network=none --read-only --tmpfs /tmp'))
         self.assertIn('python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state"', workflow)
         self.assertIn('--configuration "$fixtures/etc/config.toml" --authentication "$fixtures/run/auth.toml"', workflow)
         fixture_writer = workflow.index('python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA"')

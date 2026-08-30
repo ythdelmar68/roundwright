@@ -32,6 +32,7 @@ class DockerMountStatus(str, Enum):
     MISSING = "missing"
     OWNERSHIP_MISMATCH = "ownership-mismatch"
     PERMISSION_MISMATCH = "permission-mismatch"
+    EVIDENCE_MISMATCH = "evidence-mismatch"
 
 
 class DockerIdentityStatus(str, Enum):

@@ -38,6 +38,14 @@ def digest(character: str) -> str:
     return "sha256:" + character * 64
 
 
+def mounted_runtime_environment() -> dict[str, str]:
+    return {
+        "ROUNDWRIGHT_REPOSITORY_ROOT": "/workspace",
+        "XDG_CONFIG_HOME": "/etc",
+        "XDG_STATE_HOME": "/var/lib",
+    }
+
+
 def mounts(status: DockerMountStatus = DockerMountStatus.READY, *, authority: DockerMountStatus | None = None) -> tuple[DockerMountCheck, ...]:
     return tuple(DockerMountCheck(name, authority if name is DockerMountName.AUTHORITY_RECEIPT and authority is not None else status) for name in DockerMountName)
 
@@ -49,6 +57,7 @@ class DockerConsumerTests(unittest.TestCase):
             control_store = NativeHostControlStore(Path(temporary) / "native-host.sqlite3")
             installation = canonical_native_host_installation("a" * 40, now=now)
             self.assertTrue(control_store.install(installation).accepted)
+            self.assertTrue(control_store.verify(installation).accepted)
             self.assertTrue(control_store.admit(installation, "fixture-one", InvocationSource.ONE_SHOT, now=now).accepted)
             self.assertFalse(control_store.admit(installation, "fixture-two", InvocationSource.SCHEDULER_WAKE, now=now).accepted)
             self.assertTrue(control_store.finish(installation, "fixture-one", "completed", now=now).accepted)
@@ -203,6 +212,7 @@ class DockerConsumerTests(unittest.TestCase):
             "roundwright-read-only status",
             "roundwright-test-only status",
             "roundwright-test-only run-once",
+            "ROUNDWRIGHT_AUTHORITY_RECEIPT=<authority-receipt.json>",
             "returns exit code 3",
         ):
             self.assertIn(value, documentation)
@@ -213,18 +223,19 @@ class DockerConsumerTests(unittest.TestCase):
             root = Path(temporary)
             paths = {name: root / name.value for name in DockerMountName}
             paths[DockerMountName.REPOSITORY].mkdir(); paths[DockerMountName.STATE].mkdir()
-            for name in (DockerMountName.CONFIGURATION, DockerMountName.AUTHENTICATION):
-                paths[name].write_text("{}\n", encoding="utf-8")
+            paths[DockerMountName.CONFIGURATION].write_text("[runtime]\nschema_version = 1\n", encoding="utf-8")
+            paths[DockerMountName.AUTHENTICATION].write_text("# fixture\n", encoding="utf-8")
             paths[DockerMountName.AUTHORITY_RECEIPT].write_text(json.dumps({"candidate_sha": "a" * 40}), encoding="utf-8")
             identity = root / "identity.json"
             identity.write_text(json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}), encoding="utf-8")
             receipt = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
-            environment = {"ROUNDWRIGHT_DOCKER_MODE": "authoritative", "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64, "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"), "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt}
+            environment = {"ROUNDWRIGHT_DOCKER_MODE": "authoritative", "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64, "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"), "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt, **mounted_runtime_environment()}
             # A digest-matching JSON fragment is not authority: mounted typed
             # canonical evidence must pass the existing deployment evaluator.
-            self.assertFalse(preflight(environment, paths=paths, identity_path=identity).ready)
-            environment["ROUNDWRIGHT_DOCKER_CANDIDATE_SHA"] = "e" * 40
-            report = preflight(environment, paths=paths, identity_path=identity)
+            with mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
+                self.assertFalse(preflight(environment, paths=paths, identity_path=identity).ready)
+                environment["ROUNDWRIGHT_DOCKER_CANDIDATE_SHA"] = "e" * 40
+                report = preflight(environment, paths=paths, identity_path=identity)
             self.assertFalse(report.ready)
             self.assertEqual(report.candidate, DockerIdentityStatus.MISMATCH)
 
@@ -235,8 +246,8 @@ class DockerConsumerTests(unittest.TestCase):
             paths = {name: root / name.value for name in DockerMountName}
             paths[DockerMountName.REPOSITORY].mkdir()
             paths[DockerMountName.STATE].mkdir()
-            for name in (DockerMountName.CONFIGURATION, DockerMountName.AUTHENTICATION):
-                paths[name].write_text("{}\n", encoding="utf-8")
+            paths[DockerMountName.CONFIGURATION].write_text("[runtime]\nschema_version = 1\n", encoding="utf-8")
+            paths[DockerMountName.AUTHENTICATION].write_text("# fixture\n", encoding="utf-8")
             paths[DockerMountName.AUTHORITY_RECEIPT].write_text(
                 json.dumps(canonical_fixture_envelope("a" * 40, now=now), sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
@@ -247,20 +258,45 @@ class DockerConsumerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            self.assertTrue(NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").install(canonical_native_host_installation("a" * 40, now=now)).accepted)
             environment = {
                 "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
                 "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40,
                 "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
                 "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
                 "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt_sha,
+                **mounted_runtime_environment(),
             }
             def mounted_access(path: Path, mode: int) -> bool:
                 if mode == os.R_OK:
                     return True
                 return path is paths[DockerMountName.STATE]
 
-            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access):
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
                 self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+
+    def test_entrypoint_requires_mounted_runtime_evidence_and_environment(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir(); paths[DockerMountName.STATE].mkdir()
+            paths[DockerMountName.CONFIGURATION].write_text("[runtime]\nschema_version = 1\n", encoding="utf-8")
+            paths[DockerMountName.AUTHENTICATION].write_text("# fixture\n", encoding="utf-8")
+            paths[DockerMountName.AUTHORITY_RECEIPT].write_text(json.dumps(canonical_fixture_envelope("a" * 40, now=now)), encoding="utf-8")
+            self.assertTrue(NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").install(canonical_native_host_installation("a" * 40, now=now)).accepted)
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}), encoding="utf-8")
+            receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            environment = {"ROUNDWRIGHT_DOCKER_MODE": "authoritative", "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64, "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"), "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt_sha, **mounted_runtime_environment()}
+            def mounted_access(path: Path, mode: int) -> bool:
+                return mode == os.R_OK or path is paths[DockerMountName.STATE]
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
+                self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+                environment.pop("XDG_STATE_HOME")
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertFalse(report.ready)
+            self.assertIn("repository mount is evidence-mismatch", report.reason)
 
     def test_entrypoint_blocks_writable_host_owned_mounts_and_dispatches_cli_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -282,6 +318,6 @@ class DockerConsumerTests(unittest.TestCase):
                 return mode == os.R_OK or path is paths[DockerMountName.CONFIGURATION]
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=writable_configuration):
                 self.assertFalse(preflight(environment, paths=paths, identity_path=identity).ready)
-        with mock.patch("roundwright.docker_entrypoint.preflight", return_value=mock.Mock(ready=True)), mock.patch("roundwright.docker_entrypoint.render_docker_consumer_diagnostics"), mock.patch("roundwright.docker_entrypoint.cli_main", return_value=3) as cli:
+        with mock.patch("roundwright.docker_entrypoint.preflight", return_value=mock.Mock(ready=True)), mock.patch("roundwright.docker_entrypoint.render_docker_consumer_diagnostics"), mock.patch("roundwright.docker_entrypoint.os.chdir"), mock.patch("roundwright.docker_entrypoint.cli_main", return_value=3) as cli:
             self.assertEqual(docker_entrypoint_main(["run-once"]), 3)
             cli.assert_called_once_with(["run-once"])

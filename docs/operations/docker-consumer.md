@@ -63,10 +63,12 @@ python ci/write_docker_consumer_fixture.py --candidate <40-lowercase-hex> --stat
 
 Set `ROUNDWRIGHT_REPOSITORY`, `ROUNDWRIGHT_STATE`,
 `ROUNDWRIGHT_CONFIGURATION`, and `ROUNDWRIGHT_AUTHENTICATION` for every mode.
-Set `ROUNDWRIGHT_AUTHORITY_RECEIPT` and its SHA-256 only for authoritative
-mode. Repository, configuration, authentication, and receipt mounts must be
+Repository, configuration, authentication, and receipt mounts must be
 read-only. The authoritative state must be owned and writable by UID/GID
-`65532`; read-only and test-only state must not be writable.
+`65532`; read-only and test-only state must not be writable. Set
+`ROUNDWRIGHT_AUTHORITY_RECEIPT` and its SHA-256 only in the authoritative
+command; the read-only and test-only commands below deliberately do not
+interpolate either authority variable.
 
 Every invocation selects its dedicated Compose service:
 
@@ -91,11 +93,20 @@ installed package CLI. It must not print host paths, credential values, or
 receipt content. Run the three modes with their dedicated Compose services:
 
 ```text
-docker compose -f docker/compose.yaml run --rm roundwright-authoritative doctor
 docker compose -f docker/compose.yaml run --rm roundwright-read-only status
 docker compose -f docker/compose.yaml run --rm roundwright-test-only status
 docker compose -f docker/compose.yaml run --rm roundwright-test-only run-once
+ROUNDWRIGHT_AUTHORITY_RECEIPT=<authority-receipt.json> \
+ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256=<64-lowercase-hex> \
+docker compose -f docker/compose.yaml run --rm roundwright-authoritative doctor
 ```
+
+The first three commands can render and run with only the common repository,
+state, configuration, and authentication inputs. The final authoritative
+command adds the external receipt at invocation time; it is not inherited by
+the non-authoritative Compose services. Hosted qualification executes these
+same three Compose services against the exact uploaded wheel and records only
+public-safe results.
 
 `run-once` is intentionally blocked by the package and returns exit code 3;
 the entrypoint propagates that exact result. Doctor reports mount availability,

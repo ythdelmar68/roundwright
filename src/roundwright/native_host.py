@@ -251,6 +251,24 @@ class NativeHostControlStore:
             return self._denied(installation, "native host state database is unavailable")
         return self._accepted(installation, "native host installation recorded")
 
+    def verify(self, installation: NativeHostInstallation) -> NativeHostDecision:
+        """Read a mounted installation without creating or repairing state.
+
+        Docker consumers use this to prove that their host-owned SQLite input
+        already belongs to the typed handoff installation.  Unlike ``install``
+        it never creates a database or schema, which keeps read-only and
+        test-only consumers incapable of manufacturing lifecycle evidence.
+        """
+
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                if not self._matches(connection, installation):
+                    return self._denied(installation, "native host state is not authoritative for this candidate")
+        except (OSError, ValueError, sqlite3.Error):
+            return self._denied(installation, "native host state database is unavailable")
+        return self._accepted(installation, "native host installation verified")
+
     def admit(self, installation: NativeHostInstallation, process_id: str, source: InvocationSource, *, now: datetime, lease_for: timedelta = _DEFAULT_PROCESS_LEASE) -> NativeHostDecision:
         if type(lease_for) is not timedelta or lease_for <= timedelta():
             raise NativeHostError("native host process lease is invalid")

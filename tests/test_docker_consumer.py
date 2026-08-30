@@ -255,6 +255,11 @@ class DockerConsumerTests(unittest.TestCase):
         self.assertIn("roundwright-test-only:", compose)
         self.assertIn("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256:", compose)
         self.assertNotIn("/dev/null", compose)
+        # Service-level environments replace the extension mapping in Compose,
+        # so every mode must restate the mounted runtime paths explicitly.
+        self.assertEqual(compose.count("ROUNDWRIGHT_REPOSITORY_ROOT: /workspace"), 3)
+        self.assertEqual(compose.count("XDG_CONFIG_HOME: /etc"), 3)
+        self.assertEqual(compose.count("XDG_STATE_HOME: /var/lib"), 3)
 
     def test_operator_documentation_matches_current_docker_contract(self) -> None:
         documentation = (ROOT / "docs" / "operations" / "docker-consumer.md").read_text(encoding="utf-8")

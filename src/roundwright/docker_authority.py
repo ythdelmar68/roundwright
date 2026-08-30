@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import re
 from pathlib import Path
 from uuid import UUID
 
@@ -21,6 +22,8 @@ class DockerAuthorityAdapterError(ValueError):
 def evaluate_mounted_authority(path: Path, *, candidate_sha: str, now: datetime):
     """Parse one canonical public-safe envelope and delegate typed evaluation."""
     try:
+        if type(candidate_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
+            raise ValueError
         payload = json.loads(path.read_text(encoding="utf-8"))
         if type(payload) is not dict or set(payload) != {"candidate_sha", "identity", "receipt", "verification"} or payload["candidate_sha"] != candidate_sha:
             raise ValueError

@@ -45,6 +45,8 @@ class DockerConsumerTests(unittest.TestCase):
             path = Path(temporary) / "authority.json"
             with self.assertRaises(DockerAuthorityAdapterError):
                 evaluate_mounted_authority(path, candidate_sha="a" * 40, now=datetime.now(timezone.utc))
+            with self.assertRaises(DockerAuthorityAdapterError):
+                evaluate_mounted_authority(path, candidate_sha="not-a-candidate", now=datetime.now(timezone.utc))
             path.write_text("{}", encoding="utf-8")
             with self.assertRaises(DockerAuthorityAdapterError):
                 evaluate_mounted_authority(path, candidate_sha="a" * 40, now=datetime.now(timezone.utc))

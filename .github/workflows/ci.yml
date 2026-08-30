@@ -189,8 +189,14 @@ jobs:
             output="$("$@" 2>&1)"
             exit_code=$?
             set -e
-            test "$exit_code" -eq 2
-            printf '%s\n' "$output" | grep -F "$expected"
+            if [ "$exit_code" -ne 2 ]; then
+              printf '%s\n' "$output" >&2
+              return 1
+            fi
+            if ! printf '%s\n' "$output" | grep -F "$expected"; then
+              printf '%s\n' "$output" >&2
+              return 1
+            fi
           }
           # Each negative is a real image invocation.  Keep these fail-closed
           # assertions beside the positive paths so hosted CI cannot replace
@@ -205,7 +211,10 @@ jobs:
           # Exercise every mandatory host-owned input independently.  These
           # use the same candidate-bound image and fixture material as the
           # positive paths, but never publish an image or mutate authority.
-          expect_blocked "repository mount: missing" docker run --rm "${bare[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          # The image declares /workspace, so omitting the host bind keeps an
+          # empty image directory.  That is present-but-unverified evidence,
+          # not an absent mount, and must fail closed accordingly.
+          expect_blocked "repository mount: evidence-mismatch" docker run --rm "${bare[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           expect_blocked "configuration mount: missing" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           expect_blocked "authentication mount: missing" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           expect_blocked "state mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:ro" "${authority_mount[@]}" "$image" doctor

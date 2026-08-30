@@ -448,6 +448,40 @@ class DockerConsumerTests(unittest.TestCase):
             self.assertEqual(report.exit_code, 2)
             self.assertIn("state mount is evidence-mismatch", report.reason)
 
+    def test_entrypoint_treats_unbound_image_workspace_as_repository_evidence_drift(self) -> None:
+        """The image's declared workspace is not proof of a host checkout mount."""
+
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            candidate = write_self_contained_checkout(paths[DockerMountName.REPOSITORY])
+            write_typed_mounted_evidence(paths, candidate, now=now)
+            paths[DockerMountName.AUTHORITY_RECEIPT].unlink()
+            identity = root / "identity.json"
+            identity.write_text(
+                json.dumps({"candidate_sha": candidate, "package_digest": digest("b"), "base_image_digest": digest("c")} ),
+                encoding="utf-8",
+            )
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": DockerOperationMode.TEST_ONLY.value,
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                **mounted_runtime_environment(),
+            }
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=lambda _path, access_mode: access_mode == os.R_OK):
+                self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+                image_workspace = root / "image-workspace"
+                image_workspace.mkdir()
+                paths[DockerMountName.REPOSITORY] = image_workspace
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertFalse(report.ready)
+            self.assertEqual(report.exit_code, 2)
+            self.assertIn("repository mount is evidence-mismatch", report.reason)
+
     def test_entrypoint_blocks_state_ownership_before_database_access(self) -> None:
         """An inaccessible authoritative database must never escape preflight."""
 

@@ -262,15 +262,19 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('expect_blocked "authority-receipt mount: permission-mismatch"', workflow)
         self.assertIn('expect_blocked "state mount: ownership-mismatch"', workflow)
         for diagnostic in (
-            "repository mount: missing", "configuration mount: missing", "authentication mount: missing",
+            "repository mount: evidence-mismatch", "configuration mount: missing", "authentication mount: missing",
             "repository mount: permission-mismatch", "configuration mount: permission-mismatch",
             "authentication mount: permission-mismatch", "authority-receipt mount: permission-mismatch",
             "authority receipt: missing", "authority receipt: mismatch",
         ):
             self.assertIn(f'expect_blocked "{diagnostic}"', workflow)
+        self.assertNotIn('expect_blocked "repository mount: missing"', workflow)
+        self.assertIn('if [ "$exit_code" -ne 2 ]; then', workflow)
+        self.assertIn("printf '%s\\n' \"$output\" >&2", workflow)
+        self.assertIn("if ! printf '%s\\n' \"$output\" | grep -F \"$expected\"; then", workflow)
         self.assertIn("for status in expired copied conflicting revoked", workflow)
         self.assertIn("authority-wrong-candidate.json", workflow)
-        self.assertIn('test "$exit_code" -eq 2', workflow)
+        self.assertNotIn('test "$exit_code" -eq 2', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-authoritative doctor', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-read-only status', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-test-only status', workflow)

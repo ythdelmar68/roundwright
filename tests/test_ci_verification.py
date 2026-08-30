@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -164,8 +165,8 @@ class CiVerificationTests(unittest.TestCase):
 
     def test_git_commit_materializer_writes_exact_loose_object_from_packed_start(self) -> None:
         materializer = load_git_commit_materializer()
-        payload = b"tree " + b"0" * 40 + b"\\nauthor Docker <docker@example.invalid> 0 +0000\\n\\nfixture\\n"
-        raw_object = b"commit " + str(len(payload)).encode("ascii") + b"\\0" + payload
+        payload = b"tree " + b"0" * 40 + b"\nauthor Docker <docker@example.invalid> 0 +0000\n\nfixture\n"
+        raw_object = b"commit " + str(len(payload)).encode("ascii") + b"\0" + payload
         candidate = hashlib.sha1(raw_object).hexdigest()
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
@@ -173,7 +174,7 @@ class CiVerificationTests(unittest.TestCase):
             packed = git_directory / "objects" / "pack"
             packed.mkdir(parents=True)
             (packed / "pack-fixture.pack").write_bytes(b"packed candidate already available")
-            (git_directory / "HEAD").write_text(candidate + "\\n", encoding="ascii")
+            (git_directory / "HEAD").write_bytes(candidate.encode("ascii") + b"\n")
 
             target = materializer.materialize_loose_commit(repository, candidate, payload)
 
@@ -184,6 +185,29 @@ class CiVerificationTests(unittest.TestCase):
             self.assertEqual(materializer.materialize_loose_commit(repository, candidate, payload), target)
             with self.assertRaises(ValueError):
                 materializer.materialize_loose_commit(repository, candidate, b"copied payload")
+            (git_directory / "HEAD").write_bytes(candidate.encode("ascii") + b"\\n")
+            with self.assertRaises(ValueError):
+                materializer.materialize_loose_commit(repository, candidate, payload)
+
+    def test_git_commit_materializer_uses_real_detached_head_and_nul_object_header(self) -> None:
+        materializer = load_git_commit_materializer()
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.name", "Docker fixture"], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.email", "docker@example.invalid"], check=True)
+            (repository / "fixture.txt").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "fixture.txt"], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "fixture"], check=True)
+            candidate = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "-C", str(repository), "checkout", "--detach", candidate], check=True, capture_output=True)
+            payload = subprocess.run(["git", "-C", str(repository), "cat-file", "commit", candidate], check=True, capture_output=True).stdout
+
+            self.assertEqual((repository / ".git" / "HEAD").read_bytes(), candidate.encode("ascii") + b"\n")
+            raw_object = materializer._canonical_commit(payload)
+            self.assertEqual(raw_object, b"commit " + str(len(payload)).encode("ascii") + b"\0" + payload)
+            self.assertNotEqual(raw_object, b"commit " + str(len(payload)).encode("ascii") + b"\\0" + payload)
+            self.assertEqual(materializer.materialize_loose_commit(repository, candidate, payload), repository / ".git" / "objects" / candidate[:2] / candidate[2:])
 
     def test_docker_qualification_binds_artifact_base_and_dockerfile_without_paths(self) -> None:
         qualification = load_docker_qualification()

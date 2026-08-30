@@ -22,12 +22,12 @@ def _require_directory(path: Path, label: str) -> None:
 
 def _require_detached_head(git_directory: Path, candidate: str) -> None:
     head = git_directory / "HEAD"
-    if head.is_symlink() or not head.is_file() or head.read_bytes() != f"{candidate}\\n".encode("ascii"):
+    if head.is_symlink() or not head.is_file() or head.read_bytes() != f"{candidate}\n".encode("ascii"):
         raise ValueError("repository HEAD must be the exact detached candidate")
 
 
 def _canonical_commit(payload: bytes) -> bytes:
-    return b"commit " + str(len(payload)).encode("ascii") + b"\\0" + payload
+    return b"commit " + str(len(payload)).encode("ascii") + b"\0" + payload
 
 
 def _verify_loose_object(path: Path, raw_object: bytes) -> None:

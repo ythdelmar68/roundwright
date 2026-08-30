@@ -34,6 +34,16 @@ def load_validation_resolver() -> object:
     return module
 
 
+def load_docker_qualification() -> object:
+    location = ROOT / "ci" / "docker_consumer_qualification.py"
+    specification = importlib.util.spec_from_file_location("docker_consumer_qualification", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("Docker qualification helper is unavailable")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 class CiVerificationTests(unittest.TestCase):
     def test_candidate_route_uses_candidate_lock_and_explicit_shared_cache(self) -> None:
         resolver = load_validation_resolver()
@@ -77,6 +87,52 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("actions/download-artifact@v4", workflow)
         self.assertIn("ci/verify_package_digest.py verify dist", workflow)
         self.assertIn("ci/verify_package_digest.py qualify dist", workflow)
+
+    def test_docker_consumer_workflow_qualifies_the_uploaded_wheel_without_publication(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("docker-consumer-qualification:", workflow)
+        self.assertIn("needs: build-package", workflow)
+        self.assertIn("roundwright-package-${{ github.sha }}", workflow)
+        self.assertIn("ci/docker_consumer_qualification.py inputs dist --candidate", workflow)
+        self.assertIn("docker pull \"${{ steps.docker-inputs.outputs.base_image }}\"", workflow)
+        self.assertIn("docker build --network=none --file docker/Dockerfile", workflow)
+        self.assertIn("ROUNDWRIGHT_WHEEL_SHA256=${{ steps.docker-inputs.outputs.wheel_sha256 }}", workflow)
+        self.assertIn("docker run --rm --network=none --read-only --tmpfs /tmp", workflow)
+        self.assertIn("--docker-mode read-only", workflow)
+        self.assertIn("--docker-mode test-only", workflow)
+        self.assertIn("roundwright-docker-consumer-qualification-${{ github.sha }}", workflow)
+        self.assertNotIn("docker push", workflow)
+
+    def test_docker_qualification_binds_artifact_base_and_dockerfile_without_paths(self) -> None:
+        qualification = load_docker_qualification()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dist = root / "dist"
+            dist.mkdir()
+            wheel = dist / "roundwright-0.0.0-py3-none-any.whl"
+            wheel.write_bytes(b"candidate wheel")
+            digest = qualification.hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (dist / "package-digest.json").write_text(
+                qualification.json.dumps({"wheel": wheel.name, "sha256": digest}) + "\n", encoding="utf-8"
+            )
+            dockerfile = root / "Dockerfile"
+            dockerfile.write_text(
+                "FROM python:3.12.13-slim-bookworm@sha256:" + "a" * 64
+                + "\nCOPY --chown=65532:65532 dist/${ROUNDWRIGHT_WHEEL} /tmp/roundwright.whl\n"
+                + "RUN python -m pip install --no-index --no-deps /tmp/roundwright.whl\n",
+                encoding="utf-8",
+            )
+            values = qualification.docker_inputs(dist, "b" * 40, dockerfile=dockerfile)
+            self.assertEqual(values["wheel_sha256"], digest)
+            self.assertEqual(values["base_image_digest"], "sha256:" + "a" * 64)
+            self.assertNotIn(str(root), qualification.json.dumps(values, sort_keys=True))
+            receipt = root / "receipt.json"
+            with mock.patch.object(qualification, "_DOCKERFILE", dockerfile):
+                qualification.record_qualification(dist, "b" * 40, values["base_image"], receipt)
+            recorded = qualification.json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(recorded["candidate_sha"], "b" * 40)
+            self.assertEqual(recorded["wheel_sha256"], digest)
+            self.assertEqual(recorded["checks"]["offline_build"], "passed")
 
     def test_workflow_does_not_restore_nonportable_windows_junctions(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

@@ -157,9 +157,21 @@ jobs:
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
-          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" status
-          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" status
-          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" status
+          expect_status() {
+            output="$("$@" 2>&1)"
+            printf '%s\n' "$output" | grep -F "candidate: match"
+            printf '%s\n' "$output" | grep -F "worktree: match"
+            printf '%s\n' "$output" | grep -F "sqlite: ready"
+            printf '%s\n' "$output" | grep -F "native-host: match"
+            printf '%s\n' "$output" | grep -F "runtime-binding: match"
+            printf '%s\n' "$output" | grep -F "active-lock: held"
+            printf '%s\n' "$output" | grep -F "restart: observed"
+            printf '%s\n' "$output" | grep -F "cancellation: observed"
+            printf '%s\n' "$output" | grep -F "stale-recovery: observed"
+          }
+          expect_status docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" status
+          expect_status docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" status
+          expect_status docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" status
           set +e
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" run-once
           exit_code=$?

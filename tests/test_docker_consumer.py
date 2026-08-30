@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import contextlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -29,7 +29,7 @@ from roundwright.docker_consumer import (
     evaluate_docker_consumer,
     render_docker_consumer_diagnostics,
 )
-from roundwright.docker_entrypoint import _checkout_candidate, main as docker_entrypoint_main, preflight
+from roundwright.docker_entrypoint import _checkout_candidate, _render_mounted_status, main as docker_entrypoint_main, preflight
 from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority
 from roundwright.docker_authority import canonical_native_host_installation
 from roundwright.native_host import InvocationSource, NativeHostControlStore
@@ -142,6 +142,41 @@ class DockerConsumerTests(unittest.TestCase):
             self.assertFalse(control_store.admit(installation, "fixture-two", InvocationSource.SCHEDULER_WAKE, now=now).accepted)
             self.assertTrue(control_store.finish(installation, "fixture-one", "completed", now=now).accepted)
             self.assertTrue(control_store.admit(installation, "fixture-two", InvocationSource.SCHEDULER_WAKE, now=now).accepted)
+
+    def test_mounted_status_observes_persisted_lifecycle_without_dispatch(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir()
+            installation = canonical_native_host_installation("a" * 40, now=now)
+            store = NativeHostControlStore(state / "native-host.sqlite3")
+            self.assertTrue(store.install(installation).accepted)
+            self.assertTrue(store.admit(installation, "restart", InvocationSource.ONE_SHOT, now=now).accepted)
+            self.assertTrue(store.finish(installation, "restart", "completed", now=now).accepted)
+            self.assertTrue(store.admit(installation, "cancel", InvocationSource.ONE_SHOT, now=now).accepted)
+            self.assertTrue(store.finish(installation, "cancel", "cancelled", now=now).accepted)
+            stale_at = now - timedelta(hours=1)
+            self.assertTrue(store.admit(installation, "stale", InvocationSource.SCHEDULER_WAKE, now=stale_at, lease_for=timedelta(seconds=1)).accepted)
+            self.assertTrue(store.recover_stale(installation, "stale", now=now, stale_after=timedelta(minutes=1)).accepted)
+            self.assertTrue(store.admit(installation, "active", InvocationSource.ONE_SHOT, now=now).accepted)
+            paths = {name: state for name in DockerMountName}
+            paths[DockerMountName.STATE] = state
+            output = io.StringIO()
+            self.assertEqual(_render_mounted_status(output, paths=paths, candidate="a" * 40, authoritative=True), 0)
+            rendered = output.getvalue()
+            for value in ("candidate: match", "worktree: match", "sqlite: ready", "native-host: match", "runtime-binding: match", "receipt: match", "active-lock: held", "restart: observed", "cancellation: observed", "stale-recovery: observed", "result: ready"):
+                self.assertIn(value, rendered)
+            self.assertNotIn(str(state), rendered)
+
+            connection = sqlite3.connect(state / "native-host.sqlite3")
+            try:
+                with connection:
+                    connection.execute("UPDATE native_host_metadata SET value = ? WHERE key = 'candidate_sha'", ("b" * 40,))
+            finally:
+                connection.close()
+            output = io.StringIO()
+            self.assertEqual(_render_mounted_status(output, paths=paths, candidate="a" * 40, authoritative=True), 2)
+            self.assertEqual(output.getvalue(), "roundwright docker status\nresult: blocked\n")
     def test_mounted_authority_adapter_accepts_typed_canonical_fixture(self) -> None:
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,6 +211,11 @@ class DockerConsumerTests(unittest.TestCase):
             self.assertFalse(decision_for(runtime_drift).authorized)
             envelope = canonical_fixture_envelope("a" * 40, now=now)
             envelope["candidate_sha"] = "b" * 40
+            path.write_text(json.dumps(envelope), encoding="utf-8")
+            with self.assertRaises(DockerAuthorityAdapterError):
+                evaluate_mounted_authority(path, candidate_sha="a" * 40, now=now)
+            envelope = canonical_fixture_envelope("a" * 40, now=now)
+            envelope["mounts"]["runtime_environment"]["XDG_STATE_HOME"] = "/unexpected"  # type: ignore[index]
             path.write_text(json.dumps(envelope), encoding="utf-8")
             with self.assertRaises(DockerAuthorityAdapterError):
                 evaluate_mounted_authority(path, candidate_sha="a" * 40, now=now)

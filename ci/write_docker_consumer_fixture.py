@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import argparse
 import json
 from pathlib import Path
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.docker_authority import canonical_fixture_envelope, canonical_native_host_installation
-from roundwright.native_host import NativeHostControlStore
+from roundwright.native_host import InvocationSource, NativeHostControlStore
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -35,6 +35,24 @@ def main() -> int:
     decision = NativeHostControlStore(arguments.state / "native-host.sqlite3").install(installation)
     if not decision.accepted:
         raise RuntimeError("native-host fixture state could not be initialized")
+    # Fixture setup may create deterministic persisted lifecycle history; the
+    # mounted image only observes it through the read-only adapter.
+    control_store = NativeHostControlStore(arguments.state / "native-host.sqlite3")
+    if not control_store.admit(installation, "fixture-restart", InvocationSource.ONE_SHOT, now=now).accepted:
+        raise RuntimeError("native-host restart fixture could not be initialized")
+    if not control_store.finish(installation, "fixture-restart", "completed", now=now).accepted:
+        raise RuntimeError("native-host restart fixture could not be completed")
+    if not control_store.admit(installation, "fixture-cancel", InvocationSource.ONE_SHOT, now=now).accepted:
+        raise RuntimeError("native-host cancellation fixture could not be initialized")
+    if not control_store.finish(installation, "fixture-cancel", "cancelled", now=now).accepted:
+        raise RuntimeError("native-host cancellation fixture could not be completed")
+    stale_at = now - timedelta(hours=1)
+    if not control_store.admit(installation, "fixture-stale", InvocationSource.SCHEDULER_WAKE, now=stale_at, lease_for=timedelta(seconds=1)).accepted:
+        raise RuntimeError("native-host stale fixture could not be initialized")
+    if not control_store.recover_stale(installation, "fixture-stale", now=now, stale_after=timedelta(minutes=1)).accepted:
+        raise RuntimeError("native-host stale fixture could not be recovered")
+    if not control_store.admit(installation, "fixture-active", InvocationSource.ONE_SHOT, now=now).accepted:
+        raise RuntimeError("native-host active-lock fixture could not be initialized")
     arguments.configuration.parent.mkdir(parents=True, exist_ok=True)
     binding = material["identity"]["runtime_binding"]
     authentication_identity = material["mounts"]["authentication_identity"]

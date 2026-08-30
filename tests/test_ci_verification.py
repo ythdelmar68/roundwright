@@ -128,6 +128,9 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE=read-only", workflow)
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE=test-only", workflow)
         self.assertIn('"$image" status', workflow)
+        self.assertIn('expect_status() {', workflow)
+        for status in ("candidate: match", "worktree: match", "sqlite: ready", "native-host: match", "runtime-binding: match", "active-lock: held", "restart: observed", "cancellation: observed", "stale-recovery: observed"):
+            self.assertIn(f'grep -F "{status}"', workflow)
         self.assertIn('"$image" run-once', workflow)
         self.assertIn('test "$exit_code" -eq 3', workflow)
         self.assertIn('git clone --no-local --no-checkout "$GITHUB_WORKSPACE" "$fixtures/repository"', workflow)

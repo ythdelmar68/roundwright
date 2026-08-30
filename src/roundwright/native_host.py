@@ -110,6 +110,21 @@ class NativeHostObservation:
 
 
 @dataclass(frozen=True)
+class NativeHostLifecycleObservation:
+    """Read-only lifecycle facts for a mounted native-host control store."""
+
+    installation: NativeHostObservation
+    active_lock: bool
+    completed_count: int
+    cancelled_count: int
+    recovered_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.installation) is not NativeHostObservation or any(type(value) is not int or value < 0 for value in (self.completed_count, self.cancelled_count, self.recovered_count)):
+            raise NativeHostError("native host lifecycle observation is invalid")
+
+
+@dataclass(frozen=True)
 class NativeHostPaths:
     """Platform-aware, public-safe locations used by a native-host wrapper.
 
@@ -295,6 +310,25 @@ class NativeHostControlStore:
                 raise NativeHostError("native host state metadata is invalid")
             return NativeHostObservation(
                 metadata["installation_fingerprint"], metadata["receipt_fingerprint"], metadata["candidate_sha"],
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise NativeHostError("native host state database is unavailable") from error
+
+    def observe_lifecycle(self) -> NativeHostLifecycleObservation:
+        """Return persisted lifecycle facts without acquiring a lock or mutating state."""
+
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+                if set(metadata) != {"installation_fingerprint", "receipt_fingerprint", "candidate_sha"}:
+                    raise NativeHostError("native host state metadata is invalid")
+                states = dict(connection.execute("SELECT state, COUNT(*) FROM native_host_process GROUP BY state"))
+            if set(states).difference({"running", "completed", "cancelled", "recovered"}):
+                raise NativeHostError("native host process state is invalid")
+            return NativeHostLifecycleObservation(
+                NativeHostObservation(metadata["installation_fingerprint"], metadata["receipt_fingerprint"], metadata["candidate_sha"]),
+                states.get("running", 0) > 0, states.get("completed", 0), states.get("cancelled", 0), states.get("recovered", 0),
             )
         except (OSError, ValueError, sqlite3.Error) as error:
             raise NativeHostError("native host state database is unavailable") from error

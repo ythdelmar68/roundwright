@@ -13,7 +13,7 @@ import zlib
 
 from .cli import main as cli_main
 from .docker_consumer import DockerConsumerContract, DockerMountCheck, DockerMountName, DockerMountStatus, DockerOperationMode, evaluate_docker_consumer, render_docker_consumer_diagnostics
-from .docker_authority import DockerAuthorityAdapterError, MountedAuthorityEvidence, evaluate_mounted_authority, load_mounted_authority
+from .docker_authority import DockerAuthorityAdapterError, MountedAuthorityEvidence, evaluate_mounted_authority, load_mounted_authority, runtime_environment_fingerprint
 from .native_host import NativeHostControlStore, NativeHostError
 from .runtime_binding import RuntimeBinding
 
@@ -169,6 +169,17 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
         # A wrong runtime path can otherwise make the CLI silently inspect a
         # container-local default instead of the host-owned fixtures.
         result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
+    elif authority is not None:
+        observed_environment = {name: environment[name] for name in _RUNTIME_ENVIRONMENT}
+        try:
+            if (
+                observed_environment != authority.runtime_environment
+                or runtime_environment_fingerprint(candidate, observed_environment)
+                != authority.native_host_installation.identity.environment_fingerprint
+            ):
+                result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
+        except DockerAuthorityAdapterError:
+            result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
     return result
 
 
@@ -251,6 +262,26 @@ def preflight(environment: Mapping[str, str], *, paths: Mapping[DockerMountName,
     ))
 
 
+def _render_mounted_status(output: object, *, paths: Mapping[DockerMountName, Path], candidate: str, authoritative: bool) -> int:
+    """Render path-free persisted control-store facts; this never acquires dispatch authority."""
+
+    try:
+        lifecycle = NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").observe_lifecycle()
+        if lifecycle.installation.candidate_sha != candidate:
+            raise NativeHostError("mounted native host candidate is mismatched")
+    except NativeHostError:
+        output.write("roundwright docker status\nresult: blocked\n")  # type: ignore[attr-defined]
+        return 2
+    output.write("roundwright docker status\n")  # type: ignore[attr-defined]
+    output.write("candidate: match\nworktree: match\nsqlite: ready\nnative-host: match\nruntime-binding: match\n")  # type: ignore[attr-defined]
+    output.write(f"receipt: {'match' if authoritative else 'not-applicable'}\n")  # type: ignore[attr-defined]
+    output.write(f"active-lock: {'held' if lifecycle.active_lock else 'clear'}\n")  # type: ignore[attr-defined]
+    output.write(f"restart: {'observed' if lifecycle.completed_count else 'none'}\n")  # type: ignore[attr-defined]
+    output.write(f"cancellation: {'observed' if lifecycle.cancelled_count else 'none'}\n")  # type: ignore[attr-defined]
+    output.write(f"stale-recovery: {'observed' if lifecycle.recovered_count else 'none'}\nresult: ready\n")  # type: ignore[attr-defined]
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = __import__("sys").argv[1:]
@@ -258,6 +289,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     render_docker_consumer_diagnostics(report, __import__("sys").stdout)
     if not report.ready:
         return report.exit_code
+    if list(argv) == ["status"]:
+        return _render_mounted_status(
+            __import__("sys").stdout, paths=_PATHS, candidate=os.environ["ROUNDWRIGHT_DOCKER_CANDIDATE_SHA"],
+            authoritative=os.environ["ROUNDWRIGHT_DOCKER_MODE"] == DockerOperationMode.AUTHORITATIVE.value,
+        )
     if not argv or list(argv) == ["doctor"]:
         return 0
     # The installed CLI must resolve the same mounted repository and XDG

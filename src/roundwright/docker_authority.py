@@ -23,6 +23,19 @@ class DockerAuthorityAdapterError(ValueError):
     pass
 
 
+_RUNTIME_ENVIRONMENT_KEYS = ("ROUNDWRIGHT_REPOSITORY_ROOT", "XDG_CONFIG_HOME", "XDG_STATE_HOME")
+
+
+def runtime_environment_fingerprint(candidate_sha: str, environment: dict[str, str]) -> str:
+    """Bind the mounted runtime paths to the candidate without exposing paths in diagnostics."""
+
+    if type(candidate_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
+        raise DockerAuthorityAdapterError("mounted runtime candidate is invalid")
+    if type(environment) is not dict or set(environment) != set(_RUNTIME_ENVIRONMENT_KEYS) or any(type(value) is not str or not value.startswith("/") for value in environment.values()):
+        raise DockerAuthorityAdapterError("mounted runtime environment is invalid")
+    return hashlib.sha256(json.dumps({"candidate_sha": candidate_sha, "environment": environment}, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class MountedAuthorityEvidence:
     """Strictly parsed, host-owned evidence consumed by the Docker adapter."""
@@ -33,12 +46,14 @@ class MountedAuthorityEvidence:
     verification: AuthorityReceiptVerification
     native_host_installation: NativeHostInstallation
     authentication_identity: str
+    runtime_environment: dict[str, str]
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha):
             raise DockerAuthorityAdapterError("mounted authority candidate is invalid")
         if not re.fullmatch(r"[0-9a-f]{64}", self.authentication_identity):
             raise DockerAuthorityAdapterError("mounted authentication identity is invalid")
+        runtime_environment_fingerprint(self.candidate_sha, self.runtime_environment)
 
 
 def _fixture_fingerprint(candidate_sha: str, label: str) -> str:
@@ -97,6 +112,11 @@ def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str
         identity.repository_fingerprint, identity.state_id,
         identity.deployment_fingerprint, AuthorityReceiptStatus.FRESH, binding,
     )
+    runtime_environment = {
+        "ROUNDWRIGHT_REPOSITORY_ROOT": "/workspace",
+        "XDG_CONFIG_HOME": "/etc",
+        "XDG_STATE_HOME": "/var/lib",
+    }
     native_host = canonical_native_host_installation(candidate_sha, now=issued_at)
     return {
         "candidate_sha": candidate_sha,
@@ -143,6 +163,7 @@ def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str
         },
         "mounts": {
             "authentication_identity": _fixture_fingerprint(candidate_sha, "authentication"),
+            "runtime_environment": runtime_environment,
         },
     }
 
@@ -161,7 +182,11 @@ def canonical_native_host_installation(candidate_sha: str, *, now: datetime) -> 
         _fixture_fingerprint(candidate_sha, "state"),
         uuid5(NAMESPACE_URL, "roundwright-docker-fixture:" + candidate_sha),
         _fixture_fingerprint(candidate_sha, "deployment"), candidate_sha,
-        _fixture_fingerprint(candidate_sha, "environment"), binding,
+        runtime_environment_fingerprint(candidate_sha, {
+            "ROUNDWRIGHT_REPOSITORY_ROOT": "/workspace",
+            "XDG_CONFIG_HOME": "/etc",
+            "XDG_STATE_HOME": "/var/lib",
+        }), binding,
     )
     issued_at = now.replace(microsecond=0)
     receipt = DeploymentAuthorityHandoffReceipt(
@@ -225,12 +250,17 @@ def load_mounted_authority(path: Path, *, candidate_sha: str) -> MountedAuthorit
             datetime.fromisoformat(native_receipt_data["issued_at"]), datetime.fromisoformat(native_receipt_data["expires_at"]),
         )
         mounts = payload["mounts"]
-        if type(mounts) is not dict or set(mounts) != {"authentication_identity"}:
+        if type(mounts) is not dict or set(mounts) != {"authentication_identity", "runtime_environment"}:
+            raise ValueError
+        runtime_environment = mounts["runtime_environment"]
+        if type(runtime_environment) is not dict or set(runtime_environment) != set(_RUNTIME_ENVIRONMENT_KEYS) or any(type(value) is not str for value in runtime_environment.values()):
+            raise ValueError
+        if native_identity.environment_fingerprint != runtime_environment_fingerprint(candidate_sha, runtime_environment):
             raise ValueError
         return MountedAuthorityEvidence(
             candidate_sha, identity, receipt, verification,
             NativeHostInstallation(native_host_data["installation_fingerprint"], native_identity, native_receipt),
-            mounts["authentication_identity"],
+            mounts["authentication_identity"], runtime_environment,
         )
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
         raise DockerAuthorityAdapterError("mounted authority evidence is invalid") from error

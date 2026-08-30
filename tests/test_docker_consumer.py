@@ -27,7 +27,7 @@ from roundwright.docker_consumer import (
     render_docker_consumer_diagnostics,
 )
 from roundwright.docker_entrypoint import preflight
-from roundwright.docker_authority import DockerAuthorityAdapterError, evaluate_mounted_authority
+from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority
 from roundwright.cli import main
 
 
@@ -40,6 +40,14 @@ def mounts(status: DockerMountStatus = DockerMountStatus.READY, *, authority: Do
 
 
 class DockerConsumerTests(unittest.TestCase):
+    def test_mounted_authority_adapter_accepts_typed_canonical_fixture(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "authority.json"
+            path.write_text(json.dumps(canonical_fixture_envelope("a" * 40, now=now), sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            decision = evaluate_mounted_authority(path, candidate_sha="a" * 40, now=now)
+        self.assertTrue(decision.authorized)
+
     def test_mounted_authority_adapter_rejects_missing_or_malformed_material(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "authority.json"

@@ -89,11 +89,13 @@ def preflight(environment: Mapping[str, str], *, paths: Mapping[DockerMountName,
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None:
+        argv = __import__("sys").argv[1:]
     report = preflight(os.environ)
     render_docker_consumer_diagnostics(report, __import__("sys").stdout)
     if not report.ready:
         return report.exit_code
-    if argv is None or not argv or list(argv) == ["doctor"]:
+    if not argv or list(argv) == ["doctor"]:
         return 0
     return cli_main(argv)
 

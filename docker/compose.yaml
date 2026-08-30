@@ -20,11 +20,11 @@ services:
       ROUNDWRIGHT_DOCKER_CANDIDATE_SHA: ${ROUNDWRIGHT_DOCKER_CANDIDATE_SHA:?set the exact candidate sha}
       ROUNDWRIGHT_DOCKER_PACKAGE_SHA256: ${ROUNDWRIGHT_WHEEL_SHA256:?set the exact wheel sha256 digest}
       ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST: sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
-      ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256: ${ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256:?set the authoritative receipt sha256 digest}
+      ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256: ${ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256:-}
     command: ["doctor"]
     volumes:
       - ${ROUNDWRIGHT_REPOSITORY:?set the canonical repository}:/workspace:ro
-      - ${ROUNDWRIGHT_STATE:?set the authoritative state directory}:/var/lib/roundwright:rw
+      - ${ROUNDWRIGHT_STATE:?set the authoritative state directory}:/var/lib/roundwright:${ROUNDWRIGHT_STATE_MOUNT_MODE:?set ro for read-only/test-only or rw for authoritative}
       - ${ROUNDWRIGHT_CONFIGURATION:?set the typed configuration file}:/etc/roundwright/config.toml:ro
       - ${ROUNDWRIGHT_AUTHENTICATION:?set the operator-provided authentication file}:/run/roundwright/auth.toml:ro
-      - ${ROUNDWRIGHT_AUTHORITY_RECEIPT:?set the external authority receipt}:/run/roundwright/authority-receipt.json:ro
+      - ${ROUNDWRIGHT_AUTHORITY_RECEIPT:-/dev/null}:/run/roundwright/authority-receipt.json:ro

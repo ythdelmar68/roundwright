@@ -120,7 +120,7 @@ class DockerConsumerTests(unittest.TestCase):
         compose = (ROOT / "docker" / "compose.yaml").read_text(encoding="utf-8")
         for target in (
             "/workspace:ro",
-            "/var/lib/roundwright:rw",
+            "/var/lib/roundwright:${ROUNDWRIGHT_STATE_MOUNT_MODE",
             "/etc/roundwright/config.toml:ro",
             "/run/roundwright/auth.toml:ro",
             "/run/roundwright/authority-receipt.json:ro",
@@ -130,6 +130,7 @@ class DockerConsumerTests(unittest.TestCase):
         self.assertIn("read_only: true", compose)
         self.assertNotIn("image: ghcr.io", compose)
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE", compose)
+        self.assertIn("${ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256:-}", compose)
 
     def test_entrypoint_observes_real_mounts_and_identity_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -101,6 +101,8 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("docker image inspect --format '{{.Id}}'", workflow)
         self.assertIn("/workspace:ro", workflow)
         self.assertIn("/var/lib/roundwright:rw", workflow)
+        self.assertIn('sudo chown 65532:65532 "$fixtures/state"', workflow)
+        self.assertIn('chmod 0750 "$fixtures/state"', workflow)
         self.assertIn('common=(--network=none --read-only --tmpfs /tmp', workflow)
         self.assertIn('docker run --rm "${common[@]}"', workflow)
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE=authoritative", workflow)

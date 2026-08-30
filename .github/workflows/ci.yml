@@ -122,6 +122,8 @@ jobs:
           base="${{ steps.docker-inputs.outputs.base_image_digest }}"
           fixtures="$RUNNER_TEMP/roundwright-docker-fixtures"
           mkdir -p "$fixtures/repository" "$fixtures/state" "$fixtures/etc" "$fixtures/run"
+          sudo chown 65532:65532 "$fixtures/state"
+          chmod 0750 "$fixtures/state"
           printf '{}\n' > "$fixtures/etc/config.toml"
           printf '{}\n' > "$fixtures/run/auth.toml"
           printf '{"candidate_sha":"${{ github.sha }}"}\n' > "$fixtures/run/authority-receipt.json"

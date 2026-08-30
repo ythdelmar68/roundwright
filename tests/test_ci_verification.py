@@ -110,6 +110,8 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE=authoritative", workflow)
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE=read-only", workflow)
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE=test-only", workflow)
+        self.assertIn('git -C "$fixtures/repository" init -q', workflow)
+        self.assertIn('git -C "$fixtures/repository" branch -M "candidate-$CANDIDATE_SHA"', workflow)
         self.assertIn("roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("docker push", workflow)
 

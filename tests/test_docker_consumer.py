@@ -28,6 +28,8 @@ from roundwright.docker_consumer import (
 )
 from roundwright.docker_entrypoint import preflight
 from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority
+from roundwright.docker_authority import canonical_native_host_installation
+from roundwright.native_host import InvocationSource, NativeHostControlStore
 from roundwright.cli import main
 
 
@@ -40,6 +42,16 @@ def mounts(status: DockerMountStatus = DockerMountStatus.READY, *, authority: Do
 
 
 class DockerConsumerTests(unittest.TestCase):
+    def test_typed_native_host_fixture_initializes_sqlite_and_enforces_one_active_lock(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            control_store = NativeHostControlStore(Path(temporary) / "native-host.sqlite3")
+            installation = canonical_native_host_installation("a" * 40, now=now)
+            self.assertTrue(control_store.install(installation).accepted)
+            self.assertTrue(control_store.admit(installation, "fixture-one", InvocationSource.ONE_SHOT, now=now).accepted)
+            self.assertFalse(control_store.admit(installation, "fixture-two", InvocationSource.SCHEDULER_WAKE, now=now).accepted)
+            self.assertTrue(control_store.finish(installation, "fixture-one", "completed", now=now).accepted)
+            self.assertTrue(control_store.admit(installation, "fixture-two", InvocationSource.SCHEDULER_WAKE, now=now).accepted)
     def test_mounted_authority_adapter_accepts_typed_canonical_fixture(self) -> None:
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as temporary:

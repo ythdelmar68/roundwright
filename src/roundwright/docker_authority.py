@@ -13,11 +13,35 @@ from .deployment import (
     AuthorityReceiptStatus, AuthorityReceiptVerification, DeploymentAuthorityReceipt,
     DeploymentIdentity, DeploymentMode, evaluate_deployment_authority,
 )
+from .deployment_handoff import DeploymentAuthorityHandoffReceipt, DeploymentAuthorityIdentity
+from .native_host import NativeHostInstallation
 from .runtime_binding import RuntimeBinding
 
 
 class DockerAuthorityAdapterError(ValueError):
     pass
+
+
+def _fixture_fingerprint(candidate_sha: str, label: str) -> str:
+    return hashlib.sha256(f"roundwright-docker-fixture:{label}:{candidate_sha}".encode("utf-8")).hexdigest()
+
+
+def _fixture_runtime_binding(candidate_sha: str) -> RuntimeBinding:
+    review_policy = {
+        "complete_rounds": 1,
+        "max_rounds": 3,
+        "max_supervisor_attempts_per_round": 1,
+        "on_final_findings": "worker-final-repair-then-merge",
+    }
+    return RuntimeBinding(
+        "roundwright-runtime/v1",
+        "sha256:" + _fixture_fingerprint(candidate_sha, "runtime"),
+        "sha256:" + _fixture_fingerprint(candidate_sha, "worker"),
+        ("sha256:" + _fixture_fingerprint(candidate_sha, "supervisor"),),
+        review_policy["complete_rounds"], review_policy["max_rounds"],
+        review_policy["max_supervisor_attempts_per_round"], review_policy["on_final_findings"],
+        hashlib.sha256(json.dumps(review_policy, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+    )
 
 
 def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str, object]:
@@ -34,32 +58,15 @@ def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str
     if type(now) is not datetime or now.tzinfo is not timezone.utc or now.utcoffset() is None:
         raise DockerAuthorityAdapterError("mounted authority fixture time is invalid")
 
-    def fingerprint(label: str) -> str:
-        return hashlib.sha256(f"roundwright-docker-fixture:{label}:{candidate_sha}".encode("utf-8")).hexdigest()
-
-    review_policy = {
-        "complete_rounds": 1,
-        "max_rounds": 3,
-        "max_supervisor_attempts_per_round": 1,
-        "on_final_findings": "worker-final-repair-then-merge",
-    }
-    binding = RuntimeBinding(
-        "roundwright-runtime/v1",
-        "sha256:" + fingerprint("runtime"),
-        "sha256:" + fingerprint("worker"),
-        ("sha256:" + fingerprint("supervisor"),),
-        review_policy["complete_rounds"], review_policy["max_rounds"],
-        review_policy["max_supervisor_attempts_per_round"], review_policy["on_final_findings"],
-        hashlib.sha256(json.dumps(review_policy, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
-    )
+    binding = _fixture_runtime_binding(candidate_sha)
     identity = DeploymentIdentity(
-        fingerprint("repository"), fingerprint("checkout"), fingerprint("state"),
+        _fixture_fingerprint(candidate_sha, "repository"), _fixture_fingerprint(candidate_sha, "checkout"), _fixture_fingerprint(candidate_sha, "state"),
         uuid5(NAMESPACE_URL, "roundwright-docker-fixture:" + candidate_sha),
-        fingerprint("deployment"), binding,
+        _fixture_fingerprint(candidate_sha, "deployment"), binding,
     )
     issued_at = now.replace(microsecond=0)
     receipt = DeploymentAuthorityReceipt(
-        fingerprint("receipt"), identity, DeploymentMode.AUTHORITATIVE,
+        _fixture_fingerprint(candidate_sha, "receipt"), identity, DeploymentMode.AUTHORITATIVE,
         issued_at, issued_at + timedelta(minutes=15),
     )
     # This is the canonical typed receipt-binding identity computed by the
@@ -97,6 +104,30 @@ def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str
             "runtime_binding": verification.runtime_binding.canonical_material(),
         },
     }
+
+
+def canonical_native_host_installation(candidate_sha: str, *, now: datetime) -> NativeHostInstallation:
+    """Construct a handoff-bound native-host installation for disposable CI state."""
+
+    if type(candidate_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
+        raise DockerAuthorityAdapterError("mounted native-host fixture candidate is invalid")
+    if type(now) is not datetime or now.tzinfo is not timezone.utc or now.utcoffset() is None:
+        raise DockerAuthorityAdapterError("mounted native-host fixture time is invalid")
+    binding = _fixture_runtime_binding(candidate_sha)
+    identity = DeploymentAuthorityIdentity(
+        _fixture_fingerprint(candidate_sha, "repository"),
+        _fixture_fingerprint(candidate_sha, "checkout"),
+        _fixture_fingerprint(candidate_sha, "state"),
+        uuid5(NAMESPACE_URL, "roundwright-docker-fixture:" + candidate_sha),
+        _fixture_fingerprint(candidate_sha, "deployment"), candidate_sha,
+        _fixture_fingerprint(candidate_sha, "environment"), binding,
+    )
+    issued_at = now.replace(microsecond=0)
+    receipt = DeploymentAuthorityHandoffReceipt(
+        _fixture_fingerprint(candidate_sha, "native-host-receipt"), identity,
+        issued_at, issued_at + timedelta(minutes=15),
+    )
+    return NativeHostInstallation(_fixture_fingerprint(candidate_sha, "native-host-installation"), identity, receipt)
 
 
 def evaluate_mounted_authority(path: Path, *, candidate_sha: str, now: datetime):

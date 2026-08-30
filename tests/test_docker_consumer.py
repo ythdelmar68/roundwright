@@ -130,7 +130,7 @@ class DockerConsumerTests(unittest.TestCase):
         self.assertIn("read_only: true", compose)
         self.assertNotIn("image: ghcr.io", compose)
         self.assertIn("ROUNDWRIGHT_DOCKER_MODE", compose)
-        self.assertIn("${ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256:-}", compose)
+        self.assertIn("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256:", compose)
 
     def test_entrypoint_observes_real_mounts_and_identity_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

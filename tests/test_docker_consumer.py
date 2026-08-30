@@ -171,3 +171,31 @@ class DockerConsumerTests(unittest.TestCase):
             report = preflight(environment, paths=paths, identity_path=identity)
             self.assertFalse(report.ready)
             self.assertEqual(report.candidate, DockerIdentityStatus.MISMATCH)
+
+    def test_entrypoint_accepts_typed_authoritative_mounted_evidence(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            for name in (DockerMountName.CONFIGURATION, DockerMountName.AUTHENTICATION):
+                paths[name].write_text("{}\n", encoding="utf-8")
+            paths[DockerMountName.AUTHORITY_RECEIPT].write_text(
+                json.dumps(canonical_fixture_envelope("a" * 40, now=now), sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            identity = root / "identity.json"
+            identity.write_text(
+                json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}),
+                encoding="utf-8",
+            )
+            receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt_sha,
+            }
+            self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)

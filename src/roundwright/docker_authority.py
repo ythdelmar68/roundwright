@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, NAMESPACE_URL, uuid5
 
@@ -20,6 +21,24 @@ from .runtime_binding import RuntimeBinding
 
 class DockerAuthorityAdapterError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class MountedAuthorityEvidence:
+    """Strictly parsed, host-owned evidence consumed by the Docker adapter."""
+
+    candidate_sha: str
+    identity: DeploymentIdentity
+    receipt: DeploymentAuthorityReceipt
+    verification: AuthorityReceiptVerification
+    native_host_installation: NativeHostInstallation
+    authentication_identity: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha):
+            raise DockerAuthorityAdapterError("mounted authority candidate is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.authentication_identity):
+            raise DockerAuthorityAdapterError("mounted authentication identity is invalid")
 
 
 def _fixture_fingerprint(candidate_sha: str, label: str) -> str:
@@ -78,6 +97,7 @@ def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str
         identity.repository_fingerprint, identity.state_id,
         identity.deployment_fingerprint, AuthorityReceiptStatus.FRESH, binding,
     )
+    native_host = canonical_native_host_installation(candidate_sha, now=issued_at)
     return {
         "candidate_sha": candidate_sha,
         "identity": {
@@ -102,6 +122,27 @@ def canonical_fixture_envelope(candidate_sha: str, *, now: datetime) -> dict[str
             "authoritative_deployment_fingerprint": verification.authoritative_deployment_fingerprint,
             "status": verification.status.value,
             "runtime_binding": verification.runtime_binding.canonical_material(),
+        },
+        "native_host": {
+            "installation_fingerprint": native_host.installation_fingerprint,
+            "identity": {
+                "repository_fingerprint": native_host.identity.repository_fingerprint,
+                "canonical_checkout_fingerprint": native_host.identity.canonical_checkout_fingerprint,
+                "state_store_fingerprint": native_host.identity.state_store_fingerprint,
+                "state_id": str(native_host.identity.state_id),
+                "deployment_fingerprint": native_host.identity.deployment_fingerprint,
+                "candidate_sha": native_host.identity.candidate_sha,
+                "environment_fingerprint": native_host.identity.environment_fingerprint,
+                "runtime_binding": native_host.identity.runtime_binding.canonical_material(),
+            },
+            "receipt": {
+                "receipt_fingerprint": native_host.receipt.receipt_fingerprint,
+                "issued_at": native_host.receipt.issued_at.isoformat(),
+                "expires_at": native_host.receipt.expires_at.isoformat(),
+            },
+        },
+        "mounts": {
+            "authentication_identity": _fixture_fingerprint(candidate_sha, "authentication"),
         },
     }
 
@@ -130,13 +171,13 @@ def canonical_native_host_installation(candidate_sha: str, *, now: datetime) -> 
     return NativeHostInstallation(_fixture_fingerprint(candidate_sha, "native-host-installation"), identity, receipt)
 
 
-def evaluate_mounted_authority(path: Path, *, candidate_sha: str, now: datetime):
-    """Parse one canonical public-safe envelope and delegate typed evaluation."""
+def load_mounted_authority(path: Path, *, candidate_sha: str) -> MountedAuthorityEvidence:
+    """Parse mounted typed authority and native-host material without trusting fixtures."""
     try:
         if type(candidate_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
             raise ValueError
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if type(payload) is not dict or set(payload) != {"candidate_sha", "identity", "receipt", "verification"} or payload["candidate_sha"] != candidate_sha:
+        if type(payload) is not dict or set(payload) != {"candidate_sha", "identity", "receipt", "verification", "native_host", "mounts"} or payload["candidate_sha"] != candidate_sha:
             raise ValueError
         identity_data = payload["identity"]
         receipt_data = payload["receipt"]
@@ -160,6 +201,46 @@ def evaluate_mounted_authority(path: Path, *, candidate_sha: str, now: datetime)
             verification_data["authoritative_deployment_fingerprint"], AuthorityReceiptStatus(verification_data["status"]),
             RuntimeBinding.from_canonical(verification_data["runtime_binding"]),
         )
-        return evaluate_deployment_authority(identity, receipt, verification, mode=DeploymentMode.AUTHORITATIVE, now=now)
+        native_host_data = payload["native_host"]
+        if type(native_host_data) is not dict or set(native_host_data) != {"installation_fingerprint", "identity", "receipt"}:
+            raise ValueError
+        native_identity_data = native_host_data["identity"]
+        required_native_identity = {
+            "repository_fingerprint", "canonical_checkout_fingerprint", "state_store_fingerprint", "state_id",
+            "deployment_fingerprint", "candidate_sha", "environment_fingerprint", "runtime_binding",
+        }
+        if type(native_identity_data) is not dict or set(native_identity_data) != required_native_identity:
+            raise ValueError
+        native_identity = DeploymentAuthorityIdentity(
+            native_identity_data["repository_fingerprint"], native_identity_data["canonical_checkout_fingerprint"],
+            native_identity_data["state_store_fingerprint"], UUID(native_identity_data["state_id"]),
+            native_identity_data["deployment_fingerprint"], native_identity_data["candidate_sha"],
+            native_identity_data["environment_fingerprint"], RuntimeBinding.from_canonical(native_identity_data["runtime_binding"]),
+        )
+        native_receipt_data = native_host_data["receipt"]
+        if type(native_receipt_data) is not dict or set(native_receipt_data) != {"receipt_fingerprint", "issued_at", "expires_at"}:
+            raise ValueError
+        native_receipt = DeploymentAuthorityHandoffReceipt(
+            native_receipt_data["receipt_fingerprint"], native_identity,
+            datetime.fromisoformat(native_receipt_data["issued_at"]), datetime.fromisoformat(native_receipt_data["expires_at"]),
+        )
+        mounts = payload["mounts"]
+        if type(mounts) is not dict or set(mounts) != {"authentication_identity"}:
+            raise ValueError
+        return MountedAuthorityEvidence(
+            candidate_sha, identity, receipt, verification,
+            NativeHostInstallation(native_host_data["installation_fingerprint"], native_identity, native_receipt),
+            mounts["authentication_identity"],
+        )
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
         raise DockerAuthorityAdapterError("mounted authority evidence is invalid") from error
+
+
+def evaluate_mounted_authority(path: Path, *, candidate_sha: str, now: datetime):
+    """Delegate strict mounted evidence through the normative authority evaluator."""
+
+    material = load_mounted_authority(path, candidate_sha=candidate_sha)
+    return evaluate_deployment_authority(
+        material.identity, material.receipt, material.verification,
+        mode=DeploymentMode.AUTHORITATIVE, now=now,
+    )

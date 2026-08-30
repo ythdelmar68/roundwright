@@ -95,6 +95,21 @@ class NativeHostDecision:
 
 
 @dataclass(frozen=True)
+class NativeHostObservation:
+    """Read-only, public-safe metadata observed from a mounted control store."""
+
+    installation_fingerprint: str
+    receipt_fingerprint: str
+    candidate_sha: str
+
+    def __post_init__(self) -> None:
+        _require_fingerprint(self.installation_fingerprint, "observed native host installation")
+        _require_fingerprint(self.receipt_fingerprint, "observed native host receipt")
+        if type(self.candidate_sha) is not str or not _COMMIT.fullmatch(self.candidate_sha):
+            raise NativeHostError("observed native host candidate SHA is invalid")
+
+
+@dataclass(frozen=True)
 class NativeHostPaths:
     """Platform-aware, public-safe locations used by a native-host wrapper.
 
@@ -268,6 +283,21 @@ class NativeHostControlStore:
         except (OSError, ValueError, sqlite3.Error):
             return self._denied(installation, "native host state database is unavailable")
         return self._accepted(installation, "native host installation verified")
+
+    def observe(self) -> NativeHostObservation:
+        """Read mounted installation metadata without manufacturing lifecycle state."""
+
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+            if set(metadata) != {"installation_fingerprint", "receipt_fingerprint", "candidate_sha"}:
+                raise NativeHostError("native host state metadata is invalid")
+            return NativeHostObservation(
+                metadata["installation_fingerprint"], metadata["receipt_fingerprint"], metadata["candidate_sha"],
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise NativeHostError("native host state database is unavailable") from error
 
     def admit(self, installation: NativeHostInstallation, process_id: str, source: InvocationSource, *, now: datetime, lease_for: timedelta = _DEFAULT_PROCESS_LEASE) -> NativeHostDecision:
         if type(lease_for) is not timedelta or lease_for <= timedelta():

@@ -13,8 +13,9 @@ import zlib
 
 from .cli import main as cli_main
 from .docker_consumer import DockerConsumerContract, DockerMountCheck, DockerMountName, DockerMountStatus, DockerOperationMode, evaluate_docker_consumer, render_docker_consumer_diagnostics
-from .docker_authority import DockerAuthorityAdapterError, canonical_native_host_installation, evaluate_mounted_authority
+from .docker_authority import DockerAuthorityAdapterError, MountedAuthorityEvidence, evaluate_mounted_authority, load_mounted_authority
 from .native_host import NativeHostControlStore, NativeHostError
+from .runtime_binding import RuntimeBinding
 
 
 _PATHS = {
@@ -99,7 +100,7 @@ def _authority_issued_at(path: Path) -> datetime | None:
     return timestamp if timestamp.tzinfo is timezone.utc else None
 
 
-def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str], paths: Mapping[DockerMountName, Path], candidate: str, *, authority_issued_at: datetime | None) -> dict[DockerMountName, DockerMountStatus]:
+def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str], paths: Mapping[DockerMountName, Path], candidate: str, *, authority: MountedAuthorityEvidence | None) -> dict[DockerMountName, DockerMountStatus]:
     """Validate host-owned mounted material before the package can dispatch."""
 
     result: dict[DockerMountName, DockerMountStatus] = {}
@@ -110,14 +111,22 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
         result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
     try:
         configuration = tomllib.loads(paths[DockerMountName.CONFIGURATION].read_text(encoding="utf-8"))
-        if configuration.get("runtime", {}).get("schema_version") != 1:
+        runtime = configuration.get("runtime")
+        if type(runtime) is not dict or set(runtime) != {"candidate_sha", "binding"} or runtime["candidate_sha"] != candidate:
             raise ValueError
+        binding = RuntimeBinding.from_canonical(runtime["binding"])
+        if authority is not None:
+            authority.identity.runtime_binding.require_matches(binding)
     except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
         result[DockerMountName.CONFIGURATION] = DockerMountStatus.EVIDENCE_MISMATCH
     try:
-        if not paths[DockerMountName.AUTHENTICATION].read_text(encoding="utf-8").strip():
+        authentication = tomllib.loads(paths[DockerMountName.AUTHENTICATION].read_text(encoding="utf-8"))
+        operator = authentication.get("operator")
+        if type(operator) is not dict or set(operator) != {"candidate_sha", "identity"} or operator["candidate_sha"] != candidate or type(operator["identity"]) is not str or len(operator["identity"]) != 64 or any(value not in "0123456789abcdef" for value in operator["identity"]):
             raise ValueError
-    except (OSError, ValueError, UnicodeDecodeError):
+        if authority is not None and operator["identity"] != authority.authentication_identity:
+            raise ValueError
+    except (OSError, TypeError, ValueError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         result[DockerMountName.AUTHENTICATION] = DockerMountStatus.EVIDENCE_MISMATCH
     database = paths[DockerMountName.STATE] / "native-host.sqlite3"
     state_valid = False
@@ -130,14 +139,25 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
             # blocked preflight, rather than leaking a SQLite permission
             # exception from a file it is not allowed to inspect.
             result[DockerMountName.STATE] = DockerMountStatus.OWNERSHIP_MISMATCH
-        elif mode is DockerOperationMode.AUTHORITATIVE and authority_issued_at is not None:
-            state_valid = NativeHostControlStore(database).verify(
-                canonical_native_host_installation(candidate, now=authority_issued_at)
-            ).accepted
         else:
-            # Non-authoritative modes can inspect the existing state but
-            # cannot use or synthesize an authority receipt to validate it.
-            state_valid = True
+            observation = NativeHostControlStore(database).observe()
+            state_valid = observation.candidate_sha == candidate
+            if authority is not None:
+                installation = authority.native_host_installation
+                installation.identity.runtime_binding.require_matches(authority.identity.runtime_binding)
+                if (
+                    installation.identity.candidate_sha != candidate
+                    or installation.identity.repository_fingerprint != authority.identity.repository_fingerprint
+                    or installation.identity.canonical_checkout_fingerprint != authority.identity.canonical_checkout_fingerprint
+                    or installation.identity.state_store_fingerprint != authority.identity.state_fingerprint
+                    or installation.identity.state_id != authority.identity.state_id
+                    or installation.identity.deployment_fingerprint != authority.identity.deployment_fingerprint
+                    or observation.installation_fingerprint != installation.installation_fingerprint
+                    or observation.receipt_fingerprint != installation.receipt.receipt_fingerprint
+                ):
+                    state_valid = False
+                else:
+                    state_valid = NativeHostControlStore(database).verify(installation).accepted
     except (NativeHostError, OSError, ValueError):
         # Corrupt or unreadable mounted state is untrusted input.  It must
         # produce ordinary fail-closed preflight evidence, never an unhandled
@@ -216,8 +236,13 @@ def preflight(environment: Mapping[str, str], *, paths: Mapping[DockerMountName,
             authority = None
         if authority is None or not authority.authorized:
             expected_receipt = None
-    authority_issued_at = _authority_issued_at(receipt_path) if expected_receipt is not None else None
-    evidence = _runtime_evidence(mode, environment, paths, candidate, authority_issued_at=authority_issued_at)
+    mounted_authority = None
+    if mode is DockerOperationMode.AUTHORITATIVE and expected_receipt is not None:
+        try:
+            mounted_authority = load_mounted_authority(receipt_path, candidate_sha=candidate)
+        except DockerAuthorityAdapterError:
+            expected_receipt = None
+    evidence = _runtime_evidence(mode, environment, paths, candidate, authority=mounted_authority)
     observed_candidate = _checkout_candidate(paths[DockerMountName.REPOSITORY])
     return evaluate_docker_consumer(DockerConsumerContract(
         mode, candidate, observed_candidate, package, observed.get("package_digest"), base,

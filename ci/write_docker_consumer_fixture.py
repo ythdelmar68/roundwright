@@ -36,9 +36,21 @@ def main() -> int:
     if not decision.accepted:
         raise RuntimeError("native-host fixture state could not be initialized")
     arguments.configuration.parent.mkdir(parents=True, exist_ok=True)
-    arguments.configuration.write_text("[runtime]\nschema_version = 1\n", encoding="utf-8")
+    binding = material["identity"]["runtime_binding"]
+    authentication_identity = material["mounts"]["authentication_identity"]
+    arguments.configuration.write_text(
+        "[runtime]\n"
+        f"candidate_sha = {json.dumps(arguments.candidate)}\n"
+        f"binding = {json.dumps(binding)}\n",
+        encoding="utf-8",
+    )
     arguments.authentication.parent.mkdir(parents=True, exist_ok=True)
-    arguments.authentication.write_text("# operator-provided authentication fixture; no credential material\n", encoding="utf-8")
+    arguments.authentication.write_text(
+        "[operator]\n"
+        f"candidate_sha = {json.dumps(arguments.candidate)}\n"
+        f"identity = {json.dumps(authentication_identity)}\n",
+        encoding="utf-8",
+    )
     arguments.output.write_text(
         json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n",
         encoding="utf-8",

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -66,6 +67,31 @@ def write_self_contained_checkout(repository: Path, *, body: bytes | None = None
     object_path.write_bytes(zlib.compress(raw))
     (git_directory / "HEAD").write_text(candidate + "\n", encoding="ascii")
     return candidate
+
+
+def write_typed_mounted_evidence(paths: dict[DockerMountName, Path], candidate: str, *, now: datetime) -> dict[str, object]:
+    """Create disposable typed inputs; production must only parse them."""
+
+    material = canonical_fixture_envelope(candidate, now=now)
+    paths[DockerMountName.CONFIGURATION].write_text(
+        "[runtime]\n"
+        f"candidate_sha = {json.dumps(candidate)}\n"
+        f"binding = {json.dumps(material['identity']['runtime_binding'])}\n",
+        encoding="utf-8",
+    )
+    paths[DockerMountName.AUTHENTICATION].write_text(
+        "[operator]\n"
+        f"candidate_sha = {json.dumps(candidate)}\n"
+        f"identity = {json.dumps(material['mounts']['authentication_identity'])}\n",
+        encoding="utf-8",
+    )
+    paths[DockerMountName.AUTHORITY_RECEIPT].write_text(
+        json.dumps(material, sort_keys=True, separators=(",", ":")), encoding="utf-8",
+    )
+    assert NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").install(
+        canonical_native_host_installation(candidate, now=now)
+    ).accepted
+    return material
 
 
 class DockerConsumerTests(unittest.TestCase):
@@ -317,6 +343,8 @@ class DockerConsumerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            write_typed_mounted_evidence(paths, "a" * 40, now=now)
+            receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
             self.assertTrue(NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").install(canonical_native_host_installation("a" * 40, now=now)).accepted)
             environment = {
                 "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
@@ -332,11 +360,48 @@ class DockerConsumerTests(unittest.TestCase):
                 return path is paths[DockerMountName.STATE]
 
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
-                self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+                report = preflight(environment, paths=paths, identity_path=identity)
+                self.assertTrue(report.ready, report.reason)
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="b" * 40):
                 report = preflight(environment, paths=paths, identity_path=identity)
             self.assertFalse(report.ready)
             self.assertIn("repository mount is evidence-mismatch", report.reason)
+
+            write_typed_mounted_evidence(paths, "a" * 40, now=now)
+            receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            environment["ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256"] = receipt_sha
+            paths[DockerMountName.CONFIGURATION].write_text(
+                "[runtime]\ncandidate_sha = \"a\"\nbinding = \"malformed\"\n", encoding="utf-8",
+            )
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertEqual(report.exit_code, 2)
+            self.assertIn("configuration mount is evidence-mismatch", report.reason)
+
+            write_typed_mounted_evidence(paths, "a" * 40, now=now)
+            receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            environment["ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256"] = receipt_sha
+            paths[DockerMountName.AUTHENTICATION].write_text(
+                "[operator]\ncandidate_sha = \"a\"\nidentity = \"b" + "b" * 63 + "\"\n", encoding="utf-8",
+            )
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertEqual(report.exit_code, 2)
+            self.assertIn("authentication mount is evidence-mismatch", report.reason)
+
+            write_typed_mounted_evidence(paths, "a" * 40, now=now)
+            receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
+            environment["ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256"] = receipt_sha
+            connection = sqlite3.connect(paths[DockerMountName.STATE] / "native-host.sqlite3")
+            try:
+                with connection:
+                    connection.execute("UPDATE native_host_metadata SET value = ? WHERE key = 'candidate_sha'", ("b" * 40,))
+            finally:
+                connection.close()
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertEqual(report.exit_code, 2)
+            self.assertIn("state mount is evidence-mismatch", report.reason)
 
     def test_entrypoint_blocks_state_ownership_before_database_access(self) -> None:
         """An inaccessible authoritative database must never escape preflight."""
@@ -355,6 +420,7 @@ class DockerConsumerTests(unittest.TestCase):
             )
             database = paths[DockerMountName.STATE] / "native-host.sqlite3"
             self.assertTrue(NativeHostControlStore(database).install(canonical_native_host_installation("a" * 40, now=now)).accepted)
+            write_typed_mounted_evidence(paths, "a" * 40, now=now)
             identity = root / "identity.json"
             identity.write_text(
                 json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}),
@@ -395,6 +461,7 @@ class DockerConsumerTests(unittest.TestCase):
             paths[DockerMountName.AUTHENTICATION].write_text("# fixture\n", encoding="utf-8")
             paths[DockerMountName.AUTHORITY_RECEIPT].write_text(json.dumps(canonical_fixture_envelope("a" * 40, now=now)), encoding="utf-8")
             self.assertTrue(NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").install(canonical_native_host_installation("a" * 40, now=now)).accepted)
+            write_typed_mounted_evidence(paths, "a" * 40, now=now)
             identity = root / "identity.json"
             identity.write_text(json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}), encoding="utf-8")
             receipt_sha = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()

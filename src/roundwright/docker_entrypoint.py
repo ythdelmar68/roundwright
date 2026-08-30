@@ -14,7 +14,7 @@ import zlib
 from .cli import main as cli_main
 from .docker_consumer import DockerConsumerContract, DockerMountCheck, DockerMountName, DockerMountStatus, DockerOperationMode, evaluate_docker_consumer, render_docker_consumer_diagnostics
 from .docker_authority import DockerAuthorityAdapterError, canonical_native_host_installation, evaluate_mounted_authority
-from .native_host import NativeHostControlStore
+from .native_host import NativeHostControlStore, NativeHostError
 
 
 _PATHS = {
@@ -118,17 +118,31 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
     except (OSError, ValueError, UnicodeDecodeError):
         result[DockerMountName.AUTHENTICATION] = DockerMountStatus.EVIDENCE_MISMATCH
     database = paths[DockerMountName.STATE] / "native-host.sqlite3"
-    if mode is DockerOperationMode.AUTHORITATIVE and authority_issued_at is not None:
-        state = NativeHostControlStore(database).verify(canonical_native_host_installation(candidate, now=authority_issued_at))
-        state_valid = state.accepted
-    else:
-        # Non-authoritative modes can inspect the existing state but cannot
-        # use or synthesize an authority receipt to validate it.
-        state_valid = database.is_file()
-    if not state_valid:
+    state_valid = False
+    try:
+        if not database.is_file():
+            state_valid = False
+        elif mode is DockerOperationMode.AUTHORITATIVE and hasattr(os, "geteuid") and database.stat().st_uid != os.geteuid():
+            # Check the concrete database ownership before opening it.  An
+            # authoritative container must report a host-owned mismatch as a
+            # blocked preflight, rather than leaking a SQLite permission
+            # exception from a file it is not allowed to inspect.
+            result[DockerMountName.STATE] = DockerMountStatus.OWNERSHIP_MISMATCH
+        elif mode is DockerOperationMode.AUTHORITATIVE and authority_issued_at is not None:
+            state_valid = NativeHostControlStore(database).verify(
+                canonical_native_host_installation(candidate, now=authority_issued_at)
+            ).accepted
+        else:
+            # Non-authoritative modes can inspect the existing state but
+            # cannot use or synthesize an authority receipt to validate it.
+            state_valid = True
+    except (NativeHostError, OSError, ValueError):
+        # Corrupt or unreadable mounted state is untrusted input.  It must
+        # produce ordinary fail-closed preflight evidence, never an unhandled
+        # installed-image exception.
+        state_valid = False
+    if DockerMountName.STATE not in result and not state_valid:
         result[DockerMountName.STATE] = DockerMountStatus.EVIDENCE_MISMATCH
-    elif mode is DockerOperationMode.AUTHORITATIVE and hasattr(os, "geteuid") and database.stat().st_uid != os.geteuid():
-        result[DockerMountName.STATE] = DockerMountStatus.OWNERSHIP_MISMATCH
     if any(environment.get(name) != value for name, value in _RUNTIME_ENVIRONMENT.items()):
         # A wrong runtime path can otherwise make the CLI silently inspect a
         # container-local default instead of the host-owned fixtures.

@@ -329,6 +329,53 @@ class DockerConsumerTests(unittest.TestCase):
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
                 self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
 
+    def test_entrypoint_blocks_state_ownership_before_database_access(self) -> None:
+        """An inaccessible authoritative database must never escape preflight."""
+
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            paths[DockerMountName.CONFIGURATION].write_text("[runtime]\nschema_version = 1\n", encoding="utf-8")
+            paths[DockerMountName.AUTHENTICATION].write_text("# fixture\n", encoding="utf-8")
+            paths[DockerMountName.AUTHORITY_RECEIPT].write_text(
+                json.dumps(canonical_fixture_envelope("a" * 40, now=now), sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            database = paths[DockerMountName.STATE] / "native-host.sqlite3"
+            self.assertTrue(NativeHostControlStore(database).install(canonical_native_host_installation("a" * 40, now=now)).accepted)
+            identity = root / "identity.json"
+            identity.write_text(
+                json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}),
+                encoding="utf-8",
+            )
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest(),
+                **mounted_runtime_environment(),
+            }
+
+            def mounted_access(path: Path, mode: int) -> bool:
+                return mode == os.R_OK or path is paths[DockerMountName.STATE]
+
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40), mock.patch("roundwright.docker_entrypoint.os.geteuid", return_value=database.stat().st_uid + 1, create=True), mock.patch("roundwright.docker_entrypoint.NativeHostControlStore.verify") as verify:
+                ownership_report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertFalse(ownership_report.ready)
+            self.assertIn("state mount is ownership-mismatch", ownership_report.reason)
+            self.assertEqual(ownership_report.exit_code, 2)
+            verify.assert_not_called()
+
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40), mock.patch("roundwright.docker_entrypoint.os.geteuid", return_value=database.stat().st_uid, create=True), mock.patch("roundwright.docker_entrypoint.NativeHostControlStore.verify", side_effect=OSError("database unavailable")):
+                access_report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertFalse(access_report.ready)
+            self.assertIn("state mount is evidence-mismatch", access_report.reason)
+            self.assertEqual(access_report.exit_code, 2)
+
     def test_entrypoint_requires_mounted_runtime_evidence_and_environment(self) -> None:
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as temporary:

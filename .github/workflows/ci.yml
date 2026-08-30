@@ -128,7 +128,14 @@ jobs:
           base="${{ steps.docker-inputs.outputs.base_image_digest }}"
           fixtures="$RUNNER_TEMP/roundwright-docker-fixtures"
           mkdir -p "$fixtures/state" "$fixtures/etc" "$fixtures/run"
-          git -C "$GITHUB_WORKSPACE" worktree add --detach "$fixtures/repository" "$CANDIDATE_SHA"
+          # A linked worktree has a .git *file* that points outside this
+          # bind mount.  The consumer must observe HEAD from inside
+          # /workspace, so create a standalone local clone with its own
+          # object database instead.
+          git clone --no-local --no-checkout "$GITHUB_WORKSPACE" "$fixtures/repository"
+          git -C "$fixtures/repository" checkout --detach "$CANDIDATE_SHA"
+          test -d "$fixtures/repository/.git"
+          test ! -e "$fixtures/repository/.git/objects/info/alternates"
           test "$(git -C "$fixtures/repository" rev-parse HEAD)" = "$CANDIDATE_SHA"
           python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state" --configuration "$fixtures/etc/config.toml" --authentication "$fixtures/run/auth.toml" --output "$fixtures/run/authority-receipt.json"
           sudo chown -R 65532:65532 "$fixtures/state"

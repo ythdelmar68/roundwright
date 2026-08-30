@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import contextlib
 import os
+import subprocess
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -27,7 +28,7 @@ from roundwright.docker_consumer import (
     evaluate_docker_consumer,
     render_docker_consumer_diagnostics,
 )
-from roundwright.docker_entrypoint import main as docker_entrypoint_main, preflight
+from roundwright.docker_entrypoint import _checkout_candidate, main as docker_entrypoint_main, preflight
 from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority
 from roundwright.docker_authority import canonical_native_host_installation
 from roundwright.native_host import InvocationSource, NativeHostControlStore
@@ -51,6 +52,28 @@ def mounts(status: DockerMountStatus = DockerMountStatus.READY, *, authority: Do
 
 
 class DockerConsumerTests(unittest.TestCase):
+    def test_entrypoint_reads_head_from_a_self_contained_mounted_checkout(self) -> None:
+        """A mounted repository must not depend on worktree metadata outside it."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            subprocess.run(("git", "init", "--quiet", repository), check=True)
+            subprocess.run(("git", "-C", repository, "config", "user.name", "fixture"), check=True)
+            subprocess.run(("git", "-C", repository, "config", "user.email", "fixture@example.invalid"), check=True)
+            (repository / "fixture.txt").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(("git", "-C", repository, "add", "fixture.txt"), check=True)
+            subprocess.run(("git", "-C", repository, "commit", "--quiet", "-m", "fixture"), check=True)
+            expected = subprocess.run(
+                ("git", "-C", repository, "rev-parse", "HEAD"), check=True, text=True, stdout=subprocess.PIPE
+            ).stdout.strip()
+            self.assertTrue((repository / ".git").is_dir())
+            self.assertEqual(_checkout_candidate(repository), expected)
+
+            linked = Path(temporary) / "linked-worktree"
+            linked.mkdir()
+            (linked / ".git").write_text("gitdir: /outside/mounted-boundary\n", encoding="utf-8")
+            self.assertIsNone(_checkout_candidate(linked))
+
     def test_typed_native_host_fixture_initializes_sqlite_and_enforces_one_active_lock(self) -> None:
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as temporary:

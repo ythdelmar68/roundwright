@@ -160,6 +160,8 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-authoritative doctor', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-read-only status', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-test-only status', workflow)
+        self.assertIn('export ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256="$receipt_sha"', workflow)
+        self.assertNotIn('export ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256="$receipt_sha"', workflow)
         self.assertIn("roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("docker push", workflow)
 

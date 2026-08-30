@@ -189,7 +189,7 @@ jobs:
           export ROUNDWRIGHT_WHEEL="${{ steps.docker-inputs.outputs.wheel }}"
           export ROUNDWRIGHT_WHEEL_SHA256="${{ steps.docker-inputs.outputs.wheel_sha256 }}"
           export ROUNDWRIGHT_DOCKER_CANDIDATE_SHA="$CANDIDATE_SHA"
-          export ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256="$receipt_sha"
+          export ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256="$receipt_sha"
           export ROUNDWRIGHT_REPOSITORY="$fixtures/repository"
           export ROUNDWRIGHT_STATE="$fixtures/state"
           export ROUNDWRIGHT_CONFIGURATION="$fixtures/etc/config.toml"

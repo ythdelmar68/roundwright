@@ -131,8 +131,9 @@ jobs:
           git -C "$GITHUB_WORKSPACE" worktree add --detach "$fixtures/repository" "$CANDIDATE_SHA"
           test "$(git -C "$fixtures/repository" rev-parse HEAD)" = "$CANDIDATE_SHA"
           python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state" --configuration "$fixtures/etc/config.toml" --authentication "$fixtures/run/auth.toml" --output "$fixtures/run/authority-receipt.json"
-          sudo chown 65532:65532 "$fixtures/state"
-          sudo chmod 0750 "$fixtures/state"
+          sudo chown -R 65532:65532 "$fixtures/state"
+          sudo find "$fixtures/state" -type d -exec chmod 0750 {} +
+          sudo find "$fixtures/state" -type f -exec chmod 0640 {} +
           receipt_sha="$(sha256sum "$fixtures/run/authority-receipt.json" | cut -d ' ' -f 1)"
           common=(--network=none --read-only --tmpfs /tmp --env "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=$CANDIDATE_SHA" --env "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256=${{ steps.docker-inputs.outputs.wheel_sha256 }}" --env "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST=$base" -v "$fixtures/repository:/workspace:ro" -v "$fixtures/etc/config.toml:/etc/roundwright/config.toml:ro" -v "$fixtures/run/auth.toml:/run/roundwright/auth.toml:ro")
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor

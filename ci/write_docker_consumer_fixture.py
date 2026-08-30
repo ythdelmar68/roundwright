@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import argparse
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -29,9 +30,10 @@ def seal_read_only_state(database: Path) -> None:
     """
 
     try:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection:
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            connection.commit()
         if mode != ("delete",):
             raise sqlite3.Error("fixture database did not leave WAL mode")
     except sqlite3.Error as error:

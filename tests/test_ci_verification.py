@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import os
 import sys
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +41,16 @@ def load_docker_qualification() -> object:
     specification = importlib.util.spec_from_file_location("docker_consumer_qualification", location)
     if specification is None or specification.loader is None:
         raise AssertionError("Docker qualification helper is unavailable")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def load_git_commit_materializer() -> object:
+    location = ROOT / "ci" / "materialize_git_commit.py"
+    specification = importlib.util.spec_from_file_location("materialize_git_commit", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("Git commit materializer is unavailable")
     module = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(module)
     return module
@@ -123,7 +135,8 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('test ! -e "$fixtures/repository/.git/objects/info/alternates"', workflow)
         self.assertNotIn('worktree add --detach "$fixtures/repository"', workflow)
         self.assertIn('git -C "$fixtures/repository" rev-parse HEAD', workflow)
-        self.assertIn('git -C "$fixtures/repository" cat-file commit "$CANDIDATE_SHA" | git -C "$fixtures/repository" hash-object -w -t commit --stdin', workflow)
+        materialize = 'git -C "$fixtures/repository" cat-file commit "$CANDIDATE_SHA" | python ci/materialize_git_commit.py --repository "$fixtures/repository" --candidate "$CANDIDATE_SHA"'
+        self.assertIn(materialize, workflow)
         self.assertIn('test -f "$fixtures/repository/.git/objects/${CANDIDATE_SHA:0:2}/${CANDIDATE_SHA:2}"', workflow)
         repository_owner = 'sudo chown -R 65532:65532 "$fixtures/repository"'
         self.assertIn(repository_owner, workflow)
@@ -148,6 +161,29 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-test-only status', workflow)
         self.assertIn("roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("docker push", workflow)
+
+    def test_git_commit_materializer_writes_exact_loose_object_from_packed_start(self) -> None:
+        materializer = load_git_commit_materializer()
+        payload = b"tree " + b"0" * 40 + b"\\nauthor Docker <docker@example.invalid> 0 +0000\\n\\nfixture\\n"
+        raw_object = b"commit " + str(len(payload)).encode("ascii") + b"\\0" + payload
+        candidate = hashlib.sha1(raw_object).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            git_directory = repository / ".git"
+            packed = git_directory / "objects" / "pack"
+            packed.mkdir(parents=True)
+            (packed / "pack-fixture.pack").write_bytes(b"packed candidate already available")
+            (git_directory / "HEAD").write_text(candidate + "\\n", encoding="ascii")
+
+            target = materializer.materialize_loose_commit(repository, candidate, payload)
+
+            self.assertEqual(target, git_directory / "objects" / candidate[:2] / candidate[2:])
+            self.assertTrue(target.is_file())
+            self.assertEqual(zlib.decompress(target.read_bytes()), raw_object)
+            self.assertTrue((packed / "pack-fixture.pack").is_file())
+            self.assertEqual(materializer.materialize_loose_commit(repository, candidate, payload), target)
+            with self.assertRaises(ValueError):
+                materializer.materialize_loose_commit(repository, candidate, b"copied payload")
 
     def test_docker_qualification_binds_artifact_base_and_dockerfile_without_paths(self) -> None:
         qualification = load_docker_qualification()

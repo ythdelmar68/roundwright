@@ -127,12 +127,9 @@ jobs:
           image="roundwright-consumer:$CANDIDATE_SHA"
           base="${{ steps.docker-inputs.outputs.base_image_digest }}"
           fixtures="$RUNNER_TEMP/roundwright-docker-fixtures"
-          mkdir -p "$fixtures/repository" "$fixtures/state" "$fixtures/etc" "$fixtures/run"
-          git -C "$fixtures/repository" init -q
-          git -C "$fixtures/repository" config user.email fixture@invalid
-          git -C "$fixtures/repository" config user.name roundwright-fixture
-          git -C "$fixtures/repository" commit --allow-empty -qm fixture
-          git -C "$fixtures/repository" branch -M "candidate-$CANDIDATE_SHA"
+          mkdir -p "$fixtures/state" "$fixtures/etc" "$fixtures/run"
+          git -C "$GITHUB_WORKSPACE" worktree add --detach "$fixtures/repository" "$CANDIDATE_SHA"
+          test "$(git -C "$fixtures/repository" rev-parse HEAD)" = "$CANDIDATE_SHA"
           sudo chown 65532:65532 "$fixtures/state"
           sudo chmod 0750 "$fixtures/state"
           printf '{}\n' > "$fixtures/etc/config.toml"

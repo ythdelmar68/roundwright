@@ -117,6 +117,9 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('git -C "$fixtures/repository" rev-parse HEAD', workflow)
         self.assertIn('python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state"', workflow)
         self.assertIn('--configuration "$fixtures/etc/config.toml" --authentication "$fixtures/run/auth.toml"', workflow)
+        fixture_writer = workflow.index('python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA"')
+        self.assertLess(fixture_writer, workflow.index('sudo chown 65532:65532 "$fixtures/state"'))
+        self.assertLess(fixture_writer, workflow.index('sudo chmod 0750 "$fixtures/state"'))
         self.assertIn("roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("docker push", workflow)
 

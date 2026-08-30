@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -67,14 +69,30 @@ def load_docker_fixture_writer() -> object:
     return module
 
 
+def load_docker_consumer_test_helpers() -> object:
+    location = ROOT / "tests" / "test_docker_consumer.py"
+    specification = importlib.util.spec_from_file_location("docker_consumer_test_helpers", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("Docker consumer test helpers are unavailable")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 class CiVerificationTests(unittest.TestCase):
     def test_docker_fixture_writer_records_the_serialized_native_host_installation(self) -> None:
         """The positive image fixture must persist exactly the mounted typed state evidence."""
 
         writer = load_docker_fixture_writer()
+        helpers = load_docker_consumer_test_helpers()
+        from roundwright.docker_consumer import DockerMountName, DockerOperationMode
+        from roundwright.docker_entrypoint import preflight
         candidate = "a" * 40
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            repository = root / "repository"
+            (repository / ".git").mkdir(parents=True)
+            candidate = helpers.write_self_contained_checkout(repository)
             output = root / "run" / "authority-receipt.json"
             state = root / "state"
             configuration = root / "etc" / "config.toml"
@@ -97,6 +115,49 @@ class CiVerificationTests(unittest.TestCase):
                     authority.native_host_installation
                 ).accepted
             )
+            connection = sqlite3.connect(state / "native-host.sqlite3")
+            try:
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone(), ("delete",))
+            finally:
+                connection.close()
+            self.assertFalse((state / "native-host.sqlite3-wal").exists())
+            self.assertFalse((state / "native-host.sqlite3-shm").exists())
+
+            identity = root / "consumer-identity.json"
+            identity.write_text(json.dumps({
+                "candidate_sha": candidate,
+                "package_digest": "sha256:" + "b" * 64,
+                "base_image_digest": "sha256:" + "c" * 64,
+            }), encoding="utf-8")
+            receipt_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+            base_environment = {
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": "sha256:" + "c" * 64,
+                "ROUNDWRIGHT_REPOSITORY_ROOT": "/workspace",
+                "XDG_CONFIG_HOME": "/etc",
+                "XDG_STATE_HOME": "/var/lib",
+            }
+            for mode in DockerOperationMode:
+                paths = {
+                    DockerMountName.REPOSITORY: repository,
+                    DockerMountName.STATE: state,
+                    DockerMountName.CONFIGURATION: configuration,
+                    DockerMountName.AUTHENTICATION: authentication,
+                    DockerMountName.AUTHORITY_RECEIPT: output if mode is DockerOperationMode.AUTHORITATIVE else root / "unmounted-authority.json",
+                }
+                environment = {**base_environment, "ROUNDWRIGHT_DOCKER_MODE": mode.value}
+                if mode is DockerOperationMode.AUTHORITATIVE:
+                    environment["ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256"] = receipt_sha
+
+                def mounted_access(path: Path, access_mode: int) -> bool:
+                    return access_mode == os.R_OK or (
+                        path == state and mode is DockerOperationMode.AUTHORITATIVE
+                    )
+
+                with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access):
+                    report = preflight(environment, paths=paths, identity_path=identity)
+                self.assertTrue(report.ready, f"{mode.value}: {report.reason}")
 
     def test_candidate_route_uses_candidate_lock_and_explicit_shared_cache(self) -> None:
         resolver = load_validation_resolver()

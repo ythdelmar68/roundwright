@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import argparse
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 
@@ -14,6 +15,30 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.docker_authority import canonical_fixture_envelope, load_mounted_authority
 from roundwright.native_host import InvocationSource, NativeHostControlStore
+
+
+def seal_read_only_state(database: Path) -> None:
+    """Checkpoint fixture lifecycle state before its read-only image mount.
+
+    ``NativeHostControlStore`` correctly uses WAL for host-side mutations.
+    The disposable consumer fixture is different: the first test-only and
+    read-only image invocations must observe a self-contained SQLite database
+    through a read-only bind mount.  Retaining a WAL journal would require
+    SQLite to coordinate sidecars at runtime, which is incompatible with that
+    mount contract.
+    """
+
+    try:
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if mode != ("delete",):
+            raise sqlite3.Error("fixture database did not leave WAL mode")
+    except sqlite3.Error as error:
+        raise RuntimeError("native-host fixture state could not be sealed") from error
+    for suffix in ("-wal", "-shm"):
+        if database.with_name(database.name + suffix).exists():
+            raise RuntimeError("native-host fixture state retained a journal sidecar")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -64,6 +89,7 @@ def main() -> int:
         raise RuntimeError("native-host stale fixture could not be recovered")
     if not control_store.admit(installation, "fixture-active", InvocationSource.ONE_SHOT, now=now).accepted:
         raise RuntimeError("native-host active-lock fixture could not be initialized")
+    seal_read_only_state(arguments.state / "native-host.sqlite3")
     arguments.configuration.parent.mkdir(parents=True, exist_ok=True)
     binding = material["identity"]["runtime_binding"]
     authentication_identity = material["mounts"]["authentication_identity"]

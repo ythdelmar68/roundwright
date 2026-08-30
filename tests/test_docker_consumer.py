@@ -407,6 +407,14 @@ class DockerConsumerTests(unittest.TestCase):
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
                 report = preflight(environment, paths=paths, identity_path=identity)
                 self.assertTrue(report.ready, report.reason)
+            def writable_authority(path: Path, mode: int) -> bool:
+                return mode == os.R_OK or path in {
+                    paths[DockerMountName.STATE], paths[DockerMountName.AUTHORITY_RECEIPT]
+                }
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=writable_authority), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="a" * 40):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            self.assertEqual(report.exit_code, 2)
+            self.assertIn("authority-receipt mount is permission-mismatch", report.reason)
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value="b" * 40):
                 report = preflight(environment, paths=paths, identity_path=identity)
             self.assertFalse(report.ready)

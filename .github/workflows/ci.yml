@@ -225,7 +225,10 @@ jobs:
           cp "$fixtures/run/auth.toml" "$fixtures/run/auth-writable.toml"
           chmod 0666 "$fixtures/run/auth-writable.toml"
           expect_blocked "authentication mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" -v "$fixtures/run/auth-writable.toml:/run/roundwright/auth.toml:rw" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
-          expect_blocked "authority-receipt mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:rw" "$image" doctor
+          cp "$fixtures/run/authority-receipt.json" "$fixtures/run/authority-writable.json"
+          sudo chown 65532:65532 "$fixtures/run/authority-writable.json"
+          sudo chmod 0660 "$fixtures/run/authority-writable.json"
+          expect_blocked "authority-receipt mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-writable.json:/run/roundwright/authority-receipt.json:rw" "$image" doctor
           cp "$fixtures/run/authority-receipt.json" "$fixtures/run/authority-malformed.json"
           printf '{}\n' > "$fixtures/run/authority-malformed.json"
           malformed_sha="$(sha256sum "$fixtures/run/authority-malformed.json" | cut -d ' ' -f 1)"

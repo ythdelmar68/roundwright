@@ -66,6 +66,30 @@ class DockerConsumerTests(unittest.TestCase):
             path = Path(temporary) / "authority.json"
             with self.assertRaises(DockerAuthorityAdapterError):
                 evaluate_mounted_authority(path, candidate_sha="a" * 40, now=datetime.now(timezone.utc))
+
+    def test_mounted_authority_adapter_blocks_typed_receipt_and_identity_drift(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "authority.json"
+            def decision_for(mutator: object):
+                envelope = canonical_fixture_envelope("a" * 40, now=now)
+                mutator(envelope)  # type: ignore[operator]
+                path.write_text(json.dumps(envelope, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+                return evaluate_mounted_authority(path, candidate_sha="a" * 40, now=now)
+
+            for status in ("expired", "copied", "conflicting", "revoked"):
+                self.assertFalse(decision_for(lambda envelope, status=status: envelope["verification"].update({"status": status})).authorized)  # type: ignore[index]
+            self.assertFalse(decision_for(lambda envelope: envelope["verification"].update({"state_id": "12345678-1234-5678-1234-567812345678"})).authorized)  # type: ignore[index]
+            def runtime_drift(envelope: dict[str, object]) -> None:
+                binding = json.loads(envelope["identity"]["runtime_binding"])  # type: ignore[index]
+                binding["resolved_digest"] = digest("f")
+                envelope["identity"]["runtime_binding"] = json.dumps(binding, sort_keys=True, separators=(",", ":"))  # type: ignore[index]
+            self.assertFalse(decision_for(runtime_drift).authorized)
+            envelope = canonical_fixture_envelope("a" * 40, now=now)
+            envelope["candidate_sha"] = "b" * 40
+            path.write_text(json.dumps(envelope), encoding="utf-8")
+            with self.assertRaises(DockerAuthorityAdapterError):
+                evaluate_mounted_authority(path, candidate_sha="a" * 40, now=now)
             with self.assertRaises(DockerAuthorityAdapterError):
                 evaluate_mounted_authority(path, candidate_sha="not-a-candidate", now=datetime.now(timezone.utc))
             path.write_text("{}", encoding="utf-8")
@@ -153,7 +177,8 @@ class DockerConsumerTests(unittest.TestCase):
         compose = (ROOT / "docker" / "compose.yaml").read_text(encoding="utf-8")
         for target in (
             "/workspace:ro",
-            "/var/lib/roundwright:${ROUNDWRIGHT_STATE_MOUNT_MODE",
+            "/var/lib/roundwright:rw",
+            "/var/lib/roundwright:ro",
             "/etc/roundwright/config.toml:ro",
             "/run/roundwright/auth.toml:ro",
             "/run/roundwright/authority-receipt.json:ro",
@@ -162,8 +187,26 @@ class DockerConsumerTests(unittest.TestCase):
         self.assertIn('user: "65532:65532"', compose)
         self.assertIn("read_only: true", compose)
         self.assertNotIn("image: ghcr.io", compose)
-        self.assertIn("ROUNDWRIGHT_DOCKER_MODE", compose)
+        self.assertIn("roundwright-authoritative:", compose)
+        self.assertIn("roundwright-read-only:", compose)
+        self.assertIn("roundwright-test-only:", compose)
         self.assertIn("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256:", compose)
+        self.assertNotIn("/dev/null", compose)
+
+    def test_operator_documentation_matches_current_docker_contract(self) -> None:
+        documentation = (ROOT / "docs" / "operations" / "docker-consumer.md").read_text(encoding="utf-8")
+        for value in (
+            "--build-arg ROUNDWRIGHT_CANDIDATE_SHA=<40-lowercase-hex>",
+            "--build-arg ROUNDWRIGHT_BASE_IMAGE_DIGEST=sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2",
+            "ci/write_docker_consumer_fixture.py --candidate",
+            "roundwright-authoritative doctor",
+            "roundwright-read-only status",
+            "roundwright-test-only status",
+            "roundwright-test-only run-once",
+            "returns exit code 3",
+        ):
+            self.assertIn(value, documentation)
+        self.assertNotIn("--docker-authority-receipt-matches-candidate", documentation)
 
     def test_entrypoint_observes_real_mounts_and_identity_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

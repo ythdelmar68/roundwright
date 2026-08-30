@@ -57,7 +57,47 @@ def load_git_commit_materializer() -> object:
     return module
 
 
+def load_docker_fixture_writer() -> object:
+    location = ROOT / "ci" / "write_docker_consumer_fixture.py"
+    specification = importlib.util.spec_from_file_location("write_docker_consumer_fixture", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("Docker fixture writer is unavailable")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 class CiVerificationTests(unittest.TestCase):
+    def test_docker_fixture_writer_records_the_serialized_native_host_installation(self) -> None:
+        """The positive image fixture must persist exactly the mounted typed state evidence."""
+
+        writer = load_docker_fixture_writer()
+        candidate = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "run" / "authority-receipt.json"
+            state = root / "state"
+            configuration = root / "etc" / "config.toml"
+            authentication = root / "run" / "auth.toml"
+            arguments = [
+                "write_docker_consumer_fixture.py", "--candidate", candidate,
+                "--output", str(output), "--state", str(state),
+                "--configuration", str(configuration), "--authentication", str(authentication),
+            ]
+            with mock.patch.object(sys, "argv", arguments):
+                self.assertEqual(writer.main(), 0)
+
+            authority = writer.load_mounted_authority(output, candidate_sha=candidate)
+            observed = writer.NativeHostControlStore(state / "native-host.sqlite3").observe()
+            self.assertEqual(observed.candidate_sha, candidate)
+            self.assertEqual(observed.installation_fingerprint, authority.native_host_installation.installation_fingerprint)
+            self.assertEqual(observed.receipt_fingerprint, authority.native_host_installation.receipt.receipt_fingerprint)
+            self.assertTrue(
+                writer.NativeHostControlStore(state / "native-host.sqlite3").verify(
+                    authority.native_host_installation
+                ).accepted
+            )
+
     def test_candidate_route_uses_candidate_lock_and_explicit_shared_cache(self) -> None:
         resolver = load_validation_resolver()
         candidate_lock = Path("candidate") / "ci" / "validation-toolchain.lock.toml"

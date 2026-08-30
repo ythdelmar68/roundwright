@@ -12,7 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.docker_authority import canonical_fixture_envelope, canonical_native_host_installation
+from roundwright.docker_authority import canonical_fixture_envelope, load_mounted_authority
 from roundwright.native_host import InvocationSource, NativeHostControlStore
 
 
@@ -30,8 +30,19 @@ def main() -> int:
     arguments = parse_arguments()
     now = datetime.now(timezone.utc)
     material = canonical_fixture_envelope(arguments.candidate, now=now)
+    # State is not allowed to independently reconstruct a native-host
+    # installation from the candidate.  The mounted authority envelope is the
+    # typed source that the consumer will parse, so initialize its persisted
+    # control store from that exact serialized installation.
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    arguments.output.write_text(
+        json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    installation = load_mounted_authority(
+        arguments.output, candidate_sha=arguments.candidate
+    ).native_host_installation
     arguments.state.mkdir(parents=True, exist_ok=True)
-    installation = canonical_native_host_installation(arguments.candidate, now=now)
     decision = NativeHostControlStore(arguments.state / "native-host.sqlite3").install(installation)
     if not decision.accepted:
         raise RuntimeError("native-host fixture state could not be initialized")
@@ -67,10 +78,6 @@ def main() -> int:
         "[operator]\n"
         f"candidate_sha = {json.dumps(arguments.candidate)}\n"
         f"identity = {json.dumps(authentication_identity)}\n",
-        encoding="utf-8",
-    )
-    arguments.output.write_text(
-        json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
     return 0

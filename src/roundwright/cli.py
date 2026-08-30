@@ -36,11 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "doctor":
             command.add_argument("--docker-mode", choices=tuple(item.value for item in DockerOperationMode), help="evaluate one path-free Docker consumer contract")
             command.add_argument("--docker-candidate-sha")
+            command.add_argument("--docker-observed-candidate-sha")
             command.add_argument("--docker-package-digest")
+            command.add_argument("--docker-observed-package-digest")
             command.add_argument("--docker-base-image-digest")
+            command.add_argument("--docker-observed-base-image-digest")
             command.add_argument("--docker-mount", action="append", default=[], metavar="NAME=STATUS")
             command.add_argument("--docker-authority-receipt-digest")
-            command.add_argument("--docker-authority-receipt-matches-candidate", action="store_true")
+            command.add_argument("--docker-observed-authority-receipt-digest")
+            command.add_argument("--docker-observed-authority-receipt-candidate-sha")
             command.add_argument("--docker-authority-inputs-conflict", action="store_true")
     configuration = subcommands.add_parser("config", help="validate or inspect resolved runtime configuration")
     config_commands = configuration.add_subparsers(dest="config_command")
@@ -178,11 +182,15 @@ def _docker_consumer_report(arguments: argparse.Namespace):
     supplied = (
         mode,
         getattr(arguments, "docker_candidate_sha", None),
+        getattr(arguments, "docker_observed_candidate_sha", None),
         getattr(arguments, "docker_package_digest", None),
+        getattr(arguments, "docker_observed_package_digest", None),
         getattr(arguments, "docker_base_image_digest", None),
+        getattr(arguments, "docker_observed_base_image_digest", None),
         tuple(getattr(arguments, "docker_mount", ())),
         getattr(arguments, "docker_authority_receipt_digest", None),
-        getattr(arguments, "docker_authority_receipt_matches_candidate", False),
+        getattr(arguments, "docker_observed_authority_receipt_digest", None),
+        getattr(arguments, "docker_observed_authority_receipt_candidate_sha", None),
         getattr(arguments, "docker_authority_inputs_conflict", False),
     )
     if not any(supplied):
@@ -200,14 +208,11 @@ def _docker_consumer_report(arguments: argparse.Namespace):
             raise DockerConsumerError("Docker mount is invalid") from error
     return evaluate_docker_consumer(
         DockerConsumerContract(
-            DockerOperationMode(mode),
-            arguments.docker_candidate_sha,
-            arguments.docker_package_digest,
-            arguments.docker_base_image_digest,
-            tuple(parsed_mounts),
-            arguments.docker_authority_receipt_digest,
-            arguments.docker_authority_receipt_matches_candidate,
-            arguments.docker_authority_inputs_conflict,
+            DockerOperationMode(mode), arguments.docker_candidate_sha, arguments.docker_observed_candidate_sha,
+            arguments.docker_package_digest, arguments.docker_observed_package_digest,
+            arguments.docker_base_image_digest, arguments.docker_observed_base_image_digest, tuple(parsed_mounts),
+            arguments.docker_authority_receipt_digest, arguments.docker_observed_authority_receipt_digest,
+            arguments.docker_observed_authority_receipt_candidate_sha, arguments.docker_authority_inputs_conflict,
         )
     )
 

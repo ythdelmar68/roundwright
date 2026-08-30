@@ -66,7 +66,8 @@ Set `ROUNDWRIGHT_REPOSITORY`, `ROUNDWRIGHT_STATE`,
 Repository, configuration, authentication, and receipt mounts must be
 read-only. The authoritative state must be owned and writable by UID/GID
 `65532`; read-only and test-only state must not be writable. Set
-`ROUNDWRIGHT_AUTHORITY_RECEIPT` and its SHA-256 only in the authoritative
+`ROUNDWRIGHT_AUTHORITY_RECEIPT` and
+`ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256` only in the authoritative
 command; the read-only and test-only commands below deliberately do not
 interpolate either authority variable.
 
@@ -93,11 +94,42 @@ installed package CLI. It must not print host paths, credential values, or
 receipt content. Run the three modes with their dedicated Compose services:
 
 ```text
+ROUNDWRIGHT_WHEEL=<exact-wheel-name> \
+ROUNDWRIGHT_WHEEL_SHA256=<64-lowercase-hex> \
+ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex> \
+ROUNDWRIGHT_REPOSITORY=<repository> \
+ROUNDWRIGHT_STATE=<state-directory> \
+ROUNDWRIGHT_CONFIGURATION=<config.toml> \
+ROUNDWRIGHT_AUTHENTICATION=<auth.toml> \
 docker compose -f docker/compose.yaml run --rm roundwright-read-only status
+
+ROUNDWRIGHT_WHEEL=<exact-wheel-name> \
+ROUNDWRIGHT_WHEEL_SHA256=<64-lowercase-hex> \
+ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex> \
+ROUNDWRIGHT_REPOSITORY=<repository> \
+ROUNDWRIGHT_STATE=<state-directory> \
+ROUNDWRIGHT_CONFIGURATION=<config.toml> \
+ROUNDWRIGHT_AUTHENTICATION=<auth.toml> \
 docker compose -f docker/compose.yaml run --rm roundwright-test-only status
+
+ROUNDWRIGHT_WHEEL=<exact-wheel-name> \
+ROUNDWRIGHT_WHEEL_SHA256=<64-lowercase-hex> \
+ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex> \
+ROUNDWRIGHT_REPOSITORY=<repository> \
+ROUNDWRIGHT_STATE=<state-directory> \
+ROUNDWRIGHT_CONFIGURATION=<config.toml> \
+ROUNDWRIGHT_AUTHENTICATION=<auth.toml> \
 docker compose -f docker/compose.yaml run --rm roundwright-test-only run-once
+
+ROUNDWRIGHT_WHEEL=<exact-wheel-name> \
+ROUNDWRIGHT_WHEEL_SHA256=<64-lowercase-hex> \
+ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex> \
+ROUNDWRIGHT_REPOSITORY=<repository> \
+ROUNDWRIGHT_STATE=<state-directory> \
+ROUNDWRIGHT_CONFIGURATION=<config.toml> \
+ROUNDWRIGHT_AUTHENTICATION=<auth.toml> \
 ROUNDWRIGHT_AUTHORITY_RECEIPT=<authority-receipt.json> \
-ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256=<64-lowercase-hex> \
+ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=<64-lowercase-hex> \
 docker compose -f docker/compose.yaml run --rm roundwright-authoritative doctor
 ```
 

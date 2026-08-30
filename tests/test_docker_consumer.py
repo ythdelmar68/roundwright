@@ -338,9 +338,14 @@ class DockerConsumerTests(unittest.TestCase):
             "roundwright-test-only status",
             "roundwright-test-only run-once",
             "ROUNDWRIGHT_AUTHORITY_RECEIPT=<authority-receipt.json>",
+            "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=<64-lowercase-hex>",
             "returns exit code 3",
         ):
             self.assertIn(value, documentation)
+        self.assertNotIn("\nROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256=", documentation)
+        self.assertEqual(documentation.count("ROUNDWRIGHT_WHEEL=<exact-wheel-name>"), 4)
+        self.assertEqual(documentation.count("ROUNDWRIGHT_REPOSITORY=<repository>"), 4)
+        self.assertEqual(documentation.count("ROUNDWRIGHT_AUTHORITY_RECEIPT=<authority-receipt.json>"), 1)
         self.assertNotIn("--docker-authority-receipt-matches-candidate", documentation)
 
     def test_entrypoint_observes_real_mounts_and_identity_drift(self) -> None:

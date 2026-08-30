@@ -8,6 +8,15 @@ from pathlib import Path
 from collections.abc import Sequence
 
 from .deployment import blocked_command_shell_preflight
+from .docker_consumer import (
+    DockerConsumerContract,
+    DockerConsumerError,
+    DockerMountCheck,
+    DockerMountName,
+    DockerMountStatus,
+    DockerOperationMode,
+    evaluate_docker_consumer,
+)
 from .doctor import collect_diagnostics, render_diagnostics, render_provider_recovery_status
 from .provider_health import CodexFailure
 from .identity import UnsafeEntrypointIdentityError, require_safe_entrypoint_identity
@@ -24,6 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (("doctor", "report read-only package diagnostics"), ("status", "report deployment modes without dispatching")):
         command = subcommands.add_parser(name, help=help_text)
         command.add_argument("--provider-failure", choices=tuple(item.value for item in CodexFailure), help="render sanitized operator recovery guidance without contacting a provider")
+        if name == "doctor":
+            command.add_argument("--docker-mode", choices=tuple(item.value for item in DockerOperationMode), help="evaluate one path-free Docker consumer contract")
+            command.add_argument("--docker-candidate-sha")
+            command.add_argument("--docker-package-digest")
+            command.add_argument("--docker-base-image-digest")
+            command.add_argument("--docker-mount", action="append", default=[], metavar="NAME=STATUS")
+            command.add_argument("--docker-authority-receipt-digest")
+            command.add_argument("--docker-authority-receipt-matches-candidate", action="store_true")
+            command.add_argument("--docker-authority-inputs-conflict", action="store_true")
     configuration = subcommands.add_parser("config", help="validate or inspect resolved runtime configuration")
     config_commands = configuration.add_subparsers(dest="config_command")
     for name, help_text in (("validate", "validate runtime configuration without writing"), ("show", "show public-safe configuration sources")):
@@ -44,7 +62,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     if arguments.command == "doctor":
-        report = collect_diagnostics(sys.argv[0], provider_failure=_provider_failure(arguments))
+        try:
+            docker_consumer = _docker_consumer_report(arguments)
+        except DockerConsumerError as error:
+            sys.stdout.write(f"roundwright doctor\nDocker consumer: blocked ({error})\nresult: attention required\n")
+            return 2
+        report = collect_diagnostics(
+            sys.argv[0], provider_failure=_provider_failure(arguments), docker_consumer=docker_consumer,
+        )
         render_diagnostics(report, sys.stdout)
         return report.exit_code
     if arguments.command == "status":
@@ -144,6 +169,47 @@ def _render_status(output: object, *, provider_failure: CodexFailure | None = No
 def _provider_failure(arguments: argparse.Namespace) -> CodexFailure | None:
     value = getattr(arguments, "provider_failure", None)
     return None if value is None else CodexFailure(value)
+
+
+def _docker_consumer_report(arguments: argparse.Namespace):
+    """Parse an optional path-free mount contract for ``doctor`` only."""
+
+    mode = getattr(arguments, "docker_mode", None)
+    supplied = (
+        mode,
+        getattr(arguments, "docker_candidate_sha", None),
+        getattr(arguments, "docker_package_digest", None),
+        getattr(arguments, "docker_base_image_digest", None),
+        tuple(getattr(arguments, "docker_mount", ())),
+        getattr(arguments, "docker_authority_receipt_digest", None),
+        getattr(arguments, "docker_authority_receipt_matches_candidate", False),
+        getattr(arguments, "docker_authority_inputs_conflict", False),
+    )
+    if not any(supplied):
+        return None
+    if mode is None:
+        raise DockerConsumerError("Docker operation mode is required")
+    parsed_mounts: list[DockerMountCheck] = []
+    for value in arguments.docker_mount:
+        name, separator, status = value.partition("=")
+        if not separator:
+            raise DockerConsumerError("Docker mount must use NAME=STATUS")
+        try:
+            parsed_mounts.append(DockerMountCheck(DockerMountName(name), DockerMountStatus(status)))
+        except ValueError as error:
+            raise DockerConsumerError("Docker mount is invalid") from error
+    return evaluate_docker_consumer(
+        DockerConsumerContract(
+            DockerOperationMode(mode),
+            arguments.docker_candidate_sha,
+            arguments.docker_package_digest,
+            arguments.docker_base_image_digest,
+            tuple(parsed_mounts),
+            arguments.docker_authority_receipt_digest,
+            arguments.docker_authority_receipt_matches_candidate,
+            arguments.docker_authority_inputs_conflict,
+        )
+    )
 
 
 def _render_blocked_shell(command: str, reason: str, output: object) -> None:

@@ -1,0 +1,21 @@
+# Example only: Docker consumes host-owned state, policy, and credentials.
+# It does not publish an image or create an authority receipt.
+services:
+  roundwright:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        ROUNDWRIGHT_WHEEL: ${ROUNDWRIGHT_WHEEL:?set the exact wheel filename}
+        ROUNDWRIGHT_WHEEL_SHA256: ${ROUNDWRIGHT_WHEEL_SHA256:?set the exact sha256 digest}
+    image: roundwright-consumer:local
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ${ROUNDWRIGHT_REPOSITORY:?set the canonical repository}:/workspace:ro
+      - ${ROUNDWRIGHT_STATE:?set the authoritative state directory}:/var/lib/roundwright:rw
+      - ${ROUNDWRIGHT_CONFIGURATION:?set the typed configuration file}:/etc/roundwright/config.toml:ro
+      - ${ROUNDWRIGHT_AUTHENTICATION:?set the operator-provided authentication file}:/run/roundwright/auth.toml:ro
+      - ${ROUNDWRIGHT_AUTHORITY_RECEIPT:?set the external authority receipt}:/run/roundwright/authority-receipt.json:ro

@@ -17,6 +17,11 @@ authentication-location, cache, state, and worktree paths without reading a
 credential. It does not install software, discover credentials, start a
 scheduler, or grant dispatch authority.
 
+The [minimal Docker deployment consumer](docs/operations/docker-consumer.md)
+uses that same released wheel and host-owned authority/state boundary. Its
+pinned image copies no source runtime and documents only explicit repository,
+state, configuration, authentication, and receipt mounts.
+
 Read-only and test-only modes require no receipt. Authoritative mode requires
 one fresh external designation; missing, expired, copied, conflicting, or
 drifted evidence becomes the explicit `blocked` mode. No Worker, Supervisor,

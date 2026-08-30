@@ -318,6 +318,8 @@ class DockerConsumerTests(unittest.TestCase):
                 return mode == os.R_OK or path is paths[DockerMountName.CONFIGURATION]
             with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=writable_configuration):
                 self.assertFalse(preflight(environment, paths=paths, identity_path=identity).ready)
+        original_environment = {name: os.environ.get(name) for name in ("ROUNDWRIGHT_REPOSITORY_ROOT", "XDG_CONFIG_HOME", "XDG_STATE_HOME")}
         with mock.patch("roundwright.docker_entrypoint.preflight", return_value=mock.Mock(ready=True)), mock.patch("roundwright.docker_entrypoint.render_docker_consumer_diagnostics"), mock.patch("roundwright.docker_entrypoint.os.chdir"), mock.patch("roundwright.docker_entrypoint.cli_main", return_value=3) as cli:
             self.assertEqual(docker_entrypoint_main(["run-once"]), 3)
             cli.assert_called_once_with(["run-once"])
+        self.assertEqual({name: os.environ.get(name) for name in original_environment}, original_environment)

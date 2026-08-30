@@ -197,9 +197,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     # The installed CLI must resolve the same mounted repository and XDG
     # locations that preflight observed; it must never fall back to /app.
-    os.chdir(_PATHS[DockerMountName.REPOSITORY])
-    os.environ.update(_RUNTIME_ENVIRONMENT)
-    return cli_main(argv)
+    previous_directory = Path.cwd()
+    previous_environment = {name: os.environ.get(name) for name in _RUNTIME_ENVIRONMENT}
+    try:
+        os.chdir(_PATHS[DockerMountName.REPOSITORY])
+        os.environ.update(_RUNTIME_ENVIRONMENT)
+        return cli_main(argv)
+    finally:
+        os.chdir(previous_directory)
+        for name, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 if __name__ == "__main__":

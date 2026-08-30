@@ -11,12 +11,14 @@ permissions:
 
 jobs:
   build-package:
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -34,10 +36,12 @@ jobs:
           python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py write dist
       - uses: actions/upload-artifact@v4
         with:
-          name: roundwright-package-${{ github.sha }}
+          name: roundwright-package-${{ env.CANDIDATE_SHA }}
           path: dist/
 
   verify-package:
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     needs: build-package
     strategy:
       fail-fast: false
@@ -49,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -63,7 +67,7 @@ jobs:
         run: python ci/resolve_validation_toolchain.py provision
       - uses: actions/download-artifact@v4
         with:
-          name: roundwright-package-${{ github.sha }}
+          name: roundwright-package-${{ env.CANDIDATE_SHA }}
           path: dist/
       - name: Verify the one uploaded package digest
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py verify dist
@@ -85,13 +89,15 @@ jobs:
           path: dist/qualification-receipt.json
 
   docker-consumer-qualification:
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     needs: build-package
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -104,37 +110,37 @@ jobs:
         run: python ci/resolve_validation_toolchain.py provision
       - uses: actions/download-artifact@v4
         with:
-          name: roundwright-package-${{ github.sha }}
+          name: roundwright-package-${{ env.CANDIDATE_SHA }}
           path: dist/
       - name: Bind exact Docker inputs to the uploaded package
         id: docker-inputs
-        run: python ci/resolve_validation_toolchain.py exec-python -- ci/docker_consumer_qualification.py inputs dist --candidate "${{ github.sha }}" --github-output "$GITHUB_OUTPUT"
+        run: python ci/resolve_validation_toolchain.py exec-python -- ci/docker_consumer_qualification.py inputs dist --candidate "$CANDIDATE_SHA" --github-output "$GITHUB_OUTPUT"
       - name: Pull the exact pinned base image
         run: docker pull "${{ steps.docker-inputs.outputs.base_image }}"
       - name: Build the exact wheel offline
         id: docker-build
         run: |
-          docker build --network=none --file docker/Dockerfile --build-arg "ROUNDWRIGHT_WHEEL=${{ steps.docker-inputs.outputs.wheel }}" --build-arg "ROUNDWRIGHT_WHEEL_SHA256=${{ steps.docker-inputs.outputs.wheel_sha256 }}" --build-arg "ROUNDWRIGHT_CANDIDATE_SHA=${{ github.sha }}" --build-arg "ROUNDWRIGHT_BASE_IMAGE_DIGEST=${{ steps.docker-inputs.outputs.base_image_digest }}" --tag "roundwright-consumer:${{ github.sha }}" .
-          echo "built_image_id=$(docker image inspect --format '{{.Id}}' roundwright-consumer:${{ github.sha }})" >> "$GITHUB_OUTPUT"
+          docker build --network=none --file docker/Dockerfile --build-arg "ROUNDWRIGHT_WHEEL=${{ steps.docker-inputs.outputs.wheel }}" --build-arg "ROUNDWRIGHT_WHEEL_SHA256=${{ steps.docker-inputs.outputs.wheel_sha256 }}" --build-arg "ROUNDWRIGHT_CANDIDATE_SHA=$CANDIDATE_SHA" --build-arg "ROUNDWRIGHT_BASE_IMAGE_DIGEST=${{ steps.docker-inputs.outputs.base_image_digest }}" --tag "roundwright-consumer:$CANDIDATE_SHA" .
+          echo "built_image_id=$(docker image inspect --format '{{.Id}}' roundwright-consumer:$CANDIDATE_SHA)" >> "$GITHUB_OUTPUT"
       - name: Run installed doctor and observed mode preflights
         run: |
-          image="roundwright-consumer:${{ github.sha }}"
+          image="roundwright-consumer:$CANDIDATE_SHA"
           base="${{ steps.docker-inputs.outputs.base_image_digest }}"
           fixtures="$RUNNER_TEMP/roundwright-docker-fixtures"
           mkdir -p "$fixtures/repository" "$fixtures/state" "$fixtures/etc" "$fixtures/run"
           sudo chown 65532:65532 "$fixtures/state"
-          chmod 0750 "$fixtures/state"
+          sudo chmod 0750 "$fixtures/state"
           printf '{}\n' > "$fixtures/etc/config.toml"
           printf '{}\n' > "$fixtures/run/auth.toml"
-          printf '{"candidate_sha":"${{ github.sha }}"}\n' > "$fixtures/run/authority-receipt.json"
+          printf '{"candidate_sha":"%s"}\n' "$CANDIDATE_SHA" > "$fixtures/run/authority-receipt.json"
           receipt_sha="$(sha256sum "$fixtures/run/authority-receipt.json" | cut -d ' ' -f 1)"
-          common=(--network=none --read-only --tmpfs /tmp --env "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=${{ github.sha }}" --env "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256=${{ steps.docker-inputs.outputs.wheel_sha256 }}" --env "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST=$base" -v "$fixtures/repository:/workspace:ro" -v "$fixtures/etc/config.toml:/etc/roundwright/config.toml:ro" -v "$fixtures/run/auth.toml:/run/roundwright/auth.toml:ro")
+          common=(--network=none --read-only --tmpfs /tmp --env "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=$CANDIDATE_SHA" --env "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256=${{ steps.docker-inputs.outputs.wheel_sha256 }}" --env "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST=$base" -v "$fixtures/repository:/workspace:ro" -v "$fixtures/etc/config.toml:/etc/roundwright/config.toml:ro" -v "$fixtures/run/auth.toml:/run/roundwright/auth.toml:ro")
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
       - name: Record public-safe Docker qualification
-        run: python ci/resolve_validation_toolchain.py exec-python -- ci/docker_consumer_qualification.py record dist --candidate "${{ github.sha }}" --base-image "${{ steps.docker-inputs.outputs.base_image }}" --built-image-id "${{ steps.docker-build.outputs.built_image_id }}" --check base_image_pull=passed --check offline_build=passed --check installed_doctor=passed --check authoritative_mode_preflight=passed --check read_only_mode_preflight=passed --check test_only_mode_preflight=passed --output dist/docker-consumer-qualification.json
+        run: python ci/resolve_validation_toolchain.py exec-python -- ci/docker_consumer_qualification.py record dist --candidate "$CANDIDATE_SHA" --base-image "${{ steps.docker-inputs.outputs.base_image }}" --built-image-id "${{ steps.docker-build.outputs.built_image_id }}" --check base_image_pull=passed --check offline_build=passed --check installed_doctor=passed --check authoritative_mode_preflight=passed --check read_only_mode_preflight=passed --check test_only_mode_preflight=passed --output dist/docker-consumer-qualification.json
       - uses: actions/upload-artifact@v4
         with:
-          name: roundwright-docker-consumer-qualification-${{ github.sha }}
+          name: roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}
           path: dist/docker-consumer-qualification.json

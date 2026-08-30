@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from .cli import main as cli_main
 from .docker_consumer import DockerConsumerContract, DockerMountCheck, DockerMountName, DockerMountStatus, DockerOperationMode, evaluate_docker_consumer, render_docker_consumer_diagnostics
+from .docker_authority import DockerAuthorityAdapterError, evaluate_mounted_authority
 
 
 _PATHS = {
@@ -81,6 +83,13 @@ def preflight(environment: Mapping[str, str], *, paths: Mapping[DockerMountName,
         except (OSError, json.JSONDecodeError):
             pass
     expected_receipt = environment.get("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256")
+    if mode is DockerOperationMode.AUTHORITATIVE:
+        try:
+            authority = evaluate_mounted_authority(receipt_path, candidate_sha=candidate, now=datetime.now(timezone.utc))
+        except DockerAuthorityAdapterError:
+            authority = None
+        if authority is None or not authority.authorized:
+            expected_receipt = None
     return evaluate_docker_consumer(DockerConsumerContract(
         mode, candidate, observed.get("candidate_sha"), package, observed.get("package_digest"), base,
         observed.get("base_image_digest"), _mounts(mode, paths),

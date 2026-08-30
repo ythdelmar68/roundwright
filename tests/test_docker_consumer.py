@@ -154,7 +154,9 @@ class DockerConsumerTests(unittest.TestCase):
             identity.write_text(json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}), encoding="utf-8")
             receipt = hashlib.sha256(paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()).hexdigest()
             environment = {"ROUNDWRIGHT_DOCKER_MODE": "authoritative", "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64, "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"), "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt}
-            self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+            # A digest-matching JSON fragment is not authority: mounted typed
+            # canonical evidence must pass the existing deployment evaluator.
+            self.assertFalse(preflight(environment, paths=paths, identity_path=identity).ready)
             environment["ROUNDWRIGHT_DOCKER_CANDIDATE_SHA"] = "e" * 40
             report = preflight(environment, paths=paths, identity_path=identity)
             self.assertFalse(report.ready)

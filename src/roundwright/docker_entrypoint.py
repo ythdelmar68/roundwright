@@ -54,7 +54,23 @@ def _mounts(mode: DockerOperationMode, paths: Mapping[DockerMountName, Path]) ->
             status = DockerMountStatus.MISSING
         elif not os.access(path, os.R_OK):
             status = DockerMountStatus.PERMISSION_MISMATCH
-        elif name is DockerMountName.STATE and ((mode is DockerOperationMode.AUTHORITATIVE) != os.access(path, os.W_OK)):
+        elif name is DockerMountName.STATE:
+            writable = os.access(path, os.W_OK)
+            if mode is DockerOperationMode.AUTHORITATIVE and not writable:
+                status = DockerMountStatus.PERMISSION_MISMATCH
+            elif mode is not DockerOperationMode.AUTHORITATIVE and writable:
+                status = DockerMountStatus.PERMISSION_MISMATCH
+            else:
+                effective_uid = getattr(os, "geteuid", None)
+                observed_uid = getattr(path.stat(), "st_uid", None)
+                if mode is DockerOperationMode.AUTHORITATIVE and callable(effective_uid) and observed_uid is not None and observed_uid != effective_uid():
+                    status = DockerMountStatus.OWNERSHIP_MISMATCH
+                else:
+                    status = DockerMountStatus.READY
+        elif os.access(path, os.W_OK):
+            # Repository, configuration, authentication, and authority
+            # evidence are host-owned observations.  A writable mount lets a
+            # consumer manufacture its own evidence, so fail closed.
             status = DockerMountStatus.PERMISSION_MISMATCH
         else:
             status = DockerMountStatus.READY

@@ -138,6 +138,14 @@ jobs:
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
+          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" status
+          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" status
+          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" status
+          set +e
+          docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" run-once
+          exit_code=$?
+          set -e
+          test "$exit_code" -eq 3
       - name: Record public-safe Docker qualification
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/docker_consumer_qualification.py record dist --candidate "$CANDIDATE_SHA" --base-image "${{ steps.docker-inputs.outputs.base_image }}" --built-image-id "${{ steps.docker-build.outputs.built_image_id }}" --check base_image_pull=passed --check offline_build=passed --check installed_doctor=passed --check authoritative_mode_preflight=passed --check read_only_mode_preflight=passed --check test_only_mode_preflight=passed --output dist/docker-consumer-qualification.json
       - uses: actions/upload-artifact@v4

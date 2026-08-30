@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import contextlib
+import os
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -26,7 +27,7 @@ from roundwright.docker_consumer import (
     evaluate_docker_consumer,
     render_docker_consumer_diagnostics,
 )
-from roundwright.docker_entrypoint import preflight
+from roundwright.docker_entrypoint import main as docker_entrypoint_main, preflight
 from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority
 from roundwright.docker_authority import canonical_native_host_installation
 from roundwright.native_host import InvocationSource, NativeHostControlStore
@@ -210,4 +211,34 @@ class DockerConsumerTests(unittest.TestCase):
                 "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
                 "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": receipt_sha,
             }
-            self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+            def mounted_access(path: Path, mode: int) -> bool:
+                if mode == os.R_OK:
+                    return True
+                return path is paths[DockerMountName.STATE]
+
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access):
+                self.assertTrue(preflight(environment, paths=paths, identity_path=identity).ready)
+
+    def test_entrypoint_blocks_writable_host_owned_mounts_and_dispatches_cli_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir(); paths[DockerMountName.STATE].mkdir()
+            for name in (DockerMountName.CONFIGURATION, DockerMountName.AUTHENTICATION):
+                paths[name].write_text("fixture\n", encoding="utf-8")
+            paths[DockerMountName.AUTHORITY_RECEIPT].write_text("fixture\n", encoding="utf-8")
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": "test-only",
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+            }
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({"candidate_sha": "a" * 40, "package_digest": digest("b"), "base_image_digest": digest("c")}), encoding="utf-8")
+            def writable_configuration(path: Path, mode: int) -> bool:
+                return mode == os.R_OK or path is paths[DockerMountName.CONFIGURATION]
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=writable_configuration):
+                self.assertFalse(preflight(environment, paths=paths, identity_path=identity).ready)
+        with mock.patch("roundwright.docker_entrypoint.preflight", return_value=mock.Mock(ready=True)), mock.patch("roundwright.docker_entrypoint.render_docker_consumer_diagnostics"), mock.patch("roundwright.docker_entrypoint.cli_main", return_value=3) as cli:
+            self.assertEqual(docker_entrypoint_main(["run-once"]), 3)
+            cli.assert_called_once_with(["run-once"])

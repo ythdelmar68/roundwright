@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import contextlib
 import os
-import subprocess
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -14,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -51,28 +51,59 @@ def mounts(status: DockerMountStatus = DockerMountStatus.READY, *, authority: Do
     return tuple(DockerMountCheck(name, authority if name is DockerMountName.AUTHORITY_RECEIPT and authority is not None else status) for name in DockerMountName)
 
 
+def write_self_contained_checkout(repository: Path, *, body: bytes | None = None) -> str:
+    """Create only the detached Git evidence available to the minimal image."""
+
+    body = body or (
+        b"tree " + b"0" * 40 + b"\nauthor Fixture <fixture@example.invalid> 0 +0000"
+        b"\ncommitter Fixture <fixture@example.invalid> 0 +0000\n\nfixture\n"
+    )
+    raw = f"commit {len(body)}".encode("ascii") + b"\0" + body
+    candidate = hashlib.sha1(raw).hexdigest()
+    git_directory = repository / ".git"
+    object_path = git_directory / "objects" / candidate[:2] / candidate[2:]
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(zlib.compress(raw))
+    (git_directory / "HEAD").write_text(candidate + "\n", encoding="ascii")
+    return candidate
+
+
 class DockerConsumerTests(unittest.TestCase):
-    def test_entrypoint_reads_head_from_a_self_contained_mounted_checkout(self) -> None:
-        """A mounted repository must not depend on worktree metadata outside it."""
+    def test_entrypoint_reads_head_from_self_contained_git_metadata_without_git(self) -> None:
+        """A mounted repository must not depend on a Git executable or outside metadata."""
 
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
-            subprocess.run(("git", "init", "--quiet", repository), check=True)
-            subprocess.run(("git", "-C", repository, "config", "user.name", "fixture"), check=True)
-            subprocess.run(("git", "-C", repository, "config", "user.email", "fixture@example.invalid"), check=True)
-            (repository / "fixture.txt").write_text("fixture\n", encoding="utf-8")
-            subprocess.run(("git", "-C", repository, "add", "fixture.txt"), check=True)
-            subprocess.run(("git", "-C", repository, "commit", "--quiet", "-m", "fixture"), check=True)
-            expected = subprocess.run(
-                ("git", "-C", repository, "rev-parse", "HEAD"), check=True, text=True, stdout=subprocess.PIPE
-            ).stdout.strip()
-            self.assertTrue((repository / ".git").is_dir())
-            self.assertEqual(_checkout_candidate(repository), expected)
+            (repository / ".git").mkdir(parents=True)
+            expected = write_self_contained_checkout(repository)
+            with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+                self.assertEqual(_checkout_candidate(repository), expected)
 
             linked = Path(temporary) / "linked-worktree"
             linked.mkdir()
             (linked / ".git").write_text("gitdir: /outside/mounted-boundary\n", encoding="utf-8")
             self.assertIsNone(_checkout_candidate(linked))
+
+    def test_entrypoint_rejects_symbolic_malformed_and_copied_git_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            symbolic = root / "symbolic"
+            (symbolic / ".git").mkdir(parents=True)
+            (symbolic / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="ascii")
+            self.assertIsNone(_checkout_candidate(symbolic))
+
+            malformed = root / "malformed"
+            (malformed / ".git").mkdir(parents=True)
+            (malformed / ".git" / "HEAD").write_text("not-a-candidate\n", encoding="ascii")
+            self.assertIsNone(_checkout_candidate(malformed))
+
+            copied = root / "copied"
+            (copied / ".git").mkdir(parents=True)
+            candidate = write_self_contained_checkout(copied)
+            object_path = copied / ".git" / "objects" / candidate[:2] / candidate[2:]
+            wrong = b"commit 5\0wrong"
+            object_path.write_bytes(zlib.compress(wrong))
+            self.assertIsNone(_checkout_candidate(copied))
 
     def test_typed_native_host_fixture_initializes_sqlite_and_enforces_one_active_lock(self) -> None:
         now = datetime.now(timezone.utc)

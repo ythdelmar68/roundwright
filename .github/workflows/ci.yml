@@ -137,6 +137,11 @@ jobs:
           test -d "$fixtures/repository/.git"
           test ! -e "$fixtures/repository/.git/objects/info/alternates"
           test "$(git -C "$fixtures/repository" rev-parse HEAD)" = "$CANDIDATE_SHA"
+          # The minimal image intentionally has no Git executable.  Persist
+          # the detached exact commit as self-contained loose object evidence
+          # for its strict Python metadata reader before the read-only mount.
+          test "$(git -C "$fixtures/repository" cat-file commit "$CANDIDATE_SHA" | git -C "$fixtures/repository" hash-object -w -t commit --stdin)" = "$CANDIDATE_SHA"
+          test -f "$fixtures/repository/.git/objects/${CANDIDATE_SHA:0:2}/${CANDIDATE_SHA:2}"
           # Git refuses a repository owned by another UID.  Transfer both
           # the checkout and its internal metadata before mounting it
           # read-only into the non-root consumer image.

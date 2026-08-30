@@ -7,9 +7,9 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone
-import subprocess
 import tomllib
 from typing import Mapping, Sequence
+import zlib
 
 from .cli import main as cli_main
 from .docker_consumer import DockerConsumerContract, DockerMountCheck, DockerMountName, DockerMountStatus, DockerOperationMode, evaluate_docker_consumer, render_docker_consumer_diagnostics
@@ -51,17 +51,41 @@ def _identity(path: Path) -> dict[str, str] | None:
 
 
 def _checkout_candidate(repository: Path) -> str | None:
-    """Read the mounted checkout identity rather than trusting image metadata."""
+    """Read a detached candidate from self-contained mounted Git metadata.
 
+    The minimal consumer image intentionally does not carry Git.  The hosted
+    fixture therefore supplies a detached ``HEAD`` plus a verified loose
+    commit object inside its own ``.git`` directory.  Linked worktrees,
+    symbolic heads, object indirection, and malformed/copy-pasted objects all
+    fail closed rather than falling back to caller-provided identity.
+    """
+
+    git_directory = repository / ".git"
     try:
-        result = subprocess.run(
-            ("git", "-C", os.fspath(repository), "rev-parse", "--verify", "HEAD^{commit}"),
-            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+        if not git_directory.is_dir() or git_directory.is_symlink():
+            return None
+        head = git_directory / "HEAD"
+        if not head.is_file() or head.is_symlink():
+            return None
+        value = head.read_text(encoding="ascii")
+        if len(value) != 41 or value[-1] != "\n":
+            return None
+        candidate = value[:-1]
+        if len(candidate) != 40 or any(character not in "0123456789abcdef" for character in candidate):
+            return None
+        object_path = git_directory / "objects" / candidate[:2] / candidate[2:]
+        if not object_path.is_file() or object_path.is_symlink():
+            return None
+        raw = zlib.decompress(object_path.read_bytes())
+    except (OSError, UnicodeError, zlib.error):
         return None
-    value = result.stdout.strip()
-    return value if result.returncode == 0 and len(value) == 40 and all(character in "0123456789abcdef" for character in value) else None
+    separator = raw.find(b"\0")
+    if separator <= 0:
+        return None
+    header, body = raw[:separator], raw[separator + 1 :]
+    if header != f"commit {len(body)}".encode("ascii"):
+        return None
+    return candidate if hashlib.sha1(raw).hexdigest() == candidate else None
 
 
 def _authority_issued_at(path: Path) -> datetime | None:

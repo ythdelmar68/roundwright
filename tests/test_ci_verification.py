@@ -123,6 +123,8 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('test ! -e "$fixtures/repository/.git/objects/info/alternates"', workflow)
         self.assertNotIn('worktree add --detach "$fixtures/repository"', workflow)
         self.assertIn('git -C "$fixtures/repository" rev-parse HEAD', workflow)
+        self.assertIn('git -C "$fixtures/repository" cat-file commit "$CANDIDATE_SHA" | git -C "$fixtures/repository" hash-object -w -t commit --stdin', workflow)
+        self.assertIn('test -f "$fixtures/repository/.git/objects/${CANDIDATE_SHA:0:2}/${CANDIDATE_SHA:2}"', workflow)
         repository_owner = 'sudo chown -R 65532:65532 "$fixtures/repository"'
         self.assertIn(repository_owner, workflow)
         self.assertIn('test "$(stat -c \'%u:%g\' "$fixtures/repository")" = "65532:65532"', workflow)

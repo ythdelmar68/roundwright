@@ -19,6 +19,7 @@ _MOUNTS = ("authentication", "authority-receipt", "configuration", "repository",
 class NegativeScenario:
     mode: str
     reason: str
+    candidate: str = "match"
     authentication: str = "ready"
     authority_receipt: str | None = None
     authority_mount: str | None = None
@@ -44,7 +45,7 @@ class NegativeScenario:
             "roundwright Docker consumer preflight",
             f"mode: {self.mode}",
             *(f"{name} mount: {values[name]}" for name in _MOUNTS),
-            "candidate: match",
+            f"candidate: {self.candidate}",
             "package: match",
             "base image: match",
             f"authority receipt: {authority_receipt}",
@@ -67,7 +68,11 @@ _SCENARIOS = {
     ("authoritative", "authority-receipt mount: missing"): _mount("authoritative", "authority-receipt mount: missing", authority_receipt="missing"),
     ("test-only", "authority-receipt mount: permission-mismatch"): _mount("test-only", "authority-receipt mount: permission-mismatch"),
     ("authoritative", "state mount: ownership-mismatch"): _mount("authoritative", "state mount: ownership-mismatch"),
-    ("test-only", "repository mount: evidence-mismatch"): _mount("test-only", "repository mount: evidence-mismatch"),
+    # A dirty checkout and the image's empty /workspace both fail the strict
+    # verifier before it can observe a detached candidate, so this is
+    # deliberately candidate *missing*, not merely a ready identity paired
+    # with an unrelated mount error.
+    ("test-only", "repository mount: evidence-mismatch"): _mount("test-only", "repository mount: evidence-mismatch", candidate="missing"),
     ("read-only", "configuration mount: evidence-mismatch"): _mount("read-only", "configuration mount: evidence-mismatch"),
     ("test-only", "authentication mount: evidence-mismatch"): _mount("test-only", "authentication mount: evidence-mismatch"),
     ("authoritative", "state mount: evidence-mismatch"): _mount("authoritative", "state mount: evidence-mismatch", authentication="evidence-mismatch", configuration="evidence-mismatch"),

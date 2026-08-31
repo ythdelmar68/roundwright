@@ -108,6 +108,9 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("authority-receipt mount: missing", authority_missing)
         self.assertIn("authority receipt: missing", authority_missing)
         self.assertIn("result: blocked (authority-receipt mount is missing)", authority_missing)
+        repository_drift = scenarios.scenario("test-only", "repository mount: evidence-mismatch").render()
+        self.assertIn("repository mount: evidence-mismatch", repository_drift)
+        self.assertIn("candidate: missing", repository_drift)
         self.assertIn('ci/docker_negative_scenarios.py "$mode" "$expected"', workflow)
         self.assertNotIn('canonical="$(printf', workflow)
     def test_docker_fixture_writer_records_the_serialized_native_host_installation(self) -> None:

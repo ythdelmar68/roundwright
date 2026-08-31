@@ -580,6 +580,39 @@ class DockerConsumerTests(unittest.TestCase):
             self.assertIn("authority-receipt mount: missing\n", rendered.getvalue())
             self.assertIn("authority receipt: missing\n", rendered.getvalue())
 
+    def test_entrypoint_reports_candidate_missing_for_dirty_or_empty_checkout(self) -> None:
+        """Repository evidence failures cannot claim an observed candidate."""
+
+        now = datetime.now(timezone.utc)
+        candidate = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            write_typed_mounted_evidence(paths, candidate, now=now)
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({
+                "candidate_sha": candidate, "package_digest": digest("b"), "base_image_digest": digest("c"),
+            }), encoding="utf-8")
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": "test-only", "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64, "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                **mounted_runtime_environment(),
+            }
+            paths[DockerMountName.AUTHORITY_RECEIPT] = root / "authority-unmounted.json"
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=lambda path, mode: mode == os.R_OK), mock.patch(
+                "roundwright.docker_entrypoint._checkout_candidate", return_value=None,
+            ):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            rendered = io.StringIO()
+            render_docker_consumer_diagnostics(report, rendered)
+            self.assertEqual(report.exit_code, 2)
+            self.assertEqual(report.reason, "repository mount is evidence-mismatch")
+            self.assertEqual(report.candidate, DockerIdentityStatus.MISSING)
+            self.assertIn("repository mount: evidence-mismatch\n", rendered.getvalue())
+            self.assertIn("candidate: missing\n", rendered.getvalue())
+
     def test_entrypoint_reconciles_typed_runtime_identity_drift_in_every_mode(self) -> None:
         """Every mode consumes the same mounted identity evidence before ready."""
 

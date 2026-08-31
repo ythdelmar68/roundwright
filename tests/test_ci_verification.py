@@ -69,6 +69,17 @@ def load_docker_fixture_writer() -> object:
     return module
 
 
+def load_docker_negative_scenarios() -> object:
+    location = ROOT / "ci" / "docker_negative_scenarios.py"
+    specification = importlib.util.spec_from_file_location("docker_negative_scenarios", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("Docker negative scenarios are unavailable")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = module
+    specification.loader.exec_module(module)
+    return module
+
+
 def load_docker_consumer_test_helpers() -> object:
     location = ROOT / "tests" / "test_docker_consumer.py"
     specification = importlib.util.spec_from_file_location("docker_consumer_test_helpers", location)
@@ -80,6 +91,25 @@ def load_docker_consumer_test_helpers() -> object:
 
 
 class CiVerificationTests(unittest.TestCase):
+    def test_docker_negative_scenarios_cover_every_workflow_invocation(self) -> None:
+        """Hosted assertions consume one complete, reviewed projection each."""
+
+        scenarios = load_docker_negative_scenarios()
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        import re
+        calls = re.findall(r'expect_blocked (authoritative|read-only|test-only) "([^"]+)"', workflow)
+        self.assertGreaterEqual(len(calls), 20)
+        for mode, expected in calls:
+            rendered = scenarios.scenario(mode, expected).render()
+            self.assertEqual(rendered.count("\n"), 11)
+            self.assertIn(f"mode: {mode}\n", rendered)
+            self.assertIn(f"result: blocked ({scenarios.scenario(mode, expected).reason})", rendered)
+        authority_missing = scenarios.scenario("authoritative", "authority-receipt mount: missing").render()
+        self.assertIn("authority-receipt mount: missing", authority_missing)
+        self.assertIn("authority receipt: missing", authority_missing)
+        self.assertIn("result: blocked (authority-receipt mount is missing)", authority_missing)
+        self.assertIn('ci/docker_negative_scenarios.py "$mode" "$expected"', workflow)
+        self.assertNotIn('canonical="$(printf', workflow)
     def test_docker_fixture_writer_records_the_serialized_native_host_installation(self) -> None:
         """The positive image fixture must persist exactly the mounted typed state evidence."""
 
@@ -258,9 +288,6 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('sudo find "$fixtures/state" -type d -exec chmod 0750 {} +', workflow)
         self.assertIn('sudo find "$fixtures/state" -type f -exec chmod 0640 {} +', workflow)
         self.assertIn('expect_blocked test-only "state mount: missing"', workflow)
-        self.assertIn("if [ \"$mode:$expected\" = 'test-only:state mount: missing' ]; then", workflow)
-        self.assertIn('authentication=evidence-mismatch', workflow)
-        self.assertIn('configuration=evidence-mismatch', workflow)
         self.assertIn('No state bind also prevents typed configuration/authentication', workflow)
         self.assertIn('expect_blocked read-only "state mount: permission-mismatch"', workflow)
         self.assertIn('expect_blocked authoritative "authority-receipt mount: missing"', workflow)
@@ -294,10 +321,9 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('expect_blocked test-only "authentication mount: evidence-mismatch"', workflow)
         self.assertIn('expect_blocked authoritative "state mount: evidence-mismatch"', workflow)
         self.assertNotIn('expect_blocked authoritative "authority receipt: missing"', workflow)
-        self.assertIn('authoritative:authority\\ receipt:\\ mismatch', workflow)
         self.assertNotIn('"repository mount: missing" docker', workflow)
         self.assertIn('if [ "$exit_code" -ne 2 ]; then', workflow)
-        self.assertIn('canonical="$(printf', workflow)
+        self.assertIn('canonical="$(python ci/resolve_validation_toolchain.py exec-python -- ci/docker_negative_scenarios.py', workflow)
         self.assertIn('if [ "$output" != "$canonical" ]; then', workflow)
         self.assertIn('docker consumer negative assertion failed: $mode/$expected diagnostic', workflow)
         self.assertNotIn("printf '%s\\n' \"$output\" >&2", workflow)
@@ -309,9 +335,8 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('sudo chmod 0660 "$fixtures/run/authority-writable.json"', workflow)
         self.assertIn('-v "$fixtures/run/authority-writable.json:/run/roundwright/authority-receipt.json:rw"', workflow)
         self.assertNotIn('test "$exit_code" -eq 2', workflow)
-        self.assertIn("case \"$mode:$expected\" in", workflow)
-        self.assertIn("authentication=ready", workflow)
-        self.assertIn("authority_receipt=match", workflow)
+        self.assertNotIn("case \"$mode:$expected\" in", workflow)
+        self.assertIn('docker_negative_scenarios.py "$mode" "$expected"', workflow)
         self.assertIn("roundwright-docker-fixtures", workflow)
         self.assertNotIn("| python ci/materialize_git_commit.py", workflow)
         self.assertNotIn("\n            python -c", workflow)

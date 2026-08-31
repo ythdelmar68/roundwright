@@ -544,6 +544,42 @@ class DockerConsumerTests(unittest.TestCase):
                 "result: blocked (state mount is missing)\n",
             )
 
+    def test_entrypoint_reports_complete_missing_authority_diagnostic(self) -> None:
+        """An authoritative absent receipt is mount-missing and identity-missing."""
+
+        now = datetime.now(timezone.utc)
+        candidate = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            write_typed_mounted_evidence(paths, candidate, now=now)
+            paths[DockerMountName.AUTHORITY_RECEIPT] = root / "authority-unmounted.json"
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({
+                "candidate_sha": candidate,
+                "package_digest": digest("b"),
+                "base_image_digest": digest("c"),
+            }), encoding="utf-8")
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                **mounted_runtime_environment(),
+            }
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=lambda _path, mode: mode == os.R_OK or _path is paths[DockerMountName.STATE]), mock.patch(
+                "roundwright.docker_entrypoint._checkout_candidate", return_value=candidate,
+            ):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            rendered = io.StringIO()
+            render_docker_consumer_diagnostics(report, rendered)
+            self.assertEqual(report.exit_code, 2)
+            self.assertEqual(report.reason, "authority-receipt mount is missing")
+            self.assertIn("authority-receipt mount: missing\n", rendered.getvalue())
+            self.assertIn("authority receipt: missing\n", rendered.getvalue())
+
     def test_entrypoint_reconciles_typed_runtime_identity_drift_in_every_mode(self) -> None:
         """Every mode consumes the same mounted identity evidence before ready."""
 

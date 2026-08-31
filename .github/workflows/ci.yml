@@ -187,10 +187,6 @@ jobs:
             mode="$1"
             expected="$2"
             shift 2
-            case "$mode:$expected" in
-              authoritative:authority\ receipt:\ mismatch|authoritative:authority-receipt\ mount:\ missing|authoritative:authority-receipt\ mount:\ permission-mismatch|authoritative:state\ mount:\ ownership-mismatch|authoritative:state\ mount:\ evidence-mismatch|authoritative:state\ mount:\ permission-mismatch|read-only:state\ mount:\ permission-mismatch|read-only:configuration\ mount:\ evidence-mismatch|read-only:configuration\ mount:\ missing|read-only:configuration\ mount:\ permission-mismatch|test-only:state\ mount:\ missing|test-only:repository\ mount:\ evidence-mismatch|test-only:repository\ mount:\ permission-mismatch|test-only:authentication\ mount:\ evidence-mismatch|test-only:authentication\ mount:\ missing|test-only:authentication\ mount:\ permission-mismatch|test-only:authority-receipt\ mount:\ permission-mismatch) ;;
-              *) printf '%s\n' "docker consumer negative assertion failed: invalid canonical scenario" >&2; return 1 ;;
-            esac
             set +e
             output="$("$@" 2>&1)"
             exit_code=$?
@@ -199,49 +195,10 @@ jobs:
               printf '%s\n' "docker consumer negative assertion failed: $mode/$expected exit" >&2
               return 1
             fi
-            authentication=ready
-            authority_mount=ready
-            configuration=ready
-            repository=ready
-            state=ready
-            authority_receipt=match
-            case "$mode" in
-              test-only|read-only) authority_mount=not-applicable; authority_receipt='not required' ;;
-            esac
-            case "$expected" in
-              authentication\ mount:*) authentication="${expected#authentication mount: }" ;;
-              authority-receipt\ mount:*) authority_mount="${expected#authority-receipt mount: }" ;;
-              configuration\ mount:*) configuration="${expected#configuration mount: }" ;;
-              repository\ mount:*) repository="${expected#repository mount: }" ;;
-              state\ mount:*) state="${expected#state mount: }" ;;
-              authority\ receipt:\ mismatch) authority_receipt=mismatch ;;
-            esac
-            # Omitting the state bind leaves no native-host evidence from
-            # which configuration and authentication identities can be
-            # independently reconciled.  The state mount remains the first
-            # blocked contract violation, while these two fields accurately
-            # describe the complete observed diagnostic.
-            if [ "$mode:$expected" = 'test-only:state mount: missing' ]; then
-              authentication=evidence-mismatch
-              configuration=evidence-mismatch
-            fi
-            case "$expected" in
-              authority\ receipt:\ mismatch) reason='authority receipt identity is missing or mismatched' ;;
-              *) reason="${expected/mount: /mount is }" ;;
-            esac
-            canonical="$(printf '%s\n' \
-              'roundwright Docker consumer preflight' \
-              "mode: $mode" \
-              "authentication mount: $authentication" \
-              "authority-receipt mount: $authority_mount" \
-              "configuration mount: $configuration" \
-              "repository mount: $repository" \
-              "state mount: $state" \
-              'candidate: match' \
-              'package: match' \
-              'base image: match' \
-              "authority receipt: $authority_receipt" \
-              "result: blocked ($reason)")"
+            canonical="$(python ci/resolve_validation_toolchain.py exec-python -- ci/docker_negative_scenarios.py "$mode" "$expected")" || {
+              printf '%s\n' "docker consumer negative assertion failed: invalid canonical scenario" >&2
+              return 1
+            }
             if [ "$output" != "$canonical" ]; then
               printf '%s\n' "docker consumer negative assertion failed: $mode/$expected diagnostic" >&2
               return 1

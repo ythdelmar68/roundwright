@@ -14,8 +14,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.docker_authority import canonical_fixture_envelope, load_mounted_authority
-from roundwright.native_host import InvocationSource, NativeHostControlStore
+from roundwright.docker_authority import canonical_fixture_envelope, load_mounted_authority, runtime_environment_fingerprint
+from roundwright.native_host import InvocationSource, NativeHostControlStore, NativeHostMountedRuntimeEvidence
 
 
 def seal_read_only_state(database: Path) -> None:
@@ -73,6 +73,16 @@ def main() -> int:
     decision = NativeHostControlStore(arguments.state / "native-host.sqlite3").install(installation)
     if not decision.accepted:
         raise RuntimeError("native-host fixture state could not be initialized")
+    mounted_evidence = NativeHostMountedRuntimeEvidence(
+        installation.installation_fingerprint,
+        installation.receipt.receipt_fingerprint,
+        arguments.candidate,
+        installation.identity.runtime_binding,
+        material["mounts"]["authentication_identity"],
+        runtime_environment_fingerprint(arguments.candidate, material["mounts"]["runtime_environment"]),
+    )
+    if not NativeHostControlStore(arguments.state / "native-host.sqlite3").record_mounted_runtime_evidence(mounted_evidence).accepted:
+        raise RuntimeError("native-host fixture mounted evidence could not be initialized")
     # Fixture setup may create deterministic persisted lifecycle history; the
     # mounted image only observes it through the read-only adapter.
     control_store = NativeHostControlStore(arguments.state / "native-host.sqlite3")

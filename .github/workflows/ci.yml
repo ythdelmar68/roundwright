@@ -184,38 +184,69 @@ jobs:
           set -e
           test "$exit_code" -eq 3
           expect_blocked() {
-            expected="$1"
-            shift
+            mode="$1"
+            expected="$2"
+            shift 2
+            case "$mode:$expected" in
+              authoritative:authority\ receipt:\ mismatch|authoritative:authority-receipt\ mount:\ missing|authoritative:authority-receipt\ mount:\ permission-mismatch|authoritative:state\ mount:\ ownership-mismatch|authoritative:state\ mount:\ evidence-mismatch|authoritative:state\ mount:\ permission-mismatch|read-only:state\ mount:\ permission-mismatch|read-only:configuration\ mount:\ evidence-mismatch|read-only:configuration\ mount:\ missing|read-only:configuration\ mount:\ permission-mismatch|test-only:state\ mount:\ missing|test-only:repository\ mount:\ evidence-mismatch|test-only:repository\ mount:\ permission-mismatch|test-only:authentication\ mount:\ evidence-mismatch|test-only:authentication\ mount:\ missing|test-only:authentication\ mount:\ permission-mismatch|test-only:authority-receipt\ mount:\ permission-mismatch) ;;
+              *) printf '%s\n' "docker consumer negative assertion failed: invalid canonical scenario" >&2; return 1 ;;
+            esac
             set +e
             output="$("$@" 2>&1)"
             exit_code=$?
             set -e
             if [ "$exit_code" -ne 2 ]; then
-              printf '%s\n' "$output" >&2
+              printf '%s\n' "docker consumer negative assertion failed: $mode/$expected exit" >&2
               return 1
             fi
-            if ! printf '%s\n' "$output" | grep -F "$expected"; then
-              printf '%s\n' "$output" >&2
-              return 1
-            fi
-            if [ "$(printf '%s\n' "$output" | wc -l)" -ne 12 ] || printf '%s\n' "$output" | grep -Ev '^(roundwright Docker consumer preflight|mode: (authoritative|read-only|test-only)|(authentication|authority-receipt|configuration|repository|state) mount: (ready|not-applicable|missing|ownership-mismatch|permission-mismatch|evidence-mismatch)|candidate: (match|missing|mismatch)|package: (match|missing|mismatch)|base image: (match|missing|mismatch)|authority receipt: (not required|match|missing|mismatch)|result: blocked \(((authentication|authority-receipt|configuration|repository|state) mount is (missing|ownership-mismatch|permission-mismatch|evidence-mismatch)|authority receipt identity is missing or mismatched|authority receipt candidate is mismatched|candidate identity is (missing|mismatched)|package identity is (missing|mismatched)|base image identity is (missing|mismatched)|non-authoritative mode received authority input|authority inputs conflict)\))$'; then
-              printf '%s\n' "$output" >&2
-              return 1
-            fi
-            if printf '%s\n' "$output" | grep -Eiq '(/workspace|/etc/roundwright|/run/roundwright|/var/lib/roundwright|roundwright-docker-fixtures|authority-receipt\.json|auth\.toml|config\.toml|token|credential|sha256:)'; then
-              printf '%s\n' "$output" >&2
+            authentication=ready
+            authority_mount=ready
+            configuration=ready
+            repository=ready
+            state=ready
+            authority_receipt=match
+            case "$mode" in
+              test-only|read-only) authority_mount=not-applicable; authority_receipt='not required' ;;
+            esac
+            case "$expected" in
+              authentication\ mount:*) authentication="${expected#authentication mount: }" ;;
+              authority-receipt\ mount:*) authority_mount="${expected#authority-receipt mount: }" ;;
+              configuration\ mount:*) configuration="${expected#configuration mount: }" ;;
+              repository\ mount:*) repository="${expected#repository mount: }" ;;
+              state\ mount:*) state="${expected#state mount: }" ;;
+              authority\ receipt:\ mismatch) authority_receipt=mismatch ;;
+            esac
+            case "$expected" in
+              authority\ receipt:\ mismatch) reason='authority receipt identity is missing or mismatched' ;;
+              *) reason="${expected/mount: /mount is }" ;;
+            esac
+            canonical="$(printf '%s\n' \
+              'roundwright Docker consumer preflight' \
+              "mode: $mode" \
+              "authentication mount: $authentication" \
+              "authority-receipt mount: $authority_mount" \
+              "configuration mount: $configuration" \
+              "repository mount: $repository" \
+              "state mount: $state" \
+              'candidate: match' \
+              'package: match' \
+              'base image: match' \
+              "authority receipt: $authority_receipt" \
+              "result: blocked ($reason)")"
+            if [ "$output" != "$canonical" ]; then
+              printf '%s\n' "docker consumer negative assertion failed: $mode/$expected diagnostic" >&2
               return 1
             fi
           }
           # Each negative is a real image invocation.  Keep these fail-closed
           # assertions beside the positive paths so hosted CI cannot replace
           # mount/authority drift with an empty fixture.
-          expect_blocked "state mount: missing" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only "$image" doctor
-          expect_blocked "state mount: permission-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:rw" "$image" doctor
-          expect_blocked "authority-receipt mount: missing" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative -v "$fixtures/state:/var/lib/roundwright:rw" "$image" doctor
-          expect_blocked "authority-receipt mount: permission-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:ro" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
+          expect_blocked test-only "state mount: missing" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only "$image" doctor
+          expect_blocked read-only "state mount: permission-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:rw" "$image" doctor
+          expect_blocked authoritative "authority-receipt mount: missing" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative -v "$fixtures/state:/var/lib/roundwright:rw" "$image" doctor
+          expect_blocked test-only "authority-receipt mount: permission-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:ro" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
           sudo chown 0:0 "$fixtures/state/native-host.sqlite3"
-          expect_blocked "state mount: ownership-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
+          expect_blocked authoritative "state mount: ownership-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-receipt.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
           sudo chown 65532:65532 "$fixtures/state/native-host.sqlite3"
           # These are material drift cases, not missing-mount substitutes.
           # Preserve their typed shape and only change the observed binding so
@@ -227,11 +258,11 @@ jobs:
           sudo cp -a "$fixtures/repository" "$fixtures/repository-dirty"
           sudo sh -c 'printf "# mounted-tree-drift\\n" >> "$1/README.md"' sh "$fixtures/repository-dirty"
           sudo chown -R 65532:65532 "$fixtures/repository-dirty"
-          expect_blocked "repository mount: evidence-mismatch" docker run --rm "${bare[@]}" -v "$fixtures/repository-dirty:/workspace:ro" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked test-only "repository mount: evidence-mismatch" docker run --rm "${bare[@]}" -v "$fixtures/repository-dirty:/workspace:ro" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           sed "s/$CANDIDATE_SHA/0000000000000000000000000000000000000000/" "$fixtures/etc/config.toml" > "$fixtures/etc/config-drift.toml"
-          expect_blocked "configuration mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-drift.toml:/etc/roundwright/config.toml:ro" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked read-only "configuration mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-drift.toml:/etc/roundwright/config.toml:ro" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           sed "s/$CANDIDATE_SHA/0000000000000000000000000000000000000000/" "$fixtures/run/auth.toml" > "$fixtures/run/auth-drift.toml"
-          expect_blocked "authentication mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" -v "$fixtures/run/auth-drift.toml:/run/roundwright/auth.toml:ro" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked test-only "authentication mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" -v "$fixtures/run/auth-drift.toml:/run/roundwright/auth.toml:ro" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           # State is already the runtime-owned authoritative tree.  The
           # disposable drift copy must therefore be created by setup root
           # before its copied ownership and modes are reasserted below.
@@ -240,43 +271,43 @@ jobs:
           sudo chown -R 65532:65532 "$fixtures/state-drift"
           sudo find "$fixtures/state-drift" -type d -exec chmod 0750 {} +
           sudo find "$fixtures/state-drift" -type f -exec chmod 0640 {} +
-          expect_blocked "state mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state-drift:/var/lib/roundwright:rw" "${authority_mount[@]}" "$image" doctor
+          expect_blocked authoritative "state mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state-drift:/var/lib/roundwright:rw" "${authority_mount[@]}" "$image" doctor
           # Exercise every mandatory host-owned input independently.  These
           # use the same candidate-bound image and fixture material as the
           # positive paths, but never publish an image or mutate authority.
           # The image declares /workspace, so omitting the host bind keeps an
           # empty image directory.  That is present-but-unverified evidence,
           # not an absent mount, and must fail closed accordingly.
-          expect_blocked "repository mount: evidence-mismatch" docker run --rm "${bare[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
-          expect_blocked "configuration mount: missing" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
-          expect_blocked "authentication mount: missing" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
-          expect_blocked "state mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:ro" "${authority_mount[@]}" "$image" doctor
-          expect_blocked "repository mount: permission-mismatch" docker run --rm "${bare[@]}" -v "$fixtures/repository:/workspace:rw" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked test-only "repository mount: evidence-mismatch" docker run --rm "${bare[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked read-only "configuration mount: missing" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked test-only "authentication mount: missing" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked authoritative "state mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:ro" "${authority_mount[@]}" "$image" doctor
+          expect_blocked test-only "repository mount: permission-mismatch" docker run --rm "${bare[@]}" -v "$fixtures/repository:/workspace:rw" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           cp "$fixtures/etc/config.toml" "$fixtures/etc/config-writable.toml"
           chmod 0666 "$fixtures/etc/config-writable.toml"
-          expect_blocked "configuration mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-writable.toml:/etc/roundwright/config.toml:rw" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked read-only "configuration mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-writable.toml:/etc/roundwright/config.toml:rw" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           cp "$fixtures/run/auth.toml" "$fixtures/run/auth-writable.toml"
           chmod 0666 "$fixtures/run/auth-writable.toml"
-          expect_blocked "authentication mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" -v "$fixtures/run/auth-writable.toml:/run/roundwright/auth.toml:rw" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked test-only "authentication mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" -v "$fixtures/run/auth-writable.toml:/run/roundwright/auth.toml:rw" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           cp "$fixtures/run/authority-receipt.json" "$fixtures/run/authority-writable.json"
           sudo chown 65532:65532 "$fixtures/run/authority-writable.json"
           sudo chmod 0660 "$fixtures/run/authority-writable.json"
-          expect_blocked "authority-receipt mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-writable.json:/run/roundwright/authority-receipt.json:rw" "$image" doctor
+          expect_blocked authoritative "authority-receipt mount: permission-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-writable.json:/run/roundwright/authority-receipt.json:rw" "$image" doctor
           cp "$fixtures/run/authority-receipt.json" "$fixtures/run/authority-malformed.json"
           printf '{}\n' > "$fixtures/run/authority-malformed.json"
           malformed_sha="$(sha256sum "$fixtures/run/authority-malformed.json" | cut -d ' ' -f 1)"
-          expect_blocked "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$malformed_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-malformed.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
-          expect_blocked "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$(printf '0%.0s' {1..64})" -v "$fixtures/state:/var/lib/roundwright:rw" "${authority_mount[@]}" "$image" doctor
+          expect_blocked authoritative "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$malformed_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-malformed.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
+          expect_blocked authoritative "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$(printf '0%.0s' {1..64})" -v "$fixtures/state:/var/lib/roundwright:rw" "${authority_mount[@]}" "$image" doctor
           for status in expired copied conflicting revoked; do
             cp "$fixtures/run/authority-receipt.json" "$fixtures/run/authority-$status.json"
             python ci/resolve_validation_toolchain.py exec-python -- -c 'import json,sys; path=sys.argv[1]; status=sys.argv[2]; value=json.load(open(path)); value["verification"]["status"]=status; open(path,"w").write(json.dumps(value,sort_keys=True,separators=(",",":")))' "$fixtures/run/authority-$status.json" "$status"
             bad_sha="$(sha256sum "$fixtures/run/authority-$status.json" | cut -d ' ' -f 1)"
-            expect_blocked "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$bad_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-$status.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
+            expect_blocked authoritative "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$bad_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-$status.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
           done
           cp "$fixtures/run/authority-receipt.json" "$fixtures/run/authority-wrong-candidate.json"
           python ci/resolve_validation_toolchain.py exec-python -- -c 'import json,sys; path=sys.argv[1]; value=json.load(open(path)); value["candidate_sha"]="0"*40; open(path,"w").write(json.dumps(value,sort_keys=True,separators=(",",":")))' "$fixtures/run/authority-wrong-candidate.json"
           bad_sha="$(sha256sum "$fixtures/run/authority-wrong-candidate.json" | cut -d ' ' -f 1)"
-          expect_blocked "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$bad_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-wrong-candidate.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
+          expect_blocked authoritative "authority receipt: mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$bad_sha" -v "$fixtures/state:/var/lib/roundwright:rw" -v "$fixtures/run/authority-wrong-candidate.json:/run/roundwright/authority-receipt.json:ro" "$image" doctor
           docker tag "$image" roundwright-consumer:local
           export ROUNDWRIGHT_WHEEL="${{ steps.docker-inputs.outputs.wheel }}"
           export ROUNDWRIGHT_WHEEL_SHA256="${{ steps.docker-inputs.outputs.wheel_sha256 }}"

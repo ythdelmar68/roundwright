@@ -14,7 +14,7 @@ import zlib
 from .cli import main as cli_main
 from .docker_consumer import DockerConsumerContract, DockerMountCheck, DockerMountName, DockerMountStatus, DockerOperationMode, evaluate_docker_consumer, render_docker_consumer_diagnostics
 from .docker_authority import DockerAuthorityAdapterError, MountedAuthorityEvidence, evaluate_mounted_authority, load_mounted_authority, runtime_environment_fingerprint
-from .native_host import NativeHostControlStore, NativeHostError
+from .native_host import NativeHostControlStore, NativeHostError, NativeHostMountedRuntimeEvidence
 from .runtime_binding import RuntimeBinding
 
 
@@ -204,6 +204,8 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
     # repository for a different candidate is just as unsafe as no checkout.
     if _checkout_candidate(repository) != candidate:
         result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
+    binding: RuntimeBinding | None = None
+    authentication_identity: str | None = None
     try:
         configuration = tomllib.loads(paths[DockerMountName.CONFIGURATION].read_text(encoding="utf-8"))
         runtime = configuration.get("runtime")
@@ -226,6 +228,7 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
             raise ValueError
         if authority is not None and operator["identity"] != authority.authentication_identity:
             raise ValueError
+        authentication_identity = operator["identity"]
     except (OSError, TypeError, ValueError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         result[DockerMountName.AUTHENTICATION] = DockerMountStatus.EVIDENCE_MISMATCH
     database = paths[DockerMountName.STATE] / "native-host.sqlite3"
@@ -240,7 +243,8 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
             # exception from a file it is not allowed to inspect.
             result[DockerMountName.STATE] = DockerMountStatus.OWNERSHIP_MISMATCH
         else:
-            observation = NativeHostControlStore(database).observe()
+            store = NativeHostControlStore(database)
+            observation = store.observe()
             state_valid = observation.candidate_sha == candidate
             if mounted_runtime is None:
                 state_valid = False
@@ -249,7 +253,29 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
                 or observation.receipt_fingerprint != mounted_runtime["receipt_fingerprint"]
             ):
                 state_valid = False
-            elif authority is not None:
+            elif (
+                DockerMountName.CONFIGURATION in result
+                or DockerMountName.AUTHENTICATION in result
+            ):
+                # Preserve the directly observed configuration/authentication
+                # diagnostic when that input cannot be parsed.  The store is
+                # still verified for coherent substitutions below, where both
+                # mounted files otherwise look valid.
+                state_valid = True
+            elif binding is None or authentication_identity is None:
+                state_valid = False
+            else:
+                observed_environment = {name: environment[name] for name in _RUNTIME_ENVIRONMENT}
+                mounted_evidence = NativeHostMountedRuntimeEvidence(
+                    observation.installation_fingerprint,
+                    observation.receipt_fingerprint,
+                    candidate,
+                    binding,
+                    authentication_identity,
+                    runtime_environment_fingerprint(candidate, observed_environment),
+                )
+                state_valid = store.verify_mounted_runtime_evidence(mounted_evidence).accepted
+            if state_valid and authority is not None:
                 installation = authority.native_host_installation
                 installation.identity.runtime_binding.require_matches(authority.identity.runtime_binding)
                 if (
@@ -264,8 +290,8 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
                 ):
                     state_valid = False
                 else:
-                    state_valid = NativeHostControlStore(database).verify(installation).accepted
-    except (NativeHostError, OSError, ValueError):
+                    state_valid = store.verify(installation).accepted
+    except (KeyError, NativeHostError, OSError, ValueError):
         # Corrupt or unreadable mounted state is untrusted input.  It must
         # produce ordinary fail-closed preflight evidence, never an unhandled
         # installed-image exception.

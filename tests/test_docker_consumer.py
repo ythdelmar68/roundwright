@@ -30,9 +30,9 @@ from roundwright.docker_consumer import (
     render_docker_consumer_diagnostics,
 )
 from roundwright.docker_entrypoint import _checkout_candidate, _render_mounted_status, main as docker_entrypoint_main, preflight
-from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority
+from roundwright.docker_authority import DockerAuthorityAdapterError, canonical_fixture_envelope, evaluate_mounted_authority, runtime_environment_fingerprint
 from roundwright.docker_authority import canonical_native_host_installation
-from roundwright.native_host import InvocationSource, NativeHostControlStore
+from roundwright.native_host import InvocationSource, NativeHostControlStore, NativeHostMountedRuntimeEvidence
 from roundwright.cli import main
 
 
@@ -97,10 +97,17 @@ def write_typed_mounted_evidence(paths: dict[DockerMountName, Path], candidate: 
     paths[DockerMountName.AUTHORITY_RECEIPT].write_text(
         json.dumps(material, sort_keys=True, separators=(",", ":")), encoding="utf-8",
     )
-    assert NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3").install(
-        canonical_native_host_installation(candidate, now=now)
-    ).accepted
+    store = NativeHostControlStore(paths[DockerMountName.STATE] / "native-host.sqlite3")
+    assert store.install(canonical_native_host_installation(candidate, now=now)).accepted
     installation = canonical_native_host_installation(candidate, now=now)
+    assert store.record_mounted_runtime_evidence(NativeHostMountedRuntimeEvidence(
+        installation.installation_fingerprint,
+        installation.receipt.receipt_fingerprint,
+        candidate,
+        installation.identity.runtime_binding,
+        material["mounts"]["authentication_identity"],
+        runtime_environment_fingerprint(candidate, material["mounts"]["runtime_environment"]),
+    )).accepted
     (paths[DockerMountName.STATE] / "docker-runtime-evidence.json").write_text(
         json.dumps(
             {
@@ -599,6 +606,66 @@ class DockerConsumerTests(unittest.TestCase):
                 report = preflight(environment, paths=paths, identity_path=identity)
             self.assertEqual(report.exit_code, 2)
             self.assertIn("state mount is evidence-mismatch", report.reason)
+
+    def test_entrypoint_rejects_correlated_runtime_and_authentication_substitution_in_every_mode(self) -> None:
+        """SQLite-native host evidence is independent of substitutable mounts."""
+
+        now = datetime.now(timezone.utc)
+        candidate = "a" * 40
+        substituted = canonical_fixture_envelope("b" * 40, now=now)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({
+                "candidate_sha": candidate, "package_digest": digest("b"), "base_image_digest": digest("c"),
+            }), encoding="utf-8")
+
+            for mode in DockerOperationMode:
+                paths[DockerMountName.AUTHORITY_RECEIPT] = root / "authority-receipt"
+                write_typed_mounted_evidence(paths, candidate, now=now)
+                runtime = json.loads((paths[DockerMountName.STATE] / "docker-runtime-evidence.json").read_text(encoding="utf-8"))
+                runtime["runtime_binding"] = substituted["identity"]["runtime_binding"]
+                runtime["authentication_identity"] = substituted["mounts"]["authentication_identity"]
+                (paths[DockerMountName.STATE] / "docker-runtime-evidence.json").write_text(
+                    json.dumps(runtime, sort_keys=True, separators=(",", ":")), encoding="utf-8",
+                )
+                paths[DockerMountName.CONFIGURATION].write_text(
+                    "[runtime]\n"
+                    f"candidate_sha = {json.dumps(candidate)}\n"
+                    f"binding = {json.dumps(substituted['identity']['runtime_binding'])}\n",
+                    encoding="utf-8",
+                )
+                paths[DockerMountName.AUTHENTICATION].write_text(
+                    "[operator]\n"
+                    f"candidate_sha = {json.dumps(candidate)}\n"
+                    f"identity = {json.dumps(substituted['mounts']['authentication_identity'])}\n",
+                    encoding="utf-8",
+                )
+                environment = {
+                    "ROUNDWRIGHT_DOCKER_MODE": mode.value,
+                    "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                    "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                    "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                    **mounted_runtime_environment(),
+                }
+                if mode is DockerOperationMode.AUTHORITATIVE:
+                    environment["ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256"] = hashlib.sha256(
+                        paths[DockerMountName.AUTHORITY_RECEIPT].read_bytes()
+                    ).hexdigest()
+                    access = lambda path, access_mode: access_mode == os.R_OK or path is paths[DockerMountName.STATE]
+                else:
+                    paths[DockerMountName.AUTHORITY_RECEIPT] = root / "unmounted-authority"
+                    access = lambda _path, access_mode: access_mode == os.R_OK
+                with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=access), mock.patch(
+                    "roundwright.docker_entrypoint._checkout_candidate", return_value=candidate,
+                ):
+                    report = preflight(environment, paths=paths, identity_path=identity)
+                self.assertEqual(report.exit_code, 2, mode.value)
+                expected = "configuration mount is evidence-mismatch" if mode is DockerOperationMode.AUTHORITATIVE else "state mount is evidence-mismatch"
+                self.assertIn(expected, report.reason, mode.value)
 
     def test_entrypoint_renders_every_present_invalid_authority_variant_as_mismatch(self) -> None:
         """Present authority evidence is never rendered as an absent mount."""

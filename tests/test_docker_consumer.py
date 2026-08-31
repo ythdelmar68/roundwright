@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import contextlib
+from dataclasses import dataclass
 import os
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -15,10 +16,12 @@ import tempfile
 import unittest
 from unittest import mock
 import zlib
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from ci.docker_negative_scenarios import _SCENARIOS, scenario
 from roundwright.docker_consumer import (
     DockerConsumerContract,
     DockerIdentityStatus,
@@ -52,10 +55,28 @@ def mounts(status: DockerMountStatus = DockerMountStatus.READY, *, authority: Do
     return tuple(DockerMountCheck(name, authority if name is DockerMountName.AUTHORITY_RECEIPT and authority is not None else status) for name in DockerMountName)
 
 
-def write_self_contained_checkout(repository: Path, *, body: bytes | None = None) -> str:
+def write_self_contained_checkout(
+    repository: Path,
+    *,
+    body: bytes | None = None,
+    tracked_file: tuple[str, bytes] | None = None,
+) -> str:
     """Create only the detached Git evidence available to the minimal image."""
 
-    tree_raw = b"tree 0\0"
+    git_directory = repository / ".git"
+    entries: list[dict[str, str]] = []
+    tree_body = b""
+    if tracked_file is not None:
+        name, content = tracked_file
+        raw_blob = b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+        blob_sha = hashlib.sha1(raw_blob).hexdigest()
+        blob_path = git_directory / "objects" / blob_sha[:2] / blob_sha[2:]
+        blob_path.parent.mkdir(parents=True, exist_ok=True)
+        blob_path.write_bytes(zlib.compress(raw_blob))
+        (repository / name).write_bytes(content)
+        tree_body = b"100644 " + name.encode("utf-8") + b"\0" + bytes.fromhex(blob_sha)
+        entries.append({"path": name, "sha1": blob_sha})
+    tree_raw = b"tree " + str(len(tree_body)).encode("ascii") + b"\0" + tree_body
     tree_sha = hashlib.sha1(tree_raw).hexdigest()
     body = body or (
         b"tree " + tree_sha.encode("ascii") + b"\nauthor Fixture <fixture@example.invalid> 0 +0000"
@@ -63,7 +84,6 @@ def write_self_contained_checkout(repository: Path, *, body: bytes | None = None
     )
     raw = f"commit {len(body)}".encode("ascii") + b"\0" + body
     candidate = hashlib.sha1(raw).hexdigest()
-    git_directory = repository / ".git"
     object_path = git_directory / "objects" / candidate[:2] / candidate[2:]
     object_path.parent.mkdir(parents=True)
     object_path.write_bytes(zlib.compress(raw))
@@ -72,7 +92,7 @@ def write_self_contained_checkout(repository: Path, *, body: bytes | None = None
     tree_path.write_bytes(zlib.compress(tree_raw))
     (git_directory / "HEAD").write_text(candidate + "\n", encoding="ascii")
     (git_directory / "roundwright-checkout.json").write_text(
-        json.dumps({"candidate_sha": candidate, "entries": [], "tree_sha": tree_sha}, sort_keys=True, separators=(",", ":")),
+        json.dumps({"candidate_sha": candidate, "entries": entries, "tree_sha": tree_sha}, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
     return candidate
@@ -123,6 +143,63 @@ def write_typed_mounted_evidence(paths: dict[DockerMountName, Path], candidate: 
         encoding="utf-8",
     )
     return material
+
+
+@dataclass(frozen=True)
+class HostedNegativeCase:
+    """One expanded hosted ``expect_blocked`` invocation and its fixture drift."""
+
+    name: str
+    mode: str
+    expected: str
+
+
+_HOSTED_NEGATIVE_CASES = (
+    HostedNegativeCase("state-missing", "test-only", "state mount: missing"),
+    HostedNegativeCase("state-writable-read-only", "read-only", "state mount: permission-mismatch"),
+    HostedNegativeCase("authority-mount-missing", "authoritative", "authority-receipt mount: missing"),
+    HostedNegativeCase("authority-present-nonauthoritative", "test-only", "authority-receipt mount: permission-mismatch"),
+    HostedNegativeCase("state-ownership", "authoritative", "state mount: ownership-mismatch"),
+    HostedNegativeCase("repository-dirty", "test-only", "repository mount: evidence-mismatch"),
+    HostedNegativeCase("configuration-drift", "read-only", "configuration mount: evidence-mismatch"),
+    HostedNegativeCase("authentication-drift", "test-only", "authentication mount: evidence-mismatch"),
+    HostedNegativeCase("state-drift", "authoritative", "state mount: evidence-mismatch"),
+    HostedNegativeCase("repository-omitted", "test-only", "repository mount: evidence-mismatch"),
+    HostedNegativeCase("configuration-missing", "read-only", "configuration mount: missing"),
+    HostedNegativeCase("authentication-missing", "test-only", "authentication mount: missing"),
+    HostedNegativeCase("state-read-only-authoritative", "authoritative", "state mount: permission-mismatch"),
+    HostedNegativeCase("repository-writable", "test-only", "repository mount: permission-mismatch"),
+    HostedNegativeCase("configuration-writable", "read-only", "configuration mount: permission-mismatch"),
+    HostedNegativeCase("authentication-writable", "test-only", "authentication mount: permission-mismatch"),
+    HostedNegativeCase("authority-writable", "authoritative", "authority-receipt mount: permission-mismatch"),
+    HostedNegativeCase("authority-malformed", "authoritative", "authority receipt: mismatch"),
+    HostedNegativeCase("authority-digest-mismatch", "authoritative", "authority receipt: mismatch"),
+    HostedNegativeCase("authority-expired", "authoritative", "authority receipt: mismatch"),
+    HostedNegativeCase("authority-copied", "authoritative", "authority receipt: mismatch"),
+    HostedNegativeCase("authority-conflicting", "authoritative", "authority receipt: mismatch"),
+    HostedNegativeCase("authority-revoked", "authoritative", "authority receipt: mismatch"),
+    HostedNegativeCase("authority-wrong-candidate", "authoritative", "authority receipt: mismatch"),
+)
+
+
+def hosted_workflow_expectations() -> tuple[tuple[str, str], ...]:
+    """Expand the workflow's literal status loop into hosted invocations."""
+
+    cases: list[tuple[str, str]] = []
+    statuses: tuple[str, ...] | None = None
+    call = re.compile(r'^\s*expect_blocked\s+(\S+)\s+"([^"]+)"')
+    status_loop = re.compile(r"^\s*for status in ([a-z ]+); do\s*$")
+    for line in (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines():
+        loop_match = status_loop.match(line)
+        if loop_match:
+            statuses = tuple(loop_match.group(1).split())
+            continue
+        call_match = call.match(line)
+        if call_match:
+            cases.extend((call_match.group(1), call_match.group(2)) for _ in (statuses or ("one",)))
+        if statuses is not None and line.strip() == "done":
+            statuses = None
+    return tuple(cases)
 
 
 class DockerConsumerTests(unittest.TestCase):
@@ -788,56 +865,124 @@ class DockerConsumerTests(unittest.TestCase):
                 self.assertIn(expected, report.reason, mode.value)
 
     def test_entrypoint_renders_every_present_invalid_authority_variant_as_mismatch(self) -> None:
-        """Present authority evidence is never rendered as an absent mount."""
+        """Every hosted negative reaches production preflight and its projection."""
 
-        now = datetime.now(timezone.utc)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = {name: root / name.value for name in DockerMountName}
-            paths[DockerMountName.REPOSITORY].mkdir()
-            paths[DockerMountName.STATE].mkdir()
-            identity = root / "identity.json"
-            candidate = "a" * 40
-            identity.write_text(
-                json.dumps({"candidate_sha": candidate, "package_digest": digest("b"), "base_image_digest": digest("c")} ),
-                encoding="utf-8",
-            )
+        self.assertEqual(
+            hosted_workflow_expectations(),
+            tuple((case.mode, case.expected) for case in _HOSTED_NEGATIVE_CASES),
+        )
+        self.assertEqual(set(hosted_workflow_expectations()), set(_SCENARIOS))
 
-            def mounted_access(path: Path, mode: int) -> bool:
-                return mode == os.R_OK or path is paths[DockerMountName.STATE]
+        def mutate_payload(receipt_path: Path, update) -> None:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            update(payload)
+            receipt_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
-            def evaluate_variant(name: str, mutate, *, declared_digest: str | None = None) -> None:
+        for case in _HOSTED_NEGATIVE_CASES:
+            with self.subTest(case=case.name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths = {name: root / name.value for name in DockerMountName}
+                paths[DockerMountName.REPOSITORY].mkdir()
+                paths[DockerMountName.STATE].mkdir()
+                candidate = write_self_contained_checkout(
+                    paths[DockerMountName.REPOSITORY],
+                    tracked_file=("README.md", b"candidate-bound\n"),
+                )
+                now = datetime.now(timezone.utc)
                 write_typed_mounted_evidence(paths, candidate, now=now)
-                receipt_path = paths[DockerMountName.AUTHORITY_RECEIPT]
-                mutate(receipt_path)
+                identity = root / "identity.json"
+                identity.write_text(
+                    json.dumps({"candidate_sha": candidate, "package_digest": digest("b"), "base_image_digest": digest("c")}),
+                    encoding="utf-8",
+                )
+                writable_paths: set[Path] = set()
+                state_writable = case.mode == DockerOperationMode.AUTHORITATIVE.value
+                effective_uid = (paths[DockerMountName.STATE] / "native-host.sqlite3").stat().st_uid
+
+                if case.mode != DockerOperationMode.AUTHORITATIVE.value and case.name != "authority-present-nonauthoritative":
+                    paths[DockerMountName.AUTHORITY_RECEIPT] = root / "unmounted-authority.json"
+
+                if case.name == "state-missing":
+                    paths[DockerMountName.STATE] = root / "unmounted-state"
+                elif case.name == "state-writable-read-only":
+                    state_writable = True
+                elif case.name == "authority-mount-missing":
+                    paths[DockerMountName.AUTHORITY_RECEIPT] = root / "unmounted-authority.json"
+                elif case.name == "authority-present-nonauthoritative":
+                    writable_paths.add(paths[DockerMountName.AUTHORITY_RECEIPT])
+                elif case.name == "state-ownership":
+                    effective_uid += 1
+                elif case.name == "repository-dirty":
+                    (paths[DockerMountName.REPOSITORY] / "README.md").write_bytes(b"mounted-tree-drift\n")
+                elif case.name == "configuration-drift":
+                    paths[DockerMountName.CONFIGURATION].write_text("[runtime]\ncandidate_sha = \"0\"\nbinding = \"{}\"\n", encoding="utf-8")
+                elif case.name == "authentication-drift":
+                    paths[DockerMountName.AUTHENTICATION].write_text("[operator]\ncandidate_sha = \"0\"\nidentity = \"0\"\n", encoding="utf-8")
+                elif case.name == "state-drift":
+                    runtime = json.loads((paths[DockerMountName.STATE] / "docker-runtime-evidence.json").read_text(encoding="utf-8"))
+                    runtime["candidate_sha"] = "0" * 40
+                    (paths[DockerMountName.STATE] / "docker-runtime-evidence.json").write_text(json.dumps(runtime, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+                elif case.name == "repository-omitted":
+                    paths[DockerMountName.REPOSITORY] = root / "image-workspace"
+                    paths[DockerMountName.REPOSITORY].mkdir()
+                elif case.name == "configuration-missing":
+                    paths[DockerMountName.CONFIGURATION] = root / "unmounted-config.toml"
+                elif case.name == "authentication-missing":
+                    paths[DockerMountName.AUTHENTICATION] = root / "unmounted-auth.toml"
+                elif case.name == "state-read-only-authoritative":
+                    state_writable = False
+                elif case.name == "repository-writable":
+                    writable_paths.add(paths[DockerMountName.REPOSITORY])
+                elif case.name == "configuration-writable":
+                    writable_paths.add(paths[DockerMountName.CONFIGURATION])
+                elif case.name == "authentication-writable":
+                    writable_paths.add(paths[DockerMountName.AUTHENTICATION])
+                elif case.name == "authority-writable":
+                    writable_paths.add(paths[DockerMountName.AUTHORITY_RECEIPT])
+                elif case.name == "authority-malformed":
+                    paths[DockerMountName.AUTHORITY_RECEIPT].write_text("{}\n", encoding="utf-8")
+                elif case.name == "authority-digest-mismatch":
+                    pass
+                elif case.name.startswith("authority-"):
+                    status = case.name.removeprefix("authority-")
+                    if status == "wrong-candidate":
+                        mutate_payload(paths[DockerMountName.AUTHORITY_RECEIPT], lambda payload: payload.update({"candidate_sha": "0" * 40}))
+                    else:
+                        mutate_payload(paths[DockerMountName.AUTHORITY_RECEIPT], lambda payload: payload["verification"].update({"status": status}))
+                else:
+                    self.fail(f"unhandled hosted negative case: {case.name}")
+
                 environment = {
-                    "ROUNDWRIGHT_DOCKER_MODE": "authoritative",
+                    "ROUNDWRIGHT_DOCKER_MODE": case.mode,
                     "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
                     "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
                     "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
-                    "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256": declared_digest or hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
                     **mounted_runtime_environment(),
                 }
-                with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch("roundwright.docker_entrypoint._checkout_candidate", return_value=candidate):
+                receipt_path = paths[DockerMountName.AUTHORITY_RECEIPT]
+                if (
+                    case.mode == DockerOperationMode.AUTHORITATIVE.value
+                    and case.name != "authority-mount-missing"
+                ) or case.name == "authority-present-nonauthoritative":
+                    receipt_digest = "0" * 64 if case.name == "authority-digest-mismatch" else hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+                    environment["ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256"] = receipt_digest
+
+                def mounted_access(path: Path, mode: int) -> bool:
+                    if mode == os.R_OK:
+                        return True
+                    if path == paths[DockerMountName.STATE]:
+                        return state_writable
+                    return path in writable_paths
+
+                with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=mounted_access), mock.patch(
+                    "roundwright.docker_entrypoint.os.geteuid", return_value=effective_uid, create=True,
+                ):
                     report = preflight(environment, paths=paths, identity_path=identity)
                 output = io.StringIO()
                 render_docker_consumer_diagnostics(report, output)
-                rendered = output.getvalue().lower()
-                self.assertEqual(report.exit_code, 2, name)
-                self.assertFalse(report.ready, name)
-                self.assertIn("authority receipt: mismatch", rendered, name)
-                self.assertIn("result: blocked (authority receipt identity is missing or mismatched)", rendered, name)
-
-            def mutate_payload(receipt_path: Path, update) -> None:
-                payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-                update(payload)
-                receipt_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-
-            evaluate_variant("malformed", lambda receipt_path: receipt_path.write_text("{}\n", encoding="utf-8"))
-            evaluate_variant("digest-mismatch", lambda receipt_path: None, declared_digest="0" * 64)
-            for status in ("expired", "copied", "conflicting", "revoked"):
-                evaluate_variant(status, lambda receipt_path, status=status: mutate_payload(receipt_path, lambda payload: payload["verification"].update({"status": status})))
-            evaluate_variant("wrong-candidate", lambda receipt_path: mutate_payload(receipt_path, lambda payload: payload.update({"candidate_sha": "0" * 40})))
+                self.assertEqual(report.exit_code, 2)
+                self.assertFalse(report.ready)
+                self.assertEqual(output.getvalue(), scenario(case.mode, case.expected).render() + "\n")
 
     def test_entrypoint_treats_unbound_image_workspace_as_repository_evidence_drift(self) -> None:
         """The image's declared workspace is not proof of a host checkout mount."""

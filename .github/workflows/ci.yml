@@ -221,7 +221,10 @@ jobs:
           # Preserve their typed shape and only change the observed binding so
           # each non-authoritative and authoritative mode reaches production
           # reconciliation inside the installed image.
-          cp -a "$fixtures/repository" "$fixtures/repository-dirty"
+          # The source was deliberately transferred to the non-root runtime
+          # UID before its read-only mount.  Copy its private Git evidence as
+          # setup root, then restore the copied fixture's runtime ownership.
+          sudo cp -a "$fixtures/repository" "$fixtures/repository-dirty"
           sudo sh -c 'printf "# mounted-tree-drift\\n" >> "$1/README.md"' sh "$fixtures/repository-dirty"
           sudo chown -R 65532:65532 "$fixtures/repository-dirty"
           expect_blocked "repository mount: evidence-mismatch" docker run --rm "${bare[@]}" -v "$fixtures/repository-dirty:/workspace:ro" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor

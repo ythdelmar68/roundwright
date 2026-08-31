@@ -264,6 +264,12 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('expect_blocked "state mount: ownership-mismatch"', workflow)
         self.assertIn('repository-dirty', workflow)
         self.assertIn('mounted-tree-drift', workflow)
+        self.assertIn('sudo cp -a "$fixtures/repository" "$fixtures/repository-dirty"', workflow)
+        self.assertNotIn('          cp -a "$fixtures/repository" "$fixtures/repository-dirty"', workflow)
+        self.assertLess(
+            workflow.index('sudo cp -a "$fixtures/repository" "$fixtures/repository-dirty"'),
+            workflow.index('sudo chown -R 65532:65532 "$fixtures/repository-dirty"'),
+        )
         self.assertIn('config-drift.toml', workflow)
         self.assertIn('auth-drift.toml', workflow)
         self.assertIn('state-drift/docker-runtime-evidence.json', workflow)

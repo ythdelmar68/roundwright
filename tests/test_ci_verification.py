@@ -133,7 +133,12 @@ class CiVerificationTests(unittest.TestCase):
         correlated_writer = 'python ci/resolve_validation_toolchain.py exec-python -- ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state-correlated" --configuration "$fixtures/etc/config-correlated.toml" --authentication "$fixtures/run/auth-correlated.toml" --correlated-substitution'
         self.assertIn(correlated_writer, workflow)
         self.assertNotIn('from roundwright.docker_authority import canonical_fixture_envelope', workflow)
-        self.assertLess(workflow.index('sudo chown "$USER" "$fixtures/state-correlated/docker-runtime-evidence.json"'), workflow.index(correlated_writer))
+        host_owner = 'sudo chown -R "$USER" "$fixtures/state-correlated"'
+        image_owner = 'sudo chown -R 65532:65532 "$fixtures/state-correlated"'
+        self.assertIn(host_owner, workflow)
+        self.assertLess(workflow.index(host_owner), workflow.index(correlated_writer))
+        self.assertLess(workflow.index(correlated_writer), workflow.index(image_owner))
+        self.assertLess(workflow.index(image_owner), workflow.index('sudo find "$fixtures/state-correlated" -type d -exec chmod 0750 {} +'))
         for mode, expected, state_access in (
             ("authoritative", "configuration mount: evidence-mismatch", "rw"),
             ("read-only", "state mount: evidence-mismatch", "ro"),

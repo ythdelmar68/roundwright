@@ -246,8 +246,13 @@ jobs:
           # These must be real installed-image calls: independent one-file
           # drift is not a substitute for a correlated host-input attack.
           sudo cp -a "$fixtures/state" "$fixtures/state-correlated"
-          sudo chown "$USER" "$fixtures/state-correlated/docker-runtime-evidence.json"
+          # The copied fixture retains the image UID and non-traversable
+          # directory modes.  Hand the complete copy back to the host only
+          # while the hermetic writer constructs the correlated mutation.
+          sudo chown -R "$USER" "$fixtures/state-correlated"
           python ci/resolve_validation_toolchain.py exec-python -- ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state-correlated" --configuration "$fixtures/etc/config-correlated.toml" --authentication "$fixtures/run/auth-correlated.toml" --correlated-substitution
+          # Reassert the exact image-facing ownership and modes before every
+          # installed-image diagnostic below.
           sudo chown -R 65532:65532 "$fixtures/state-correlated"
           sudo find "$fixtures/state-correlated" -type d -exec chmod 0750 {} +
           sudo find "$fixtures/state-correlated" -type f -exec chmod 0640 {} +

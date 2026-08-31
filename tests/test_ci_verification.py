@@ -240,18 +240,19 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('test ! -e "$fixtures/repository/.git/objects/info/alternates"', workflow)
         self.assertNotIn('worktree add --detach "$fixtures/repository"', workflow)
         self.assertIn('git -C "$fixtures/repository" rev-parse HEAD', workflow)
-        materialize = 'git -C "$fixtures/repository" cat-file commit "$CANDIDATE_SHA" | python ci/materialize_git_commit.py --repository "$fixtures/repository" --candidate "$CANDIDATE_SHA"'
+        materialize = 'python ci/resolve_validation_toolchain.py exec-python -- ci/materialize_git_commit.py --repository "$fixtures/repository" --candidate "$CANDIDATE_SHA"'
         self.assertIn(materialize, workflow)
         self.assertIn('test -f "$fixtures/repository/.git/objects/${CANDIDATE_SHA:0:2}/${CANDIDATE_SHA:2}"', workflow)
+        self.assertIn('test -f "$fixtures/repository/.git/roundwright-checkout.json"', workflow)
         repository_owner = 'sudo chown -R 65532:65532 "$fixtures/repository"'
         self.assertIn(repository_owner, workflow)
         self.assertIn('test "$(stat -c \'%u:%g\' "$fixtures/repository")" = "65532:65532"', workflow)
         self.assertIn('test "$(stat -c \'%u:%g\' "$fixtures/repository/.git")" = "65532:65532"', workflow)
         self.assertLess(workflow.index('git -C "$fixtures/repository" checkout --detach "$CANDIDATE_SHA"'), workflow.index(repository_owner))
         self.assertLess(workflow.index(repository_owner), workflow.index('common=(--network=none --read-only --tmpfs /tmp'))
-        self.assertIn('python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state"', workflow)
+        self.assertIn('python ci/resolve_validation_toolchain.py exec-python -- ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA" --state "$fixtures/state"', workflow)
         self.assertIn('--configuration "$fixtures/etc/config.toml" --authentication "$fixtures/run/auth.toml"', workflow)
-        fixture_writer = workflow.index('python ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA"')
+        fixture_writer = workflow.index('python ci/resolve_validation_toolchain.py exec-python -- ci/write_docker_consumer_fixture.py --candidate "$CANDIDATE_SHA"')
         recursive_owner = 'sudo chown -R 65532:65532 "$fixtures/state"'
         self.assertLess(fixture_writer, workflow.index(recursive_owner))
         self.assertIn('sudo find "$fixtures/state" -type d -exec chmod 0750 {} +', workflow)
@@ -261,6 +262,11 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('expect_blocked "authority-receipt mount: missing"', workflow)
         self.assertIn('expect_blocked "authority-receipt mount: permission-mismatch"', workflow)
         self.assertIn('expect_blocked "state mount: ownership-mismatch"', workflow)
+        self.assertIn('repository-dirty', workflow)
+        self.assertIn('mounted-tree-drift', workflow)
+        self.assertIn('config-drift.toml', workflow)
+        self.assertIn('auth-drift.toml', workflow)
+        self.assertIn('state-drift/docker-runtime-evidence.json', workflow)
         for diagnostic in (
             "repository mount: evidence-mismatch", "configuration mount: missing", "authentication mount: missing",
             "repository mount: permission-mismatch", "configuration mount: permission-mismatch",
@@ -268,6 +274,9 @@ class CiVerificationTests(unittest.TestCase):
             "authority receipt: mismatch",
         ):
             self.assertIn(f'expect_blocked "{diagnostic}"', workflow)
+        self.assertIn('expect_blocked "configuration mount: evidence-mismatch"', workflow)
+        self.assertIn('expect_blocked "authentication mount: evidence-mismatch"', workflow)
+        self.assertIn('expect_blocked "state mount: evidence-mismatch"', workflow)
         self.assertNotIn('expect_blocked "authority receipt: missing"', workflow)
         self.assertEqual(workflow.count('expect_blocked "authority receipt: mismatch"'), 4)
         self.assertNotIn('expect_blocked "repository mount: missing"', workflow)
@@ -281,6 +290,11 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('sudo chmod 0660 "$fixtures/run/authority-writable.json"', workflow)
         self.assertIn('-v "$fixtures/run/authority-writable.json:/run/roundwright/authority-receipt.json:rw"', workflow)
         self.assertNotIn('test "$exit_code" -eq 2', workflow)
+        self.assertIn("wc -l", workflow)
+        self.assertIn("grep -Ev", workflow)
+        self.assertIn("roundwright-docker-fixtures", workflow)
+        self.assertNotIn("| python ci/materialize_git_commit.py", workflow)
+        self.assertNotIn("\n            python -c", workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-authoritative doctor', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-read-only status', workflow)
         self.assertIn('docker compose -f docker/compose.yaml run --rm roundwright-test-only status', workflow)
@@ -288,6 +302,19 @@ class CiVerificationTests(unittest.TestCase):
         self.assertNotIn('export ROUNDWRIGHT_AUTHORITY_RECEIPT_SHA256="$receipt_sha"', workflow)
         self.assertIn("roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("docker push", workflow)
+
+    def test_docker_qualification_routes_every_python_helper_through_the_resolver(self) -> None:
+        """Hosted Docker setup may bootstrap the resolver, never bypass its receipt."""
+
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        docker_job = workflow[workflow.index("  docker-consumer-qualification:"):]
+        for line in docker_job.splitlines():
+            stripped = line.lstrip()
+            if "python" not in line or stripped.startswith("#") or "uses:" in stripped or "python-version:" in stripped:
+                continue
+            self.assertIn("python ci/resolve_validation_toolchain.py", line)
+        self.assertNotIn("python -c", docker_job)
+        self.assertNotIn("| python", docker_job)
 
     def test_git_commit_materializer_writes_exact_loose_object_from_packed_start(self) -> None:
         materializer = load_git_commit_materializer()
@@ -333,7 +360,13 @@ class CiVerificationTests(unittest.TestCase):
             raw_object = materializer._canonical_commit(payload)
             self.assertEqual(raw_object, b"commit " + str(len(payload)).encode("ascii") + b"\0" + payload)
             self.assertNotEqual(raw_object, b"commit " + str(len(payload)).encode("ascii") + b"\\0" + payload)
-            self.assertEqual(materializer.materialize_loose_commit(repository, candidate, payload), repository / ".git" / "objects" / candidate[:2] / candidate[2:])
+            manifest = materializer.materialize_checkout_evidence(repository, candidate)
+            self.assertEqual(manifest, repository / ".git" / "roundwright-checkout.json")
+            evidence = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["candidate_sha"], candidate)
+            self.assertEqual(evidence["entries"], [{"path": "fixture.txt", "sha1": subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", f"{candidate}:fixture.txt"], check=True, capture_output=True, text=True,
+            ).stdout.strip()}])
 
     def test_docker_qualification_binds_artifact_base_and_dockerfile_without_paths(self) -> None:
         qualification = load_docker_qualification()

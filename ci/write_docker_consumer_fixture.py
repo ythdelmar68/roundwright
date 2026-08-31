@@ -92,6 +92,20 @@ def main() -> int:
     if not control_store.admit(installation, "fixture-active", InvocationSource.ONE_SHOT, now=now).accepted:
         raise RuntimeError("native-host active-lock fixture could not be initialized")
     seal_read_only_state(arguments.state / "native-host.sqlite3")
+    (arguments.state / "docker-runtime-evidence.json").write_text(
+        json.dumps(
+            {
+                "authentication_identity": material["mounts"]["authentication_identity"],
+                "candidate_sha": arguments.candidate,
+                "installation_fingerprint": installation.installation_fingerprint,
+                "receipt_fingerprint": installation.receipt.receipt_fingerprint,
+                "runtime_binding": material["identity"]["runtime_binding"],
+                "runtime_environment": material["mounts"]["runtime_environment"],
+            },
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
     arguments.configuration.parent.mkdir(parents=True, exist_ok=True)
     binding = material["identity"]["runtime_binding"]
     authentication_identity = material["mounts"]["authentication_identity"]

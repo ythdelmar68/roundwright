@@ -51,14 +51,61 @@ def _identity(path: Path) -> dict[str, str] | None:
     return value
 
 
-def _checkout_candidate(repository: Path) -> str | None:
-    """Read a detached candidate from self-contained mounted Git metadata.
+def _git_object(git_directory: Path, object_sha: str, kind: str) -> bytes | None:
+    if len(object_sha) != 40 or any(character not in "0123456789abcdef" for character in object_sha):
+        return None
+    try:
+        path = git_directory / "objects" / object_sha[:2] / object_sha[2:]
+        if not path.is_file() or path.is_symlink():
+            return None
+        raw = zlib.decompress(path.read_bytes())
+    except (OSError, zlib.error):
+        return None
+    separator = raw.find(b"\0")
+    if separator <= 0 or hashlib.sha1(raw).hexdigest() != object_sha:
+        return None
+    header, body = raw[:separator], raw[separator + 1 :]
+    return body if header == f"{kind} {len(body)}".encode("ascii") else None
 
-    The minimal consumer image intentionally does not carry Git.  The hosted
-    fixture therefore supplies a detached ``HEAD`` plus a verified loose
-    commit object inside its own ``.git`` directory.  Linked worktrees,
-    symbolic heads, object indirection, and malformed/copy-pasted objects all
-    fail closed rather than falling back to caller-provided identity.
+
+def _tracked_tree(git_directory: Path, tree_sha: str, prefix: str = "") -> list[dict[str, str]] | None:
+    body = _git_object(git_directory, tree_sha, "tree")
+    if body is None:
+        return None
+    entries: list[dict[str, str]] = []
+    cursor = 0
+    while cursor < len(body):
+        separator = body.find(b"\0", cursor)
+        if separator <= cursor or separator + 21 > len(body):
+            return None
+        try:
+            mode, name = body[cursor:separator].split(b" ", 1)
+            component = name.decode("utf-8", "strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not component or "/" in component or "\\" in component or component in {".", ".."}:
+            return None
+        object_sha = body[separator + 1:separator + 21].hex()
+        path = prefix + component
+        if mode == b"40000":
+            nested = _tracked_tree(git_directory, object_sha, path + "/")
+            if nested is None:
+                return None
+            entries.extend(nested)
+        elif mode in {b"100644", b"100755"}:
+            entries.append({"path": path, "sha1": object_sha})
+        else:
+            return None
+        cursor = separator + 21
+    return entries
+
+
+def _checkout_candidate(repository: Path) -> str | None:
+    """Verify detached commit, tree, and every tracked mounted file without Git.
+
+    The mounted evidence must be self-contained: linked gitdirs, packed-only
+    object indirection, synthetic manifests, substituted trees, and dirty
+    tracked files all fail before package dispatch.
     """
 
     git_directory = repository / ".git"
@@ -72,21 +119,34 @@ def _checkout_candidate(repository: Path) -> str | None:
         if len(value) != 41 or value[-1] != "\n":
             return None
         candidate = value[:-1]
-        if len(candidate) != 40 or any(character not in "0123456789abcdef" for character in candidate):
+        commit = _git_object(git_directory, candidate, "commit")
+        if commit is None:
             return None
-        object_path = git_directory / "objects" / candidate[:2] / candidate[2:]
-        if not object_path.is_file() or object_path.is_symlink():
+        first_line = commit.split(b"\n", 1)[0]
+        if not first_line.startswith(b"tree ") or len(first_line) != 45:
             return None
-        raw = zlib.decompress(object_path.read_bytes())
-    except (OSError, UnicodeError, zlib.error):
+        tree_sha = first_line[5:].decode("ascii")
+        tracked = _tracked_tree(git_directory, tree_sha)
+        manifest = json.loads((git_directory / "roundwright-checkout.json").read_text(encoding="utf-8"))
+        if (
+            type(manifest) is not dict
+            or set(manifest) != {"candidate_sha", "entries", "tree_sha"}
+            or manifest["candidate_sha"] != candidate
+            or manifest["tree_sha"] != tree_sha
+            or manifest["entries"] != tracked
+        ):
+            return None
+        for entry in tracked:
+            path = repository.joinpath(*entry["path"].split("/"))
+            if not path.is_file() or path.is_symlink():
+                return None
+            content = path.read_bytes()
+            raw = b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+            if hashlib.sha1(raw).hexdigest() != entry["sha1"]:
+                return None
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
         return None
-    separator = raw.find(b"\0")
-    if separator <= 0:
-        return None
-    header, body = raw[:separator], raw[separator + 1 :]
-    if header != f"commit {len(body)}".encode("ascii"):
-        return None
-    return candidate if hashlib.sha1(raw).hexdigest() == candidate else None
+    return candidate
 
 
 def _authority_issued_at(path: Path) -> datetime | None:
@@ -100,11 +160,46 @@ def _authority_issued_at(path: Path) -> datetime | None:
     return timestamp if timestamp.tzinfo is timezone.utc else None
 
 
+def _mounted_runtime_evidence(state: Path, candidate: str) -> dict[str, object] | None:
+    """Read bounded host-owned identity observations shared by every mode."""
+
+    try:
+        value = json.loads((state / "docker-runtime-evidence.json").read_text(encoding="utf-8"))
+        required = {
+            "authentication_identity", "candidate_sha", "installation_fingerprint",
+            "receipt_fingerprint", "runtime_binding", "runtime_environment",
+        }
+        if type(value) is not dict or set(value) != required or value["candidate_sha"] != candidate:
+            return None
+        if type(value["authentication_identity"]) is not str or len(value["authentication_identity"]) != 64:
+            return None
+        if any(character not in "0123456789abcdef" for character in value["authentication_identity"]):
+            return None
+        if any(
+            type(value[name]) is not str
+            or len(value[name]) != 64
+            or any(character not in "0123456789abcdef" for character in value[name])
+            for name in ("installation_fingerprint", "receipt_fingerprint")
+        ):
+            return None
+        binding = RuntimeBinding.from_canonical(value["runtime_binding"])
+        environment = value["runtime_environment"]
+        if type(environment) is not dict or environment != _RUNTIME_ENVIRONMENT:
+            return None
+        runtime_environment_fingerprint(candidate, environment)
+        return {**value, "binding": binding}
+    except (OSError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
 def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str], paths: Mapping[DockerMountName, Path], candidate: str, *, authority: MountedAuthorityEvidence | None) -> dict[DockerMountName, DockerMountStatus]:
     """Validate host-owned mounted material before the package can dispatch."""
 
     result: dict[DockerMountName, DockerMountStatus] = {}
     repository = paths[DockerMountName.REPOSITORY]
+    mounted_runtime = _mounted_runtime_evidence(paths[DockerMountName.STATE], candidate)
+    if mounted_runtime is None:
+        result[DockerMountName.STATE] = DockerMountStatus.EVIDENCE_MISMATCH
     # The mounted checkout is independent evidence.  A well-formed detached
     # repository for a different candidate is just as unsafe as no checkout.
     if _checkout_candidate(repository) != candidate:
@@ -115,6 +210,9 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
         if type(runtime) is not dict or set(runtime) != {"candidate_sha", "binding"} or runtime["candidate_sha"] != candidate:
             raise ValueError
         binding = RuntimeBinding.from_canonical(runtime["binding"])
+        if mounted_runtime is None:
+            raise ValueError
+        binding.require_matches(mounted_runtime["binding"])
         if authority is not None:
             authority.identity.runtime_binding.require_matches(binding)
     except (OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
@@ -123,6 +221,8 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
         authentication = tomllib.loads(paths[DockerMountName.AUTHENTICATION].read_text(encoding="utf-8"))
         operator = authentication.get("operator")
         if type(operator) is not dict or set(operator) != {"candidate_sha", "identity"} or operator["candidate_sha"] != candidate or type(operator["identity"]) is not str or len(operator["identity"]) != 64 or any(value not in "0123456789abcdef" for value in operator["identity"]):
+            raise ValueError
+        if mounted_runtime is None or operator["identity"] != mounted_runtime["authentication_identity"]:
             raise ValueError
         if authority is not None and operator["identity"] != authority.authentication_identity:
             raise ValueError
@@ -142,7 +242,14 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
         else:
             observation = NativeHostControlStore(database).observe()
             state_valid = observation.candidate_sha == candidate
-            if authority is not None:
+            if mounted_runtime is None:
+                state_valid = False
+            elif (
+                observation.installation_fingerprint != mounted_runtime["installation_fingerprint"]
+                or observation.receipt_fingerprint != mounted_runtime["receipt_fingerprint"]
+            ):
+                state_valid = False
+            elif authority is not None:
                 installation = authority.native_host_installation
                 installation.identity.runtime_binding.require_matches(authority.identity.runtime_binding)
                 if (
@@ -169,11 +276,12 @@ def _runtime_evidence(mode: DockerOperationMode, environment: Mapping[str, str],
         # A wrong runtime path can otherwise make the CLI silently inspect a
         # container-local default instead of the host-owned fixtures.
         result[DockerMountName.REPOSITORY] = DockerMountStatus.EVIDENCE_MISMATCH
-    elif authority is not None:
+    elif authority is not None and mounted_runtime is not None:
         observed_environment = {name: environment[name] for name in _RUNTIME_ENVIRONMENT}
         try:
             if (
-                observed_environment != authority.runtime_environment
+                observed_environment != mounted_runtime["runtime_environment"]
+                or observed_environment != authority.runtime_environment
                 or runtime_environment_fingerprint(candidate, observed_environment)
                 != authority.native_host_installation.identity.environment_fingerprint
             ):

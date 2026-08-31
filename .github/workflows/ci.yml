@@ -240,6 +240,22 @@ jobs:
           sudo find "$fixtures/state-drift" -type d -exec chmod 0750 {} +
           sudo find "$fixtures/state-drift" -type f -exec chmod 0640 {} +
           expect_blocked authoritative "state mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state-drift:/var/lib/roundwright:rw" "${authority_mount[@]}" "$image" doctor
+          # Keep the native-host SQLite record authoritative while coherently
+          # substituting the mutable runtime binding and authentication
+          # identity in the runtime evidence, configuration, and auth mounts.
+          # These must be real installed-image calls: independent one-file
+          # drift is not a substitute for a correlated host-input attack.
+          sudo cp -a "$fixtures/state" "$fixtures/state-correlated"
+          sudo chown "$USER" "$fixtures/state-correlated/docker-runtime-evidence.json"
+          python ci/resolve_validation_toolchain.py exec-python -- -c 'from datetime import datetime,timezone; import json,sys; from roundwright.docker_authority import canonical_fixture_envelope; state,configuration,authentication,candidate=sys.argv[1:]; substituted=canonical_fixture_envelope("b" * 40,now=datetime.now(timezone.utc)); runtime=json.load(open(state)); runtime["runtime_binding"]=substituted["identity"]["runtime_binding"]; runtime["authentication_identity"]=substituted["mounts"]["authentication_identity"]; open(state,"w").write(json.dumps(runtime,sort_keys=True,separators=(",",":"))); open(configuration,"w").write("[runtime]\\ncandidate_sha = "+json.dumps(candidate)+"\\nbinding = "+json.dumps(substituted["identity"]["runtime_binding"])+"\\n"); open(authentication,"w").write("[operator]\\ncandidate_sha = "+json.dumps(candidate)+"\\nidentity = "+json.dumps(substituted["mounts"]["authentication_identity"])+"\\n")' "$fixtures/state-correlated/docker-runtime-evidence.json" "$fixtures/etc/config-correlated.toml" "$fixtures/run/auth-correlated.toml" "$CANDIDATE_SHA"
+          sudo chown -R 65532:65532 "$fixtures/state-correlated"
+          sudo find "$fixtures/state-correlated" -type d -exec chmod 0750 {} +
+          sudo find "$fixtures/state-correlated" -type f -exec chmod 0640 {} +
+          sudo chown 65532:65532 "$fixtures/etc/config-correlated.toml" "$fixtures/run/auth-correlated.toml"
+          sudo chmod 0640 "$fixtures/etc/config-correlated.toml" "$fixtures/run/auth-correlated.toml"
+          expect_blocked authoritative "configuration mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-correlated.toml:/etc/roundwright/config.toml:ro" -v "$fixtures/run/auth-correlated.toml:/run/roundwright/auth.toml:ro" --env ROUNDWRIGHT_DOCKER_MODE=authoritative --env "ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=$receipt_sha" -v "$fixtures/state-correlated:/var/lib/roundwright:rw" "${authority_mount[@]}" "$image" doctor
+          expect_blocked read-only "state mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-correlated.toml:/etc/roundwright/config.toml:ro" -v "$fixtures/run/auth-correlated.toml:/run/roundwright/auth.toml:ro" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state-correlated:/var/lib/roundwright:ro" "$image" doctor
+          expect_blocked test-only "state mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-correlated.toml:/etc/roundwright/config.toml:ro" -v "$fixtures/run/auth-correlated.toml:/run/roundwright/auth.toml:ro" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state-correlated:/var/lib/roundwright:ro" "$image" doctor
           # Exercise every mandatory host-owned input independently.  These
           # use the same candidate-bound image and fixture material as the
           # positive paths, but never publish an image or mutate authority.

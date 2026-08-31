@@ -154,6 +154,9 @@ _HOSTED_NEGATIVE_CASES = (
     ("configuration-drift", "read-only", "configuration mount: evidence-mismatch"),
     ("authentication-drift", "test-only", "authentication mount: evidence-mismatch"),
     ("state-drift", "authoritative", "state mount: evidence-mismatch"),
+    ("correlated-bindings-authoritative", "authoritative", "configuration mount: evidence-mismatch"),
+    ("correlated-bindings-read-only", "read-only", "state mount: evidence-mismatch"),
+    ("correlated-bindings-test-only", "test-only", "state mount: evidence-mismatch"),
     ("repository-omitted", "test-only", "repository mount: evidence-mismatch"),
     ("configuration-missing", "read-only", "configuration mount: missing"),
     ("authentication-missing", "test-only", "authentication mount: missing"),
@@ -852,7 +855,11 @@ class DockerConsumerTests(unittest.TestCase):
                     report = preflight(environment, paths=paths, identity_path=identity)
                 self.assertEqual(report.exit_code, 2, mode.value)
                 expected = "configuration mount is evidence-mismatch" if mode is DockerOperationMode.AUTHORITATIVE else "state mount is evidence-mismatch"
-                self.assertIn(expected, report.reason, mode.value)
+                output = io.StringIO()
+                render_docker_consumer_diagnostics(report, output)
+                projection = "configuration mount: evidence-mismatch" if mode is DockerOperationMode.AUTHORITATIVE else "state mount: evidence-mismatch"
+                self.assertEqual(expected, report.reason, mode.value)
+                self.assertEqual(output.getvalue(), scenario(mode.value, projection).render() + "\n", mode.value)
 
     def test_entrypoint_renders_every_present_invalid_authority_variant_as_mismatch(self) -> None:
         """Every hosted negative reaches production preflight and its projection."""
@@ -912,6 +919,25 @@ class DockerConsumerTests(unittest.TestCase):
                     runtime = json.loads((paths[DockerMountName.STATE] / "docker-runtime-evidence.json").read_text(encoding="utf-8"))
                     runtime["candidate_sha"] = "0" * 40
                     (paths[DockerMountName.STATE] / "docker-runtime-evidence.json").write_text(json.dumps(runtime, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+                elif case_name.startswith("correlated-bindings-"):
+                    substituted = canonical_fixture_envelope("b" * 40, now=now)
+                    runtime_path = paths[DockerMountName.STATE] / "docker-runtime-evidence.json"
+                    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+                    runtime["runtime_binding"] = substituted["identity"]["runtime_binding"]
+                    runtime["authentication_identity"] = substituted["mounts"]["authentication_identity"]
+                    runtime_path.write_text(json.dumps(runtime, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+                    paths[DockerMountName.CONFIGURATION].write_text(
+                        "[runtime]\n"
+                        f"candidate_sha = {json.dumps(candidate)}\n"
+                        f"binding = {json.dumps(substituted['identity']['runtime_binding'])}\n",
+                        encoding="utf-8",
+                    )
+                    paths[DockerMountName.AUTHENTICATION].write_text(
+                        "[operator]\n"
+                        f"candidate_sha = {json.dumps(candidate)}\n"
+                        f"identity = {json.dumps(substituted['mounts']['authentication_identity'])}\n",
+                        encoding="utf-8",
+                    )
                 elif case_name == "repository-omitted":
                     paths[DockerMountName.REPOSITORY] = root / "image-workspace"
                     paths[DockerMountName.REPOSITORY].mkdir()

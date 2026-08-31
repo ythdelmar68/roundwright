@@ -97,7 +97,7 @@ class CiVerificationTests(unittest.TestCase):
         helpers = load_docker_consumer_test_helpers()
         expected = tuple((mode, diagnostic) for _, mode, diagnostic in helpers._HOSTED_NEGATIVE_CASES)
         self.assertEqual(helpers.hosted_workflow_expectations(), expected)
-        self.assertEqual(len(expected), 24)
+        self.assertEqual(len(expected), 27)
 
     def test_docker_negative_scenarios_cover_every_workflow_invocation(self) -> None:
         """Hosted assertions consume one complete, reviewed projection each."""
@@ -124,6 +124,28 @@ class CiVerificationTests(unittest.TestCase):
         self.assertNotIn("authority receipt: missing", authority_mismatch)
         self.assertIn('ci/docker_negative_scenarios.py "$mode" "$expected"', workflow)
         self.assertNotIn('canonical="$(printf', workflow)
+
+    def test_docker_workflow_runs_correlated_typed_substitution_in_each_mode(self) -> None:
+        """The hosted image invokes, rather than merely lists, this attack."""
+
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('sudo cp -a "$fixtures/state" "$fixtures/state-correlated"', workflow)
+        self.assertIn('runtime["runtime_binding"]', workflow)
+        self.assertIn('runtime["authentication_identity"]', workflow)
+        for mode, expected, state_access in (
+            ("authoritative", "configuration mount: evidence-mismatch", "rw"),
+            ("read-only", "state mount: evidence-mismatch", "ro"),
+            ("test-only", "state mount: evidence-mismatch", "ro"),
+        ):
+            invocation = f'expect_blocked {mode} "{expected}" docker run --rm'
+            self.assertIn(invocation, workflow)
+            start = workflow.index(invocation)
+            command = workflow[start:workflow.index("\n", start)]
+            self.assertIn('config-correlated.toml:/etc/roundwright/config.toml:ro', command)
+            self.assertIn('auth-correlated.toml:/run/roundwright/auth.toml:ro', command)
+            self.assertIn(f'state-correlated:/var/lib/roundwright:{state_access}', command)
+            self.assertTrue(command.endswith('"$image" doctor'))
+
     def test_docker_fixture_writer_records_the_serialized_native_host_installation(self) -> None:
         """The positive image fixture must persist exactly the mounted typed state evidence."""
 

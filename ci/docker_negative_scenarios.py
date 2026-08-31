@@ -76,6 +76,15 @@ _SCENARIOS = {
     ("read-only", "configuration mount: evidence-mismatch"): _mount("read-only", "configuration mount: evidence-mismatch"),
     ("test-only", "authentication mount: evidence-mismatch"): _mount("test-only", "authentication mount: evidence-mismatch"),
     ("authoritative", "state mount: evidence-mismatch"): _mount("authoritative", "state mount: evidence-mismatch", authentication="evidence-mismatch", configuration="evidence-mismatch"),
+    # A correlated foreign runtime binding across the mutable typed files must
+    # still be rejected against the unchanged native-host SQLite record.
+    # Authoritative mode reports both independently reconciled mutable mounts
+    # while configuration remains its primary blocking observation;
+    # non-authoritative modes carry the coherent mutable binding as state
+    # evidence drift.
+    ("authoritative", "configuration mount: evidence-mismatch"): _mount("authoritative", "configuration mount: evidence-mismatch", authentication="evidence-mismatch"),
+    ("read-only", "state mount: evidence-mismatch"): _mount("read-only", "state mount: evidence-mismatch"),
+    ("test-only", "state mount: evidence-mismatch"): _mount("test-only", "state mount: evidence-mismatch"),
     ("read-only", "configuration mount: missing"): _mount("read-only", "configuration mount: missing"),
     ("test-only", "authentication mount: missing"): _mount("test-only", "authentication mount: missing"),
     ("authoritative", "state mount: permission-mismatch"): _mount("authoritative", "state mount: permission-mismatch"),

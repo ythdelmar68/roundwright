@@ -216,6 +216,15 @@ jobs:
               state\ mount:*) state="${expected#state mount: }" ;;
               authority\ receipt:\ mismatch) authority_receipt=mismatch ;;
             esac
+            # Omitting the state bind leaves no native-host evidence from
+            # which configuration and authentication identities can be
+            # independently reconciled.  The state mount remains the first
+            # blocked contract violation, while these two fields accurately
+            # describe the complete observed diagnostic.
+            if [ "$mode:$expected" = 'test-only:state mount: missing' ]; then
+              authentication=evidence-mismatch
+              configuration=evidence-mismatch
+            fi
             case "$expected" in
               authority\ receipt:\ mismatch) reason='authority receipt identity is missing or mismatched' ;;
               *) reason="${expected/mount: /mount is }" ;;
@@ -241,6 +250,8 @@ jobs:
           # Each negative is a real image invocation.  Keep these fail-closed
           # assertions beside the positive paths so hosted CI cannot replace
           # mount/authority drift with an empty fixture.
+          # No state bind also prevents typed configuration/authentication
+          # reconciliation; expect_blocked asserts all three exact statuses.
           expect_blocked test-only "state mount: missing" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=test-only "$image" doctor
           expect_blocked read-only "state mount: permission-mismatch" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:rw" "$image" doctor
           expect_blocked authoritative "authority-receipt mount: missing" docker run --rm "${common[@]}" --env ROUNDWRIGHT_DOCKER_MODE=authoritative -v "$fixtures/state:/var/lib/roundwright:rw" "$image" doctor

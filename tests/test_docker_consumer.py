@@ -493,6 +493,57 @@ class DockerConsumerTests(unittest.TestCase):
             self.assertEqual(report.exit_code, 2)
             self.assertIn("configuration mount is evidence-mismatch", report.reason)
 
+    def test_entrypoint_reports_complete_no_state_bind_diagnostic(self) -> None:
+        """An absent state bind makes dependent typed identities unverifiable."""
+
+        now = datetime.now(timezone.utc)
+        candidate = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {name: root / name.value for name in DockerMountName}
+            paths[DockerMountName.REPOSITORY].mkdir()
+            paths[DockerMountName.STATE].mkdir()
+            write_typed_mounted_evidence(paths, candidate, now=now)
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({
+                "candidate_sha": candidate,
+                "package_digest": digest("b"),
+                "base_image_digest": digest("c"),
+            }), encoding="utf-8")
+            missing_state = root / "state-unmounted"
+            paths[DockerMountName.STATE] = missing_state
+            # The hosted no-state scenario also supplies no authority bind in
+            # test-only mode; preserve the image-bound absent-path shape.
+            paths[DockerMountName.AUTHORITY_RECEIPT] = root / "authority-unmounted.json"
+            environment = {
+                "ROUNDWRIGHT_DOCKER_MODE": "test-only",
+                "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "b" * 64,
+                "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": digest("c"),
+                **mounted_runtime_environment(),
+            }
+            with mock.patch("roundwright.docker_entrypoint.os.access", side_effect=lambda _path, mode: mode == os.R_OK), mock.patch(
+                "roundwright.docker_entrypoint._checkout_candidate", return_value=candidate,
+            ):
+                report = preflight(environment, paths=paths, identity_path=identity)
+            rendered = io.StringIO()
+            render_docker_consumer_diagnostics(report, rendered)
+            self.assertEqual(report.exit_code, 2)
+            self.assertEqual(report.reason, "state mount is missing")
+            self.assertEqual(
+                rendered.getvalue(),
+                "roundwright Docker consumer preflight\n"
+                "mode: test-only\n"
+                "authentication mount: evidence-mismatch\n"
+                "authority-receipt mount: not-applicable\n"
+                "configuration mount: evidence-mismatch\n"
+                "repository mount: ready\n"
+                "state mount: missing\n"
+                "candidate: match\npackage: match\nbase image: match\n"
+                "authority receipt: not required\n"
+                "result: blocked (state mount is missing)\n",
+            )
+
     def test_entrypoint_reconciles_typed_runtime_identity_drift_in_every_mode(self) -> None:
         """Every mode consumes the same mounted identity evidence before ready."""
 

@@ -82,6 +82,7 @@ class PackageArtifactTests(unittest.TestCase):
                 self.assertIn("roundwright/cli.py", archive.namelist())
                 self.assertIn("roundwright/doctor.py", archive.namelist())
                 self.assertIn("roundwright/native_host.py", archive.namelist())
+                self.assertIn("roundwright/docker_consumer.py", archive.namelist())
                 defaults = [name for name in archive.namelist() if name.endswith("roundwright/runtime-defaults.toml")]
                 self.assertEqual(defaults, ["roundwright/runtime-defaults.toml"])
             with tarfile.open(sdist) as archive:
@@ -89,6 +90,7 @@ class PackageArtifactTests(unittest.TestCase):
                 self.assertTrue(any(name.endswith("/pyproject.toml") for name in names))
                 self.assertTrue(any(name.endswith("/src/roundwright/cli.py") for name in names))
                 self.assertTrue(any(name.endswith("/src/roundwright/native_host.py") for name in names))
+                self.assertTrue(any(name.endswith("/src/roundwright/docker_consumer.py") for name in names))
                 self.assertEqual(sum(name.endswith("/src/roundwright/runtime-defaults.toml") for name in names), 1)
 
             environment = workspace / "environment"

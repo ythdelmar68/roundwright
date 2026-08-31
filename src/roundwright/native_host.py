@@ -25,6 +25,7 @@ from .deployment_handoff import (
     DeploymentAuthorityHandoffReceipt,
     DeploymentAuthorityIdentity,
 )
+from .runtime_binding import RuntimeBinding
 
 
 class NativeHostError(ValueError):
@@ -92,6 +93,67 @@ class NativeHostDecision:
     installation_fingerprint: str | None = None
     receipt_fingerprint: str | None = None
     process_id: str | None = None
+
+
+@dataclass(frozen=True)
+class NativeHostObservation:
+    """Read-only, public-safe metadata observed from a mounted control store."""
+
+    installation_fingerprint: str
+    receipt_fingerprint: str
+    candidate_sha: str
+
+    def __post_init__(self) -> None:
+        _require_fingerprint(self.installation_fingerprint, "observed native host installation")
+        _require_fingerprint(self.receipt_fingerprint, "observed native host receipt")
+        if type(self.candidate_sha) is not str or not _COMMIT.fullmatch(self.candidate_sha):
+            raise NativeHostError("observed native host candidate SHA is invalid")
+
+
+@dataclass(frozen=True)
+class NativeHostMountedRuntimeEvidence:
+    """Read-only Docker adapter binding persisted beside native-host truth.
+
+    This deliberately contains identities, never configuration or
+    authentication material.  It lets a non-authoritative consumer compare
+    its mounted inputs with host-created SQLite evidence without granting that
+    consumer any ability to create or refresh the evidence.
+    """
+
+    installation_fingerprint: str
+    receipt_fingerprint: str
+    candidate_sha: str
+    runtime_binding: RuntimeBinding
+    authentication_identity: str
+    environment_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for value, description in (
+            (self.installation_fingerprint, "mounted native host installation"),
+            (self.receipt_fingerprint, "mounted native host receipt"),
+            (self.authentication_identity, "mounted authentication"),
+            (self.environment_fingerprint, "mounted environment"),
+        ):
+            _require_fingerprint(value, description)
+        if type(self.candidate_sha) is not str or not _COMMIT.fullmatch(self.candidate_sha):
+            raise NativeHostError("mounted native host candidate SHA is invalid")
+        if type(self.runtime_binding) is not RuntimeBinding:
+            raise NativeHostError("mounted native host runtime binding is invalid")
+
+
+@dataclass(frozen=True)
+class NativeHostLifecycleObservation:
+    """Read-only lifecycle facts for a mounted native-host control store."""
+
+    installation: NativeHostObservation
+    active_lock: bool
+    completed_count: int
+    cancelled_count: int
+    recovered_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.installation) is not NativeHostObservation or any(type(value) is not int or value < 0 for value in (self.completed_count, self.cancelled_count, self.recovered_count)):
+            raise NativeHostError("native host lifecycle observation is invalid")
 
 
 @dataclass(frozen=True)
@@ -251,6 +313,111 @@ class NativeHostControlStore:
             return self._denied(installation, "native host state database is unavailable")
         return self._accepted(installation, "native host installation recorded")
 
+    def verify(self, installation: NativeHostInstallation) -> NativeHostDecision:
+        """Read a mounted installation without creating or repairing state.
+
+        Docker consumers use this to prove that their host-owned SQLite input
+        already belongs to the typed handoff installation.  Unlike ``install``
+        it never creates a database or schema, which keeps read-only and
+        test-only consumers incapable of manufacturing lifecycle evidence.
+        """
+
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                if not self._matches(connection, installation):
+                    return self._denied(installation, "native host state is not authoritative for this candidate")
+        except (OSError, ValueError, sqlite3.Error):
+            return self._denied(installation, "native host state database is unavailable")
+        return self._accepted(installation, "native host installation verified")
+
+    def observe(self) -> NativeHostObservation:
+        """Read mounted installation metadata without manufacturing lifecycle state."""
+
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+            if set(metadata) != {"installation_fingerprint", "receipt_fingerprint", "candidate_sha"}:
+                raise NativeHostError("native host state metadata is invalid")
+            return NativeHostObservation(
+                metadata["installation_fingerprint"], metadata["receipt_fingerprint"], metadata["candidate_sha"],
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise NativeHostError("native host state database is unavailable") from error
+
+    def record_mounted_runtime_evidence(self, evidence: NativeHostMountedRuntimeEvidence) -> NativeHostDecision:
+        """Persist host-created Docker mount identities after installation.
+
+        Qualification setup is the only caller permitted to create this row.
+        Consumer preflight uses :meth:`verify_mounted_runtime_evidence`, which
+        opens the database read-only and therefore cannot manufacture it.
+        """
+
+        if type(evidence) is not NativeHostMountedRuntimeEvidence:
+            raise NativeHostError("mounted runtime evidence is invalid")
+        try:
+            with closing(self._connection()) as connection:
+                with connection:
+                    self._prepare(connection)
+                    metadata = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+                    if metadata != {
+                        "installation_fingerprint": evidence.installation_fingerprint,
+                        "receipt_fingerprint": evidence.receipt_fingerprint,
+                        "candidate_sha": evidence.candidate_sha,
+                    }:
+                        return NativeHostDecision(False, "native host state is not authoritative for mounted evidence")
+                    expected = self._mounted_runtime_values(evidence)
+                    current = dict(connection.execute("SELECT key, value FROM native_host_mounted_runtime"))
+                    if current and current != expected:
+                        return NativeHostDecision(False, "native host mounted evidence conflicts")
+                    if not current:
+                        connection.executemany(
+                            "INSERT INTO native_host_mounted_runtime(key, value) VALUES (?, ?)", expected.items()
+                        )
+        except (OSError, sqlite3.Error):
+            return NativeHostDecision(False, "native host state database is unavailable")
+        return NativeHostDecision(True, "native host mounted evidence recorded")
+
+    def verify_mounted_runtime_evidence(self, evidence: NativeHostMountedRuntimeEvidence) -> NativeHostDecision:
+        """Read and compare complete mounted identities without state mutation."""
+
+        if type(evidence) is not NativeHostMountedRuntimeEvidence:
+            raise NativeHostError("mounted runtime evidence is invalid")
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+                current = dict(connection.execute("SELECT key, value FROM native_host_mounted_runtime"))
+            if metadata != {
+                "installation_fingerprint": evidence.installation_fingerprint,
+                "receipt_fingerprint": evidence.receipt_fingerprint,
+                "candidate_sha": evidence.candidate_sha,
+            } or current != self._mounted_runtime_values(evidence):
+                return NativeHostDecision(False, "native host mounted evidence is mismatched")
+        except (OSError, ValueError, sqlite3.Error):
+            return NativeHostDecision(False, "native host state database is unavailable")
+        return NativeHostDecision(True, "native host mounted evidence verified")
+
+    def observe_lifecycle(self) -> NativeHostLifecycleObservation:
+        """Return persisted lifecycle facts without acquiring a lock or mutating state."""
+
+        try:
+            uri = self._database.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM native_host_metadata"))
+                if set(metadata) != {"installation_fingerprint", "receipt_fingerprint", "candidate_sha"}:
+                    raise NativeHostError("native host state metadata is invalid")
+                states = dict(connection.execute("SELECT state, COUNT(*) FROM native_host_process GROUP BY state"))
+            if set(states).difference({"running", "completed", "cancelled", "recovered"}):
+                raise NativeHostError("native host process state is invalid")
+            return NativeHostLifecycleObservation(
+                NativeHostObservation(metadata["installation_fingerprint"], metadata["receipt_fingerprint"], metadata["candidate_sha"]),
+                states.get("running", 0) > 0, states.get("completed", 0), states.get("cancelled", 0), states.get("recovered", 0),
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise NativeHostError("native host state database is unavailable") from error
+
     def admit(self, installation: NativeHostInstallation, process_id: str, source: InvocationSource, *, now: datetime, lease_for: timedelta = _DEFAULT_PROCESS_LEASE) -> NativeHostDecision:
         if type(lease_for) is not timedelta or lease_for <= timedelta():
             raise NativeHostError("native host process lease is invalid")
@@ -357,7 +524,16 @@ class NativeHostControlStore:
     @staticmethod
     def _prepare(connection: sqlite3.Connection) -> None:
         connection.execute("CREATE TABLE IF NOT EXISTS native_host_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS native_host_mounted_runtime (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         connection.execute("CREATE TABLE IF NOT EXISTS native_host_process (process_id TEXT PRIMARY KEY, receipt_fingerprint TEXT NOT NULL, candidate_sha TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL, lease_expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+
+    @staticmethod
+    def _mounted_runtime_values(evidence: NativeHostMountedRuntimeEvidence) -> dict[str, str]:
+        return {
+            "authentication_identity": evidence.authentication_identity,
+            "environment_fingerprint": evidence.environment_fingerprint,
+            "runtime_binding": evidence.runtime_binding.canonical_material(),
+        }
 
     @staticmethod
     def _matches(connection: sqlite3.Connection, installation: NativeHostInstallation) -> bool:

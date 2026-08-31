@@ -273,6 +273,12 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('config-drift.toml', workflow)
         self.assertIn('auth-drift.toml', workflow)
         self.assertIn('state-drift/docker-runtime-evidence.json', workflow)
+        self.assertIn('sudo cp -a "$fixtures/state" "$fixtures/state-drift"', workflow)
+        self.assertNotIn('          cp -a "$fixtures/state" "$fixtures/state-drift"', workflow)
+        self.assertLess(
+            workflow.index('sudo cp -a "$fixtures/state" "$fixtures/state-drift"'),
+            workflow.index('sudo chown -R 65532:65532 "$fixtures/state-drift"'),
+        )
         for diagnostic in (
             "repository mount: evidence-mismatch", "configuration mount: missing", "authentication mount: missing",
             "repository mount: permission-mismatch", "configuration mount: permission-mismatch",

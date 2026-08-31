@@ -232,7 +232,10 @@ jobs:
           expect_blocked "configuration mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" -v "$fixtures/etc/config-drift.toml:/etc/roundwright/config.toml:ro" "${authentication_mount[@]}" --env ROUNDWRIGHT_DOCKER_MODE=read-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
           sed "s/$CANDIDATE_SHA/0000000000000000000000000000000000000000/" "$fixtures/run/auth.toml" > "$fixtures/run/auth-drift.toml"
           expect_blocked "authentication mount: evidence-mismatch" docker run --rm "${bare[@]}" "${repository_mount[@]}" "${configuration_mount[@]}" -v "$fixtures/run/auth-drift.toml:/run/roundwright/auth.toml:ro" --env ROUNDWRIGHT_DOCKER_MODE=test-only -v "$fixtures/state:/var/lib/roundwright:ro" "$image" doctor
-          cp -a "$fixtures/state" "$fixtures/state-drift"
+          # State is already the runtime-owned authoritative tree.  The
+          # disposable drift copy must therefore be created by setup root
+          # before its copied ownership and modes are reasserted below.
+          sudo cp -a "$fixtures/state" "$fixtures/state-drift"
           sudo sed -i "s/$CANDIDATE_SHA/0000000000000000000000000000000000000000/" "$fixtures/state-drift/docker-runtime-evidence.json"
           sudo chown -R 65532:65532 "$fixtures/state-drift"
           sudo find "$fixtures/state-drift" -type d -exec chmod 0750 {} +

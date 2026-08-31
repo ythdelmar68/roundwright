@@ -117,14 +117,35 @@ def _tree_entries(repository: Path, candidate: str) -> tuple[str, list[dict[str,
     return tree_sha, entries
 
 
+def _tree_objects(repository: Path, candidate: str, root_tree: str) -> tuple[str, ...]:
+    """Return every tree needed by the Git-free recursive tree reader."""
+
+    objects = {root_tree}
+    for record in _git(repository, "ls-tree", "-r", "-t", "-z", candidate).split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, _ = record.split(b"\t", 1)
+            mode, object_type, object_sha = metadata.decode("ascii", "strict").split(" ")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("candidate tree entry is invalid") from error
+        if object_type == "tree":
+            if mode != "040000" or not _CANDIDATE_SHA.fullmatch(object_sha):
+                raise ValueError("candidate tree entry is unsupported")
+            objects.add(object_sha)
+    return tuple(sorted(objects))
+
+
 def materialize_checkout_evidence(repository: Path, candidate: str) -> Path:
     """Materialize Git-free checked-out tree and tracked-content evidence."""
 
     commit_payload = _git(repository, "cat-file", "commit", candidate)
     materialize_loose_commit(repository, candidate, commit_payload)
     tree_sha, entries = _tree_entries(repository, candidate)
-    tree_payload = _git(repository, "cat-file", "tree", tree_sha)
-    _materialize_loose_object(repository / ".git", tree_sha, b"tree " + str(len(tree_payload)).encode("ascii") + b"\0" + tree_payload)
+    for object_sha in _tree_objects(repository, candidate, tree_sha):
+        tree_payload = _git(repository, "cat-file", "tree", object_sha)
+        raw_tree = b"tree " + str(len(tree_payload)).encode("ascii") + b"\0" + tree_payload
+        _materialize_loose_object(repository / ".git", object_sha, raw_tree)
     manifest = repository / ".git" / _CHECKOUT_MANIFEST
     value = {"candidate_sha": candidate, "entries": entries, "tree_sha": tree_sha}
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8") + b"\n"

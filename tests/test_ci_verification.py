@@ -344,15 +344,21 @@ class CiVerificationTests(unittest.TestCase):
 
     def test_git_commit_materializer_uses_real_detached_head_and_nul_object_header(self) -> None:
         materializer = load_git_commit_materializer()
+        from roundwright.docker_entrypoint import _checkout_candidate
         with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
             repository = Path(temporary) / "repository"
-            subprocess.run(["git", "init", "-q", str(repository)], check=True)
-            subprocess.run(["git", "-C", str(repository), "config", "user.name", "Docker fixture"], check=True)
-            subprocess.run(["git", "-C", str(repository), "config", "user.email", "docker@example.invalid"], check=True)
-            (repository / "fixture.txt").write_text("fixture\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(repository), "add", "fixture.txt"], check=True)
-            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "fixture"], check=True)
-            candidate = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "Docker fixture"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "docker@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "core.autocrlf", "false"], check=True)
+            (source / "nested").mkdir()
+            (source / "fixture.txt").write_text("fixture\n", encoding="utf-8")
+            (source / "nested" / "tracked.txt").write_text("nested\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "fixture.txt", "nested/tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+            candidate = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "--no-local", "--no-checkout", str(source), str(repository)], check=True)
             subprocess.run(["git", "-C", str(repository), "checkout", "--detach", candidate], check=True, capture_output=True)
             payload = subprocess.run(["git", "-C", str(repository), "cat-file", "commit", candidate], check=True, capture_output=True).stdout
 
@@ -364,9 +370,17 @@ class CiVerificationTests(unittest.TestCase):
             self.assertEqual(manifest, repository / ".git" / "roundwright-checkout.json")
             evidence = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(evidence["candidate_sha"], candidate)
-            self.assertEqual(evidence["entries"], [{"path": "fixture.txt", "sha1": subprocess.run(
-                ["git", "-C", str(repository), "rev-parse", f"{candidate}:fixture.txt"], check=True, capture_output=True, text=True,
-            ).stdout.strip()}])
+            self.assertEqual(evidence["entries"], [
+                {"path": "fixture.txt", "sha1": subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", f"{candidate}:fixture.txt"], check=True, capture_output=True, text=True,
+                ).stdout.strip()},
+                {"path": "nested/tracked.txt", "sha1": subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", f"{candidate}:nested/tracked.txt"], check=True, capture_output=True, text=True,
+                ).stdout.strip()},
+            ])
+            self.assertEqual(_checkout_candidate(repository), candidate)
+            (repository / "nested" / "tracked.txt").write_text("substituted\n", encoding="utf-8")
+            self.assertIsNone(_checkout_candidate(repository))
 
     def test_docker_qualification_binds_artifact_base_and_dockerfile_without_paths(self) -> None:
         qualification = load_docker_qualification()

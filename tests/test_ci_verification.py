@@ -91,6 +91,14 @@ def load_docker_consumer_test_helpers() -> object:
 
 
 class CiVerificationTests(unittest.TestCase):
+    def test_docker_consumer_matrix_helpers_load_without_module_registration(self) -> None:
+        """The fixture writer's dynamic helper loader need not register modules."""
+
+        helpers = load_docker_consumer_test_helpers()
+        expected = tuple((mode, diagnostic) for _, mode, diagnostic in helpers._HOSTED_NEGATIVE_CASES)
+        self.assertEqual(helpers.hosted_workflow_expectations(), expected)
+        self.assertEqual(len(expected), 24)
+
     def test_docker_negative_scenarios_cover_every_workflow_invocation(self) -> None:
         """Hosted assertions consume one complete, reviewed projection each."""
 

@@ -46,15 +46,55 @@ def seal_read_only_state(database: Path) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", required=True)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--configuration", required=True, type=Path)
     parser.add_argument("--authentication", required=True, type=Path)
+    parser.add_argument("--correlated-substitution", action="store_true")
     return parser.parse_args()
+
+
+def write_correlated_substitution(arguments: argparse.Namespace) -> None:
+    """Coherently alter mutable host inputs without importing from CI's host.
+
+    This helper is invoked through the receipt-bound build environment.  The
+    hosted workflow must not use an inline checkout import: its interpreter
+    intentionally exposes only the hermetic validation environment.
+    """
+
+    material = canonical_fixture_envelope("b" * 40, now=datetime.now(timezone.utc))
+    evidence_path = arguments.state / "docker-runtime-evidence.json"
+    try:
+        runtime = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("correlated fixture runtime evidence is unavailable") from error
+    runtime["runtime_binding"] = material["identity"]["runtime_binding"]
+    runtime["authentication_identity"] = material["mounts"]["authentication_identity"]
+    evidence_path.write_text(
+        json.dumps(runtime, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    arguments.configuration.write_text(
+        "[runtime]\n"
+        f"candidate_sha = {json.dumps(arguments.candidate)}\n"
+        f"binding = {json.dumps(material['identity']['runtime_binding'])}\n",
+        encoding="utf-8",
+    )
+    arguments.authentication.write_text(
+        "[operator]\n"
+        f"candidate_sha = {json.dumps(arguments.candidate)}\n"
+        f"identity = {json.dumps(material['mounts']['authentication_identity'])}\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
     arguments = parse_arguments()
+    if arguments.correlated_substitution:
+        write_correlated_substitution(arguments)
+        return 0
+    if arguments.output is None:
+        raise ValueError("fixture authority output is required")
     now = datetime.now(timezone.utc)
     material = canonical_fixture_envelope(arguments.candidate, now=now)
     # State is not allowed to independently reconstruct a native-host

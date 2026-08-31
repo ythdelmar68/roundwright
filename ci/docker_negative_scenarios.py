@@ -83,7 +83,10 @@ _SCENARIOS = {
     ("read-only", "configuration mount: permission-mismatch"): _mount("read-only", "configuration mount: permission-mismatch"),
     ("test-only", "authentication mount: permission-mismatch"): _mount("test-only", "authentication mount: permission-mismatch"),
     ("authoritative", "authority-receipt mount: permission-mismatch"): _mount("authoritative", "authority-receipt mount: permission-mismatch"),
-    ("authoritative", "authority receipt: mismatch"): NegativeScenario("authoritative", "authority receipt identity is missing or mismatched", authority_receipt="missing"),
+    # Present malformed, digest-drifted, expired, copied, conflicting,
+    # revoked, and wrong-candidate receipts are observed bytes, so production
+    # renders their identity as mismatch (not missing).
+    ("authoritative", "authority receipt: mismatch"): NegativeScenario("authoritative", "authority receipt identity is missing or mismatched", authority_receipt="mismatch"),
 }
 
 

@@ -140,6 +140,7 @@ class DevContainerConsumerTests(unittest.TestCase):
 
     def test_reference_cli_receipt_requires_real_startup_and_exact_identity(self) -> None:
         environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        environment.update({"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64})
         calls: list[tuple[str, ...]] = []
 
         def runner(command, **_kwargs):
@@ -171,6 +172,7 @@ class DevContainerConsumerTests(unittest.TestCase):
 
     def test_reference_cli_receipt_is_not_written_after_a_failed_command(self) -> None:
         environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        environment.update({"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64})
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "receipt.json"
             with self.assertRaises(RuntimeError):
@@ -179,6 +181,22 @@ class DevContainerConsumerTests(unittest.TestCase):
                     "0.82.0", output, runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("reference CLI failed")),
                 )
             self.assertFalse(output.exists())
+
+    def test_identity_drift_blocks_before_any_reference_cli_command(self) -> None:
+        environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        cases = (
+            ("candidate", {"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "c" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64}, "a" * 40, "b" * 64, _BASE),
+            ("wheel", {"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "c" * 64}, "a" * 40, "b" * 64, _BASE),
+            ("base", {"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64}, "a" * 40, "b" * 64, "sha256:" + "0" * 64),
+        )
+        for _name, update, candidate, wheel, base in cases:
+            with self.subTest(case=_name), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "receipt.json"
+                calls = []
+                with self.assertRaises(ValueError):
+                    devcontainer_consumer_qualification.qualify_and_record("devcontainer", ROOT, ROOT, {**environment, **update}, candidate, wheel, base, "0.82.0", output, runner=lambda *args, **kwargs: calls.append(args))
+                self.assertEqual(calls, [])
+                self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

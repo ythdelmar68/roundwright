@@ -147,6 +147,26 @@ def _receipt(
     }
 
 
+def _require_identity_binding(candidate_sha: str, wheel_sha256: str, base_image_digest: str, configuration_root: Path, environment: Mapping[str, str]) -> None:
+    """Reject substituted invocation identities before starting any CLI process."""
+
+    if environment.get("ROUNDWRIGHT_DOCKER_CANDIDATE_SHA") != candidate_sha or environment.get("ROUNDWRIGHT_WHEEL_SHA256") != wheel_sha256:
+        raise ValueError("Dev Container qualification environment identity is mismatched")
+    try:
+        dockerfile = (configuration_root / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        if f"@{base_image_digest}" not in dockerfile or f'test "${{ROUNDWRIGHT_BASE_IMAGE_DIGEST}}" = "{base_image_digest}"' not in dockerfile:
+            raise ValueError("Dev Container qualification base identity is mismatched")
+        for path in (configuration_root / _DEFAULT, *(configuration_root / item for item in _MODES.values())):
+            configuration = json.loads(path.read_text(encoding="utf-8"))
+            if configuration["build"]["args"]["ROUNDWRIGHT_BASE_IMAGE_DIGEST"] != base_image_digest:
+                raise ValueError("Dev Container qualification base identity is mismatched")
+            runtime = configuration.get("containerEnv", {})
+            if runtime and runtime.get("ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST") != base_image_digest:
+                raise ValueError("Dev Container qualification base identity is mismatched")
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Dev Container qualification base identity is mismatched") from error
+
+
 def qualify_and_record(
     executable: str,
     workspace: Path,
@@ -164,6 +184,7 @@ def qualify_and_record(
 
     if output.exists():
         raise ValueError("Dev Container qualification output already exists")
+    _require_identity_binding(candidate_sha, wheel_sha256, base_image_digest, configuration_root, environment)
     version = runner((executable, "--version"), check=True, capture_output=True, text=True)
     if version.stdout.strip() != reference_cli_version:
         raise ValueError("Dev Container reference CLI version is mismatched")

@@ -84,7 +84,7 @@ installed doctor and all three mode preflights, and retains the
 candidate-bound receipt.  The complementary reference-CLI qualification is:
 
 ```text
-python ci/devcontainer_consumer_qualification.py --devcontainer <reference-cli> --workspace .
+ROUNDWRIGHT_WHEEL=<exact-wheel-name> ROUNDWRIGHT_WHEEL_SHA256=<64-lowercase-hex> ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex> ROUNDWRIGHT_STATE=<state-directory> ROUNDWRIGHT_CONFIGURATION=<config.toml> ROUNDWRIGHT_AUTHENTICATION=<auth.toml> ROUNDWRIGHT_AUTHORITY_RECEIPT=<authority-receipt.json> ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256=<64-lowercase-hex> <bootstrap-python> ci/resolve_validation_toolchain.py --lock ci/validation-toolchain.lock.toml --cache-root <authoritative-checkout>/.roundlet/validation-tools exec-python -- ci/devcontainer_consumer_qualification.py --devcontainer <pinned-reference-cli> --workspace <candidate-repository> --configuration-root . --candidate <40-lowercase-hex> --wheel-sha256 <64-lowercase-hex> --base-image-digest sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 --reference-cli-version 0.82.0 --output dist/devcontainer-consumer-qualification.json
 ```
 
 It opens the passive default container, verifies the effective user/home and

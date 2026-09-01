@@ -180,7 +180,7 @@ class DevContainerConsumerTests(unittest.TestCase):
             if command[1] == "--version":
                 return mock.Mock(stdout="0.82.0\n")
             environment = kwargs["env"]
-            configuration = command[command.index("--config") + 1]
+            configuration = str(Path(command[command.index("--config") + 1]).resolve())
             wheel = environment["ROUNDWRIGHT_WHEEL_SHA256"]
             if command[1] == "up":
                 if configuration in containers and "--remove-existing-container" not in command:

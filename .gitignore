@@ -5,3 +5,5 @@
 __pycache__/
 *.py[cod]
 .roundwright/
+.devcontainer/devcontainer-lock.json
+.devcontainer/**/devcontainer-lock.json

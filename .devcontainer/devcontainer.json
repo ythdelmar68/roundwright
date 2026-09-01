@@ -1,0 +1,20 @@
+{
+  "name": "Roundwright minimal consumer (optional)",
+  "build": {
+    "context": "..",
+    "dockerfile": "../docker/Dockerfile",
+    "args": {
+      "ROUNDWRIGHT_WHEEL": "${localEnv:ROUNDWRIGHT_WHEEL}",
+      "ROUNDWRIGHT_WHEEL_SHA256": "${localEnv:ROUNDWRIGHT_WHEEL_SHA256}",
+      "ROUNDWRIGHT_CANDIDATE_SHA": "${localEnv:ROUNDWRIGHT_DOCKER_CANDIDATE_SHA}",
+      "ROUNDWRIGHT_BASE_IMAGE_DIGEST": "${localEnv:ROUNDWRIGHT_BASE_IMAGE_DIGEST}"
+    }
+  },
+  "remoteUser": "65532",
+  "overrideCommand": true,
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,readonly",
+  "mounts": [
+    "type=tmpfs,target=/tmp"
+  ]
+}

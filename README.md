@@ -20,7 +20,10 @@ scheduler, or grant dispatch authority.
 The [minimal Docker deployment consumer](docs/operations/docker-consumer.md)
 uses that same released wheel and host-owned authority/state boundary. Its
 pinned image copies no source runtime and documents only explicit repository,
-state, configuration, authentication, and receipt mounts.
+state, configuration, authentication, and receipt mounts. The optional
+[minimal Dev Container consumer](docs/operations/devcontainer-consumer.md)
+builds that same artifact-only image without adding setup hooks, a Feature, or
+a Template.
 
 Read-only and test-only modes require no receipt. Authoritative mode requires
 one fresh external designation; missing, expired, copied, conflicting, or

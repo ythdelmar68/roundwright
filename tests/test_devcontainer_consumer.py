@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -37,6 +38,7 @@ class DevContainerConsumerTests(unittest.TestCase):
         )
         self.assertEqual(configuration["remoteUser"], "roundwright")
         self.assertFalse(configuration["updateRemoteUserUID"])
+        self.assertEqual(configuration["build"]["options"], ["--network=none"])
 
     def test_default_open_is_read_only_and_has_no_lifecycle_hook(self) -> None:
         configuration = json.loads(
@@ -93,6 +95,7 @@ class DevContainerConsumerTests(unittest.TestCase):
                 self.assertEqual(configuration["remoteUser"], "roundwright")
                 self.assertFalse(configuration["updateRemoteUserUID"])
                 self.assertEqual(configuration["runArgs"], ["--read-only"])
+                self.assertEqual(configuration["build"]["options"], ["--network=none"])
                 self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_CONFIGURATION},target=/etc/roundwright/config.toml,readonly", configuration["mounts"])
                 self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_AUTHENTICATION},target=/run/roundwright/auth.toml,readonly", configuration["mounts"])
                 if mode == "authoritative":
@@ -118,7 +121,7 @@ class DevContainerConsumerTests(unittest.TestCase):
             calls.append(tuple(command))
             return mock.Mock()
 
-        devcontainer_consumer_qualification.qualify("devcontainer", ROOT, environment, runner=runner)
+        devcontainer_consumer_qualification.qualify("devcontainer", ROOT, ROOT, environment, runner=runner)
         self.assertEqual(sum(command[1] == "up" for command in calls), 4)
         self.assertEqual(sum(command[1] == "exec" for command in calls), 4)
         self.assertTrue(any(any("devcontainer.authoritative.json" in value for value in command) for command in calls))
@@ -126,6 +129,38 @@ class DevContainerConsumerTests(unittest.TestCase):
         self.assertTrue(any(any("devcontainer.test-only.json" in value for value in command) for command in calls))
         doctor_commands = [command for command in calls if command[1] == "exec" and command[-1].endswith("roundwright.docker_entrypoint doctor")]
         self.assertEqual(len(doctor_commands), 3)
+
+    def test_reference_cli_receipt_requires_real_startup_and_exact_identity(self) -> None:
+        environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        calls: list[tuple[str, ...]] = []
+
+        def runner(command, **_kwargs):
+            calls.append(tuple(command))
+            return mock.Mock(stdout="0.82.0\n")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "receipt.json"
+            devcontainer_consumer_qualification.qualify_and_record(
+                "devcontainer", ROOT, ROOT, environment, "a" * 40, "b" * 64, _BASE,
+                "0.82.0", output, runner=runner,
+            )
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["candidate_sha"], "a" * 40)
+        self.assertEqual(receipt["wheel_sha256"], "b" * 64)
+        self.assertEqual(receipt["reference_cli_version"], "0.82.0")
+        self.assertEqual(set(receipt["checks"]), {"default_startup", "authoritative_doctor", "read_only_doctor", "test_only_doctor"})
+        self.assertEqual(calls[0], ("devcontainer", "--version"))
+
+    def test_reference_cli_receipt_is_not_written_after_a_failed_command(self) -> None:
+        environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "receipt.json"
+            with self.assertRaises(RuntimeError):
+                devcontainer_consumer_qualification.qualify_and_record(
+                    "devcontainer", ROOT, ROOT, environment, "a" * 40, "b" * 64, _BASE,
+                    "0.82.0", output, runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("reference CLI failed")),
+                )
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

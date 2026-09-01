@@ -3,6 +3,9 @@
   "build": {
     "context": "..",
     "dockerfile": "../docker/Dockerfile",
+    "options": [
+      "--network=none"
+    ],
     "args": {
       "ROUNDWRIGHT_WHEEL": "${localEnv:ROUNDWRIGHT_WHEEL}",
       "ROUNDWRIGHT_WHEEL_SHA256": "${localEnv:ROUNDWRIGHT_WHEEL_SHA256}",

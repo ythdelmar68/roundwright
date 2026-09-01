@@ -391,6 +391,21 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("roundwright-docker-consumer-qualification-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("docker push", workflow)
 
+    def test_workflow_runs_pinned_reference_cli_against_every_devcontainer_path(self) -> None:
+        """The public receipt exists only after real default and mode execution."""
+
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('DEVCONTAINER_CLI_VERSION: "0.82.0"', workflow)
+        self.assertIn('npm install --no-save --no-package-lock --prefix "$cli_root" "@devcontainers/cli@$DEVCONTAINER_CLI_VERSION"', workflow)
+        self.assertIn('"$cli_root/node_modules/.bin/devcontainer" --version | grep -Fx "$DEVCONTAINER_CLI_VERSION"', workflow)
+        command = 'ci/devcontainer_consumer_qualification.py --devcontainer "$devcontainer" --workspace "$fixtures/repository" --configuration-root "$GITHUB_WORKSPACE" --candidate "$CANDIDATE_SHA" --wheel-sha256 "${{ steps.docker-inputs.outputs.wheel_sha256 }}" --base-image-digest "${{ steps.docker-inputs.outputs.base_image_digest }}" --reference-cli-version "$DEVCONTAINER_CLI_VERSION" --output dist/devcontainer-consumer-qualification.json'
+        self.assertIn(command, workflow)
+        self.assertIn('test -f dist/devcontainer-consumer-qualification.json', workflow)
+        self.assertIn('roundwright-devcontainer-consumer-qualification-${{ env.CANDIDATE_SHA }}', workflow)
+        self.assertIn('path: dist/devcontainer-consumer-qualification.json', workflow)
+        self.assertLess(workflow.index('Install pinned Dev Container reference CLI'), workflow.index('Qualify the exact Dev Container consumer paths'))
+        self.assertLess(workflow.index('Qualify the exact Dev Container consumer paths'), workflow.index('Record public-safe Docker qualification'))
+
     def test_docker_qualification_routes_every_python_helper_through_the_resolver(self) -> None:
         """Hosted Docker setup may bootstrap the resolver, never bypass its receipt."""
 

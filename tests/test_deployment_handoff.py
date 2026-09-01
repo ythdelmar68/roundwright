@@ -23,6 +23,7 @@ from roundwright.deployment_handoff import (
     HandoffRecoveryStatus,
     HandoffPhase,
     HandoffReconciliation,
+    HandoffTeardown,
     InMemoryDeploymentAuthorityStore,
 )
 from roundwright.runtime_binding import RuntimeBinding
@@ -82,6 +83,12 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
             fingerprint(prior_claim), generation, fingerprint(replacement_claim),
             self.store.state_store_fingerprint, self.state_id, status, observed,
             observed + timedelta(minutes=1) if expires_at is None else expires_at,
+        )
+
+    def teardown(self, handoff: str = "9", old: str = "f", *, resources_torn_down: bool = True) -> HandoffTeardown:
+        return HandoffTeardown(
+            fingerprint(handoff), fingerprint(old), self.store.state_store_fingerprint, self.state_id,
+            resources_torn_down, fingerprint("a"),
         )
 
     def test_concurrent_initial_acquisition_has_exactly_one_active_authority(self) -> None:
@@ -226,6 +233,24 @@ class DeploymentAuthorityHandoffTests(unittest.TestCase):
                 )
                 self.assertFalse(decision.authorized)
                 self.assertIsNone(self.coordinator.progress)
+
+    def test_terminal_teardown_clears_only_a_fully_revoked_and_cleaned_handoff(self) -> None:
+        old_identity, new_identity = self.identity(), self.identity(candidate="b")
+        old = self.receipt(old_identity)
+        handoff = fingerprint("9")
+        self.assertTrue(self.coordinator.activate_initial(old, self.verification(old), now=self.now).authorized)
+        self.assertTrue(self.coordinator.claim_orchestrator(old, claim_fingerprint=fingerprint("5"), now=self.now).authorized)
+        self.assertTrue(self.coordinator.begin_handoff(old, new_identity, handoff_fingerprint=handoff, now=self.now).authorized)
+        self.assertTrue(self.coordinator.reconcile(self.reconciliation()).authorized)
+        self.assertTrue(self.coordinator.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
+        self.assertFalse(self.coordinator.complete_teardown(self.teardown(resources_torn_down=False)).authorized)
+        self.assertEqual(self.coordinator.progress.phase, HandoffPhase.REVOKED)  # type: ignore[union-attr]
+        self.assertTrue(self.coordinator.complete_teardown(self.teardown()).authorized)
+        self.assertIsNone(self.coordinator.active_receipt)
+        self.assertIsNone(self.coordinator.progress)
+        restarted = DeploymentAuthorityHandoffCoordinator(self.store)
+        self.assertIsNone(restarted.active_receipt)
+        self.assertIsNone(restarted.progress)
 
 
 if __name__ == "__main__":

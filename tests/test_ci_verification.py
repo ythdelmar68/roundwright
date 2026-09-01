@@ -86,6 +86,7 @@ def load_ci_read_only_handoff() -> object:
     if specification is None or specification.loader is None:
         raise AssertionError("CI read-only handoff verifier is unavailable")
     module = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = module
     specification.loader.exec_module(module)
     return module
 
@@ -104,21 +105,44 @@ class CiVerificationTests(unittest.TestCase):
     def test_ci_defaults_to_read_only_and_proves_complete_handoff_teardown(self) -> None:
         verifier = load_ci_read_only_handoff()
         candidate = "a" * 40
-        receipt = verifier.qualify(candidate, candidate, "b" * 64, "c" * 64, workflow_mode="read-only")
+        receipt = verifier.qualify(
+            candidate, candidate, "b" * 64, "c" * 64, "d" * 64,
+            expected_policy="c" * 64, expected_verifier="d" * 64, workflow_mode="read-only",
+        )
         self.assertEqual(receipt["schema"], "roundwright-ci-read-only-handoff/v1")
         self.assertEqual(receipt["candidate_sha"], candidate)
         self.assertEqual(receipt["checked_out_sha"], candidate)
         self.assertEqual(receipt["default_dispatch"], "denied")
         self.assertEqual(receipt["selected_handoff"], ["stop", "reconcile", "revoke-old", "issue-new", "bounded-work", "read-back"])
-        self.assertEqual(receipt["teardown"], ["stop", "reconcile", "revoke-selected", "no-active-authority"])
+        self.assertEqual(receipt["action_budget"], 1)
+        self.assertEqual(receipt["action_read_back"], "completed")
+        self.assertEqual(receipt["teardown"], ["stop", "reconcile", "revoke-selected", "verify-cleanup", "clear-handoff", "no-active-authority"])
         self.assertEqual(receipt["result"], "passed")
 
     def test_ci_read_only_handoff_rejects_stale_candidate_and_dispatch_mode(self) -> None:
         verifier = load_ci_read_only_handoff()
         with self.assertRaisesRegex(ValueError, "checked-out SHA"):
-            verifier.qualify("a" * 40, "b" * 40, "c" * 64, "d" * 64, workflow_mode="read-only")
+            verifier.qualify("a" * 40, "b" * 40, "c" * 64, "d" * 64, "e" * 64, expected_policy="d" * 64, expected_verifier="e" * 64, workflow_mode="read-only")
         with self.assertRaisesRegex(ValueError, "read-only"):
-            verifier.qualify("a" * 40, "a" * 40, "c" * 64, "d" * 64, workflow_mode="authoritative")
+            verifier.qualify("a" * 40, "a" * 40, "c" * 64, "d" * 64, "e" * 64, expected_policy="d" * 64, expected_verifier="e" * 64, workflow_mode="authoritative")
+
+    def test_ci_read_only_handoff_rejects_policy_verifier_and_action_readback_substitution(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        arguments = ("a" * 40, "a" * 40, "b" * 64, "c" * 64, "d" * 64)
+        with self.assertRaisesRegex(ValueError, "candidate policy"):
+            verifier.qualify(*arguments, expected_policy="e" * 64, expected_verifier="d" * 64, workflow_mode="read-only")
+        with self.assertRaisesRegex(ValueError, "candidate policy"):
+            verifier.qualify(*arguments, expected_policy="c" * 64, expected_verifier="e" * 64, workflow_mode="read-only")
+        action = verifier.SyntheticAction("f" * 64, "a" * 64, "a" * 40, 1)
+        for readback in (
+            None,
+            verifier.SyntheticActionReadback("e" * 64, "a" * 64, "a" * 40, 1, 1, "completed"),
+            verifier.SyntheticActionReadback("f" * 64, "a" * 64, "a" * 40, 2, 1, "completed"),
+            verifier.SyntheticActionReadback("f" * 64, "a" * 64, "a" * 40, 1, 2, "completed"),
+        ):
+            with self.subTest(readback=readback):
+                with self.assertRaises(ValueError):
+                    verifier.verify_action_readback(action, readback)
 
     def test_ci_read_only_handoff_binds_one_uploaded_wheel_digest(self) -> None:
         verifier = load_ci_read_only_handoff()
@@ -137,15 +161,17 @@ class CiVerificationTests(unittest.TestCase):
 
     def test_ci_workflow_runs_the_read_only_handoff_fixture_on_the_exact_artifact(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        command = "ci/verify_ci_read_only_handoff.py --candidate \"$CANDIDATE_SHA\" --checked-out-sha \"$checked_out_sha\" --dist dist --policy .github/workflows/ci.yml --workflow-mode read-only --output dist/ci-read-only-handoff.json"
+        command = "ci/verify_ci_read_only_handoff.py --candidate \"$CANDIDATE_SHA\" --checked-out-sha \"$checked_out_sha\" --dist dist --policy .github/workflows/ci.yml --expected-policy-sha256 \"$candidate_policy_sha\" --expected-verifier-sha256 \"$candidate_verifier_sha\" --workflow-mode read-only --output dist/ci-read-only-handoff.json"
         self.assertIn(command, workflow)
         self.assertIn('test "$checked_out_sha" = "$CANDIDATE_SHA"', workflow)
+        self.assertIn('git show "$CANDIDATE_SHA:.github/workflows/ci.yml"', workflow)
+        self.assertIn('git show "$CANDIDATE_SHA:ci/verify_ci_read_only_handoff.py"', workflow)
+        self.assertIn('git diff --exit-code "$CANDIDATE_SHA" -- .github/workflows/ci.yml ci/verify_ci_read_only_handoff.py', workflow)
         self.assertIn("roundwright-ci-read-only-handoff-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("workflow_dispatch:", workflow)
         guide = (ROOT / "docs" / "operations" / "ci-read-only-handoff.md").read_text(encoding="utf-8")
         self.assertIn("no dispatch trigger", guide)
-        self.assertIn("final assertion is that no", guide)
-        self.assertIn("receipt remains active", guide)
+        self.assertIn("no receipt or handoff remains active", guide)
 
     def test_docker_consumer_matrix_helpers_load_without_module_registration(self) -> None:
         """The fixture writer's dynamic helper loader need not register modules."""

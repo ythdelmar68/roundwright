@@ -82,7 +82,12 @@ jobs:
         run: |
           checked_out_sha="$(git rev-parse HEAD)"
           test "$checked_out_sha" = "$CANDIDATE_SHA"
-          python ci/resolve_validation_toolchain.py exec-python -- ci/verify_ci_read_only_handoff.py --candidate "$CANDIDATE_SHA" --checked-out-sha "$checked_out_sha" --dist dist --policy .github/workflows/ci.yml --workflow-mode read-only --output dist/ci-read-only-handoff.json
+          candidate_policy_sha="$(git show "$CANDIDATE_SHA:.github/workflows/ci.yml" | sha256sum | cut -d ' ' -f 1)"
+          candidate_verifier_sha="$(git show "$CANDIDATE_SHA:ci/verify_ci_read_only_handoff.py" | sha256sum | cut -d ' ' -f 1)"
+          test "$candidate_policy_sha" = "$(sha256sum .github/workflows/ci.yml | cut -d ' ' -f 1)"
+          test "$candidate_verifier_sha" = "$(sha256sum ci/verify_ci_read_only_handoff.py | cut -d ' ' -f 1)"
+          git diff --exit-code "$CANDIDATE_SHA" -- .github/workflows/ci.yml ci/verify_ci_read_only_handoff.py
+          python ci/resolve_validation_toolchain.py exec-python -- ci/verify_ci_read_only_handoff.py --candidate "$CANDIDATE_SHA" --checked-out-sha "$checked_out_sha" --dist dist --policy .github/workflows/ci.yml --expected-policy-sha256 "$candidate_policy_sha" --expected-verifier-sha256 "$candidate_verifier_sha" --workflow-mode read-only --output dist/ci-read-only-handoff.json
       - name: Record and validate exact push evidence
         if: github.event_name == 'push'
         shell: bash

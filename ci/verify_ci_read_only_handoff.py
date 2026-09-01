@@ -9,6 +9,7 @@ receipt, opens deployment state, starts work, or contacts a provider.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -28,6 +29,7 @@ from roundwright.deployment_handoff import (
     DeploymentAuthorityIdentity,
     DeploymentAuthorityReceiptVerification,
     HandoffReconciliation,
+    HandoffTeardown,
     InMemoryDeploymentAuthorityStore,
 )
 from roundwright.runtime_binding import RuntimeBinding
@@ -54,6 +56,84 @@ def _require_candidate(value: object, description: str) -> str:
     if type(value) is not str or _CANDIDATE.fullmatch(value) is None:
         raise ValueError(f"{description} is invalid")
     return value
+
+
+@dataclass(frozen=True)
+class SyntheticAction:
+    """The one no-op action that CI may model after authority handoff."""
+
+    action_fingerprint: str
+    receipt_fingerprint: str
+    candidate_sha: str
+    budget: int
+
+    def __post_init__(self) -> None:
+        _require_digest(self.action_fingerprint, "synthetic action")
+        _require_digest(self.receipt_fingerprint, "synthetic action receipt")
+        _require_candidate(self.candidate_sha, "synthetic action candidate")
+        if type(self.budget) is not int or self.budget != 1:
+            raise ValueError("synthetic action budget is invalid")
+
+
+@dataclass(frozen=True)
+class SyntheticActionReadback:
+    """Independent machine-state read-back for the bounded no-op action."""
+
+    action_fingerprint: str
+    receipt_fingerprint: str
+    candidate_sha: str
+    consumed_budget: int
+    executions: int
+    outcome: str
+
+    def __post_init__(self) -> None:
+        _require_digest(self.action_fingerprint, "synthetic action read-back")
+        _require_digest(self.receipt_fingerprint, "synthetic action read-back receipt")
+        _require_candidate(self.candidate_sha, "synthetic action read-back candidate")
+        if type(self.consumed_budget) is not int or self.consumed_budget < 0 or type(self.executions) is not int or self.executions < 0:
+            raise ValueError("synthetic action read-back is invalid")
+        if self.outcome != "completed":
+            raise ValueError("synthetic action read-back outcome is invalid")
+
+
+class InMemorySyntheticActionStore:
+    """One-shot action record kept distinct from the authority coordinator."""
+
+    def __init__(self) -> None:
+        self._readback: SyntheticActionReadback | None = None
+
+    def execute(self, action: SyntheticAction, receipt: DeploymentAuthorityHandoffReceipt) -> SyntheticActionReadback:
+        if type(action) is not SyntheticAction or type(receipt) is not DeploymentAuthorityHandoffReceipt:
+            raise ValueError("synthetic action is unavailable")
+        if self._readback is not None:
+            raise ValueError("synthetic action was replayed")
+        if action.receipt_fingerprint != receipt.receipt_fingerprint or action.candidate_sha != receipt.identity.candidate_sha:
+            raise ValueError("synthetic action does not match selected authority")
+        self._readback = SyntheticActionReadback(
+            action.action_fingerprint, action.receipt_fingerprint, action.candidate_sha,
+            action.budget, 1, "completed",
+        )
+        return self._readback
+
+    def read_back(self) -> SyntheticActionReadback | None:
+        return self._readback
+
+
+def verify_action_readback(action: SyntheticAction, readback: object) -> SyntheticActionReadback:
+    """Reject absent, substituted, ambiguous, replayed, or over-budget results."""
+
+    if type(action) is not SyntheticAction or type(readback) is not SyntheticActionReadback:
+        raise ValueError("synthetic action read-back is absent or invalid")
+    if (
+        readback.action_fingerprint != action.action_fingerprint
+        or readback.receipt_fingerprint != action.receipt_fingerprint
+        or readback.candidate_sha != action.candidate_sha
+        or readback.consumed_budget != action.budget
+        or readback.executions != 1
+        or readback.outcome != "completed"
+    ):
+        raise ValueError("synthetic action read-back is mismatched, ambiguous, replayed, or over budget")
+    return readback
 
 
 def package_digest(directory: Path) -> str:
@@ -138,7 +218,17 @@ def _reconciliation(handoff: str, receipt: DeploymentAuthorityHandoffReceipt) ->
     )
 
 
-def qualify(candidate: str, checked_out_sha: str, package: str, policy: str, *, workflow_mode: str) -> dict[str, object]:
+def _teardown(handoff: str, receipt: DeploymentAuthorityHandoffReceipt, *, resources_torn_down: bool = True) -> HandoffTeardown:
+    return HandoffTeardown(
+        handoff, receipt.receipt_fingerprint, receipt.identity.state_store_fingerprint, receipt.identity.state_id,
+        resources_torn_down, _fingerprint("teardown", handoff, receipt.binding_digest),
+    )
+
+
+def qualify(
+    candidate: str, checked_out_sha: str, package: str, policy: str, verifier: str, *,
+    expected_policy: str, expected_verifier: str, workflow_mode: str,
+) -> dict[str, object]:
     """Run one complete in-memory handoff and return a public-safe receipt."""
 
     candidate = _require_candidate(candidate, "candidate SHA")
@@ -146,6 +236,11 @@ def qualify(candidate: str, checked_out_sha: str, package: str, policy: str, *, 
         raise ValueError("checked-out SHA does not match the selected candidate")
     _require_digest(package, "package digest")
     _require_digest(policy, "policy digest")
+    _require_digest(verifier, "verifier digest")
+    _require_digest(expected_policy, "expected policy digest")
+    _require_digest(expected_verifier, "expected verifier digest")
+    if policy != expected_policy or verifier != expected_verifier:
+        raise ValueError("candidate policy or verifier bytes do not match the checked-out files")
     if workflow_mode != _MODE:
         raise ValueError("CI workflow mode must be read-only")
     default = evaluate_deployment_authority(None, mode=DeploymentMode.READ_ONLY, now=_NOW)
@@ -182,6 +277,19 @@ def qualify(candidate: str, checked_out_sha: str, package: str, policy: str, *, 
     if not coordinator.authorize(selected_identity, selected, now=_NOW).authorized:
         raise AssertionError("selected synthetic receipt was not exact and current")
 
+    action = SyntheticAction(
+        _fingerprint("bounded synthetic action", selected.binding_digest), selected.receipt_fingerprint, candidate, 1,
+    )
+    actions = InMemorySyntheticActionStore()
+    actions.execute(action, selected)
+    verify_action_readback(action, actions.read_back())
+    try:
+        actions.execute(action, selected)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("synthetic action replay was accepted")
+
     # The bounded work is represented solely by this ordered proof; CI never
     # calls a deployment, provider, or scheduler.  Teardown again stops,
     # reconciles, and revokes the selected receipt, leaving no active authority.
@@ -191,7 +299,14 @@ def qualify(candidate: str, checked_out_sha: str, package: str, policy: str, *, 
         raise AssertionError("fixture could not reconcile teardown")
     if not coordinator.revoke_old_receipt(handoff_fingerprint=teardown).authorized:
         raise AssertionError("fixture could not revoke the selected receipt during teardown")
-    if coordinator.active_receipt is not None or coordinator.authorize(selected_identity, selected, now=_NOW).authorized:
+    if not coordinator.complete_teardown(_teardown(teardown, selected)).authorized:
+        raise AssertionError("fixture could not complete teardown")
+    restarted = DeploymentAuthorityHandoffCoordinator(store)
+    if (
+        restarted.active_receipt is not None
+        or restarted.progress is not None
+        or restarted.authorize(selected_identity, selected, now=_NOW).authorized
+    ):
         raise AssertionError("teardown left a synthetic authority active")
 
     return {
@@ -200,10 +315,13 @@ def qualify(candidate: str, checked_out_sha: str, package: str, policy: str, *, 
         "checked_out_sha": checked_out_sha,
         "package_sha256": package,
         "policy_sha256": policy,
+        "verifier_sha256": verifier,
         "workflow_mode": workflow_mode,
         "default_dispatch": "denied",
         "selected_handoff": ["stop", "reconcile", "revoke-old", "issue-new", "bounded-work", "read-back"],
-        "teardown": ["stop", "reconcile", "revoke-selected", "no-active-authority"],
+        "action_budget": 1,
+        "action_read_back": "completed",
+        "teardown": ["stop", "reconcile", "revoke-selected", "verify-cleanup", "clear-handoff", "no-active-authority"],
         "result": "passed",
     }
 
@@ -214,6 +332,8 @@ def main() -> int:
     parser.add_argument("--checked-out-sha", required=True)
     parser.add_argument("--dist", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--expected-policy-sha256", required=True)
+    parser.add_argument("--expected-verifier-sha256", required=True)
     parser.add_argument("--workflow-mode", required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
@@ -223,6 +343,9 @@ def main() -> int:
             arguments.checked_out_sha,
             package_digest(arguments.dist),
             hashlib.sha256(arguments.policy.read_bytes()).hexdigest(),
+            hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            expected_policy=arguments.expected_policy_sha256,
+            expected_verifier=arguments.expected_verifier_sha256,
             workflow_mode=arguments.workflow_mode,
         )
     except (AssertionError, OSError, ValueError) as error:

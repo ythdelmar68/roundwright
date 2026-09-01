@@ -218,6 +218,29 @@ class HandoffReconciliation:
 
 
 @dataclass(frozen=True)
+class HandoffTeardown:
+    """Final cleanup evidence for a revoked handoff with no replacement receipt."""
+
+    handoff_fingerprint: str
+    old_receipt_fingerprint: str
+    state_store_fingerprint: str
+    state_id: UUID
+    resources_torn_down: bool
+    evidence_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for value, description in (
+            (self.handoff_fingerprint, "handoff"),
+            (self.old_receipt_fingerprint, "old receipt"),
+            (self.state_store_fingerprint, "state store"),
+            (self.evidence_fingerprint, "teardown evidence"),
+        ):
+            _require_fingerprint(value, description)
+        if type(self.state_id) is not UUID or type(self.resources_torn_down) is not bool:
+            raise DeploymentHandoffError("handoff teardown evidence is invalid")
+
+
+@dataclass(frozen=True)
 class HandoffRecoveryClaim:
     """Repository-external evidence that a prior handoff owner is stale.
 
@@ -650,6 +673,33 @@ class DeploymentAuthorityHandoffCoordinator:
             self._clear_handoff_claim()
             self._store._progress = None
             return HandoffDecision(True, "new receipt is the sole active authority", receipt.receipt_fingerprint)
+
+    def complete_teardown(self, evidence: HandoffTeardown) -> HandoffDecision:
+        """Clear a revoked handoff only after its external cleanup read-back.
+
+        This terminal path deliberately has no replacement receipt.  A future
+        authority must begin again through its own externally issued receipt.
+        """
+
+        with self._store._lock:
+            progress = self._store._progress
+            if progress is None or progress.phase is not HandoffPhase.REVOKED:
+                return HandoffDecision(False, "no revoked handoff can complete teardown")
+            if not self._holds_handoff_claim(progress):
+                return HandoffDecision(False, "handoff is owned by another coordinator or requires recovery verification")
+            if (
+                type(evidence) is not HandoffTeardown
+                or evidence.handoff_fingerprint != progress.handoff_fingerprint
+                or evidence.old_receipt_fingerprint != progress.old_receipt_fingerprint
+                or evidence.state_store_fingerprint != self._store.state_store_fingerprint
+                or evidence.state_id != self._store.state_id
+                or not evidence.resources_torn_down
+                or self._store._active is not None
+            ):
+                return HandoffDecision(False, "teardown evidence is incomplete or does not match revoked machine truth")
+            self._store._progress = None
+            self._clear_handoff_claim()
+            return HandoffDecision(True, "revoked handoff resources are torn down and no authority is active", evidence.old_receipt_fingerprint)
 
     def _identity_names_this_store(self, identity: object) -> bool:
         return (

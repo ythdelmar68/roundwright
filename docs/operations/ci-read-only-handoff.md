@@ -13,14 +13,16 @@ following against the exact checked-out candidate:
 - the selected SHA equals `git rev-parse HEAD`;
 - `package-digest.json` matches exactly one uploaded wheel;
 - the workflow policy bytes are represented by a SHA-256 digest; and
+- the policy and verifier bytes equal the exact candidate-tree blobs; and
 - the workflow mode is exactly `read-only`.
 
 It then exercises the pure, in-memory deployment handoff coordinator. The
 fixture stops the synthetic old authority, records complete dispatcher/child/
 lease reconciliation, revokes the old receipt, issues one exact selected
-receipt, records bounded fixture work and read-back, then repeats stop,
-reconciliation, and revocation for teardown. The final assertion is that no
-receipt remains active. Missing state, a stale candidate, copied receipt,
+receipt, records one budget-one fixture action and independently reads back its
+exact completed result, then repeats stop, reconciliation, and revocation for
+teardown. The terminal teardown verifies cleanup, clears the revoked handoff,
+and asserts after restart that no receipt or handoff remains active. Missing state, a stale candidate, copied receipt,
 partial reconciliation, ambiguous read-back, or failed teardown is a
 fail-closed qualification error.
 

@@ -28,6 +28,7 @@ from roundwright.deployment_handoff import (
     DeploymentAuthorityHandoffReceipt,
     DeploymentAuthorityIdentity,
     DeploymentAuthorityReceiptVerification,
+    HandoffDecision,
     HandoffReconciliation,
     HandoffTeardown,
     InMemoryDeploymentAuthorityStore,
@@ -102,18 +103,48 @@ class InMemorySyntheticActionStore:
     def __init__(self) -> None:
         self._readback: SyntheticActionReadback | None = None
 
-    def execute(self, action: SyntheticAction, receipt: DeploymentAuthorityHandoffReceipt) -> SyntheticActionReadback:
-        if type(action) is not SyntheticAction or type(receipt) is not DeploymentAuthorityHandoffReceipt:
+    def execute(
+        self,
+        coordinator: DeploymentAuthorityHandoffCoordinator,
+        identity: DeploymentAuthorityIdentity,
+        action: SyntheticAction,
+        receipt: DeploymentAuthorityHandoffReceipt,
+        *,
+        now: datetime,
+    ) -> tuple[HandoffDecision, SyntheticActionReadback | None]:
+        """Consume the fixture budget only inside the receipt-bound transition."""
+
+        if (
+            type(coordinator) is not DeploymentAuthorityHandoffCoordinator
+            or type(identity) is not DeploymentAuthorityIdentity
+            or type(action) is not SyntheticAction
+            or type(receipt) is not DeploymentAuthorityHandoffReceipt
+        ):
             raise ValueError("synthetic action is unavailable")
         if self._readback is not None:
             raise ValueError("synthetic action was replayed")
-        if action.receipt_fingerprint != receipt.receipt_fingerprint or action.candidate_sha != receipt.identity.candidate_sha:
+        if (
+            identity != receipt.identity
+            or action.receipt_fingerprint != receipt.receipt_fingerprint
+            or action.candidate_sha != receipt.identity.candidate_sha
+        ):
             raise ValueError("synthetic action does not match selected authority")
-        self._readback = SyntheticActionReadback(
-            action.action_fingerprint, action.receipt_fingerprint, action.candidate_sha,
-            action.budget, 1, "completed",
+
+        def consume() -> SyntheticActionReadback:
+            self._readback = SyntheticActionReadback(
+                action.action_fingerprint, action.receipt_fingerprint, action.candidate_sha,
+                action.budget, 1, "completed",
+            )
+            return self._readback
+
+        authority, readback = coordinator.transition_if_authorized(
+            identity, receipt, now=now, transition=consume,
         )
-        return self._readback
+        if not authority.authorized:
+            return authority, None
+        if type(readback) is not SyntheticActionReadback:
+            raise AssertionError("authorized synthetic action did not return an exact read-back")
+        return authority, readback
 
     def read_back(self) -> SyntheticActionReadback | None:
         return self._readback
@@ -281,10 +312,12 @@ def qualify(
         _fingerprint("bounded synthetic action", selected.binding_digest), selected.receipt_fingerprint, candidate, 1,
     )
     actions = InMemorySyntheticActionStore()
-    actions.execute(action, selected)
-    verify_action_readback(action, actions.read_back())
+    action_authority, readback = actions.execute(coordinator, selected_identity, action, selected, now=_NOW)
+    if not action_authority.authorized:
+        raise AssertionError("selected synthetic receipt was not authorized for bounded work")
+    verify_action_readback(action, readback)
     try:
-        actions.execute(action, selected)
+        actions.execute(coordinator, selected_identity, action, selected, now=_NOW)
     except ValueError:
         pass
     else:

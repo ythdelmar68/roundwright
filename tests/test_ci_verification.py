@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import timedelta
 import importlib.util
 import hashlib
 import json
@@ -143,6 +145,80 @@ class CiVerificationTests(unittest.TestCase):
             with self.subTest(readback=readback):
                 with self.assertRaises(ValueError):
                     verifier.verify_action_readback(action, readback)
+
+    def test_ci_synthetic_action_cannot_consume_budget_without_exact_live_authority(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        candidate, policy = "a" * 40, "b" * 64
+
+        def fixture(name: str) -> tuple[object, object, object, object, object]:
+            identity = verifier._identity(candidate, policy, environment=name)
+            store = verifier.InMemoryDeploymentAuthorityStore(identity.state_store_fingerprint, identity.state_id)
+            coordinator = verifier.DeploymentAuthorityHandoffCoordinator(store)
+            receipt = verifier._receipt(identity, name)
+            action = verifier.SyntheticAction(
+                verifier._fingerprint("adversarial synthetic action", name, receipt.binding_digest),
+                receipt.receipt_fingerprint,
+                candidate,
+                1,
+            )
+            return identity, store, coordinator, receipt, action
+
+        def activate_and_claim(identity: object, coordinator: object, receipt: object, *, now: object) -> None:
+            self.assertTrue(coordinator.activate_initial(receipt, verifier._verification(receipt), now=now).authorized)
+            self.assertTrue(
+                coordinator.claim_orchestrator(
+                    receipt, claim_fingerprint=verifier._fingerprint("adversarial claim", receipt.binding_digest), now=now,
+                ).authorized
+            )
+
+        def assert_denied(coordinator: object, identity: object, receipt: object, action: object, *, now: object) -> None:
+            actions = verifier.InMemorySyntheticActionStore()
+            authority, readback = actions.execute(coordinator, identity, action, receipt, now=now)
+            self.assertFalse(authority.authorized)
+            self.assertIsNone(readback)
+            self.assertIsNone(actions.read_back())
+
+        with self.subTest(state="unactivated"):
+            identity, _, coordinator, receipt, action = fixture("unactivated")
+            assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
+
+        with self.subTest(state="copied"):
+            identity, store, coordinator, receipt, action = fixture("copied")
+            activate_and_claim(identity, coordinator, receipt, now=verifier._NOW)
+            copied = verifier.DeploymentAuthorityHandoffCoordinator(store)
+            assert_denied(copied, identity, replace(receipt), action, now=verifier._NOW)
+
+        with self.subTest(state="stale"):
+            identity, _, coordinator, receipt, action = fixture("stale")
+            stale = replace(
+                receipt,
+                issued_at=verifier._NOW - timedelta(minutes=3),
+                expires_at=verifier._NOW - timedelta(minutes=2),
+            )
+            stale_action = verifier.SyntheticAction(
+                action.action_fingerprint, stale.receipt_fingerprint, candidate, 1,
+            )
+            activate_and_claim(identity, coordinator, stale, now=verifier._NOW - timedelta(minutes=2, seconds=30))
+            assert_denied(coordinator, identity, stale, stale_action, now=verifier._NOW)
+
+        with self.subTest(state="revoked"):
+            identity, _, coordinator, receipt, action = fixture("revoked")
+            activate_and_claim(identity, coordinator, receipt, now=verifier._NOW)
+            replacement = verifier._identity(candidate, policy, environment="revoked-replacement")
+            handoff = verifier._fingerprint("adversarial handoff", receipt.binding_digest)
+            self.assertTrue(coordinator.begin_handoff(receipt, replacement, handoff_fingerprint=handoff, now=verifier._NOW).authorized)
+            self.assertTrue(coordinator.reconcile(verifier._reconciliation(handoff, receipt)).authorized)
+            self.assertTrue(coordinator.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
+            self.assertTrue(coordinator.complete_teardown(verifier._teardown(handoff, receipt)).authorized)
+            assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
+
+        with self.subTest(state="handoff-open"):
+            identity, _, coordinator, receipt, action = fixture("handoff-open")
+            activate_and_claim(identity, coordinator, receipt, now=verifier._NOW)
+            replacement = verifier._identity(candidate, policy, environment="handoff-open-replacement")
+            handoff = verifier._fingerprint("adversarial handoff", receipt.binding_digest)
+            self.assertTrue(coordinator.begin_handoff(receipt, replacement, handoff_fingerprint=handoff, now=verifier._NOW).authorized)
+            assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
 
     def test_ci_read_only_handoff_binds_one_uploaded_wheel_digest(self) -> None:
         verifier = load_ci_read_only_handoff()

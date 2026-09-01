@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "ci"))
+
+import devcontainer_consumer_qualification
+
+
+_BASE = "sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2"
 
 
 class DevContainerConsumerTests(unittest.TestCase):
@@ -24,10 +32,11 @@ class DevContainerConsumerTests(unittest.TestCase):
                 "ROUNDWRIGHT_WHEEL": "${localEnv:ROUNDWRIGHT_WHEEL}",
                 "ROUNDWRIGHT_WHEEL_SHA256": "${localEnv:ROUNDWRIGHT_WHEEL_SHA256}",
                 "ROUNDWRIGHT_CANDIDATE_SHA": "${localEnv:ROUNDWRIGHT_DOCKER_CANDIDATE_SHA}",
-                "ROUNDWRIGHT_BASE_IMAGE_DIGEST": "${localEnv:ROUNDWRIGHT_BASE_IMAGE_DIGEST}",
+                "ROUNDWRIGHT_BASE_IMAGE_DIGEST": _BASE,
             },
         )
-        self.assertEqual(configuration["remoteUser"], "65532")
+        self.assertEqual(configuration["remoteUser"], "roundwright")
+        self.assertFalse(configuration["updateRemoteUserUID"])
 
     def test_default_open_is_read_only_and_has_no_lifecycle_hook(self) -> None:
         configuration = json.loads(
@@ -40,7 +49,14 @@ class DevContainerConsumerTests(unittest.TestCase):
             configuration["workspaceMount"],
             "source=${localWorkspaceFolder},target=/workspace,type=bind,readonly",
         )
-        self.assertEqual(configuration["mounts"], ["type=tmpfs,target=/tmp"])
+        self.assertEqual(
+            configuration["mounts"],
+            [
+                "type=volume,source=roundwright-devcontainer-home,target=/home/roundwright",
+                "type=tmpfs,target=/tmp",
+            ],
+        )
+        self.assertEqual(configuration["runArgs"], ["--read-only"])
         self.assertNotIn("features", configuration)
         self.assertFalse(any(key.lower().endswith("command") for key in configuration if key != "overrideCommand"))
 
@@ -51,7 +67,7 @@ class DevContainerConsumerTests(unittest.TestCase):
             "ROUNDWRIGHT_WHEEL=<exact-wheel-name>",
             "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex>",
             "ROUNDWRIGHT_DOCKER_MODE",
-            "python -m roundwright.docker_entrypoint doctor",
+            "devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json --no-lockfile",
             "docker/compose.yaml",
             "--network=none",
             "exit code 3",
@@ -59,6 +75,57 @@ class DevContainerConsumerTests(unittest.TestCase):
             self.assertIn(value, documentation)
         for forbidden in ("postCreateCommand", "postStartCommand", "devcontainer-feature.json", "template.json"):
             self.assertNotIn(forbidden, documentation)
+
+    def test_every_mode_uses_the_canonical_runtime_mount_contract(self) -> None:
+        expected_common = {
+            "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "${localEnv:ROUNDWRIGHT_DOCKER_CANDIDATE_SHA}",
+            "ROUNDWRIGHT_DOCKER_PACKAGE_SHA256": "${localEnv:ROUNDWRIGHT_WHEEL_SHA256}",
+            "ROUNDWRIGHT_DOCKER_BASE_IMAGE_DIGEST": _BASE,
+            "ROUNDWRIGHT_REPOSITORY_ROOT": "/workspace",
+            "XDG_CONFIG_HOME": "/etc",
+            "XDG_STATE_HOME": "/var/lib",
+        }
+        for mode in ("authoritative", "read-only", "test-only"):
+            with self.subTest(mode=mode):
+                configuration = json.loads((ROOT / ".devcontainer" / f"devcontainer.{mode}.json").read_text(encoding="utf-8"))
+                self.assertEqual(configuration["containerEnv"]["ROUNDWRIGHT_DOCKER_MODE"], mode)
+                self.assertEqual({name: configuration["containerEnv"][name] for name in expected_common}, expected_common)
+                self.assertEqual(configuration["remoteUser"], "roundwright")
+                self.assertFalse(configuration["updateRemoteUserUID"])
+                self.assertEqual(configuration["runArgs"], ["--read-only"])
+                self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_CONFIGURATION},target=/etc/roundwright/config.toml,readonly", configuration["mounts"])
+                self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_AUTHENTICATION},target=/run/roundwright/auth.toml,readonly", configuration["mounts"])
+                if mode == "authoritative":
+                    self.assertIn("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256", configuration["containerEnv"])
+                    self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_STATE},target=/var/lib/roundwright", configuration["mounts"])
+                    self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_AUTHORITY_RECEIPT},target=/run/roundwright/authority-receipt.json,readonly", configuration["mounts"])
+                else:
+                    self.assertNotIn("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256", configuration["containerEnv"])
+                    self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_STATE},target=/var/lib/roundwright,readonly", configuration["mounts"])
+                    self.assertFalse(any("authority-receipt" in mount for mount in configuration["mounts"]))
+
+    def test_dockerfile_rejects_a_wrong_base_before_writing_identity(self) -> None:
+        dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        check = f'test "${{ROUNDWRIGHT_BASE_IMAGE_DIGEST}}" = "{_BASE}"'
+        self.assertIn(check, dockerfile)
+        self.assertLess(dockerfile.index(check), dockerfile.index("consumer-identity.json"))
+
+    def test_reference_cli_qualification_starts_and_execs_all_modes(self) -> None:
+        environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        calls: list[tuple[str, ...]] = []
+
+        def runner(command, **_kwargs):
+            calls.append(tuple(command))
+            return mock.Mock()
+
+        devcontainer_consumer_qualification.qualify("devcontainer", ROOT, environment, runner=runner)
+        self.assertEqual(sum(command[1] == "up" for command in calls), 4)
+        self.assertEqual(sum(command[1] == "exec" for command in calls), 4)
+        self.assertTrue(any(any("devcontainer.authoritative.json" in value for value in command) for command in calls))
+        self.assertTrue(any(any("devcontainer.read-only.json" in value for value in command) for command in calls))
+        self.assertTrue(any(any("devcontainer.test-only.json" in value for value in command) for command in calls))
+        doctor_commands = [command for command in calls if command[1] == "exec" and command[-1].endswith("roundwright.docker_entrypoint doctor")]
+        self.assertEqual(len(doctor_commands), 3)
 
 
 if __name__ == "__main__":

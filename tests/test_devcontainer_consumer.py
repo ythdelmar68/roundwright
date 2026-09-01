@@ -69,7 +69,7 @@ class DevContainerConsumerTests(unittest.TestCase):
             "ROUNDWRIGHT_WHEEL=<exact-wheel-name>",
             "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex>",
             "ROUNDWRIGHT_DOCKER_MODE",
-            "devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json --no-lockfile",
+            "devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json",
             "docker/compose.yaml",
             "--network=none",
             "exit code 3",
@@ -124,6 +124,7 @@ class DevContainerConsumerTests(unittest.TestCase):
         devcontainer_consumer_qualification.qualify("devcontainer", ROOT, ROOT, environment, runner=runner)
         self.assertEqual(sum(command[1] == "up" for command in calls), 4)
         self.assertEqual(sum(command[1] == "exec" for command in calls), 4)
+        self.assertFalse(any("--no-lockfile" in command or "--noLockfile" in command for command in calls))
         self.assertTrue(any(any("devcontainer.authoritative.json" in value for value in command) for command in calls))
         self.assertTrue(any(any("devcontainer.read-only.json" in value for value in command) for command in calls))
         self.assertTrue(any(any("devcontainer.test-only.json" in value for value in command) for command in calls))

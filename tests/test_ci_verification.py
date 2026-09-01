@@ -400,7 +400,11 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn('"$cli_root/node_modules/.bin/devcontainer" --version | grep -Fx "$DEVCONTAINER_CLI_VERSION"', workflow)
         command = 'ci/devcontainer_consumer_qualification.py --devcontainer "$devcontainer" --workspace "$fixtures/repository" --configuration-root "$GITHUB_WORKSPACE" --candidate "$CANDIDATE_SHA" --wheel-sha256 "${{ steps.docker-inputs.outputs.wheel_sha256 }}" --base-image-digest "${{ steps.docker-inputs.outputs.base_image_digest }}" --reference-cli-version "$DEVCONTAINER_CLI_VERSION" --output dist/devcontainer-consumer-qualification.json'
         self.assertIn(command, workflow)
+        self.assertNotIn("--no-lockfile", workflow)
+        self.assertNotIn("--noLockfile", workflow)
         self.assertIn('test -f dist/devcontainer-consumer-qualification.json', workflow)
+        self.assertGreaterEqual(workflow.count("git diff --exit-code"), 2)
+        self.assertIn('test -z "$(git status --porcelain --untracked-files=no)"', workflow)
         self.assertIn('roundwright-devcontainer-consumer-qualification-${{ env.CANDIDATE_SHA }}', workflow)
         self.assertIn('path: dist/devcontainer-consumer-qualification.json', workflow)
         self.assertLess(workflow.index('Install pinned Dev Container reference CLI'), workflow.index('Qualify the exact Dev Container consumer paths'))

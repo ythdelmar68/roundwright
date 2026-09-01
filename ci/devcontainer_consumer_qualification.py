@@ -74,8 +74,8 @@ def qualify(
     """Start and exec every opt-in consumer through the reference CLI.
 
     Callers provide an already-built wheel and the same disposable host inputs
-    used by the Docker consumer fixture.  The reference CLI is run with no
-    lockfile generation; after the pinned base has been made local, each
+    used by the Docker consumer fixture.  The definitions use no Features or
+    generated lockfile inputs; after the pinned base has been made local, each
     command is an offline candidate qualification.
     """
 
@@ -87,7 +87,7 @@ def qualify(
     modes = {mode: configuration_root / configuration for mode, configuration in _MODES.items()}
     if not default.is_file() or any(not configuration.is_file() for configuration in modes.values()):
         raise ValueError("Dev Container qualification configuration is unavailable")
-    run(_reference_command(executable, "up", workspace, default, "--no-lockfile"))
+    run(_reference_command(executable, "up", workspace, default))
     run(
         _reference_command(
             executable,
@@ -100,7 +100,7 @@ def qualify(
         )
     )
     for mode, configuration in modes.items():
-        run(_reference_command(executable, "up", workspace, configuration, "--no-lockfile"))
+        run(_reference_command(executable, "up", workspace, configuration))
         run(
             _reference_command(
                 executable,

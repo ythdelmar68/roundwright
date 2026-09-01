@@ -57,7 +57,7 @@ exactly the same targets and with the same RO/RW semantics as
 invoke the installed entrypoint explicitly:
 
 ```text
-devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json --no-lockfile
+devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json
 devcontainer exec --workspace-folder . --config .devcontainer/devcontainer.read-only.json python -m roundwright.docker_entrypoint doctor
 devcontainer exec --workspace-folder . --config .devcontainer/devcontainer.read-only.json python -m roundwright.docker_entrypoint status
 devcontainer exec --workspace-folder . --config .devcontainer/devcontainer.test-only.json python -m roundwright.docker_entrypoint run-once
@@ -89,5 +89,7 @@ python ci/devcontainer_consumer_qualification.py --devcontainer <reference-cli> 
 
 It opens the passive default container, verifies the effective user/home and
 non-writable workspace, then opens and executes doctor in each opt-in mode.
-It creates no lockfile, invokes no lifecycle command, and performs no
+The definitions use no Features and do not consume a generated lockfile; the
+candidate workflow checks that no tracked candidate input changed after the
+reference-CLI calls.  It invokes no lifecycle command and performs no
 registry, GitHub, provider, image-publication, or Canary operation.

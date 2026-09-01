@@ -157,6 +157,10 @@ skill applies its exact toolbox/target pins and standing Roundlet Booleans to a
 selected leaf. Neither the route nor the skill activates Roundwright or grants
 authority outside the reviewed root policy.
 
+The [CI read-only handoff qualification](docs/operations/ci-read-only-handoff.md)
+documents CI's default no-dispatch contract and the purely hermetic handoff
+fixture that proves receipt ordering and teardown.
+
 New external profiles enter through the reviewed Harness `run-profile`
 executor and public factory
 `roundwright.external_validation:roundwright_profile_adapter_factory`.

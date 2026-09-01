@@ -77,6 +77,12 @@ jobs:
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_installs.py dist
       - name: Record host qualification bound to package digest
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py qualify dist --output dist/qualification-receipt.json
+      - name: Qualify read-only CI and complete receipt handoff teardown
+        shell: bash
+        run: |
+          checked_out_sha="$(git rev-parse HEAD)"
+          test "$checked_out_sha" = "$CANDIDATE_SHA"
+          python ci/resolve_validation_toolchain.py exec-python -- ci/verify_ci_read_only_handoff.py --candidate "$CANDIDATE_SHA" --checked-out-sha "$checked_out_sha" --dist dist --policy .github/workflows/ci.yml --workflow-mode read-only --output dist/ci-read-only-handoff.json
       - name: Record and validate exact push evidence
         if: github.event_name == 'push'
         shell: bash
@@ -87,6 +93,10 @@ jobs:
         with:
           name: roundwright-qualification-${{ matrix.os }}-${{ github.sha }}
           path: dist/qualification-receipt.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roundwright-ci-read-only-handoff-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
+          path: dist/ci-read-only-handoff.json
 
   docker-consumer-qualification:
     env:

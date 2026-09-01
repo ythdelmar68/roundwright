@@ -80,6 +80,16 @@ def load_docker_negative_scenarios() -> object:
     return module
 
 
+def load_ci_read_only_handoff() -> object:
+    location = ROOT / "ci" / "verify_ci_read_only_handoff.py"
+    specification = importlib.util.spec_from_file_location("verify_ci_read_only_handoff", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("CI read-only handoff verifier is unavailable")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 def load_docker_consumer_test_helpers() -> object:
     location = ROOT / "tests" / "test_docker_consumer.py"
     specification = importlib.util.spec_from_file_location("docker_consumer_test_helpers", location)
@@ -91,6 +101,52 @@ def load_docker_consumer_test_helpers() -> object:
 
 
 class CiVerificationTests(unittest.TestCase):
+    def test_ci_defaults_to_read_only_and_proves_complete_handoff_teardown(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        candidate = "a" * 40
+        receipt = verifier.qualify(candidate, candidate, "b" * 64, "c" * 64, workflow_mode="read-only")
+        self.assertEqual(receipt["schema"], "roundwright-ci-read-only-handoff/v1")
+        self.assertEqual(receipt["candidate_sha"], candidate)
+        self.assertEqual(receipt["checked_out_sha"], candidate)
+        self.assertEqual(receipt["default_dispatch"], "denied")
+        self.assertEqual(receipt["selected_handoff"], ["stop", "reconcile", "revoke-old", "issue-new", "bounded-work", "read-back"])
+        self.assertEqual(receipt["teardown"], ["stop", "reconcile", "revoke-selected", "no-active-authority"])
+        self.assertEqual(receipt["result"], "passed")
+
+    def test_ci_read_only_handoff_rejects_stale_candidate_and_dispatch_mode(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        with self.assertRaisesRegex(ValueError, "checked-out SHA"):
+            verifier.qualify("a" * 40, "b" * 40, "c" * 64, "d" * 64, workflow_mode="read-only")
+        with self.assertRaisesRegex(ValueError, "read-only"):
+            verifier.qualify("a" * 40, "a" * 40, "c" * 64, "d" * 64, workflow_mode="authoritative")
+
+    def test_ci_read_only_handoff_binds_one_uploaded_wheel_digest(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        with tempfile.TemporaryDirectory() as temporary:
+            dist = Path(temporary)
+            wheel = dist / "roundwright-0.0.0-py3-none-any.whl"
+            wheel.write_bytes(b"candidate wheel")
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (dist / "package-digest.json").write_text(
+                json.dumps({"wheel": wheel.name, "sha256": digest}), encoding="utf-8"
+            )
+            self.assertEqual(verifier.package_digest(dist), digest)
+            wheel.write_bytes(b"substituted wheel")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                verifier.package_digest(dist)
+
+    def test_ci_workflow_runs_the_read_only_handoff_fixture_on_the_exact_artifact(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        command = "ci/verify_ci_read_only_handoff.py --candidate \"$CANDIDATE_SHA\" --checked-out-sha \"$checked_out_sha\" --dist dist --policy .github/workflows/ci.yml --workflow-mode read-only --output dist/ci-read-only-handoff.json"
+        self.assertIn(command, workflow)
+        self.assertIn('test "$checked_out_sha" = "$CANDIDATE_SHA"', workflow)
+        self.assertIn("roundwright-ci-read-only-handoff-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        guide = (ROOT / "docs" / "operations" / "ci-read-only-handoff.md").read_text(encoding="utf-8")
+        self.assertIn("no dispatch trigger", guide)
+        self.assertIn("final assertion is that no", guide)
+        self.assertIn("receipt remains active", guide)
+
     def test_docker_consumer_matrix_helpers_load_without_module_registration(self) -> None:
         """The fixture writer's dynamic helper loader need not register modules."""
 

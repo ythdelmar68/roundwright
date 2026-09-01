@@ -171,6 +171,58 @@ class DevContainerConsumerTests(unittest.TestCase):
         )
         self.assertEqual(calls[0], ("devcontainer", "--version"))
 
+    def test_repeated_qualification_recreates_old_wheel_containers(self) -> None:
+        """A receipt for a new wheel may not execute in an old wheel's container."""
+
+        containers: dict[str, str] = {}
+
+        def runner(command, **kwargs):
+            if command[1] == "--version":
+                return mock.Mock(stdout="0.82.0\n")
+            environment = kwargs["env"]
+            configuration = command[command.index("--config") + 1]
+            wheel = environment["ROUNDWRIGHT_WHEEL_SHA256"]
+            if command[1] == "up":
+                if configuration in containers and "--remove-existing-container" not in command:
+                    raise AssertionError("qualification reused a container from an old wheel")
+                containers[configuration] = wheel
+            elif command[1] == "exec":
+                self.assertEqual(containers.get(configuration), wheel)
+            return mock.Mock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            for candidate, wheel in (("a" * 40, "b" * 64), ("c" * 40, "d" * 64)):
+                environment = {
+                    name: "provided"
+                    for name in (
+                        devcontainer_consumer_qualification._COMMON_ENVIRONMENT
+                        | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT
+                    )
+                }
+                environment.update(
+                    {
+                        "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": candidate,
+                        "ROUNDWRIGHT_WHEEL_SHA256": wheel,
+                    }
+                )
+                output = temporary_path / f"{wheel}.json"
+                devcontainer_consumer_qualification.qualify_and_record(
+                    "devcontainer",
+                    ROOT,
+                    ROOT,
+                    environment,
+                    candidate,
+                    wheel,
+                    _BASE,
+                    "0.82.0",
+                    output,
+                    runner=runner,
+                )
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["wheel_sha256"], wheel)
+
+        self.assertEqual(set(containers.values()), {"d" * 64})
+
     def test_reference_cli_receipt_is_not_written_after_a_failed_command(self) -> None:
         environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
         environment.update({"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64})

@@ -87,7 +87,7 @@ def qualify(
     modes = {mode: configuration_root / configuration for mode, configuration in _MODES.items()}
     if not default.is_file() or any(not configuration.is_file() for configuration in modes.values()):
         raise ValueError("Dev Container qualification configuration is unavailable")
-    run(_reference_command(executable, "up", workspace, default))
+    run(_reference_command(executable, "up", workspace, default, "--remove-existing-container"))
     run(
         _reference_command(
             executable,
@@ -100,7 +100,15 @@ def qualify(
         )
     )
     for mode, configuration in modes.items():
-        run(_reference_command(executable, "up", workspace, configuration))
+        run(
+            _reference_command(
+                executable,
+                "up",
+                workspace,
+                configuration,
+                "--remove-existing-container",
+            )
+        )
         run(
             _reference_command(
                 executable,

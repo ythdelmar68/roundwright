@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import shutil
 from unittest import mock
 
 
@@ -197,6 +198,19 @@ class DevContainerConsumerTests(unittest.TestCase):
                     devcontainer_consumer_qualification.qualify_and_record("devcontainer", ROOT, ROOT, {**environment, **update}, candidate, wheel, base, "0.82.0", output, runner=lambda *args, **kwargs: calls.append(args))
                 self.assertEqual(calls, [])
                 self.assertFalse(output.exists())
+
+    def test_committed_definition_and_dockerfile_drift_block_before_runner(self) -> None:
+        environment = {name: "provided" for name in devcontainer_consumer_qualification._COMMON_ENVIRONMENT | devcontainer_consumer_qualification._AUTHORITATIVE_ENVIRONMENT}
+        environment.update({"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64})
+        for target in ("definition", "dockerfile"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                copied = Path(temporary) / "candidate"; shutil.copytree(ROOT, copied)
+                path = copied / ".devcontainer" / "authoritative" / "devcontainer.json" if target == "definition" else copied / "docker" / "Dockerfile"
+                path.write_text(path.read_text(encoding="utf-8").replace(_BASE, "sha256:" + "0" * 64, 1), encoding="utf-8")
+                output = Path(temporary) / "receipt.json"; calls = []
+                with self.assertRaises(ValueError):
+                    devcontainer_consumer_qualification.qualify_and_record("devcontainer", copied, copied, environment, "a" * 40, "b" * 64, _BASE, "0.82.0", output, runner=lambda *args, **kwargs: calls.append(args))
+                self.assertEqual(calls, []); self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

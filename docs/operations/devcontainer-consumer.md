@@ -44,9 +44,9 @@ The three opt-in files provide concrete reference-CLI launch definitions:
 
 | Mode | Definition | State | Authority receipt |
 | --- | --- | --- | --- |
-| authoritative | `.devcontainer/devcontainer.authoritative.json` | read/write | required, read-only |
-| read-only | `.devcontainer/devcontainer.read-only.json` | read-only | not mounted |
-| test-only | `.devcontainer/devcontainer.test-only.json` | read-only | not mounted |
+| authoritative | `.devcontainer/authoritative/devcontainer.json` | read/write | required, read-only |
+| read-only | `.devcontainer/read-only/devcontainer.json` | read-only | not mounted |
+| test-only | `.devcontainer/test-only/devcontainer.json` | read-only | not mounted |
 
 Set `ROUNDWRIGHT_STATE`, `ROUNDWRIGHT_CONFIGURATION`, and
 `ROUNDWRIGHT_AUTHENTICATION` to the host-owned inputs for every opt-in mode.
@@ -57,10 +57,10 @@ exactly the same targets and with the same RO/RW semantics as
 invoke the installed entrypoint explicitly:
 
 ```text
-devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json
-devcontainer exec --workspace-folder . --config .devcontainer/devcontainer.read-only.json python -m roundwright.docker_entrypoint doctor
-devcontainer exec --workspace-folder . --config .devcontainer/devcontainer.read-only.json python -m roundwright.docker_entrypoint status
-devcontainer exec --workspace-folder . --config .devcontainer/devcontainer.test-only.json python -m roundwright.docker_entrypoint run-once
+devcontainer up --workspace-folder . --config .devcontainer/read-only/devcontainer.json
+devcontainer exec --workspace-folder . --config .devcontainer/read-only/devcontainer.json python -m roundwright.docker_entrypoint doctor
+devcontainer exec --workspace-folder . --config .devcontainer/read-only/devcontainer.json python -m roundwright.docker_entrypoint status
+devcontainer exec --workspace-folder . --config .devcontainer/test-only/devcontainer.json python -m roundwright.docker_entrypoint run-once
 ```
 
 Select exactly one `ROUNDWRIGHT_DOCKER_MODE`: `authoritative`, `read-only`, or

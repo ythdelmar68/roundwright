@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -69,7 +70,7 @@ class DevContainerConsumerTests(unittest.TestCase):
             "ROUNDWRIGHT_WHEEL=<exact-wheel-name>",
             "ROUNDWRIGHT_DOCKER_CANDIDATE_SHA=<40-lowercase-hex>",
             "ROUNDWRIGHT_DOCKER_MODE",
-            "devcontainer up --workspace-folder . --config .devcontainer/devcontainer.read-only.json",
+            "devcontainer up --workspace-folder . --config .devcontainer/read-only/devcontainer.json",
             "docker/compose.yaml",
             "--network=none",
             "exit code 3",
@@ -89,7 +90,11 @@ class DevContainerConsumerTests(unittest.TestCase):
         }
         for mode in ("authoritative", "read-only", "test-only"):
             with self.subTest(mode=mode):
-                configuration = json.loads((ROOT / ".devcontainer" / f"devcontainer.{mode}.json").read_text(encoding="utf-8"))
+                definition = ROOT / ".devcontainer" / mode / "devcontainer.json"
+                self.assertEqual(definition.name, "devcontainer.json")
+                configuration = json.loads(definition.read_text(encoding="utf-8"))
+                self.assertEqual(configuration["build"]["context"], "../..")
+                self.assertEqual(configuration["build"]["dockerfile"], "../../docker/Dockerfile")
                 self.assertEqual(configuration["containerEnv"]["ROUNDWRIGHT_DOCKER_MODE"], mode)
                 self.assertEqual({name: configuration["containerEnv"][name] for name in expected_common}, expected_common)
                 self.assertEqual(configuration["remoteUser"], "roundwright")
@@ -106,6 +111,8 @@ class DevContainerConsumerTests(unittest.TestCase):
                     self.assertNotIn("ROUNDWRIGHT_DOCKER_AUTHORITY_RECEIPT_SHA256", configuration["containerEnv"])
                     self.assertIn("type=bind,source=${localEnv:ROUNDWRIGHT_STATE},target=/var/lib/roundwright,readonly", configuration["mounts"])
                     self.assertFalse(any("authority-receipt" in mount for mount in configuration["mounts"]))
+        for mode in ("authoritative", "read-only", "test-only"):
+            self.assertFalse((ROOT / ".devcontainer" / f"devcontainer.{mode}.json").exists())
 
     def test_dockerfile_rejects_a_wrong_base_before_writing_identity(self) -> None:
         dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
@@ -125,9 +132,9 @@ class DevContainerConsumerTests(unittest.TestCase):
         self.assertEqual(sum(command[1] == "up" for command in calls), 4)
         self.assertEqual(sum(command[1] == "exec" for command in calls), 4)
         self.assertFalse(any("--no-lockfile" in command or "--noLockfile" in command for command in calls))
-        self.assertTrue(any(any("devcontainer.authoritative.json" in value for value in command) for command in calls))
-        self.assertTrue(any(any("devcontainer.read-only.json" in value for value in command) for command in calls))
-        self.assertTrue(any(any("devcontainer.test-only.json" in value for value in command) for command in calls))
+        self.assertTrue(any(any("authoritative/devcontainer.json" in value.replace("\\", "/") for value in command) for command in calls))
+        self.assertTrue(any(any("read-only/devcontainer.json" in value.replace("\\", "/") for value in command) for command in calls))
+        self.assertTrue(any(any("test-only/devcontainer.json" in value.replace("\\", "/") for value in command) for command in calls))
         doctor_commands = [command for command in calls if command[1] == "exec" and command[-1].endswith("roundwright.docker_entrypoint doctor")]
         self.assertEqual(len(doctor_commands), 3)
 
@@ -150,6 +157,16 @@ class DevContainerConsumerTests(unittest.TestCase):
         self.assertEqual(receipt["wheel_sha256"], "b" * 64)
         self.assertEqual(receipt["reference_cli_version"], "0.82.0")
         self.assertEqual(set(receipt["checks"]), {"default_startup", "authoritative_doctor", "read_only_doctor", "test_only_doctor"})
+        definitions = {
+            "default": ROOT / ".devcontainer" / "devcontainer.json",
+            "authoritative": ROOT / ".devcontainer" / "authoritative" / "devcontainer.json",
+            "read-only": ROOT / ".devcontainer" / "read-only" / "devcontainer.json",
+            "test-only": ROOT / ".devcontainer" / "test-only" / "devcontainer.json",
+        }
+        self.assertEqual(
+            receipt["configuration_digests"],
+            {name: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() for name, path in definitions.items()},
+        )
         self.assertEqual(calls[0], ("devcontainer", "--version"))
 
     def test_reference_cli_receipt_is_not_written_after_a_failed_command(self) -> None:

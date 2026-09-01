@@ -1,8 +1,8 @@
 {
   "name": "Roundwright test-only consumer (opt-in)",
   "build": {
-    "context": "..",
-    "dockerfile": "../docker/Dockerfile",
+    "context": "../..",
+    "dockerfile": "../../docker/Dockerfile",
     "options": [
       "--network=none"
     ],

@@ -20,9 +20,9 @@ from typing import Callable, Mapping
 
 _DEFAULT = Path(".devcontainer/devcontainer.json")
 _MODES = {
-    "authoritative": Path(".devcontainer/devcontainer.authoritative.json"),
-    "read-only": Path(".devcontainer/devcontainer.read-only.json"),
-    "test-only": Path(".devcontainer/devcontainer.test-only.json"),
+    "authoritative": Path(".devcontainer/authoritative/devcontainer.json"),
+    "read-only": Path(".devcontainer/read-only/devcontainer.json"),
+    "test-only": Path(".devcontainer/test-only/devcontainer.json"),
 }
 _COMMON_ENVIRONMENT = {
     "ROUNDWRIGHT_WHEEL",

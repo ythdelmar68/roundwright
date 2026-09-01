@@ -13,7 +13,8 @@ following against the exact checked-out candidate:
 - the selected SHA equals `git rev-parse HEAD`;
 - `package-digest.json` matches exactly one uploaded wheel;
 - the workflow policy bytes are represented by a SHA-256 digest; and
-- the policy and verifier bytes equal the exact candidate-tree blobs; and
+- the policy and verifier Git blob identities equal the exact candidate-tree
+  blobs (independent of platform line-ending materialization); and
 - the workflow mode is exactly `read-only`.
 
 It then exercises the pure, in-memory deployment handoff coordinator. The

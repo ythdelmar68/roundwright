@@ -164,8 +164,10 @@ class CiVerificationTests(unittest.TestCase):
         command = "ci/verify_ci_read_only_handoff.py --candidate \"$CANDIDATE_SHA\" --checked-out-sha \"$checked_out_sha\" --dist dist --policy .github/workflows/ci.yml --expected-policy-sha256 \"$candidate_policy_sha\" --expected-verifier-sha256 \"$candidate_verifier_sha\" --workflow-mode read-only --output dist/ci-read-only-handoff.json"
         self.assertIn(command, workflow)
         self.assertIn('test "$checked_out_sha" = "$CANDIDATE_SHA"', workflow)
-        self.assertIn('git show "$CANDIDATE_SHA:.github/workflows/ci.yml"', workflow)
-        self.assertIn('git show "$CANDIDATE_SHA:ci/verify_ci_read_only_handoff.py"', workflow)
+        self.assertIn('git rev-parse "$CANDIDATE_SHA:.github/workflows/ci.yml"', workflow)
+        self.assertIn('git hash-object --path=.github/workflows/ci.yml .github/workflows/ci.yml', workflow)
+        self.assertIn('git rev-parse "$CANDIDATE_SHA:ci/verify_ci_read_only_handoff.py"', workflow)
+        self.assertIn('git hash-object --path=ci/verify_ci_read_only_handoff.py ci/verify_ci_read_only_handoff.py', workflow)
         self.assertIn('git diff --exit-code "$CANDIDATE_SHA" -- .github/workflows/ci.yml ci/verify_ci_read_only_handoff.py', workflow)
         self.assertIn("roundwright-ci-read-only-handoff-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}", workflow)
         self.assertNotIn("workflow_dispatch:", workflow)

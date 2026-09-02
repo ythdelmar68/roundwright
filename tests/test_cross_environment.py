@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.cross_environment import (
     CROSS_ENVIRONMENT_CANARY_PROFILE,
     CROSS_ENVIRONMENT_EVIDENCE_SCHEMA,
     ComparisonResult,
+    CrossEnvironmentComparison,
     CrossEnvironmentEvidence,
     CrossEnvironmentEvidenceError,
     EnvironmentKind,
@@ -66,6 +71,34 @@ class CrossEnvironmentEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(blocked.result, ComparisonResult.BLOCKED)
         self.assertNotIn("path", str(blocked.public_payload()))
+
+    def test_rejects_duplicate_authority_across_distinct_environment_lanes(self) -> None:
+        evidence = self.evidence()
+        duplicate_authority = tuple(
+            replace(lane, mode=OperationMode.AUTHORITATIVE)
+            if lane.environment is EnvironmentKind.NATIVE_MACOS else lane
+            for lane in evidence.lanes
+        )
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            replace(evidence, lanes=duplicate_authority)
+
+    def test_rejects_secret_shaped_values_in_every_emitted_free_text_field(self) -> None:
+        evidence = self.evidence()
+        values = ("ghp_abc123", "sk-secret", "github_pat_abc123")
+        for value in values:
+            with self.subTest(field="environment_identity", value=value), self.assertRaises(CrossEnvironmentEvidenceError):
+                replace(evidence.lanes[0], environment_identity=value)
+            with self.subTest(field="reason", value=value), self.assertRaises(CrossEnvironmentEvidenceError):
+                replace(
+                    evidence.lanes[0], receipt_state=ReceiptState.BLOCKED, receipt_digest=None,
+                    result=ComparisonResult.BLOCKED, reason=value,
+                )
+            with self.subTest(field="differences", value=value), self.assertRaises(CrossEnvironmentEvidenceError):
+                CrossEnvironmentComparison(ComparisonResult.BLOCKED, "a" * 40, digest("1"), digest("2"), (value,))
+
+    def test_rejects_a_non_enum_comparison_result_before_public_rendering(self) -> None:
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            CrossEnvironmentComparison("blocked", "a" * 40, digest("1"), digest("2"), ("lane-mismatch",))  # type: ignore[arg-type]
 
     def test_comparison_and_retention_read_back_are_deterministic_and_public_safe(self) -> None:
         evidence = self.evidence()

@@ -65,7 +65,10 @@ def _safe_token(value: object) -> bool:
     if type(value) is not str or _TOKEN.fullmatch(value) is None:
         return False
     lowered = value.lower()
-    return not any(word in lowered for word in ("secret", "token", "credential", "password", "path"))
+    return (
+        not any(word in lowered for word in ("secret", "token", "credential", "password", "path"))
+        and not lowered.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-"))
+    )
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,8 @@ class CrossEnvironmentEvidence:
             raise CrossEnvironmentEvidenceError("cross-environment evidence is invalid")
         if {lane.environment for lane in self.lanes} != set(EnvironmentKind):
             raise CrossEnvironmentEvidenceError("cross-environment lanes are missing or duplicate")
+        if sum(lane.mode is OperationMode.AUTHORITATIVE for lane in self.lanes) > 1:
+            raise CrossEnvironmentEvidenceError("cross-environment authority is duplicate")
         if any(
             (
                 lane.candidate_sha,
@@ -225,6 +230,7 @@ class CrossEnvironmentComparison:
     def __post_init__(self) -> None:
         if (
             self.schema != CROSS_ENVIRONMENT_RESULT_SCHEMA
+            or type(self.result) is not ComparisonResult
             or _SHA.fullmatch(self.candidate_sha) is None
             or _DIGEST.fullmatch(self.expected_digest) is None
             or _DIGEST.fullmatch(self.observed_digest) is None

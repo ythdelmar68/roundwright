@@ -1062,10 +1062,11 @@ class ShadowV2Tests(unittest.TestCase):
         read_only_external_observation = shadow_evidence_profile(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)
         integrated_boundary = shadow_evidence_profile(INTEGRATED_BOUNDARY_PROFILE)
         qualification_consumer = shadow_evidence_profile("roundwright-shadow-profile/phase-3-qualification/v1")
+        cross_environment = shadow_evidence_profile("roundwright-shadow-profile/cross-environment-canary/v1")
         self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(
             shadow_evidence_profiles(),
-            (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary, qualification_consumer),
+            (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary, qualification_consumer, cross_environment),
         )
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
@@ -1085,6 +1086,8 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(integrated_boundary.event_kinds, ("composed-evidence-manifest", "composed-evidence-result"))
         self.assertEqual(qualification_consumer.capture_mode, CaptureMode.COMPOSED_EVIDENCE)
         self.assertEqual(qualification_consumer.event_kinds, ("qualification-inventory", "qualification-decision"))
+        self.assertEqual(cross_environment.capture_mode, CaptureMode.SYNTHETIC_ONE_SHOT)
+        self.assertEqual(cross_environment.event_kinds, ("cross-environment-profile-qualification",))
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

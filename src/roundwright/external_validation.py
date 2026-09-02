@@ -23,6 +23,7 @@ from .shadow import (
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     INTEGRATED_BOUNDARY_PROFILE,
     PHASE_3_QUALIFICATION_PROFILE,
+    CROSS_ENVIRONMENT_CANARY_PROFILE,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -63,6 +64,14 @@ from .provider_attempt_runtime import (
     prepare_context as prepare_provider_attempt_context,
 )
 from . import lifecycle_observation
+from .cross_environment import (
+    CROSS_ENVIRONMENT_EVIDENCE_SCHEMA,
+    ComparisonResult,
+    CrossEnvironmentEvidence,
+    CrossEnvironmentEvidenceError,
+    compare_cross_environment_evidence,
+    semantic_read_back,
+)
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
@@ -171,6 +180,7 @@ HOSTED_CHECK_OBSERVATION_BLOCKER = "hosted-check-observation-unavailable"
 LIVE_LIFECYCLE_OBSERVATION_BLOCKER = "live-lifecycle-shadow-observation-unavailable"
 INTEGRATED_BOUNDARY_SCHEMA = "roundwright-integrated-boundary-composition/v1"
 PHASE_3_QUALIFICATION_SCHEMA = "roundwright-phase-3-qualification/v1"
+CROSS_ENVIRONMENT_CANARY_SCHEMA = CROSS_ENVIRONMENT_EVIDENCE_SCHEMA
 
 
 def synthetic_component_identities() -> tuple[str, str, str]:
@@ -277,6 +287,21 @@ PHASE_3_QUALIFICATION_COMPARATOR_IDENTITY = _digest({"schema": PHASE_3_QUALIFICA
 
 def phase_3_qualification_component_identities() -> tuple[str, str, str]:
     return (PHASE_3_QUALIFICATION_PRODUCER_IDENTITY, PHASE_3_QUALIFICATION_EXPORTER_IDENTITY, PHASE_3_QUALIFICATION_COMPARATOR_IDENTITY)
+
+
+CROSS_ENVIRONMENT_CANARY_PRODUCER_IDENTITY = _digest({"schema": CROSS_ENVIRONMENT_CANARY_SCHEMA, "component": "cross-environment-profile-producer"})
+CROSS_ENVIRONMENT_CANARY_EXPORTER_IDENTITY = _digest({"schema": CROSS_ENVIRONMENT_CANARY_SCHEMA, "component": "public-safe-cross-environment-exporter"})
+CROSS_ENVIRONMENT_CANARY_COMPARATOR_IDENTITY = _digest({"schema": CROSS_ENVIRONMENT_CANARY_SCHEMA, "component": "exact-artifact-matrix-comparator"})
+
+
+def cross_environment_canary_component_identities() -> tuple[str, str, str]:
+    """Return the closed identities for the Phase 4 synthetic profile."""
+
+    return (
+        CROSS_ENVIRONMENT_CANARY_PRODUCER_IDENTITY,
+        CROSS_ENVIRONMENT_CANARY_EXPORTER_IDENTITY,
+        CROSS_ENVIRONMENT_CANARY_COMPARATOR_IDENTITY,
+    )
 
 
 def _phase_3_qualification_inputs_type() -> type:
@@ -3999,7 +4024,221 @@ class Phase3QualificationAdapter:
         return _harness_executor().ProfileComparison(status, _digest({"schema": PHASE_3_QUALIFICATION_SCHEMA, "status": status, "expected_identity": _digest(expected), "observed_identity": _digest(evidence), "ready_at": binding.ready_at}))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter:
+@dataclass(frozen=True)
+class CrossEnvironmentCanaryInputs:
+    """One exact package, candidate, and six-lane evidence matrix for #95."""
+
+    candidate_sha: str
+    case_id: str
+    capture_plan_digest: str
+    ready_at: int
+    evidence: CrossEnvironmentEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_token(self.case_id)
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or type(self.ready_at) is not int
+            or self.ready_at < 0
+            or type(self.evidence) is not CrossEnvironmentEvidence
+            or self.evidence.candidate_sha != self.candidate_sha
+            or self.evidence.producer_identity != CROSS_ENVIRONMENT_CANARY_PRODUCER_IDENTITY
+        ):
+            raise ExternalValidationAdapterError("cross-environment qualification inputs are invalid")
+
+    @property
+    def input_digest(self) -> str:
+        return _digest(self.execution_context())
+
+    def execution_context(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-cross-environment-canary-context/v1",
+            "candidate_sha": self.candidate_sha,
+            "case_id": self.case_id,
+            "capture_plan_digest": self.capture_plan_digest,
+            "ready_at": self.ready_at,
+            "evidence": self.evidence.public_payload(),
+            "evidence_digest": self.evidence.evidence_digest,
+            "zero_provider_calls": 0,
+            "zero_target_actions": 0,
+            "zero_github_mutations": 0,
+        }
+
+
+@dataclass(frozen=True)
+class MaterializedCrossEnvironmentCanaryContext:
+    """Opaque V2 context which prevents matrix substitution after readiness."""
+
+    descriptor: dict[str, object]
+    inputs: CrossEnvironmentCanaryInputs
+    input_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.descriptor) is not dict
+            or type(self.inputs) is not CrossEnvironmentCanaryInputs
+            or self.descriptor != self.inputs.execution_context()
+            or self.input_digest != _digest(self.descriptor)
+        ):
+            raise ExternalValidationAdapterError("cross-environment execution context is invalid")
+
+    @property
+    def identity(self) -> str:
+        return _digest({
+            "schema": "roundwright-cross-environment-canary-context-binding/v1",
+            "descriptor": self.descriptor,
+            "input_digest": self.input_digest,
+        })
+
+
+def _cross_environment_binding_identity(binding: object) -> str:
+    try:
+        payload = {
+            "schema": CROSS_ENVIRONMENT_CANARY_SCHEMA,
+            "profile": binding.profile,
+            "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at,
+            "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("cross-environment binding is invalid") from error
+    if (
+        payload["profile"] != CROSS_ENVIRONMENT_CANARY_PROFILE
+        or not _safe_token(payload["case_id"])
+        or _SHA.fullmatch(payload["candidate_sha"]) is None
+        or type(payload["ready_at"]) is not int
+        or payload["ready_at"] < 0
+        or _DIGEST.fullmatch(payload["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("cross-environment binding is invalid")
+    return _digest(payload)
+
+
+def _cross_environment_context(
+    binding: object, inputs: CrossEnvironmentCanaryInputs,
+) -> MaterializedCrossEnvironmentCanaryContext:
+    try:
+        context = binding.execution_context
+        value = context.value
+        descriptor_digest = binding.execution_context_input_digest
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("cross-environment execution context is unavailable") from error
+    if (
+        type(value) is not MaterializedCrossEnvironmentCanaryContext
+        or value.inputs != inputs
+        or value.descriptor != inputs.execution_context()
+        or value.input_digest != descriptor_digest
+        or context.identity != value.identity
+        or (inputs.candidate_sha, inputs.case_id, inputs.capture_plan_digest, inputs.ready_at)
+        != (binding.candidate_sha, binding.case_id, binding.plan.plan_digest, binding.ready_at)
+    ):
+        raise ExternalValidationAdapterError("cross-environment execution context has drifted")
+    return value
+
+
+@dataclass(frozen=True)
+class CrossEnvironmentCanaryAdapter:
+    """The repository adapter for deterministic, zero-action profile qualification."""
+
+    inputs: CrossEnvironmentCanaryInputs | None = None
+    profile_id: str = CROSS_ENVIRONMENT_CANARY_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile_id != CROSS_ENVIRONMENT_CANARY_PROFILE or (self.inputs is not None and type(self.inputs) is not CrossEnvironmentCanaryInputs):
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(*cross_environment_canary_component_identities())
+
+    def prepare_execution_context(self, preparation: object) -> object:
+        try:
+            if self.inputs is None or (
+                preparation.descriptor != self.inputs.execution_context()
+                or preparation.input_digest != self.inputs.input_digest
+                or preparation.components != self.component_identities
+                or (
+                    preparation.plan.candidate_sha,
+                    preparation.plan.case_id,
+                    preparation.plan.plan_digest,
+                    preparation.plan.ready_at,
+                ) != (
+                    self.inputs.candidate_sha,
+                    self.inputs.case_id,
+                    self.inputs.capture_plan_digest,
+                    self.inputs.ready_at,
+                )
+            ):
+                raise ValueError
+            context = MaterializedCrossEnvironmentCanaryContext(
+                self.inputs.execution_context(), self.inputs, preparation.input_digest,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, TypeError, ValueError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("cross-environment execution context is invalid") from error
+
+    def validate(self, binding: object) -> None:
+        _cross_environment_binding_identity(binding)
+        try:
+            components = (
+                binding.components.producer_identity,
+                binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("cross-environment components are invalid") from error
+        if components != cross_environment_canary_component_identities() or self.inputs is None:
+            raise ExternalValidationAdapterError("cross-environment profile inputs are unavailable")
+        _cross_environment_context(binding, self.inputs)
+
+    def execute(self, binding: object) -> object:
+        self.validate(binding)
+        assert self.inputs is not None
+        evidence = self.inputs.evidence
+        if evidence.result is not ComparisonResult.PASS:
+            raise ExternalValidationAdapterError("cross-environment profile evidence is not qualified")
+        return _harness_executor().ProfileExecution({
+            "evidence": evidence.public_payload(),
+            "semantic_read_back": semantic_read_back(evidence.public_payload(), evidence).public_payload(),
+        }, mutation_count=0)
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        self.validate(binding)
+        assert self.inputs is not None
+        expected = {
+            "evidence": self.inputs.evidence.public_payload(),
+            "semantic_read_back": semantic_read_back(self.inputs.evidence.public_payload(), self.inputs.evidence).public_payload(),
+        }
+        try:
+            if execution.mutation_count != 0 or execution.value != expected:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ExternalValidationAdapterError("cross-environment execution has drifted") from error
+        return {
+            "schema": "roundwright-shadow-case/v2",
+            "profile": CROSS_ENVIRONMENT_CANARY_PROFILE,
+            "ready_at": binding.ready_at,
+            "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha,
+            "capture_plan_digest": binding.plan.plan_digest,
+            "cross_environment": expected,
+        }
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        expected = self.project(binding, self.execute(binding))
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        return _harness_executor().ProfileComparison(status, _digest({
+            "schema": CROSS_ENVIRONMENT_CANARY_SCHEMA,
+            "status": status,
+            "ready_at": binding.ready_at,
+            "expected_identity": _digest(expected),
+            "observed_identity": _digest(evidence),
+        }))
+
+
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
@@ -4018,6 +4257,10 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
         return IntegratedBoundaryCompositionAdapter(profile_id=profile_id)
     if profile_id == PHASE_3_QUALIFICATION_PROFILE:
         return Phase3QualificationAdapter(profile_id=profile_id)
+    if profile_id == CROSS_ENVIRONMENT_CANARY_PROFILE:
+        raise ExternalValidationAdapterError(
+            "cross-environment qualification requires the repository-hosted V2 entrypoint"
+        )
     raise ExternalValidationAdapterError("executor profile is unsupported")
 
 
@@ -4237,6 +4480,57 @@ def run_phase_3_qualification_profile(mode: Literal["validate", "execute"], requ
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("phase-3 qualification hosted validate binding is invalid") from error
+
+
+def run_cross_environment_canary_profile(
+    mode: Literal["validate", "execute"],
+    request_value: Mapping[str, Any],
+    store_root: Path,
+    inputs: CrossEnvironmentCanaryInputs,
+    *,
+    expected_readiness_digest: str | None = None,
+) -> object:
+    """Run #95 only through the reviewed Harness V2 executor and this adapter.
+
+    The input is a deterministic, public-safe synthetic matrix.  It grants no
+    provider, target, GitHub, or filesystem mutation capability.
+    """
+
+    harness = _harness_executor()
+    try:
+        if mode not in {"validate", "execute"} or type(inputs) is not CrossEnvironmentCanaryInputs or not isinstance(store_root, Path):
+            raise ValueError
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != CROSS_ENVIRONMENT_CANARY_PROFILE
+            or not _canonical_json_equivalent(request.execution_context, inputs.execution_context())
+            or (mode == "validate" and expected_readiness_digest is not None)
+            or (mode == "execute" and _DIGEST.fullmatch(expected_readiness_digest or "") is None)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        producer, exporter, comparator = cross_environment_canary_component_identities()
+        capture = request.capture_plan
+        if (
+            type(capture) is not dict
+            or capture.get("schema") != "roundwright-harness-capture-plan/v1"
+            or (
+                capture.get("candidate_sha"), capture.get("case_id"), capture.get("ready_at"),
+                capture.get("producer_identity"), capture.get("exporter_identity"), capture.get("comparator_identity"),
+            ) != (inputs.candidate_sha, inputs.case_id, inputs.ready_at, producer, exporter, comparator)
+            or (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at)
+            != (inputs.candidate_sha, inputs.case_id, inputs.capture_plan_digest, inputs.ready_at)
+        ):
+            raise ValueError
+        return harness.run_profile_executor(
+            mode, request_value, CrossEnvironmentCanaryAdapter(inputs), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except (CrossEnvironmentEvidenceError, ExternalValidationAdapterError):
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("cross-environment hosted entrypoint binding is invalid") from error
 
 
 def run_read_only_external_observation_profile(

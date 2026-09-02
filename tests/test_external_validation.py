@@ -76,6 +76,7 @@ from roundwright.shadow import (
     INTEGRATED_BOUNDARY_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PHASE_3_QUALIFICATION_PROFILE,
+    CROSS_ENVIRONMENT_CANARY_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     EvidenceRole,
@@ -85,6 +86,14 @@ from roundwright.shadow import (
     ShadowV2Event,
     ShadowV2EventGraph,
     shadow_evidence_profile,
+)
+from roundwright.cross_environment import (
+    ComparisonResult,
+    CrossEnvironmentEvidence,
+    EnvironmentKind,
+    EnvironmentLane,
+    OperationMode,
+    ReceiptState,
 )
 from roundwright.integrated_boundary import (
     IntegratedBoundaryInputs, RetainedEvidenceExpectation, RetainedEvidenceSource, RetainedSourceKind,
@@ -464,6 +473,34 @@ class ExternalValidationTests(unittest.TestCase):
             "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
             "execution_context": external_validation.phase_3_qualification_execution_context(inputs, authority),
         }
+
+    def cross_environment_v2_request(self) -> tuple[external_validation.CrossEnvironmentCanaryInputs, dict[str, object], dict[str, object]]:
+        producer, exporter, comparator = external_validation.cross_environment_canary_component_identities()
+        plan: dict[str, object] = {
+            "schema": "roundwright-harness-capture-plan/v1", "profile": CROSS_ENVIRONMENT_CANARY_PROFILE,
+            "case_id": "issue-95-cross-environment", "candidate_sha": "c" * 40, "ready_at": 29,
+            "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+            "recorder_identity": "sha256:" + "7" * 64, "store_identity": "sha256:" + "8" * 64,
+            "observation_identity": "sha256:" + "9" * 64,
+        }
+        plan_digest = external_validation._digest(plan)
+        lanes = tuple(
+            EnvironmentLane(
+                environment, environment.value + "-fixture", OperationMode.READ_ONLY, "c" * 40,
+                "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64,
+                "sha256:" + "4" * 64, producer, ReceiptState.VERIFIED, "sha256:" + "5" * 64,
+                29, ComparisonResult.PASS,
+            )
+            for environment in sorted(EnvironmentKind, key=lambda item: item.value)
+        )
+        inputs = external_validation.CrossEnvironmentCanaryInputs(
+            "c" * 40, "issue-95-cross-environment", plan_digest, 29,
+            CrossEnvironmentEvidence("c" * 40, "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64, "sha256:" + "4" * 64, producer, lanes),
+        )
+        return inputs, plan, {
+            "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
+            "execution_context": inputs.execution_context(),
+        }
     @staticmethod
     def trace_read_result(request: GitHubReadRequest, candidate_sha: str) -> GitHubReadResult:
         """Return the separately-bound implementation PR and Conversation evidence."""
@@ -604,6 +641,44 @@ class ExternalValidationTests(unittest.TestCase):
             ),
             {"status": "fake"},
         )
+
+    def test_cross_environment_profile_requires_one_bound_synthetic_matrix_and_zero_actions(self) -> None:
+        inputs, plan, request = self.cross_environment_v2_request()
+        producer, exporter, comparator = external_validation.cross_environment_canary_component_identities()
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        readiness = external_validation.run_cross_environment_canary_profile(
+            "validate", request, Path("cross-environment-recorder"), inputs,
+        )
+        self.assertEqual(len(harness.run_calls), before + 1)
+        adapter = harness.run_calls[-1][0][2]
+        prepared = adapter.prepare_execution_context(SimpleNamespace(
+            descriptor=request["execution_context"], input_digest=external_validation._digest(request["execution_context"]),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-95-cross-environment", ready_at=29),
+            components=adapter.component_identities,
+        ))
+        exact = binding(
+            profile=CROSS_ENVIRONMENT_CANARY_PROFILE, case_id="issue-95-cross-environment", candidate_sha="c" * 40,
+            ready_at=29, plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
+            components=SimpleNamespace(producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator),
+            execution_context=prepared, execution_context_input_digest=external_validation._digest(request["execution_context"]),
+        )
+        adapter.validate(exact)
+        evidence = adapter.project(exact, adapter.execute(exact))
+        self.assertEqual(adapter.compare(exact, evidence).status, "pass")
+        self.assertEqual(
+            (request["execution_context"]["zero_provider_calls"], request["execution_context"]["zero_target_actions"], request["execution_context"]["zero_github_mutations"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(
+            external_validation.run_cross_environment_canary_profile(
+                "execute", request, Path("cross-environment-recorder"), inputs,
+                expected_readiness_digest=readiness.as_dict()["receipt_digest"],
+            ),
+            {"status": "fake"},
+        )
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.roundwright_profile_adapter_factory(CROSS_ENVIRONMENT_CANARY_PROFILE)
 
     def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
         """The V2 parser may freeze JSON collections, without relaxing any identity binding."""

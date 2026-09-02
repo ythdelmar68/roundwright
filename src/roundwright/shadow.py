@@ -878,6 +878,7 @@ LIVE_LIFECYCLE_SHADOW_PROFILE = "roundwright-shadow-profile/live-lifecycle-shado
 READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = "roundwright-shadow-profile/read-only-external-observation/v1"
 INTEGRATED_BOUNDARY_PROFILE = "roundwright-shadow-profile/integrated-boundary/v1"
 PHASE_3_QUALIFICATION_PROFILE = "roundwright-shadow-profile/phase-3-qualification/v1"
+CROSS_ENVIRONMENT_CANARY_PROFILE = "roundwright-shadow-profile/cross-environment-canary/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1134,6 +1135,17 @@ _PHASE_3_QUALIFICATION_PROFILE = ShadowEvidenceProfile(
     ("qualification-inventory", "qualification-decision"),
 )
 
+_CROSS_ENVIRONMENT_CANARY_PROFILE = ShadowEvidenceProfile(
+    CROSS_ENVIRONMENT_CANARY_PROFILE,
+    CaptureMode.SYNTHETIC_ONE_SHOT,
+    ShadowProducer.PROFILE_DEFINED,
+    "exact-candidate-artifact-matrix-schema-adapter-recorder-readback-bound",
+    "before-cross-environment-profile-qualification",
+    "append-only-content-addressed-readback",
+    "same-input-deterministic-recapture-or-new-identity",
+    ("cross-environment-profile-qualification",),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
@@ -1148,6 +1160,7 @@ def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
         _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
         _INTEGRATED_BOUNDARY_PROFILE,
         _PHASE_3_QUALIFICATION_PROFILE,
+        _CROSS_ENVIRONMENT_CANARY_PROFILE,
     )
 
 
@@ -1168,6 +1181,8 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _INTEGRATED_BOUNDARY_PROFILE
     if profile_id == PHASE_3_QUALIFICATION_PROFILE:
         return _PHASE_3_QUALIFICATION_PROFILE
+    if profile_id == CROSS_ENVIRONMENT_CANARY_PROFILE:
+        return _CROSS_ENVIRONMENT_CANARY_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

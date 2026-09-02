@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import hashlib
 import json
@@ -10,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -80,6 +84,17 @@ def load_docker_negative_scenarios() -> object:
     return module
 
 
+def load_ci_read_only_handoff() -> object:
+    location = ROOT / "ci" / "verify_ci_read_only_handoff.py"
+    specification = importlib.util.spec_from_file_location("verify_ci_read_only_handoff", location)
+    if specification is None or specification.loader is None:
+        raise AssertionError("CI read-only handoff verifier is unavailable")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = module
+    specification.loader.exec_module(module)
+    return module
+
+
 def load_docker_consumer_test_helpers() -> object:
     location = ROOT / "tests" / "test_docker_consumer.py"
     specification = importlib.util.spec_from_file_location("docker_consumer_test_helpers", location)
@@ -91,6 +106,222 @@ def load_docker_consumer_test_helpers() -> object:
 
 
 class CiVerificationTests(unittest.TestCase):
+    def test_ci_defaults_to_read_only_and_proves_complete_handoff_teardown(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        candidate = "a" * 40
+        receipt = verifier.qualify(
+            candidate, candidate, "b" * 64, "c" * 64, "d" * 64,
+            expected_policy="c" * 64, expected_verifier="d" * 64, workflow_mode="read-only",
+        )
+        self.assertEqual(receipt["schema"], "roundwright-ci-read-only-handoff/v1")
+        self.assertEqual(receipt["candidate_sha"], candidate)
+        self.assertEqual(receipt["checked_out_sha"], candidate)
+        self.assertEqual(receipt["default_dispatch"], "denied")
+        self.assertEqual(receipt["selected_handoff"], ["stop", "reconcile", "revoke-old", "issue-new", "bounded-work", "read-back"])
+        self.assertEqual(receipt["action_budget"], 1)
+        self.assertEqual(receipt["action_read_back"], "completed")
+        self.assertEqual(receipt["teardown"], ["stop", "reconcile", "revoke-selected", "verify-cleanup", "clear-handoff", "no-active-authority"])
+        self.assertEqual(receipt["result"], "passed")
+
+    def test_ci_read_only_handoff_rejects_stale_candidate_and_dispatch_mode(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        with self.assertRaisesRegex(ValueError, "checked-out SHA"):
+            verifier.qualify("a" * 40, "b" * 40, "c" * 64, "d" * 64, "e" * 64, expected_policy="d" * 64, expected_verifier="e" * 64, workflow_mode="read-only")
+        with self.assertRaisesRegex(ValueError, "read-only"):
+            verifier.qualify("a" * 40, "a" * 40, "c" * 64, "d" * 64, "e" * 64, expected_policy="d" * 64, expected_verifier="e" * 64, workflow_mode="authoritative")
+
+    def test_ci_read_only_handoff_rejects_policy_verifier_and_action_readback_substitution(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        arguments = ("a" * 40, "a" * 40, "b" * 64, "c" * 64, "d" * 64)
+        with self.assertRaisesRegex(ValueError, "candidate policy"):
+            verifier.qualify(*arguments, expected_policy="e" * 64, expected_verifier="d" * 64, workflow_mode="read-only")
+        with self.assertRaisesRegex(ValueError, "candidate policy"):
+            verifier.qualify(*arguments, expected_policy="c" * 64, expected_verifier="e" * 64, workflow_mode="read-only")
+        action = verifier.SyntheticAction("f" * 64, "a" * 64, "a" * 40, 1)
+        for readback in (
+            None,
+            verifier.SyntheticActionReadback("e" * 64, "a" * 64, "a" * 40, 1, 1, "completed"),
+            verifier.SyntheticActionReadback("f" * 64, "a" * 64, "a" * 40, 2, 1, "completed"),
+            verifier.SyntheticActionReadback("f" * 64, "a" * 64, "a" * 40, 1, 2, "completed"),
+        ):
+            with self.subTest(readback=readback):
+                with self.assertRaises(ValueError):
+                    verifier.verify_action_readback(action, readback)
+
+    def test_ci_synthetic_action_cannot_consume_budget_without_exact_live_authority(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        candidate, policy = "a" * 40, "b" * 64
+
+        def fixture(name: str) -> tuple[object, object, object, object, object]:
+            identity = verifier._identity(candidate, policy, environment=name)
+            store = verifier.InMemoryDeploymentAuthorityStore(identity.state_store_fingerprint, identity.state_id)
+            coordinator = verifier.DeploymentAuthorityHandoffCoordinator(store)
+            receipt = verifier._receipt(identity, name)
+            action = verifier.SyntheticAction(
+                verifier._fingerprint("adversarial synthetic action", name, receipt.binding_digest),
+                receipt.receipt_fingerprint,
+                candidate,
+                1,
+            )
+            return identity, store, coordinator, receipt, action
+
+        def activate_and_claim(identity: object, coordinator: object, receipt: object, *, now: object) -> None:
+            self.assertTrue(coordinator.activate_initial(receipt, verifier._verification(receipt), now=now).authorized)
+            self.assertTrue(
+                coordinator.claim_orchestrator(
+                    receipt, claim_fingerprint=verifier._fingerprint("adversarial claim", receipt.binding_digest), now=now,
+                ).authorized
+            )
+
+        def assert_denied(coordinator: object, identity: object, receipt: object, action: object, *, now: object) -> None:
+            actions = verifier.InMemorySyntheticActionStore()
+            authority, readback = actions.execute(coordinator, identity, action, receipt, now=now)
+            self.assertFalse(authority.authorized)
+            self.assertIsNone(readback)
+            self.assertIsNone(actions.read_back())
+
+        with self.subTest(state="unactivated"):
+            identity, _, coordinator, receipt, action = fixture("unactivated")
+            assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
+
+        with self.subTest(state="copied"):
+            identity, store, coordinator, receipt, action = fixture("copied")
+            activate_and_claim(identity, coordinator, receipt, now=verifier._NOW)
+            copied = verifier.DeploymentAuthorityHandoffCoordinator(store)
+            assert_denied(copied, identity, replace(receipt), action, now=verifier._NOW)
+
+        with self.subTest(state="stale"):
+            identity, _, coordinator, receipt, action = fixture("stale")
+            stale = replace(
+                receipt,
+                issued_at=verifier._NOW - timedelta(minutes=3),
+                expires_at=verifier._NOW - timedelta(minutes=2),
+            )
+            stale_action = verifier.SyntheticAction(
+                action.action_fingerprint, stale.receipt_fingerprint, candidate, 1,
+            )
+            activate_and_claim(identity, coordinator, stale, now=verifier._NOW - timedelta(minutes=2, seconds=30))
+            assert_denied(coordinator, identity, stale, stale_action, now=verifier._NOW)
+
+        with self.subTest(state="revoked"):
+            identity, _, coordinator, receipt, action = fixture("revoked")
+            activate_and_claim(identity, coordinator, receipt, now=verifier._NOW)
+            replacement = verifier._identity(candidate, policy, environment="revoked-replacement")
+            handoff = verifier._fingerprint("adversarial handoff", receipt.binding_digest)
+            self.assertTrue(coordinator.begin_handoff(receipt, replacement, handoff_fingerprint=handoff, now=verifier._NOW).authorized)
+            self.assertTrue(coordinator.reconcile(verifier._reconciliation(handoff, receipt)).authorized)
+            self.assertTrue(coordinator.revoke_old_receipt(handoff_fingerprint=handoff).authorized)
+            self.assertTrue(coordinator.complete_teardown(verifier._teardown(handoff, receipt)).authorized)
+            assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
+
+        with self.subTest(state="handoff-open"):
+            identity, _, coordinator, receipt, action = fixture("handoff-open")
+            activate_and_claim(identity, coordinator, receipt, now=verifier._NOW)
+            replacement = verifier._identity(candidate, policy, environment="handoff-open-replacement")
+            handoff = verifier._fingerprint("adversarial handoff", receipt.binding_digest)
+            self.assertTrue(coordinator.begin_handoff(receipt, replacement, handoff_fingerprint=handoff, now=verifier._NOW).authorized)
+            assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
+
+    def test_ci_synthetic_action_concurrent_replay_consumes_one_authorized_budget(self) -> None:
+        """Both callers reach the authority boundary before either can consume."""
+
+        verifier = load_ci_read_only_handoff()
+        candidate, policy = "a" * 40, "b" * 64
+        identity = verifier._identity(candidate, policy, environment="concurrent-replay")
+        store = verifier.InMemoryDeploymentAuthorityStore(identity.state_store_fingerprint, identity.state_id)
+        coordinator = verifier.DeploymentAuthorityHandoffCoordinator(store)
+        receipt = verifier._receipt(identity, "concurrent-replay")
+        self.assertTrue(coordinator.activate_initial(receipt, verifier._verification(receipt), now=verifier._NOW).authorized)
+        self.assertTrue(
+            coordinator.claim_orchestrator(
+                receipt, claim_fingerprint=verifier._fingerprint("concurrent replay claim", receipt.binding_digest),
+                now=verifier._NOW,
+            ).authorized
+        )
+        action = verifier.SyntheticAction(
+            verifier._fingerprint("concurrent synthetic action", receipt.binding_digest),
+            receipt.receipt_fingerprint,
+            candidate,
+            1,
+        )
+        actions = verifier.InMemorySyntheticActionStore()
+        original_transition = coordinator.transition_if_authorized
+        boundary = threading.Barrier(2)
+
+        def simultaneous_transition(*args: object, **kwargs: object) -> object:
+            boundary.wait(timeout=5)
+            return original_transition(*args, **kwargs)
+
+        def execute() -> object:
+            return actions.execute(coordinator, identity, action, receipt, now=verifier._NOW)
+
+        with mock.patch.object(coordinator, "transition_if_authorized", side_effect=simultaneous_transition):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                attempts = [executor.submit(execute) for _ in range(2)]
+        successes, rejections = [], []
+        for attempt in attempts:
+            try:
+                successes.append(attempt.result())
+            except ValueError as error:
+                rejections.append(error)
+
+        self.assertEqual(len(successes), 1)
+        authority, readback = successes[0]
+        self.assertTrue(authority.authorized)
+        self.assertIs(readback, actions.read_back())
+        self.assertEqual(len(rejections), 1)
+        self.assertIn("replayed", str(rejections[0]))
+        verifier.verify_action_readback(action, actions.read_back())
+
+    def test_ci_read_only_handoff_binds_one_uploaded_wheel_digest(self) -> None:
+        verifier = load_ci_read_only_handoff()
+        with tempfile.TemporaryDirectory() as temporary:
+            dist = Path(temporary)
+            wheel = dist / "roundwright-0.0.0-py3-none-any.whl"
+            wheel.write_bytes(b"candidate wheel")
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (dist / "package-digest.json").write_text(
+                json.dumps({"wheel": wheel.name, "sha256": digest}), encoding="utf-8"
+            )
+            self.assertEqual(verifier.package_digest(dist), digest)
+            wheel.write_bytes(b"substituted wheel")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                verifier.package_digest(dist)
+
+    def test_ci_workflow_runs_the_read_only_handoff_fixture_on_the_exact_artifact(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        command = "ci/verify_ci_read_only_handoff.py --candidate \"$CANDIDATE_SHA\" --checked-out-sha \"$checked_out_sha\" --dist dist --policy .github/workflows/ci.yml --expected-policy-sha256 \"$candidate_policy_sha\" --expected-verifier-sha256 \"$candidate_verifier_sha\" --workflow-mode read-only --output dist/ci-read-only-handoff.json"
+        self.assertIn(command, workflow)
+        self.assertIn('test "$checked_out_sha" = "$CANDIDATE_SHA"', workflow)
+        self.assertIn('git rev-parse "$CANDIDATE_SHA:.github/workflows/ci.yml"', workflow)
+        self.assertIn('git hash-object --path=.github/workflows/ci.yml .github/workflows/ci.yml', workflow)
+        self.assertIn('git rev-parse "$CANDIDATE_SHA:ci/verify_ci_read_only_handoff.py"', workflow)
+        self.assertIn('git hash-object --path=ci/verify_ci_read_only_handoff.py ci/verify_ci_read_only_handoff.py', workflow)
+        self.assertIn('git diff --exit-code "$CANDIDATE_SHA" -- .github/workflows/ci.yml ci/verify_ci_read_only_handoff.py', workflow)
+        self.assertIn("roundwright-ci-read-only-handoff-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        guide = (ROOT / "docs" / "operations" / "ci-read-only-handoff.md").read_text(encoding="utf-8")
+        self.assertIn("no dispatch trigger", guide)
+        self.assertIn("no receipt or handoff remains active", guide)
+
+    def test_ci_workflow_removes_checkout_credentials_before_candidate_code(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        checkout = """      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Verify checkout has no repository credential
+        shell: bash
+        run: |
+          if git config --local --get-regexp '^(http\\..*\\.extraheader|credential\\..*helper)$' >/dev/null; then
+            echo \"checkout retained a repository credential\" >&2
+            exit 1
+          fi
+"""
+        self.assertEqual(workflow.count("- uses: actions/checkout@v4"), 3)
+        self.assertEqual(workflow.count(checkout), 3)
+        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+
     def test_docker_consumer_matrix_helpers_load_without_module_registration(self) -> None:
         """The fixture writer's dynamic helper loader need not register modules."""
 

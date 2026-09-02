@@ -19,6 +19,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Verify checkout has no repository credential
+        shell: bash
+        run: |
+          if git config --local --get-regexp '^(http\..*\.extraheader|credential\..*helper)$' >/dev/null; then
+            echo "checkout retained a repository credential" >&2
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -54,6 +62,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Verify checkout has no repository credential
+        shell: bash
+        run: |
+          if git config --local --get-regexp '^(http\..*\.extraheader|credential\..*helper)$' >/dev/null; then
+            echo "checkout retained a repository credential" >&2
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -113,6 +129,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Verify checkout has no repository credential
+        shell: bash
+        run: |
+          if git config --local --get-regexp '^(http\..*\.extraheader|credential\..*helper)$' >/dev/null; then
+            echo "checkout retained a repository credential" >&2
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

@@ -121,8 +121,6 @@ class InMemorySyntheticActionStore:
             or type(receipt) is not DeploymentAuthorityHandoffReceipt
         ):
             raise ValueError("synthetic action is unavailable")
-        if self._readback is not None:
-            raise ValueError("synthetic action was replayed")
         if (
             identity != receipt.identity
             or action.receipt_fingerprint != receipt.receipt_fingerprint
@@ -131,6 +129,11 @@ class InMemorySyntheticActionStore:
             raise ValueError("synthetic action does not match selected authority")
 
         def consume() -> SyntheticActionReadback:
+            # The coordinator holds the canonical authority lock while this
+            # callback runs.  Checking here prevents concurrent callers from
+            # both passing a stale out-of-lock replay observation.
+            if self._readback is not None:
+                raise ValueError("synthetic action was replayed")
             self._readback = SyntheticActionReadback(
                 action.action_fingerprint, action.receipt_fingerprint, action.candidate_sha,
                 action.budget, 1, "completed",

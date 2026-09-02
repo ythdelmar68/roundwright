@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import hashlib
 import json
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -220,6 +222,57 @@ class CiVerificationTests(unittest.TestCase):
             self.assertTrue(coordinator.begin_handoff(receipt, replacement, handoff_fingerprint=handoff, now=verifier._NOW).authorized)
             assert_denied(coordinator, identity, receipt, action, now=verifier._NOW)
 
+    def test_ci_synthetic_action_concurrent_replay_consumes_one_authorized_budget(self) -> None:
+        """Both callers reach the authority boundary before either can consume."""
+
+        verifier = load_ci_read_only_handoff()
+        candidate, policy = "a" * 40, "b" * 64
+        identity = verifier._identity(candidate, policy, environment="concurrent-replay")
+        store = verifier.InMemoryDeploymentAuthorityStore(identity.state_store_fingerprint, identity.state_id)
+        coordinator = verifier.DeploymentAuthorityHandoffCoordinator(store)
+        receipt = verifier._receipt(identity, "concurrent-replay")
+        self.assertTrue(coordinator.activate_initial(receipt, verifier._verification(receipt), now=verifier._NOW).authorized)
+        self.assertTrue(
+            coordinator.claim_orchestrator(
+                receipt, claim_fingerprint=verifier._fingerprint("concurrent replay claim", receipt.binding_digest),
+                now=verifier._NOW,
+            ).authorized
+        )
+        action = verifier.SyntheticAction(
+            verifier._fingerprint("concurrent synthetic action", receipt.binding_digest),
+            receipt.receipt_fingerprint,
+            candidate,
+            1,
+        )
+        actions = verifier.InMemorySyntheticActionStore()
+        original_transition = coordinator.transition_if_authorized
+        boundary = threading.Barrier(2)
+
+        def simultaneous_transition(*args: object, **kwargs: object) -> object:
+            boundary.wait(timeout=5)
+            return original_transition(*args, **kwargs)
+
+        def execute() -> object:
+            return actions.execute(coordinator, identity, action, receipt, now=verifier._NOW)
+
+        with mock.patch.object(coordinator, "transition_if_authorized", side_effect=simultaneous_transition):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                attempts = [executor.submit(execute) for _ in range(2)]
+        successes, rejections = [], []
+        for attempt in attempts:
+            try:
+                successes.append(attempt.result())
+            except ValueError as error:
+                rejections.append(error)
+
+        self.assertEqual(len(successes), 1)
+        authority, readback = successes[0]
+        self.assertTrue(authority.authorized)
+        self.assertIs(readback, actions.read_back())
+        self.assertEqual(len(rejections), 1)
+        self.assertIn("replayed", str(rejections[0]))
+        verifier.verify_action_readback(action, actions.read_back())
+
     def test_ci_read_only_handoff_binds_one_uploaded_wheel_digest(self) -> None:
         verifier = load_ci_read_only_handoff()
         with tempfile.TemporaryDirectory() as temporary:
@@ -250,6 +303,24 @@ class CiVerificationTests(unittest.TestCase):
         guide = (ROOT / "docs" / "operations" / "ci-read-only-handoff.md").read_text(encoding="utf-8")
         self.assertIn("no dispatch trigger", guide)
         self.assertIn("no receipt or handoff remains active", guide)
+
+    def test_ci_workflow_removes_checkout_credentials_before_candidate_code(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        checkout = """      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Verify checkout has no repository credential
+        shell: bash
+        run: |
+          if git config --local --get-regexp '^(http\\..*\\.extraheader|credential\\..*helper)$' >/dev/null; then
+            echo \"checkout retained a repository credential\" >&2
+            exit 1
+          fi
+"""
+        self.assertEqual(workflow.count("- uses: actions/checkout@v4"), 3)
+        self.assertEqual(workflow.count(checkout), 3)
+        self.assertEqual(workflow.count("persist-credentials: false"), 3)
 
     def test_docker_consumer_matrix_helpers_load_without_module_registration(self) -> None:
         """The fixture writer's dynamic helper loader need not register modules."""

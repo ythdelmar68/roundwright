@@ -4156,7 +4156,9 @@ class CrossEnvironmentCanaryAdapter:
     def prepare_execution_context(self, preparation: object) -> object:
         try:
             if self.inputs is None or (
-                preparation.descriptor != self.inputs.execution_context()
+                not _canonical_json_equivalent(
+                    preparation.descriptor, self.inputs.execution_context(),
+                )
                 or preparation.input_digest != self.inputs.input_digest
                 or preparation.components != self.component_identities
                 or (

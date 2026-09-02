@@ -680,6 +680,32 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
             external_validation.roundwright_profile_adapter_factory(CROSS_ENVIRONMENT_CANARY_PROFILE)
 
+    def test_cross_environment_context_accepts_frozen_harness_json_and_rejects_content_drift(self) -> None:
+        """Harness V2 freezes JSON lists into tuples before adapter preparation."""
+
+        inputs, plan, request = self.cross_environment_v2_request()
+        adapter = external_validation.CrossEnvironmentCanaryAdapter(inputs)
+        frozen = ExecutorRequest.parse(request).execution_context
+        self.assertIsInstance(frozen, MappingProxyType)
+        self.assertIsInstance(frozen["evidence"]["lanes"], tuple)  # type: ignore[index]
+        preparation = SimpleNamespace(
+            descriptor=frozen,
+            input_digest=external_validation._digest(external_validation._canonical_json_materialize(frozen)),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-95-cross-environment", ready_at=29),
+            components=adapter.component_identities,
+        )
+        self.assertEqual(adapter.prepare_execution_context(preparation).value.inputs, inputs)
+
+        drifted = inputs.execution_context()
+        drifted["evidence"] = {**drifted["evidence"], "artifact_digest": "sha256:" + "0" * 64}
+        drifted_preparation = SimpleNamespace(
+            descriptor=ExecutorRequest.parse({**request, "execution_context": drifted}).execution_context,
+            input_digest=external_validation._digest(drifted), plan=preparation.plan,
+            components=adapter.component_identities,
+        )
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            adapter.prepare_execution_context(drifted_preparation)
+
     def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
         """The V2 parser may freeze JSON collections, without relaxing any identity binding."""
 

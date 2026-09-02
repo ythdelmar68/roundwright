@@ -70,6 +70,7 @@ from .cross_environment import (
     CrossEnvironmentEvidence,
     CrossEnvironmentEvidenceError,
     compare_cross_environment_evidence,
+    is_safe_cross_environment_public_string,
     semantic_read_back,
 )
 
@@ -4035,9 +4036,14 @@ class CrossEnvironmentCanaryInputs:
     evidence: CrossEnvironmentEvidence
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Recheck retained inputs before they become public execution context."""
+
         if (
             _SHA.fullmatch(self.candidate_sha) is None
-            or not _safe_token(self.case_id)
+            or not is_safe_cross_environment_public_string(self.case_id)
             or _DIGEST.fullmatch(self.capture_plan_digest) is None
             or type(self.ready_at) is not int
             or self.ready_at < 0
@@ -4052,6 +4058,7 @@ class CrossEnvironmentCanaryInputs:
         return _digest(self.execution_context())
 
     def execution_context(self) -> dict[str, object]:
+        self.validate()
         return {
             "schema": "roundwright-cross-environment-canary-context/v1",
             "candidate_sha": self.candidate_sha,
@@ -4106,7 +4113,7 @@ def _cross_environment_binding_identity(binding: object) -> str:
         raise ExternalValidationAdapterError("cross-environment binding is invalid") from error
     if (
         payload["profile"] != CROSS_ENVIRONMENT_CANARY_PROFILE
-        or not _safe_token(payload["case_id"])
+        or not is_safe_cross_environment_public_string(payload["case_id"])
         or _SHA.fullmatch(payload["candidate_sha"]) is None
         or type(payload["ready_at"]) is not int
         or payload["ready_at"] < 0

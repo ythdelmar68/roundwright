@@ -84,7 +84,11 @@ class CrossEnvironmentEvidenceTests(unittest.TestCase):
 
     def test_rejects_secret_shaped_values_in_every_emitted_free_text_field(self) -> None:
         evidence = self.evidence()
-        values = ("ghp_abc123", "sk-secret", "github_pat_abc123")
+        values = (
+            "ghp_abc123", "gho_abc123", "ghu_abc123", "ghs_abc123", "ghr_abc123",
+            "github_pat_abc123", "sk-live-abc123", "sk-proj-abc123",
+            "safe-github_pat_abc123", "safe-sk-proj-abc123",
+        )
         for value in values:
             with self.subTest(field="environment_identity", value=value), self.assertRaises(CrossEnvironmentEvidenceError):
                 replace(evidence.lanes[0], environment_identity=value)

@@ -706,6 +706,28 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertRaises(external_validation.ExternalValidationAdapterError):
             adapter.prepare_execution_context(drifted_preparation)
 
+    def test_cross_environment_case_ids_reject_credential_shapes_directly_and_through_inputs(self) -> None:
+        inputs, _, _ = self.cross_environment_v2_request()
+        values = (
+            "ghp_abc123", "gho_abc123", "ghu_abc123", "ghs_abc123", "ghr_abc123",
+            "github_pat_abc123", "sk-live-abc123", "sk-proj-abc123",
+            "issue-95-github_pat_abc123", "issue-95-sk-proj-abc123",
+        )
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation.CrossEnvironmentCanaryInputs(
+                    inputs.candidate_sha, value, inputs.capture_plan_digest, inputs.ready_at, inputs.evidence,
+                )
+            with self.subTest(binding=value), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation._cross_environment_binding_identity(SimpleNamespace(
+                    profile=CROSS_ENVIRONMENT_CANARY_PROFILE, case_id=value, candidate_sha=inputs.candidate_sha,
+                    ready_at=inputs.ready_at, plan=SimpleNamespace(plan_digest=inputs.capture_plan_digest),
+                ))
+            object.__setattr__(inputs, "case_id", value)
+            with self.subTest(wrapper=value), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                inputs.execution_context()
+            object.__setattr__(inputs, "case_id", "issue-95-cross-environment")
+
     def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
         """The V2 parser may freeze JSON collections, without relaxing any identity binding."""
 

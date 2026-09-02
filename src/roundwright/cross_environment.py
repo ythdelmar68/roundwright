@@ -22,6 +22,9 @@ CROSS_ENVIRONMENT_RESULT_SCHEMA = "roundwright-cross-environment-result/v1"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_CREDENTIAL_SHAPES = (
+    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-",
+)
 
 
 class CrossEnvironmentEvidenceError(ValueError):
@@ -61,14 +64,20 @@ def _digest(value: object) -> str:
     ).hexdigest()
 
 
-def _safe_token(value: object) -> bool:
+def is_safe_cross_environment_public_string(value: object) -> bool:
+    """Return whether a bounded public identifier cannot resemble a credential."""
+
     if type(value) is not str or _TOKEN.fullmatch(value) is None:
         return False
     lowered = value.lower()
     return (
         not any(word in lowered for word in ("secret", "token", "credential", "password", "path"))
-        and not lowered.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-"))
+        and not any(shape in lowered for shape in _CREDENTIAL_SHAPES)
     )
+
+
+def _safe_token(value: object) -> bool:
+    return is_safe_cross_environment_public_string(value)
 
 
 @dataclass(frozen=True)

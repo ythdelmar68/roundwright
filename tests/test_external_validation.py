@@ -76,6 +76,7 @@ from roundwright.shadow import (
     INTEGRATED_BOUNDARY_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PHASE_3_QUALIFICATION_PROFILE,
+    CROSS_ENVIRONMENT_CANARY_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     EvidenceRole,
@@ -85,6 +86,14 @@ from roundwright.shadow import (
     ShadowV2Event,
     ShadowV2EventGraph,
     shadow_evidence_profile,
+)
+from roundwright.cross_environment import (
+    ComparisonResult,
+    CrossEnvironmentEvidence,
+    EnvironmentKind,
+    EnvironmentLane,
+    OperationMode,
+    ReceiptState,
 )
 from roundwright.integrated_boundary import (
     IntegratedBoundaryInputs, RetainedEvidenceExpectation, RetainedEvidenceSource, RetainedSourceKind,
@@ -464,6 +473,34 @@ class ExternalValidationTests(unittest.TestCase):
             "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
             "execution_context": external_validation.phase_3_qualification_execution_context(inputs, authority),
         }
+
+    def cross_environment_v2_request(self) -> tuple[external_validation.CrossEnvironmentCanaryInputs, dict[str, object], dict[str, object]]:
+        producer, exporter, comparator = external_validation.cross_environment_canary_component_identities()
+        plan: dict[str, object] = {
+            "schema": "roundwright-harness-capture-plan/v1", "profile": CROSS_ENVIRONMENT_CANARY_PROFILE,
+            "case_id": "issue-95-cross-environment", "candidate_sha": "c" * 40, "ready_at": 29,
+            "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
+            "recorder_identity": "sha256:" + "7" * 64, "store_identity": "sha256:" + "8" * 64,
+            "observation_identity": "sha256:" + "9" * 64,
+        }
+        plan_digest = external_validation._digest(plan)
+        lanes = tuple(
+            EnvironmentLane(
+                environment, environment.value + "-fixture", OperationMode.READ_ONLY, "c" * 40,
+                "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64,
+                "sha256:" + "4" * 64, producer, ReceiptState.VERIFIED, "sha256:" + "5" * 64,
+                29, ComparisonResult.PASS,
+            )
+            for environment in sorted(EnvironmentKind, key=lambda item: item.value)
+        )
+        inputs = external_validation.CrossEnvironmentCanaryInputs(
+            "c" * 40, "issue-95-cross-environment", plan_digest, 29,
+            CrossEnvironmentEvidence("c" * 40, "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64, "sha256:" + "4" * 64, producer, lanes),
+        )
+        return inputs, plan, {
+            "schema": "roundwright-harness-profile-executor-request/v2", "capture_plan": plan,
+            "execution_context": inputs.execution_context(),
+        }
     @staticmethod
     def trace_read_result(request: GitHubReadRequest, candidate_sha: str) -> GitHubReadResult:
         """Return the separately-bound implementation PR and Conversation evidence."""
@@ -604,6 +641,113 @@ class ExternalValidationTests(unittest.TestCase):
             ),
             {"status": "fake"},
         )
+
+    def test_cross_environment_profile_requires_one_bound_synthetic_matrix_and_zero_actions(self) -> None:
+        inputs, plan, request = self.cross_environment_v2_request()
+        producer, exporter, comparator = external_validation.cross_environment_canary_component_identities()
+        harness = sys.modules["roundwright_harness.executor"]
+        before = len(harness.run_calls)
+        readiness = external_validation.run_cross_environment_canary_profile(
+            "validate", request, Path("cross-environment-recorder"), inputs,
+        )
+        self.assertEqual(len(harness.run_calls), before + 1)
+        adapter = harness.run_calls[-1][0][2]
+        prepared = adapter.prepare_execution_context(SimpleNamespace(
+            descriptor=request["execution_context"], input_digest=external_validation._digest(request["execution_context"]),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-95-cross-environment", ready_at=29),
+            components=adapter.component_identities,
+        ))
+        exact = binding(
+            profile=CROSS_ENVIRONMENT_CANARY_PROFILE, case_id="issue-95-cross-environment", candidate_sha="c" * 40,
+            ready_at=29, plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
+            components=SimpleNamespace(producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator),
+            execution_context=prepared, execution_context_input_digest=external_validation._digest(request["execution_context"]),
+        )
+        adapter.validate(exact)
+        evidence = adapter.project(exact, adapter.execute(exact))
+        self.assertEqual(adapter.compare(exact, evidence).status, "pass")
+        self.assertEqual(
+            (request["execution_context"]["zero_provider_calls"], request["execution_context"]["zero_target_actions"], request["execution_context"]["zero_github_mutations"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(
+            external_validation.run_cross_environment_canary_profile(
+                "execute", request, Path("cross-environment-recorder"), inputs,
+                expected_readiness_digest=readiness.as_dict()["receipt_digest"],
+            ),
+            {"status": "fake"},
+        )
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            external_validation.roundwright_profile_adapter_factory(CROSS_ENVIRONMENT_CANARY_PROFILE)
+
+    def test_cross_environment_context_accepts_frozen_harness_json_and_rejects_content_drift(self) -> None:
+        """Harness V2 freezes JSON lists into tuples before adapter preparation."""
+
+        inputs, plan, request = self.cross_environment_v2_request()
+        adapter = external_validation.CrossEnvironmentCanaryAdapter(inputs)
+        frozen = ExecutorRequest.parse(request).execution_context
+        self.assertIsInstance(frozen, MappingProxyType)
+        self.assertIsInstance(frozen["evidence"]["lanes"], tuple)  # type: ignore[index]
+        preparation = SimpleNamespace(
+            descriptor=frozen,
+            input_digest=external_validation._digest(external_validation._canonical_json_materialize(frozen)),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-95-cross-environment", ready_at=29),
+            components=adapter.component_identities,
+        )
+        self.assertEqual(adapter.prepare_execution_context(preparation).value.inputs, inputs)
+
+        drifted = inputs.execution_context()
+        drifted["evidence"] = {**drifted["evidence"], "artifact_digest": "sha256:" + "0" * 64}
+        drifted_preparation = SimpleNamespace(
+            descriptor=ExecutorRequest.parse({**request, "execution_context": drifted}).execution_context,
+            input_digest=external_validation._digest(drifted), plan=preparation.plan,
+            components=adapter.component_identities,
+        )
+        with self.assertRaises(external_validation.ExternalValidationAdapterError):
+            adapter.prepare_execution_context(drifted_preparation)
+
+    def test_cross_environment_case_ids_reject_credential_shapes_directly_and_through_inputs(self) -> None:
+        inputs, _, _ = self.cross_environment_v2_request()
+        values = (
+            "ghp_abc123", "gho_abc123", "ghu_abc123", "ghs_abc123", "ghr_abc123",
+            "github_pat_abc123", "sk-live-abc123", "sk-proj-abc123",
+            "issue-95-github_pat_abc123", "issue-95-sk-proj-abc123",
+        )
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation.CrossEnvironmentCanaryInputs(
+                    inputs.candidate_sha, value, inputs.capture_plan_digest, inputs.ready_at, inputs.evidence,
+                )
+            with self.subTest(binding=value), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                external_validation._cross_environment_binding_identity(SimpleNamespace(
+                    profile=CROSS_ENVIRONMENT_CANARY_PROFILE, case_id=value, candidate_sha=inputs.candidate_sha,
+                    ready_at=inputs.ready_at, plan=SimpleNamespace(plan_digest=inputs.capture_plan_digest),
+                ))
+            object.__setattr__(inputs, "case_id", value)
+            with self.subTest(wrapper=value), self.assertRaises(external_validation.ExternalValidationAdapterError):
+                inputs.execution_context()
+            object.__setattr__(inputs, "case_id", "issue-95-cross-environment")
+
+    def test_cross_environment_revalidates_mutated_nested_lanes_before_harness_dispatch(self) -> None:
+        for field, value in (
+            ("environment_identity", "ghp_bypassed"),
+            ("reason", "github_pat_bypassed"),
+        ):
+            with self.subTest(field=field):
+                inputs, _plan, request = self.cross_environment_v2_request()
+                lane = inputs.evidence.lanes[0]
+                if field == "reason":
+                    object.__setattr__(lane, "receipt_state", ReceiptState.BLOCKED)
+                    object.__setattr__(lane, "receipt_digest", None)
+                    object.__setattr__(lane, "result", ComparisonResult.BLOCKED)
+                object.__setattr__(lane, field, value)
+                harness = sys.modules["roundwright_harness.executor"]
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_cross_environment_canary_profile(
+                        "validate", request, Path("cross-environment-rejected"), inputs,
+                    )
+                self.assertEqual(len(harness.run_calls), before)
 
     def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
         """The V2 parser may freeze JSON collections, without relaxing any identity binding."""

@@ -162,11 +162,12 @@ documents CI's default no-dispatch contract and the purely hermetic handoff
 fixture that proves receipt ordering and teardown.
 
 New external profiles enter through the reviewed Harness `run-profile`
-executor and public factory
-`roundwright.external_validation:roundwright_profile_adapter_factory`.
-Roundwright owns typed profile/exporter/comparator semantics; Harness owns the
-single immutable execution/record/read-back path; generic Roundlet treats both
-as an opaque repository contract.
+executor and a Roundwright-owned adapter. Context-free profiles use the public
+factory `roundwright.external_validation:roundwright_profile_adapter_factory`;
+profiles with a closed product context use their explicit repository-hosted V2
+entrypoint. Roundwright owns typed profile/exporter/comparator semantics;
+Harness owns the single immutable execution/record/read-back path; generic
+Roundlet treats both as an opaque repository contract.
 
 The integrated Phase 3 boundary is intentionally narrower still.  Its
 `roundwright-shadow-profile/integrated-boundary/v1` composition accepts only
@@ -181,6 +182,16 @@ The Phase 3 qualification consumer then reads those sealed inventories only.
 It emits an owner-facing `PROMOTION_READY_FOR_CANARY_DECISION` package only
 when the exact candidate and every current gate reconcile. That package grants
 no Canary action, activation, authority transition, or Roundlet retirement.
+
+Phase 4 starts with the deterministic
+`roundwright-shadow-profile/cross-environment-canary/v1` qualification profile.
+It binds one exact candidate and package artifact to native Windows, macOS, and
+Linux, CI, Docker, and Dev Container lanes. Every lane declares an explicit
+authoritative, read-only, or test-only mode, a bounded receipt state, and no
+paths, credentials, or raw logs. The repository-hosted
+`run_cross_environment_canary_profile` V2 entrypoint validates, records, and
+semantically reads back that closed matrix with zero provider, target, GitHub,
+or lifecycle actions; it is not live Canary evidence and cannot authorize one.
 
 ## Development check
 

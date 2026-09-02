@@ -57,7 +57,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.12"]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Windows runs the same hermetic, Git-heavy suite without restoring the
+    # nonportable managed-Python junction cache; allow the required package
+    # qualification steps to finish while retaining a bounded job lifetime.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:

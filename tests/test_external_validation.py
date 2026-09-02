@@ -728,6 +728,27 @@ class ExternalValidationTests(unittest.TestCase):
                 inputs.execution_context()
             object.__setattr__(inputs, "case_id", "issue-95-cross-environment")
 
+    def test_cross_environment_revalidates_mutated_nested_lanes_before_harness_dispatch(self) -> None:
+        for field, value in (
+            ("environment_identity", "ghp_bypassed"),
+            ("reason", "github_pat_bypassed"),
+        ):
+            with self.subTest(field=field):
+                inputs, _plan, request = self.cross_environment_v2_request()
+                lane = inputs.evidence.lanes[0]
+                if field == "reason":
+                    object.__setattr__(lane, "receipt_state", ReceiptState.BLOCKED)
+                    object.__setattr__(lane, "receipt_digest", None)
+                    object.__setattr__(lane, "result", ComparisonResult.BLOCKED)
+                object.__setattr__(lane, field, value)
+                harness = sys.modules["roundwright_harness.executor"]
+                before = len(harness.run_calls)
+                with self.assertRaises(external_validation.ExternalValidationAdapterError):
+                    external_validation.run_cross_environment_canary_profile(
+                        "validate", request, Path("cross-environment-rejected"), inputs,
+                    )
+                self.assertEqual(len(harness.run_calls), before)
+
     def test_phase_3_qualification_context_materializes_executor_json_only(self) -> None:
         """The V2 parser may freeze JSON collections, without relaxing any identity binding."""
 

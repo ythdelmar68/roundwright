@@ -132,22 +132,44 @@ class EnvironmentLane:
             raise CrossEnvironmentEvidenceError("blocked or rejected lane needs a bounded reason")
 
     def public_payload(self) -> dict[str, object]:
-        return {
-            "environment": self.environment.value,
-            "environment_identity": self.environment_identity,
-            "mode": self.mode.value,
-            "candidate_sha": self.candidate_sha,
-            "artifact_digest": self.artifact_digest,
-            "policy_digest": self.policy_digest,
-            "profile_digest": self.profile_digest,
-            "schema_digest": self.schema_digest,
-            "producer_identity": self.producer_identity,
-            "receipt_state": self.receipt_state.value,
-            "receipt_digest": self.receipt_digest,
-            "observed_at": self.observed_at,
-            "result": self.result.value,
-            "reason": self.reason,
-        }
+        return _environment_lane_public_payload(_validated_environment_lane(self))
+
+
+def _environment_lane_public_payload(lane: EnvironmentLane) -> dict[str, object]:
+    """Render a lane only after its fields have been reconstructed and checked."""
+
+    return {
+        "environment": lane.environment.value,
+        "environment_identity": lane.environment_identity,
+        "mode": lane.mode.value,
+        "candidate_sha": lane.candidate_sha,
+        "artifact_digest": lane.artifact_digest,
+        "policy_digest": lane.policy_digest,
+        "profile_digest": lane.profile_digest,
+        "schema_digest": lane.schema_digest,
+        "producer_identity": lane.producer_identity,
+        "receipt_state": lane.receipt_state.value,
+        "receipt_digest": lane.receipt_digest,
+        "observed_at": lane.observed_at,
+        "result": lane.result.value,
+        "reason": lane.reason,
+    }
+
+
+def _validated_environment_lane(lane: object) -> EnvironmentLane:
+    """Reject post-construction changes to a frozen lane before public use."""
+
+    if type(lane) is not EnvironmentLane:
+        raise CrossEnvironmentEvidenceError("cross-environment lane is invalid")
+    try:
+        return EnvironmentLane(
+            lane.environment, lane.environment_identity, lane.mode, lane.candidate_sha,
+            lane.artifact_digest, lane.policy_digest, lane.profile_digest,
+            lane.schema_digest, lane.producer_identity, lane.receipt_state,
+            lane.receipt_digest, lane.observed_at, lane.result, lane.reason,
+        )
+    except (AttributeError, TypeError) as error:
+        raise CrossEnvironmentEvidenceError("cross-environment lane is invalid") from error
 
 
 @dataclass(frozen=True)
@@ -205,24 +227,41 @@ class CrossEnvironmentEvidence:
 
     @property
     def result(self) -> ComparisonResult:
-        if any(lane.result is ComparisonResult.REJECTED for lane in self.lanes):
+        evidence = _validated_cross_environment_evidence(self)
+        if any(lane.result is ComparisonResult.REJECTED for lane in evidence.lanes):
             return ComparisonResult.REJECTED
-        if any(lane.result is ComparisonResult.BLOCKED for lane in self.lanes):
+        if any(lane.result is ComparisonResult.BLOCKED for lane in evidence.lanes):
             return ComparisonResult.BLOCKED
         return ComparisonResult.PASS
 
     def public_payload(self) -> dict[str, object]:
+        evidence = _validated_cross_environment_evidence(self)
         return {
-            "schema": self.schema,
-            "candidate_sha": self.candidate_sha,
-            "artifact_digest": self.artifact_digest,
-            "policy_digest": self.policy_digest,
-            "profile_digest": self.profile_digest,
-            "schema_digest": self.schema_digest,
-            "producer_identity": self.producer_identity,
-            "lanes": [lane.public_payload() for lane in self.lanes],
-            "result": self.result.value,
+            "schema": evidence.schema,
+            "candidate_sha": evidence.candidate_sha,
+            "artifact_digest": evidence.artifact_digest,
+            "policy_digest": evidence.policy_digest,
+            "profile_digest": evidence.profile_digest,
+            "schema_digest": evidence.schema_digest,
+            "producer_identity": evidence.producer_identity,
+            "lanes": [_environment_lane_public_payload(lane) for lane in evidence.lanes],
+            "result": evidence.result.value,
         }
+
+
+def _validated_cross_environment_evidence(evidence: object) -> CrossEnvironmentEvidence:
+    """Reconstruct the complete evidence tree at each public boundary."""
+
+    if type(evidence) is not CrossEnvironmentEvidence or type(evidence.lanes) is not tuple:
+        raise CrossEnvironmentEvidenceError("cross-environment evidence is invalid")
+    try:
+        return CrossEnvironmentEvidence(
+            evidence.candidate_sha, evidence.artifact_digest, evidence.policy_digest,
+            evidence.profile_digest, evidence.schema_digest, evidence.producer_identity,
+            tuple(_validated_environment_lane(lane) for lane in evidence.lanes), evidence.schema,
+        )
+    except (AttributeError, TypeError) as error:
+        raise CrossEnvironmentEvidenceError("cross-environment evidence is invalid") from error
 
 
 @dataclass(frozen=True)
@@ -266,8 +305,8 @@ def compare_cross_environment_evidence(
 ) -> CrossEnvironmentComparison:
     """Compare only public-safe semantic fields; never report raw lane content."""
 
-    if type(expected) is not CrossEnvironmentEvidence or type(observed) is not CrossEnvironmentEvidence:
-        raise CrossEnvironmentEvidenceError("cross-environment comparison inputs are invalid")
+    expected = _validated_cross_environment_evidence(expected)
+    observed = _validated_cross_environment_evidence(observed)
     differences: list[str] = []
     if expected.candidate_sha != observed.candidate_sha:
         differences.append("candidate-mismatch")
@@ -296,8 +335,9 @@ def semantic_read_back(
 ) -> CrossEnvironmentComparison:
     """Require a recorded public-safe payload to be the exact expected evidence."""
 
-    if type(retained_payload) is not dict or type(expected) is not CrossEnvironmentEvidence:
+    if type(retained_payload) is not dict:
         raise CrossEnvironmentEvidenceError("cross-environment retention payload is invalid")
+    expected = _validated_cross_environment_evidence(expected)
     observed = expected.public_payload()
     if retained_payload == observed:
         return compare_cross_environment_evidence(expected, expected)

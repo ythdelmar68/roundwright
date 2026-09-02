@@ -100,6 +100,23 @@ class CrossEnvironmentEvidenceTests(unittest.TestCase):
             with self.subTest(field="differences", value=value), self.assertRaises(CrossEnvironmentEvidenceError):
                 CrossEnvironmentComparison(ComparisonResult.BLOCKED, "a" * 40, digest("1"), digest("2"), (value,))
 
+    def test_revalidates_mutated_nested_lanes_before_projection_or_retention(self) -> None:
+        evidence = self.evidence()
+        retained = evidence.public_payload()
+        lane = evidence.lanes[0]
+        object.__setattr__(lane, "environment_identity", "ghp_bypassed")
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            evidence.public_payload()
+
+        evidence = self.evidence()
+        lane = evidence.lanes[0]
+        object.__setattr__(lane, "receipt_state", ReceiptState.BLOCKED)
+        object.__setattr__(lane, "receipt_digest", None)
+        object.__setattr__(lane, "result", ComparisonResult.BLOCKED)
+        object.__setattr__(lane, "reason", "github_pat_bypassed")
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            semantic_read_back(retained, evidence)
+
     def test_rejects_a_non_enum_comparison_result_before_public_rendering(self) -> None:
         with self.assertRaises(CrossEnvironmentEvidenceError):
             CrossEnvironmentComparison("blocked", "a" * 40, digest("1"), digest("2"), ("lane-mismatch",))  # type: ignore[arg-type]

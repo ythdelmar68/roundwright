@@ -69,6 +69,7 @@ from .cross_environment import (
     ComparisonResult,
     CrossEnvironmentEvidence,
     CrossEnvironmentEvidenceError,
+    EnvironmentLane,
     compare_cross_environment_evidence,
     is_safe_cross_environment_public_string,
     semantic_read_back,
@@ -4038,7 +4039,7 @@ class CrossEnvironmentCanaryInputs:
     def __post_init__(self) -> None:
         self.validate()
 
-    def validate(self) -> None:
+    def validate(self) -> CrossEnvironmentEvidence:
         """Recheck retained inputs before they become public execution context."""
 
         if (
@@ -4052,21 +4053,44 @@ class CrossEnvironmentCanaryInputs:
             or self.evidence.producer_identity != CROSS_ENVIRONMENT_CANARY_PRODUCER_IDENTITY
         ):
             raise ExternalValidationAdapterError("cross-environment qualification inputs are invalid")
+        try:
+            if type(self.evidence.lanes) is not tuple or any(
+                type(lane) is not EnvironmentLane for lane in self.evidence.lanes
+            ):
+                raise ValueError
+            return CrossEnvironmentEvidence(
+                self.evidence.candidate_sha, self.evidence.artifact_digest,
+                self.evidence.policy_digest, self.evidence.profile_digest,
+                self.evidence.schema_digest, self.evidence.producer_identity,
+                tuple(
+                    EnvironmentLane(
+                        lane.environment, lane.environment_identity, lane.mode,
+                        lane.candidate_sha, lane.artifact_digest, lane.policy_digest,
+                        lane.profile_digest, lane.schema_digest, lane.producer_identity,
+                        lane.receipt_state, lane.receipt_digest, lane.observed_at,
+                        lane.result, lane.reason,
+                    )
+                    for lane in self.evidence.lanes
+                ),
+                self.evidence.schema,
+            )
+        except (AttributeError, TypeError, CrossEnvironmentEvidenceError) as error:
+            raise ExternalValidationAdapterError("cross-environment qualification inputs are invalid") from error
 
     @property
     def input_digest(self) -> str:
         return _digest(self.execution_context())
 
     def execution_context(self) -> dict[str, object]:
-        self.validate()
+        evidence = self.validate()
         return {
             "schema": "roundwright-cross-environment-canary-context/v1",
             "candidate_sha": self.candidate_sha,
             "case_id": self.case_id,
             "capture_plan_digest": self.capture_plan_digest,
             "ready_at": self.ready_at,
-            "evidence": self.evidence.public_payload(),
-            "evidence_digest": self.evidence.evidence_digest,
+            "evidence": evidence.public_payload(),
+            "evidence_digest": evidence.evidence_digest,
             "zero_provider_calls": 0,
             "zero_target_actions": 0,
             "zero_github_mutations": 0,
@@ -4205,7 +4229,7 @@ class CrossEnvironmentCanaryAdapter:
     def execute(self, binding: object) -> object:
         self.validate(binding)
         assert self.inputs is not None
-        evidence = self.inputs.evidence
+        evidence = self.inputs.validate()
         if evidence.result is not ComparisonResult.PASS:
             raise ExternalValidationAdapterError("cross-environment profile evidence is not qualified")
         return _harness_executor().ProfileExecution({
@@ -4216,9 +4240,10 @@ class CrossEnvironmentCanaryAdapter:
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
         self.validate(binding)
         assert self.inputs is not None
+        evidence = self.inputs.validate()
         expected = {
-            "evidence": self.inputs.evidence.public_payload(),
-            "semantic_read_back": semantic_read_back(self.inputs.evidence.public_payload(), self.inputs.evidence).public_payload(),
+            "evidence": evidence.public_payload(),
+            "semantic_read_back": semantic_read_back(evidence.public_payload(), evidence).public_payload(),
         }
         try:
             if execution.mutation_count != 0 or execution.value != expected:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -23,6 +24,7 @@ PHASE_4_CROSS_ENVIRONMENT_RECEIPT_SCHEMA = "roundwright-phase-4-cross-environmen
 PHASE_3_DECISION_SCHEMA = "roundwright-phase-3-qualification-decision/v1"
 PHASE_3_QUALIFICATION_PROFILE = "roundwright-shadow-profile/phase-3-qualification/v1"
 PHASE_4_LINEAGE_SCHEMA = "roundwright-phase-4-candidate-lineage/v1"
+PHASE_4_LINEAGE_READBACK_SCHEMA = "roundwright-phase-4-local-git-ancestry-readback/v1"
 ISSUE_97_EVIDENCE_CANDIDATE_SHA = "fe1da4ffa4ee29df21aa62cc5a995fb4075e075d"
 PHASE_5_OWNER_DECISION_REQUIRED = "PHASE_5_OWNER_DECISION_REQUIRED"
 PHASE_4_QUALIFICATION_BLOCKED = "PHASE_4_QUALIFICATION_BLOCKED"
@@ -47,6 +49,28 @@ def _digest(value: object) -> str:
 
 def _bytes_digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _observed_ancestry_digest(source_candidate_sha: str, qualification_candidate_sha: str) -> str:
+    """Return an authoritative local Git ancestry observation or fail closed."""
+
+    if _SHA.fullmatch(source_candidate_sha) is None or _SHA.fullmatch(qualification_candidate_sha) is None:
+        raise Phase4QualificationError("Phase 4 ancestry identity is invalid")
+    try:
+        result = subprocess.run(
+            ("git", "merge-base", "--is-ancestor", source_candidate_sha, qualification_candidate_sha),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True,
+        )
+    except OSError as error:
+        raise Phase4QualificationError("Phase 4 Git ancestry read-back is unavailable") from error
+    if result.returncode != 0:
+        raise Phase4QualificationError("Phase 4 Git ancestry read-back is not an ancestor")
+    return _digest({
+        "schema": PHASE_4_LINEAGE_READBACK_SCHEMA,
+        "source_candidate_sha": source_candidate_sha,
+        "qualification_candidate_sha": qualification_candidate_sha,
+        "relation": "ancestor",
+    })
 
 
 def _no_duplicate_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -135,6 +159,7 @@ class Phase4SelectionPins:
     historical_ready_at: int
     retained_bundle_digest: str
     lineage_receipt_digest: str
+    lineage_readback_digest: str
     exit_evidence: tuple[Phase4ExitEvidencePin, ...]
     selection_digest: str = field(init=False)
 
@@ -151,7 +176,7 @@ class Phase4SelectionPins:
                 self.package_artifact_digest, self.phase_3_decision_digest, self.phase_3_receipt_digest,
                 self.issue_97_evidence_digest, self.issue_97_result_digest, self.issue_97_receipt_digest,
                 self.issue_97_profile_digest, self.issue_97_schema_digest, self.retained_bundle_digest,
-                self.lineage_receipt_digest,
+                self.lineage_receipt_digest, self.lineage_readback_digest,
             )) or type(self.exit_evidence) is not tuple
             or tuple(item.area for item in self.exit_evidence) != REQUIRED_EXIT_EVIDENCE
             or any(type(item) is not Phase4ExitEvidencePin for item in self.exit_evidence)
@@ -169,7 +194,7 @@ class Phase4SelectionPins:
                 self.issue_97_result_digest, self.issue_97_receipt_digest, self.issue_97_profile_digest,
                 self.issue_97_schema_digest, self.source_candidate_sha, self.cross_environment_profile,
                 self.cross_environment_schema, self.historical_ready_at, self.retained_bundle_digest,
-                self.lineage_receipt_digest, self.exit_evidence,
+                self.lineage_receipt_digest, self.lineage_readback_digest, self.exit_evidence,
             )
             if rebuilt.selection_digest != self.selection_digest:
                 raise ValueError
@@ -196,6 +221,7 @@ class Phase4SelectionPins:
             "historical_ready_at": self.historical_ready_at,
             "retained_bundle_digest": self.retained_bundle_digest,
             "lineage_receipt_digest": self.lineage_receipt_digest,
+            "lineage_readback_digest": self.lineage_readback_digest,
             "exit_evidence": [item.public_payload() for item in self.exit_evidence],
         }
         return value | ({"selection_digest": self.selection_digest} if include_digest else {})
@@ -247,6 +273,7 @@ class _RetainedEvidence:
     phase_3_receipt_digest: str
     lineage_qualification_candidate_sha: str
     lineage_receipt_digest: str
+    lineage_readback_digest: str
     evidence: CrossEnvironmentEvidence
     comparison: CrossEnvironmentComparison
     cross_environment_receipt_digest: str
@@ -371,7 +398,7 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
         lineage = _require_keys(payload["lineage"], {
             "schema", "source_candidate_sha", "qualification_candidate_sha", "relation",
             "observed_source_candidate_sha", "observed_qualification_candidate_sha", "observed_relation",
-            "semantic_result", "receipt_digest",
+            "semantic_result", "authoritative_readback_digest", "receipt_digest",
         }, "retained candidate lineage")
         lineage_core = {key: value for key, value in lineage.items() if key != "receipt_digest"}
         if (
@@ -380,7 +407,12 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
             or lineage["source_candidate_sha"] == lineage["qualification_candidate_sha"] or lineage["relation"] != "ancestor"
             or (lineage["observed_source_candidate_sha"], lineage["observed_qualification_candidate_sha"], lineage["observed_relation"])
             != (lineage["source_candidate_sha"], lineage["qualification_candidate_sha"], "ancestor")
-            or lineage["semantic_result"] != "verified" or lineage["receipt_digest"] != _digest(lineage_core)
+            or lineage["semantic_result"] != "verified"
+            or type(lineage["authoritative_readback_digest"]) is not str
+            or lineage["authoritative_readback_digest"] != _observed_ancestry_digest(
+                lineage["source_candidate_sha"], lineage["qualification_candidate_sha"],
+            )
+            or lineage["receipt_digest"] != _digest(lineage_core)
         ):
             raise ValueError
         topology = _require_keys(payload["consumer_topology"], {
@@ -428,7 +460,7 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
             raise ValueError
         return _RetainedEvidence(
             phase_3["candidate_sha"], phase_3["decision_digest"], phase_3["receipt_digest"],
-            lineage["qualification_candidate_sha"], lineage["receipt_digest"], evidence, comparison,
+            lineage["qualification_candidate_sha"], lineage["receipt_digest"], lineage["authoritative_readback_digest"], evidence, comparison,
             receipt["receipt_digest"], tuple(exits), confidence, risks,
         )
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError, CrossEnvironmentEvidenceError, Phase4QualificationError) as error:
@@ -468,6 +500,7 @@ class Phase4QualificationInputs:
                 or _bytes_digest(self.retained_bundle_bytes) != pins.retained_bundle_digest
                 or observed.lineage_qualification_candidate_sha != self.qualification_candidate_sha
                 or observed.lineage_receipt_digest != pins.lineage_receipt_digest
+                or observed.lineage_readback_digest != pins.lineage_readback_digest
                 or observed.evidence.candidate_sha != pins.source_candidate_sha
                 or observed.evidence.artifact_digest != pins.package_artifact_digest
                 or observed.evidence.schema != pins.cross_environment_schema

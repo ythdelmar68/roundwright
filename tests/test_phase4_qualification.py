@@ -6,6 +6,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 
@@ -25,7 +26,7 @@ from roundwright.phase4_qualification import (
     PHASE_4_LINEAGE_SCHEMA, PHASE_4_QUALIFICATION_BLOCKED, PHASE_4_RETAINED_EVIDENCE_SCHEMA,
     PHASE_5_OWNER_DECISION_REQUIRED, ExitEvidenceArea, Phase4ExitEvidencePin,
     Phase4OwnerDecision, Phase4QualificationError, Phase4QualificationInputs, Phase4SelectionPins,
-    assess_phase_4_qualification,
+    _observed_ancestry_digest, assess_phase_4_qualification,
 )
 
 
@@ -46,7 +47,7 @@ def byte_digest(value: bytes) -> str:
 
 
 class Phase4QualificationTests(unittest.TestCase):
-    qualification_candidate = "b" * 40
+    qualification_candidate = subprocess.check_output(("git", "rev-parse", "HEAD"), text=True).strip()
 
     def evidence(self) -> CrossEnvironmentEvidence:
         lanes = tuple(
@@ -89,6 +90,7 @@ class Phase4QualificationTests(unittest.TestCase):
             "observed_source_candidate_sha": evidence.candidate_sha,
             "observed_qualification_candidate_sha": self.qualification_candidate,
             "observed_relation": "ancestor", "semantic_result": "verified",
+            "authoritative_readback_digest": _observed_ancestry_digest(evidence.candidate_sha, self.qualification_candidate),
         }
         lineage = lineage_core | {"receipt_digest": canonical(lineage_core)}
         exits = []
@@ -117,6 +119,7 @@ class Phase4QualificationTests(unittest.TestCase):
             evidence.evidence_digest, canonical(comparison.public_payload()), cross["receipt_digest"], evidence.profile_digest,
             evidence.schema_digest, evidence.candidate_sha, CROSS_ENVIRONMENT_CANARY_PROFILE, evidence.schema,
             evidence.sealed_canary.ready_at, byte_digest(bundle), lineage["receipt_digest"],
+            lineage["authoritative_readback_digest"],
             tuple(Phase4ExitEvidencePin(
                 area, evidence.candidate_sha, evidence.evidence_digest, item["expected_source_identity"],
                 item["observed_source_identity"], item["receipt_digest"],
@@ -165,7 +168,9 @@ class Phase4QualificationTests(unittest.TestCase):
         bundle, pins = self.retained_bundle()
         altered = json.loads(bundle)
         lineage = altered["lineage"]
+        lineage["qualification_candidate_sha"] = "0" * 40
         lineage["observed_qualification_candidate_sha"] = "0" * 40
+        lineage["authoritative_readback_digest"] = digest("0")
         lineage["receipt_digest"] = canonical({key: value for key, value in lineage.items() if key != "receipt_digest"})
         changed = encoded(altered)
         with self.assertRaises(Phase4QualificationError):

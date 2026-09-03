@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from roundwright.cross_environment import (
     CROSS_ENVIRONMENT_CANARY_PROFILE,
     CROSS_ENVIRONMENT_EVIDENCE_SCHEMA,
+    CROSS_ENVIRONMENT_LANE_ORDER,
     ComparisonResult,
     CrossEnvironmentComparison,
     CrossEnvironmentEvidence,
@@ -20,6 +21,14 @@ from roundwright.cross_environment import (
     EnvironmentLane,
     OperationMode,
     ReceiptState,
+    SEALED_CANARY_EXECUTION_LEDGER_DIGEST,
+    SEALED_CANARY_LIFECYCLE_COMPARISON_DIGEST,
+    SEALED_CANARY_LIFECYCLE_LEDGER_DIGEST,
+    SEALED_CANARY_READY_AT,
+    SEALED_CANARY_RECEIPT_DIGEST,
+    SEALED_CANARY_SOURCE_CANDIDATE_SHA,
+    SEALED_CANARY_TARGET_MERGE_SHA,
+    SealedCanaryReceipt,
     compare_cross_environment_evidence,
     semantic_read_back,
 )
@@ -31,23 +40,32 @@ def digest(character: str) -> str:
 
 class CrossEnvironmentEvidenceTests(unittest.TestCase):
     def lane(self, environment: EnvironmentKind, *, mode: OperationMode = OperationMode.READ_ONLY) -> EnvironmentLane:
+        parity_digest = None if environment is EnvironmentKind.SEALED_CANARY_RECEIPT_CONSUMER else digest("6")
         return EnvironmentLane(
             environment, environment.value + "-runner", mode, "a" * 40,
             digest("b"), digest("c"), digest("d"), digest("e"), digest("f"),
-            ReceiptState.VERIFIED, digest("1"), 100, ComparisonResult.PASS,
+            ReceiptState.VERIFIED, SEALED_CANARY_RECEIPT_DIGEST, 100, ComparisonResult.PASS,
+            parity_digest=parity_digest, sealed_canary_receipt_digest=SEALED_CANARY_RECEIPT_DIGEST,
         )
 
     def evidence(self) -> CrossEnvironmentEvidence:
         lanes = tuple(
             self.lane(environment, mode=OperationMode.AUTHORITATIVE if environment is EnvironmentKind.NATIVE_WINDOWS else OperationMode.READ_ONLY)
-            for environment in sorted(EnvironmentKind, key=lambda item: item.value)
+            for environment in CROSS_ENVIRONMENT_LANE_ORDER
         )
-        return CrossEnvironmentEvidence("a" * 40, digest("b"), digest("c"), digest("d"), digest("e"), digest("f"), lanes)
+        sealed = SealedCanaryReceipt(
+            SEALED_CANARY_SOURCE_CANDIDATE_SHA, SEALED_CANARY_RECEIPT_DIGEST,
+            SEALED_CANARY_EXECUTION_LEDGER_DIGEST, SEALED_CANARY_LIFECYCLE_LEDGER_DIGEST,
+            SEALED_CANARY_LIFECYCLE_COMPARISON_DIGEST,
+            "ythdelmar68/roundlet-forward-test", SEALED_CANARY_TARGET_MERGE_SHA,
+            SEALED_CANARY_READY_AT,
+        )
+        return CrossEnvironmentEvidence("a" * 40, digest("b"), digest("c"), digest("d"), digest("e"), digest("f"), lanes, sealed)
 
     def test_schema_uses_one_exact_artifact_across_the_closed_environment_matrix(self) -> None:
         evidence = self.evidence()
         self.assertEqual(evidence.schema, CROSS_ENVIRONMENT_EVIDENCE_SCHEMA)
-        self.assertEqual({lane.environment for lane in evidence.lanes}, set(EnvironmentKind))
+        self.assertEqual(tuple(lane.environment for lane in evidence.lanes), CROSS_ENVIRONMENT_LANE_ORDER)
         self.assertEqual({lane.artifact_digest for lane in evidence.lanes}, {digest("b")})
         self.assertEqual(CROSS_ENVIRONMENT_CANARY_PROFILE, "roundwright-shadow-profile/cross-environment-canary/v1")
         self.assertEqual(evidence.result, ComparisonResult.PASS)
@@ -70,7 +88,7 @@ class CrossEnvironmentEvidenceTests(unittest.TestCase):
             receipt_digest=None, result=ComparisonResult.BLOCKED, reason="environment-unavailable",
         )
         self.assertEqual(blocked.result, ComparisonResult.BLOCKED)
-        self.assertNotIn("path", str(blocked.public_payload()))
+        self.assertNotIn("C:\\", str(blocked.public_payload()))
 
     def test_rejects_duplicate_authority_across_distinct_environment_lanes(self) -> None:
         evidence = self.evidence()
@@ -81,6 +99,32 @@ class CrossEnvironmentEvidenceTests(unittest.TestCase):
         )
         with self.assertRaises(CrossEnvironmentEvidenceError):
             replace(evidence, lanes=duplicate_authority)
+
+    def test_requires_the_sealed_canary_for_every_lane_and_a_read_only_consumer(self) -> None:
+        evidence = self.evidence()
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            replace(evidence, lanes=(replace(evidence.lanes[0], sealed_canary_receipt_digest=digest("0")), *evidence.lanes[1:]))
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            replace(evidence, lanes=(*evidence.lanes[:-1], replace(evidence.lanes[-1], mode=OperationMode.TEST_ONLY)))
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            replace(evidence, lanes=(replace(evidence.lanes[0], parity_digest=digest("0")), *evidence.lanes[1:]))
+
+    def test_revalidates_a_mutated_sealed_receipt_before_public_rendering(self) -> None:
+        evidence = self.evidence()
+        object.__setattr__(evidence.sealed_canary, "target_repository", "other/target")
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            evidence.public_payload()
+
+    def test_requires_the_exact_immutable_sealed_source_without_relabeling_it_as_the_current_candidate(self) -> None:
+        evidence = self.evidence()
+        self.assertNotEqual(evidence.candidate_sha, evidence.sealed_canary.source_candidate_sha)
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            replace(evidence.sealed_canary, source_candidate_sha=evidence.candidate_sha)
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            replace(evidence.sealed_canary, receipt_digest=digest("0"))
+        object.__setattr__(evidence.sealed_canary, "source_candidate_sha", evidence.candidate_sha)
+        with self.assertRaises(CrossEnvironmentEvidenceError):
+            evidence.public_payload()
 
     def test_rejects_secret_shaped_values_in_every_emitted_free_text_field(self) -> None:
         evidence = self.evidence()

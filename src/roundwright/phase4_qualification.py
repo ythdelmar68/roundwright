@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -26,6 +27,17 @@ PHASE_4_LINEAGE_SCHEMA = "roundwright-phase-4-candidate-lineage/v1"
 PHASE_4_LINEAGE_PROOF_SCHEMA = "roundwright-phase-4-authoritative-lineage-proof/v1"
 _LINEAGE_PROOF_ISSUER = "roundwright-authoritative-git-object-db/v1"
 _LINEAGE_PROOF_REPOSITORY = "ythdelmar68/roundwright"
+_LINEAGE_PROOF_KEY_ID = "roundwright-phase4-authority-2026-09"
+_LINEAGE_PROOF_RSA_N = int.from_bytes(base64.urlsafe_b64decode(
+    "sFwBme8IMzNjdxUlNlP65WHlhWOMCqPKpELVLgPGx7tI6ozFAF62TqgQSBf3oa75"
+    "vA0NQ0DBGdfCXNgJcAZSloJ3qwijo_eob_KelMurrlQIPvAAGjrt9TcWql_HK0f-fS"
+    "PuOAVnUXLf3F8yqEyic47AUzY2Iyuh174_-9ynWyiAiQ3LGDj-Ly2wwWL2JzhfHnkn"
+    "5sdaEWMqsoPsUlBKae8KP5MVGselCUj4Zoh0apn5P3AoQp2Eq2TeBet65qZI_uI0u_"
+    "FnJAH_wHvvED1Fy5tXm2-qHalQbEFMWs1tCb5VR-Sc01HCHEwQAA2zJuwZhRo1sNlU"
+    "2llXYSmycEwx5w" + "=="
+), "big")
+_LINEAGE_PROOF_RSA_E = 65537
+_SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 ISSUE_97_EVIDENCE_CANDIDATE_SHA = "fe1da4ffa4ee29df21aa62cc5a995fb4075e075d"
 PHASE_5_OWNER_DECISION_REQUIRED = "PHASE_5_OWNER_DECISION_REQUIRED"
 PHASE_4_QUALIFICATION_BLOCKED = "PHASE_4_QUALIFICATION_BLOCKED"
@@ -63,20 +75,24 @@ def _parse_authoritative_lineage_proof(contents: bytes) -> dict[str, str]:
             raise ValueError
         proof = _require_keys(proof, {
             "schema", "issuer_identity", "repository_identity", "object_database_identity",
-            "source_candidate_sha", "qualification_candidate_sha", "relation", "semantic_result", "proof_digest",
+            "issuer_key_id", "source_candidate_sha", "qualification_candidate_sha", "relation", "semantic_result",
+            "proof_digest", "issuer_signature",
         }, "authoritative lineage proof")
-        core = {key: value for key, value in proof.items() if key != "proof_digest"}
+        unsigned = {key: value for key, value in proof.items() if key not in {"proof_digest", "issuer_signature"}}
+        signed = {key: value for key, value in proof.items() if key != "issuer_signature"}
         if (
             any(type(value) is not str for value in proof.values())
             or proof["schema"] != PHASE_4_LINEAGE_PROOF_SCHEMA
             or proof["issuer_identity"] != _LINEAGE_PROOF_ISSUER
+            or proof["issuer_key_id"] != _LINEAGE_PROOF_KEY_ID
             or proof["repository_identity"] != _LINEAGE_PROOF_REPOSITORY
             or _DIGEST.fullmatch(proof["object_database_identity"]) is None
             or _SHA.fullmatch(proof["source_candidate_sha"]) is None
             or _SHA.fullmatch(proof["qualification_candidate_sha"]) is None
             or proof["source_candidate_sha"] == proof["qualification_candidate_sha"]
             or proof["relation"] != "ancestor" or proof["semantic_result"] != "verified"
-            or proof["proof_digest"] != _digest(core)
+            or proof["proof_digest"] != _digest(unsigned)
+            or not _verify_lineage_issuer_signature(_canonical_bytes(signed), proof["issuer_signature"])
         ):
             raise ValueError
         return proof  # type: ignore[return-value]
@@ -84,6 +100,21 @@ def _parse_authoritative_lineage_proof(contents: bytes) -> dict[str, str]:
         if isinstance(error, Phase4QualificationError):
             raise
         raise Phase4QualificationError("authoritative lineage proof is invalid") from error
+
+
+def _verify_lineage_issuer_signature(signed: bytes, signature: str) -> bool:
+    """Verify the fixed issuer's RSA-SHA256 attestation without ambient tools."""
+
+    try:
+        value = base64.b64decode(signature, validate=True)
+    except (ValueError, TypeError):
+        return False
+    if len(value) != 256:
+        return False
+    encoded = pow(int.from_bytes(value, "big"), _LINEAGE_PROOF_RSA_E, _LINEAGE_PROOF_RSA_N).to_bytes(256, "big")
+    digest_info = _SHA256_DIGEST_INFO + hashlib.sha256(signed).digest()
+    padding_length = len(encoded) - len(digest_info) - 3
+    return padding_length >= 8 and encoded == b"\x00\x01" + b"\xff" * padding_length + b"\x00" + digest_info
 
 
 def _no_duplicate_object(pairs: list[tuple[object, object]]) -> dict[str, object]:

@@ -86,12 +86,15 @@ class Phase4QualificationTests(unittest.TestCase):
         cross = cross_core | {"receipt_digest": canonical(cross_core)}
         proof_core = {
             "schema": "roundwright-phase-4-authoritative-lineage-proof/v1",
-            "issuer_identity": "roundwright-authoritative-git-object-db/v1",
+            "issuer_identity": "roundwright-authoritative-git-object-db/v1", "issuer_key_id": "roundwright-phase4-authority-2026-09",
             "repository_identity": "ythdelmar68/roundwright", "object_database_identity": digest("a"),
             "source_candidate_sha": evidence.candidate_sha, "qualification_candidate_sha": self.qualification_candidate,
             "relation": "ancestor", "semantic_result": "verified",
         }
-        proof = proof_core | {"proof_digest": canonical(proof_core)}
+        proof = proof_core | {
+            "proof_digest": canonical(proof_core),
+            "issuer_signature": "N9IQKFGZG6yQm1/Z58+iPUMhhy9kZx9PPpHZkCgDdxWcPdF6LyvzE8/3cX4Y7GqNnmBQBsjvedg852MehgtdxJtkSBQs36dSMM0ZIjounc4QvinD9l6of23hPWk5qGdiF+S5vRHwLh0TD+t3uIvBrx9oa+4zWDOKXPGaXFVR5V4pGCV7n+qn2A+1wu9Cp5SAwUzqMz98B6gISP6OZ67363Stbj7pKE+vjcQCiHtRSt8NlUjklS+EEcG9WSTjA9TA1MVBpZSlKOZpp07h63UIeRZqeE94wPYwrEEOhOIHRapA3z/lqMyiiMIjn0wAWb5phtx0CKFQclLlf86WTlUWAA==",
+        }
         proof_bytes = encoded(proof)
         lineage_core = {
             "schema": PHASE_4_LINEAGE_SCHEMA, "source_candidate_sha": evidence.candidate_sha,
@@ -196,6 +199,28 @@ class Phase4QualificationTests(unittest.TestCase):
             Phase4QualificationInputs(SEALED_CANARY_SOURCE_CANDIDATE_SHA, altered_pins, changed, changed_proof)
         with self.assertRaises(Phase4QualificationError):
             self.inputs(qualification_candidate_sha="0" * 40)
+
+    def test_coherent_caller_repin_cannot_forge_issuer_attestation(self) -> None:
+        bundle, proof, pins = self.retained_bundle()
+        forged_candidate = "0" * 40
+        forged_proof = json.loads(proof)
+        forged_proof["qualification_candidate_sha"] = forged_candidate
+        forged_proof["proof_digest"] = canonical({key: value for key, value in forged_proof.items() if key not in {"proof_digest", "issuer_signature"}})
+        forged_proof_bytes = encoded(forged_proof)
+        forged_bundle = json.loads(bundle)
+        lineage = forged_bundle["lineage"]
+        lineage["qualification_candidate_sha"] = forged_candidate
+        lineage["observed_qualification_candidate_sha"] = forged_candidate
+        lineage["authoritative_proof_digest"] = forged_proof["proof_digest"]
+        lineage["receipt_digest"] = canonical({key: value for key, value in lineage.items() if key != "receipt_digest"})
+        forged_bundle_bytes = encoded(forged_bundle)
+        forged_pins = replace(
+            pins, qualification_candidate_sha=forged_candidate,
+            retained_bundle_digest=byte_digest(forged_bundle_bytes), lineage_receipt_digest=lineage["receipt_digest"],
+            lineage_proof_digest=forged_proof["proof_digest"],
+        )
+        with self.assertRaises(Phase4QualificationError):
+            Phase4QualificationInputs(forged_candidate, forged_pins, forged_bundle_bytes, forged_proof_bytes)
 
     def test_exit_receipts_require_pinned_area_specific_expected_and_observed_identity(self) -> None:
         bundle, _, pins = self.retained_bundle()

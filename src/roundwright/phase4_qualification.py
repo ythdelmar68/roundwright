@@ -1,9 +1,4 @@
-"""Fail-closed, consumer-only Phase 4 qualification for Issue #98.
-
-The gate consumes selection-time pins and independently retained public-safe
-bytes. It does not invoke a Harness, provider, scheduler, target, GitHub, or
-lifecycle sink. A pass only produces a Phase 5 owner-decision input.
-"""
+"""Fail-closed, consumer-only Phase 4 qualification for Issue #98."""
 
 from __future__ import annotations
 
@@ -21,28 +16,46 @@ from .cross_environment import (
     is_safe_cross_environment_public_string,
 )
 
-
 PHASE_4_QUALIFICATION_SCHEMA = "roundwright-phase-4-qualification-decision/v2"
 PHASE_4_RETAINED_EVIDENCE_SCHEMA = "roundwright-phase-4-retained-evidence/v1"
 PHASE_4_EXIT_RECEIPT_SCHEMA = "roundwright-phase-4-exit-evidence/v1"
 PHASE_4_CROSS_ENVIRONMENT_RECEIPT_SCHEMA = "roundwright-phase-4-cross-environment-receipt/v1"
 PHASE_3_DECISION_SCHEMA = "roundwright-phase-3-qualification-decision/v1"
 PHASE_3_QUALIFICATION_PROFILE = "roundwright-shadow-profile/phase-3-qualification/v1"
+PHASE_4_LINEAGE_SCHEMA = "roundwright-phase-4-candidate-lineage/v1"
 ISSUE_97_EVIDENCE_CANDIDATE_SHA = "fe1da4ffa4ee29df21aa62cc5a995fb4075e075d"
 PHASE_5_OWNER_DECISION_REQUIRED = "PHASE_5_OWNER_DECISION_REQUIRED"
 PHASE_4_QUALIFICATION_BLOCKED = "PHASE_4_QUALIFICATION_BLOCKED"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PHASE_5_PREREQUISITES = (
+    "owner-phase-5-decision", "no-automatic-activation", "no-roundlet-retirement", "no-promotion-or-release",
+)
 
 
 class Phase4QualificationError(ValueError):
-    """Raised when a retained Phase 4 evidence binding is stale or mixed."""
+    """Raised when retained Phase 4 evidence is stale, malformed, or mixed."""
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def _digest(value: object) -> str:
-    return "sha256:" + hashlib.sha256(json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-    ).encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _bytes_digest(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _no_duplicate_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if type(key) is not str or key in result:
+            raise Phase4QualificationError("retained Phase 4 JSON is not canonical")
+        result[key] = value
+    return result
 
 
 def _require_keys(value: object, keys: set[str], label: str) -> dict[str, object]:
@@ -76,10 +89,39 @@ REQUIRED_EXIT_EVIDENCE = tuple(ExitEvidenceArea)
 
 
 @dataclass(frozen=True)
-class Phase4SelectionPins:
-    """Selection-time identities, separated from observed retained bytes."""
+class Phase4ExitEvidencePin:
+    area: ExitEvidenceArea
+    source_candidate_sha: str
+    source_evidence_digest: str
+    expected_source_identity: str
+    observed_source_identity: str
+    receipt_digest: str
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.area) is not ExitEvidenceArea or _SHA.fullmatch(self.source_candidate_sha) is None
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.source_evidence_digest, self.expected_source_identity, self.observed_source_identity, self.receipt_digest,
+            )) or self.expected_source_identity != self.observed_source_identity
+        ):
+            raise Phase4QualificationError("Phase 4 exit evidence pin is invalid")
+
+    def public_payload(self) -> dict[str, str]:
+        return {
+            "area": self.area.value, "source_candidate_sha": self.source_candidate_sha,
+            "source_evidence_digest": self.source_evidence_digest,
+            "expected_source_identity": self.expected_source_identity,
+            "observed_source_identity": self.observed_source_identity, "receipt_digest": self.receipt_digest,
+        }
+
+
+@dataclass(frozen=True)
+class Phase4SelectionPins:
+    """Selection-time identities, separated from independently retained bytes."""
+
+    qualification_candidate_sha: str
     package_artifact_digest: str
+    phase_3_candidate_sha: str
     phase_3_decision_digest: str
     phase_3_receipt_digest: str
     issue_97_evidence_digest: str
@@ -91,25 +133,30 @@ class Phase4SelectionPins:
     cross_environment_profile: str
     cross_environment_schema: str
     historical_ready_at: int
-    exit_receipt_digests: tuple[str, ...]
+    retained_bundle_digest: str
+    lineage_receipt_digest: str
+    exit_evidence: tuple[Phase4ExitEvidencePin, ...]
     selection_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         if (
-            any(_DIGEST.fullmatch(value) is None for value in (
-                self.package_artifact_digest, self.phase_3_decision_digest,
-                self.phase_3_receipt_digest, self.issue_97_evidence_digest,
-                self.issue_97_result_digest, self.issue_97_receipt_digest,
-                self.issue_97_profile_digest, self.issue_97_schema_digest,
-            ))
+            _SHA.fullmatch(self.qualification_candidate_sha) is None
+            or self.qualification_candidate_sha == ISSUE_97_EVIDENCE_CANDIDATE_SHA
+            or _SHA.fullmatch(self.phase_3_candidate_sha) is None
             or self.source_candidate_sha != ISSUE_97_EVIDENCE_CANDIDATE_SHA
             or self.cross_environment_profile != CROSS_ENVIRONMENT_CANARY_PROFILE
             or self.cross_environment_schema != CROSS_ENVIRONMENT_EVIDENCE_SCHEMA
             or type(self.historical_ready_at) is not int or self.historical_ready_at < 0
-            or type(self.exit_receipt_digests) is not tuple
-            or len(self.exit_receipt_digests) != len(REQUIRED_EXIT_EVIDENCE)
-            or any(_DIGEST.fullmatch(value) is None for value in self.exit_receipt_digests)
-            or len(set(self.exit_receipt_digests)) != len(self.exit_receipt_digests)
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.package_artifact_digest, self.phase_3_decision_digest, self.phase_3_receipt_digest,
+                self.issue_97_evidence_digest, self.issue_97_result_digest, self.issue_97_receipt_digest,
+                self.issue_97_profile_digest, self.issue_97_schema_digest, self.retained_bundle_digest,
+                self.lineage_receipt_digest,
+            )) or type(self.exit_evidence) is not tuple
+            or tuple(item.area for item in self.exit_evidence) != REQUIRED_EXIT_EVIDENCE
+            or any(type(item) is not Phase4ExitEvidencePin for item in self.exit_evidence)
+            or any(item.source_candidate_sha != self.source_candidate_sha for item in self.exit_evidence)
+            or len({item.receipt_digest for item in self.exit_evidence}) != len(self.exit_evidence)
         ):
             raise Phase4QualificationError("Phase 4 selection pins are invalid")
         object.__setattr__(self, "selection_digest", _digest(self.public_payload(include_digest=False)))
@@ -117,13 +164,12 @@ class Phase4SelectionPins:
     def validate(self) -> None:
         try:
             rebuilt = Phase4SelectionPins(
-                self.package_artifact_digest, self.phase_3_decision_digest,
-                self.phase_3_receipt_digest, self.issue_97_evidence_digest,
-                self.issue_97_result_digest, self.issue_97_receipt_digest,
-                self.issue_97_profile_digest, self.issue_97_schema_digest,
-                self.source_candidate_sha, self.cross_environment_profile,
-                self.cross_environment_schema, self.historical_ready_at,
-                self.exit_receipt_digests,
+                self.qualification_candidate_sha, self.package_artifact_digest, self.phase_3_candidate_sha,
+                self.phase_3_decision_digest, self.phase_3_receipt_digest, self.issue_97_evidence_digest,
+                self.issue_97_result_digest, self.issue_97_receipt_digest, self.issue_97_profile_digest,
+                self.issue_97_schema_digest, self.source_candidate_sha, self.cross_environment_profile,
+                self.cross_environment_schema, self.historical_ready_at, self.retained_bundle_digest,
+                self.lineage_receipt_digest, self.exit_evidence,
             )
             if rebuilt.selection_digest != self.selection_digest:
                 raise ValueError
@@ -134,7 +180,9 @@ class Phase4SelectionPins:
         if include_digest:
             self.validate()
         value: dict[str, object] = {
+            "qualification_candidate_sha": self.qualification_candidate_sha,
             "package_artifact_digest": self.package_artifact_digest,
+            "phase_3_candidate_sha": self.phase_3_candidate_sha,
             "phase_3_decision_digest": self.phase_3_decision_digest,
             "phase_3_receipt_digest": self.phase_3_receipt_digest,
             "issue_97_evidence_digest": self.issue_97_evidence_digest,
@@ -146,7 +194,9 @@ class Phase4SelectionPins:
             "cross_environment_profile": self.cross_environment_profile,
             "cross_environment_schema": self.cross_environment_schema,
             "historical_ready_at": self.historical_ready_at,
-            "exit_receipt_digests": list(self.exit_receipt_digests),
+            "retained_bundle_digest": self.retained_bundle_digest,
+            "lineage_receipt_digest": self.lineage_receipt_digest,
+            "exit_evidence": [item.public_payload() for item in self.exit_evidence],
         }
         return value | ({"selection_digest": self.selection_digest} if include_digest else {})
 
@@ -155,13 +205,38 @@ class Phase4SelectionPins:
 class _RetainedExitReceipt:
     area: ExitEvidenceArea
     source_candidate_sha: str
-    source_digest: str
+    source_evidence_digest: str
+    expected_source_identity: str
+    observed_source_identity: str
+    semantic_result: str
     receipt_digest: str
 
-    def public_payload(self) -> dict[str, str]:
+    def validate(self) -> None:
+        core = {
+            "schema": PHASE_4_EXIT_RECEIPT_SCHEMA, "area": self.area.value,
+            "source_candidate_sha": self.source_candidate_sha, "source_evidence_digest": self.source_evidence_digest,
+            "expected_source_identity": self.expected_source_identity,
+            "observed_source_identity": self.observed_source_identity,
+            "semantic_result": self.semantic_result, "result": "pass",
+        }
+        if (
+            type(self.area) is not ExitEvidenceArea or _SHA.fullmatch(self.source_candidate_sha) is None
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.source_evidence_digest, self.expected_source_identity, self.observed_source_identity, self.receipt_digest,
+            )) or self.expected_source_identity != self.observed_source_identity
+            or self.semantic_result != "verified" or self.receipt_digest != _digest(core)
+        ):
+            raise Phase4QualificationError("retained exit receipt is invalid")
+
+    def public_payload(self, *, include_digest: bool = True) -> dict[str, str]:
+        if include_digest:
+            self.validate()
         return {
             "area": self.area.value, "source_candidate_sha": self.source_candidate_sha,
-            "source_digest": self.source_digest, "receipt_digest": self.receipt_digest,
+            "source_evidence_digest": self.source_evidence_digest,
+            "expected_source_identity": self.expected_source_identity,
+            "observed_source_identity": self.observed_source_identity,
+            "semantic_result": self.semantic_result, "receipt_digest": self.receipt_digest,
         }
 
 
@@ -171,13 +246,40 @@ class _RetainedEvidence:
     phase_3_decision_digest: str
     phase_3_receipt_digest: str
     lineage_qualification_candidate_sha: str
+    lineage_receipt_digest: str
     evidence: CrossEnvironmentEvidence
     comparison: CrossEnvironmentComparison
     cross_environment_receipt_digest: str
-    topology: dict[str, object]
     exit_receipts: tuple[_RetainedExitReceipt, ...]
     confidence: EvidenceConfidence
     residual_risks: tuple[str, ...]
+
+
+def _parse_lane(value: object) -> EnvironmentLane:
+    payload = _require_keys(value, {
+        "environment", "environment_identity", "mode", "candidate_sha", "artifact_digest", "policy_digest",
+        "profile_digest", "schema_digest", "producer_identity", "receipt_state", "receipt_digest", "observed_at",
+        "result", "reason", "parity_dimensions", "parity_digest", "sealed_canary_receipt_digest",
+    }, "retained #97 lane")
+    if (
+        any(type(payload[key]) is not str for key in (
+            "environment", "environment_identity", "mode", "candidate_sha", "artifact_digest", "policy_digest",
+            "profile_digest", "schema_digest", "producer_identity", "receipt_state", "result",
+        )) or payload["receipt_digest"] is not None and type(payload["receipt_digest"]) is not str
+        or type(payload["observed_at"]) is not int or payload["reason"] is not None and type(payload["reason"]) is not str
+        or type(payload["parity_dimensions"]) is not list or any(type(item) is not str for item in payload["parity_dimensions"])
+        or payload["parity_digest"] is not None and type(payload["parity_digest"]) is not str
+        or payload["sealed_canary_receipt_digest"] is not None and type(payload["sealed_canary_receipt_digest"]) is not str
+    ):
+        raise Phase4QualificationError("retained #97 lane is invalid")
+    return EnvironmentLane(
+        EnvironmentKind(payload["environment"]), payload["environment_identity"], OperationMode(payload["mode"]),
+        payload["candidate_sha"], payload["artifact_digest"], payload["policy_digest"], payload["profile_digest"],
+        payload["schema_digest"], payload["producer_identity"], ReceiptState(payload["receipt_state"]),
+        payload["receipt_digest"], payload["observed_at"], ComparisonResult(payload["result"]), payload["reason"],
+        tuple(ParityDimension(item) for item in payload["parity_dimensions"]), payload["parity_digest"],
+        payload["sealed_canary_receipt_digest"],
+    )
 
 
 def _parse_evidence(value: object) -> CrossEnvironmentEvidence:
@@ -186,31 +288,27 @@ def _parse_evidence(value: object) -> CrossEnvironmentEvidence:
         "schema_digest", "producer_identity", "lanes", "sealed_canary", "result",
     }, "retained #97 evidence")
     try:
-        if type(payload["lanes"]) is not list:
+        if any(type(payload[key]) is not str for key in (
+            "schema", "candidate_sha", "artifact_digest", "policy_digest", "profile_digest", "schema_digest",
+            "producer_identity", "result",
+        )) or type(payload["lanes"]) is not list:
             raise ValueError
-        lanes = tuple(EnvironmentLane(
-            EnvironmentKind(item["environment"]), item["environment_identity"], OperationMode(item["mode"]),
-            item["candidate_sha"], item["artifact_digest"], item["policy_digest"], item["profile_digest"],
-            item["schema_digest"], item["producer_identity"], ReceiptState(item["receipt_state"]),
-            item["receipt_digest"], item["observed_at"], ComparisonResult(item["result"]), item["reason"],
-            tuple(ParityDimension(dimension) for dimension in item["parity_dimensions"]),
-            item["parity_digest"], item["sealed_canary_receipt_digest"],
-        ) for item in payload["lanes"])
-        sealed_payload = _require_keys(payload["sealed_canary"], {
+        sealed = _require_keys(payload["sealed_canary"], {
             "source_candidate_sha", "receipt_digest", "execution_ledger_digest", "lifecycle_ledger_digest",
             "lifecycle_comparison_digest", "target_repository", "target_merge_sha", "ready_at",
         }, "retained #96 receipt")
+        if any(type(sealed[key]) is not str for key in sealed if key != "ready_at") or type(sealed["ready_at"]) is not int:
+            raise ValueError
         evidence = CrossEnvironmentEvidence(
-            payload["candidate_sha"], payload["artifact_digest"], payload["policy_digest"],
-            payload["profile_digest"], payload["schema_digest"], payload["producer_identity"], lanes,
+            payload["candidate_sha"], payload["artifact_digest"], payload["policy_digest"], payload["profile_digest"],
+            payload["schema_digest"], payload["producer_identity"], tuple(_parse_lane(item) for item in payload["lanes"]),
             SealedCanaryReceipt(
-                sealed_payload["source_candidate_sha"], sealed_payload["receipt_digest"],
-                sealed_payload["execution_ledger_digest"], sealed_payload["lifecycle_ledger_digest"],
-                sealed_payload["lifecycle_comparison_digest"], sealed_payload["target_repository"],
-                sealed_payload["target_merge_sha"], sealed_payload["ready_at"],
+                sealed["source_candidate_sha"], sealed["receipt_digest"], sealed["execution_ledger_digest"],
+                sealed["lifecycle_ledger_digest"], sealed["lifecycle_comparison_digest"], sealed["target_repository"],
+                sealed["target_merge_sha"], sealed["ready_at"],
             ), payload["schema"],
         )
-        if payload["result"] != evidence.result.value:
+        if payload != evidence.public_payload():
             raise ValueError
         return evidence
     except (AttributeError, KeyError, TypeError, ValueError, CrossEnvironmentEvidenceError) as error:
@@ -221,22 +319,25 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
     try:
         if type(contents) is not bytes:
             raise ValueError
-        payload = _require_keys(json.loads(contents), {
+        payload = json.loads(contents, object_pairs_hook=_no_duplicate_object)
+        if contents != _canonical_bytes(payload):
+            raise ValueError
+        payload = _require_keys(payload, {
             "schema", "phase_3", "cross_environment", "lineage", "consumer_topology", "exit_evidence",
             "confidence", "residual_risks",
         }, "retained Phase 4 bundle")
-        if payload["schema"] != PHASE_4_RETAINED_EVIDENCE_SCHEMA:
+        if type(payload["schema"]) is not str or payload["schema"] != PHASE_4_RETAINED_EVIDENCE_SCHEMA:
             raise ValueError
         phase_3 = _require_keys(payload["phase_3"], {
             "schema", "profile", "candidate_sha", "decision_digest", "result", "receipt_digest",
         }, "retained #51 decision")
-        phase_3_core = {key: value for key, value in phase_3.items() if key != "receipt_digest"}
+        phase_core = {key: value for key, value in phase_3.items() if key != "receipt_digest"}
         if (
-            phase_3["schema"] != PHASE_3_DECISION_SCHEMA or phase_3["profile"] != PHASE_3_QUALIFICATION_PROFILE
-            or _SHA.fullmatch(str(phase_3["candidate_sha"])) is None
+            any(type(value) is not str for value in phase_3.values()) or phase_3["schema"] != PHASE_3_DECISION_SCHEMA
+            or phase_3["profile"] != PHASE_3_QUALIFICATION_PROFILE or _SHA.fullmatch(phase_3["candidate_sha"]) is None
             or phase_3["result"] != "PROMOTION_READY_FOR_CANARY_DECISION"
-            or any(_DIGEST.fullmatch(str(phase_3[key])) is None for key in ("decision_digest", "receipt_digest"))
-            or phase_3["receipt_digest"] != _digest(phase_3_core)
+            or any(_DIGEST.fullmatch(phase_3[key]) is None for key in ("decision_digest", "receipt_digest"))
+            or phase_3["receipt_digest"] != _digest(phase_core)
         ):
             raise ValueError
         cross = _require_keys(payload["cross_environment"], {"evidence", "comparison", "receipt"}, "retained #97 bundle")
@@ -244,44 +345,51 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
         comparison_payload = _require_keys(cross["comparison"], {
             "schema", "result", "candidate_sha", "expected_digest", "observed_digest", "differences",
         }, "retained #97 result")
+        if any(type(comparison_payload[key]) is not str for key in (
+            "schema", "result", "candidate_sha", "expected_digest", "observed_digest",
+        )) or type(comparison_payload["differences"]) is not list or any(type(item) is not str for item in comparison_payload["differences"]):
+            raise ValueError
         comparison = CrossEnvironmentComparison(
             ComparisonResult(comparison_payload["result"]), comparison_payload["candidate_sha"],
             comparison_payload["expected_digest"], comparison_payload["observed_digest"],
             tuple(comparison_payload["differences"]), comparison_payload["schema"],
         )
+        if comparison_payload != comparison.public_payload():
+            raise ValueError
         receipt = _require_keys(cross["receipt"], {
             "schema", "profile", "candidate_sha", "ready_at", "evidence_digest", "result_digest", "receipt_digest",
         }, "retained #97 receipt")
         receipt_core = {key: value for key, value in receipt.items() if key != "receipt_digest"}
         if (
-            receipt["schema"] != PHASE_4_CROSS_ENVIRONMENT_RECEIPT_SCHEMA
-            or receipt["profile"] != CROSS_ENVIRONMENT_CANARY_PROFILE
-            or receipt["candidate_sha"] != evidence.candidate_sha
-            or receipt["ready_at"] != evidence.sealed_canary.ready_at
-            or receipt["evidence_digest"] != evidence.evidence_digest
-            or receipt["result_digest"] != _digest(comparison.public_payload())
-            or receipt["receipt_digest"] != _digest(receipt_core)
+            any(type(receipt[key]) is not str for key in receipt if key != "ready_at") or type(receipt["ready_at"]) is not int
+            or receipt["schema"] != PHASE_4_CROSS_ENVIRONMENT_RECEIPT_SCHEMA
+            or receipt["profile"] != CROSS_ENVIRONMENT_CANARY_PROFILE or receipt["candidate_sha"] != evidence.candidate_sha
+            or receipt["ready_at"] != evidence.sealed_canary.ready_at or receipt["evidence_digest"] != evidence.evidence_digest
+            or receipt["result_digest"] != _digest(comparison.public_payload()) or receipt["receipt_digest"] != _digest(receipt_core)
         ):
             raise ValueError
         lineage = _require_keys(payload["lineage"], {
-            "schema", "source_candidate_sha", "qualification_candidate_sha", "relation", "receipt_digest",
+            "schema", "source_candidate_sha", "qualification_candidate_sha", "relation",
+            "observed_source_candidate_sha", "observed_qualification_candidate_sha", "observed_relation",
+            "semantic_result", "receipt_digest",
         }, "retained candidate lineage")
         lineage_core = {key: value for key, value in lineage.items() if key != "receipt_digest"}
         if (
-            lineage["schema"] != "roundwright-phase-4-candidate-lineage/v1"
-            or lineage["source_candidate_sha"] != evidence.candidate_sha
-            or _SHA.fullmatch(str(lineage["qualification_candidate_sha"])) is None
-            or lineage["qualification_candidate_sha"] == evidence.candidate_sha
-            or lineage["relation"] != "descendant"
-            or lineage["receipt_digest"] != _digest(lineage_core)
+            any(type(value) is not str for value in lineage.values()) or lineage["schema"] != PHASE_4_LINEAGE_SCHEMA
+            or _SHA.fullmatch(lineage["source_candidate_sha"]) is None or _SHA.fullmatch(lineage["qualification_candidate_sha"]) is None
+            or lineage["source_candidate_sha"] == lineage["qualification_candidate_sha"] or lineage["relation"] != "ancestor"
+            or (lineage["observed_source_candidate_sha"], lineage["observed_qualification_candidate_sha"], lineage["observed_relation"])
+            != (lineage["source_candidate_sha"], lineage["qualification_candidate_sha"], "ancestor")
+            or lineage["semantic_result"] != "verified" or lineage["receipt_digest"] != _digest(lineage_core)
         ):
             raise ValueError
         topology = _require_keys(payload["consumer_topology"], {
             "docker_artifact_digest", "devcontainer_artifact_digest", "devcontainer_feature_count", "devcontainer_template_count",
         }, "retained consumer topology")
         if (
-            topology["docker_artifact_digest"] != evidence.artifact_digest
-            or topology["devcontainer_artifact_digest"] != evidence.artifact_digest
+            type(topology["docker_artifact_digest"]) is not str or type(topology["devcontainer_artifact_digest"]) is not str
+            or type(topology["devcontainer_feature_count"]) is not int or type(topology["devcontainer_template_count"]) is not int
+            or topology["docker_artifact_digest"] != evidence.artifact_digest or topology["devcontainer_artifact_digest"] != evidence.artifact_digest
             or topology["devcontainer_feature_count"] != 0 or topology["devcontainer_template_count"] != 0
         ):
             raise ValueError
@@ -290,26 +398,38 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
         exits: list[_RetainedExitReceipt] = []
         for area, item in zip(REQUIRED_EXIT_EVIDENCE, payload["exit_evidence"], strict=True):
             receipt_value = _require_keys(item, {
-                "schema", "area", "source_candidate_sha", "source_digest", "result", "receipt_digest",
+                "schema", "area", "source_candidate_sha", "source_evidence_digest", "expected_source_identity",
+                "observed_source_identity", "semantic_result", "result", "receipt_digest",
             }, "retained exit receipt")
             core = {key: value for key, value in receipt_value.items() if key != "receipt_digest"}
+            if any(type(value) is not str for value in receipt_value.values()):
+                raise ValueError
+            exit_receipt = _RetainedExitReceipt(
+                area, receipt_value["source_candidate_sha"], receipt_value["source_evidence_digest"],
+                receipt_value["expected_source_identity"], receipt_value["observed_source_identity"],
+                receipt_value["semantic_result"], receipt_value["receipt_digest"],
+            )
             if (
                 receipt_value["schema"] != PHASE_4_EXIT_RECEIPT_SCHEMA or receipt_value["area"] != area.value
                 or receipt_value["source_candidate_sha"] != evidence.candidate_sha
-                or receipt_value["source_digest"] != evidence.evidence_digest or receipt_value["result"] != "pass"
+                or receipt_value["source_evidence_digest"] != evidence.evidence_digest or receipt_value["result"] != "pass"
                 or receipt_value["receipt_digest"] != _digest(core)
             ):
                 raise ValueError
-            exits.append(_RetainedExitReceipt(area, receipt_value["source_candidate_sha"], receipt_value["source_digest"], receipt_value["receipt_digest"]))
+            exit_receipt.validate()
+            exits.append(exit_receipt)
         if len({item.receipt_digest for item in exits}) != len(exits):
+            raise ValueError
+        if type(payload["confidence"]) is not str or type(payload["residual_risks"]) is not list:
             raise ValueError
         confidence = EvidenceConfidence(payload["confidence"])
         risks = tuple(payload["residual_risks"])
-        if type(payload["residual_risks"]) is not list or any(not is_safe_cross_environment_public_string(item) for item in risks) or tuple(sorted(set(risks))) != risks:
+        if any(not is_safe_cross_environment_public_string(item) for item in risks) or tuple(sorted(set(risks))) != risks:
             raise ValueError
         return _RetainedEvidence(
-            phase_3["candidate_sha"], phase_3["decision_digest"], phase_3["receipt_digest"], lineage["qualification_candidate_sha"],
-            evidence, comparison, receipt["receipt_digest"], dict(topology), tuple(exits), confidence, risks,
+            phase_3["candidate_sha"], phase_3["decision_digest"], phase_3["receipt_digest"],
+            lineage["qualification_candidate_sha"], lineage["receipt_digest"], evidence, comparison,
+            receipt["receipt_digest"], tuple(exits), confidence, risks,
         )
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError, CrossEnvironmentEvidenceError, Phase4QualificationError) as error:
         if isinstance(error, Phase4QualificationError):
@@ -319,18 +439,13 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
 
 @dataclass(frozen=True)
 class Phase4QualificationInputs:
-    """Selection pins plus independently retained #51/#96/#97 bytes."""
-
     qualification_candidate_sha: str
     selection_pins: Phase4SelectionPins
     retained_bundle_bytes: bytes
     input_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if (
-            _SHA.fullmatch(self.qualification_candidate_sha) is None
-            or type(self.selection_pins) is not Phase4SelectionPins or type(self.retained_bundle_bytes) is not bytes
-        ):
+        if _SHA.fullmatch(self.qualification_candidate_sha) is None or type(self.selection_pins) is not Phase4SelectionPins or type(self.retained_bundle_bytes) is not bytes:
             raise Phase4QualificationError("Phase 4 qualification inputs are invalid")
         object.__setattr__(self, "input_digest", _digest(self._identity_payload()))
         self.validate()
@@ -339,7 +454,7 @@ class Phase4QualificationInputs:
         return {
             "qualification_candidate_sha": self.qualification_candidate_sha,
             "selection_digest": self.selection_pins.selection_digest,
-            "retained_bundle_digest": "sha256:" + hashlib.sha256(self.retained_bundle_bytes).hexdigest(),
+            "retained_bundle_digest": _bytes_digest(self.retained_bundle_bytes),
         }
 
     def validate(self) -> _RetainedEvidence:
@@ -347,11 +462,12 @@ class Phase4QualificationInputs:
             self.selection_pins.validate()
             if self.input_digest != _digest(self._identity_payload()):
                 raise ValueError
-            observed = _parse_retained_bundle(self.retained_bundle_bytes)
-            pins = self.selection_pins
+            observed, pins = _parse_retained_bundle(self.retained_bundle_bytes), self.selection_pins
             if (
-                self.qualification_candidate_sha == observed.evidence.candidate_sha
+                self.qualification_candidate_sha != pins.qualification_candidate_sha
+                or _bytes_digest(self.retained_bundle_bytes) != pins.retained_bundle_digest
                 or observed.lineage_qualification_candidate_sha != self.qualification_candidate_sha
+                or observed.lineage_receipt_digest != pins.lineage_receipt_digest
                 or observed.evidence.candidate_sha != pins.source_candidate_sha
                 or observed.evidence.artifact_digest != pins.package_artifact_digest
                 or observed.evidence.schema != pins.cross_environment_schema
@@ -367,9 +483,10 @@ class Phase4QualificationInputs:
                 or observed.comparison.differences != ()
                 or _digest(observed.comparison.public_payload()) != pins.issue_97_result_digest
                 or observed.cross_environment_receipt_digest != pins.issue_97_receipt_digest
-                or observed.phase_3_decision_digest != pins.phase_3_decision_digest
-                or observed.phase_3_receipt_digest != pins.phase_3_receipt_digest
-                or tuple(item.receipt_digest for item in observed.exit_receipts) != pins.exit_receipt_digests
+                or (observed.phase_3_candidate_sha, observed.phase_3_decision_digest, observed.phase_3_receipt_digest)
+                != (pins.phase_3_candidate_sha, pins.phase_3_decision_digest, pins.phase_3_receipt_digest)
+                or tuple((item.area, item.source_candidate_sha, item.source_evidence_digest, item.expected_source_identity, item.observed_source_identity, item.receipt_digest) for item in observed.exit_receipts)
+                != tuple((item.area, item.source_candidate_sha, item.source_evidence_digest, item.expected_source_identity, item.observed_source_identity, item.receipt_digest) for item in pins.exit_evidence)
             ):
                 raise ValueError
             return observed
@@ -379,56 +496,61 @@ class Phase4QualificationInputs:
 
 @dataclass(frozen=True)
 class Phase4OwnerDecision:
-    """Public-safe owner input; it carries no activation or mutation authority."""
+    """Public-safe owner input reconstructed from sealed qualification inputs."""
 
-    disposition: str
-    qualification_candidate_sha: str
-    retained_evidence_candidate_sha: str
-    package_artifact_digest: str
-    phase_3_receipt_digest: str
-    cross_environment_evidence_digest: str
-    cross_environment_result_digest: str
-    cross_environment_receipt_digest: str
-    sealed_canary_receipt_digest: str
-    historical_ready_at: int
-    exit_evidence: tuple[_RetainedExitReceipt, ...]
-    confidence: EvidenceConfidence
-    residual_risks: tuple[str, ...]
-    input_digest: str
+    qualification_inputs: Phase4QualificationInputs
     schema: str = PHASE_4_QUALIFICATION_SCHEMA
+    disposition: str = field(init=False)
+    qualification_candidate_sha: str = field(init=False)
+    retained_evidence_candidate_sha: str = field(init=False)
+    package_artifact_digest: str = field(init=False)
+    phase_3_receipt_digest: str = field(init=False)
+    cross_environment_evidence_digest: str = field(init=False)
+    cross_environment_result_digest: str = field(init=False)
+    cross_environment_receipt_digest: str = field(init=False)
+    sealed_canary_receipt_digest: str = field(init=False)
+    historical_ready_at: int = field(init=False)
+    exit_evidence: tuple[_RetainedExitReceipt, ...] = field(init=False)
+    confidence: EvidenceConfidence = field(init=False)
+    residual_risks: tuple[str, ...] = field(init=False)
+    phase_5_prerequisites: tuple[str, ...] = field(init=False)
+    input_digest: str = field(init=False)
     decision_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if (
-            self.schema != PHASE_4_QUALIFICATION_SCHEMA
-            or self.disposition not in {PHASE_5_OWNER_DECISION_REQUIRED, PHASE_4_QUALIFICATION_BLOCKED}
-            or any(_SHA.fullmatch(value) is None for value in (self.qualification_candidate_sha, self.retained_evidence_candidate_sha))
-            or self.qualification_candidate_sha == self.retained_evidence_candidate_sha
-            or any(_DIGEST.fullmatch(value) is None for value in (
-                self.package_artifact_digest, self.phase_3_receipt_digest, self.cross_environment_evidence_digest,
-                self.cross_environment_result_digest, self.cross_environment_receipt_digest,
-                self.sealed_canary_receipt_digest, self.input_digest,
-            ))
-            or type(self.historical_ready_at) is not int or self.historical_ready_at < 0
-            or type(self.exit_evidence) is not tuple or tuple(item.area for item in self.exit_evidence) != REQUIRED_EXIT_EVIDENCE
-            or any(type(item) is not _RetainedExitReceipt for item in self.exit_evidence)
-            or type(self.confidence) is not EvidenceConfidence
-            or type(self.residual_risks) is not tuple or any(not is_safe_cross_environment_public_string(item) for item in self.residual_risks)
-        ):
+        if type(self.qualification_inputs) is not Phase4QualificationInputs or self.schema != PHASE_4_QUALIFICATION_SCHEMA:
             raise Phase4QualificationError("Phase 4 owner decision is invalid")
+        observed = self.qualification_inputs.validate()
+        evidence = observed.evidence
+        values: dict[str, object] = {
+            "disposition": PHASE_4_QUALIFICATION_BLOCKED if observed.confidence is not EvidenceConfidence.HIGH or observed.residual_risks else PHASE_5_OWNER_DECISION_REQUIRED,
+            "qualification_candidate_sha": self.qualification_inputs.qualification_candidate_sha,
+            "retained_evidence_candidate_sha": evidence.candidate_sha, "package_artifact_digest": evidence.artifact_digest,
+            "phase_3_receipt_digest": observed.phase_3_receipt_digest, "cross_environment_evidence_digest": evidence.evidence_digest,
+            "cross_environment_result_digest": _digest(observed.comparison.public_payload()),
+            "cross_environment_receipt_digest": observed.cross_environment_receipt_digest,
+            "sealed_canary_receipt_digest": evidence.sealed_canary.receipt_digest,
+            "historical_ready_at": evidence.sealed_canary.ready_at, "exit_evidence": observed.exit_receipts,
+            "confidence": observed.confidence, "residual_risks": observed.residual_risks,
+            "phase_5_prerequisites": _PHASE_5_PREREQUISITES, "input_digest": self.qualification_inputs.input_digest,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
         object.__setattr__(self, "decision_digest", _digest(self.public_payload(include_digest=False)))
 
     def validate(self) -> None:
         try:
-            rebuilt = Phase4OwnerDecision(
-                self.disposition, self.qualification_candidate_sha, self.retained_evidence_candidate_sha,
-                self.package_artifact_digest, self.phase_3_receipt_digest, self.cross_environment_evidence_digest,
-                self.cross_environment_result_digest, self.cross_environment_receipt_digest,
-                self.sealed_canary_receipt_digest, self.historical_ready_at, self.exit_evidence,
-                self.confidence, self.residual_risks, self.input_digest, self.schema,
+            rebuilt = Phase4OwnerDecision(self.qualification_inputs, self.schema)
+            names = (
+                "disposition", "qualification_candidate_sha", "retained_evidence_candidate_sha", "package_artifact_digest",
+                "phase_3_receipt_digest", "cross_environment_evidence_digest", "cross_environment_result_digest",
+                "cross_environment_receipt_digest", "sealed_canary_receipt_digest", "historical_ready_at", "exit_evidence",
+                "confidence", "residual_risks", "phase_5_prerequisites", "input_digest", "decision_digest",
             )
-            if rebuilt.decision_digest != self.decision_digest:
+            if any(getattr(rebuilt, name) != getattr(self, name) for name in names):
                 raise ValueError
+            for receipt in self.exit_evidence:
+                receipt.validate()
         except (AttributeError, TypeError, ValueError, Phase4QualificationError) as error:
             raise Phase4QualificationError("Phase 4 owner decision has drifted") from error
 
@@ -439,8 +561,7 @@ class Phase4OwnerDecision:
             "schema": self.schema, "disposition": self.disposition,
             "qualification_candidate_sha": self.qualification_candidate_sha,
             "retained_evidence_candidate_sha": self.retained_evidence_candidate_sha,
-            "package_artifact_digest": self.package_artifact_digest,
-            "phase_3_receipt_digest": self.phase_3_receipt_digest,
+            "package_artifact_digest": self.package_artifact_digest, "phase_3_receipt_digest": self.phase_3_receipt_digest,
             "cross_environment_evidence_digest": self.cross_environment_evidence_digest,
             "cross_environment_result_digest": self.cross_environment_result_digest,
             "cross_environment_receipt_digest": self.cross_environment_receipt_digest,
@@ -448,7 +569,8 @@ class Phase4OwnerDecision:
             "historical_ready_at": self.historical_ready_at,
             "exit_evidence": [item.public_payload() for item in self.exit_evidence],
             "confidence": self.confidence.value, "residual_risks": list(self.residual_risks),
-            "input_digest": self.input_digest, "authority": "owner-decision-required", "mutation_count": 0,
+            "phase_5_prerequisites": list(self.phase_5_prerequisites),
+            "authority": "owner-decision-required", "mutation_count": 0,
         }
         return value | ({"decision_digest": self.decision_digest} if include_digest else {})
 
@@ -458,14 +580,4 @@ def assess_phase_4_qualification(inputs: Phase4QualificationInputs) -> Phase4Own
 
     if type(inputs) is not Phase4QualificationInputs:
         raise Phase4QualificationError("Phase 4 qualification inputs are invalid")
-    observed = inputs.validate()
-    evidence = observed.evidence
-    blocked = observed.confidence is not EvidenceConfidence.HIGH or bool(observed.residual_risks)
-    return Phase4OwnerDecision(
-        PHASE_4_QUALIFICATION_BLOCKED if blocked else PHASE_5_OWNER_DECISION_REQUIRED,
-        inputs.qualification_candidate_sha, evidence.candidate_sha, evidence.artifact_digest,
-        observed.phase_3_receipt_digest, evidence.evidence_digest, _digest(observed.comparison.public_payload()),
-        observed.cross_environment_receipt_digest, evidence.sealed_canary.receipt_digest,
-        evidence.sealed_canary.ready_at, observed.exit_receipts, observed.confidence,
-        observed.residual_risks, inputs.input_digest,
-    )
+    return Phase4OwnerDecision(inputs)

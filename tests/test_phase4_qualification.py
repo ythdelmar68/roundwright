@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 import hashlib
 import json
@@ -24,7 +25,7 @@ from roundwright.phase4_qualification import (
     ISSUE_97_EVIDENCE_CANDIDATE_SHA, PHASE_3_DECISION_SCHEMA, PHASE_3_QUALIFICATION_PROFILE,
     PHASE_4_CROSS_ENVIRONMENT_RECEIPT_SCHEMA, PHASE_4_EXIT_RECEIPT_SCHEMA,
     PHASE_4_LINEAGE_SCHEMA, PHASE_4_QUALIFICATION_BLOCKED, PHASE_4_RETAINED_EVIDENCE_SCHEMA,
-    PHASE_5_OWNER_DECISION_REQUIRED, ExitEvidenceArea, Phase4ExitEvidencePin,
+    PHASE_5_OWNER_DECISION_REQUIRED, _LINEAGE_PROOF_RSA_N, ExitEvidenceArea, Phase4ExitEvidencePin,
     Phase4OwnerDecision, Phase4QualificationError, Phase4QualificationInputs, Phase4SelectionPins,
     assess_phase_4_qualification,
 )
@@ -221,6 +222,20 @@ class Phase4QualificationTests(unittest.TestCase):
         )
         with self.assertRaises(Phase4QualificationError):
             Phase4QualificationInputs(forged_candidate, forged_pins, forged_bundle_bytes, forged_proof_bytes)
+
+    def test_lineage_signature_requires_one_canonical_in_range_representation(self) -> None:
+        bundle, proof, pins = self.retained_bundle()
+        for mutate in (
+            lambda value: value.update({"issuer_signature": value["issuer_signature"][:-3] + "B=="}),
+            lambda value: value.update({"issuer_signature": base64.b64encode(
+                (int.from_bytes(base64.b64decode(value["issuer_signature"], validate=True), "big") + _LINEAGE_PROOF_RSA_N)
+                .to_bytes(256, "big")
+            ).decode("ascii")}),
+        ):
+            altered = json.loads(proof)
+            mutate(altered)
+            with self.subTest(mutate=mutate), self.assertRaises(Phase4QualificationError):
+                Phase4QualificationInputs(self.qualification_candidate, pins, bundle, encoded(altered))
 
     def test_exit_receipts_require_pinned_area_specific_expected_and_observed_identity(self) -> None:
         bundle, _, pins = self.retained_bundle()

@@ -103,15 +103,20 @@ def _parse_authoritative_lineage_proof(contents: bytes) -> dict[str, str]:
 
 
 def _verify_lineage_issuer_signature(signed: bytes, signature: str) -> bool:
-    """Verify the fixed issuer's RSA-SHA256 attestation without ambient tools."""
+    """Verify the fixed issuer's canonical RSA-SHA256 attestation without ambient tools."""
 
     try:
         value = base64.b64decode(signature, validate=True)
     except (ValueError, TypeError):
         return False
-    if len(value) != 256:
+    representative = int.from_bytes(value, "big")
+    if (
+        len(value) != 256
+        or base64.b64encode(value).decode("ascii") != signature
+        or not 0 <= representative < _LINEAGE_PROOF_RSA_N
+    ):
         return False
-    encoded = pow(int.from_bytes(value, "big"), _LINEAGE_PROOF_RSA_E, _LINEAGE_PROOF_RSA_N).to_bytes(256, "big")
+    encoded = pow(representative, _LINEAGE_PROOF_RSA_E, _LINEAGE_PROOF_RSA_N).to_bytes(256, "big")
     digest_info = _SHA256_DIGEST_INFO + hashlib.sha256(signed).digest()
     padding_length = len(encoded) - len(digest_info) - 3
     return padding_length >= 8 and encoded == b"\x00\x01" + b"\xff" * padding_length + b"\x00" + digest_info

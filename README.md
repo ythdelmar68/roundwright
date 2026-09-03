@@ -198,6 +198,20 @@ No lane may expose private paths, credentials, or raw logs. The repository-hoste
 semantically reads back that closed matrix with zero new provider, target,
 GitHub, or lifecycle actions; it cannot authorize another Canary.
 
+The Phase 4 closing consumer then compares selection-time pins with one exact
+canonical retained #51/#96/#97 byte sequence. It preserves the distinct #98
+qualification candidate and #97 evidence-source candidate through a
+selection-pinned, independently issued authoritative ancestry-proof artifact
+with one canonical, in-range RSA issuer attestation, rather than
+relabeling either generation. Each required exit area likewise carries a
+selection-pinned expected/observed source identity and semantic receipt. Its
+public-safe outcome is either
+`PHASE_5_OWNER_DECISION_REQUIRED` or `PHASE_4_QUALIFICATION_BLOCKED`; both are
+non-mutating. In particular, the result preserves the sealed historical
+`ready_at`, reports digest-only exit evidence, residual risks, and explicit
+Phase 5 prerequisites, and cannot activate Roundwright, retire Roundlet,
+release, or promote anything.
+
 ## Development check
 
 The packaging gate uses the tracked, receipt-bound toolchain described in

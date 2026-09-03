@@ -198,6 +198,14 @@ No lane may expose private paths, credentials, or raw logs. The repository-hoste
 semantically reads back that closed matrix with zero new provider, target,
 GitHub, or lifecycle actions; it cannot authorize another Canary.
 
+The Phase 4 closing consumer then accepts only that exact seven-lane matrix,
+the sealed #96 receipt, a Phase 3 entry-decision digest, and a single package
+artifact identity. Its public-safe outcome is either
+`PHASE_5_OWNER_DECISION_REQUIRED` or `PHASE_4_QUALIFICATION_BLOCKED`; both are
+non-mutating. In particular, the result preserves the sealed historical
+`ready_at`, reports digest-only exit evidence and residual risks, and cannot
+activate Roundwright, retire Roundlet, release, or promote anything.
+
 ## Development check
 
 The packaging gate uses the tracked, receipt-bound toolchain described in

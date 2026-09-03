@@ -198,9 +198,11 @@ No lane may expose private paths, credentials, or raw logs. The repository-hoste
 semantically reads back that closed matrix with zero new provider, target,
 GitHub, or lifecycle actions; it cannot authorize another Canary.
 
-The Phase 4 closing consumer then accepts only that exact seven-lane matrix,
-the sealed #96 receipt, a Phase 3 entry-decision digest, and a single package
-artifact identity. Its public-safe outcome is either
+The Phase 4 closing consumer then compares selection-time pins with
+independently retained #51/#96/#97 bytes. It preserves the distinct #98
+qualification candidate and #97 evidence-source candidate, plus their sealed
+descendant lineage, rather than relabeling either generation. Its public-safe
+outcome is either
 `PHASE_5_OWNER_DECISION_REQUIRED` or `PHASE_4_QUALIFICATION_BLOCKED`; both are
 non-mutating. In particular, the result preserves the sealed historical
 `ready_at`, reports digest-only exit evidence and residual risks, and cannot

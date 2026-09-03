@@ -78,6 +78,13 @@ class ParityDimension(StrEnum):
 
 PARITY_DIMENSIONS = tuple(ParityDimension)
 FORWARD_TEST_REPOSITORY = "ythdelmar68/roundlet-forward-test"
+SEALED_CANARY_SOURCE_CANDIDATE_SHA = "e574bb04101a66baf0a508a99f0baf41a731a054"
+SEALED_CANARY_RECEIPT_DIGEST = "sha256:3f5b2e84c69d0c4cb13695c62bc6e8fb86e80765f89fcc6934272758ea37f051"
+SEALED_CANARY_EXECUTION_LEDGER_DIGEST = "sha256:87856fcfd1b3c91735f5d73396475888e94aae5e3d08f41c581c6671f3c499a8"
+SEALED_CANARY_LIFECYCLE_LEDGER_DIGEST = "sha256:73159c52015b0e2607fa36f5f2925876a1751c48f2fc3787c757d23af0948f62"
+SEALED_CANARY_LIFECYCLE_COMPARISON_DIGEST = "sha256:754b17ea9e901561ae0530494b833119c3e50a71a9a29f645c0c1f9477a490d2"
+SEALED_CANARY_TARGET_MERGE_SHA = "dfd514757f25b88d8182c9d33c87481ce3016a7e"
+SEALED_CANARY_READY_AT = 1788367569
 
 
 class OperationMode(StrEnum):
@@ -102,8 +109,7 @@ class ComparisonResult(StrEnum):
 class SealedCanaryReceipt:
     """Immutable public-safe #96 identity consumed without target mutation."""
 
-    candidate_sha: str
-    artifact_digest: str
+    source_candidate_sha: str
     receipt_digest: str
     execution_ledger_digest: str
     lifecycle_ledger_digest: str
@@ -114,11 +120,10 @@ class SealedCanaryReceipt:
 
     def __post_init__(self) -> None:
         if (
-            _SHA.fullmatch(self.candidate_sha) is None
+            self.source_candidate_sha != SEALED_CANARY_SOURCE_CANDIDATE_SHA
             or any(
                 _DIGEST.fullmatch(value) is None
                 for value in (
-                    self.artifact_digest,
                     self.receipt_digest,
                     self.execution_ledger_digest,
                     self.lifecycle_ledger_digest,
@@ -130,13 +135,27 @@ class SealedCanaryReceipt:
             or _SHA.fullmatch(self.target_merge_sha) is None
             or type(self.ready_at) is not int
             or self.ready_at < 0
+            or (
+                self.receipt_digest,
+                self.execution_ledger_digest,
+                self.lifecycle_ledger_digest,
+                self.lifecycle_comparison_digest,
+                self.target_merge_sha,
+                self.ready_at,
+            ) != (
+                SEALED_CANARY_RECEIPT_DIGEST,
+                SEALED_CANARY_EXECUTION_LEDGER_DIGEST,
+                SEALED_CANARY_LIFECYCLE_LEDGER_DIGEST,
+                SEALED_CANARY_LIFECYCLE_COMPARISON_DIGEST,
+                SEALED_CANARY_TARGET_MERGE_SHA,
+                SEALED_CANARY_READY_AT,
+            )
         ):
             raise CrossEnvironmentEvidenceError("sealed Canary receipt is invalid")
 
     def public_payload(self) -> dict[str, object]:
         return {
-            "candidate_sha": self.candidate_sha,
-            "artifact_digest": self.artifact_digest,
+            "source_candidate_sha": self.source_candidate_sha,
             "receipt_digest": self.receipt_digest,
             "execution_ledger_digest": self.execution_ledger_digest,
             "lifecycle_ledger_digest": self.lifecycle_ledger_digest,
@@ -326,11 +345,7 @@ class CrossEnvironmentEvidence:
             for lane in self.lanes
         ):
             raise CrossEnvironmentEvidenceError("cross-environment lane identity has drifted")
-        if (
-            (self.sealed_canary.candidate_sha, self.sealed_canary.artifact_digest)
-            != (self.candidate_sha, self.artifact_digest)
-            or any(lane.sealed_canary_receipt_digest != self.sealed_canary.receipt_digest for lane in self.lanes)
-        ):
+        if any(lane.sealed_canary_receipt_digest != self.sealed_canary.receipt_digest for lane in self.lanes):
             raise CrossEnvironmentEvidenceError("cross-environment sealed Canary binding has drifted")
         active_lanes = self.lanes[:-1]
         if len({lane.parity_digest for lane in active_lanes}) != 1:
@@ -376,7 +391,7 @@ def _validated_cross_environment_evidence(evidence: object) -> CrossEnvironmentE
     try:
         sealed = evidence.sealed_canary
         sealed = SealedCanaryReceipt(
-            sealed.candidate_sha, sealed.artifact_digest, sealed.receipt_digest,
+            sealed.source_candidate_sha, sealed.receipt_digest,
             sealed.execution_ledger_digest, sealed.lifecycle_ledger_digest,
             sealed.lifecycle_comparison_digest, sealed.target_repository,
             sealed.target_merge_sha, sealed.ready_at,

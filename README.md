@@ -191,8 +191,9 @@ six lanes carry the same normalized doctor, configuration, path, lock, SQLite,
 worktree, cancellation, stale-recovery, CLI, and authority-preflight result.
 Exactly one is authoritative through the immutable Canary receipt; the others
 are read-only or test-only, and the final consumer is read-only. The receipt
-also binds the exact forward-test merge and historical readiness point. No
-lane may expose private paths, credentials, or raw logs. The repository-hosted
+preserves its own #96 source candidate, exact forward-test merge, and
+historical readiness point; it is not relabeled as #97's candidate or package.
+No lane may expose private paths, credentials, or raw logs. The repository-hosted
 `run_cross_environment_canary_profile` V2 entrypoint validates, records, and
 semantically reads back that closed matrix with zero new provider, target,
 GitHub, or lifecycle actions; it cannot authorize another Canary.

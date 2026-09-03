@@ -95,6 +95,13 @@ from roundwright.cross_environment import (
     EnvironmentLane,
     OperationMode,
     ReceiptState,
+    SEALED_CANARY_EXECUTION_LEDGER_DIGEST,
+    SEALED_CANARY_LIFECYCLE_COMPARISON_DIGEST,
+    SEALED_CANARY_LIFECYCLE_LEDGER_DIGEST,
+    SEALED_CANARY_READY_AT,
+    SEALED_CANARY_RECEIPT_DIGEST,
+    SEALED_CANARY_SOURCE_CANDIDATE_SHA,
+    SEALED_CANARY_TARGET_MERGE_SHA,
     SealedCanaryReceipt,
 )
 from roundwright.integrated_boundary import (
@@ -480,7 +487,7 @@ class ExternalValidationTests(unittest.TestCase):
         producer, exporter, comparator = external_validation.cross_environment_canary_component_identities()
         plan: dict[str, object] = {
             "schema": "roundwright-harness-capture-plan/v1", "profile": CROSS_ENVIRONMENT_CANARY_PROFILE,
-            "case_id": "issue-97-cross-environment", "candidate_sha": "c" * 40, "ready_at": 29,
+            "case_id": "issue-97-cross-environment", "candidate_sha": "c" * 40, "ready_at": SEALED_CANARY_READY_AT,
             "producer_identity": producer, "exporter_identity": exporter, "comparator_identity": comparator,
             "recorder_identity": "sha256:" + "7" * 64, "store_identity": "sha256:" + "8" * 64,
             "observation_identity": "sha256:" + "9" * 64,
@@ -490,21 +497,23 @@ class ExternalValidationTests(unittest.TestCase):
             EnvironmentLane(
                 environment, environment.value + "-fixture", OperationMode.READ_ONLY, "c" * 40,
                 "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64,
-                "sha256:" + "4" * 64, producer, ReceiptState.VERIFIED, "sha256:" + "5" * 64,
-                29, ComparisonResult.PASS,
+                "sha256:" + "4" * 64, producer, ReceiptState.VERIFIED, SEALED_CANARY_RECEIPT_DIGEST,
+                SEALED_CANARY_READY_AT, ComparisonResult.PASS,
                 parity_digest=None if environment is EnvironmentKind.SEALED_CANARY_RECEIPT_CONSUMER else "sha256:" + "6" * 64,
-                sealed_canary_receipt_digest="sha256:" + "5" * 64,
+                sealed_canary_receipt_digest=SEALED_CANARY_RECEIPT_DIGEST,
             )
             for environment in CROSS_ENVIRONMENT_LANE_ORDER
         )
         lanes = (replace(lanes[0], mode=OperationMode.AUTHORITATIVE), *lanes[1:])
         sealed = SealedCanaryReceipt(
-            "c" * 40, "sha256:" + "1" * 64, "sha256:" + "5" * 64,
-            "sha256:" + "a" * 64, "sha256:" + "b" * 64, "sha256:" + "d" * 64,
-            "ythdelmar68/roundlet-forward-test", "e" * 40, 29,
+            SEALED_CANARY_SOURCE_CANDIDATE_SHA, SEALED_CANARY_RECEIPT_DIGEST,
+            SEALED_CANARY_EXECUTION_LEDGER_DIGEST, SEALED_CANARY_LIFECYCLE_LEDGER_DIGEST,
+            SEALED_CANARY_LIFECYCLE_COMPARISON_DIGEST,
+            "ythdelmar68/roundlet-forward-test", SEALED_CANARY_TARGET_MERGE_SHA,
+            SEALED_CANARY_READY_AT,
         )
         inputs = external_validation.CrossEnvironmentCanaryInputs(
-            "c" * 40, "issue-97-cross-environment", plan_digest, 29,
+            "c" * 40, "issue-97-cross-environment", plan_digest, SEALED_CANARY_READY_AT,
             CrossEnvironmentEvidence("c" * 40, "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64, "sha256:" + "4" * 64, producer, lanes, sealed),
         )
         return inputs, plan, {
@@ -664,12 +673,12 @@ class ExternalValidationTests(unittest.TestCase):
         adapter = harness.run_calls[-1][0][2]
         prepared = adapter.prepare_execution_context(SimpleNamespace(
             descriptor=request["execution_context"], input_digest=external_validation._digest(request["execution_context"]),
-            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-97-cross-environment", ready_at=29),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-97-cross-environment", ready_at=SEALED_CANARY_READY_AT),
             components=adapter.component_identities,
         ))
         exact = binding(
             profile=CROSS_ENVIRONMENT_CANARY_PROFILE, case_id="issue-97-cross-environment", candidate_sha="c" * 40,
-            ready_at=29, plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
+            ready_at=SEALED_CANARY_READY_AT, plan=SimpleNamespace(plan_digest=external_validation._digest(plan)),
             components=SimpleNamespace(producer_identity=producer, exporter_identity=exporter, comparator_identity=comparator),
             execution_context=prepared, execution_context_input_digest=external_validation._digest(request["execution_context"]),
         )
@@ -701,7 +710,7 @@ class ExternalValidationTests(unittest.TestCase):
         preparation = SimpleNamespace(
             descriptor=frozen,
             input_digest=external_validation._digest(external_validation._canonical_json_materialize(frozen)),
-            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-97-cross-environment", ready_at=29),
+            plan=SimpleNamespace(plan_digest=external_validation._digest(plan), candidate_sha="c" * 40, case_id="issue-97-cross-environment", ready_at=SEALED_CANARY_READY_AT),
             components=adapter.component_identities,
         )
         self.assertEqual(adapter.prepare_execution_context(preparation).value.inputs, inputs)

@@ -4028,7 +4028,7 @@ class Phase3QualificationAdapter:
 
 @dataclass(frozen=True)
 class CrossEnvironmentCanaryInputs:
-    """One exact package, candidate, and six-lane evidence matrix for #95."""
+    """One exact package, candidate, and seven-lane evidence matrix for #97."""
 
     candidate_sha: str
     case_id: str
@@ -4051,6 +4051,7 @@ class CrossEnvironmentCanaryInputs:
             or type(self.evidence) is not CrossEnvironmentEvidence
             or self.evidence.candidate_sha != self.candidate_sha
             or self.evidence.producer_identity != CROSS_ENVIRONMENT_CANARY_PRODUCER_IDENTITY
+            or self.evidence.sealed_canary.ready_at != self.ready_at
         ):
             raise ExternalValidationAdapterError("cross-environment qualification inputs are invalid")
         try:
@@ -4068,10 +4069,12 @@ class CrossEnvironmentCanaryInputs:
                         lane.candidate_sha, lane.artifact_digest, lane.policy_digest,
                         lane.profile_digest, lane.schema_digest, lane.producer_identity,
                         lane.receipt_state, lane.receipt_digest, lane.observed_at,
-                        lane.result, lane.reason,
+                        lane.result, lane.reason, lane.parity_dimensions,
+                        lane.parity_digest, lane.sealed_canary_receipt_digest,
                     )
                     for lane in self.evidence.lanes
                 ),
+                self.evidence.sealed_canary,
                 self.evidence.schema,
             )
         except (AttributeError, TypeError, CrossEnvironmentEvidenceError) as error:
@@ -4524,10 +4527,11 @@ def run_cross_environment_canary_profile(
     *,
     expected_readiness_digest: str | None = None,
 ) -> object:
-    """Run #95 only through the reviewed Harness V2 executor and this adapter.
+    """Run #97 only through the reviewed Harness V2 executor and this adapter.
 
-    The input is a deterministic, public-safe synthetic matrix.  It grants no
-    provider, target, GitHub, or filesystem mutation capability.
+    The input is a deterministic, public-safe comparison matrix that consumes
+    an already sealed Canary. It grants no provider, target, GitHub, or
+    filesystem mutation capability.
     """
 
     harness = _harness_executor()

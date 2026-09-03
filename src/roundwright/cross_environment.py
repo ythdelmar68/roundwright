@@ -22,6 +22,7 @@ CROSS_ENVIRONMENT_RESULT_SCHEMA = "roundwright-cross-environment-result/v1"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
 _CREDENTIAL_SHAPES = (
     "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-",
 )
@@ -32,12 +33,51 @@ class CrossEnvironmentEvidenceError(ValueError):
 
 
 class EnvironmentKind(StrEnum):
-    NATIVE_WINDOWS = "native-windows"
-    NATIVE_MACOS = "native-macos"
-    NATIVE_LINUX = "native-linux"
-    CI = "ci"
-    DOCKER = "docker"
-    DEV_CONTAINER = "dev-container"
+    WINDOWS_HOST_PARITY = "windows-host-parity"
+    LINUX_HOST_PARITY = "linux-host-parity"
+    MACOS_HOST_PARITY = "macos-host-parity"
+    CI_PARITY = "ci-parity"
+    DOCKER_PARITY = "docker-parity"
+    DEVCONTAINER_PARITY = "devcontainer-parity"
+    SEALED_CANARY_RECEIPT_CONSUMER = "sealed-canary-receipt-consumer"
+
+    # Compatibility aliases for the pre-#97 six-lane synthetic contract.
+    NATIVE_WINDOWS = WINDOWS_HOST_PARITY
+    NATIVE_LINUX = LINUX_HOST_PARITY
+    NATIVE_MACOS = MACOS_HOST_PARITY
+    CI = CI_PARITY
+    DOCKER = DOCKER_PARITY
+    DEV_CONTAINER = DEVCONTAINER_PARITY
+
+
+CROSS_ENVIRONMENT_LANE_ORDER = (
+    EnvironmentKind.WINDOWS_HOST_PARITY,
+    EnvironmentKind.LINUX_HOST_PARITY,
+    EnvironmentKind.MACOS_HOST_PARITY,
+    EnvironmentKind.CI_PARITY,
+    EnvironmentKind.DOCKER_PARITY,
+    EnvironmentKind.DEVCONTAINER_PARITY,
+    EnvironmentKind.SEALED_CANARY_RECEIPT_CONSUMER,
+)
+
+
+class ParityDimension(StrEnum):
+    """The normalized runtime observations every executable lane must cover."""
+
+    DOCTOR = "doctor"
+    CONFIGURATION = "configuration"
+    PATH = "path"
+    LOCK = "lock"
+    SQLITE = "sqlite"
+    WORKTREE = "worktree"
+    CANCELLATION = "cancellation"
+    STALE_RECOVERY = "stale-recovery"
+    CLI = "cli"
+    AUTHORITY_PREFLIGHT = "authority-preflight"
+
+
+PARITY_DIMENSIONS = tuple(ParityDimension)
+FORWARD_TEST_REPOSITORY = "ythdelmar68/roundlet-forward-test"
 
 
 class OperationMode(StrEnum):
@@ -56,6 +96,55 @@ class ComparisonResult(StrEnum):
     PASS = "pass"
     BLOCKED = "blocked"
     REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class SealedCanaryReceipt:
+    """Immutable public-safe #96 identity consumed without target mutation."""
+
+    candidate_sha: str
+    artifact_digest: str
+    receipt_digest: str
+    execution_ledger_digest: str
+    lifecycle_ledger_digest: str
+    lifecycle_comparison_digest: str
+    target_repository: str
+    target_merge_sha: str
+    ready_at: int
+
+    def __post_init__(self) -> None:
+        if (
+            _SHA.fullmatch(self.candidate_sha) is None
+            or any(
+                _DIGEST.fullmatch(value) is None
+                for value in (
+                    self.artifact_digest,
+                    self.receipt_digest,
+                    self.execution_ledger_digest,
+                    self.lifecycle_ledger_digest,
+                    self.lifecycle_comparison_digest,
+                )
+            )
+            or self.target_repository != FORWARD_TEST_REPOSITORY
+            or _REPOSITORY.fullmatch(self.target_repository) is None
+            or _SHA.fullmatch(self.target_merge_sha) is None
+            or type(self.ready_at) is not int
+            or self.ready_at < 0
+        ):
+            raise CrossEnvironmentEvidenceError("sealed Canary receipt is invalid")
+
+    def public_payload(self) -> dict[str, object]:
+        return {
+            "candidate_sha": self.candidate_sha,
+            "artifact_digest": self.artifact_digest,
+            "receipt_digest": self.receipt_digest,
+            "execution_ledger_digest": self.execution_ledger_digest,
+            "lifecycle_ledger_digest": self.lifecycle_ledger_digest,
+            "lifecycle_comparison_digest": self.lifecycle_comparison_digest,
+            "target_repository": self.target_repository,
+            "target_merge_sha": self.target_merge_sha,
+            "ready_at": self.ready_at,
+        }
 
 
 def _digest(value: object) -> str:
@@ -98,6 +187,9 @@ class EnvironmentLane:
     observed_at: int
     result: ComparisonResult
     reason: str | None = None
+    parity_dimensions: tuple[ParityDimension, ...] = PARITY_DIMENSIONS
+    parity_digest: str | None = None
+    sealed_canary_receipt_digest: str | None = None
 
     def __post_init__(self) -> None:
         fields = (
@@ -120,6 +212,11 @@ class EnvironmentLane:
             or self.observed_at < 0
             or type(self.result) is not ComparisonResult
             or self.reason is not None and not _safe_token(self.reason)
+            or type(self.parity_dimensions) is not tuple
+            or any(type(dimension) is not ParityDimension for dimension in self.parity_dimensions)
+            or self.parity_dimensions != PARITY_DIMENSIONS
+            or self.parity_digest is not None and _DIGEST.fullmatch(self.parity_digest) is None
+            or self.sealed_canary_receipt_digest is not None and _DIGEST.fullmatch(self.sealed_canary_receipt_digest) is None
         ):
             raise CrossEnvironmentEvidenceError("cross-environment lane is invalid")
         if (self.receipt_state is ReceiptState.VERIFIED) != (self.receipt_digest is not None):
@@ -130,6 +227,11 @@ class EnvironmentLane:
             raise CrossEnvironmentEvidenceError("passing lane receipt is invalid")
         if self.result is not ComparisonResult.PASS and self.reason is None:
             raise CrossEnvironmentEvidenceError("blocked or rejected lane needs a bounded reason")
+        if self.environment is EnvironmentKind.SEALED_CANARY_RECEIPT_CONSUMER:
+            if self.mode is not OperationMode.READ_ONLY or self.parity_digest is not None:
+                raise CrossEnvironmentEvidenceError("sealed Canary consumer mode is invalid")
+        elif self.parity_digest is None:
+            raise CrossEnvironmentEvidenceError("environment lane parity is missing")
 
     def public_payload(self) -> dict[str, object]:
         return _environment_lane_public_payload(_validated_environment_lane(self))
@@ -153,6 +255,9 @@ def _environment_lane_public_payload(lane: EnvironmentLane) -> dict[str, object]
         "observed_at": lane.observed_at,
         "result": lane.result.value,
         "reason": lane.reason,
+        "parity_dimensions": [dimension.value for dimension in lane.parity_dimensions],
+        "parity_digest": lane.parity_digest,
+        "sealed_canary_receipt_digest": lane.sealed_canary_receipt_digest,
     }
 
 
@@ -167,6 +272,7 @@ def _validated_environment_lane(lane: object) -> EnvironmentLane:
             lane.artifact_digest, lane.policy_digest, lane.profile_digest,
             lane.schema_digest, lane.producer_identity, lane.receipt_state,
             lane.receipt_digest, lane.observed_at, lane.result, lane.reason,
+            lane.parity_dimensions, lane.parity_digest, lane.sealed_canary_receipt_digest,
         )
     except (AttributeError, TypeError) as error:
         raise CrossEnvironmentEvidenceError("cross-environment lane is invalid") from error
@@ -174,7 +280,7 @@ def _validated_environment_lane(lane: object) -> EnvironmentLane:
 
 @dataclass(frozen=True)
 class CrossEnvironmentEvidence:
-    """The closed six-lane qualification input consumed by the V2 adapter."""
+    """The closed seven-lane qualification input consumed by the V2 adapter."""
 
     candidate_sha: str
     artifact_digest: str
@@ -183,6 +289,7 @@ class CrossEnvironmentEvidence:
     schema_digest: str
     producer_identity: str
     lanes: tuple[EnvironmentLane, ...]
+    sealed_canary: SealedCanaryReceipt
     schema: str = CROSS_ENVIRONMENT_EVIDENCE_SCHEMA
 
     def __post_init__(self) -> None:
@@ -198,14 +305,15 @@ class CrossEnvironmentEvidence:
             or _SHA.fullmatch(self.candidate_sha) is None
             or any(_DIGEST.fullmatch(value) is None for value in digests)
             or type(self.lanes) is not tuple
-            or len(self.lanes) != len(EnvironmentKind)
+            or len(self.lanes) != len(CROSS_ENVIRONMENT_LANE_ORDER)
             or any(type(lane) is not EnvironmentLane for lane in self.lanes)
+            or type(self.sealed_canary) is not SealedCanaryReceipt
         ):
             raise CrossEnvironmentEvidenceError("cross-environment evidence is invalid")
-        if {lane.environment for lane in self.lanes} != set(EnvironmentKind):
+        if tuple(lane.environment for lane in self.lanes) != CROSS_ENVIRONMENT_LANE_ORDER:
             raise CrossEnvironmentEvidenceError("cross-environment lanes are missing or duplicate")
-        if sum(lane.mode is OperationMode.AUTHORITATIVE for lane in self.lanes) > 1:
-            raise CrossEnvironmentEvidenceError("cross-environment authority is duplicate")
+        if sum(lane.mode is OperationMode.AUTHORITATIVE for lane in self.lanes) != 1:
+            raise CrossEnvironmentEvidenceError("cross-environment authority is not singular")
         if any(
             (
                 lane.candidate_sha,
@@ -218,8 +326,18 @@ class CrossEnvironmentEvidence:
             for lane in self.lanes
         ):
             raise CrossEnvironmentEvidenceError("cross-environment lane identity has drifted")
-        if tuple(lane.environment.value for lane in self.lanes) != tuple(sorted(lane.environment.value for lane in self.lanes)):
-            raise CrossEnvironmentEvidenceError("cross-environment lanes are not canonically ordered")
+        if (
+            (self.sealed_canary.candidate_sha, self.sealed_canary.artifact_digest)
+            != (self.candidate_sha, self.artifact_digest)
+            or any(lane.sealed_canary_receipt_digest != self.sealed_canary.receipt_digest for lane in self.lanes)
+        ):
+            raise CrossEnvironmentEvidenceError("cross-environment sealed Canary binding has drifted")
+        active_lanes = self.lanes[:-1]
+        if len({lane.parity_digest for lane in active_lanes}) != 1:
+            raise CrossEnvironmentEvidenceError("cross-environment parity results differ")
+        authoritative = next(lane for lane in active_lanes if lane.mode is OperationMode.AUTHORITATIVE)
+        if authoritative.receipt_digest != self.sealed_canary.receipt_digest:
+            raise CrossEnvironmentEvidenceError("authoritative lane is not bound to the sealed Canary")
 
     @property
     def evidence_digest(self) -> str:
@@ -245,6 +363,7 @@ class CrossEnvironmentEvidence:
             "schema_digest": evidence.schema_digest,
             "producer_identity": evidence.producer_identity,
             "lanes": [_environment_lane_public_payload(lane) for lane in evidence.lanes],
+            "sealed_canary": evidence.sealed_canary.public_payload(),
             "result": evidence.result.value,
         }
 
@@ -255,10 +374,17 @@ def _validated_cross_environment_evidence(evidence: object) -> CrossEnvironmentE
     if type(evidence) is not CrossEnvironmentEvidence or type(evidence.lanes) is not tuple:
         raise CrossEnvironmentEvidenceError("cross-environment evidence is invalid")
     try:
+        sealed = evidence.sealed_canary
+        sealed = SealedCanaryReceipt(
+            sealed.candidate_sha, sealed.artifact_digest, sealed.receipt_digest,
+            sealed.execution_ledger_digest, sealed.lifecycle_ledger_digest,
+            sealed.lifecycle_comparison_digest, sealed.target_repository,
+            sealed.target_merge_sha, sealed.ready_at,
+        )
         return CrossEnvironmentEvidence(
             evidence.candidate_sha, evidence.artifact_digest, evidence.policy_digest,
             evidence.profile_digest, evidence.schema_digest, evidence.producer_identity,
-            tuple(_validated_environment_lane(lane) for lane in evidence.lanes), evidence.schema,
+            tuple(_validated_environment_lane(lane) for lane in evidence.lanes), sealed, evidence.schema,
         )
     except (AttributeError, TypeError) as error:
         raise CrossEnvironmentEvidenceError("cross-environment evidence is invalid") from error

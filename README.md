@@ -185,13 +185,17 @@ no Canary action, activation, authority transition, or Roundlet retirement.
 
 Phase 4 starts with the deterministic
 `roundwright-shadow-profile/cross-environment-canary/v1` qualification profile.
-It binds one exact candidate and package artifact to native Windows, macOS, and
-Linux, CI, Docker, and Dev Container lanes. Every lane declares an explicit
-authoritative, read-only, or test-only mode, a bounded receipt state, and no
-paths, credentials, or raw logs. The repository-hosted
+It binds one exact candidate and package artifact to ordered Windows, Linux,
+macOS, CI, Docker, Dev Container, and sealed-Canary-consumer lanes. The first
+six lanes carry the same normalized doctor, configuration, path, lock, SQLite,
+worktree, cancellation, stale-recovery, CLI, and authority-preflight result.
+Exactly one is authoritative through the immutable Canary receipt; the others
+are read-only or test-only, and the final consumer is read-only. The receipt
+also binds the exact forward-test merge and historical readiness point. No
+lane may expose private paths, credentials, or raw logs. The repository-hosted
 `run_cross_environment_canary_profile` V2 entrypoint validates, records, and
-semantically reads back that closed matrix with zero provider, target, GitHub,
-or lifecycle actions; it is not live Canary evidence and cannot authorize one.
+semantically reads back that closed matrix with zero new provider, target,
+GitHub, or lifecycle actions; it cannot authorize another Canary.
 
 ## Development check
 

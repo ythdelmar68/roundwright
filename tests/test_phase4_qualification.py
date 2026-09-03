@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
-import subprocess
 import sys
 import unittest
 
@@ -26,7 +26,7 @@ from roundwright.phase4_qualification import (
     PHASE_4_LINEAGE_SCHEMA, PHASE_4_QUALIFICATION_BLOCKED, PHASE_4_RETAINED_EVIDENCE_SCHEMA,
     PHASE_5_OWNER_DECISION_REQUIRED, ExitEvidenceArea, Phase4ExitEvidencePin,
     Phase4OwnerDecision, Phase4QualificationError, Phase4QualificationInputs, Phase4SelectionPins,
-    _observed_ancestry_digest, assess_phase_4_qualification,
+    assess_phase_4_qualification,
 )
 
 
@@ -47,7 +47,7 @@ def byte_digest(value: bytes) -> str:
 
 
 class Phase4QualificationTests(unittest.TestCase):
-    qualification_candidate = subprocess.check_output(("git", "rev-parse", "HEAD"), text=True).strip()
+    qualification_candidate = "b" * 40
 
     def evidence(self) -> CrossEnvironmentEvidence:
         lanes = tuple(
@@ -70,7 +70,7 @@ class Phase4QualificationTests(unittest.TestCase):
             ),
         )
 
-    def retained_bundle(self, *, confidence: str = "high", risks: list[str] | None = None) -> tuple[bytes, Phase4SelectionPins]:
+    def retained_bundle(self, *, confidence: str = "high", risks: list[str] | None = None) -> tuple[bytes, bytes, Phase4SelectionPins]:
         evidence = self.evidence()
         comparison = compare_cross_environment_evidence(evidence, evidence)
         phase_core = {
@@ -84,13 +84,22 @@ class Phase4QualificationTests(unittest.TestCase):
             "evidence_digest": evidence.evidence_digest, "result_digest": canonical(comparison.public_payload()),
         }
         cross = cross_core | {"receipt_digest": canonical(cross_core)}
+        proof_core = {
+            "schema": "roundwright-phase-4-authoritative-lineage-proof/v1",
+            "issuer_identity": "roundwright-authoritative-git-object-db/v1",
+            "repository_identity": "ythdelmar68/roundwright", "object_database_identity": digest("a"),
+            "source_candidate_sha": evidence.candidate_sha, "qualification_candidate_sha": self.qualification_candidate,
+            "relation": "ancestor", "semantic_result": "verified",
+        }
+        proof = proof_core | {"proof_digest": canonical(proof_core)}
+        proof_bytes = encoded(proof)
         lineage_core = {
             "schema": PHASE_4_LINEAGE_SCHEMA, "source_candidate_sha": evidence.candidate_sha,
             "qualification_candidate_sha": self.qualification_candidate, "relation": "ancestor",
             "observed_source_candidate_sha": evidence.candidate_sha,
             "observed_qualification_candidate_sha": self.qualification_candidate,
             "observed_relation": "ancestor", "semantic_result": "verified",
-            "authoritative_readback_digest": _observed_ancestry_digest(evidence.candidate_sha, self.qualification_candidate),
+            "authoritative_proof_digest": proof["proof_digest"],
         }
         lineage = lineage_core | {"receipt_digest": canonical(lineage_core)}
         exits = []
@@ -119,19 +128,19 @@ class Phase4QualificationTests(unittest.TestCase):
             evidence.evidence_digest, canonical(comparison.public_payload()), cross["receipt_digest"], evidence.profile_digest,
             evidence.schema_digest, evidence.candidate_sha, CROSS_ENVIRONMENT_CANARY_PROFILE, evidence.schema,
             evidence.sealed_canary.ready_at, byte_digest(bundle), lineage["receipt_digest"],
-            lineage["authoritative_readback_digest"],
+            proof["proof_digest"],
             tuple(Phase4ExitEvidencePin(
                 area, evidence.candidate_sha, evidence.evidence_digest, item["expected_source_identity"],
                 item["observed_source_identity"], item["receipt_digest"],
             ) for area, item in zip(ExitEvidenceArea, exits, strict=True)),
         )
-        return bundle, pins
+        return bundle, proof_bytes, pins
 
     def inputs(self, **changes: object) -> Phase4QualificationInputs:
-        bundle, pins = self.retained_bundle()
+        bundle, proof, pins = self.retained_bundle()
         values: dict[str, object] = {
             "qualification_candidate_sha": self.qualification_candidate,
-            "selection_pins": pins, "retained_bundle_bytes": bundle,
+            "selection_pins": pins, "retained_bundle_bytes": bundle, "authoritative_lineage_proof_bytes": proof,
         }
         values.update(changes)
         return Phase4QualificationInputs(**values)  # type: ignore[arg-type]
@@ -150,7 +159,7 @@ class Phase4QualificationTests(unittest.TestCase):
         ])
 
     def test_selection_pins_exact_canonical_bytes_and_rejects_nested_shape_drift(self) -> None:
-        bundle, pins = self.retained_bundle()
+        bundle, _, pins = self.retained_bundle()
         with self.assertRaises(Phase4QualificationError):
             self.inputs(retained_bundle_bytes=bundle + b"\n", selection_pins=self.repin(pins, bundle + b"\n"))
         for mutate in (
@@ -165,21 +174,31 @@ class Phase4QualificationTests(unittest.TestCase):
                 self.inputs(retained_bundle_bytes=changed, selection_pins=self.repin(pins, changed))
 
     def test_selection_pins_exact_ancestry_read_back_and_non_descendant_blocks(self) -> None:
-        bundle, pins = self.retained_bundle()
+        bundle, proof, pins = self.retained_bundle()
         altered = json.loads(bundle)
         lineage = altered["lineage"]
-        lineage["qualification_candidate_sha"] = "0" * 40
-        lineage["observed_qualification_candidate_sha"] = "0" * 40
-        lineage["authoritative_readback_digest"] = digest("0")
+        lineage["qualification_candidate_sha"] = SEALED_CANARY_SOURCE_CANDIDATE_SHA
+        lineage["observed_qualification_candidate_sha"] = SEALED_CANARY_SOURCE_CANDIDATE_SHA
+        altered_proof = json.loads(proof)
+        altered_proof["qualification_candidate_sha"] = SEALED_CANARY_SOURCE_CANDIDATE_SHA
+        altered_proof["relation"] = "not-ancestor"
+        altered_proof["proof_digest"] = canonical({key: value for key, value in altered_proof.items() if key != "proof_digest"})
+        changed_proof = encoded(altered_proof)
+        lineage["authoritative_proof_digest"] = altered_proof["proof_digest"]
         lineage["receipt_digest"] = canonical({key: value for key, value in lineage.items() if key != "receipt_digest"})
         changed = encoded(altered)
+        altered_pins = replace(
+            pins, qualification_candidate_sha=SEALED_CANARY_SOURCE_CANDIDATE_SHA,
+            retained_bundle_digest=byte_digest(changed), lineage_receipt_digest=lineage["receipt_digest"],
+            lineage_proof_digest=altered_proof["proof_digest"],
+        )
         with self.assertRaises(Phase4QualificationError):
-            self.inputs(retained_bundle_bytes=changed, selection_pins=self.repin(pins, changed))
+            Phase4QualificationInputs(SEALED_CANARY_SOURCE_CANDIDATE_SHA, altered_pins, changed, changed_proof)
         with self.assertRaises(Phase4QualificationError):
             self.inputs(qualification_candidate_sha="0" * 40)
 
     def test_exit_receipts_require_pinned_area_specific_expected_and_observed_identity(self) -> None:
-        bundle, pins = self.retained_bundle()
+        bundle, _, pins = self.retained_bundle()
         for mutate in (
             lambda value: value["exit_evidence"][0].update({"observed_source_identity": digest("f")}),
             lambda value: value["exit_evidence"].__setitem__(1, dict(value["exit_evidence"][0])),
@@ -193,8 +212,8 @@ class Phase4QualificationTests(unittest.TestCase):
                 self.inputs(retained_bundle_bytes=changed, selection_pins=self.repin(pins, changed))
 
     def test_owner_decision_is_reconstructed_and_low_confidence_cannot_be_ready(self) -> None:
-        low_bundle, low_pins = self.retained_bundle(confidence="low", risks=["retention-review-needed"])
-        low = Phase4QualificationInputs(self.qualification_candidate, low_pins, low_bundle)
+        low_bundle, low_proof, low_pins = self.retained_bundle(confidence="low", risks=["retention-review-needed"])
+        low = Phase4QualificationInputs(self.qualification_candidate, low_pins, low_bundle, low_proof)
         decision = Phase4OwnerDecision(low)
         self.assertEqual(decision.public_payload()["disposition"], PHASE_4_QUALIFICATION_BLOCKED)
         self.assertEqual(replace(decision, qualification_inputs=low).public_payload()["disposition"], PHASE_4_QUALIFICATION_BLOCKED)
@@ -210,6 +229,21 @@ class Phase4QualificationTests(unittest.TestCase):
         object.__setattr__(rebuilt.qualification_inputs, "retained_bundle_bytes", self.retained_bundle(confidence="low")[0])
         with self.assertRaises(Phase4QualificationError):
             rebuilt.public_payload()
+
+    def test_authoritative_proof_needs_no_ambient_history_or_path(self) -> None:
+        bundle, proof, pins = self.retained_bundle()
+        previous = os.environ.get("PATH")
+        try:
+            os.environ["PATH"] = ""
+            self.assertEqual(
+                assess_phase_4_qualification(Phase4QualificationInputs(self.qualification_candidate, pins, bundle, proof)).disposition,
+                PHASE_5_OWNER_DECISION_REQUIRED,
+            )
+        finally:
+            if previous is None:
+                del os.environ["PATH"]
+            else:
+                os.environ["PATH"] = previous
 
 
 if __name__ == "__main__":

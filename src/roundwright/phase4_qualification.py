@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -24,7 +23,9 @@ PHASE_4_CROSS_ENVIRONMENT_RECEIPT_SCHEMA = "roundwright-phase-4-cross-environmen
 PHASE_3_DECISION_SCHEMA = "roundwright-phase-3-qualification-decision/v1"
 PHASE_3_QUALIFICATION_PROFILE = "roundwright-shadow-profile/phase-3-qualification/v1"
 PHASE_4_LINEAGE_SCHEMA = "roundwright-phase-4-candidate-lineage/v1"
-PHASE_4_LINEAGE_READBACK_SCHEMA = "roundwright-phase-4-local-git-ancestry-readback/v1"
+PHASE_4_LINEAGE_PROOF_SCHEMA = "roundwright-phase-4-authoritative-lineage-proof/v1"
+_LINEAGE_PROOF_ISSUER = "roundwright-authoritative-git-object-db/v1"
+_LINEAGE_PROOF_REPOSITORY = "ythdelmar68/roundwright"
 ISSUE_97_EVIDENCE_CANDIDATE_SHA = "fe1da4ffa4ee29df21aa62cc5a995fb4075e075d"
 PHASE_5_OWNER_DECISION_REQUIRED = "PHASE_5_OWNER_DECISION_REQUIRED"
 PHASE_4_QUALIFICATION_BLOCKED = "PHASE_4_QUALIFICATION_BLOCKED"
@@ -51,26 +52,38 @@ def _bytes_digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def _observed_ancestry_digest(source_candidate_sha: str, qualification_candidate_sha: str) -> str:
-    """Return an authoritative local Git ancestry observation or fail closed."""
+def _parse_authoritative_lineage_proof(contents: bytes) -> dict[str, str]:
+    """Parse a separately issued immutable ancestry proof without local Git access."""
 
-    if _SHA.fullmatch(source_candidate_sha) is None or _SHA.fullmatch(qualification_candidate_sha) is None:
-        raise Phase4QualificationError("Phase 4 ancestry identity is invalid")
     try:
-        result = subprocess.run(
-            ("git", "merge-base", "--is-ancestor", source_candidate_sha, qualification_candidate_sha),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True,
-        )
-    except OSError as error:
-        raise Phase4QualificationError("Phase 4 Git ancestry read-back is unavailable") from error
-    if result.returncode != 0:
-        raise Phase4QualificationError("Phase 4 Git ancestry read-back is not an ancestor")
-    return _digest({
-        "schema": PHASE_4_LINEAGE_READBACK_SCHEMA,
-        "source_candidate_sha": source_candidate_sha,
-        "qualification_candidate_sha": qualification_candidate_sha,
-        "relation": "ancestor",
-    })
+        if type(contents) is not bytes:
+            raise ValueError
+        proof = json.loads(contents, object_pairs_hook=_no_duplicate_object)
+        if contents != _canonical_bytes(proof):
+            raise ValueError
+        proof = _require_keys(proof, {
+            "schema", "issuer_identity", "repository_identity", "object_database_identity",
+            "source_candidate_sha", "qualification_candidate_sha", "relation", "semantic_result", "proof_digest",
+        }, "authoritative lineage proof")
+        core = {key: value for key, value in proof.items() if key != "proof_digest"}
+        if (
+            any(type(value) is not str for value in proof.values())
+            or proof["schema"] != PHASE_4_LINEAGE_PROOF_SCHEMA
+            or proof["issuer_identity"] != _LINEAGE_PROOF_ISSUER
+            or proof["repository_identity"] != _LINEAGE_PROOF_REPOSITORY
+            or _DIGEST.fullmatch(proof["object_database_identity"]) is None
+            or _SHA.fullmatch(proof["source_candidate_sha"]) is None
+            or _SHA.fullmatch(proof["qualification_candidate_sha"]) is None
+            or proof["source_candidate_sha"] == proof["qualification_candidate_sha"]
+            or proof["relation"] != "ancestor" or proof["semantic_result"] != "verified"
+            or proof["proof_digest"] != _digest(core)
+        ):
+            raise ValueError
+        return proof  # type: ignore[return-value]
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError, Phase4QualificationError) as error:
+        if isinstance(error, Phase4QualificationError):
+            raise
+        raise Phase4QualificationError("authoritative lineage proof is invalid") from error
 
 
 def _no_duplicate_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -159,7 +172,7 @@ class Phase4SelectionPins:
     historical_ready_at: int
     retained_bundle_digest: str
     lineage_receipt_digest: str
-    lineage_readback_digest: str
+    lineage_proof_digest: str
     exit_evidence: tuple[Phase4ExitEvidencePin, ...]
     selection_digest: str = field(init=False)
 
@@ -176,7 +189,7 @@ class Phase4SelectionPins:
                 self.package_artifact_digest, self.phase_3_decision_digest, self.phase_3_receipt_digest,
                 self.issue_97_evidence_digest, self.issue_97_result_digest, self.issue_97_receipt_digest,
                 self.issue_97_profile_digest, self.issue_97_schema_digest, self.retained_bundle_digest,
-                self.lineage_receipt_digest, self.lineage_readback_digest,
+                self.lineage_receipt_digest, self.lineage_proof_digest,
             )) or type(self.exit_evidence) is not tuple
             or tuple(item.area for item in self.exit_evidence) != REQUIRED_EXIT_EVIDENCE
             or any(type(item) is not Phase4ExitEvidencePin for item in self.exit_evidence)
@@ -194,7 +207,7 @@ class Phase4SelectionPins:
                 self.issue_97_result_digest, self.issue_97_receipt_digest, self.issue_97_profile_digest,
                 self.issue_97_schema_digest, self.source_candidate_sha, self.cross_environment_profile,
                 self.cross_environment_schema, self.historical_ready_at, self.retained_bundle_digest,
-                self.lineage_receipt_digest, self.lineage_readback_digest, self.exit_evidence,
+                self.lineage_receipt_digest, self.lineage_proof_digest, self.exit_evidence,
             )
             if rebuilt.selection_digest != self.selection_digest:
                 raise ValueError
@@ -221,7 +234,7 @@ class Phase4SelectionPins:
             "historical_ready_at": self.historical_ready_at,
             "retained_bundle_digest": self.retained_bundle_digest,
             "lineage_receipt_digest": self.lineage_receipt_digest,
-            "lineage_readback_digest": self.lineage_readback_digest,
+            "lineage_proof_digest": self.lineage_proof_digest,
             "exit_evidence": [item.public_payload() for item in self.exit_evidence],
         }
         return value | ({"selection_digest": self.selection_digest} if include_digest else {})
@@ -273,7 +286,7 @@ class _RetainedEvidence:
     phase_3_receipt_digest: str
     lineage_qualification_candidate_sha: str
     lineage_receipt_digest: str
-    lineage_readback_digest: str
+    lineage_proof_digest: str
     evidence: CrossEnvironmentEvidence
     comparison: CrossEnvironmentComparison
     cross_environment_receipt_digest: str
@@ -398,7 +411,7 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
         lineage = _require_keys(payload["lineage"], {
             "schema", "source_candidate_sha", "qualification_candidate_sha", "relation",
             "observed_source_candidate_sha", "observed_qualification_candidate_sha", "observed_relation",
-            "semantic_result", "authoritative_readback_digest", "receipt_digest",
+            "semantic_result", "authoritative_proof_digest", "receipt_digest",
         }, "retained candidate lineage")
         lineage_core = {key: value for key, value in lineage.items() if key != "receipt_digest"}
         if (
@@ -408,10 +421,8 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
             or (lineage["observed_source_candidate_sha"], lineage["observed_qualification_candidate_sha"], lineage["observed_relation"])
             != (lineage["source_candidate_sha"], lineage["qualification_candidate_sha"], "ancestor")
             or lineage["semantic_result"] != "verified"
-            or type(lineage["authoritative_readback_digest"]) is not str
-            or lineage["authoritative_readback_digest"] != _observed_ancestry_digest(
-                lineage["source_candidate_sha"], lineage["qualification_candidate_sha"],
-            )
+            or type(lineage["authoritative_proof_digest"]) is not str
+            or _DIGEST.fullmatch(lineage["authoritative_proof_digest"]) is None
             or lineage["receipt_digest"] != _digest(lineage_core)
         ):
             raise ValueError
@@ -460,7 +471,7 @@ def _parse_retained_bundle(contents: bytes) -> _RetainedEvidence:
             raise ValueError
         return _RetainedEvidence(
             phase_3["candidate_sha"], phase_3["decision_digest"], phase_3["receipt_digest"],
-            lineage["qualification_candidate_sha"], lineage["receipt_digest"], lineage["authoritative_readback_digest"], evidence, comparison,
+            lineage["qualification_candidate_sha"], lineage["receipt_digest"], lineage["authoritative_proof_digest"], evidence, comparison,
             receipt["receipt_digest"], tuple(exits), confidence, risks,
         )
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError, CrossEnvironmentEvidenceError, Phase4QualificationError) as error:
@@ -474,10 +485,11 @@ class Phase4QualificationInputs:
     qualification_candidate_sha: str
     selection_pins: Phase4SelectionPins
     retained_bundle_bytes: bytes
+    authoritative_lineage_proof_bytes: bytes
     input_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if _SHA.fullmatch(self.qualification_candidate_sha) is None or type(self.selection_pins) is not Phase4SelectionPins or type(self.retained_bundle_bytes) is not bytes:
+        if _SHA.fullmatch(self.qualification_candidate_sha) is None or type(self.selection_pins) is not Phase4SelectionPins or type(self.retained_bundle_bytes) is not bytes or type(self.authoritative_lineage_proof_bytes) is not bytes:
             raise Phase4QualificationError("Phase 4 qualification inputs are invalid")
         object.__setattr__(self, "input_digest", _digest(self._identity_payload()))
         self.validate()
@@ -487,6 +499,7 @@ class Phase4QualificationInputs:
             "qualification_candidate_sha": self.qualification_candidate_sha,
             "selection_digest": self.selection_pins.selection_digest,
             "retained_bundle_digest": _bytes_digest(self.retained_bundle_bytes),
+            "authoritative_lineage_proof_digest": _bytes_digest(self.authoritative_lineage_proof_bytes),
         }
 
     def validate(self) -> _RetainedEvidence:
@@ -494,13 +507,16 @@ class Phase4QualificationInputs:
             self.selection_pins.validate()
             if self.input_digest != _digest(self._identity_payload()):
                 raise ValueError
-            observed, pins = _parse_retained_bundle(self.retained_bundle_bytes), self.selection_pins
+            observed, proof, pins = _parse_retained_bundle(self.retained_bundle_bytes), _parse_authoritative_lineage_proof(self.authoritative_lineage_proof_bytes), self.selection_pins
             if (
                 self.qualification_candidate_sha != pins.qualification_candidate_sha
                 or _bytes_digest(self.retained_bundle_bytes) != pins.retained_bundle_digest
                 or observed.lineage_qualification_candidate_sha != self.qualification_candidate_sha
                 or observed.lineage_receipt_digest != pins.lineage_receipt_digest
-                or observed.lineage_readback_digest != pins.lineage_readback_digest
+                or observed.lineage_proof_digest != pins.lineage_proof_digest
+                or proof["proof_digest"] != pins.lineage_proof_digest
+                or (proof["source_candidate_sha"], proof["qualification_candidate_sha"])
+                != (pins.source_candidate_sha, self.qualification_candidate_sha)
                 or observed.evidence.candidate_sha != pins.source_candidate_sha
                 or observed.evidence.artifact_digest != pins.package_artifact_digest
                 or observed.evidence.schema != pins.cross_environment_schema

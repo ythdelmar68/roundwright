@@ -326,6 +326,62 @@ class DependencyReviewTests(unittest.TestCase):
         with self.assertRaises(DependencyReviewError):
             store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=attempt.attempt_id)
 
+    def test_lineage_reconstructs_every_ancestor_and_raw_successor_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            second_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            second = store.start_attempt(repository, second_subset, attempt_id="attempt-114", binding=self.binding(second_subset), supersedes_attempt_id=first.attempt_id)
+            store.record_invalid(repository, attempt_id=second.attempt_id, output_digest=digest("9"), reason_code="malformed-response")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("DELETE FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (first.attempt_id,))
+                connection.commit()
+            finally:
+                connection.close()
+            third_subset = AffectedSubset("subset-115", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, third_subset, attempt_id="attempt-115", binding=self.binding(third_subset), supersedes_attempt_id=second.attempt_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            second_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            second = store.start_attempt(repository, second_subset, attempt_id="attempt-114", binding=self.binding(second_subset), supersedes_attempt_id=first.attempt_id)
+            proposal = self.proposal(second.attempt_id)
+            store.accept_proposal(repository, proposal, binding=self.binding(second_subset))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE dependency_review_successors SET successor_attempt_id = ? WHERE predecessor_attempt_id = ?", ("missing-attempt", first.attempt_id))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(DependencyReviewError):
+                store.accept_proposal(repository, proposal, binding=self.binding(second_subset))
+
+    def test_accepted_predecessor_rejects_proposal_edge_ordinal_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            second_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            second = store.start_attempt(repository, second_subset, attempt_id="attempt-114", binding=self.binding(second_subset), supersedes_attempt_id=first.attempt_id)
+            proposal = self.proposal(second.attempt_id)
+            store.accept_proposal(repository, proposal, binding=self.binding(second_subset))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE dependency_review_proposal_edges SET ordinal = 5 WHERE proposal_id = ?", (proposal.proposal_id,))
+                connection.commit()
+            finally:
+                connection.close()
+            third_subset = AffectedSubset("subset-115", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, third_subset, attempt_id="attempt-115", binding=self.binding(third_subset), supersedes_attempt_id=second.attempt_id)
+
 
 if __name__ == "__main__":
     unittest.main()

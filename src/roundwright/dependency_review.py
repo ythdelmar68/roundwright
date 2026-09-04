@@ -335,7 +335,10 @@ class DependencyReviewStore:
         if row is None:
             raise DependencyReviewError("dependency proposal is unavailable")
         try:
-            edges = tuple(ProposedEdge(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, Confidence(confidence), conflicts) for _, kind, direction, subject, object_, rationale, confidence, conflicts in connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal_id,)))
+            stored_edges = tuple(connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal_id,)))
+            if tuple(edge[0] for edge in stored_edges) != tuple(range(len(stored_edges))):
+                raise DependencyReviewError("dependency proposal edges have drifted")
+            edges = tuple(ProposedEdge(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, Confidence(confidence), conflicts) for _, kind, direction, subject, object_, rationale, confidence, conflicts in stored_edges)
             proposal = DependencyProposal(proposal_id, row[0], RequestedDisposition(row[2]), row[3], edges)
         except (TypeError, ValueError) as error:
             raise DependencyReviewError("dependency proposal has drifted") from error
@@ -395,19 +398,31 @@ class DependencyReviewStore:
                 raise DependencyReviewError("dependency review retry lineage has forked")
             children[predecessor] = attempt_id
             expected_claims.append((predecessor, attempt_id))
-        claims = tuple(connection.execute("SELECT claims.predecessor_attempt_id, claims.successor_attempt_id, predecessors.task_id, successors.task_id FROM dependency_review_successors AS claims JOIN dependency_review_attempts AS predecessors ON predecessors.attempt_id = claims.predecessor_attempt_id JOIN dependency_review_attempts AS successors ON successors.attempt_id = claims.successor_attempt_id WHERE predecessors.task_id = ? OR successors.task_id = ? ORDER BY claims.predecessor_attempt_id", (task_id, task_id)))
-        if any(left != task_id or right != task_id for _, _, left, right in claims) or tuple((predecessor, successor) for predecessor, successor, _, _ in claims) != tuple(sorted(expected_claims)):
+        all_attempt_tasks = dict(connection.execute("SELECT attempt_id, task_id FROM dependency_review_attempts"))
+        raw_claims = tuple(connection.execute("SELECT predecessor_attempt_id, successor_attempt_id FROM dependency_review_successors ORDER BY predecessor_attempt_id"))
+        claims: list[tuple[str, str]] = []
+        for predecessor, successor in raw_claims:
+            predecessor_task = all_attempt_tasks.get(predecessor)
+            successor_task = all_attempt_tasks.get(successor)
+            if predecessor_task != task_id and successor_task != task_id:
+                continue
+            if predecessor_task != task_id or successor_task != task_id:
+                raise DependencyReviewError("dependency review successor claim has drifted")
+            claims.append((predecessor, successor))
+        if tuple(claims) != tuple(sorted(expected_claims)):
             raise DependencyReviewError("dependency review successor claim has drifted")
-        visited: set[str] = set()
+        visited: list[str] = []
         current = roots[0]
         while current not in visited:
-            visited.add(current)
+            visited.append(current)
             successor = children.get(current)
             if successor is None:
                 break
             current = successor
-        if visited != set(attempts) or len([state for _, state in attempts.values() if state == "prepared"]) > 1:
+        if set(visited) != set(attempts) or len([state for _, state in attempts.values() if state == "prepared"]) > 1:
             raise DependencyReviewError("dependency review retry lineage has forked")
+        for attempt_id in visited:
+            DependencyReviewStore._read_attempt(connection, attempt_id)
 
     def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding) -> str:
         if type(binding) is not DependencyReviewBinding:

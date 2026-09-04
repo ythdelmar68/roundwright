@@ -252,14 +252,26 @@ class DependencyReviewStore:
                 raise DependencyReviewError("dependency review subset has drifted")
             existing = connection.execute("SELECT snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
             expected = (subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id, "prepared")
+            competing = connection.execute("SELECT attempt_id FROM dependency_review_attempts WHERE task_id = ? AND state = 'prepared' AND attempt_id != ?", (subset.task_id, attempt_id)).fetchone()
+            if competing is not None:
+                raise DependencyReviewError("dependency review retry lineage is already active")
             if supersedes_attempt_id is not None:
                 predecessor = connection.execute("SELECT task_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (supersedes_attempt_id,)).fetchone()
                 if predecessor is None or predecessor[0] != subset.task_id or predecessor[1] not in {"accepted", "invalid", "blocked"}:
                     raise DependencyReviewError("dependency review supersession is unavailable")
+                successor = connection.execute("SELECT successor_attempt_id FROM dependency_review_successors WHERE predecessor_attempt_id = ?", (supersedes_attempt_id,)).fetchone()
+                if successor is not None and successor != (attempt_id,):
+                    raise DependencyReviewError("dependency review retry lineage has forked")
+            elif existing is None and connection.execute("SELECT attempt_id FROM dependency_review_attempts WHERE task_id = ?", (subset.task_id,)).fetchone() is not None:
+                raise DependencyReviewError("dependency review task already has a lineage")
             if existing is None:
                 connection.execute("INSERT INTO dependency_review_attempts(attempt_id, task_id, snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared')", (attempt_id, subset.task_id, subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id))
+                if supersedes_attempt_id is not None:
+                    connection.execute("INSERT INTO dependency_review_successors(predecessor_attempt_id, successor_attempt_id) VALUES (?, ?)", (supersedes_attempt_id, attempt_id))
                 state = "prepared"
             elif tuple(existing) == expected:
+                if supersedes_attempt_id is not None and connection.execute("SELECT successor_attempt_id FROM dependency_review_successors WHERE predecessor_attempt_id = ?", (supersedes_attempt_id,)).fetchone() != (attempt_id,):
+                    raise DependencyReviewError("dependency review retry lineage has drifted")
                 state = "prepared"
             else:
                 raise DependencyReviewError("dependency review attempt has drifted")
@@ -291,16 +303,46 @@ class DependencyReviewStore:
             "members": [member.payload() for member in subset.members],
         }
 
+    @staticmethod
+    def _read_subset(connection: object, snapshot_id: str) -> AffectedSubset:
+        row = connection.execute("SELECT task_id, source_digest, candidate_sha, policy_digest, configuration_digest, boundary_digest, creation_reason, content_digest, member_count FROM dependency_review_subsets WHERE snapshot_id = ?", (snapshot_id,)).fetchone()
+        if row is None:
+            raise DependencyReviewError("dependency review subset is unavailable")
+        members = tuple(AffectedMember(*member) for member in connection.execute("SELECT member_id, member_fingerprint, content_digest FROM dependency_review_subset_members WHERE snapshot_id = ? ORDER BY member_id", (snapshot_id,)))
+        try:
+            subset = AffectedSubset(snapshot_id, *row[:7], members)
+        except (TypeError, ValueError) as error:
+            raise DependencyReviewError("dependency review subset has drifted") from error
+        if row[7] != subset.content_digest or row[8] != len(members):
+            raise DependencyReviewError("dependency review subset has drifted")
+        source = connection.execute("SELECT snapshots.source_digest FROM tasks JOIN source_snapshots AS snapshots ON snapshots.source_id = tasks.source_id WHERE tasks.task_id = ?", (subset.task_id,)).fetchone()
+        if source != (subset.source_digest,):
+            raise DependencyReviewError("dependency review source/task identity has drifted")
+        return subset
+
+    @staticmethod
+    def _verify_proposal_edges(connection: object, proposal: DependencyProposal) -> None:
+        stored = tuple(connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal.proposal_id,)))
+        expected = tuple((ordinal, edge.kind.value, edge.direction.value, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest) for ordinal, edge in enumerate(proposal.edges))
+        if stored != expected:
+            raise DependencyReviewError("dependency proposal edges have drifted")
+
     def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding) -> str:
         if type(binding) is not DependencyReviewBinding:
             raise DependencyReviewError("dependency review binding is invalid")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            attempt = connection.execute("SELECT attempts.snapshot_id, attempts.state, attempts.profile_identity, attempts.configuration_digest, subsets.candidate_sha, subsets.policy_digest, subsets.configuration_digest FROM dependency_review_attempts AS attempts JOIN dependency_review_subsets AS subsets ON subsets.snapshot_id = attempts.snapshot_id WHERE attempts.attempt_id = ?", (proposal.attempt_id,)).fetchone()
-            if attempt is None or attempt[1] not in {"prepared", "accepted"} or tuple(attempt[2:]) != (binding.profile_identity, binding.configuration_digest, binding.candidate_sha, binding.policy_digest, binding.configuration_digest):
+            attempt = connection.execute("SELECT snapshot_id, task_id, state, profile_identity, configuration_digest, input_digest FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone()
+            if attempt is None or attempt[2] not in {"prepared", "accepted"} or (attempt[3], attempt[4]) != (binding.profile_identity, binding.configuration_digest):
                 raise DependencyReviewError("dependency review attempt is not available")
-            members = {row[0] for row in connection.execute("SELECT member_id FROM dependency_review_subset_members WHERE snapshot_id = ?", (attempt[0],))}
+            subset = self._read_subset(connection, attempt[0])
+            if subset.task_id != attempt[1]:
+                raise DependencyReviewError("dependency review attempt has drifted")
+            binding.require_subset(subset)
+            if attempt[5] != _digest_value(self.model_input(subset, attempt_id=proposal.attempt_id, profile_identity=binding.profile_identity)):
+                raise DependencyReviewError("dependency review model input has drifted")
+            members = {member.member_id for member in subset.members}
             if any(edge.subject_member_id not in members or edge.object_member_id not in members for edge in proposal.edges):
                 raise DependencyReviewError("dependency proposal references a missing member")
             existing = connection.execute("SELECT attempt_id, proposal_digest, requested_disposition, owner_route FROM dependency_review_proposals WHERE proposal_id = ?", (proposal.proposal_id,)).fetchone()
@@ -313,6 +355,7 @@ class DependencyReviewStore:
                 connection.executemany("INSERT INTO dependency_review_proposal_edges(proposal_id, ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ((proposal.proposal_id, ordinal, edge.kind.value, edge.direction.value, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest) for ordinal, edge in enumerate(proposal.edges)))
             elif tuple(existing) != expected:
                 raise DependencyReviewError("dependency proposal has drifted")
+            self._verify_proposal_edges(connection, proposal)
             outcome = ("accepted", "schema-valid", proposal.proposal_digest, proposal.owner_route)
             stored = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone()
             if stored is None:
@@ -320,6 +363,8 @@ class DependencyReviewStore:
                 connection.execute("UPDATE dependency_review_attempts SET state = 'accepted' WHERE attempt_id = ?", (proposal.attempt_id,))
             elif tuple(stored) != outcome:
                 raise DependencyReviewError("dependency proposal outcome has drifted")
+            if connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone() != ("accepted",):
+                raise DependencyReviewError("dependency proposal acceptance has drifted")
             connection.commit()
             return proposal.proposal_digest
         except Exception:

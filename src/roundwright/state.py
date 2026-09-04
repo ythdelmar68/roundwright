@@ -661,6 +661,15 @@ MIGRATIONS = (
             ("dependency_review_validation_outcomes", "CREATE TABLE dependency_review_validation_outcomes (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'invalid', 'blocked')), reason_code TEXT NOT NULL, output_digest TEXT NOT NULL, owner_route TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        51,
+        (
+            "CREATE TABLE dependency_review_successors (predecessor_attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), successor_attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), CHECK(predecessor_attempt_id != successor_attempt_id))",
+        ),
+        (
+            ("dependency_review_successors", "CREATE TABLE dependency_review_successors (predecessor_attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), successor_attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), CHECK(predecessor_attempt_id != successor_attempt_id))"),
+        ),
+    ),
 )
 
 

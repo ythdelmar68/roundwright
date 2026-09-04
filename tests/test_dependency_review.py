@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -147,6 +148,69 @@ class DependencyReviewTests(unittest.TestCase):
             other_subset = AffectedSubset("subset-115", other.task_id, "c" * 64, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "initial", subset.members)
             with self.assertRaises(DependencyReviewError):
                 store.start_attempt(repository, other_subset, attempt_id="attempt-115", binding=self.binding(other_subset), supersedes_attempt_id=first.attempt_id)
+
+    def test_retry_lineage_has_one_head_and_one_successor_across_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            successor = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            replay = store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=first.attempt_id)
+            self.assertEqual(store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=first.attempt_id), replay)
+            competing = AffectedSubset("subset-115", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, competing, attempt_id="attempt-115", binding=self.binding(competing), supersedes_attempt_id=first.attempt_id)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, competing, attempt_id="attempt-115", binding=self.binding(competing))
+            store.record_invalid(repository, attempt_id=replay.attempt_id, output_digest=digest("9"), reason_code="malformed-response")
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, competing, attempt_id="attempt-115", binding=self.binding(competing), supersedes_attempt_id=first.attempt_id)
+
+    def test_concurrent_successor_creation_admits_exactly_one_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            def create(ordinal: int) -> bool:
+                candidate = AffectedSubset(f"subset-11{ordinal}", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+                try:
+                    DependencyReviewStore().start_attempt(repository, candidate, attempt_id=f"attempt-11{ordinal}", binding=self.binding(candidate), supersedes_attempt_id=first.attempt_id)
+                    return True
+                except DependencyReviewError:
+                    return False
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                self.assertEqual(sum(executor.map(create, (4, 5))), 1)
+
+    def test_acceptance_reconstructs_all_durable_material_on_replay(self) -> None:
+        def accepted() -> tuple[RepositoryIdentity, AffectedSubset, DependencyReviewStore, DependencyProposal]:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            repository, subset = self.setup_review(Path(temporary.name))
+            store = DependencyReviewStore()
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            proposal = self.proposal(attempt.attempt_id)
+            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            return repository, subset, store, proposal
+        repository, subset, store, proposal = accepted()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("UPDATE dependency_review_subset_members SET content_digest = ? WHERE snapshot_id = ? AND member_id = ?", (digest("0"), subset.snapshot_id, "member-a"))
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(DependencyReviewError):
+            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+        repository, subset, store, proposal = accepted()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("UPDATE dependency_review_proposal_edges SET confidence = 'low' WHERE proposal_id = ?", (proposal.proposal_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(DependencyReviewError):
+            store.accept_proposal(repository, proposal, binding=self.binding(subset))
 
 
 if __name__ == "__main__":

@@ -90,6 +90,8 @@ jobs:
           path: dist/
       - name: Verify the one uploaded package digest
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py verify dist
+      - name: Validate Phase 5 public-safe coverage map
+        run: python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py validate
       - name: Run deterministic offline tests
         run: python ci/resolve_validation_toolchain.py exec-python -- -m unittest discover -s tests -v
       - name: Verify isolated pip, pipx, and uv installations

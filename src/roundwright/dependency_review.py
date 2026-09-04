@@ -253,12 +253,14 @@ class DependencyReviewStore:
             existing = connection.execute("SELECT snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
             expected = (subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id, "prepared")
             self._verify_task_lineage(connection, subset.task_id)
+            if existing is not None:
+                self._read_attempt(connection, attempt_id)
             competing = connection.execute("SELECT attempt_id FROM dependency_review_attempts WHERE task_id = ? AND state = 'prepared' AND attempt_id != ?", (subset.task_id, attempt_id)).fetchone()
             if competing is not None:
                 raise DependencyReviewError("dependency review retry lineage is already active")
             if supersedes_attempt_id is not None:
-                predecessor = connection.execute("SELECT task_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (supersedes_attempt_id,)).fetchone()
-                if predecessor is None or predecessor[0] != subset.task_id or predecessor[1] not in {"accepted", "invalid", "blocked"}:
+                predecessor, _ = self._read_attempt(connection, supersedes_attempt_id)
+                if predecessor[0] != subset.task_id or predecessor[6] not in {"accepted", "invalid", "blocked"}:
                     raise DependencyReviewError("dependency review supersession is unavailable")
                 successor = connection.execute("SELECT successor_attempt_id FROM dependency_review_successors WHERE predecessor_attempt_id = ?", (supersedes_attempt_id,)).fetchone()
                 if successor is not None and successor != (attempt_id,):
@@ -328,6 +330,49 @@ class DependencyReviewStore:
             raise DependencyReviewError("dependency proposal edges have drifted")
 
     @staticmethod
+    def _read_proposal(connection: object, proposal_id: str) -> DependencyProposal:
+        row = connection.execute("SELECT attempt_id, proposal_digest, requested_disposition, owner_route FROM dependency_review_proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+        if row is None:
+            raise DependencyReviewError("dependency proposal is unavailable")
+        try:
+            edges = tuple(ProposedEdge(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, Confidence(confidence), conflicts) for _, kind, direction, subject, object_, rationale, confidence, conflicts in connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal_id,)))
+            proposal = DependencyProposal(proposal_id, row[0], RequestedDisposition(row[2]), row[3], edges)
+        except (TypeError, ValueError) as error:
+            raise DependencyReviewError("dependency proposal has drifted") from error
+        if proposal.proposal_digest != row[1]:
+            raise DependencyReviewError("dependency proposal has drifted")
+        return proposal
+
+    @staticmethod
+    def _read_attempt(connection: object, attempt_id: str) -> tuple[tuple[object, ...], AffectedSubset]:
+        """Reconstruct one complete attempt and reject any terminal repair gap."""
+
+        row = connection.execute("SELECT task_id, snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+        if row is None:
+            raise DependencyReviewError("dependency review attempt is unavailable")
+        subset = DependencyReviewStore._read_subset(connection, row[1])
+        if row[0] != subset.task_id or not _digest(row[2]) or row[3] != subset.configuration_digest or row[4] != _digest_value(DependencyReviewStore.model_input(subset, attempt_id=attempt_id, profile_identity=row[2])) or (row[5] is not None and not _token(row[5])):
+            raise DependencyReviewError("dependency review attempt has drifted")
+        proposals = tuple(connection.execute("SELECT proposal_id FROM dependency_review_proposals WHERE attempt_id = ?", (attempt_id,)))
+        outcome = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (attempt_id,)).fetchone()
+        state = row[6]
+        if state == "prepared":
+            if proposals or outcome is not None:
+                raise DependencyReviewError("dependency review prepared evidence has drifted")
+        elif state == "accepted":
+            if len(proposals) != 1:
+                raise DependencyReviewError("dependency proposal is unavailable")
+            proposal = DependencyReviewStore._read_proposal(connection, proposals[0][0])
+            if proposal.attempt_id != attempt_id or outcome != ("accepted", "schema-valid", proposal.proposal_digest, proposal.owner_route):
+                raise DependencyReviewError("dependency proposal outcome has drifted")
+        elif state in {"invalid", "blocked"}:
+            if proposals or outcome is None or outcome[0] != state or not _REASON.fullmatch(outcome[1]) or not _digest(outcome[2]) or not _REASON.fullmatch(outcome[3]):
+                raise DependencyReviewError("dependency review terminal evidence has drifted")
+        else:
+            raise DependencyReviewError("dependency review attempt has drifted")
+        return tuple(row), subset
+
+    @staticmethod
     def _verify_task_lineage(connection: object, task_id: str) -> None:
         """Authenticate one complete task-local retry chain from durable rows."""
 
@@ -370,16 +415,11 @@ class DependencyReviewStore:
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            attempt = connection.execute("SELECT snapshot_id, task_id, state, profile_identity, configuration_digest, input_digest FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone()
-            if attempt is None or attempt[2] not in {"prepared", "accepted"} or (attempt[3], attempt[4]) != (binding.profile_identity, binding.configuration_digest):
+            attempt, subset = self._read_attempt(connection, proposal.attempt_id)
+            if attempt[6] not in {"prepared", "accepted"} or (attempt[2], attempt[3]) != (binding.profile_identity, binding.configuration_digest):
                 raise DependencyReviewError("dependency review attempt is not available")
-            self._verify_task_lineage(connection, attempt[1])
-            subset = self._read_subset(connection, attempt[0])
-            if subset.task_id != attempt[1]:
-                raise DependencyReviewError("dependency review attempt has drifted")
+            self._verify_task_lineage(connection, attempt[0])
             binding.require_subset(subset)
-            if attempt[5] != _digest_value(self.model_input(subset, attempt_id=proposal.attempt_id, profile_identity=binding.profile_identity)):
-                raise DependencyReviewError("dependency review model input has drifted")
             members = {member.member_id for member in subset.members}
             if any(edge.subject_member_id not in members or edge.object_member_id not in members for edge in proposal.edges):
                 raise DependencyReviewError("dependency proposal references a missing member")
@@ -387,7 +427,7 @@ class DependencyReviewStore:
             expected = (proposal.attempt_id, proposal.proposal_digest, proposal.requested_disposition.value, proposal.owner_route)
             outcome = ("accepted", "schema-valid", proposal.proposal_digest, proposal.owner_route)
             stored = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone()
-            if attempt[2] == "accepted":
+            if attempt[6] == "accepted":
                 if existing is None or stored is None or tuple(existing) != expected or tuple(stored) != outcome:
                     raise DependencyReviewError("dependency proposal outcome has drifted")
                 self._verify_proposal_edges(connection, proposal)
@@ -424,15 +464,13 @@ class DependencyReviewStore:
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
-            if row is None or row[0] not in {"prepared", "invalid"}:
+            row, _ = self._read_attempt(connection, attempt_id)
+            if row[6] not in {"prepared", "invalid"}:
                 raise DependencyReviewError("dependency review attempt is not available")
-            task = connection.execute("SELECT task_id FROM dependency_review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
-            assert task is not None
-            self._verify_task_lineage(connection, task[0])
+            self._verify_task_lineage(connection, row[0])
             outcome = ("invalid", reason_code, output_digest, owner_route)
             stored = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (attempt_id,)).fetchone()
-            if row[0] == "invalid":
+            if row[6] == "invalid":
                 if tuple(stored) != outcome:
                     raise DependencyReviewError("dependency review invalid outcome has drifted")
                 connection.commit()

@@ -292,6 +292,40 @@ class DependencyReviewTests(unittest.TestCase):
             with self.assertRaises(DependencyReviewError):
                 store.accept_proposal(repository, proposal, binding=self.binding(successor))
 
+    def test_invalid_terminal_replay_and_successor_require_complete_evidence(self) -> None:
+        def invalid_terminal() -> tuple[RepositoryIdentity, AffectedSubset, DependencyReviewStore, object]:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            repository, subset = self.setup_review(Path(temporary.name))
+            store = DependencyReviewStore()
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            return repository, subset, store, attempt
+        repository, subset, store, attempt = invalid_terminal()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("DELETE FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (attempt.attempt_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        successor = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+        with self.assertRaises(DependencyReviewError):
+            store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+        with self.assertRaises(DependencyReviewError):
+            store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=attempt.attempt_id)
+        repository, subset, store, attempt = invalid_terminal()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("UPDATE dependency_review_subset_members SET content_digest = ? WHERE snapshot_id = ? AND member_id = ?", (digest("0"), subset.snapshot_id, "member-a"))
+            connection.commit()
+        finally:
+            connection.close()
+        successor = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+        with self.assertRaises(DependencyReviewError):
+            store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+        with self.assertRaises(DependencyReviewError):
+            store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=attempt.attempt_id)
+
 
 if __name__ == "__main__":
     unittest.main()

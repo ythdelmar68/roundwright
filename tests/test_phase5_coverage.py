@@ -7,7 +7,9 @@ import json
 import shutil
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +79,37 @@ class Phase5CoverageTests(unittest.TestCase):
             document["items"][0]["verification"] = verification
             self.write_document(document)
             with self.subTest(verification=verification), self.assertRaisesRegex(coverage.CoverageError, expected_error):
+                coverage.validate(self.source, self.ledger, self.tests)
+
+    def test_rejects_disposition_prerequisite_confidence_and_status_drift(self) -> None:
+        baseline = self.document()
+        for field, value, expected_error in (
+            ("disposition", "adopt", "disposition has drifted"),
+            ("prerequisites", ["#118"], "prerequisites have drifted"),
+            ("confidence", "low", "confidence has drifted"),
+            ("status", "blocked", "status has drifted"),
+        ):
+            document = json.loads(json.dumps(baseline))
+            item = next(item for item in document["items"] if item["id"] == "EV-0F91CDC81DEA")
+            item[field] = value
+            self.write_document(document)
+            with self.subTest(field=field), self.assertRaisesRegex(coverage.CoverageError, expected_error):
+                coverage.validate(self.source, self.ledger, self.tests)
+
+    def test_required_source_selection_survives_map_and_binding_omission(self) -> None:
+        identifier = "TS-856DFB0B5E51"
+        document = self.document()
+        document["items"] = [item for item in document["items"] if item["id"] != identifier]
+        self.write_document(document)
+        tables = (
+            "EXPECTED_OWNERS", "EXPECTED_DESTINATIONS", "EXPECTED_VERIFICATIONS", "EXPECTED_DISPOSITIONS",
+            "EXPECTED_PREREQUISITES", "EXPECTED_CONFIDENCES", "EXPECTED_STATUSES",
+        )
+        with ExitStack() as stack:
+            for name in tables:
+                values = getattr(coverage, name)
+                stack.enter_context(patch.object(coverage, name, {key: value for key, value in values.items() if key != identifier}))
+            with self.assertRaisesRegex(coverage.CoverageError, "required Phase 5 source inventory is omitted"):
                 coverage.validate(self.source, self.ledger, self.tests)
 
     def test_rejects_stale_sources_unsafe_text_and_candidate_drift(self) -> None:

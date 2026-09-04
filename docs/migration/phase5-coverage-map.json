@@ -11,6 +11,7 @@
     {"id":"EV-457FC17699F7","disposition":"adopt","destination":"worker-objective-state","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"high","status":"proposed"},
     {"id":"EV-50613D9E02C5","disposition":"reframe","destination":"daemon-lifecycle","owner_issue":"#118","prerequisites":["#117"],"verification":"daemon-lifecycle-qualification","confidence":"medium","status":"proposed"},
     {"id":"EV-5AAD74DCC184","disposition":"adopt","destination":"execution-profile-policy","owner_issue":"#119","prerequisites":["#118"],"verification":"retention-and-eligibility-suite","confidence":"high","status":"proposed"},
+    {"id":"EV-6BC84399BF20","disposition":"defer","destination":"optional-daemon-autostart-deferment","owner_issue":"#119","prerequisites":["#118"],"verification":"owner-decision-required","confidence":"medium","status":"blocked"},
     {"id":"EV-6FCE77814A22","disposition":"adopt","destination":"maintenance-lifecycle","owner_issue":"#119","prerequisites":["#118"],"verification":"retention-and-eligibility-suite","confidence":"high","status":"proposed"},
     {"id":"EV-70980A46DE9E","disposition":"adopt","destination":"promotion-evidence-gate","owner_issue":"#120","prerequisites":["#112","#119"],"verification":"candidate-bound-promotion-package","confidence":"high","status":"proposed"},
     {"id":"EV-8B3ADA5DCF43","disposition":"adopt","destination":"review-item-lifecycle","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"high","status":"proposed"},
@@ -31,7 +32,9 @@
     {"id":"TS-5ECC2458A2BF","disposition":"adopt","destination":"daemon-lifecycle","owner_issue":"#118","prerequisites":["#117"],"verification":"daemon-lifecycle-qualification","confidence":"high","status":"proposed"},
     {"id":"TS-617815F1AF67","disposition":"adopt","destination":"promotion-final-gate","owner_issue":"#120","prerequisites":["#112","#119"],"verification":"candidate-bound-promotion-package","confidence":"high","status":"proposed"},
     {"id":"TS-658FBA7F941B","disposition":"adopt","destination":"review-item-lifecycle","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"high","status":"proposed"},
+    {"id":"TS-856DFB0B5E51","disposition":"retire","destination":"destructive-cleanup-retirement","owner_issue":"#119","prerequisites":["#118"],"verification":"owner-decision-required","confidence":"low","status":"owner-routed"},
     {"id":"TS-9C2FE6B21A18","disposition":"adopt","destination":"owner-command-queue","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"medium","status":"proposed"},
+    {"id":"TS-94DA8C4D0395","disposition":"retire","destination":"destructive-cleanup-retirement","owner_issue":"#119","prerequisites":["#118"],"verification":"owner-decision-required","confidence":"low","status":"owner-routed"},
     {"id":"TS-A0D00D74FBB0","disposition":"adopt","destination":"owner-command-policy","owner_issue":"#119","prerequisites":["#118"],"verification":"retention-and-eligibility-suite","confidence":"high","status":"proposed"},
     {"id":"TS-A1630BB5E806","disposition":"adopt","destination":"owner-command-queue","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"high","status":"proposed"},
     {"id":"TS-D5AC3D130518","disposition":"reframe","destination":"owner-command-queue","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"medium","status":"proposed"},
@@ -42,6 +45,7 @@
     {"id":"TS-ECEA91EAD390","disposition":"adopt","destination":"review-item-lifecycle","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"high","status":"proposed"},
     {"id":"TS-F6DC3340D9FF","disposition":"adopt","destination":"dependency-graph-validator","owner_issue":"#114","prerequisites":["#113"],"verification":"transactional-graph-suite","confidence":"high","status":"proposed"},
     {"id":"TS-F8EA5D587E87","disposition":"adopt","destination":"review-item-lifecycle","owner_issue":"#115","prerequisites":["#114"],"verification":"durable-review-lifecycle-suite","confidence":"high","status":"proposed"},
+    {"id":"TS-CA4258665663","disposition":"retire","destination":"destructive-cleanup-retirement","owner_issue":"#119","prerequisites":["#118"],"verification":"owner-decision-required","confidence":"low","status":"owner-routed"},
     {"id":"TS-FCE318E20A2A","disposition":"adopt","destination":"owner-command-policy","owner_issue":"#119","prerequisites":["#118"],"verification":"retention-and-eligibility-suite","confidence":"high","status":"proposed"}
   ]
 }

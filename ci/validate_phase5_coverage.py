@@ -37,7 +37,7 @@ EXPECTED_OWNERS = {
     "EV-6FCE77814A22": "#119", "EV-70980A46DE9E": "#120", "EV-8B3ADA5DCF43": "#115",
     "EV-9C3DC7F9F8A0": "#115", "EV-A66CF4326777": "#115", "EV-AC0B36BE5F29": "#114",
     "EV-B766FE226AE0": "#115", "EV-BC32C3A410F6": "#119", "EV-CA4BBED76303": "#117",
-    "EV-F467391FEB1E": "#119",
+    "EV-F467391FEB1E": "#119", "EV-6BC84399BF20": "#119",
     "TS-0351A26DBE99": "#118", "TS-06896C06863C": "#114", "TS-126BD58C04F8": "#119",
     "TS-176D0551EC9C": "#114", "TS-28CD3D7A4ECA": "#115", "TS-3135EFA60899": "#120",
     "TS-38B72E44AD2C": "#115", "TS-5ECC2458A2BF": "#118", "TS-617815F1AF67": "#120",
@@ -45,7 +45,7 @@ EXPECTED_OWNERS = {
     "TS-A1630BB5E806": "#115", "TS-D5AC3D130518": "#115", "TS-E0FEB594E104": "#114",
     "TS-E5C8F4C6FEA2": "#119", "TS-E739091723AA": "#120", "TS-EABDEABE0FC0": "#119",
     "TS-ECEA91EAD390": "#115", "TS-F6DC3340D9FF": "#114", "TS-F8EA5D587E87": "#115",
-    "TS-FCE318E20A2A": "#119",
+    "TS-FCE318E20A2A": "#119", "TS-856DFB0B5E51": "#119", "TS-94DA8C4D0395": "#119", "TS-CA4258665663": "#119",
 }
 
 EXPECTED_DESTINATIONS = {
@@ -55,7 +55,7 @@ EXPECTED_DESTINATIONS = {
     "EV-6FCE77814A22": "maintenance-lifecycle", "EV-70980A46DE9E": "promotion-evidence-gate", "EV-8B3ADA5DCF43": "review-item-lifecycle",
     "EV-9C3DC7F9F8A0": "owner-command-queue", "EV-A66CF4326777": "owner-command-queue", "EV-AC0B36BE5F29": "final-gate-aggregation",
     "EV-B766FE226AE0": "review-item-lifecycle", "EV-BC32C3A410F6": "cleanup-eligibility", "EV-CA4BBED76303": "configured-source-ingestion",
-    "EV-F467391FEB1E": "verification-denial-taxonomy",
+    "EV-F467391FEB1E": "verification-denial-taxonomy", "EV-6BC84399BF20": "optional-daemon-autostart-deferment",
     "TS-0351A26DBE99": "daemon-lifecycle", "TS-06896C06863C": "dependency-graph-validator", "TS-126BD58C04F8": "cleanup-eligibility",
     "TS-176D0551EC9C": "dependency-graph-validator", "TS-28CD3D7A4ECA": "review-item-lifecycle", "TS-3135EFA60899": "promotion-public-safety",
     "TS-38B72E44AD2C": "owner-command-queue", "TS-5ECC2458A2BF": "daemon-lifecycle", "TS-617815F1AF67": "promotion-final-gate",
@@ -63,7 +63,8 @@ EXPECTED_DESTINATIONS = {
     "TS-A1630BB5E806": "owner-command-queue", "TS-D5AC3D130518": "owner-command-queue", "TS-E0FEB594E104": "dependency-graph-validator",
     "TS-E5C8F4C6FEA2": "cleanup-eligibility", "TS-E739091723AA": "promotion-final-gate", "TS-EABDEABE0FC0": "verification-denial-taxonomy",
     "TS-ECEA91EAD390": "review-item-lifecycle", "TS-F6DC3340D9FF": "dependency-graph-validator", "TS-F8EA5D587E87": "review-item-lifecycle",
-    "TS-FCE318E20A2A": "owner-command-policy",
+    "TS-FCE318E20A2A": "owner-command-policy", "TS-856DFB0B5E51": "destructive-cleanup-retirement",
+    "TS-94DA8C4D0395": "destructive-cleanup-retirement", "TS-CA4258665663": "destructive-cleanup-retirement",
 }
 
 EXPECTED_VERIFICATIONS = (
@@ -86,7 +87,55 @@ EXPECTED_VERIFICATIONS = (
         "EV-11F2ACA46283", "EV-50613D9E02C5", "TS-0351A26DBE99", "TS-5ECC2458A2BF",
     )}
     | {"EV-CA4BBED76303": "scanner-and-selection-suite"}
+    | {identifier: "owner-decision-required" for identifier in (
+        "EV-6BC84399BF20", "TS-856DFB0B5E51", "TS-94DA8C4D0395", "TS-CA4258665663",
+    )}
 )
+
+EXPECTED_DISPOSITIONS = {identifier: "adopt" for identifier in EXPECTED_OWNERS} | {
+    "EV-0F91CDC81DEA": "merge", "EV-50613D9E02C5": "reframe", "EV-B766FE226AE0": "merge",
+    "EV-BC32C3A410F6": "reframe", "EV-6BC84399BF20": "defer", "TS-126BD58C04F8": "reframe",
+    "TS-D5AC3D130518": "reframe", "TS-E5C8F4C6FEA2": "reframe", "TS-EABDEABE0FC0": "reframe",
+    "TS-856DFB0B5E51": "retire", "TS-94DA8C4D0395": "retire", "TS-CA4258665663": "retire",
+}
+EXPECTED_PREREQUISITES = (
+    {identifier: ("#112", "#119") for identifier in (
+        "EV-0F91CDC81DEA", "EV-305347E6CE3A", "EV-70980A46DE9E", "TS-3135EFA60899", "TS-617815F1AF67", "TS-E739091723AA",
+    )}
+    | {identifier: ("#113",) for identifier in (
+        "EV-3C97D24C7ECE", "EV-AC0B36BE5F29", "TS-06896C06863C", "TS-176D0551EC9C", "TS-E0FEB594E104", "TS-F6DC3340D9FF",
+    )}
+    | {identifier: ("#114",) for identifier in (
+        "EV-346AD74E1323", "EV-457FC17699F7", "EV-8B3ADA5DCF43", "EV-9C3DC7F9F8A0", "EV-A66CF4326777", "EV-B766FE226AE0",
+        "TS-28CD3D7A4ECA", "TS-38B72E44AD2C", "TS-658FBA7F941B", "TS-9C2FE6B21A18", "TS-A1630BB5E806", "TS-D5AC3D130518",
+        "TS-ECEA91EAD390", "TS-F8EA5D587E87",
+    )}
+    | {identifier: ("#117",) for identifier in ("EV-11F2ACA46283", "EV-50613D9E02C5", "TS-0351A26DBE99", "TS-5ECC2458A2BF")}
+    | {identifier: ("#118",) for identifier in (
+        "EV-312D7F292898", "EV-5AAD74DCC184", "EV-6FCE77814A22", "EV-BC32C3A410F6", "EV-F467391FEB1E", "EV-6BC84399BF20",
+        "TS-126BD58C04F8", "TS-A0D00D74FBB0", "TS-E5C8F4C6FEA2", "TS-EABDEABE0FC0", "TS-FCE318E20A2A",
+        "TS-856DFB0B5E51", "TS-94DA8C4D0395", "TS-CA4258665663",
+    )}
+    | {"EV-CA4BBED76303": ("#114", "#115")}
+)
+EXPECTED_CONFIDENCES = {identifier: "high" for identifier in EXPECTED_OWNERS} | {
+    "EV-0F91CDC81DEA": "medium", "EV-50613D9E02C5": "medium", "EV-B766FE226AE0": "medium",
+    "TS-38B72E44AD2C": "medium", "TS-9C2FE6B21A18": "medium", "TS-D5AC3D130518": "medium", "TS-EABDEABE0FC0": "medium",
+    "EV-6BC84399BF20": "medium", "EV-BC32C3A410F6": "low", "TS-126BD58C04F8": "low", "TS-E5C8F4C6FEA2": "low",
+    "TS-856DFB0B5E51": "low", "TS-94DA8C4D0395": "low", "TS-CA4258665663": "low",
+}
+EXPECTED_STATUSES = {identifier: "proposed" for identifier in EXPECTED_OWNERS} | {
+    "EV-BC32C3A410F6": "blocked", "EV-6BC84399BF20": "blocked", "TS-126BD58C04F8": "owner-routed",
+    "TS-E5C8F4C6FEA2": "owner-routed", "TS-856DFB0B5E51": "owner-routed", "TS-94DA8C4D0395": "owner-routed",
+    "TS-CA4258665663": "owner-routed",
+}
+
+# Selection is independent of the editable coverage map and expected bindings.
+# These source rows explicitly defer or retire Phase 5 work and must remain
+# visible and owner-routed rather than being silently converted to delivery.
+REQUIRED_SOURCE_IDENTIFIERS = frozenset({
+    "EV-6BC84399BF20", "TS-856DFB0B5E51", "TS-94DA8C4D0395", "TS-CA4258665663",
+})
 
 FORBIDDEN_TEXT = re.compile(
     r"(?:https?://|file://|[A-Za-z]:[\\/]|\\\\|(?:^|[\\s\"'])/(?:home|users|private|var|tmp|opt|srv)(?:/|$)|\.codex/|\b[\w.-]+/[\w.-]+\b|"
@@ -184,19 +233,30 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
         prerequisites = item["prerequisites"]
         if type(prerequisites) is not list or not prerequisites or any(type(value) is not str or not ISSUE.fullmatch(value) for value in prerequisites):
             raise CoverageError("coverage prerequisites are invalid")
-        if item["status"] in {"blocked", "owner-routed"} and item["confidence"] != "low":
-            raise CoverageError("blocked or owner-routed items must remain low confidence")
         if FORBIDDEN_TEXT.search(_canonical(item).decode("ascii")):
             raise CoverageError("coverage map contains unsafe text")
         if item["destination"] != EXPECTED_DESTINATIONS.get(identifier):
             raise CoverageError("coverage destination has drifted")
         if item["verification"] != EXPECTED_VERIFICATIONS.get(identifier):
             raise CoverageError("coverage verification has drifted")
+        if item["disposition"] != EXPECTED_DISPOSITIONS.get(identifier):
+            raise CoverageError("coverage disposition has drifted")
+        if tuple(prerequisites) != EXPECTED_PREREQUISITES.get(identifier):
+            raise CoverageError("coverage prerequisites have drifted")
+        if item["confidence"] != EXPECTED_CONFIDENCES.get(identifier):
+            raise CoverageError("coverage confidence has drifted")
+        if item["status"] != EXPECTED_STATUSES.get(identifier):
+            raise CoverageError("coverage status has drifted")
         observed[identifier] = item["owner_issue"]
-    if observed != EXPECTED_OWNERS or set(observed) != set(EXPECTED_DESTINATIONS) or set(observed) != set(EXPECTED_VERIFICATIONS):
+    expected_sets = (EXPECTED_OWNERS, EXPECTED_DESTINATIONS, EXPECTED_VERIFICATIONS, EXPECTED_DISPOSITIONS, EXPECTED_PREREQUISITES, EXPECTED_CONFIDENCES, EXPECTED_STATUSES)
+    if observed != EXPECTED_OWNERS or any(set(observed) != set(expected) for expected in expected_sets):
         raise CoverageError("coverage inventory is missing, unknown, or unassigned identifiers")
     ledger_ids = _source_identifiers(ledger, "EV")
     test_ids = _source_identifiers(tests, "TS")
+    if not REQUIRED_SOURCE_IDENTIFIERS <= ledger_ids | test_ids:
+        raise CoverageError("required Phase 5 source inventory is unavailable")
+    if not REQUIRED_SOURCE_IDENTIFIERS <= set(observed):
+        raise CoverageError("required Phase 5 source inventory is omitted")
     if not set(identifier for identifier in observed if identifier.startswith("EV-")) <= ledger_ids:
         raise CoverageError("coverage ledger identifier is stale")
     if not set(identifier for identifier in observed if identifier.startswith("TS-")) <= test_ids:

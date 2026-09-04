@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,24 @@ EXPECTED_OWNERS = {
     "TS-FCE318E20A2A": "#119",
 }
 
+EXPECTED_DESTINATIONS = {
+    "EV-0F91CDC81DEA": "promotion-evaluation", "EV-11F2ACA46283": "daemon-authority", "EV-305347E6CE3A": "promotion-verification-policy",
+    "EV-312D7F292898": "retention-policy", "EV-346AD74E1323": "review-item-lifecycle", "EV-3C97D24C7ECE": "dependency-graph-validator",
+    "EV-457FC17699F7": "worker-objective-state", "EV-50613D9E02C5": "daemon-lifecycle", "EV-5AAD74DCC184": "execution-profile-policy",
+    "EV-6FCE77814A22": "maintenance-lifecycle", "EV-70980A46DE9E": "promotion-evidence-gate", "EV-8B3ADA5DCF43": "review-item-lifecycle",
+    "EV-9C3DC7F9F8A0": "owner-command-queue", "EV-A66CF4326777": "owner-command-queue", "EV-AC0B36BE5F29": "final-gate-aggregation",
+    "EV-B766FE226AE0": "review-item-lifecycle", "EV-BC32C3A410F6": "cleanup-eligibility", "EV-CA4BBED76303": "configured-source-ingestion",
+    "EV-F467391FEB1E": "verification-denial-taxonomy",
+    "TS-0351A26DBE99": "daemon-lifecycle", "TS-06896C06863C": "dependency-graph-validator", "TS-126BD58C04F8": "cleanup-eligibility",
+    "TS-176D0551EC9C": "dependency-graph-validator", "TS-28CD3D7A4ECA": "review-item-lifecycle", "TS-3135EFA60899": "promotion-public-safety",
+    "TS-38B72E44AD2C": "owner-command-queue", "TS-5ECC2458A2BF": "daemon-lifecycle", "TS-617815F1AF67": "promotion-final-gate",
+    "TS-658FBA7F941B": "review-item-lifecycle", "TS-9C2FE6B21A18": "owner-command-queue", "TS-A0D00D74FBB0": "owner-command-policy",
+    "TS-A1630BB5E806": "owner-command-queue", "TS-D5AC3D130518": "owner-command-queue", "TS-E0FEB594E104": "dependency-graph-validator",
+    "TS-E5C8F4C6FEA2": "cleanup-eligibility", "TS-E739091723AA": "promotion-final-gate", "TS-EABDEABE0FC0": "verification-denial-taxonomy",
+    "TS-ECEA91EAD390": "review-item-lifecycle", "TS-F6DC3340D9FF": "dependency-graph-validator", "TS-F8EA5D587E87": "review-item-lifecycle",
+    "TS-FCE318E20A2A": "owner-command-policy",
+}
+
 FORBIDDEN_TEXT = re.compile(
     r"(?:https?://|file://|[A-Za-z]:[\\/]|\\\\|\.codex/|private[-_ ]?(?:repo|path|url)|credential|password|token|secret|owner reasoning)",
     re.IGNORECASE,
@@ -59,6 +78,11 @@ class CoverageError(ValueError):
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_source_digest(path: Path) -> str:
+    """Hash source text as canonical Git content regardless of checkout EOLs."""
+    return _digest(path.read_bytes().replace(b"\r\n", b"\n"))
 
 
 def _canonical(value: object) -> bytes:
@@ -84,6 +108,28 @@ def _source_identifiers(path: Path, prefix: str) -> set[str]:
     return set(identifiers)
 
 
+def current_candidate() -> str:
+    """Return the exact checked-out candidate; no caller-selected SHA is trusted."""
+    try:
+        result = subprocess.run(
+            ("git", "rev-parse", "HEAD"), cwd=ROOT, check=True,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CoverageError("checked-out candidate is unavailable") from error
+    candidate = result.stdout.strip()
+    if not COMMIT_SHA.fullmatch(candidate):
+        raise CoverageError("checked-out candidate is invalid")
+    return candidate
+
+
+def _require_current_candidate(candidate: str) -> None:
+    if not COMMIT_SHA.fullmatch(candidate):
+        raise CoverageError("candidate SHA is invalid")
+    if candidate != current_candidate():
+        raise CoverageError("candidate SHA does not match checked-out HEAD")
+
+
 def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     document = _read_json(source)
     if set(document) != {"schema", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
@@ -93,7 +139,7 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     source_bindings = document["sources"]
     if any(type(value) is not str or not SHA256.fullmatch(value) for value in source_bindings.values()):
         raise CoverageError("coverage source digest is invalid")
-    if source_bindings["ledger_sha256"] != _digest(ledger.read_bytes()) or source_bindings["test_disposition_sha256"] != _digest(tests.read_bytes()):
+    if source_bindings["ledger_sha256"] != _canonical_source_digest(ledger) or source_bindings["test_disposition_sha256"] != _canonical_source_digest(tests):
         raise CoverageError("coverage source content has drifted")
     items = document["items"]
     if type(items) is not list or not items:
@@ -118,8 +164,10 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
             raise CoverageError("blocked or owner-routed items must remain low confidence")
         if FORBIDDEN_TEXT.search(_canonical(item).decode("ascii")):
             raise CoverageError("coverage map contains unsafe text")
+        if item["destination"] != EXPECTED_DESTINATIONS.get(identifier):
+            raise CoverageError("coverage destination has drifted")
         observed[identifier] = item["owner_issue"]
-    if observed != EXPECTED_OWNERS:
+    if observed != EXPECTED_OWNERS or set(observed) != set(EXPECTED_DESTINATIONS):
         raise CoverageError("coverage inventory is missing, unknown, or unassigned identifiers")
     ledger_ids = _source_identifiers(ledger, "EV")
     test_ids = _source_identifiers(tests, "TS")
@@ -131,8 +179,7 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
 
 
 def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path) -> None:
-    if not COMMIT_SHA.fullmatch(candidate):
-        raise CoverageError("candidate SHA is invalid")
+    _require_current_candidate(candidate)
     document = validate(source, ledger, tests)
     payload = {"schema": "roundwright-phase5-coverage-readback/v1", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "items": document["items"]}
     receipt = {**payload, "coverage_digest": _digest(_canonical(payload))}
@@ -140,8 +187,7 @@ def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path
 
 
 def verify(source: Path, ledger: Path, tests: Path, candidate: str, manifest: Path) -> None:
-    if not COMMIT_SHA.fullmatch(candidate):
-        raise CoverageError("candidate SHA is invalid")
+    _require_current_candidate(candidate)
     document = validate(source, ledger, tests)
     actual = _read_json(manifest)
     payload = {"schema": "roundwright-phase5-coverage-readback/v1", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "items": document["items"]}

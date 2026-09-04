@@ -90,8 +90,15 @@ jobs:
           path: dist/
       - name: Verify the one uploaded package digest
         run: python ci/resolve_validation_toolchain.py exec-python -- ci/verify_package_digest.py verify dist
-      - name: Validate Phase 5 public-safe coverage map
-        run: python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py validate
+      - name: Render and verify candidate-bound Phase 5 coverage evidence
+        shell: bash
+        run: |
+          checked_out_sha="$(git rev-parse HEAD)"
+          test "$checked_out_sha" = "$CANDIDATE_SHA"
+          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py validate
+          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py render --candidate "$CANDIDATE_SHA" --output dist/phase5-coverage-manifest.json
+          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py verify --candidate "$CANDIDATE_SHA" --manifest dist/phase5-coverage-manifest.json
+          sha256sum dist/phase5-coverage-manifest.json > dist/phase5-coverage-manifest.sha256
       - name: Run deterministic offline tests
         run: python ci/resolve_validation_toolchain.py exec-python -- -m unittest discover -s tests -v
       - name: Verify isolated pip, pipx, and uv installations
@@ -119,6 +126,12 @@ jobs:
         with:
           name: roundwright-qualification-${{ matrix.os }}-${{ github.sha }}
           path: dist/qualification-receipt.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roundwright-phase5-coverage-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
+          path: |
+            dist/phase5-coverage-manifest.json
+            dist/phase5-coverage-manifest.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: roundwright-ci-read-only-handoff-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}

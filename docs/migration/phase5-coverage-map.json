@@ -1,6 +1,6 @@
 {
   "schema": "roundwright-phase5-coverage/v1",
-  "sources": {"ledger_sha256":"ce468316d44b34bcfc382991932ac68b8be6dcfa95ecff6ab64d9ea3f1c35f1b","test_disposition_sha256":"dd37ec57eed45f110a1e4998fdb2ace7d91541591f6a8de801c02e19e84f1e76"},
+  "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},
   "items": [
     {"id":"EV-0F91CDC81DEA","disposition":"merge","destination":"promotion-evaluation","owner_issue":"#120","prerequisites":["#112","#119"],"verification":"candidate-bound-promotion-package","confidence":"medium","status":"proposed"},
     {"id":"EV-11F2ACA46283","disposition":"adopt","destination":"daemon-authority","owner_issue":"#118","prerequisites":["#117"],"verification":"daemon-lifecycle-qualification","confidence":"high","status":"proposed"},

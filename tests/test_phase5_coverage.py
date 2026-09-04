@@ -41,7 +41,7 @@ class Phase5CoverageTests(unittest.TestCase):
         document = coverage.validate(self.source, self.ledger, self.tests)
         self.assertEqual(len(document["items"]), len(coverage.EXPECTED_OWNERS))
         manifest = self.directory / "readback.json"
-        candidate = "a" * 40
+        candidate = coverage.current_candidate()
         coverage.render(self.source, self.ledger, self.tests, candidate, manifest)
         coverage.verify(self.source, self.ledger, self.tests, candidate, manifest)
 
@@ -58,6 +58,13 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "owner issue"):
             coverage.validate(self.source, self.ledger, self.tests)
 
+    def test_rejects_public_safe_destination_drift(self) -> None:
+        document = self.document()
+        document["items"][0]["destination"] = "another-public-safe-target"
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "destination has drifted"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
     def test_rejects_stale_sources_unsafe_text_and_candidate_drift(self) -> None:
         document = self.document()
         document["items"][0]["destination"] = "C:/private/source"
@@ -71,6 +78,8 @@ class Phase5CoverageTests(unittest.TestCase):
             coverage.validate(self.source, self.ledger, self.tests)
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         manifest = self.directory / "readback.json"
-        coverage.render(self.source, self.ledger, self.tests, "a" * 40, manifest)
-        with self.assertRaisesRegex(coverage.CoverageError, "does not match"):
-            coverage.verify(self.source, self.ledger, self.tests, "b" * 40, manifest)
+        candidate = coverage.current_candidate()
+        coverage.render(self.source, self.ledger, self.tests, candidate, manifest)
+        other_candidate = "0" * 40 if candidate != "0" * 40 else "1" * 40
+        with self.assertRaisesRegex(coverage.CoverageError, "does not match checked-out HEAD"):
+            coverage.verify(self.source, self.ledger, self.tests, other_candidate, manifest)

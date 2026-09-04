@@ -2,6 +2,11 @@
 
 This public-safe ledger records Phase 0 dispositions using opaque evidence identifiers. It intentionally excludes private source identities and locations.
 
+The Phase 5 subset is owned and validated through
+[`phase5-coverage-map.json`](phase5-coverage-map.json). That map records only
+opaque identifiers and public-safe destination metadata, then produces a
+candidate-bound read-back manifest.
+
 ## Inventory binding
 
 The initial planning baseline expected 52 unique issue/PR links. Authenticated capture found 56. The run failed closed, recaptured the complete inventory, and rebound coverage before analysis. No record was silently ignored.

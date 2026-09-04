@@ -2,6 +2,11 @@
 
 Every test in the accepted frozen snapshot is classified exactly once. These rows preserve behavioral intent without importing implementation accidentally.
 
+The Phase 5 subset has one public-safe implementation owner, disposition,
+prerequisite set, and verification contract in
+[`phase5-coverage-map.json`](phase5-coverage-map.json). The rendered manifest
+does not copy the legacy source locations or test prose.
+
 | ID | Test | Classification | Destination | Verification | Confidence | Rationale |
 | --- | --- | --- | --- | --- | --- | --- |
 | TS-00DCF39C5E12 | .codex/skills/loop-orchestrator/tests/test_runtime.py::test_cancel_verification_like_process_stales_candidate_bound_evidence | migrate invariant/contract | tests/contracts/test_verification_gates.py | Implement the classified port, replacement, rewrite, or retirement decision and verify it in the target test suite. | high | Cancel verification like process stales candidate bound evidence expresses a safety, authority, identity, or lifecycle contract that should survive the implementation change. |

@@ -66,8 +66,32 @@ EXPECTED_DESTINATIONS = {
     "TS-FCE318E20A2A": "owner-command-policy",
 }
 
+EXPECTED_VERIFICATIONS = (
+    {identifier: "candidate-bound-promotion-package" for identifier in (
+        "EV-0F91CDC81DEA", "EV-305347E6CE3A", "EV-70980A46DE9E", "TS-3135EFA60899", "TS-617815F1AF67", "TS-E739091723AA",
+    )}
+    | {identifier: "retention-and-eligibility-suite" for identifier in (
+        "EV-312D7F292898", "EV-5AAD74DCC184", "EV-6FCE77814A22", "EV-BC32C3A410F6", "EV-F467391FEB1E", "TS-126BD58C04F8",
+        "TS-A0D00D74FBB0", "TS-E5C8F4C6FEA2", "TS-EABDEABE0FC0", "TS-FCE318E20A2A",
+    )}
+    | {identifier: "durable-review-lifecycle-suite" for identifier in (
+        "EV-346AD74E1323", "EV-457FC17699F7", "EV-8B3ADA5DCF43", "EV-9C3DC7F9F8A0", "EV-A66CF4326777", "EV-B766FE226AE0",
+        "TS-28CD3D7A4ECA", "TS-38B72E44AD2C", "TS-658FBA7F941B", "TS-9C2FE6B21A18", "TS-A1630BB5E806", "TS-D5AC3D130518",
+        "TS-ECEA91EAD390", "TS-F8EA5D587E87",
+    )}
+    | {identifier: "transactional-graph-suite" for identifier in (
+        "EV-3C97D24C7ECE", "EV-AC0B36BE5F29", "TS-06896C06863C", "TS-176D0551EC9C", "TS-E0FEB594E104", "TS-F6DC3340D9FF",
+    )}
+    | {identifier: "daemon-lifecycle-qualification" for identifier in (
+        "EV-11F2ACA46283", "EV-50613D9E02C5", "TS-0351A26DBE99", "TS-5ECC2458A2BF",
+    )}
+    | {"EV-CA4BBED76303": "scanner-and-selection-suite"}
+)
+
 FORBIDDEN_TEXT = re.compile(
-    r"(?:https?://|file://|[A-Za-z]:[\\/]|\\\\|\.codex/|private[-_ ]?(?:repo|path|url)|credential|password|token|secret|owner reasoning)",
+    r"(?:https?://|file://|[A-Za-z]:[\\/]|\\\\|(?:^|[\\s\"'])/(?:home|users|private|var|tmp|opt|srv)(?:/|$)|\.codex/|\b[\w.-]+/[\w.-]+\b|"
+    r"private[-_ ]?(?:repo|path|url)|(?:raw|internal)[-_ ]?(?:evidence|output|artifact|migration|transcript|material)|"
+    r"credential|password|token|secret|owner[-_ ]?(?:reasoning|rationale|notes?))",
     re.IGNORECASE,
 )
 
@@ -166,8 +190,10 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
             raise CoverageError("coverage map contains unsafe text")
         if item["destination"] != EXPECTED_DESTINATIONS.get(identifier):
             raise CoverageError("coverage destination has drifted")
+        if item["verification"] != EXPECTED_VERIFICATIONS.get(identifier):
+            raise CoverageError("coverage verification has drifted")
         observed[identifier] = item["owner_issue"]
-    if observed != EXPECTED_OWNERS or set(observed) != set(EXPECTED_DESTINATIONS):
+    if observed != EXPECTED_OWNERS or set(observed) != set(EXPECTED_DESTINATIONS) or set(observed) != set(EXPECTED_VERIFICATIONS):
         raise CoverageError("coverage inventory is missing, unknown, or unassigned identifiers")
     ledger_ids = _source_identifiers(ledger, "EV")
     test_ids = _source_identifiers(tests, "TS")

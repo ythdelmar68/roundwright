@@ -65,6 +65,20 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "destination has drifted"):
             coverage.validate(self.source, self.ledger, self.tests)
 
+    def test_rejects_verification_drift_and_unsafe_verification_values(self) -> None:
+        document = self.document()
+        for verification, expected_error in (
+            ("another-public-safe-contract", "verification has drifted"),
+            ("ythdelmar68/roundwright", "unsafe"),
+            ("/private/roundwright/evidence", "unsafe"),
+            ("raw-internal-evidence", "unsafe"),
+            ("owner-reasoning", "unsafe"),
+        ):
+            document["items"][0]["verification"] = verification
+            self.write_document(document)
+            with self.subTest(verification=verification), self.assertRaisesRegex(coverage.CoverageError, expected_error):
+                coverage.validate(self.source, self.ledger, self.tests)
+
     def test_rejects_stale_sources_unsafe_text_and_candidate_drift(self) -> None:
         document = self.document()
         document["items"][0]["destination"] = "C:/private/source"

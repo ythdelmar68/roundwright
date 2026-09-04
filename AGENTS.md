@@ -65,6 +65,9 @@ Roundlet runtime state remains local-only under `.roundlet/` in the authoritativ
 # roundlet:repository-authority
 roundlet:
   enabled: true
+  allow_create_remote_branch: true
+  allow_update_remote_branch: true
+  allow_create_draft_pr: true
   allow_external_validation_read_only: true
   allow_external_validation_disposable_target_mutation: true
   allow_mark_pr_ready: true

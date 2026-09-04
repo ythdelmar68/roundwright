@@ -81,6 +81,7 @@ class DependencyReviewTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-113'").fetchone(), ("accepted",))
                 self.assertEqual(connection.execute("SELECT outcome, reason_code FROM dependency_review_validation_outcomes WHERE attempt_id='attempt-113'").fetchone(), ("accepted", "schema-valid"))
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_proposal_edges").fetchone(), (1,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_successors").fetchone(), (0,))
             finally:
                 connection.close()
 
@@ -211,6 +212,85 @@ class DependencyReviewTests(unittest.TestCase):
             connection.close()
         with self.assertRaises(DependencyReviewError):
             store.accept_proposal(repository, proposal, binding=self.binding(subset))
+
+    def test_terminal_replays_never_repair_missing_or_extra_outcomes(self) -> None:
+        def accepted() -> tuple[RepositoryIdentity, AffectedSubset, DependencyReviewStore, DependencyProposal]:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            repository, subset = self.setup_review(Path(temporary.name))
+            store = DependencyReviewStore()
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            proposal = self.proposal(attempt.attempt_id)
+            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            return repository, subset, store, proposal
+        repository, subset, store, proposal = accepted()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("DELETE FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (proposal.attempt_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(DependencyReviewError):
+            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+        repository, subset, store, proposal = accepted()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("UPDATE dependency_review_validation_outcomes SET reason_code = 'tampered' WHERE attempt_id = ?", (proposal.attempt_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(DependencyReviewError):
+            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, 'invalid', 'unexpected', ?, 'owner-review')", (attempt.attempt_id, digest("8")))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(DependencyReviewError):
+                store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=self.binding(subset))
+            with self.assertRaises(DependencyReviewError):
+                store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+
+    def test_lineage_claim_and_predecessor_drift_fail_closed_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            successor = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            second = store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=first.attempt_id)
+            store.record_invalid(repository, attempt_id=second.attempt_id, output_digest=digest("9"), reason_code="malformed-response")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("DELETE FROM dependency_review_successors WHERE predecessor_attempt_id = ?", (first.attempt_id,))
+                connection.commit()
+            finally:
+                connection.close()
+            fork = AffectedSubset("subset-115", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, fork, attempt_id="attempt-115", binding=self.binding(fork), supersedes_attempt_id=first.attempt_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            successor = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            second = store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=first.attempt_id)
+            proposal = self.proposal(second.attempt_id)
+            store.accept_proposal(repository, proposal, binding=self.binding(successor))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE dependency_review_attempts SET supersedes_attempt_id = NULL WHERE attempt_id = ?", (second.attempt_id,))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(DependencyReviewError):
+                store.accept_proposal(repository, proposal, binding=self.binding(successor))
 
 
 if __name__ == "__main__":

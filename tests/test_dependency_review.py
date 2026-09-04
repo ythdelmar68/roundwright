@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from roundwright.configuration import RepositoryIdentity, load_configuration
 from roundwright.dependency_review import (
     AffectedMember, AffectedSubset, Confidence, DependencyProposal,
-    DependencyReviewError, DependencyReviewStore, EdgeDirection, EdgeKind,
+    DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, EdgeDirection, EdgeKind,
     ProposedEdge, RequestedDisposition,
 )
 from roundwright.git_identity import acquire_transition_lease
@@ -50,10 +50,15 @@ class DependencyReviewTests(unittest.TestCase):
             (ProposedEdge(EdgeKind.SEMANTIC_INFERRED if semantic else EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),),
         )
 
+    def binding(self, subset: AffectedSubset, *, candidate: str | None = None, policy: str | None = None, configuration: str | None = None, profile: str | None = None) -> DependencyReviewBinding:
+        return DependencyReviewBinding(candidate or subset.candidate_sha, policy or subset.policy_digest, configuration or subset.configuration_digest, profile or digest("7"))
+
     def test_default_role_and_input_are_exact_and_public_safe(self) -> None:
         configuration = load_configuration(cwd=Path.cwd(), environment={}, home=Path.cwd() / "missing-home")
         self.assertEqual((configuration.dependency_review.value.model, configuration.dependency_review.value.reasoning_effort.value), ("gpt-5.6-terra", "high"))
         self.assertEqual(configuration.dependency_review.source.value, "default")
+        resolved = DependencyReviewBinding.from_configuration(configuration, candidate_sha="c" * 40, policy_digest=digest("d"))
+        self.assertEqual((resolved.configuration_digest, resolved.profile_identity), (configuration.pin().digest, configuration.pin().dependency_review_profile_identity))
         with tempfile.TemporaryDirectory() as temporary:
             _, subset = self.setup_review(Path(temporary))
             input_value = DependencyReviewStore.model_input(subset, attempt_id="attempt-113", profile_identity=digest("7"))
@@ -65,11 +70,11 @@ class DependencyReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             store = DependencyReviewStore()
-            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", profile_identity=digest("7"))
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             self.assertEqual(attempt.state, "prepared")
             proposal = self.proposal(attempt.attempt_id)
-            self.assertEqual(store.accept_proposal(repository, proposal), proposal.proposal_digest)
-            self.assertEqual(store.accept_proposal(repository, proposal), proposal.proposal_digest)
+            self.assertEqual(store.accept_proposal(repository, proposal, binding=self.binding(subset)), proposal.proposal_digest)
+            self.assertEqual(store.accept_proposal(repository, proposal, binding=self.binding(subset)), proposal.proposal_digest)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-113'").fetchone(), ("accepted",))
@@ -82,30 +87,66 @@ class DependencyReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             store = DependencyReviewStore()
-            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", profile_identity=digest("7"))
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             with self.assertRaises(DependencyReviewError):
                 DependencyProposal.parse({"schema": "roundwright-dependency-review-proposal/v1"})
             missing = DependencyProposal("proposal-113", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "missing", digest("5"), Confidence.HIGH, digest("6")),))
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, missing)
+                store.accept_proposal(repository, missing, binding=self.binding(subset))
             changed = AffectedSubset(subset.snapshot_id, subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, digest("0"), subset.creation_reason, subset.members)
             with self.assertRaises(DependencyReviewError):
-                store.start_attempt(repository, changed, attempt_id="attempt-113", profile_identity=digest("7"))
+                store.start_attempt(repository, changed, attempt_id="attempt-113", binding=self.binding(subset))
             store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, self.proposal(attempt.attempt_id))
+                store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=self.binding(subset))
 
     def test_semantic_edges_require_owner_routing_and_retries_are_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             store = DependencyReviewStore()
-            first = store.start_attempt(repository, subset, attempt_id="attempt-113", profile_identity=digest("7"))
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             with self.assertRaises(DependencyReviewError):
                 DependencyProposal("bad-semantic", first.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
             store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
             retry_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
-            retry = store.start_attempt(repository, retry_subset, attempt_id="attempt-114", profile_identity=digest("7"), supersedes_attempt_id=first.attempt_id)
-            self.assertEqual(store.accept_proposal(repository, self.proposal(retry.attempt_id, semantic=True)), self.proposal(retry.attempt_id, semantic=True).proposal_digest)
+            retry = store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=first.attempt_id)
+            self.assertEqual(store.accept_proposal(repository, self.proposal(retry.attempt_id, semantic=True), binding=self.binding(retry_subset)), self.proposal(retry.attempt_id, semantic=True).proposal_digest)
+
+    def test_acceptance_rejects_current_binding_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            for binding in (
+                self.binding(subset, candidate="0" * 40),
+                self.binding(subset, policy=digest("0")),
+                self.binding(subset, configuration=digest("0")),
+                self.binding(subset, profile=digest("0")),
+            ):
+                with self.subTest(binding=binding):
+                    with self.assertRaises(DependencyReviewError):
+                        store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=binding)
+            self.assertEqual(store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=self.binding(subset)), self.proposal(attempt.attempt_id).proposal_digest)
+
+    def test_subset_order_is_normalized_and_retry_lineage_is_task_terminal_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            reordered = AffectedSubset(subset.snapshot_id, subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, subset.creation_reason, tuple(reversed(subset.members)))
+            self.assertEqual((reordered.members, reordered.content_digest), (subset.members, subset.content_digest))
+            store = DependencyReviewStore()
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            retry_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=first.attempt_id)
+            store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
+            replay = store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=first.attempt_id)
+            self.assertEqual(store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=first.attempt_id), replay)
+            other = TaskIdentity("task-114", "source-114", "repo-113", "codex/114", "C:/review-114", "a" * 40)
+            lease = acquire_transition_lease(repository, repository_id=other.repository_id, owner="dependency-review-tests", ttl_seconds=60)
+            admit_task(repository, other, (SourceSnapshot(other.source_id, other.repository_id, "c" * 64),), lease=lease)
+            other_subset = AffectedSubset("subset-115", other.task_id, "c" * 64, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "initial", subset.members)
+            with self.assertRaises(DependencyReviewError):
+                store.start_attempt(repository, other_subset, attempt_id="attempt-115", binding=self.binding(other_subset), supersedes_attempt_id=first.attempt_id)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .configuration import RepositoryIdentity
-from .state import StateError, _open_writable_connection
+from .state import _open_writable_connection
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -48,6 +48,34 @@ class RequestedDisposition(StrEnum):
     AUTO_ACTIVATE = "auto-activate"
     OWNER_REVIEW = "owner-review"
     REJECT = "reject"
+
+
+@dataclass(frozen=True)
+class DependencyReviewBinding:
+    """Current trusted identities that must match an immutable review record."""
+
+    candidate_sha: str
+    policy_digest: str
+    configuration_digest: str
+    profile_identity: str
+
+    def __post_init__(self) -> None:
+        if not _SHA.fullmatch(self.candidate_sha) or not all(_digest(value) for value in (self.policy_digest, self.configuration_digest, self.profile_identity)):
+            raise DependencyReviewError("dependency review binding is invalid")
+
+    @classmethod
+    def from_configuration(cls, configuration: object, *, candidate_sha: str, policy_digest: str) -> "DependencyReviewBinding":
+        """Bind a job to one resolved configuration, never an ambient fallback."""
+
+        try:
+            pinned = configuration.pin()
+            return cls(candidate_sha, policy_digest, pinned.digest, pinned.dependency_review_profile_identity)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise DependencyReviewError("dependency review configuration binding is unavailable") from error
+
+    def require_subset(self, subset: "AffectedSubset") -> None:
+        if (subset.candidate_sha, subset.policy_digest, subset.configuration_digest) != (self.candidate_sha, self.policy_digest, self.configuration_digest):
+            raise DependencyReviewError("dependency review binding has drifted")
 
 
 @dataclass(frozen=True)
@@ -86,6 +114,7 @@ class AffectedSubset:
             raise DependencyReviewError("affected subset is invalid")
         if len({member.member_id for member in self.members}) != len(self.members) or len({member.member_fingerprint for member in self.members}) != len(self.members):
             raise DependencyReviewError("affected subset members are ambiguous")
+        object.__setattr__(self, "members", tuple(sorted(self.members, key=lambda member: member.member_id)))
 
     def payload(self) -> dict[str, object]:
         return {
@@ -202,10 +231,11 @@ class DependencyReviewAttempt:
 class DependencyReviewStore:
     """Transactional persistence for isolated dependency-review records only."""
 
-    def start_attempt(self, repository: RepositoryIdentity, subset: AffectedSubset, *, attempt_id: str, profile_identity: str, supersedes_attempt_id: str | None = None) -> DependencyReviewAttempt:
-        if not _token(attempt_id) or not _digest(profile_identity) or (supersedes_attempt_id is not None and not _token(supersedes_attempt_id)):
+    def start_attempt(self, repository: RepositoryIdentity, subset: AffectedSubset, *, attempt_id: str, binding: DependencyReviewBinding, supersedes_attempt_id: str | None = None) -> DependencyReviewAttempt:
+        if not _token(attempt_id) or type(binding) is not DependencyReviewBinding or (supersedes_attempt_id is not None and not _token(supersedes_attempt_id)):
             raise DependencyReviewError("dependency review attempt identity is invalid")
-        input_digest = _digest_value(self.model_input(subset, attempt_id=attempt_id, profile_identity=profile_identity))
+        binding.require_subset(subset)
+        input_digest = _digest_value(self.model_input(subset, attempt_id=attempt_id, profile_identity=binding.profile_identity))
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -221,18 +251,20 @@ class DependencyReviewStore:
             elif tuple(existing_subset) != expected_subset or tuple(connection.execute("SELECT member_id, member_fingerprint, content_digest FROM dependency_review_subset_members WHERE snapshot_id = ? ORDER BY member_id", (subset.snapshot_id,))) != tuple((member.member_id, member.member_fingerprint, member.content_digest) for member in sorted(subset.members, key=lambda item: item.member_id)):
                 raise DependencyReviewError("dependency review subset has drifted")
             existing = connection.execute("SELECT snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
-            expected = (subset.snapshot_id, profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id, "prepared")
-            if supersedes_attempt_id is not None and connection.execute("SELECT 1 FROM dependency_review_attempts WHERE attempt_id = ?", (supersedes_attempt_id,)).fetchone() is None:
-                raise DependencyReviewError("dependency review supersession is unavailable")
+            expected = (subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id, "prepared")
+            if supersedes_attempt_id is not None:
+                predecessor = connection.execute("SELECT task_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (supersedes_attempt_id,)).fetchone()
+                if predecessor is None or predecessor[0] != subset.task_id or predecessor[1] not in {"accepted", "invalid", "blocked"}:
+                    raise DependencyReviewError("dependency review supersession is unavailable")
             if existing is None:
-                connection.execute("INSERT INTO dependency_review_attempts(attempt_id, task_id, snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared')", (attempt_id, subset.task_id, subset.snapshot_id, profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id))
+                connection.execute("INSERT INTO dependency_review_attempts(attempt_id, task_id, snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared')", (attempt_id, subset.task_id, subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id))
                 state = "prepared"
             elif tuple(existing) == expected:
                 state = "prepared"
             else:
                 raise DependencyReviewError("dependency review attempt has drifted")
             connection.commit()
-            return DependencyReviewAttempt(attempt_id, subset.snapshot_id, profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id, state)
+            return DependencyReviewAttempt(attempt_id, subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id, state)
         except Exception:
             connection.rollback()
             raise
@@ -259,12 +291,14 @@ class DependencyReviewStore:
             "members": [member.payload() for member in subset.members],
         }
 
-    def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal) -> str:
+    def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding) -> str:
+        if type(binding) is not DependencyReviewBinding:
+            raise DependencyReviewError("dependency review binding is invalid")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            attempt = connection.execute("SELECT snapshot_id, state FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone()
-            if attempt is None or attempt[1] not in {"prepared", "accepted"}:
+            attempt = connection.execute("SELECT attempts.snapshot_id, attempts.state, attempts.profile_identity, attempts.configuration_digest, subsets.candidate_sha, subsets.policy_digest, subsets.configuration_digest FROM dependency_review_attempts AS attempts JOIN dependency_review_subsets AS subsets ON subsets.snapshot_id = attempts.snapshot_id WHERE attempts.attempt_id = ?", (proposal.attempt_id,)).fetchone()
+            if attempt is None or attempt[1] not in {"prepared", "accepted"} or tuple(attempt[2:]) != (binding.profile_identity, binding.configuration_digest, binding.candidate_sha, binding.policy_digest, binding.configuration_digest):
                 raise DependencyReviewError("dependency review attempt is not available")
             members = {row[0] for row in connection.execute("SELECT member_id FROM dependency_review_subset_members WHERE snapshot_id = ?", (attempt[0],))}
             if any(edge.subject_member_id not in members or edge.object_member_id not in members for edge in proposal.edges):

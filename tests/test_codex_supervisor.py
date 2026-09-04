@@ -810,8 +810,9 @@ class SupervisorTests(unittest.TestCase):
         def canonical(material): return json.dumps(material, sort_keys=True, separators=(",", ":"))
         def construct(material, **typed):
             return ResolvedConfigurationBinding(
-                typed.get("schema_version", pinned.schema_version), "sha256:" + hashlib.sha256(canonical(material).encode()).hexdigest(), typed.get("sources", dict(pinned.sources)), typed.get("worker_profile_identity", pinned.worker_profile_identity), typed.get("supervisor_profile_identities", pinned.supervisor_profile_identities), typed.get("review_policy", pinned.review_policy), typed.get("repository_root_identity", pinned.repository_root_identity), typed.get("cache_directory_identity", pinned.cache_directory_identity), typed.get("trusted_review_floor", pinned.trusted_review_floor), canonical(material), pinned.trusted_floor_evidence_required,
+                schema_version=typed.get("schema_version", pinned.schema_version), digest="sha256:" + hashlib.sha256(canonical(material).encode()).hexdigest(), sources=typed.get("sources", dict(pinned.sources)), worker_profile_identity=typed.get("worker_profile_identity", pinned.worker_profile_identity), dependency_review_profile_identity=typed.get("dependency_review_profile_identity", pinned.dependency_review_profile_identity), supervisor_profile_identities=typed.get("supervisor_profile_identities", pinned.supervisor_profile_identities), review_policy=typed.get("review_policy", pinned.review_policy), repository_root_identity=typed.get("repository_root_identity", pinned.repository_root_identity), cache_directory_identity=typed.get("cache_directory_identity", pinned.cache_directory_identity), trusted_review_floor=typed.get("trusted_review_floor", pinned.trusted_review_floor), canonical_material=canonical(material), trusted_floor_evidence_required=pinned.trusted_floor_evidence_required,
             )
+        self.assertEqual(construct(baseline), pinned)
         changed = digest("crafted-drift")
         cases = []
         for key in tuple(baseline):
@@ -825,6 +826,7 @@ class SupervisorTests(unittest.TestCase):
             ("repository-path", lambda value: value["paths"].__setitem__("repository_root", changed)),
             ("cache-path", lambda value: value["paths"].__setitem__("cache_directory", changed)),
             ("worker", lambda value: value.__setitem__("worker", {"model": "changed", "reasoning_effort": "high", "name": "changed"})),
+            ("dependency-review-profile", lambda value: value.__setitem__("dependency_review", {"model": "changed", "reasoning_effort": "high"})),
             ("profile-substitution", lambda value: value["supervisor_attempt_profiles"].__setitem__(0, {"model": "changed", "reasoning_effort": "high", "name": "changed"})),
             ("profile-order", lambda value: value.__setitem__("supervisor_attempt_profiles", list(reversed(value["supervisor_attempt_profiles"])))),
             ("profile-duplicate", lambda value: value["supervisor_attempt_profiles"].__setitem__(1, value["supervisor_attempt_profiles"][0])),
@@ -847,6 +849,7 @@ class SupervisorTests(unittest.TestCase):
                 with self.assertRaises(ConfigurationError): construct(material)
         duplicate = list(pinned.supervisor_profile_identities); duplicate[1] = duplicate[0]
         with self.assertRaises(ConfigurationError): construct(baseline, supervisor_profile_identities=tuple(duplicate))
+        with self.assertRaises(ConfigurationError): construct(baseline, dependency_review_profile_identity=digest("dependency-review-substitution"))
         self.assertEqual(tuple(pinned.review_policy.mode_for_round(round_number) for round_number in (1, 2, 3, 4)), (ReviewMode.COMPLETE, ReviewMode.COMPLETE, ReviewMode.COMPLETE, ReviewMode.CONVERGING))
 
     def test_runtime_store_round_trip_and_tamper_fail_closed(self):

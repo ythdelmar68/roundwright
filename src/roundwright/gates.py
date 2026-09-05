@@ -715,6 +715,15 @@ def _require_current_dependency_graph(connection, task_id: str, candidate_sha: s
         raise GateError("dependency graph PASS is not valid for a single-source task")
     if not _is_token(context.dependency_graph_version_id) or not _is_fingerprint(context.dependency_graph_decision_digest):
         raise GateError("dependency graph context is unavailable")
+    # Syntax-level rows are insufficient: the graph store reconstructs the
+    # accepted proposal, predecessor snapshot, and decision digest on restart.
+    from .dependency_graph import DependencyGraphError, DependencyGraphStore
+    try:
+        current = DependencyGraphStore._read_current(connection)
+    except DependencyGraphError as error:
+        raise GateError("dependency graph evidence is unavailable or stale") from error
+    if current.graph_version_id != context.dependency_graph_version_id or current.binding is None or current.binding.candidate_sha != candidate_sha:
+        raise GateError("dependency graph evidence is unavailable or stale")
     row = connection.execute(
         "SELECT versions.candidate_sha, decisions.decision, decisions.decision_digest FROM dependency_graph_current AS current JOIN dependency_graph_versions AS versions ON versions.graph_version_id = current.graph_version_id JOIN dependency_graph_decisions AS decisions ON decisions.graph_version_id = versions.graph_version_id WHERE current.singleton = 1 AND versions.graph_version_id = ?",
         (context.dependency_graph_version_id,),

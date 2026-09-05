@@ -16,11 +16,11 @@ from roundwright.configuration import RepositoryIdentity, load_configuration
 from roundwright.dependency_review import (
     AffectedMember, AffectedSubset, Confidence, DependencyProposal,
     DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, EdgeDirection, EdgeKind,
-    ProposedEdge, RequestedDisposition,
+    ProposedEdge, RequestedDisposition, SourceOwnedRelation,
 )
 from roundwright.dependency_graph import (
     DependencyGraphBinding, DependencyGraphError, DependencyGraphStore,
-    GraphDecision, SourceOwnedRelation,
+    GraphDecision,
 )
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
@@ -49,21 +49,23 @@ class DependencyReviewTests(unittest.TestCase):
         return repository, subset
 
     def proposal(self, attempt_id: str, *, semantic: bool = False) -> DependencyProposal:
+        kind = EdgeKind.SEMANTIC_INFERRED if semantic else EdgeKind.EXPLICIT
+        relation = None if semantic else SourceOwnedRelation(kind, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
         return DependencyProposal(
             "proposal-113", attempt_id,
             RequestedDisposition.OWNER_REVIEW if semantic else RequestedDisposition.AUTO_ACTIVATE,
             "owner-review" if semantic else "not-required",
-            (ProposedEdge(EdgeKind.SEMANTIC_INFERRED if semantic else EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),),
+            (ProposedEdge(kind, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), relation.relation_digest if relation else None),),
         )
 
     def binding(self, subset: AffectedSubset, *, candidate: str | None = None, policy: str | None = None, configuration: str | None = None, profile: str | None = None) -> DependencyReviewBinding:
         return DependencyReviewBinding(candidate or subset.candidate_sha, policy or subset.policy_digest, configuration or subset.configuration_digest, profile or digest("7"))
 
-    def record_source_relations(self, repository: RepositoryIdentity, attempt_id: str, proposal: DependencyProposal) -> None:
-        graph = DependencyGraphStore()
-        for edge in proposal.edges:
-            method = graph.record_explicit_source_relation if edge.kind is EdgeKind.EXPLICIT else graph.record_deterministic_policy_relation
-            method(repository, attempt_id=attempt_id, relation=SourceOwnedRelation(edge.direction, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest))
+    def source_owned_relations(self, proposal: DependencyProposal) -> tuple[SourceOwnedRelation, ...]:
+        return tuple(
+            SourceOwnedRelation(edge.kind, edge.direction, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence, edge.conflicts_digest)
+            for edge in proposal.edges if edge.kind is not EdgeKind.SEMANTIC_INFERRED
+        )
 
     def test_default_role_and_input_are_exact_and_public_safe(self) -> None:
         configuration = load_configuration(cwd=Path.cwd(), environment={}, home=Path.cwd() / "missing-home")
@@ -74,7 +76,7 @@ class DependencyReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             _, subset = self.setup_review(Path(temporary))
             input_value = DependencyReviewStore.model_input(subset, attempt_id="attempt-113", profile_identity=digest("7"))
-        self.assertEqual(set(input_value), {"schema", "attempt_id", "profile_identity", "subset_digest", "task_id", "source_digest", "candidate_sha", "policy_digest", "configuration_digest", "boundary_digest", "members"})
+        self.assertEqual(set(input_value), {"schema", "attempt_id", "profile_identity", "subset_digest", "task_id", "source_digest", "candidate_sha", "policy_digest", "configuration_digest", "boundary_digest", "members", "trusted_relations"})
         self.assertNotIn("credential", str(input_value))
         self.assertNotIn("prompt", str(input_value))
 
@@ -95,6 +97,21 @@ class DependencyReviewTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_successors").fetchone(), (0,))
             finally:
                 connection.close()
+
+    def test_graph_requires_the_pre_dispatch_relation_identity_not_caller_scalars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
+            proposal = DependencyProposal("proposal-113", "attempt-113", RequestedDisposition.AUTO_ACTIVATE, "not-required", (
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), digest("0")),
+            ))
+            reviews = DependencyReviewStore()
+            attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=(relation,))
+            model_input = reviews.model_input(subset, attempt_id=attempt.attempt_id, profile_identity=self.binding(subset).profile_identity, source_owned_relations=(relation,))
+            self.assertEqual(model_input["trusted_relations"][0]["trusted_relation_digest"], relation.relation_digest)
+            reviews.accept_proposal(repository, proposal, binding=self.binding(subset))
+            result = DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(self.binding(subset)), graph_version_id="graph-113")
+            self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "provenance-unavailable"))
 
     def test_malformed_drifted_and_missing_member_results_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -397,9 +414,8 @@ class DependencyReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             review_store = DependencyReviewStore()
-            attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
-            proposal = self.proposal(attempt.attempt_id)
-            self.record_source_relations(repository, attempt.attempt_id, proposal)
+            proposal = self.proposal("attempt-113")
+            attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=self.source_owned_relations(proposal))
             review_store.accept_proposal(repository, proposal, binding=self.binding(subset))
             graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph_store = DependencyGraphStore()
@@ -416,9 +432,8 @@ class DependencyReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             reviews = DependencyReviewStore()
-            attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
-            proposal = self.proposal(attempt.attempt_id)
-            self.record_source_relations(repository, attempt.attempt_id, proposal)
+            proposal = self.proposal("attempt-113")
+            attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=self.source_owned_relations(proposal))
             reviews.accept_proposal(repository, proposal, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph = DependencyGraphStore()
@@ -445,20 +460,21 @@ class DependencyReviewTests(unittest.TestCase):
             pending = graph_store.activate(repository, semantic, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual((pending.decision, pending.graph_version_id), (GraphDecision.PENDING_OWNER, None))
             retry_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", (*subset.members, AffectedMember("member-c", digest("9"), digest("a"))))
-            attempt = review_store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=semantic_attempt.attempt_id)
-            incomplete = DependencyProposal("proposal-114", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
-            self.record_source_relations(repository, attempt.attempt_id, incomplete)
+            relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
+            incomplete = DependencyProposal("proposal-114", "attempt-114", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), relation.relation_digest),))
+            attempt = review_store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), source_owned_relations=(relation,), supersedes_attempt_id=semantic_attempt.attempt_id)
             review_store.accept_proposal(repository, incomplete, binding=self.binding(retry_subset))
             self.assertEqual(graph_store.activate(repository, incomplete, binding=graph_binding, graph_version_id="graph-114").reason_code, "affected-subset-incomplete")
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             review_store = DependencyReviewStore()
-            attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            first_relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
+            second_relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8"))
+            attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=(first_relation, second_relation))
             cycle = DependencyProposal("proposal-113", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (
-                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
-                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8")),
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), first_relation.relation_digest),
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8"), second_relation.relation_digest),
             ))
-            self.record_source_relations(repository, attempt.attempt_id, cycle)
             review_store.accept_proposal(repository, cycle, binding=self.binding(subset))
             graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             result = DependencyGraphStore().activate(repository, cycle, binding=graph_binding, graph_version_id="graph-113")
@@ -471,17 +487,15 @@ class DependencyReviewTests(unittest.TestCase):
             store = DependencyReviewStore()
             review_binding = self.binding(subset)
             graph_binding = DependencyGraphBinding.from_review_binding(review_binding)
-            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=review_binding)
-            proposal = self.proposal(first.attempt_id)
-            self.record_source_relations(repository, first.attempt_id, proposal)
+            proposal = self.proposal("attempt-113")
+            first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=review_binding, source_owned_relations=self.source_owned_relations(proposal))
             store.accept_proposal(repository, proposal, binding=review_binding)
             graph = DependencyGraphStore()
             first_result = graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual(first_result.decision, GraphDecision.ACCEPTED)
             successor_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
-            successor = store.start_attempt(repository, successor_subset, attempt_id="attempt-114", binding=self.binding(successor_subset), supersedes_attempt_id=first.attempt_id)
-            replacement = DependencyProposal("proposal-114", successor.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", proposal.edges)
-            self.record_source_relations(repository, successor.attempt_id, replacement)
+            replacement = DependencyProposal("proposal-114", "attempt-114", RequestedDisposition.AUTO_ACTIVATE, "not-required", proposal.edges)
+            successor = store.start_attempt(repository, successor_subset, attempt_id="attempt-114", binding=self.binding(successor_subset), source_owned_relations=self.source_owned_relations(replacement), supersedes_attempt_id=first.attempt_id)
             store.accept_proposal(repository, replacement, binding=self.binding(successor_subset))
             with self.assertRaisesRegex(DependencyGraphError, "superseded"):
                 graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
@@ -494,8 +508,6 @@ class DependencyReviewTests(unittest.TestCase):
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             proposal = self.proposal(attempt.attempt_id)
             store.accept_proposal(repository, proposal, binding=self.binding(subset))
-            with self.assertRaisesRegex(DependencyGraphError, "independently"):
-                DependencyGraphStore().record_explicit_source_relation(repository, attempt_id=attempt.attempt_id, relation=SourceOwnedRelation(proposal.edges[0].direction, proposal.edges[0].subject_member_id, proposal.edges[0].object_member_id, proposal.edges[0].rationale_digest, proposal.edges[0].confidence.value, proposal.edges[0].conflicts_digest))
             self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(self.binding(subset)), graph_version_id="graph-113").reason_code, "provenance-unavailable")
 
     def test_graph_provenance_and_persisted_decision_tampering_fail_closed(self) -> None:
@@ -506,16 +518,13 @@ class DependencyReviewTests(unittest.TestCase):
             proposal = self.proposal(attempt.attempt_id)
             store.accept_proposal(repository, proposal, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
-            stale_subset = AffectedSubset("subset-114", subset.task_id, "0" * 64, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
-            with self.assertRaises(DependencyGraphError):
-                DependencyGraphStore().record_explicit_source_relation(repository, attempt_id=attempt.attempt_id, relation=SourceOwnedRelation(proposal.edges[0].direction, "missing", proposal.edges[0].object_member_id, proposal.edges[0].rationale_digest, proposal.edges[0].confidence.value, proposal.edges[0].conflicts_digest))
             self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=binding, graph_version_id="graph-113").reason_code, "provenance-unavailable")
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             store = DependencyReviewStore()
-            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
-            policy = DependencyProposal("proposal-114", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.POLICY_DERIVED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
-            self.record_source_relations(repository, attempt.attempt_id, policy)
+            relation = SourceOwnedRelation(EdgeKind.POLICY_DERIVED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
+            policy = DependencyProposal("proposal-114", "attempt-113", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.POLICY_DERIVED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), relation.relation_digest),))
+            attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=(relation,))
             store.accept_proposal(repository, policy, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph = DependencyGraphStore()

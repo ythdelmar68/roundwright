@@ -136,7 +136,9 @@ class AffectedSubset:
 
 
 @dataclass(frozen=True)
-class ProposedEdge:
+class SourceOwnedRelation:
+    """A source or policy fact selected before the dependency model is called."""
+
     kind: EdgeKind
     direction: EdgeDirection
     subject_member_id: str
@@ -146,9 +148,53 @@ class ProposedEdge:
     conflicts_digest: str
 
     def __post_init__(self) -> None:
+        if (
+            self.kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED}
+            or type(self.direction) is not EdgeDirection
+            or not _token(self.subject_member_id)
+            or not _token(self.object_member_id)
+            or self.subject_member_id == self.object_member_id
+            or not _digest(self.rationale_digest)
+            or type(self.confidence) is not Confidence
+            or not _digest(self.conflicts_digest)
+        ):
+            raise DependencyReviewError("source-owned relation is invalid")
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "kind": self.kind.value,
+            "direction": self.direction.value,
+            "subject_member_id": self.subject_member_id,
+            "object_member_id": self.object_member_id,
+            "rationale_digest": self.rationale_digest,
+            "confidence": self.confidence.value,
+            "conflicts_digest": self.conflicts_digest,
+        }
+
+    @property
+    def relation_digest(self) -> str:
+        """Stable identifier that a model may select but cannot mint evidence for."""
+
+        return _digest_value({"schema": "roundwright-source-owned-relation/v1", **self.payload()})
+
+
+@dataclass(frozen=True)
+class ProposedEdge:
+    kind: EdgeKind
+    direction: EdgeDirection
+    subject_member_id: str
+    object_member_id: str
+    rationale_digest: str
+    confidence: Confidence
+    conflicts_digest: str
+    trusted_relation_digest: str | None = None
+
+    def __post_init__(self) -> None:
         if (type(self.kind) is not EdgeKind or type(self.direction) is not EdgeDirection or not _token(self.subject_member_id)
                 or not _token(self.object_member_id) or self.subject_member_id == self.object_member_id
-                or not _digest(self.rationale_digest) or type(self.confidence) is not Confidence or not _digest(self.conflicts_digest)):
+                or not _digest(self.rationale_digest) or type(self.confidence) is not Confidence or not _digest(self.conflicts_digest)
+                or (self.trusted_relation_digest is not None and not _digest(self.trusted_relation_digest))
+                or (self.kind is EdgeKind.SEMANTIC_INFERRED and self.trusted_relation_digest is not None)):
             raise DependencyReviewError("dependency proposal edge is invalid")
 
     def payload(self) -> dict[str, str]:
@@ -160,6 +206,7 @@ class ProposedEdge:
             "rationale_digest": self.rationale_digest,
             "confidence": self.confidence.value,
             "conflicts_digest": self.conflicts_digest,
+            "trusted_relation_digest": self.trusted_relation_digest,
         }
 
 
@@ -187,7 +234,7 @@ class DependencyProposal:
 
     def payload(self) -> dict[str, object]:
         return {
-            "schema": "roundwright-dependency-review-proposal/v1",
+            "schema": "roundwright-dependency-review-proposal/v2",
             "proposal_id": self.proposal_id,
             "attempt_id": self.attempt_id,
             "requested_disposition": self.requested_disposition.value,
@@ -204,9 +251,9 @@ class DependencyProposal:
         """Parse only the strict public-safe provider response shape."""
 
         try:
-            if type(material) is not dict or set(material) != {"schema", "proposal_id", "attempt_id", "requested_disposition", "owner_route", "edges"} or material["schema"] != "roundwright-dependency-review-proposal/v1" or type(material["edges"]) is not list:
+            if type(material) is not dict or set(material) != {"schema", "proposal_id", "attempt_id", "requested_disposition", "owner_route", "edges"} or material["schema"] != "roundwright-dependency-review-proposal/v2" or type(material["edges"]) is not list:
                 raise ValueError
-            edges = tuple(ProposedEdge(EdgeKind(edge["kind"]), EdgeDirection(edge["direction"]), edge["subject_member_id"], edge["object_member_id"], edge["rationale_digest"], Confidence(edge["confidence"]), edge["conflicts_digest"]) for edge in material["edges"] if type(edge) is dict and set(edge) == {"kind", "direction", "subject_member_id", "object_member_id", "rationale_digest", "confidence", "conflicts_digest"})
+            edges = tuple(ProposedEdge(EdgeKind(edge["kind"]), EdgeDirection(edge["direction"]), edge["subject_member_id"], edge["object_member_id"], edge["rationale_digest"], Confidence(edge["confidence"]), edge["conflicts_digest"], edge["trusted_relation_digest"]) for edge in material["edges"] if type(edge) is dict and set(edge) == {"kind", "direction", "subject_member_id", "object_member_id", "rationale_digest", "confidence", "conflicts_digest", "trusted_relation_digest"})
             if len(edges) != len(material["edges"]):
                 raise ValueError
             proposal = cls(material["proposal_id"], material["attempt_id"], RequestedDisposition(material["requested_disposition"]), material["owner_route"], edges)
@@ -231,11 +278,15 @@ class DependencyReviewAttempt:
 class DependencyReviewStore:
     """Transactional persistence for isolated dependency-review records only."""
 
-    def start_attempt(self, repository: RepositoryIdentity, subset: AffectedSubset, *, attempt_id: str, binding: DependencyReviewBinding, supersedes_attempt_id: str | None = None) -> DependencyReviewAttempt:
-        if not _token(attempt_id) or type(binding) is not DependencyReviewBinding or (supersedes_attempt_id is not None and not _token(supersedes_attempt_id)):
+    def start_attempt(self, repository: RepositoryIdentity, subset: AffectedSubset, *, attempt_id: str, binding: DependencyReviewBinding, source_owned_relations: tuple[SourceOwnedRelation, ...] = (), supersedes_attempt_id: str | None = None) -> DependencyReviewAttempt:
+        if (not _token(attempt_id) or type(binding) is not DependencyReviewBinding
+                or type(source_owned_relations) is not tuple or any(type(item) is not SourceOwnedRelation for item in source_owned_relations)
+                or len({item.relation_digest for item in source_owned_relations}) != len(source_owned_relations)
+                or (supersedes_attempt_id is not None and not _token(supersedes_attempt_id))):
             raise DependencyReviewError("dependency review attempt identity is invalid")
         binding.require_subset(subset)
-        input_digest = _digest_value(self.model_input(subset, attempt_id=attempt_id, profile_identity=binding.profile_identity))
+        source_owned_relations = tuple(sorted(source_owned_relations, key=lambda item: item.relation_digest))
+        input_digest = _digest_value(self.model_input(subset, attempt_id=attempt_id, profile_identity=binding.profile_identity, source_owned_relations=source_owned_relations))
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -271,9 +322,10 @@ class DependencyReviewStore:
                 connection.execute("INSERT INTO dependency_review_attempts(attempt_id, task_id, snapshot_id, profile_identity, configuration_digest, input_digest, supersedes_attempt_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared')", (attempt_id, subset.task_id, subset.snapshot_id, binding.profile_identity, subset.configuration_digest, input_digest, supersedes_attempt_id))
                 if supersedes_attempt_id is not None:
                     connection.execute("INSERT INTO dependency_review_successors(predecessor_attempt_id, successor_attempt_id) VALUES (?, ?)", (supersedes_attempt_id, attempt_id))
+                self._persist_source_owned_relations(connection, subset, attempt_id, source_owned_relations)
                 self._verify_task_lineage(connection, subset.task_id)
                 state = "prepared"
-            elif tuple(existing) == expected:
+            elif tuple(existing) == expected and self._read_source_owned_relations(connection, subset, attempt_id) == source_owned_relations:
                 state = "prepared"
             else:
                 raise DependencyReviewError("dependency review attempt has drifted")
@@ -286,13 +338,14 @@ class DependencyReviewStore:
             connection.close()
 
     @staticmethod
-    def model_input(subset: AffectedSubset, *, attempt_id: str, profile_identity: str) -> dict[str, object]:
-        """Return the only model input surface: identifiers and digests, never prose or credentials."""
+    def model_input(subset: AffectedSubset, *, attempt_id: str, profile_identity: str, source_owned_relations: tuple[SourceOwnedRelation, ...] = ()) -> dict[str, object]:
+        """Return the only model input surface: immutable identifiers and digests."""
 
-        if not _token(attempt_id) or not _digest(profile_identity):
+        if (not _token(attempt_id) or not _digest(profile_identity) or type(source_owned_relations) is not tuple
+                or any(type(item) is not SourceOwnedRelation for item in source_owned_relations)):
             raise DependencyReviewError("dependency review model input is invalid")
         return {
-            "schema": "roundwright-dependency-review-input/v1",
+            "schema": "roundwright-dependency-review-input/v2",
             "attempt_id": attempt_id,
             "profile_identity": profile_identity,
             "subset_digest": subset.content_digest,
@@ -303,7 +356,36 @@ class DependencyReviewStore:
             "configuration_digest": subset.configuration_digest,
             "boundary_digest": subset.boundary_digest,
             "members": [member.payload() for member in subset.members],
+            "trusted_relations": [
+                {"trusted_relation_digest": relation.relation_digest, **relation.payload()}
+                for relation in sorted(source_owned_relations, key=lambda item: item.relation_digest)
+            ],
         }
+
+    @staticmethod
+    def _persist_source_owned_relations(connection: object, subset: AffectedSubset, attempt_id: str, relations: tuple[SourceOwnedRelation, ...]) -> None:
+        """Write trusted source/policy facts in the preparation transaction, pre-dispatch."""
+
+        # The graph module depends on this module, so keep the import local.
+        from .dependency_graph import DependencyGraphBinding, DependencyGraphStore
+
+        binding = DependencyGraphBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest)
+        for relation in relations:
+            DependencyGraphStore._persist_source_relation(connection, subset, binding, attempt_id, relation)
+
+    @staticmethod
+    def _read_source_owned_relations(connection: object, subset: AffectedSubset, attempt_id: str) -> tuple[SourceOwnedRelation, ...]:
+        rows = tuple(connection.execute(
+            "SELECT edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_graph_trusted_relations WHERE snapshot_id = ? AND attempt_id = ? AND candidate_sha = ? AND policy_digest = ? AND configuration_digest = ?",
+            (subset.snapshot_id, attempt_id, subset.candidate_sha, subset.policy_digest, subset.configuration_digest),
+        ))
+        try:
+            relations = tuple(SourceOwnedRelation(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, Confidence(confidence), conflicts) for kind, direction, subject, object_, rationale, confidence, conflicts in rows)
+        except (TypeError, ValueError) as error:
+            raise DependencyReviewError("source-owned relation evidence has drifted") from error
+        if len({item.relation_digest for item in relations}) != len(relations):
+            raise DependencyReviewError("source-owned relation evidence has drifted")
+        return tuple(sorted(relations, key=lambda item: item.relation_digest))
 
     @staticmethod
     def _read_subset(connection: object, snapshot_id: str) -> AffectedSubset:
@@ -324,8 +406,8 @@ class DependencyReviewStore:
 
     @staticmethod
     def _verify_proposal_edges(connection: object, proposal: DependencyProposal) -> None:
-        stored = tuple(connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal.proposal_id,)))
-        expected = tuple((ordinal, edge.kind.value, edge.direction.value, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest) for ordinal, edge in enumerate(proposal.edges))
+        stored = tuple(connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, trusted_relation_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal.proposal_id,)))
+        expected = tuple((ordinal, edge.kind.value, edge.direction.value, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest, edge.trusted_relation_digest) for ordinal, edge in enumerate(proposal.edges))
         if stored != expected:
             raise DependencyReviewError("dependency proposal edges have drifted")
 
@@ -335,10 +417,10 @@ class DependencyReviewStore:
         if row is None:
             raise DependencyReviewError("dependency proposal is unavailable")
         try:
-            stored_edges = tuple(connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal_id,)))
+            stored_edges = tuple(connection.execute("SELECT ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, trusted_relation_digest FROM dependency_review_proposal_edges WHERE proposal_id = ? ORDER BY ordinal", (proposal_id,)))
             if tuple(edge[0] for edge in stored_edges) != tuple(range(len(stored_edges))):
                 raise DependencyReviewError("dependency proposal edges have drifted")
-            edges = tuple(ProposedEdge(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, Confidence(confidence), conflicts) for _, kind, direction, subject, object_, rationale, confidence, conflicts in stored_edges)
+            edges = tuple(ProposedEdge(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, Confidence(confidence), conflicts, trusted_relation_digest) for _, kind, direction, subject, object_, rationale, confidence, conflicts, trusted_relation_digest in stored_edges)
             proposal = DependencyProposal(proposal_id, row[0], RequestedDisposition(row[2]), row[3], edges)
         except (TypeError, ValueError) as error:
             raise DependencyReviewError("dependency proposal has drifted") from error
@@ -354,7 +436,7 @@ class DependencyReviewStore:
         if row is None:
             raise DependencyReviewError("dependency review attempt is unavailable")
         subset = DependencyReviewStore._read_subset(connection, row[1])
-        if row[0] != subset.task_id or not _digest(row[2]) or row[3] != subset.configuration_digest or row[4] != _digest_value(DependencyReviewStore.model_input(subset, attempt_id=attempt_id, profile_identity=row[2])) or (row[5] is not None and not _token(row[5])):
+        if row[0] != subset.task_id or not _digest(row[2]) or row[3] != subset.configuration_digest or row[4] != _digest_value(DependencyReviewStore.model_input(subset, attempt_id=attempt_id, profile_identity=row[2], source_owned_relations=DependencyReviewStore._read_source_owned_relations(connection, subset, attempt_id))) or (row[5] is not None and not _token(row[5])):
             raise DependencyReviewError("dependency review attempt has drifted")
         proposals = tuple(connection.execute("SELECT proposal_id FROM dependency_review_proposals WHERE attempt_id = ?", (attempt_id,)))
         outcome = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (attempt_id,)).fetchone()
@@ -455,7 +537,7 @@ class DependencyReviewStore:
                 if collision is not None:
                     raise DependencyReviewError("dependency review attempt already has a proposal")
                 connection.execute("INSERT INTO dependency_review_proposals(proposal_id, attempt_id, proposal_digest, requested_disposition, owner_route) VALUES (?, ?, ?, ?, ?)", (proposal.proposal_id, *expected))
-                connection.executemany("INSERT INTO dependency_review_proposal_edges(proposal_id, ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ((proposal.proposal_id, ordinal, edge.kind.value, edge.direction.value, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest) for ordinal, edge in enumerate(proposal.edges)))
+                connection.executemany("INSERT INTO dependency_review_proposal_edges(proposal_id, ordinal, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, trusted_relation_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ((proposal.proposal_id, ordinal, edge.kind.value, edge.direction.value, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest, edge.trusted_relation_digest) for ordinal, edge in enumerate(proposal.edges)))
             else:
                 raise DependencyReviewError("dependency proposal has drifted")
             self._verify_proposal_edges(connection, proposal)

@@ -717,6 +717,15 @@ MIGRATIONS = (
             ("dependency_graph_trusted_relations", "CREATE TABLE dependency_graph_trusted_relations (provenance_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_digest TEXT NOT NULL, subject_member_fingerprint TEXT NOT NULL, object_member_fingerprint TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(snapshot_id, provenance_digest))"),
         ),
     ),
+    Migration(
+        56,
+        (
+            "ALTER TABLE dependency_review_proposal_edges ADD COLUMN trusted_relation_digest TEXT",
+        ),
+        (
+            ("dependency_review_proposal_edges", "CREATE TABLE dependency_review_proposal_edges (proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), ordinal INTEGER NOT NULL CHECK(ordinal >= 0), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived', 'semantic-inferred')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, trusted_relation_digest TEXT, PRIMARY KEY(proposal_id, ordinal), UNIQUE(proposal_id, subject_member_id, object_member_id, edge_kind, direction))"),
+        ),
+    ),
 )
 
 

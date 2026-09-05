@@ -687,6 +687,18 @@ MIGRATIONS = (
             ("dependency_graph_decisions", "CREATE TABLE dependency_graph_decisions (proposal_id TEXT PRIMARY KEY REFERENCES dependency_review_proposals(proposal_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), subset_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('accepted', 'pending-owner', 'rejected')), reason_code TEXT NOT NULL, decision_digest TEXT NOT NULL, graph_version_id TEXT UNIQUE REFERENCES dependency_graph_versions(graph_version_id))"),
         ),
     ),
+    Migration(
+        53,
+        (
+            "ALTER TABLE dependency_graph_edges ADD COLUMN provenance_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN dependency_graph_version_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN dependency_graph_decision_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("dependency_graph_edges", "CREATE TABLE dependency_graph_edges (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), provenance_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(graph_version_id, subject_member_id, object_member_id))"),
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', dependency_graph_version_id TEXT NOT NULL DEFAULT '', dependency_graph_decision_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
 )
 
 

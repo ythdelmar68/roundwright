@@ -78,6 +78,41 @@ class DependencyGraphBinding:
 
 
 @dataclass(frozen=True)
+class TrustedEdgeProvenance:
+    """Candidate-bound deterministic evidence for one mechanically admissible edge."""
+
+    kind: EdgeKind
+    direction: EdgeDirection
+    subject_member_id: str
+    object_member_id: str
+    rationale_digest: str
+    confidence: str
+    conflicts_digest: str
+    candidate_sha: str
+    policy_digest: str
+    configuration_digest: str
+    provenance_digest: str
+
+    def __post_init__(self) -> None:
+        if (self.kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED} or type(self.direction) is not EdgeDirection
+                or not _TOKEN.fullmatch(self.subject_member_id) or not _TOKEN.fullmatch(self.object_member_id)
+                or not _digest(self.rationale_digest) or self.confidence not in {"high", "medium", "low"}
+                or not _digest(self.conflicts_digest) or not _SHA.fullmatch(self.candidate_sha)
+                or not _digest(self.policy_digest) or not _digest(self.configuration_digest)
+                or not _digest(self.provenance_digest) or self.provenance_digest != _digest_value(self.payload())):
+            raise DependencyGraphError("trusted edge provenance is invalid")
+
+    def payload(self) -> dict[str, str]:
+        return {"kind": self.kind.value, "direction": self.direction.value, "subject_member_id": self.subject_member_id, "object_member_id": self.object_member_id, "rationale_digest": self.rationale_digest, "confidence": self.confidence, "conflicts_digest": self.conflicts_digest, "candidate_sha": self.candidate_sha, "policy_digest": self.policy_digest, "configuration_digest": self.configuration_digest}
+
+    @classmethod
+    def attest(cls, edge: ProposedEdge, binding: DependencyGraphBinding) -> "TrustedEdgeProvenance":
+        """Create deterministic policy evidence outside the model proposal path."""
+        material = {"kind": edge.kind.value, "direction": edge.direction.value, "subject_member_id": edge.subject_member_id, "object_member_id": edge.object_member_id, "rationale_digest": edge.rationale_digest, "confidence": edge.confidence.value, "conflicts_digest": edge.conflicts_digest, "candidate_sha": binding.candidate_sha, "policy_digest": binding.policy_digest, "configuration_digest": binding.configuration_digest}
+        return cls(edge.kind, edge.direction, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest, binding.candidate_sha, binding.policy_digest, binding.configuration_digest, _digest_value(material))
+
+
+@dataclass(frozen=True)
 class GraphEdge:
     """One canonical directed edge: subject depends on object."""
 
@@ -85,6 +120,7 @@ class GraphEdge:
     object_member_id: str
     kind: EdgeKind
     proposal_id: str
+    provenance_digest: str
 
     def __post_init__(self) -> None:
         if (
@@ -93,6 +129,7 @@ class GraphEdge:
             or self.subject_member_id == self.object_member_id
             or self.kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED}
             or not _TOKEN.fullmatch(self.proposal_id)
+            or not _digest(self.provenance_digest)
         ):
             raise DependencyGraphError("dependency graph edge is invalid")
 
@@ -102,6 +139,7 @@ class GraphEdge:
             "object_member_id": self.object_member_id,
             "kind": self.kind.value,
             "proposal_id": self.proposal_id,
+            "provenance_digest": self.provenance_digest,
         }
 
 
@@ -194,8 +232,8 @@ class DependencyGraphValidator:
     """Pure policy/graph validation for one candidate-bound proposed change."""
 
     @staticmethod
-    def validate(proposal: DependencyProposal, subset: AffectedSubset, binding: DependencyGraphBinding, active: GraphSnapshot) -> GraphValidation:
-        if type(proposal) is not DependencyProposal or type(subset) is not AffectedSubset or type(binding) is not DependencyGraphBinding or type(active) is not GraphSnapshot:
+    def validate(proposal: DependencyProposal, subset: AffectedSubset, binding: DependencyGraphBinding, active: GraphSnapshot, provenance: tuple[TrustedEdgeProvenance, ...]) -> GraphValidation:
+        if type(proposal) is not DependencyProposal or type(subset) is not AffectedSubset or type(binding) is not DependencyGraphBinding or type(active) is not GraphSnapshot or type(provenance) is not tuple or any(type(item) is not TrustedEdgeProvenance for item in provenance):
             raise DependencyGraphError("dependency graph validation input is invalid")
         binding.require_subset(subset)
         if active.binding is not None and active.binding != binding:
@@ -211,6 +249,8 @@ class DependencyGraphValidator:
         proposed_members = {item for edge in proposal.edges for item in (edge.subject_member_id, edge.object_member_id)}
         if proposed_members != members:
             return GraphValidation(GraphDecision.REJECTED, "affected-subset-incomplete", ())
+        prior = DependencyGraphStore._replacement_baseline(active, subset, binding)
+        proofs = {(item.kind, item.direction, item.subject_member_id, item.object_member_id, item.rationale_digest, item.confidence, item.conflicts_digest): item for item in provenance}
         canonical: list[GraphEdge] = []
         for edge in proposal.edges:
             if edge.kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED}:
@@ -221,14 +261,17 @@ class DependencyGraphValidator:
                 subject, object_ = edge.object_member_id, edge.subject_member_id
             else:
                 return GraphValidation(GraphDecision.REJECTED, "direction-invalid", ())
-            canonical.append(GraphEdge(subject, object_, edge.kind, proposal.proposal_id))
+            proof = proofs.get((edge.kind, edge.direction, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest))
+            if proof is None or (proof.candidate_sha, proof.policy_digest, proof.configuration_digest) != (binding.candidate_sha, binding.policy_digest, binding.configuration_digest):
+                return GraphValidation(GraphDecision.REJECTED, "provenance-unavailable", ())
+            canonical.append(GraphEdge(subject, object_, edge.kind, proposal.proposal_id, proof.provenance_digest))
         pairs = {(edge.subject_member_id, edge.object_member_id) for edge in canonical}
         if len(pairs) != len(canonical):
             return GraphValidation(GraphDecision.REJECTED, "duplicate-or-conflicting-edge", ())
-        existing_pairs = {(edge.subject_member_id, edge.object_member_id) for edge in active.edges}
+        existing_pairs = {(edge.subject_member_id, edge.object_member_id) for edge in prior.edges}
         if pairs & existing_pairs:
             return GraphValidation(GraphDecision.REJECTED, "duplicate-or-conflicting-edge", ())
-        if _has_cycle((*active.edges, *canonical)):
+        if _has_cycle((*prior.edges, *canonical)):
             return GraphValidation(GraphDecision.REJECTED, "cycle-detected", ())
         return GraphValidation(GraphDecision.ACCEPTED, "graph-valid", tuple(sorted(canonical, key=lambda edge: (edge.subject_member_id, edge.object_member_id, edge.kind.value))))
 
@@ -236,7 +279,7 @@ class DependencyGraphValidator:
 class DependencyGraphStore:
     """Persist a complete graph version and its decision in one SQLite transaction."""
 
-    def activate(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyGraphBinding, graph_version_id: str) -> GraphActivation:
+    def activate(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyGraphBinding, graph_version_id: str, provenance: tuple[TrustedEdgeProvenance, ...] = ()) -> GraphActivation:
         if type(binding) is not DependencyGraphBinding or not _TOKEN.fullmatch(graph_version_id):
             raise DependencyGraphError("dependency graph activation identity is invalid")
         connection = _open_writable_connection(repository)
@@ -247,6 +290,9 @@ class DependencyGraphStore:
             if stored != proposal or attempt[6] != "accepted":
                 raise DependencyGraphError("dependency proposal is not durably accepted")
             binding.require_subset(subset)
+            DependencyReviewStore._verify_task_lineage(connection, attempt[0])
+            if connection.execute("SELECT 1 FROM dependency_review_successors WHERE predecessor_attempt_id = ?", (proposal.attempt_id,)).fetchone() is not None:
+                raise DependencyGraphError("dependency proposal is superseded")
             active = self._read_current(connection)
             existing = connection.execute(
                 "SELECT attempt_id, subset_digest, validator_digest, policy_digest, candidate_sha, configuration_digest, decision, reason_code, decision_digest, graph_version_id FROM dependency_graph_decisions WHERE proposal_id = ?",
@@ -266,7 +312,7 @@ class DependencyGraphStore:
                     raise DependencyGraphError("dependency graph decision has drifted")
                 connection.commit()
                 return GraphActivation(proposal.proposal_id, decision, reason_code, decision_digest, version)
-            validation = DependencyGraphValidator.validate(proposal, subset, binding, active)
+            validation = DependencyGraphValidator.validate(proposal, subset, binding, active, provenance)
             expected_digest = validation.digest(proposal, subset, binding)
             expected = (proposal.attempt_id, subset.content_digest, binding.validator_digest, binding.policy_digest, binding.candidate_sha, binding.configuration_digest, validation.decision.value, validation.reason_code, expected_digest)
             version: str | None = None
@@ -322,7 +368,7 @@ class DependencyGraphStore:
             raise DependencyGraphError("current dependency graph is unavailable")
         binding = DependencyGraphBinding(row[3], row[2], row[4], row[1])
         members = tuple(GraphMember(task_id, snapshot_id, AffectedMember(member_id, fingerprint, content)) for task_id, snapshot_id, member_id, fingerprint, content in connection.execute("SELECT task_id, snapshot_id, member_id, member_fingerprint, content_digest FROM dependency_graph_members WHERE graph_version_id = ? ORDER BY member_id", (version,)))
-        edges = tuple(GraphEdge(subject, object_, EdgeKind(kind), proposal_id) for subject, object_, kind, proposal_id in connection.execute("SELECT subject_member_id, object_member_id, edge_kind, proposal_id FROM dependency_graph_edges WHERE graph_version_id = ? ORDER BY subject_member_id, object_member_id", (version,)))
+        edges = tuple(GraphEdge(subject, object_, EdgeKind(kind), proposal_id, provenance) for subject, object_, kind, proposal_id, provenance in connection.execute("SELECT subject_member_id, object_member_id, edge_kind, proposal_id, provenance_digest FROM dependency_graph_edges WHERE graph_version_id = ? ORDER BY subject_member_id, object_member_id", (version,)))
         proposal_ids = tuple(item[0] for item in connection.execute("SELECT DISTINCT proposal_id FROM dependency_graph_edges WHERE graph_version_id = ? ORDER BY proposal_id", (version,)))
         snapshot = GraphSnapshot(version, binding, members, edges, proposal_ids)
         if snapshot.proposal_set_digest != row[0] or snapshot.graph_digest != row[5] or _has_cycle(snapshot.edges):
@@ -331,18 +377,27 @@ class DependencyGraphStore:
 
     @staticmethod
     def _next_snapshot(active: GraphSnapshot, subset: AffectedSubset, edges: tuple[GraphEdge, ...], proposal_id: str, binding: DependencyGraphBinding) -> GraphSnapshot:
-        old_members = active.members if active.binding == binding else ()
+        baseline = DependencyGraphStore._replacement_baseline(active, subset, binding)
+        old_members = baseline.members
         replaced = {member.member.member_id for member in old_members if member.task_id == subset.task_id}
         members = tuple(member for member in old_members if member.member.member_id not in replaced) + tuple(GraphMember(subset.task_id, subset.snapshot_id, member) for member in subset.members)
-        retained_edges = tuple(edge for edge in (active.edges if active.binding == binding else ()) if edge.subject_member_id not in replaced and edge.object_member_id not in replaced)
-        retained_proposals = tuple(item for item in (active.proposal_ids if active.binding == binding else ()) if item not in {edge.proposal_id for edge in active.edges if edge.subject_member_id in replaced or edge.object_member_id in replaced})
-        return GraphSnapshot(None, None, tuple(sorted(members, key=lambda member: member.member.member_id)), tuple(sorted((*retained_edges, *edges), key=lambda edge: (edge.subject_member_id, edge.object_member_id, edge.kind.value))), tuple(sorted((*retained_proposals, proposal_id))))
+        return GraphSnapshot(None, None, tuple(sorted(members, key=lambda member: member.member.member_id)), tuple(sorted((*baseline.edges, *edges), key=lambda edge: (edge.subject_member_id, edge.object_member_id, edge.kind.value))), tuple(sorted((*baseline.proposal_ids, proposal_id))))
+
+    @staticmethod
+    def _replacement_baseline(active: GraphSnapshot, subset: AffectedSubset, binding: DependencyGraphBinding) -> GraphSnapshot:
+        if active.binding != binding:
+            return GraphSnapshot(None, None, (), (), ())
+        replaced = {member.member.member_id for member in active.members if member.task_id == subset.task_id}
+        members = tuple(member for member in active.members if member.member.member_id not in replaced)
+        edges = tuple(edge for edge in active.edges if edge.subject_member_id not in replaced and edge.object_member_id not in replaced)
+        retained = tuple(sorted({edge.proposal_id for edge in edges}))
+        return GraphSnapshot(None, None, members, edges, retained)
 
     @staticmethod
     def _write_version(connection: object, version: str, predecessor: str | None, snapshot: GraphSnapshot, binding: DependencyGraphBinding) -> None:
         connection.execute("INSERT INTO dependency_graph_versions(graph_version_id, predecessor_graph_version_id, proposal_set_digest, validator_digest, policy_digest, candidate_sha, configuration_digest, graph_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (version, predecessor, snapshot.proposal_set_digest, binding.validator_digest, binding.policy_digest, binding.candidate_sha, binding.configuration_digest, snapshot.graph_digest))
         connection.executemany("INSERT INTO dependency_graph_members(graph_version_id, task_id, snapshot_id, member_id, member_fingerprint, content_digest) VALUES (?, ?, ?, ?, ?, ?)", ((version, member.task_id, member.snapshot_id, member.member.member_id, member.member.member_fingerprint, member.member.content_digest) for member in snapshot.members))
-        connection.executemany("INSERT INTO dependency_graph_edges(graph_version_id, subject_member_id, object_member_id, edge_kind, proposal_id) VALUES (?, ?, ?, ?, ?)", ((version, edge.subject_member_id, edge.object_member_id, edge.kind.value, edge.proposal_id) for edge in snapshot.edges))
+        connection.executemany("INSERT INTO dependency_graph_edges(graph_version_id, subject_member_id, object_member_id, edge_kind, proposal_id, provenance_digest) VALUES (?, ?, ?, ?, ?, ?)", ((version, edge.subject_member_id, edge.object_member_id, edge.kind.value, edge.proposal_id, edge.provenance_digest) for edge in snapshot.edges))
 
 
 def _has_cycle(edges: tuple[GraphEdge, ...] | list[GraphEdge]) -> bool:

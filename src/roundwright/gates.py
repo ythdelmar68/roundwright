@@ -246,7 +246,7 @@ def record_gate_evidence(
             )
         elif persisted_context[:16] != context_values:
             trusted_context_unchanged = persisted_context[2:14] == context_values[2:14] and persisted_context[16] == policy_activated_at
-            source_rebound = trusted_context_unchanged and persisted_context[:2] != context_values[:2]
+            source_rebound = trusted_context_unchanged and persisted_context[0] != context_values[0]
             graph_moved = trusted_context_unchanged and persisted_context[:2] == context_values[:2]
             if source_rebound and context.source_count > 1 and (_value(evidence.gate_key) != GateKey.DEPENDENCY_GRAPH.value or _value(evidence.outcome) != EvidenceOutcome.PASS.value):
                 raise GateError("source-count rebind requires current dependency graph evidence")
@@ -513,7 +513,11 @@ def _decision_from_connection(connection, identity) -> GateDecision:
         (identity.task_id, seal[1]),
     ).fetchall()
     evidence = tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows)
-    if context.source_count != _affected_source_count(connection, identity.task_id):
+    try:
+        source_count = _affected_source_count(connection, identity.task_id)
+    except GateError:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "affected source subset is unavailable or stale"),))
+    if context.source_count != source_count:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "affected source count is stale"),))
     decision = decide_gates(context, evidence)
     if decision.outcome is GateOutcome.PASS and context.source_count > 1:
@@ -730,11 +734,24 @@ def _is_token(value: object) -> bool:
 
 def _affected_source_count(connection, task_id: str) -> int:
     """Use the terminal immutable affected subset when review evidence exists."""
-    row = connection.execute(
-        "SELECT subsets.member_count FROM dependency_review_attempts AS attempts JOIN dependency_review_subsets AS subsets ON subsets.snapshot_id = attempts.snapshot_id WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
+    from .dependency_review import DependencyReviewError, DependencyReviewStore
+
+    terminals = tuple(connection.execute(
+        "SELECT attempts.attempt_id FROM dependency_review_attempts AS attempts WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
         (task_id,),
-    ).fetchone()
-    return row[0] if row is not None and type(row[0]) is int and row[0] > 0 else 1
+    ))
+    if not terminals:
+        return 1
+    if len(terminals) != 1:
+        raise GateError("terminal dependency review lineage is unavailable")
+    try:
+        DependencyReviewStore._verify_task_lineage(connection, task_id)
+        attempt, subset = DependencyReviewStore._read_attempt(connection, terminals[0][0])
+    except DependencyReviewError as error:
+        raise GateError("terminal dependency review subset is unavailable") from error
+    if attempt[0] != task_id or len(subset.members) <= 0:
+        raise GateError("terminal dependency review subset is unavailable")
+    return len(subset.members)
 
 
 def _require_current_dependency_graph(connection, task_id: str, candidate_sha: str, context: GateContext, evidence: GateEvidence) -> None:

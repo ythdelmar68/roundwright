@@ -298,17 +298,30 @@ class DependencyGraphValidator:
         if active.binding is not None and active.binding != binding:
             # Candidate movement starts a new aggregate.  An old PASS is never input to it.
             active = GraphSnapshot(None, None, (), (), ())
+        members = {member.member_id for member in subset.members}
+        proposed_members = {item for edge in proposal.edges for item in (edge.subject_member_id, edge.object_member_id)}
+        if proposed_members != members:
+            return GraphValidation(GraphDecision.REJECTED, "affected-subset-incomplete", ())
+        prior = DependencyGraphStore._replacement_baseline(active, subset, binding)
+        canonical_pairs: list[tuple[str, str]] = []
+        for edge in proposal.edges:
+            if edge.direction is EdgeDirection.DEPENDS_ON:
+                canonical_pairs.append((edge.subject_member_id, edge.object_member_id))
+            elif edge.direction is EdgeDirection.BLOCKS:
+                canonical_pairs.append((edge.object_member_id, edge.subject_member_id))
+            else:
+                return GraphValidation(GraphDecision.REJECTED, "direction-invalid", ())
+        if len(set(canonical_pairs)) != len(canonical_pairs) or set(canonical_pairs) & {(edge.subject_member_id, edge.object_member_id) for edge in prior.edges}:
+            return GraphValidation(GraphDecision.REJECTED, "duplicate-or-conflicting-edge", ())
+        structural_edges = tuple(GraphEdge(subject, object_, edge.kind if edge.kind in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED} else EdgeKind.EXPLICIT, proposal.proposal_id, "sha256:" + "0" * 64) for edge, (subject, object_) in zip(proposal.edges, canonical_pairs))
+        if _has_cycle((*prior.edges, *structural_edges)):
+            return GraphValidation(GraphDecision.REJECTED, "cycle-detected", ())
         if proposal.requested_disposition is RequestedDisposition.REJECT:
             return GraphValidation(GraphDecision.REJECTED, "proposal-rejected", ())
         if proposal.requested_disposition is RequestedDisposition.OWNER_REVIEW or any(edge.kind is EdgeKind.SEMANTIC_INFERRED for edge in proposal.edges):
             return GraphValidation(GraphDecision.PENDING_OWNER, "owner-decision-required", ())
         if proposal.requested_disposition is not RequestedDisposition.AUTO_ACTIVATE or proposal.owner_route != "not-required":
             return GraphValidation(GraphDecision.REJECTED, "invalid-disposition", ())
-        members = {member.member_id for member in subset.members}
-        proposed_members = {item for edge in proposal.edges for item in (edge.subject_member_id, edge.object_member_id)}
-        if proposed_members != members:
-            return GraphValidation(GraphDecision.REJECTED, "affected-subset-incomplete", ())
-        prior = DependencyGraphStore._replacement_baseline(active, subset, binding)
         member_fingerprints = {member.member_id: member.member_fingerprint for member in subset.members}
         proofs = {
             SourceOwnedRelation(item.kind, item.direction, item.subject_member_id, item.object_member_id, item.rationale_digest, Confidence(item.confidence), item.conflicts_digest).relation_digest: item

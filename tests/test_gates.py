@@ -403,6 +403,48 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                 with self.assertRaises(GateError):
                     transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="d" * 64, policy_evidence=policy_evidence, lease=lease)
 
+    def test_terminal_subset_member_count_and_lineage_drift_block_public_gate_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints, reviews, subset, review_binding = self.complete_persisted_multi_source_pass(Path(temporary))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE dependency_review_subsets SET member_count = 3 WHERE snapshot_id = ?", (subset.snapshot_id,))
+                connection.commit()
+            finally:
+                connection.close()
+            policy_evidence = self.policy_evidence(context)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="c" * 64, policy_evidence=policy_evidence, lease=lease)
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints, reviews, subset, review_binding = self.complete_persisted_multi_source_pass(Path(temporary))
+            successor = AffectedSubset("subset-22", identity.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            reviews.start_attempt(repository, successor, attempt_id="attempt-22", binding=review_binding, supersedes_attempt_id="attempt-21")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("DELETE FROM dependency_review_successors WHERE predecessor_attempt_id = ?", ("attempt-21",))
+                connection.commit()
+            finally:
+                connection.close()
+            policy_evidence = self.policy_evidence(context)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="b" * 64, policy_evidence=policy_evidence, lease=lease)
+
+    def test_isolation_only_context_movement_cannot_rebind_persisted_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints, *_ = self.complete_persisted_multi_source_pass(Path(temporary))
+            moved = GateContext(context.task_id, context.candidate_sha, context.source_count, True, context.policy_digest, context.receipt_fingerprint, context.runtime_binding, context.selected_supervisor_profile_identity, dependency_graph_version_id=context.dependency_graph_version_id, dependency_graph_decision_digest=context.dependency_graph_decision_digest)
+            evidence = GateEvidence(identity.task_id, seal.candidate_sha, GateKey.BUILD, EvidenceOutcome.PASS, "validator", 99, "a" * 64)
+            with mock.patch("roundwright.gates.bind_candidate_evidence"), mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                with self.assertRaises(GateError):
+                    record_gate_evidence(repository, binding, seal, moved, evidence, policy_evidence=self.policy_evidence(moved), lease=lease)
+                self.assertEqual(evaluate_gates(repository, binding, seal, moved, policy_evidence=self.policy_evidence(moved), lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, moved, evidence_fingerprint="a" * 64, policy_evidence=self.policy_evidence(moved), lease=lease)
+
     def test_sqlite_evidence_is_candidate_bound_and_uses_the_current_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary))

@@ -509,6 +509,32 @@ class DependencyReviewTests(unittest.TestCase):
             self.assertEqual(result.decision, GraphDecision.REJECTED)
             self.assertEqual(result.reason_code, "cycle-detected")
 
+    def test_semantic_owner_routing_requires_complete_nonconflicting_acyclic_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            expanded = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", (*subset.members, AffectedMember("member-c", digest("9"), digest("a"))))
+            binding = self.binding(expanded)
+            reviews = DependencyReviewStore()
+            reviews.start_attempt(repository, expanded, attempt_id="attempt-113", binding=binding)
+            incomplete = DependencyProposal("proposal-113", "attempt-113", RequestedDisposition.OWNER_REVIEW, "owner-review", (
+                ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
+            ))
+            reviews.accept_proposal(repository, incomplete, binding=binding)
+            result = DependencyGraphStore().activate(repository, incomplete, binding=DependencyGraphBinding.from_review_binding(binding), graph_version_id="graph-113")
+            self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "affected-subset-incomplete"))
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            binding = self.binding(subset)
+            reviews = DependencyReviewStore()
+            reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=binding)
+            cyclic = DependencyProposal("proposal-113", "attempt-113", RequestedDisposition.OWNER_REVIEW, "owner-review", (
+                ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
+                ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8")),
+            ))
+            reviews.accept_proposal(repository, cyclic, binding=binding)
+            result = DependencyGraphStore().activate(repository, cyclic, binding=DependencyGraphBinding.from_review_binding(binding), graph_version_id="graph-113")
+            self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "cycle-detected"))
+
     def test_graph_requires_provenance_and_replaces_only_the_terminal_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))

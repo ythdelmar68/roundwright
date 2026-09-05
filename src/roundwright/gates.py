@@ -245,7 +245,8 @@ def record_gate_evidence(
                 (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at),
             )
         elif persisted_context[:16] != context_values:
-            if type(persisted_context[16]) is not str or policy_activated_at <= persisted_context[16]:
+            graph_moved = persisted_context[:14] == context_values[:14] and persisted_context[16] == policy_activated_at
+            if not graph_moved and (type(persisted_context[16]) is not str or policy_activated_at <= persisted_context[16]):
                 raise GateError("gate context conflicts with committed task state")
             connection.execute(
                 "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",
@@ -664,7 +665,7 @@ def _is_well_formed_context(context: GateContext) -> bool:
         and type(context.runtime_binding) is RuntimeBinding
         and context.selected_supervisor_profile_identity in context.runtime_binding.supervisor_profile_identities
         and (context.dependency_graph_version_id is None or _is_token(context.dependency_graph_version_id))
-        and (context.dependency_graph_decision_digest is None or _is_fingerprint(context.dependency_graph_decision_digest))
+        and (context.dependency_graph_decision_digest is None or _is_graph_digest(context.dependency_graph_decision_digest))
     )
 
 
@@ -697,6 +698,14 @@ def _is_fingerprint(value: object) -> bool:
     return isinstance(value, str) and bool(_FINGERPRINT.fullmatch(value))
 
 
+def _is_graph_digest(value: object) -> bool:
+    return _is_fingerprint(value) or (isinstance(value, str) and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", value)))
+
+
+def _graph_fingerprint(value: str) -> str:
+    return value[7:] if value.startswith("sha256:") else value
+
+
 def _is_token(value: object) -> bool:
     return isinstance(value, str) and bool(_TOKEN.fullmatch(value))
 
@@ -713,7 +722,7 @@ def _affected_source_count(connection, task_id: str) -> int:
 def _require_current_dependency_graph(connection, task_id: str, candidate_sha: str, context: GateContext, evidence: GateEvidence) -> None:
     if context.source_count <= 1:
         raise GateError("dependency graph PASS is not valid for a single-source task")
-    if not _is_token(context.dependency_graph_version_id) or not _is_fingerprint(context.dependency_graph_decision_digest):
+    if not _is_token(context.dependency_graph_version_id) or not _is_graph_digest(context.dependency_graph_decision_digest):
         raise GateError("dependency graph context is unavailable")
     # Syntax-level rows are insufficient: the graph store reconstructs the
     # accepted proposal, predecessor snapshot, and decision digest on restart.
@@ -728,7 +737,7 @@ def _require_current_dependency_graph(connection, task_id: str, candidate_sha: s
         "SELECT versions.candidate_sha, decisions.decision, decisions.decision_digest FROM dependency_graph_current AS current JOIN dependency_graph_versions AS versions ON versions.graph_version_id = current.graph_version_id JOIN dependency_graph_decisions AS decisions ON decisions.graph_version_id = versions.graph_version_id WHERE current.singleton = 1 AND versions.graph_version_id = ?",
         (context.dependency_graph_version_id,),
     ).fetchone()
-    if row != (candidate_sha, "accepted", context.dependency_graph_decision_digest) or evidence.evidence_fingerprint != context.dependency_graph_decision_digest:
+    if row is None or row[:2] != (candidate_sha, "accepted") or _graph_fingerprint(row[2]) != _graph_fingerprint(context.dependency_graph_decision_digest) or evidence.evidence_fingerprint != _graph_fingerprint(context.dependency_graph_decision_digest):
         raise GateError("dependency graph evidence is unavailable or stale")
 
 

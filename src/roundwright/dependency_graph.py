@@ -280,6 +280,11 @@ class GraphActivation:
     graph_version_id: str | None
 
 
+def _decision_digest(validation: GraphValidation, proposal: DependencyProposal, subset: AffectedSubset, binding: DependencyGraphBinding, *, graph_version_id: str | None, predecessor_graph_version_id: str | None, graph_digest: str | None) -> str:
+    """Seal the decision to the exact transition, not only its proposal input."""
+    return _digest_value({"validation": validation.digest(proposal, subset, binding), "graph_version_id": graph_version_id, "predecessor_graph_version_id": predecessor_graph_version_id, "graph_digest": graph_digest})
+
+
 class DependencyGraphValidator:
     """Pure policy/graph validation for one candidate-bound proposed change."""
 
@@ -367,21 +372,22 @@ class DependencyGraphStore:
                 connection.commit()
                 return GraphActivation(proposal.proposal_id, decision, reason_code, decision_digest, version)
             validation = DependencyGraphValidator.validate(proposal, subset, binding, active, provenance)
-            expected_digest = validation.digest(proposal, subset, binding)
-            expected = (proposal.attempt_id, subset.content_digest, binding.validator_digest, binding.policy_digest, binding.candidate_sha, binding.configuration_digest, validation.decision.value, validation.reason_code, expected_digest)
             version: str | None = None
+            predecessor: str | None = None
+            graph_digest: str | None = None
             if validation.decision is GraphDecision.ACCEPTED:
                 snapshot = self._next_snapshot(active, subset, validation.edges, proposal.proposal_id, binding)
                 if active.binding == binding:
                     predecessor = active.graph_version_id
-                else:
-                    predecessor = None
                 self._write_version(connection, graph_version_id, predecessor, snapshot, binding)
                 connection.execute(
                     "INSERT INTO dependency_graph_current(singleton, graph_version_id) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET graph_version_id = excluded.graph_version_id",
                     (graph_version_id,),
                 )
                 version = graph_version_id
+                graph_digest = snapshot.graph_digest
+            expected_digest = _decision_digest(validation, proposal, subset, binding, graph_version_id=version, predecessor_graph_version_id=predecessor, graph_digest=graph_digest)
+            expected = (proposal.attempt_id, subset.content_digest, binding.validator_digest, binding.policy_digest, binding.candidate_sha, binding.configuration_digest, validation.decision.value, validation.reason_code, expected_digest)
             connection.execute(
                 "INSERT INTO dependency_graph_decisions(proposal_id, attempt_id, subset_digest, validator_digest, policy_digest, candidate_sha, configuration_digest, decision, reason_code, decision_digest, graph_version_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (proposal.proposal_id, *expected, version),
@@ -471,7 +477,7 @@ class DependencyGraphStore:
         if {(edge.subject_member_id, edge.object_member_id, edge.kind) for edge in new_edges} != expected_pairs:
             raise DependencyGraphError("current dependency graph has drifted")
         validation = GraphValidation(GraphDecision.ACCEPTED, "graph-valid", new_edges)
-        if validation.digest(proposal, subset, binding) != decision_digest:
+        if _decision_digest(validation, proposal, subset, binding, graph_version_id=version, predecessor_graph_version_id=predecessor, graph_digest=snapshot.graph_digest) != decision_digest:
             raise DependencyGraphError("current dependency graph has drifted")
         expected = DependencyGraphStore._next_snapshot(prior, subset, new_edges, proposal_id, binding)
         if (snapshot.members, snapshot.edges, snapshot.proposal_ids) != (expected.members, expected.edges, expected.proposal_ids):

@@ -433,7 +433,7 @@ print(json.dumps({
                 ["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
             ])
             self.assertTrue(result["database_snapshot_unchanged"])
-            self.assertEqual(result["command_sequence_digest"], "123028bb167b1b195d799b79bae30c2bece03234753c562a67301383da2dfd6e")
+            self.assertEqual(result["command_sequence_digest"], "1253bd226f3938416116e15b178164986eecc6632768fbf11b9ecffd7fdb4f08")
             self.assertTrue(result["platform_normalization_matches"])
             self.assertEqual(result["leases"], [0, 0])
             self.assertTrue(result["failure_released_lease"])

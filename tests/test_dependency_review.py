@@ -17,6 +17,10 @@ from roundwright.dependency_review import (
     DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, EdgeDirection, EdgeKind,
     ProposedEdge, RequestedDisposition,
 )
+from roundwright.dependency_graph import (
+    DependencyGraphBinding, DependencyGraphError, DependencyGraphStore,
+    GraphDecision,
+)
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 
@@ -381,6 +385,54 @@ class DependencyReviewTests(unittest.TestCase):
             third_subset = AffectedSubset("subset-115", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             with self.assertRaises(DependencyReviewError):
                 store.start_attempt(repository, third_subset, attempt_id="attempt-115", binding=self.binding(third_subset), supersedes_attempt_id=second.attempt_id)
+
+    def test_graph_activation_is_candidate_bound_transactional_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            review_store = DependencyReviewStore()
+            attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            proposal = self.proposal(attempt.attempt_id)
+            review_store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
+            graph_store = DependencyGraphStore()
+            result = graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
+            self.assertEqual((result.decision, result.graph_version_id), (GraphDecision.ACCEPTED, "graph-113"))
+            self.assertEqual(graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113"), result)
+            graph = graph_store.current(repository, binding=graph_binding)
+            self.assertEqual(graph.graph_version_id, "graph-113")
+            self.assertEqual([(edge.subject_member_id, edge.object_member_id) for edge in graph.edges], [("member-a", "member-b")])
+            with self.assertRaises(DependencyGraphError):
+                graph_store.current(repository, binding=DependencyGraphBinding("0" * 40, subset.policy_digest, subset.configuration_digest))
+
+    def test_graph_activation_routes_semantic_and_rejects_incomplete_or_cyclic_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            review_store = DependencyReviewStore()
+            graph_store = DependencyGraphStore()
+            binding = self.binding(subset)
+            graph_binding = DependencyGraphBinding.from_review_binding(binding)
+            semantic_attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=binding)
+            semantic = self.proposal(semantic_attempt.attempt_id, semantic=True)
+            review_store.accept_proposal(repository, semantic, binding=binding)
+            pending = graph_store.activate(repository, semantic, binding=graph_binding, graph_version_id="graph-113")
+            self.assertEqual((pending.decision, pending.graph_version_id), (GraphDecision.PENDING_OWNER, None))
+            retry_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", (*subset.members, AffectedMember("member-c", digest("9"), digest("a"))))
+            attempt = review_store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=semantic_attempt.attempt_id)
+            incomplete = DependencyProposal("proposal-114", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
+            review_store.accept_proposal(repository, incomplete, binding=self.binding(retry_subset))
+            self.assertEqual(graph_store.activate(repository, incomplete, binding=graph_binding, graph_version_id="graph-114").reason_code, "affected-subset-incomplete")
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            review_store = DependencyReviewStore()
+            attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            cycle = DependencyProposal("proposal-113", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8")),
+            ))
+            review_store.accept_proposal(repository, cycle, binding=self.binding(subset))
+            result = DependencyGraphStore().activate(repository, cycle, binding=DependencyGraphBinding.from_review_binding(self.binding(subset)), graph_version_id="graph-113")
+            self.assertEqual(result.decision, GraphDecision.REJECTED)
+            self.assertEqual(result.reason_code, "cycle-detected")
 
 
 if __name__ == "__main__":

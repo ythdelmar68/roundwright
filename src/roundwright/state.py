@@ -670,6 +670,23 @@ MIGRATIONS = (
             ("dependency_review_successors", "CREATE TABLE dependency_review_successors (predecessor_attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), successor_attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), CHECK(predecessor_attempt_id != successor_attempt_id))"),
         ),
     ),
+    Migration(
+        52,
+        (
+            "CREATE TABLE dependency_graph_versions (graph_version_id TEXT PRIMARY KEY, predecessor_graph_version_id TEXT REFERENCES dependency_graph_versions(graph_version_id), proposal_set_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, graph_digest TEXT NOT NULL)",
+            "CREATE TABLE dependency_graph_members (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), member_id TEXT NOT NULL, member_fingerprint TEXT NOT NULL, content_digest TEXT NOT NULL, PRIMARY KEY(graph_version_id, member_id), UNIQUE(graph_version_id, member_fingerprint))",
+            "CREATE TABLE dependency_graph_edges (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), PRIMARY KEY(graph_version_id, subject_member_id, object_member_id))",
+            "CREATE TABLE dependency_graph_current (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id))",
+            "CREATE TABLE dependency_graph_decisions (proposal_id TEXT PRIMARY KEY REFERENCES dependency_review_proposals(proposal_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), subset_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('accepted', 'pending-owner', 'rejected')), reason_code TEXT NOT NULL, decision_digest TEXT NOT NULL, graph_version_id TEXT UNIQUE REFERENCES dependency_graph_versions(graph_version_id))",
+        ),
+        (
+            ("dependency_graph_versions", "CREATE TABLE dependency_graph_versions (graph_version_id TEXT PRIMARY KEY, predecessor_graph_version_id TEXT REFERENCES dependency_graph_versions(graph_version_id), proposal_set_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, graph_digest TEXT NOT NULL)"),
+            ("dependency_graph_members", "CREATE TABLE dependency_graph_members (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), member_id TEXT NOT NULL, member_fingerprint TEXT NOT NULL, content_digest TEXT NOT NULL, PRIMARY KEY(graph_version_id, member_id), UNIQUE(graph_version_id, member_fingerprint))"),
+            ("dependency_graph_edges", "CREATE TABLE dependency_graph_edges (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), PRIMARY KEY(graph_version_id, subject_member_id, object_member_id))"),
+            ("dependency_graph_current", "CREATE TABLE dependency_graph_current (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id))"),
+            ("dependency_graph_decisions", "CREATE TABLE dependency_graph_decisions (proposal_id TEXT PRIMARY KEY REFERENCES dependency_review_proposals(proposal_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), subset_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('accepted', 'pending-owner', 'rejected')), reason_code TEXT NOT NULL, decision_digest TEXT NOT NULL, graph_version_id TEXT UNIQUE REFERENCES dependency_graph_versions(graph_version_id))"),
+        ),
+    ),
 )
 
 

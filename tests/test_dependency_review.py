@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -410,6 +411,26 @@ class DependencyReviewTests(unittest.TestCase):
             self.assertEqual([(edge.subject_member_id, edge.object_member_id) for edge in graph.edges], [("member-a", "member-b")])
             with self.assertRaises(DependencyGraphError):
                 graph_store.current(repository, binding=DependencyGraphBinding("0" * 40, subset.policy_digest, subset.configuration_digest))
+
+    def test_graph_activation_rolls_back_partial_write_and_serializes_concurrent_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            reviews = DependencyReviewStore()
+            attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
+            proposal = self.proposal(attempt.attempt_id)
+            self.record_source_relations(repository, attempt.attempt_id, proposal)
+            reviews.accept_proposal(repository, proposal, binding=self.binding(subset))
+            binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
+            graph = DependencyGraphStore()
+            with mock.patch.object(DependencyGraphStore, "_write_version", side_effect=RuntimeError("injected")):
+                with self.assertRaises(DependencyGraphError):
+                    graph.activate(repository, proposal, binding=binding, graph_version_id="graph-113")
+            with self.assertRaises(DependencyGraphError):
+                graph.current(repository, binding=binding)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = tuple(executor.map(lambda _: graph.activate(repository, proposal, binding=binding, graph_version_id="graph-113"), range(2)))
+            self.assertEqual(results[0], results[1])
+            self.assertEqual(results[0].decision, GraphDecision.ACCEPTED)
 
     def test_graph_activation_routes_semantic_and_rejects_incomplete_or_cyclic_edges(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

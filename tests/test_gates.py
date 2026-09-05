@@ -307,6 +307,47 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             transition_task(repository, identity, expected_state=before, next_state=after, evidence_fingerprint=fingerprint * 64, lease=lease)
         return repository, identity, binding, seal, context, lease, tuple(item.evidence_fingerprint for item in evidence)
 
+    def complete_persisted_multi_source_pass(self, root: Path):
+        repository, identity, binding, seal, base_context, lease, _ = self.complete_persisted_pass(root)
+        runtime = base_context.runtime_binding
+        policy_digest = "sha256:" + self.policy_snapshot().policy_digest
+        members = (
+            AffectedMember("member-a", "sha256:" + "1" * 64, "sha256:" + "2" * 64),
+            AffectedMember("member-b", "sha256:" + "3" * 64, "sha256:" + "4" * 64),
+        )
+        subset = AffectedSubset("subset-21", identity.task_id, "1" * 64, seal.candidate_sha, policy_digest, runtime.resolved_digest, "sha256:" + "5" * 64, "initial", members)
+        review_binding = DependencyReviewBinding(seal.candidate_sha, policy_digest, runtime.resolved_digest, "sha256:" + "6" * 64)
+        relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", "sha256:" + "7" * 64, Confidence.HIGH, "sha256:" + "8" * 64)
+        proposal = DependencyProposal("proposal-21", "attempt-21", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", "sha256:" + "7" * 64, Confidence.HIGH, "sha256:" + "8" * 64, relation.relation_digest),))
+        reviews = DependencyReviewStore()
+        reviews.start_attempt(repository, subset, attempt_id="attempt-21", binding=review_binding, source_owned_relations=(relation,))
+        reviews.accept_proposal(repository, proposal, binding=review_binding)
+        activation = DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(review_binding), graph_version_id="graph-21")
+        context = GateContext(identity.task_id, seal.candidate_sha, 2, False, base_context.policy_digest, base_context.receipt_fingerprint, runtime, base_context.selected_supervisor_profile_identity, dependency_graph_version_id=activation.graph_version_id, dependency_graph_decision_digest=activation.decision_digest)
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute("DELETE FROM gate_evidence WHERE task_id = ?", (identity.task_id,))
+            connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (identity.task_id,))
+            connection.execute("DELETE FROM gate_contexts WHERE task_id = ?", (identity.task_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        evidence = tuple(
+            GateEvidence(identity.task_id, seal.candidate_sha, requirement.key, EvidenceOutcome.PASS, "validator", number, activation.decision_digest[7:] if requirement.key is GateKey.DEPENDENCY_GRAPH else f"{number:064x}")
+            for number, requirement in enumerate(GATE_REGISTRY, 1)
+        )
+        policy_evidence = self.policy_evidence(context)
+        with mock.patch("roundwright.gates.bind_candidate_evidence"):
+            for item in evidence:
+                record_gate_evidence(repository, binding, seal, context, item, policy_evidence=policy_evidence, lease=lease)
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.executemany("INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)", [(identity.task_id, seal.candidate_sha, item.evidence_fingerprint) for item in evidence])
+            connection.commit()
+        finally:
+            connection.close()
+        return repository, identity, binding, seal, context, lease, tuple(item.evidence_fingerprint for item in evidence), reviews, subset, review_binding
+
     def test_dependency_graph_pass_rejects_an_unaccepted_terminal_successor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, binding, seal, base_context, lease, _ = self.complete_persisted_pass(Path(temporary))
@@ -335,6 +376,40 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
                     _require_current_dependency_graph(connection, identity.task_id, seal.candidate_sha, context, evidence)
             finally:
                 connection.close()
+
+    def test_persisted_multi_source_graph_pass_evaluates_and_transitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints, *_ = self.complete_persisted_multi_source_pass(Path(temporary))
+            policy_evidence = self.policy_evidence(context)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.PASS)
+                self.assertEqual(transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="f" * 64, policy_evidence=policy_evidence, lease=lease).state, "ready-for-owner")
+
+    def test_persisted_multi_source_successor_blocks_evaluation_and_final_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints, reviews, subset, review_binding = self.complete_persisted_multi_source_pass(Path(temporary))
+            successor = AffectedSubset("subset-22", identity.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
+            reviews.start_attempt(repository, successor, attempt_id="attempt-22", binding=review_binding, supersedes_attempt_id="attempt-21")
+            policy_evidence = self.policy_evidence(context)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="e" * 64, policy_evidence=policy_evidence, lease=lease)
+
+    def test_terminal_source_count_movement_blocks_evaluation_and_final_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, binding, seal, context, lease, fingerprints = self.complete_persisted_pass(Path(temporary))
+            members = (
+                AffectedMember("member-a", "sha256:" + "1" * 64, "sha256:" + "2" * 64),
+                AffectedMember("member-b", "sha256:" + "3" * 64, "sha256:" + "4" * 64),
+            )
+            subset = AffectedSubset("subset-21", identity.task_id, "1" * 64, seal.candidate_sha, "sha256:" + self.policy_snapshot().policy_digest, context.runtime_binding.resolved_digest, "sha256:" + "5" * 64, "initial", members)
+            DependencyReviewStore().start_attempt(repository, subset, attempt_id="attempt-21", binding=DependencyReviewBinding(seal.candidate_sha, subset.policy_digest, subset.configuration_digest, "sha256:" + "6" * 64))
+            policy_evidence = self.policy_evidence(context)
+            with mock.patch("roundwright.gates.candidate_evidence", return_value=fingerprints), mock.patch("roundwright.git_identity.candidate_evidence", return_value=fingerprints):
+                self.assertEqual(evaluate_gates(repository, binding, seal, context, policy_evidence=policy_evidence, lease=lease).outcome, GateOutcome.BLOCKED)
+                with self.assertRaises(GateError):
+                    transition_ready_for_owner(repository, binding, seal, context, evidence_fingerprint="d" * 64, policy_evidence=policy_evidence, lease=lease)
 
     def test_sqlite_evidence_is_candidate_bound_and_uses_the_current_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

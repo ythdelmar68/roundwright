@@ -509,9 +509,11 @@ def _decision_from_connection(connection, identity) -> GateDecision:
         (identity.task_id, seal[1]),
     ).fetchall()
     evidence = tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows)
+    if context.source_count != _affected_source_count(connection, identity.task_id):
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "affected source count is stale"),))
     decision = decide_gates(context, evidence)
     if decision.outcome is GateOutcome.PASS and context.source_count > 1:
-        graph_evidence = next((item for item in evidence if item.gate_key is GateKey.DEPENDENCY_GRAPH and item.outcome is EvidenceOutcome.PASS), None)
+        graph_evidence = next((item for item in evidence if _value(item.gate_key) == GateKey.DEPENDENCY_GRAPH.value and _value(item.outcome) == EvidenceOutcome.PASS.value), None)
         if graph_evidence is None:
             return GateDecision(GateOutcome.BLOCKED, (GateResult("dependency-graph", GateOutcome.BLOCKED, "accepted graph decision is unavailable"),))
         try:

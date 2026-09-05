@@ -19,7 +19,7 @@ from roundwright.dependency_review import (
 )
 from roundwright.dependency_graph import (
     DependencyGraphBinding, DependencyGraphError, DependencyGraphStore,
-    GraphDecision,
+    GraphDecision, SourceOwnedRelation,
 )
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
@@ -62,7 +62,7 @@ class DependencyReviewTests(unittest.TestCase):
         graph = DependencyGraphStore()
         for edge in proposal.edges:
             method = graph.record_explicit_source_relation if edge.kind is EdgeKind.EXPLICIT else graph.record_deterministic_policy_relation
-            method(repository, attempt_id=attempt_id, direction=edge.direction, subject_member_id=edge.subject_member_id, object_member_id=edge.object_member_id, rationale_digest=edge.rationale_digest, confidence=edge.confidence.value, conflicts_digest=edge.conflicts_digest)
+            method(repository, attempt_id=attempt_id, relation=SourceOwnedRelation(edge.direction, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence.value, edge.conflicts_digest))
 
     def test_default_role_and_input_are_exact_and_public_safe(self) -> None:
         configuration = load_configuration(cwd=Path.cwd(), environment={}, home=Path.cwd() / "missing-home")
@@ -474,7 +474,7 @@ class DependencyReviewTests(unittest.TestCase):
             proposal = self.proposal(attempt.attempt_id)
             store.accept_proposal(repository, proposal, binding=self.binding(subset))
             with self.assertRaisesRegex(DependencyGraphError, "independently"):
-                DependencyGraphStore().record_explicit_source_relation(repository, attempt_id=attempt.attempt_id, direction=proposal.edges[0].direction, subject_member_id=proposal.edges[0].subject_member_id, object_member_id=proposal.edges[0].object_member_id, rationale_digest=proposal.edges[0].rationale_digest, confidence=proposal.edges[0].confidence.value, conflicts_digest=proposal.edges[0].conflicts_digest)
+                DependencyGraphStore().record_explicit_source_relation(repository, attempt_id=attempt.attempt_id, relation=SourceOwnedRelation(proposal.edges[0].direction, proposal.edges[0].subject_member_id, proposal.edges[0].object_member_id, proposal.edges[0].rationale_digest, proposal.edges[0].confidence.value, proposal.edges[0].conflicts_digest))
             self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(self.binding(subset)), graph_version_id="graph-113").reason_code, "provenance-unavailable")
 
     def test_graph_provenance_and_persisted_decision_tampering_fail_closed(self) -> None:
@@ -487,7 +487,7 @@ class DependencyReviewTests(unittest.TestCase):
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             stale_subset = AffectedSubset("subset-114", subset.task_id, "0" * 64, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             with self.assertRaises(DependencyGraphError):
-                DependencyGraphStore().record_explicit_source_relation(repository, attempt_id=attempt.attempt_id, direction=proposal.edges[0].direction, subject_member_id="missing", object_member_id=proposal.edges[0].object_member_id, rationale_digest=proposal.edges[0].rationale_digest, confidence=proposal.edges[0].confidence.value, conflicts_digest=proposal.edges[0].conflicts_digest)
+                DependencyGraphStore().record_explicit_source_relation(repository, attempt_id=attempt.attempt_id, relation=SourceOwnedRelation(proposal.edges[0].direction, "missing", proposal.edges[0].object_member_id, proposal.edges[0].rationale_digest, proposal.edges[0].confidence.value, proposal.edges[0].conflicts_digest))
             self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=binding, graph_version_id="graph-113").reason_code, "provenance-unavailable")
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))

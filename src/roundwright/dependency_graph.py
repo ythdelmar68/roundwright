@@ -165,6 +165,21 @@ class TrustedEdgeProvenance:
 
 
 @dataclass(frozen=True)
+class SourceOwnedRelation:
+    """Typed evidence emitted by source collection before model dispatch."""
+    direction: EdgeDirection
+    subject_member_id: str
+    object_member_id: str
+    rationale_digest: str
+    confidence: str
+    conflicts_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.direction) is not EdgeDirection or not _TOKEN.fullmatch(self.subject_member_id) or not _TOKEN.fullmatch(self.object_member_id) or not _digest(self.rationale_digest) or self.confidence not in {"high", "medium", "low"} or not _digest(self.conflicts_digest):
+            raise DependencyGraphError("source-owned relation is invalid")
+
+
+@dataclass(frozen=True)
 class GraphEdge:
     """One canonical directed edge: subject depends on object."""
 
@@ -338,20 +353,20 @@ class DependencyGraphValidator:
 class DependencyGraphStore:
     """Persist a complete graph version and its decision in one SQLite transaction."""
 
-    def record_explicit_source_relation(self, repository: RepositoryIdentity, *, attempt_id: str, direction: EdgeDirection, subject_member_id: str, object_member_id: str, rationale_digest: str, confidence: str, conflicts_digest: str) -> str:
-        return self._record_source_relation(repository, attempt_id=attempt_id, kind=EdgeKind.EXPLICIT, direction=direction, subject_member_id=subject_member_id, object_member_id=object_member_id, rationale_digest=rationale_digest, confidence=confidence, conflicts_digest=conflicts_digest)
+    def record_explicit_source_relation(self, repository: RepositoryIdentity, *, attempt_id: str, relation: SourceOwnedRelation) -> str:
+        return self._record_source_relation(repository, attempt_id=attempt_id, kind=EdgeKind.EXPLICIT, relation=relation)
 
-    def record_deterministic_policy_relation(self, repository: RepositoryIdentity, *, attempt_id: str, direction: EdgeDirection, subject_member_id: str, object_member_id: str, rationale_digest: str, confidence: str, conflicts_digest: str) -> str:
-        return self._record_source_relation(repository, attempt_id=attempt_id, kind=EdgeKind.POLICY_DERIVED, direction=direction, subject_member_id=subject_member_id, object_member_id=object_member_id, rationale_digest=rationale_digest, confidence=confidence, conflicts_digest=conflicts_digest)
+    def record_deterministic_policy_relation(self, repository: RepositoryIdentity, *, attempt_id: str, relation: SourceOwnedRelation) -> str:
+        return self._record_source_relation(repository, attempt_id=attempt_id, kind=EdgeKind.POLICY_DERIVED, relation=relation)
 
-    def _record_source_relation(self, repository: RepositoryIdentity, *, attempt_id: str, kind: EdgeKind, direction: EdgeDirection, subject_member_id: str, object_member_id: str, rationale_digest: str, confidence: str, conflicts_digest: str) -> str:
+    def _record_source_relation(self, repository: RepositoryIdentity, *, attempt_id: str, kind: EdgeKind, relation: SourceOwnedRelation) -> str:
         """Persist a source/policy fact before proposal material is accepted.
 
         This is the trust root: it is deliberately scalar source input rather
         than a proposal or provenance object, and admission closes once a
         proposal exists for the review attempt.
         """
-        if not _TOKEN.fullmatch(attempt_id) or kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED}:
+        if not _TOKEN.fullmatch(attempt_id) or kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED} or type(relation) is not SourceOwnedRelation:
             raise DependencyGraphError("trusted edge provenance is invalid")
         connection = _open_writable_connection(repository)
         try:
@@ -360,7 +375,7 @@ class DependencyGraphStore:
             if attempt[6] != "prepared" or connection.execute("SELECT 1 FROM dependency_review_proposals WHERE attempt_id = ?", (attempt_id,)).fetchone() is not None:
                 raise DependencyGraphError("trusted edge provenance is not independently recorded")
             binding = DependencyGraphBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest)
-            provenance = TrustedEdgeProvenance.from_explicit_source(subset=subset, binding=binding, kind=kind, direction=direction, subject_member_id=subject_member_id, object_member_id=object_member_id, rationale_digest=rationale_digest, confidence=confidence, conflicts_digest=conflicts_digest) if kind is EdgeKind.EXPLICIT else TrustedEdgeProvenance.from_deterministic_policy(subset=subset, binding=binding, direction=direction, subject_member_id=subject_member_id, object_member_id=object_member_id, rationale_digest=rationale_digest, confidence=confidence, conflicts_digest=conflicts_digest)
+            provenance = TrustedEdgeProvenance.from_explicit_source(subset=subset, binding=binding, kind=kind, **relation.__dict__) if kind is EdgeKind.EXPLICIT else TrustedEdgeProvenance.from_deterministic_policy(subset=subset, binding=binding, **relation.__dict__)
             connection.execute(
                 "INSERT INTO dependency_graph_trusted_relations(provenance_digest, snapshot_id, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, candidate_sha, policy_digest, configuration_digest, source_digest, subject_member_fingerprint, object_member_fingerprint, attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(snapshot_id, provenance_digest) DO NOTHING",
                 (provenance.provenance_digest, subset.snapshot_id, provenance.kind.value, provenance.direction.value, provenance.subject_member_id, provenance.object_member_id, provenance.rationale_digest, provenance.confidence, provenance.conflicts_digest, provenance.candidate_sha, provenance.policy_digest, provenance.configuration_digest, provenance.source_digest, provenance.subject_member_fingerprint, provenance.object_member_fingerprint, attempt_id),

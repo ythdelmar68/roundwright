@@ -375,6 +375,8 @@ def transition_ready_for_owner(
         raise GateError("gate context does not match committed task state")
     if policy_activated_at != _persisted_policy_activation(repository, binding.task_id, seal.candidate_sha):
         raise GateError("trusted policy receipt is stale")
+    if _read_persisted_decision(repository, binding, seal, lease=lease).outcome is not GateOutcome.PASS:
+        raise GateError("persisted gate decision is no longer current")
     return _transition_ready_for_owner(
         repository,
         _task_identity(repository, binding.task_id),
@@ -506,7 +508,17 @@ def _decision_from_connection(connection, identity) -> GateDecision:
         "SELECT gates.task_id, gates.candidate_sha, gates.gate_key, gates.outcome, gates.evaluator_id, gates.evaluated_at, gates.evidence_fingerprint, gates.changed_boundary, gates.reason, gates.follow_ups FROM gate_evidence AS gates JOIN candidate_evidence AS candidate ON candidate.task_id = gates.task_id AND candidate.candidate_sha = gates.candidate_sha AND candidate.evidence_fingerprint = gates.evidence_fingerprint WHERE gates.task_id = ? AND gates.candidate_sha = ? ORDER BY gates.gate_key, gates.evaluator_id, gates.evidence_fingerprint",
         (identity.task_id, seal[1]),
     ).fetchall()
-    return decide_gates(context, tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows))
+    evidence = tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows)
+    decision = decide_gates(context, evidence)
+    if decision.outcome is GateOutcome.PASS and context.source_count > 1:
+        graph_evidence = next((item for item in evidence if item.gate_key is GateKey.DEPENDENCY_GRAPH and item.outcome is EvidenceOutcome.PASS), None)
+        if graph_evidence is None:
+            return GateDecision(GateOutcome.BLOCKED, (GateResult("dependency-graph", GateOutcome.BLOCKED, "accepted graph decision is unavailable"),))
+        try:
+            _require_current_dependency_graph(connection, identity.task_id, seal[1], context, graph_evidence)
+        except GateError:
+            return GateDecision(GateOutcome.BLOCKED, (GateResult("dependency-graph", GateOutcome.BLOCKED, "accepted graph decision is stale"),))
+    return decision
 
 
 def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:

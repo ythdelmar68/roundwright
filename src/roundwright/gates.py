@@ -732,15 +732,21 @@ def _require_current_dependency_graph(connection, task_id: str, candidate_sha: s
     except DependencyGraphError as error:
         raise GateError("dependency graph evidence is unavailable or stale") from error
     terminal = connection.execute(
-        "SELECT attempts.snapshot_id FROM dependency_review_attempts AS attempts WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
+        "SELECT attempts.attempt_id, attempts.snapshot_id, attempts.state FROM dependency_review_attempts AS attempts WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
         (task_id,),
     ).fetchone()
-    expected_members = () if terminal is None else tuple(connection.execute(
+    expected_members = () if terminal is None or terminal[2] != "accepted" else tuple(connection.execute(
         "SELECT member_id, member_fingerprint, content_digest FROM dependency_review_subset_members WHERE snapshot_id = ? ORDER BY member_id",
-        (terminal[0],),
+        (terminal[1],),
     ))
     graph_members = tuple(sorted((member.member.member_id, member.member.member_fingerprint, member.member.content_digest) for member in current.members if member.task_id == task_id))
-    if current.graph_version_id != context.dependency_graph_version_id or current.binding is None or (current.binding.candidate_sha, current.binding.policy_digest, current.binding.configuration_digest, current.binding.validator_digest) != (candidate_sha, context.policy_digest, context.runtime_binding.configuration_digest, VALIDATOR_DIGEST) or not expected_members or graph_members != expected_members:
+    graph_snapshots = {member.snapshot_id for member in current.members if member.task_id == task_id}
+    terminal_edge = None if terminal is None else connection.execute(
+        "SELECT 1 FROM dependency_graph_edges AS edges JOIN dependency_review_proposals AS proposals ON proposals.proposal_id = edges.proposal_id WHERE edges.graph_version_id = ? AND proposals.attempt_id = ?",
+        (current.graph_version_id, terminal[0]),
+    ).fetchone()
+    graph_policy_digest = context.policy_digest if context.policy_digest.startswith("sha256:") else "sha256:" + context.policy_digest
+    if current.graph_version_id != context.dependency_graph_version_id or current.binding is None or (current.binding.candidate_sha, current.binding.policy_digest, current.binding.configuration_digest, current.binding.validator_digest) != (candidate_sha, graph_policy_digest, context.runtime_binding.resolved_digest, VALIDATOR_DIGEST) or not expected_members or graph_members != expected_members or graph_snapshots != {terminal[1]} or terminal_edge is None:
         raise GateError("dependency graph evidence is unavailable or stale")
     row = connection.execute(
         "SELECT versions.candidate_sha, decisions.decision, decisions.decision_digest FROM dependency_graph_current AS current JOIN dependency_graph_versions AS versions ON versions.graph_version_id = current.graph_version_id JOIN dependency_graph_decisions AS decisions ON decisions.graph_version_id = versions.graph_version_id WHERE current.singleton = 1 AND versions.graph_version_id = ?",

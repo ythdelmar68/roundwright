@@ -699,6 +699,15 @@ MIGRATIONS = (
             ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', dependency_graph_version_id TEXT NOT NULL DEFAULT '', dependency_graph_decision_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
         ),
     ),
+    Migration(
+        54,
+        (
+            "CREATE TABLE dependency_graph_trusted_relations (provenance_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_digest TEXT NOT NULL, subject_member_fingerprint TEXT NOT NULL, object_member_fingerprint TEXT NOT NULL, PRIMARY KEY(snapshot_id, provenance_digest))",
+        ),
+        (
+            ("dependency_graph_trusted_relations", "CREATE TABLE dependency_graph_trusted_relations (provenance_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_digest TEXT NOT NULL, subject_member_fingerprint TEXT NOT NULL, object_member_fingerprint TEXT NOT NULL, PRIMARY KEY(snapshot_id, provenance_digest))"),
+        ),
+    ),
 )
 
 

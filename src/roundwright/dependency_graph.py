@@ -338,7 +338,46 @@ class DependencyGraphValidator:
 class DependencyGraphStore:
     """Persist a complete graph version and its decision in one SQLite transaction."""
 
-    def activate(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyGraphBinding, graph_version_id: str, provenance: tuple[TrustedEdgeProvenance, ...] = ()) -> GraphActivation:
+    def record_trusted_relation(self, repository: RepositoryIdentity, *, subset: AffectedSubset, binding: DependencyGraphBinding, provenance: TrustedEdgeProvenance) -> str:
+        """Durably admit one source/policy relation before any proposal may use it.
+
+        Activation never accepts caller-supplied proof records. A relation is
+        independently bound to its immutable review subset here and is replayed
+        from that durable record before a graph is accepted or read as current.
+        """
+        if type(subset) is not AffectedSubset or type(binding) is not DependencyGraphBinding or type(provenance) is not TrustedEdgeProvenance:
+            raise DependencyGraphError("trusted edge provenance is invalid")
+        binding.require_subset(subset)
+        expected_source = subset.source_digest if provenance.kind is EdgeKind.EXPLICIT else binding.policy_digest
+        members = {member.member_id: member for member in subset.members}
+        if (provenance.candidate_sha, provenance.policy_digest, provenance.configuration_digest, provenance.source_digest, provenance.subject_member_fingerprint, provenance.object_member_fingerprint) != (binding.candidate_sha, binding.policy_digest, binding.configuration_digest, expected_source, members.get(provenance.subject_member_id).member_fingerprint if provenance.subject_member_id in members else None, members.get(provenance.object_member_id).member_fingerprint if provenance.object_member_id in members else None):
+            raise DependencyGraphError("trusted edge provenance is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT task_id, source_digest, candidate_sha, policy_digest, configuration_digest FROM dependency_review_subsets WHERE snapshot_id = ?", (subset.snapshot_id,)).fetchone()
+            if row != (subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest):
+                raise DependencyGraphError("trusted edge provenance is stale")
+            connection.execute(
+                "INSERT INTO dependency_graph_trusted_relations(provenance_digest, snapshot_id, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, candidate_sha, policy_digest, configuration_digest, source_digest, subject_member_fingerprint, object_member_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(snapshot_id, provenance_digest) DO NOTHING",
+                (provenance.provenance_digest, subset.snapshot_id, provenance.kind.value, provenance.direction.value, provenance.subject_member_id, provenance.object_member_id, provenance.rationale_digest, provenance.confidence, provenance.conflicts_digest, provenance.candidate_sha, provenance.policy_digest, provenance.configuration_digest, provenance.source_digest, provenance.subject_member_fingerprint, provenance.object_member_fingerprint),
+            )
+            persisted = connection.execute("SELECT snapshot_id, edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, candidate_sha, policy_digest, configuration_digest, source_digest, subject_member_fingerprint, object_member_fingerprint FROM dependency_graph_trusted_relations WHERE snapshot_id = ? AND provenance_digest = ?", (subset.snapshot_id, provenance.provenance_digest)).fetchone()
+            expected = (subset.snapshot_id, provenance.kind.value, provenance.direction.value, provenance.subject_member_id, provenance.object_member_id, provenance.rationale_digest, provenance.confidence, provenance.conflicts_digest, provenance.candidate_sha, provenance.policy_digest, provenance.configuration_digest, provenance.source_digest, provenance.subject_member_fingerprint, provenance.object_member_fingerprint)
+            if persisted != expected:
+                raise DependencyGraphError("trusted edge provenance has drifted")
+            connection.commit()
+            return provenance.provenance_digest
+        except DependencyGraphError:
+            connection.rollback()
+            raise
+        except Exception:
+            connection.rollback()
+            raise DependencyGraphError("trusted edge provenance is unavailable") from None
+        finally:
+            connection.close()
+
+    def activate(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyGraphBinding, graph_version_id: str) -> GraphActivation:
         if type(binding) is not DependencyGraphBinding or not _TOKEN.fullmatch(graph_version_id):
             raise DependencyGraphError("dependency graph activation identity is invalid")
         connection = _open_writable_connection(repository)
@@ -371,6 +410,7 @@ class DependencyGraphStore:
                     raise DependencyGraphError("dependency graph decision has drifted")
                 connection.commit()
                 return GraphActivation(proposal.proposal_id, decision, reason_code, decision_digest, version)
+            provenance = self._trusted_provenance(connection, subset, binding)
             validation = DependencyGraphValidator.validate(proposal, subset, binding, active, provenance)
             version: str | None = None
             predecessor: str | None = None
@@ -425,6 +465,17 @@ class DependencyGraphStore:
         return DependencyGraphStore._verify_accepted_version(connection, current[0], set())
 
     @staticmethod
+    def _trusted_provenance(connection: object, subset: AffectedSubset, binding: DependencyGraphBinding) -> tuple[TrustedEdgeProvenance, ...]:
+        rows = connection.execute(
+            "SELECT edge_kind, direction, subject_member_id, object_member_id, rationale_digest, confidence, conflicts_digest, candidate_sha, policy_digest, configuration_digest, source_digest, subject_member_fingerprint, object_member_fingerprint, provenance_digest FROM dependency_graph_trusted_relations WHERE snapshot_id = ? AND candidate_sha = ? AND policy_digest = ? AND configuration_digest = ? ORDER BY provenance_digest",
+            (subset.snapshot_id, binding.candidate_sha, binding.policy_digest, binding.configuration_digest),
+        )
+        try:
+            return tuple(TrustedEdgeProvenance(EdgeKind(kind), EdgeDirection(direction), subject, object_, rationale, confidence, conflicts, candidate, policy, configuration, source, subject_fingerprint, object_fingerprint, digest) for kind, direction, subject, object_, rationale, confidence, conflicts, candidate, policy, configuration, source, subject_fingerprint, object_fingerprint, digest in rows)
+        except (TypeError, ValueError) as error:
+            raise DependencyGraphError("trusted edge provenance has drifted") from error
+
+    @staticmethod
     def _read_version(connection: object, version: str) -> tuple[GraphSnapshot, str | None]:
         row = connection.execute("SELECT predecessor_graph_version_id, proposal_set_digest, validator_digest, policy_digest, candidate_sha, configuration_digest, graph_digest FROM dependency_graph_versions WHERE graph_version_id = ?", (version,)).fetchone()
         if row is None:
@@ -468,15 +519,11 @@ class DependencyGraphStore:
         if binding is None or proposal.attempt_id != attempt_id or attempt[6] != "accepted" or (subset_digest, validator_digest, policy_digest, candidate_sha, configuration_digest) != (subset.content_digest, binding.validator_digest, binding.policy_digest, binding.candidate_sha, binding.configuration_digest):
             raise DependencyGraphError("current dependency graph has drifted")
         new_edges = tuple(edge for edge in snapshot.edges if edge.proposal_id == proposal_id)
-        expected_pairs = set()
-        for edge in proposal.edges:
-            if edge.kind not in {EdgeKind.EXPLICIT, EdgeKind.POLICY_DERIVED}:
-                raise DependencyGraphError("current dependency graph has drifted")
-            pair = (edge.subject_member_id, edge.object_member_id) if edge.direction is EdgeDirection.DEPENDS_ON else (edge.object_member_id, edge.subject_member_id)
-            expected_pairs.add((pair[0], pair[1], edge.kind))
-        if {(edge.subject_member_id, edge.object_member_id, edge.kind) for edge in new_edges} != expected_pairs:
+        provenance = DependencyGraphStore._trusted_provenance(connection, subset, binding)
+        replay = DependencyGraphValidator.validate(proposal, subset, binding, prior, provenance)
+        if replay.decision is not GraphDecision.ACCEPTED or replay.edges != new_edges:
             raise DependencyGraphError("current dependency graph has drifted")
-        validation = GraphValidation(GraphDecision.ACCEPTED, "graph-valid", new_edges)
+        validation = replay
         if _decision_digest(validation, proposal, subset, binding, graph_version_id=version, predecessor_graph_version_id=predecessor, graph_digest=snapshot.graph_digest) != decision_digest:
             raise DependencyGraphError("current dependency graph has drifted")
         expected = DependencyGraphStore._next_snapshot(prior, subset, new_edges, proposal_id, binding)

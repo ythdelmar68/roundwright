@@ -538,7 +538,7 @@ def _decide_requirement(context: GateContext, requirement: GateRequirement, entr
         return GateResult(key, GateOutcome.BLOCKED, "conflicting evidence")
     outcome = next(iter(outcomes))
     if outcome == EvidenceOutcome.PASS.value:
-        if requirement.key is GateKey.DEPENDENCY_GRAPH and context.source_count > 1 and (not _is_token(context.dependency_graph_version_id) or not _is_fingerprint(context.dependency_graph_decision_digest)):
+        if requirement.key is GateKey.DEPENDENCY_GRAPH and context.source_count > 1 and (not _is_token(context.dependency_graph_version_id) or not _is_graph_digest(context.dependency_graph_decision_digest)):
             return GateResult(key, GateOutcome.BLOCKED, "accepted graph decision is unavailable")
         return GateResult(key, GateOutcome.PASS, "accepted")
     if outcome == EvidenceOutcome.NOT_APPLICABLE.value:
@@ -726,12 +726,21 @@ def _require_current_dependency_graph(connection, task_id: str, candidate_sha: s
         raise GateError("dependency graph context is unavailable")
     # Syntax-level rows are insufficient: the graph store reconstructs the
     # accepted proposal, predecessor snapshot, and decision digest on restart.
-    from .dependency_graph import DependencyGraphError, DependencyGraphStore
+    from .dependency_graph import DependencyGraphError, DependencyGraphStore, VALIDATOR_DIGEST
     try:
         current = DependencyGraphStore._read_current(connection)
     except DependencyGraphError as error:
         raise GateError("dependency graph evidence is unavailable or stale") from error
-    if current.graph_version_id != context.dependency_graph_version_id or current.binding is None or current.binding.candidate_sha != candidate_sha:
+    terminal = connection.execute(
+        "SELECT attempts.snapshot_id FROM dependency_review_attempts AS attempts WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
+        (task_id,),
+    ).fetchone()
+    expected_members = () if terminal is None else tuple(connection.execute(
+        "SELECT member_id, member_fingerprint, content_digest FROM dependency_review_subset_members WHERE snapshot_id = ? ORDER BY member_id",
+        (terminal[0],),
+    ))
+    graph_members = tuple(sorted((member.member.member_id, member.member.member_fingerprint, member.member.content_digest) for member in current.members if member.task_id == task_id))
+    if current.graph_version_id != context.dependency_graph_version_id or current.binding is None or (current.binding.candidate_sha, current.binding.policy_digest, current.binding.configuration_digest, current.binding.validator_digest) != (candidate_sha, context.policy_digest, context.runtime_binding.configuration_digest, VALIDATOR_DIGEST) or not expected_members or graph_members != expected_members:
         raise GateError("dependency graph evidence is unavailable or stale")
     row = connection.execute(
         "SELECT versions.candidate_sha, decisions.decision, decisions.decision_digest FROM dependency_graph_current AS current JOIN dependency_graph_versions AS versions ON versions.graph_version_id = current.graph_version_id JOIN dependency_graph_decisions AS decisions ON decisions.graph_version_id = versions.graph_version_id WHERE current.singleton = 1 AND versions.graph_version_id = ?",

@@ -77,6 +77,11 @@ class DependencyReviewTests(unittest.TestCase):
                 ))
         return tuple(records)
 
+    def record_provenance(self, repository: RepositoryIdentity, proposal: DependencyProposal, subset: AffectedSubset, binding: DependencyGraphBinding) -> None:
+        graph = DependencyGraphStore()
+        for record in self.provenance(proposal, subset, binding):
+            graph.record_trusted_relation(repository, subset=subset, binding=binding, provenance=record)
+
     def test_default_role_and_input_are_exact_and_public_safe(self) -> None:
         configuration = load_configuration(cwd=Path.cwd(), environment={}, home=Path.cwd() / "missing-home")
         self.assertEqual((configuration.dependency_review.value.model, configuration.dependency_review.value.reasoning_effort.value), ("gpt-5.6-terra", "high"))
@@ -414,10 +419,10 @@ class DependencyReviewTests(unittest.TestCase):
             review_store.accept_proposal(repository, proposal, binding=self.binding(subset))
             graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph_store = DependencyGraphStore()
-            proof = self.provenance(proposal, subset, graph_binding)
-            result = graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113", provenance=proof)
+            self.record_provenance(repository, proposal, subset, graph_binding)
+            result = graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual((result.decision, result.graph_version_id), (GraphDecision.ACCEPTED, "graph-113"))
-            self.assertEqual(graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113", provenance=proof), result)
+            self.assertEqual(graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113"), result)
             graph = graph_store.current(repository, binding=graph_binding)
             self.assertEqual(graph.graph_version_id, "graph-113")
             self.assertEqual([(edge.subject_member_id, edge.object_member_id) for edge in graph.edges], [("member-a", "member-b")])
@@ -440,7 +445,8 @@ class DependencyReviewTests(unittest.TestCase):
             attempt = review_store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=semantic_attempt.attempt_id)
             incomplete = DependencyProposal("proposal-114", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
             review_store.accept_proposal(repository, incomplete, binding=self.binding(retry_subset))
-            self.assertEqual(graph_store.activate(repository, incomplete, binding=graph_binding, graph_version_id="graph-114", provenance=self.provenance(incomplete, retry_subset, graph_binding)).reason_code, "affected-subset-incomplete")
+            self.record_provenance(repository, incomplete, retry_subset, graph_binding)
+            self.assertEqual(graph_store.activate(repository, incomplete, binding=graph_binding, graph_version_id="graph-114").reason_code, "affected-subset-incomplete")
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             review_store = DependencyReviewStore()
@@ -451,7 +457,8 @@ class DependencyReviewTests(unittest.TestCase):
             ))
             review_store.accept_proposal(repository, cycle, binding=self.binding(subset))
             graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
-            result = DependencyGraphStore().activate(repository, cycle, binding=graph_binding, graph_version_id="graph-113", provenance=self.provenance(cycle, subset, graph_binding))
+            self.record_provenance(repository, cycle, subset, graph_binding)
+            result = DependencyGraphStore().activate(repository, cycle, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual(result.decision, GraphDecision.REJECTED)
             self.assertEqual(result.reason_code, "cycle-detected")
 
@@ -465,15 +472,17 @@ class DependencyReviewTests(unittest.TestCase):
             proposal = self.proposal(first.attempt_id)
             store.accept_proposal(repository, proposal, binding=review_binding)
             graph = DependencyGraphStore()
-            first_result = graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113", provenance=self.provenance(proposal, subset, graph_binding))
+            self.record_provenance(repository, proposal, subset, graph_binding)
+            first_result = graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual(first_result.decision, GraphDecision.ACCEPTED)
             successor_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             successor = store.start_attempt(repository, successor_subset, attempt_id="attempt-114", binding=self.binding(successor_subset), supersedes_attempt_id=first.attempt_id)
             replacement = DependencyProposal("proposal-114", successor.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", proposal.edges)
             store.accept_proposal(repository, replacement, binding=self.binding(successor_subset))
             with self.assertRaisesRegex(DependencyGraphError, "superseded"):
-                graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113", provenance=self.provenance(proposal, subset, graph_binding))
-            result = graph.activate(repository, replacement, binding=graph_binding, graph_version_id="graph-114", provenance=self.provenance(replacement, successor_subset, graph_binding))
+                graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
+            self.record_provenance(repository, replacement, successor_subset, graph_binding)
+            result = graph.activate(repository, replacement, binding=graph_binding, graph_version_id="graph-114")
             self.assertEqual((result.decision, result.graph_version_id), (GraphDecision.ACCEPTED, "graph-114"))
             self.assertEqual(graph.current(repository, binding=graph_binding).graph_version_id, "graph-114")
         with tempfile.TemporaryDirectory() as temporary:
@@ -493,7 +502,10 @@ class DependencyReviewTests(unittest.TestCase):
             store.accept_proposal(repository, proposal, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             stale_subset = AffectedSubset("subset-114", subset.task_id, "0" * 64, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
-            self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=binding, graph_version_id="graph-113", provenance=self.provenance(proposal, stale_subset, binding)).reason_code, "provenance-unavailable")
+            stale_provenance = self.provenance(proposal, stale_subset, binding)[0]
+            with self.assertRaises(DependencyGraphError):
+                DependencyGraphStore().record_trusted_relation(repository, subset=stale_subset, binding=binding, provenance=stale_provenance)
+            self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=binding, graph_version_id="graph-113").reason_code, "provenance-unavailable")
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             store = DependencyReviewStore()
@@ -502,10 +514,11 @@ class DependencyReviewTests(unittest.TestCase):
             store.accept_proposal(repository, policy, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph = DependencyGraphStore()
-            self.assertEqual(graph.activate(repository, policy, binding=binding, graph_version_id="graph-113", provenance=self.provenance(policy, subset, binding)).decision, GraphDecision.ACCEPTED)
+            self.record_provenance(repository, policy, subset, binding)
+            self.assertEqual(graph.activate(repository, policy, binding=binding, graph_version_id="graph-113").decision, GraphDecision.ACCEPTED)
             connection = sqlite3.connect(database_path(repository))
             try:
-                connection.execute("UPDATE dependency_graph_decisions SET decision_digest = ? WHERE proposal_id = ?", (digest("0"), policy.proposal_id))
+                connection.execute("UPDATE dependency_graph_trusted_relations SET rationale_digest = ? WHERE snapshot_id = ?", (digest("0"), subset.snapshot_id))
                 connection.commit()
             finally:
                 connection.close()

@@ -324,18 +324,10 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         reviews.accept_proposal(repository, proposal, binding=review_binding)
         activation = DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(review_binding), graph_version_id="graph-21")
         context = GateContext(identity.task_id, seal.candidate_sha, 2, False, base_context.policy_digest, base_context.receipt_fingerprint, runtime, base_context.selected_supervisor_profile_identity, dependency_graph_version_id=activation.graph_version_id, dependency_graph_decision_digest=activation.decision_digest)
-        connection = sqlite3.connect(database_path(repository))
-        try:
-            connection.execute("DELETE FROM gate_evidence WHERE task_id = ?", (identity.task_id,))
-            connection.execute("DELETE FROM candidate_evidence WHERE task_id = ?", (identity.task_id,))
-            connection.execute("DELETE FROM gate_contexts WHERE task_id = ?", (identity.task_id,))
-            connection.commit()
-        finally:
-            connection.close()
-        evidence = tuple(
+        evidence = tuple(sorted((
             GateEvidence(identity.task_id, seal.candidate_sha, requirement.key, EvidenceOutcome.PASS, "validator", number, activation.decision_digest[7:] if requirement.key is GateKey.DEPENDENCY_GRAPH else f"{number:064x}")
             for number, requirement in enumerate(GATE_REGISTRY, 1)
-        )
+        ), key=lambda item: item.gate_key is not GateKey.DEPENDENCY_GRAPH))
         policy_evidence = self.policy_evidence(context)
         with mock.patch("roundwright.gates.bind_candidate_evidence"):
             for item in evidence:

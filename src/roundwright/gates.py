@@ -245,8 +245,12 @@ def record_gate_evidence(
                 (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at),
             )
         elif persisted_context[:16] != context_values:
-            graph_moved = persisted_context[:14] == context_values[:14] and persisted_context[16] == policy_activated_at
-            if not graph_moved and (type(persisted_context[16]) is not str or policy_activated_at <= persisted_context[16]):
+            trusted_context_unchanged = persisted_context[2:14] == context_values[2:14] and persisted_context[16] == policy_activated_at
+            source_rebound = trusted_context_unchanged and persisted_context[:2] != context_values[:2]
+            graph_moved = trusted_context_unchanged and persisted_context[:2] == context_values[:2]
+            if source_rebound and context.source_count > 1 and (_value(evidence.gate_key) != GateKey.DEPENDENCY_GRAPH.value or _value(evidence.outcome) != EvidenceOutcome.PASS.value):
+                raise GateError("source-count rebind requires current dependency graph evidence")
+            if not (source_rebound or graph_moved) and (type(persisted_context[16]) is not str or policy_activated_at <= persisted_context[16]):
                 raise GateError("gate context conflicts with committed task state")
             connection.execute(
                 "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",

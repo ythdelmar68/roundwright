@@ -447,6 +447,34 @@ class DependencyReviewTests(unittest.TestCase):
             self.assertEqual(results[0], results[1])
             self.assertEqual(results[0].decision, GraphDecision.ACCEPTED)
 
+    def test_conflicting_canonical_edges_leave_the_current_graph_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            reviews = DependencyReviewStore()
+            binding = self.binding(subset)
+            graph_binding = DependencyGraphBinding.from_review_binding(binding)
+            first = self.proposal("attempt-113")
+            reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=binding, source_owned_relations=self.source_owned_relations(first))
+            reviews.accept_proposal(repository, first, binding=binding)
+            graph = DependencyGraphStore()
+            self.assertEqual(graph.activate(repository, first, binding=graph_binding, graph_version_id="graph-113").decision, GraphDecision.ACCEPTED)
+            successor_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", (*subset.members, AffectedMember("member-c", digest("9"), digest("a"))))
+            relations = (
+                SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
+                SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.BLOCKS, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8")),
+                SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-c", digest("b"), Confidence.HIGH, digest("c")),
+            )
+            proposal = DependencyProposal("proposal-114", "attempt-114", RequestedDisposition.AUTO_ACTIVATE, "not-required", (
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), relations[0].relation_digest),
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.BLOCKS, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8"), relations[1].relation_digest),
+                ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-c", digest("b"), Confidence.HIGH, digest("c"), relations[2].relation_digest),
+            ))
+            reviews.start_attempt(repository, successor_subset, attempt_id="attempt-114", binding=self.binding(successor_subset), source_owned_relations=relations, supersedes_attempt_id="attempt-113")
+            reviews.accept_proposal(repository, proposal, binding=self.binding(successor_subset))
+            result = graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-114")
+            self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "duplicate-or-conflicting-edge"))
+            self.assertEqual(graph.current(repository, binding=graph_binding).graph_version_id, "graph-113")
+
     def test_graph_activation_routes_semantic_and_rejects_incomplete_or_cyclic_edges(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))

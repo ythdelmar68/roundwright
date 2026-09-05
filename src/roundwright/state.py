@@ -670,6 +670,53 @@ MIGRATIONS = (
             ("dependency_review_successors", "CREATE TABLE dependency_review_successors (predecessor_attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), successor_attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), CHECK(predecessor_attempt_id != successor_attempt_id))"),
         ),
     ),
+    Migration(
+        52,
+        (
+            "CREATE TABLE dependency_graph_versions (graph_version_id TEXT PRIMARY KEY, predecessor_graph_version_id TEXT REFERENCES dependency_graph_versions(graph_version_id), proposal_set_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, graph_digest TEXT NOT NULL)",
+            "CREATE TABLE dependency_graph_members (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), member_id TEXT NOT NULL, member_fingerprint TEXT NOT NULL, content_digest TEXT NOT NULL, PRIMARY KEY(graph_version_id, member_id), UNIQUE(graph_version_id, member_fingerprint))",
+            "CREATE TABLE dependency_graph_edges (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), PRIMARY KEY(graph_version_id, subject_member_id, object_member_id))",
+            "CREATE TABLE dependency_graph_current (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id))",
+            "CREATE TABLE dependency_graph_decisions (proposal_id TEXT PRIMARY KEY REFERENCES dependency_review_proposals(proposal_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), subset_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('accepted', 'pending-owner', 'rejected')), reason_code TEXT NOT NULL, decision_digest TEXT NOT NULL, graph_version_id TEXT UNIQUE REFERENCES dependency_graph_versions(graph_version_id))",
+        ),
+        (
+            ("dependency_graph_versions", "CREATE TABLE dependency_graph_versions (graph_version_id TEXT PRIMARY KEY, predecessor_graph_version_id TEXT REFERENCES dependency_graph_versions(graph_version_id), proposal_set_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, graph_digest TEXT NOT NULL)"),
+            ("dependency_graph_members", "CREATE TABLE dependency_graph_members (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), member_id TEXT NOT NULL, member_fingerprint TEXT NOT NULL, content_digest TEXT NOT NULL, PRIMARY KEY(graph_version_id, member_id), UNIQUE(graph_version_id, member_fingerprint))"),
+            ("dependency_graph_edges", "CREATE TABLE dependency_graph_edges (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), PRIMARY KEY(graph_version_id, subject_member_id, object_member_id))"),
+            ("dependency_graph_current", "CREATE TABLE dependency_graph_current (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id))"),
+            ("dependency_graph_decisions", "CREATE TABLE dependency_graph_decisions (proposal_id TEXT PRIMARY KEY REFERENCES dependency_review_proposals(proposal_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES dependency_review_attempts(attempt_id), subset_digest TEXT NOT NULL, validator_digest TEXT NOT NULL, policy_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('accepted', 'pending-owner', 'rejected')), reason_code TEXT NOT NULL, decision_digest TEXT NOT NULL, graph_version_id TEXT UNIQUE REFERENCES dependency_graph_versions(graph_version_id))"),
+        ),
+    ),
+    Migration(
+        53,
+        (
+            "ALTER TABLE dependency_graph_edges ADD COLUMN provenance_digest TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN dependency_graph_version_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gate_contexts ADD COLUMN dependency_graph_decision_digest TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("dependency_graph_edges", "CREATE TABLE dependency_graph_edges (graph_version_id TEXT NOT NULL REFERENCES dependency_graph_versions(graph_version_id), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), proposal_id TEXT NOT NULL REFERENCES dependency_review_proposals(proposal_id), provenance_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(graph_version_id, subject_member_id, object_member_id))"),
+            ("gate_contexts", "CREATE TABLE \"gate_contexts\" (task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, source_count INTEGER NOT NULL CHECK(source_count > 0), isolated_local_task INTEGER NOT NULL CHECK(isolated_local_task IN (0, 1)), policy_digest TEXT NOT NULL, receipt_fingerprint TEXT NOT NULL, policy_activated_at TEXT NOT NULL DEFAULT '', configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_supervisor_profile_identity TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', dependency_graph_version_id TEXT NOT NULL DEFAULT '', dependency_graph_decision_digest TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, candidate_sha))"),
+        ),
+    ),
+    Migration(
+        54,
+        (
+            "CREATE TABLE dependency_graph_trusted_relations (provenance_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_digest TEXT NOT NULL, subject_member_fingerprint TEXT NOT NULL, object_member_fingerprint TEXT NOT NULL, PRIMARY KEY(snapshot_id, provenance_digest))",
+        ),
+        (
+            ("dependency_graph_trusted_relations", "CREATE TABLE dependency_graph_trusted_relations (provenance_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_digest TEXT NOT NULL, subject_member_fingerprint TEXT NOT NULL, object_member_fingerprint TEXT NOT NULL, PRIMARY KEY(snapshot_id, provenance_digest))"),
+        ),
+    ),
+    Migration(
+        55,
+        (
+            "ALTER TABLE dependency_graph_trusted_relations ADD COLUMN attempt_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            ("dependency_graph_trusted_relations", "CREATE TABLE dependency_graph_trusted_relations (provenance_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES dependency_review_subsets(snapshot_id), edge_kind TEXT NOT NULL CHECK(edge_kind IN ('explicit', 'policy-derived')), direction TEXT NOT NULL CHECK(direction IN ('depends-on', 'blocks')), subject_member_id TEXT NOT NULL, object_member_id TEXT NOT NULL, rationale_digest TEXT NOT NULL, confidence TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')), conflicts_digest TEXT NOT NULL, candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_digest TEXT NOT NULL, subject_member_fingerprint TEXT NOT NULL, object_member_fingerprint TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(snapshot_id, provenance_digest))"),
+        ),
+    ),
 )
 
 

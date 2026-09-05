@@ -90,6 +90,8 @@ class GateContext:
     runtime_binding: RuntimeBinding
     selected_supervisor_profile_identity: str
     review_limit_finalization: ReviewLimitFinalizationReceipt | None = field(default=None, compare=False)
+    dependency_graph_version_id: str | None = None
+    dependency_graph_decision_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -227,24 +229,28 @@ def record_gate_evidence(
         ).fetchone()
         if row != (seal.candidate_sha,):
             raise GateError("candidate seal is no longer current")
-        source_count = connection.execute(
-            "SELECT COUNT(*) FROM tasks JOIN source_snapshots ON source_snapshots.source_id = tasks.source_id WHERE tasks.task_id = ?",
-            (binding.task_id,),
-        ).fetchone()[0]
+        terminal_binding, source_count = _terminal_dependency_binding(connection, binding.task_id)
         if context.source_count != source_count:
             raise GateError("gate context source count does not match committed task state")
+        if _value(evidence.gate_key) == GateKey.DEPENDENCY_GRAPH.value and _value(evidence.outcome) == EvidenceOutcome.PASS.value:
+            _require_current_dependency_graph(connection, binding.task_id, seal.candidate_sha, context, evidence)
         persisted_context = connection.execute(
-            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, policy_activated_at FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+            "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, dependency_graph_version_id, dependency_graph_decision_digest, policy_activated_at, terminal_dependency_binding FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
             (binding.task_id, seal.candidate_sha),
         ).fetchone()
-        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint, *context.runtime_binding.complete_columns(), context.selected_supervisor_profile_identity)
+        context_values = (context.source_count, int(context.isolated_local_task), context.policy_digest, context.receipt_fingerprint, *context.runtime_binding.complete_columns(), context.selected_supervisor_profile_identity, context.dependency_graph_version_id or "", context.dependency_graph_decision_digest or "")
         if persisted_context is None:
             connection.execute(
-                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, policy_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at),
+                "INSERT INTO gate_contexts(task_id, candidate_sha, source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, dependency_graph_version_id, dependency_graph_decision_digest, policy_activated_at, terminal_dependency_binding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (binding.task_id, seal.candidate_sha, *context_values, policy_activated_at, terminal_binding),
             )
-        elif persisted_context[:14] != context_values:
-            if type(persisted_context[14]) is not str or policy_activated_at <= persisted_context[14]:
+        elif persisted_context[:16] != context_values:
+            trusted_context_unchanged = persisted_context[2:14] == context_values[2:14] and persisted_context[16] == policy_activated_at
+            source_rebound = trusted_context_unchanged and persisted_context[0] != context_values[0]
+            graph_moved = trusted_context_unchanged and persisted_context[:2] == context_values[:2]
+            if source_rebound and context.source_count > 1 and (_value(evidence.gate_key) != GateKey.DEPENDENCY_GRAPH.value or _value(evidence.outcome) != EvidenceOutcome.PASS.value):
+                raise GateError("source-count rebind requires current dependency graph evidence")
+            if not (source_rebound or graph_moved) and (type(persisted_context[16]) is not str or policy_activated_at <= persisted_context[16]):
                 raise GateError("gate context conflicts with committed task state")
             connection.execute(
                 "DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?",
@@ -255,11 +261,16 @@ def record_gate_evidence(
                 (binding.task_id, seal.candidate_sha),
             )
             connection.execute(
-                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, configuration_schema_version = ?, configuration_digest = ?, worker_profile_identity = ?, supervisor_profile_identities = ?, review_complete_rounds = ?, review_max_rounds = ?, review_max_supervisor_attempts_per_round = ?, review_on_final_findings = ?, review_policy_digest = ?, selected_supervisor_profile_identity = ?, policy_activated_at = ? WHERE task_id = ? AND candidate_sha = ?",
-                (*context_values, policy_activated_at, binding.task_id, seal.candidate_sha),
+                "UPDATE gate_contexts SET source_count = ?, isolated_local_task = ?, policy_digest = ?, receipt_fingerprint = ?, configuration_schema_version = ?, configuration_digest = ?, worker_profile_identity = ?, supervisor_profile_identities = ?, review_complete_rounds = ?, review_max_rounds = ?, review_max_supervisor_attempts_per_round = ?, review_on_final_findings = ?, review_policy_digest = ?, selected_supervisor_profile_identity = ?, dependency_graph_version_id = ?, dependency_graph_decision_digest = ?, policy_activated_at = ?, terminal_dependency_binding = ? WHERE task_id = ? AND candidate_sha = ?",
+                (*context_values, policy_activated_at, terminal_binding, binding.task_id, seal.candidate_sha),
             )
-        elif persisted_context[14] != policy_activated_at:
+        elif persisted_context[16] != policy_activated_at:
             raise GateError("gate context conflicts with committed task state")
+        elif persisted_context[17] != terminal_binding:
+            connection.execute("DELETE FROM gate_evidence WHERE task_id = ? AND candidate_sha = ?", (binding.task_id, seal.candidate_sha))
+            connection.execute("DELETE FROM candidate_evidence WHERE task_id = ? AND candidate_sha = ?", (binding.task_id, seal.candidate_sha))
+            connection.commit()
+            raise GateError("terminal dependency-review binding has moved")
         connection.execute(
             "INSERT OR IGNORE INTO candidate_evidence(task_id, candidate_sha, evidence_fingerprint) VALUES (?, ?, ?)",
             (binding.task_id, seal.candidate_sha, evidence.evidence_fingerprint),
@@ -373,6 +384,8 @@ def transition_ready_for_owner(
         raise GateError("gate context does not match committed task state")
     if policy_activated_at != _persisted_policy_activation(repository, binding.task_id, seal.candidate_sha):
         raise GateError("trusted policy receipt is stale")
+    if _read_persisted_decision(repository, binding, seal, lease=lease).outcome is not GateOutcome.PASS:
+        raise GateError("persisted gate decision is no longer current")
     return _transition_ready_for_owner(
         repository,
         _task_identity(repository, binding.task_id),
@@ -500,16 +513,36 @@ def _decision_from_connection(connection, identity) -> GateDecision:
     context = _read_gate_context(connection, identity.task_id, seal[1])
     if context is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "gate context is unavailable"),))
+    stored_binding = connection.execute(
+        "SELECT terminal_dependency_binding FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+        (identity.task_id, seal[1]),
+    ).fetchone()
+    try:
+        terminal_binding, source_count = _terminal_dependency_binding(connection, identity.task_id)
+    except GateError:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "affected source subset is unavailable or stale"),))
+    if stored_binding != (terminal_binding,) or context.source_count != source_count:
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "terminal dependency-review binding is stale"),))
     rows = connection.execute(
         "SELECT gates.task_id, gates.candidate_sha, gates.gate_key, gates.outcome, gates.evaluator_id, gates.evaluated_at, gates.evidence_fingerprint, gates.changed_boundary, gates.reason, gates.follow_ups FROM gate_evidence AS gates JOIN candidate_evidence AS candidate ON candidate.task_id = gates.task_id AND candidate.candidate_sha = gates.candidate_sha AND candidate.evidence_fingerprint = gates.evidence_fingerprint WHERE gates.task_id = ? AND gates.candidate_sha = ? ORDER BY gates.gate_key, gates.evaluator_id, gates.evidence_fingerprint",
         (identity.task_id, seal[1]),
     ).fetchall()
-    return decide_gates(context, tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows))
+    evidence = tuple(GateEvidence(*row[:9], _decode_follow_ups(row[9])) for row in rows)
+    decision = decide_gates(context, evidence)
+    if decision.outcome is GateOutcome.PASS and context.source_count > 1:
+        graph_evidence = next((item for item in evidence if _value(item.gate_key) == GateKey.DEPENDENCY_GRAPH.value and _value(item.outcome) == EvidenceOutcome.PASS.value), None)
+        if graph_evidence is None:
+            return GateDecision(GateOutcome.BLOCKED, (GateResult("dependency-graph", GateOutcome.BLOCKED, "accepted graph decision is unavailable"),))
+        try:
+            _require_current_dependency_graph(connection, identity.task_id, seal[1], context, graph_evidence)
+        except GateError:
+            return GateDecision(GateOutcome.BLOCKED, (GateResult("dependency-graph", GateOutcome.BLOCKED, "accepted graph decision is stale"),))
+    return decision
 
 
 def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateContext | None:
     row = connection.execute(
-        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
+        "SELECT source_count, isolated_local_task, policy_digest, receipt_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, selected_supervisor_profile_identity, dependency_graph_version_id, dependency_graph_decision_digest FROM gate_contexts WHERE task_id = ? AND candidate_sha = ?",
         (task_id, candidate_sha),
     ).fetchone()
     if row is None or type(row[0]) is not int or row[0] <= 0 or type(row[1]) is not int or row[1] not in (0, 1) or not _is_fingerprint(row[2]) or not _is_fingerprint(row[3]) or type(row[13]) is not str:
@@ -520,7 +553,7 @@ def _read_gate_context(connection, task_id: str, candidate_sha: str) -> GateCont
         return None
     if row[13] not in runtime_binding.supervisor_profile_identities:
         return None
-    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3], runtime_binding, row[13])
+    return GateContext(task_id, candidate_sha, row[0], bool(row[1]), row[2], row[3], runtime_binding, row[13], None, row[14] or None, row[15] or None)
 
 
 def _decide_requirement(context: GateContext, requirement: GateRequirement, entries: list[GateEvidence]) -> GateResult:
@@ -536,6 +569,8 @@ def _decide_requirement(context: GateContext, requirement: GateRequirement, entr
         return GateResult(key, GateOutcome.BLOCKED, "conflicting evidence")
     outcome = next(iter(outcomes))
     if outcome == EvidenceOutcome.PASS.value:
+        if requirement.key is GateKey.DEPENDENCY_GRAPH and context.source_count > 1 and (not _is_token(context.dependency_graph_version_id) or not _is_graph_digest(context.dependency_graph_decision_digest)):
+            return GateResult(key, GateOutcome.BLOCKED, "accepted graph decision is unavailable")
         return GateResult(key, GateOutcome.PASS, "accepted")
     if outcome == EvidenceOutcome.NOT_APPLICABLE.value:
         if not requirement.permits_phase_two_local_na:
@@ -636,10 +671,12 @@ def _contexts_match(expected: GateContext, actual: object) -> bool:
         expected.task_id, expected.candidate_sha, expected.source_count,
         expected.isolated_local_task, expected.policy_digest, expected.receipt_fingerprint,
         expected.selected_supervisor_profile_identity,
+        expected.dependency_graph_version_id, expected.dependency_graph_decision_digest,
     ) != (
         actual.task_id, actual.candidate_sha, actual.source_count,
         actual.isolated_local_task, actual.policy_digest, actual.receipt_fingerprint,
         actual.selected_supervisor_profile_identity,
+        actual.dependency_graph_version_id, actual.dependency_graph_decision_digest,
     ):
         return False
     return _runtime_bindings_match(expected.runtime_binding, actual.runtime_binding)
@@ -658,6 +695,8 @@ def _is_well_formed_context(context: GateContext) -> bool:
         and _is_fingerprint(context.receipt_fingerprint)
         and type(context.runtime_binding) is RuntimeBinding
         and context.selected_supervisor_profile_identity in context.runtime_binding.supervisor_profile_identities
+        and (context.dependency_graph_version_id is None or _is_token(context.dependency_graph_version_id))
+        and (context.dependency_graph_decision_digest is None or _is_graph_digest(context.dependency_graph_decision_digest))
     )
 
 
@@ -688,6 +727,95 @@ def _justified_na(evidence: GateEvidence) -> bool:
 
 def _is_fingerprint(value: object) -> bool:
     return isinstance(value, str) and bool(_FINGERPRINT.fullmatch(value))
+
+
+def _is_graph_digest(value: object) -> bool:
+    return _is_fingerprint(value) or (isinstance(value, str) and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", value)))
+
+
+def _graph_fingerprint(value: str) -> str:
+    return value[7:] if value.startswith("sha256:") else value
+
+
+def _is_token(value: object) -> bool:
+    return isinstance(value, str) and bool(_TOKEN.fullmatch(value))
+
+
+def _affected_source_count(connection, task_id: str) -> int:
+    """Use the terminal immutable affected subset when review evidence exists."""
+    return _terminal_dependency_binding(connection, task_id)[1]
+
+
+def _terminal_dependency_binding(connection, task_id: str) -> tuple[str, int]:
+    """Return a complete, validated terminal-review binding or the no-lineage marker."""
+
+    from .dependency_review import DependencyReviewError, DependencyReviewStore
+
+    attempts = tuple(connection.execute("SELECT attempt_id FROM dependency_review_attempts WHERE task_id = ? ORDER BY attempt_id", (task_id,)))
+    if not attempts:
+        return json.dumps({"state": "no-lineage"}, sort_keys=True, separators=(",", ":")), 1
+    terminals = tuple(connection.execute(
+        "SELECT attempts.attempt_id FROM dependency_review_attempts AS attempts WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
+        (task_id,),
+    ))
+    if len(terminals) != 1:
+        raise GateError("terminal dependency review lineage is unavailable")
+    try:
+        DependencyReviewStore._verify_task_lineage(connection, task_id)
+        attempt, subset = DependencyReviewStore._read_attempt(connection, terminals[0][0])
+    except DependencyReviewError as error:
+        raise GateError("terminal dependency review subset is unavailable") from error
+    if attempt[0] != task_id or len(subset.members) <= 0:
+        raise GateError("terminal dependency review subset is unavailable")
+    binding = {
+        "state": "terminal",
+        "attempt_id": terminals[0][0],
+        "snapshot_id": subset.snapshot_id,
+        "subset_digest": subset.content_digest,
+        "members": [member.payload() for member in subset.members],
+        "candidate_sha": subset.candidate_sha,
+        "policy_digest": subset.policy_digest,
+        "configuration_digest": subset.configuration_digest,
+        "disposition": attempt[6],
+    }
+    return json.dumps(binding, sort_keys=True, separators=(",", ":")), len(subset.members)
+
+
+def _require_current_dependency_graph(connection, task_id: str, candidate_sha: str, context: GateContext, evidence: GateEvidence) -> None:
+    if context.source_count <= 1:
+        raise GateError("dependency graph PASS is not valid for a single-source task")
+    if not _is_token(context.dependency_graph_version_id) or not _is_graph_digest(context.dependency_graph_decision_digest):
+        raise GateError("dependency graph context is unavailable")
+    # Syntax-level rows are insufficient: the graph store reconstructs the
+    # accepted proposal, predecessor snapshot, and decision digest on restart.
+    from .dependency_graph import DependencyGraphError, DependencyGraphStore, VALIDATOR_DIGEST
+    try:
+        current = DependencyGraphStore._read_current(connection)
+    except DependencyGraphError as error:
+        raise GateError("dependency graph evidence is unavailable or stale") from error
+    terminal = connection.execute(
+        "SELECT attempts.attempt_id, attempts.snapshot_id, attempts.state FROM dependency_review_attempts AS attempts WHERE attempts.task_id = ? AND NOT EXISTS (SELECT 1 FROM dependency_review_successors AS successors WHERE successors.predecessor_attempt_id = attempts.attempt_id) ORDER BY attempts.attempt_id",
+        (task_id,),
+    ).fetchone()
+    expected_members = () if terminal is None or terminal[2] != "accepted" else tuple(connection.execute(
+        "SELECT member_id, member_fingerprint, content_digest FROM dependency_review_subset_members WHERE snapshot_id = ? ORDER BY member_id",
+        (terminal[1],),
+    ))
+    graph_members = tuple(sorted((member.member.member_id, member.member.member_fingerprint, member.member.content_digest) for member in current.members if member.task_id == task_id))
+    graph_snapshots = {member.snapshot_id for member in current.members if member.task_id == task_id}
+    terminal_edge = None if terminal is None else connection.execute(
+        "SELECT 1 FROM dependency_graph_edges AS edges JOIN dependency_review_proposals AS proposals ON proposals.proposal_id = edges.proposal_id WHERE edges.graph_version_id = ? AND proposals.attempt_id = ?",
+        (current.graph_version_id, terminal[0]),
+    ).fetchone()
+    graph_policy_digest = context.policy_digest if context.policy_digest.startswith("sha256:") else "sha256:" + context.policy_digest
+    if current.graph_version_id != context.dependency_graph_version_id or current.binding is None or (current.binding.candidate_sha, current.binding.policy_digest, current.binding.configuration_digest, current.binding.validator_digest) != (candidate_sha, graph_policy_digest, context.runtime_binding.resolved_digest, VALIDATOR_DIGEST) or not expected_members or graph_members != expected_members or graph_snapshots != {terminal[1]} or terminal_edge is None:
+        raise GateError("dependency graph evidence is unavailable or stale")
+    row = connection.execute(
+        "SELECT versions.candidate_sha, decisions.decision, decisions.decision_digest FROM dependency_graph_current AS current JOIN dependency_graph_versions AS versions ON versions.graph_version_id = current.graph_version_id JOIN dependency_graph_decisions AS decisions ON decisions.graph_version_id = versions.graph_version_id WHERE current.singleton = 1 AND versions.graph_version_id = ?",
+        (context.dependency_graph_version_id,),
+    ).fetchone()
+    if row is None or row[:2] != (candidate_sha, "accepted") or _graph_fingerprint(row[2]) != _graph_fingerprint(context.dependency_graph_decision_digest) or evidence.evidence_fingerprint != _graph_fingerprint(context.dependency_graph_decision_digest):
+        raise GateError("dependency graph evidence is unavailable or stale")
 
 
 def _follow_ups_are_valid(value: object) -> bool:

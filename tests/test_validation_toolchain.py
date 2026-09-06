@@ -266,6 +266,13 @@ class ValidationToolchainTests(unittest.TestCase):
         self.assertNotIn('["pipx", "install"]', verifier)
         self.assertNotIn('["uv", "tool"]', verifier)
 
+    def test_windows_runtime_launch_uses_the_extended_receipt_bound_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "python.exe"
+            executable.write_bytes(b"tool")
+            with mock.patch.object(resolver.os, "name", "nt"):
+                self.assertEqual(resolver._runtime_executable(executable), "\\\\?\\" + str(executable.resolve(strict=True)))
+
 
 if __name__ == "__main__":
     unittest.main()

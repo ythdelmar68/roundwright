@@ -77,6 +77,7 @@ class PlanReviewOutput:
     missing_tests: tuple[str, ...]
     ambiguous_criteria: tuple[str, ...]
     residual_risks: tuple[str, ...]
+    pass_follow_ups: tuple[str, ...] = ()
 
     def normalized(self) -> "PlanReviewOutput":
         for value, name in (
@@ -106,12 +107,15 @@ class PlanReviewOutput:
             _items(self.missing_tests, "missing tests"),
             _items(self.ambiguous_criteria, "ambiguous criteria"),
             _items(self.residual_risks, "residual risks"),
+            _items(self.pass_follow_ups, "PASS follow-ups"),
         )
         details = (*result.findings, *result.missing_tests, *result.ambiguous_criteria, *result.residual_risks)
         if verdict is PlanReviewVerdict.PASS and details:
             raise PlanReviewError("PASS must not include findings or residual review fields")
         if verdict is PlanReviewVerdict.FINDINGS and not details:
             raise PlanReviewError("FINDINGS requires at least one structured detail")
+        if verdict is PlanReviewVerdict.FINDINGS and result.pass_follow_ups:
+            raise PlanReviewError("FINDINGS must not include PASS follow-ups")
         return result
 
     @property
@@ -126,7 +130,7 @@ class PlanReviewOutput:
                 "plan_attempt": value.plan_attempt_id,
                 "source": value.source_digest,
                 "plan": value.plan_digest,
-                "verdict": value.verdict.value,
+                "verdict": value.verdict.value, "pass_follow_ups": value.pass_follow_ups,
                 "findings": value.findings,
                 "missing_tests": value.missing_tests,
                 "ambiguous_criteria": value.ambiguous_criteria,
@@ -156,6 +160,7 @@ class PersistedPlanReview:
     verdict: PlanReviewVerdict
     state: PlanReviewState
     routed_finding_ids: tuple[str, ...]
+    pass_follow_up_ids: tuple[str, ...] = ()
 
 
 def dispatch_plan_review(
@@ -407,7 +412,19 @@ def read_plan_review(
                 raise PlanReviewError("accepted provider review conflicts with committed state")
             _require_exact_provider_context(connection, identity, provider[0], context)
             _require_sealed_provider_authorization(connection, identity, provider[0], context, now)
-        return PersistedPlanReview(review_attempt_id, row[0], row[1], row[2], PlanReviewVerdict(row[4]), PlanReviewState(row[3]), tuple(json.loads(row[5] or "[]")))
+        follow_ups = ()
+        if row[4] == PlanReviewVerdict.PASS.value:
+            artifact_follow_ups = connection.execute("SELECT pass_follow_ups_json FROM plan_review_artifacts WHERE review_attempt_id = ?", (review_attempt_id,)).fetchone()
+            if artifact_follow_ups is None:
+                raise PlanReviewError("review PASS artifact is unavailable")
+            try:
+                values = tuple(json.loads(artifact_follow_ups[0]))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise PlanReviewError("review PASS follow-up schema is invalid") from error
+            if any(type(value) is not str for value in values):
+                raise PlanReviewError("review PASS follow-up schema is invalid")
+            follow_ups = tuple(f"pass-follow-up-{_digest({'task': identity.task_id, 'candidate': identity.base_sha, 'follow_up': value})[:24]}" for value in values)
+        return PersistedPlanReview(review_attempt_id, row[0], row[1], row[2], PlanReviewVerdict(row[4]), PlanReviewState(row[3]), tuple(json.loads(row[5] or "[]")), follow_ups)
     finally:
         connection.close()
 
@@ -423,13 +440,13 @@ def _persist_artifact(repository, identity, dispatch, output, lease, now) -> Non
         _require_current_lease(connection, lease, identity.repository_id, _clock(now))
         _require_matching_task(connection, identity, "plan-review")
         existing = connection.execute(
-            "SELECT verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, content_digest FROM plan_review_artifacts WHERE review_attempt_id = ?",
+            "SELECT verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, pass_follow_ups_json, content_digest FROM plan_review_artifacts WHERE review_attempt_id = ?",
             (dispatch.review_attempt_id,),
         ).fetchone()
-        expected = (output.verdict.value, json.dumps(output.findings), json.dumps(output.missing_tests), json.dumps(output.ambiguous_criteria), json.dumps(output.residual_risks), output.digest)
+        expected = (output.verdict.value, json.dumps(output.findings), json.dumps(output.missing_tests), json.dumps(output.ambiguous_criteria), json.dumps(output.residual_risks), json.dumps(output.pass_follow_ups), output.digest)
         if existing is None:
             connection.execute(
-                "INSERT INTO plan_review_artifacts(review_attempt_id, task_id, verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO plan_review_artifacts(review_attempt_id, task_id, verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, pass_follow_ups_json, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (dispatch.review_attempt_id, identity.task_id, *expected),
             )
             connection.execute("UPDATE plan_review_attempts SET state = ? WHERE review_attempt_id = ?", (PlanReviewState.RECORDED.value, dispatch.review_attempt_id))
@@ -477,9 +494,15 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
         expected = (dispatch.plan_attempt_id, dispatch.review_attempt_id, dispatch.plan_digest)
         if submitted != (dispatch.plan_attempt_id, dispatch.plan_digest):
             raise PlanReviewError("accepted PASS no longer matches the submitted plan")
-        artifact = connection.execute("SELECT verdict FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?", (dispatch.review_attempt_id, identity.task_id)).fetchone()
-        if artifact != (PlanReviewVerdict.PASS.value,):
+        artifact = connection.execute("SELECT verdict, pass_follow_ups_json FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?", (dispatch.review_attempt_id, identity.task_id)).fetchone()
+        if artifact is None or artifact[0] != PlanReviewVerdict.PASS.value:
             raise PlanReviewError("only a recorded PASS can be accepted")
+        try:
+            pass_follow_ups = tuple(json.loads(artifact[1]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise PlanReviewError("accepted PASS follow-up schema is invalid") from error
+        if any(type(value) is not str for value in pass_follow_ups):
+            raise PlanReviewError("accepted PASS follow-up schema is invalid")
         provider = connection.execute("SELECT provider_role, state, accepted_review_identity, completion_evidence_fingerprint, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
         if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[3] is None:
             raise PlanReviewError("accepted PASS provider attempt is incomplete")
@@ -499,6 +522,18 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
             connection.execute("INSERT INTO accepted_plan_reviews(task_id, plan_attempt_id, review_identity, review_digest) VALUES (?, ?, ?, ?)", (identity.task_id, *expected))
         elif existing != expected:
             raise PlanReviewError("accepted plan review conflicts with committed state")
+        if pass_follow_ups:
+            from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, _record_review_item_connection
+            timestamp = connection.execute("SELECT created_at FROM plan_review_attempts WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()
+            if timestamp is None:
+                raise PlanReviewError("accepted plan review timestamp is unavailable")
+            for follow_up in pass_follow_ups:
+                digest = _digest({"task": identity.task_id, "candidate": identity.base_sha, "follow_up": follow_up})
+                _record_review_item_connection(connection, identity, ReviewItem(
+                    f"pass-follow-up-{digest[:24]}", identity.task_id, dispatch.review_attempt_id,
+                    identity.base_sha, dispatch.provider_attempt_id, ReviewItemKind.PASS_FOLLOW_UP,
+                    ReviewItemSource.ACCEPTED_REVIEW, digest, "owner-review", True, timestamp[0],
+                ))
         connection.commit()
     except Exception:
         connection.rollback()

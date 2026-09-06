@@ -1075,27 +1075,23 @@ def recover_attempt(
         _require_matching_task(connection, identity)
         row = _attempt_row(connection, identity.task_id, attempt_id)
         if not _context_matches(connection, identity, attempt_id, context):
-            connection.rollback()
-            return _projection(row, RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift")
-        _validate_context(identity, context)
-        authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
-        if _accepted_review_kind(connection, identity, row) == "invalid":
-            raise ProviderRecoveryError("accepted supervisor review is invalid")
-        if _accepted_review_kind(connection, identity, row) == "generic" and row.state is AttemptState.ACCEPTED:
-            _require_accepted_supervisor_review(connection, identity, row, context)
-        if row.state is AttemptState.PREPARED and row.session_identity is not None:
-            try:
-                _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context, authorization_fingerprint)
-            except ProviderRecoveryError:
-                connection.rollback()
-                return _projection(row, RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "session-checkpoint-unavailable")
-        action, blocker, next_state = _recovery_outcome(
-            connection,
-            row,
-            verified_completion_evidence=verified_completion_evidence,
-            max_attempts=max_attempts,
-            observed=observed,
-        )
+            action, blocker, next_state = RecoveryAction.BLOCKED_IDENTITY_DRIFT, "identity-drift", _abandonment_state(row)
+        else:
+            _validate_context(identity, context)
+            authorization_fingerprint = _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+            if _accepted_review_kind(connection, identity, row) == "invalid":
+                raise ProviderRecoveryError("accepted supervisor review is invalid")
+            if _accepted_review_kind(connection, identity, row) == "generic" and row.state is AttemptState.ACCEPTED:
+                _require_accepted_supervisor_review(connection, identity, row, context)
+            if row.state is AttemptState.PREPARED and row.session_identity is not None:
+                try:
+                    _require_session_checkpoint(connection, identity.task_id, attempt_id, row.session_identity, context, authorization_fingerprint)
+                except ProviderRecoveryError:
+                    action, blocker, next_state = RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "session-checkpoint-unavailable", _abandonment_state(row)
+                else:
+                    action, blocker, next_state = _recovery_outcome(connection, row, verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts, observed=observed)
+            else:
+                action, blocker, next_state = _recovery_outcome(connection, row, verified_completion_evidence=verified_completion_evidence, max_attempts=max_attempts, observed=observed)
         if row.state is AttemptState.ACCEPTED and row.output_pointer is not None and row.output_pointer.startswith("diff-review:"):
             _stale_unvalidated_diff_review(connection, identity, row)
             row = replace(row, state=AttemptState.INVALIDATED, accepted_review_identity=None)
@@ -1104,6 +1100,12 @@ def recover_attempt(
             row = replace(row, state=next_state)
         if blocker is not None:
             _persist_recovery_outcome(connection, attempt_id, action, blocker, observed)
+        if row.role is ProviderRole.WORKER and _terminal_worker_abandonment(action, blocker):
+            # Recovery outcome and objective terminalization share this one
+            # transaction, so a crash cannot leave an abandoned Worker active.
+            from .review_lifecycle import _cancel_objective_for_recovery_connection
+            reason = hashlib.sha256("\x1f".join(("worker-objective-recovery/v1", attempt_id, action.value, blocker or "")).encode("ascii")).hexdigest()
+            _cancel_objective_for_recovery_connection(connection, identity, attempt_id, reason)
         connection.execute(
             "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
             (identity.task_id, attempt_id, action.value, observed),
@@ -1266,6 +1268,25 @@ def _recovery_outcome(connection, row: ProviderAttempt, *, verified_completion_e
         if row.role is ProviderRole.SUPERVISOR:
             return RecoveryAction.FRESH_SUPERVISOR_SESSION, "stale-supervisor-process-lease", AttemptState.INVALIDATED
     return RecoveryAction.BLOCKED_AMBIGUOUS_TURN, "external-turn-ambiguous", AttemptState.AMBIGUOUS
+
+
+def _abandonment_state(row: ProviderAttempt) -> AttemptState:
+    """Use the only terminal state compatible with persisted turn evidence."""
+
+    return AttemptState.AMBIGUOUS if row.external_turn_identity is not None else AttemptState.BLOCKED
+
+
+def _terminal_worker_abandonment(action: RecoveryAction, blocker: str | None) -> bool:
+    """Distinguish irreversible abandonment from evidence awaiting verification."""
+
+    return (
+        action in {
+            RecoveryAction.BLOCKED_STALE_WORKER,
+            RecoveryAction.BLOCKED_IDENTITY_DRIFT,
+            RecoveryAction.BLOCKED_RETRY_LIMIT,
+        }
+        or (action is RecoveryAction.BLOCKED_AMBIGUOUS_TURN and blocker != "completion-evidence-unverified")
+    )
 
 
 def _stale_unvalidated_diff_review(connection, identity: TaskIdentity, row: ProviderAttempt) -> None:

@@ -87,6 +87,13 @@ def _executable(environment: Path, name: str) -> Path:
     return scripts / (f"{name}.exe" if os.name == "nt" else name)
 
 
+def _runtime_executable(path: Path) -> str:
+    """Return the receipt-bound interpreter path without Windows MAX_PATH loss."""
+    if os.name != "nt":
+        return str(path)
+    return "\\\\?\\" + str(path.resolve(strict=True))
+
+
 def _toolchain_environment(root: Path) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
@@ -320,7 +327,7 @@ def main() -> int:
     environment.pop("PYTHONPATH", None)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["ROUNDWRIGHT_VALIDATION_TOOLCHAIN_RECEIPT"] = str(toolchain.receipt)
-    return subprocess.run([str(toolchain.python), *command], env=environment, check=False).returncode
+    return subprocess.run([_runtime_executable(toolchain.python), *command], env=environment, check=False).returncode
 
 
 if __name__ == "__main__":

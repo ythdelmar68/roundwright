@@ -25,6 +25,7 @@ from roundwright.candidate_review import (
     recover_diff_review,
 )
 import roundwright.candidate_review as candidate_review
+import roundwright.review_lifecycle as review_lifecycle
 import roundwright.local_slice as local_slice
 from roundwright.configuration import RepositoryIdentity
 from roundwright.gates import _valid_review_limit_finalization
@@ -987,15 +988,16 @@ class CandidateReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(CandidateReviewError, "verification evidence has changed"):
                 record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-25", "diff-supervisor", "diff-session-25", "diff-turn", "diff-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
             dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
-            result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
+            result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS, pass_follow_ups=("owner-note",)), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
             self.assertTrue(result.accepted)
             self.assertEqual(result.accepted_review_identity, dispatch.diff_review_attempt_id)
             self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.ACCEPTED)
+            self.assertTrue(read_diff_review(repository, identity, dispatch.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
             self.assertEqual(
                 recover_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, max_attempts=1, lease=lease).next_action,
                 RecoveryAction.ACCEPTED_REVIEW,
             )
-            replay = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
+            replay = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS, pass_follow_ups=("owner-note",)), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
             self.assertEqual(replay.accepted_review_identity, dispatch.diff_review_attempt_id)
             self.assertEqual((result.base_sha, result.candidate_sha), (seal.base_sha, seal.candidate_sha))
             self.assertEqual(task_projection(repository, identity).state, "diff-review")
@@ -1066,6 +1068,53 @@ class CandidateReviewTests(unittest.TestCase):
             accepted = record_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id=final_review.diff_review_attempt_id, output=DiffReviewOutput("diff-final", "final-supervisor", "final-session", "final-review-turn", "final-message", final_seal.base_sha, final_seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="1" * 64, lease=lease, now=now)
             self.assertTrue(accepted.accepted)
             self.assertNotEqual(fresh.supervisor_session_identity, dispatch.supervisor_session_identity)
+
+    def test_findings_item_insertion_faults_roll_back_the_whole_set_then_replay(self):
+        """Every lifecycle insertion boundary leaves no stranded review prefix."""
+
+        for fail_after in (1, 2):
+            with self.subTest(fail_after=fail_after), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, context, binding, now = values
+                implementation, seal = self.implement(values)
+                review_context = self.review_context(identity, context, seal)
+                for verification in (
+                    CandidateVerification("atomic-tests", VerificationKind.TEST, VerificationOutcome.PASS, "7" * 64),
+                    CandidateVerification("atomic-build", VerificationKind.BUILD, VerificationOutcome.PASS, "8" * 64),
+                ):
+                    record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+                dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=f"diff-atomic-{fail_after}", implementation_attempt_id=implementation.implementation_attempt_id, provider_attempt_id=f"atomic-supervisor-{fail_after}", supervisor_session_identity=f"atomic-session-{fail_after}", external_turn_identity=f"atomic-turn-{fail_after}", message_identity=f"atomic-message-{fail_after}", process_lease_id=f"atomic-lease-{fail_after}", process_lease_expires_at=now + 60, lease=lease, now=now)
+                output = DiffReviewOutput(dispatch.diff_review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity, dispatch.external_turn_identity, dispatch.message_identity, seal.base_sha, seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("atomic first", "atomic second"))
+                original = review_lifecycle._record_review_item_connection
+                calls = 0
+
+                def faulting(*arguments):
+                    nonlocal calls
+                    calls += 1
+                    result = original(*arguments)
+                    if calls == fail_after:
+                        raise RuntimeError("injected item boundary interruption")
+                    return result
+
+                with patch.object(review_lifecycle, "_record_review_item_connection", side_effect=faulting):
+                    with self.assertRaisesRegex(RuntimeError, "injected item boundary"):
+                        record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=output, completion_evidence_fingerprint="9" * 64, lease=lease, now=now)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM diff_review_artifacts WHERE diff_review_attempt_id = ?", (dispatch.diff_review_attempt_id,)).fetchone(), (0,))
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM diff_review_routes WHERE diff_review_attempt_id = ?", (dispatch.diff_review_attempt_id,)).fetchone(), (0,))
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_records WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_provenance WHERE task_id = ?", (identity.task_id,)).fetchone(), (0,))
+                finally:
+                    connection.close()
+                replay = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=output, completion_evidence_fingerprint="9" * 64, lease=lease, now=now)
+                self.assertEqual(len(replay.routed_finding_ids), 2)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_records WHERE task_id = ?", (identity.task_id,)).fetchone(), (2,))
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_provenance WHERE task_id = ?", (identity.task_id,)).fetchone(), (2,))
+                finally:
+                    connection.close()
 
     def test_concurrent_repair_dispatch_claims_only_one_provider_turn(self):
         with tempfile.TemporaryDirectory() as temporary:

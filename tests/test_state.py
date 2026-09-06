@@ -457,6 +457,131 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def _seed_legacy_worker_objective(
+        self,
+        path: Path,
+        *,
+        version: int,
+        candidate_content_digest: str = "f" * 64,
+        legacy_state: str = "completed",
+    ) -> tuple[str, str, str, str, str]:
+        """Create a populated pre-v65 objective ledger from its durable inputs."""
+
+        task_id = "legacy-worker-task"
+        provider_attempt_id = "legacy-worker-provider"
+        implementation_attempt_id = "legacy-worker-implementation"
+        objective_id = "legacy-worker-objective"
+        candidate_sha = "legacy-worker-candidate"
+        evidence = "e" * 64
+        objective_digest = "d" * 64
+        connection = sqlite3.connect(path)
+        try:
+            _apply_migrations(connection, MIGRATIONS[:version])
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                ("legacy-source", "example/roundwright", "a" * 64),
+            )
+            connection.execute(
+                "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state, blocked_from_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, "legacy-source", "example/roundwright", "codex/legacy-worker", str(path.parent / "legacy-worker"), "legacy-worker-base", "implementing", None),
+            )
+            provider_state = "completed" if legacy_state == "completed" else "dispatched"
+            connection.execute(
+                "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES (?, ?, 'worker', 1, ?, 1, ?, ?, ?, ?, ?, NULL, ?)",
+                (provider_attempt_id, task_id, "legacy-lease", "legacy-session", "legacy-turn", "b" * 64, "legacy-output" if legacy_state == "completed" else None, evidence if legacy_state == "completed" else None, provider_state),
+            )
+            if legacy_state == "completed":
+                connection.execute("INSERT INTO provider_completion_outputs(attempt_id, output_fingerprint) VALUES (?, ?)", (provider_attempt_id, "f" * 64))
+            connection.execute(
+                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (implementation_attempt_id, task_id, "legacy-plan", "legacy-plan-review", provider_attempt_id, "legacy-worker-thread", "legacy-turn", "c" * 64, "recorded" if legacy_state == "completed" else "dispatched"),
+            )
+            if legacy_state == "completed":
+                connection.execute("INSERT INTO implementation_candidates(implementation_attempt_id, task_id, base_sha, candidate_sha, completion_evidence_fingerprint, content_digest) VALUES (?, ?, ?, ?, ?, ?)", (implementation_attempt_id, task_id, "legacy-worker-base", candidate_sha, evidence, candidate_content_digest))
+            connection.execute(
+                "INSERT INTO worker_objectives(objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (objective_id, task_id, candidate_sha, provider_attempt_id, "legacy-retry", objective_digest, legacy_state, "c" * 64 if legacy_state == "completed" else None, "c" * 64 if legacy_state == "cancelled" else None),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return objective_id, task_id, provider_attempt_id, candidate_sha, objective_digest
+
+    def test_populated_v58_v60_v62_objectives_upgrade_forward_without_rewriting_history(self) -> None:
+        """The v65 adapter recovers valid v58-v62 rows and remains restart-safe."""
+
+        historical_checksums = (
+            (58, "ca7826300fbf07de759a220ff41e85ba01f141bf1731b4acde3f3fdb6b3fbf11"),
+            (60, "3c9c0fddd9d28e341deca30703d601c347b3f75a1abe8ed3c373d53b19cf239d"),
+            (62, "9cead46ede56e0407b7628a39d50662c6e0cb46ff1269d18b1d32b5c04f17cdb"),
+        )
+        self.assertEqual(
+            tuple((MIGRATIONS[version - 1].version, MIGRATIONS[version - 1].checksum) for version, _ in historical_checksums),
+            historical_checksums,
+        )
+        for version, _ in historical_checksums:
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary))
+                path = database_path(repository)
+                path.parent.mkdir()
+                objective_id, task_id, provider_attempt_id, candidate_sha, objective_digest = self._seed_legacy_worker_objective(path, version=version)
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                self.assertEqual(initialize(repository), check_database(repository))
+                connection = sqlite3.connect(path)
+                try:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records"
+                        ).fetchall(),
+                        [(objective_id, task_id, "legacy-worker-base", provider_attempt_id, "worker-1-legacy-worker-provider", objective_digest, "completed", candidate_sha, "e" * 64, "f" * 64, None)],
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT singleton, source_count FROM legacy_objective_migration_receipts").fetchall(),
+                        [(1, 1)],
+                    )
+                finally:
+                    connection.close()
+
+    def test_populated_legacy_objective_with_contradictory_evidence_rolls_back_and_fails_closed(self) -> None:
+        """A v58 completed objective cannot be upgraded when its output digest conflicts."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            self._seed_legacy_worker_objective(path, version=58, candidate_content_digest="0" * 64)
+            with self.assertRaisesRegex(StateError, "legacy completed Worker objective provenance is contradictory or incomplete"):
+                initialize(repository)
+            with self.assertRaisesRegex(StateError, "legacy completed Worker objective provenance is contradictory or incomplete"):
+                initialize(repository)
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone(), (58,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM worker_objectives").fetchone(), (1,))
+                self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'legacy_objective_stage_v65'").fetchone())
+                self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'legacy_objective_migration_receipts'").fetchone())
+            finally:
+                connection.close()
+
+    def test_active_and_cancelled_v58_v60_v62_objectives_reconstruct_canonical_retry_identity(self) -> None:
+        """Legacy nonterminal objectives keep replayable provider-bound retry IDs."""
+
+        for version in (58, 60, 62):
+            for legacy_state in ("active", "cancelled"):
+                with self.subTest(version=version, state=legacy_state), tempfile.TemporaryDirectory() as temporary:
+                    repository = self.repository(Path(temporary))
+                    path = database_path(repository)
+                    path.parent.mkdir()
+                    self._seed_legacy_worker_objective(path, version=version, legacy_state=legacy_state)
+                    self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                    self.assertEqual(initialize(repository), check_database(repository))
+                    connection = sqlite3.connect(path)
+                    try:
+                        self.assertEqual(connection.execute("SELECT retry_identity, state, terminal_reason_digest FROM worker_objective_records").fetchone(), ("worker-1-legacy-worker-provider", legacy_state, "c" * 64 if legacy_state == "cancelled" else None))
+                    finally:
+                        connection.close()
+
     def test_version_three_lease_handles_cannot_reappear_after_upgrade(self) -> None:
         for active in (False, True):
             with self.subTest(active=active), tempfile.TemporaryDirectory() as temporary:

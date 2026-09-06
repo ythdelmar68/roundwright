@@ -82,8 +82,8 @@ class PlanReviewTests(unittest.TestCase):
         binding, control = self.control(identity, context, now)
         return dispatch_plan_review(repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR), review_attempt_id=review, provider_attempt_id=provider, supervisor_session_identity=session, external_turn_identity=f"turn-{provider}", plan_attempt_id=persisted.plan_attempt_id, process_lease_id=f"lease-{provider}", process_lease_expires_at=now + 60, binding=binding, control=control, lease=lease, now=now)
 
-    def output(self, dispatch, *, verdict=PlanReviewVerdict.PASS, plan_digest=None, findings=(), missing=(), ambiguous=(), risks=()):
-        return PlanReviewOutput(dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity, dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, plan_digest or dispatch.plan_digest, verdict, findings, missing, ambiguous, risks)
+    def output(self, dispatch, *, verdict=PlanReviewVerdict.PASS, plan_digest=None, findings=(), missing=(), ambiguous=(), risks=(), follow_ups=()):
+        return PlanReviewOutput(dispatch.review_attempt_id, dispatch.provider_attempt_id, dispatch.supervisor_session_identity, dispatch.external_turn_identity, dispatch.plan_attempt_id, dispatch.source_digest, plan_digest or dispatch.plan_digest, verdict, findings, missing, ambiguous, risks, follow_ups)
 
     def test_pass_is_identity_bound_and_only_accepted_pass_enters_implementation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -95,6 +95,20 @@ class PlanReviewTests(unittest.TestCase):
             completion = accept_plan_review_and_begin_implementation(repository, identity, plan_attempt_id="plan-one", receipt=PlanReviewReceipt("review-one", persisted.content_digest, True), evidence_fingerprint="3" * 64, lease=lease)
             self.assertEqual(completion.plan_digest, persisted.content_digest)
             self.assertEqual(task_projection(repository, identity).state, "implementing")
+
+    def test_pass_follow_ups_are_durable_owner_items_and_survive_acceptance_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease, context, now, persisted = self.setup(Path(temporary))
+            dispatch = self.dispatch(repository, identity, lease, context, now, persisted)
+            review = record_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, output=self.output(dispatch, follow_ups=("Document the rollback",)), completion_evidence_fingerprint="2" * 64, lease=lease, now=now)
+            replay = recover_plan_review(repository, identity, context, review_attempt_id=dispatch.review_attempt_id, lease=lease, now=now)
+            self.assertEqual((review.pass_follow_up_ids, replay.pass_follow_up_ids), (replay.pass_follow_up_ids, review.pass_follow_up_ids))
+            connection = _open_writable_connection(repository)
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_records WHERE task_id = ? AND item_kind = 'pass-follow-up'", (identity.task_id,)).fetchone(), (1,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_provenance").fetchone(), (1,))
+            finally:
+                connection.close()
 
     def test_public_plan_acceptance_recovery_requires_sealed_authorization_and_complete_policy(self):
         with tempfile.TemporaryDirectory() as temporary:

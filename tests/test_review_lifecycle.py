@@ -1,12 +1,14 @@
-"""Hermetic coverage for Phase 5 durable review and owner-control state."""
+"""Hermetic coverage for lease-bound Phase 5 review and owner-control state."""
 
 from __future__ import annotations
 
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -29,80 +31,87 @@ class ReviewLifecycleTests(unittest.TestCase):
         object.__setattr__(repository, "root", root.resolve())
         return repository
 
-    def setup(self, root: Path) -> tuple[RepositoryIdentity, TaskIdentity]:
+    def setup(self, root: Path):
         repository = self.repository(root)
         initialize(repository)
         identity = TaskIdentity("task-115", "source-115", "repo-115", "codex/115", "C:/review-115", "a" * 40)
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="review-lifecycle-tests", ttl_seconds=60)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "b" * 64),), lease=lease)
-        return repository, identity
+        with closing(sqlite3.connect(database_path(repository))) as connection:
+            connection.execute("INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)", (identity.task_id, identity.base_sha, self.candidate, lease.state_identity))
+            now = int(time.time()) + 60
+            connection.execute("INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES (?, ?, 'supervisor', 1, 'lease-115', ?, 'session-115', 'turn-115', ?, 'pointer-115', ?, 'review-115', 'accepted')", ("attempt-review-115", identity.task_id, now, "d" * 64, "e" * 64))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, selected_profile_identity) VALUES ('review-115', ?, 'attempt-review-115', ?, ?)", (identity.task_id, "e" * 64, "sha256:" + "2" * 64))
+            connection.execute("INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, accepted_review_identity) VALUES ('review-115', ?, 'implementation-115', 'attempt-review-115', 'review-session-115', 'review-turn-115', 'review-message-115', ?, ?, ?, 'accepted', 1, 'review-115')", (identity.task_id, identity.base_sha, self.candidate, "d" * 64))
+            connection.execute("INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES ('attempt-115', ?, 'worker', 1, 'worker-lease-115', ?, 'worker-session-115', 'worker-turn-115', ?, NULL, NULL, NULL, 'dispatched')", (identity.task_id, now, "f" * 64))
+            connection.execute("INSERT INTO owner_authority_grants(grant_id, owner_identity, command_scope, task_id, candidate_sha, authority_digest, state) VALUES ('grant-resolve-115', 'owner-115', 'resolve-review-item', ?, ?, ?, 'active')", (identity.task_id, self.candidate, "1" * 64))
+            connection.commit()
+        return repository, identity, lease
 
     def item(self, identity: TaskIdentity, *, item_id: str = "item-115", content: str = "d" * 64) -> ReviewItem:
-        return ReviewItem(item_id, identity.task_id, "review-115", self.candidate, ReviewItemKind.PASS_FOLLOW_UP,
-                          ReviewItemSource.ACCEPTED_REVIEW, content, "owner-review", True, 1)
+        return ReviewItem(item_id, identity.task_id, "review-115", self.candidate, "attempt-review-115", ReviewItemKind.PASS_FOLLOW_UP, ReviewItemSource.ACCEPTED_REVIEW, content, "owner-review", True, 1)
 
     def objective(self, identity: TaskIdentity) -> WorkerObjective:
-        return WorkerObjective("objective-115", identity.task_id, self.candidate, "attempt-115", "retry-115", "e" * 64)
+        return WorkerObjective("objective-115", identity.task_id, self.candidate, "attempt-115", "worker-1-attempt-115", "e" * 64)
 
     def command(self, identity: TaskIdentity, *, kind: OwnerCommandKind = OwnerCommandKind.RESOLVE_REVIEW_ITEM) -> OwnerCommand:
-        return OwnerCommand("command-115", identity.task_id, kind, "item-115", self.candidate, "f" * 64, "key-115")
+        return OwnerCommand("command-115", identity.task_id, kind, "item-115", self.candidate, "f" * 64, "key-115", "owner-115", "grant-resolve-115")
 
-    def test_review_items_are_idempotent_candidate_bound_and_gate_blocking(self) -> None:
+    def test_review_items_are_lease_bound_provenance_bound_and_semantically_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity = self.setup(Path(temporary))
+            repository, identity, lease = self.setup(Path(temporary))
             store = ReviewLifecycleStore()
-            first = store.record_review_item(repository, self.item(identity))
-            second = store.record_review_item(repository, self.item(identity))
-            self.assertEqual((first.disposition, second.disposition, first.blocking), ("pending", "pending", True))
+            first = store.record_review_item(repository, identity, self.item(identity), lease=lease)
+            alias = store.record_review_item(repository, identity, self.item(identity, item_id="item-116"), lease=lease)
+            self.assertEqual((first.item_id, alias.item_id, first.blocking), ("item-115", "item-115", True))
             with closing(sqlite3.connect(database_path(repository))) as connection:
                 self.assertTrue(unresolved_final_gate_blockers(connection, identity.task_id, self.candidate))
             with self.assertRaises(ReviewLifecycleError):
-                store.record_review_item(repository, self.item(identity, content="0" * 64))
+                store.record_review_item(repository, identity, self.item(identity, content="0" * 64), lease=lease)
             with self.assertRaises(ReviewLifecycleError):
-                store.record_review_item(repository, self.item(identity, item_id="item-116"))
+                store.record_review_item(repository, identity, ReviewItem("bad-item", identity.task_id, "review-115", self.candidate, "attempt-115", ReviewItemKind.FINDING, ReviewItemSource.SUPERVISOR_FINDING, "2" * 64, "owner-review", True, 1), lease=lease)
 
-    def test_exact_owner_command_is_idempotent_and_resolves_the_bound_item(self) -> None:
+    def test_mutations_require_current_lease_and_exact_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity = self.setup(Path(temporary))
+            repository, identity, lease = self.setup(Path(temporary))
+            with self.assertRaises(ReviewLifecycleError):
+                ReviewLifecycleStore().record_review_item(repository, identity, self.item(identity), lease=object())
+            stale = replace(lease, owner="replacement-owner")
+            with self.assertRaises(ReviewLifecycleError):
+                ReviewLifecycleStore().record_review_item(repository, identity, self.item(identity), lease=stale)
+            self.assertEqual(stale.repository_id, identity.repository_id)
+
+    def test_owner_command_uses_authority_grant_and_consumes_stored_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease = self.setup(Path(temporary))
             store = ReviewLifecycleStore()
-            store.record_review_item(repository, self.item(identity))
+            store.record_review_item(repository, identity, self.item(identity), lease=lease)
             command = self.command(identity)
-            self.assertEqual(store.queue_owner_command(repository, command), command)
-            resolved = store.consume_owner_command(repository, command, result_digest="1" * 64)
-            replay = store.consume_owner_command(repository, command, result_digest="1" * 64)
+            self.assertEqual(store.queue_owner_command(repository, identity, command, lease=lease), command)
+            resolved = store.consume_owner_command(repository, identity, command_id=command.command_id, lease=lease, result_digest="1" * 64)
+            replay = store.consume_owner_command(repository, identity, command_id=command.command_id, lease=lease, result_digest="1" * 64)
             self.assertEqual((resolved.disposition, resolved.verification, replay.disposition), ("resolved", "verified", "resolved"))
+            canonical = store.record_review_item(repository, identity, self.item(identity, item_id="item-116"), lease=lease)
+            self.assertEqual((canonical.item_id, canonical.disposition), ("item-115", "resolved"))
             with closing(sqlite3.connect(database_path(repository))) as connection:
                 self.assertFalse(unresolved_final_gate_blockers(connection, identity.task_id, self.candidate))
-            rendered = store.render_owner_view(repository, task_id=identity.task_id, candidate_sha=self.candidate)
-            self.assertIn("item=item-115 kind=pass-follow-up disposition=resolved", rendered)
-            self.assertNotIn("f" * 64, rendered)
+            self.assertNotIn("f" * 64, store.render_owner_view(repository, task_id=identity.task_id, candidate_sha=self.candidate))
+            untrusted = OwnerCommand("command-116", identity.task_id, OwnerCommandKind.RESOLVE_REVIEW_ITEM, "item-115", self.candidate, "f" * 64, "key-116", "untrusted-owner", "grant-resolve-115")
+            with self.assertRaises(ReviewLifecycleError):
+                store.queue_owner_command(repository, identity, untrusted, lease=lease)
 
-    def test_owner_commands_fail_closed_for_wrong_candidate_source_or_terminal_conflict(self) -> None:
+    def test_worker_objective_binds_the_current_worker_attempt_and_retry_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository, identity = self.setup(Path(temporary))
-            store = ReviewLifecycleStore()
-            store.record_review_item(repository, self.item(identity))
-            wrong_candidate = OwnerCommand("command-115", identity.task_id, OwnerCommandKind.RESOLVE_REVIEW_ITEM, "item-115", "0" * 40, "f" * 64, "key-115")
-            with self.assertRaises(ReviewLifecycleError):
-                store.queue_owner_command(repository, wrong_candidate)
-            with self.assertRaises(ReviewLifecycleError):
-                OwnerCommand("command-116", identity.task_id, OwnerCommandKind.RESOLVE_REVIEW_ITEM, "item-115", self.candidate, "f" * 64, "key-116", "untrusted-owner")
-            command = self.command(identity)
-            store.queue_owner_command(repository, command)
-            store.consume_owner_command(repository, command, result_digest="1" * 64)
-            with self.assertRaises(ReviewLifecycleError):
-                store.consume_owner_command(repository, command, result_digest="2" * 64)
-
-    def test_worker_objective_is_separate_from_attempt_and_has_one_terminal_result(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            repository, identity = self.setup(Path(temporary))
+            repository, identity, lease = self.setup(Path(temporary))
             store = ReviewLifecycleStore()
             objective = self.objective(identity)
-            self.assertEqual(store.start_objective(repository, objective), objective)
-            self.assertEqual(store.start_objective(repository, objective), objective)
-            store.complete_objective(repository, objective, completion_digest="1" * 64)
-            store.complete_objective(repository, objective, completion_digest="1" * 64)
+            self.assertEqual(store.start_objective(repository, identity, objective, lease=lease), objective)
+            store.complete_objective(repository, identity, objective, lease=lease, completion_digest="1" * 64)
+            store.complete_objective(repository, identity, objective, lease=lease, completion_digest="1" * 64)
             with self.assertRaises(ReviewLifecycleError):
-                store.cancel_objective(repository, objective, reason_digest="2" * 64)
+                store.cancel_objective(repository, identity, objective, lease=lease, reason_digest="2" * 64)
             with closing(sqlite3.connect(database_path(repository))) as connection:
-                self.assertEqual(connection.execute("SELECT state FROM worker_objectives WHERE objective_id = 'objective-115'").fetchone(), (ObjectiveState.COMPLETED.value,))
+                self.assertEqual(connection.execute("SELECT state FROM worker_objective_records WHERE objective_id = 'objective-115'").fetchone(), (ObjectiveState.COMPLETED.value,))
+            bad = WorkerObjective("objective-116", identity.task_id, self.candidate, "attempt-115", "retry-115", "e" * 64)
+            with self.assertRaises(ReviewLifecycleError):
+                store.start_objective(repository, identity, bad, lease=lease)

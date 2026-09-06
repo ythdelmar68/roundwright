@@ -952,8 +952,8 @@ def read_diff_review(
             follow_ups = tuple(json.loads(row[12] or "[]"))
         except (TypeError, json.JSONDecodeError) as error:
             raise CandidateReviewError("persisted PASS follow-up payload is invalid") from error
-        expected_follow_up_digests = {_digest({"candidate": row[4], "review": diff_review_attempt_id, "follow_up": value}) for value in follow_ups}
-        persisted_follow_up_digests = {item[0] for item in connection.execute("SELECT content_digest FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND review_identity = ? AND item_kind = 'pass-follow-up' AND source_kind = 'accepted-review'", (identity.task_id, row[4], diff_review_attempt_id))}
+        expected_follow_up_digests = {_digest({"candidate": row[4], "follow_up": value}) for value in follow_ups}
+        persisted_follow_up_digests = {item[0] for item in connection.execute("SELECT items.content_digest FROM review_item_provenance AS provenance JOIN review_item_records AS items ON items.item_id = provenance.item_id WHERE provenance.task_id = ? AND provenance.candidate_sha = ? AND provenance.review_identity = ? AND provenance.source_kind = 'accepted-review' AND provenance.source_attempt_id = ? AND items.item_kind = 'pass-follow-up'", (identity.task_id, row[4], diff_review_attempt_id, row[8]))}
         provenance_count = connection.execute("SELECT COUNT(*) FROM review_item_provenance WHERE task_id = ? AND candidate_sha = ? AND review_identity = ? AND source_kind = 'accepted-review' AND source_attempt_id = ?", (identity.task_id, row[4], diff_review_attempt_id, row[8])).fetchone()[0]
         _require_exact_provider_context(connection, identity, row[8], context)
         _require_sealed_provider_authorization(connection, identity, row[8], context, None)

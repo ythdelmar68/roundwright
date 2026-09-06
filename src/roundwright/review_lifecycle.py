@@ -82,18 +82,40 @@ class ReviewItem:
 class WorkerObjective:
     objective_id: str
     task_id: str
-    candidate_sha: str
+    dispatch_sha: str
     provider_attempt_id: str
     retry_identity: str
     objective_digest: str
     state: ObjectiveState = ObjectiveState.ACTIVE
-    terminal_digest: str | None = None
+    result: "WorkerObjectiveResult | None" = None
+    cancellation_reason_digest: str | None = None
 
     def __post_init__(self) -> None:
-        if not all(_token(v) for v in (self.objective_id, self.task_id, self.provider_attempt_id, self.retry_identity)) or not _sha(self.candidate_sha) or not _digest(self.objective_digest) or type(self.state) is not ObjectiveState:
+        if not all(_token(v) for v in (self.objective_id, self.task_id, self.provider_attempt_id, self.retry_identity)) or not _sha(self.dispatch_sha) or not _digest(self.objective_digest) or type(self.state) is not ObjectiveState:
             raise ReviewLifecycleError("Worker objective is invalid")
-        if (self.state is ObjectiveState.ACTIVE) != (self.terminal_digest is None) or (self.terminal_digest is not None and not _digest(self.terminal_digest)):
+        if ((self.state is ObjectiveState.ACTIVE and (self.result is not None or self.cancellation_reason_digest is not None))
+                or (self.state is ObjectiveState.COMPLETED and (type(self.result) is not WorkerObjectiveResult or self.cancellation_reason_digest is not None))
+                or (self.state is ObjectiveState.CANCELLED and (self.result is not None or not _digest(self.cancellation_reason_digest)))):
             raise ReviewLifecycleError("Worker objective terminal state is invalid")
+
+    @property
+    def candidate_sha(self) -> str:
+        """Compatibility alias for the SHA that was current at Worker dispatch."""
+
+        return self.dispatch_sha
+
+
+@dataclass(frozen=True)
+class WorkerObjectiveResult:
+    """The independently persisted output accepted for one Worker objective."""
+
+    candidate_sha: str
+    completion_evidence_fingerprint: str
+    accepted_result_identity: str
+
+    def __post_init__(self) -> None:
+        if not all(_digest(value) for value in (self.completion_evidence_fingerprint, self.accepted_result_identity)) or not _sha(self.candidate_sha):
+            raise ReviewLifecycleError("Worker objective result is invalid")
 
 
 @dataclass(frozen=True)
@@ -171,18 +193,17 @@ class ReviewLifecycleStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             _require_lifecycle_authority(connection, identity, lease)
-            _require_current_candidate(connection, identity, objective.candidate_sha, lease)
-            retry = _require_worker_attempt(connection, identity, objective.provider_attempt_id, objective.candidate_sha)
+            retry = _require_worker_dispatch(connection, identity, objective.provider_attempt_id, objective.dispatch_sha)
             if objective.retry_identity != retry:
                 raise ReviewLifecycleError("Worker objective retry identity is not the durable attempt identity")
-            expected = (objective.task_id, objective.candidate_sha, objective.provider_attempt_id, retry, objective.objective_digest)
-            row = connection.execute("SELECT task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest FROM worker_objective_records WHERE objective_id = ?", (objective.objective_id,)).fetchone()
+            expected = (objective.task_id, objective.dispatch_sha, objective.provider_attempt_id, retry, objective.objective_digest)
+            row = connection.execute("SELECT task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records WHERE objective_id = ?", (objective.objective_id,)).fetchone()
             if row is None:
-                connection.execute("INSERT INTO worker_objective_records(objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, NULL)", (objective.objective_id, *expected))
+                connection.execute("INSERT INTO worker_objective_records(objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, NULL, NULL, NULL)", (objective.objective_id, *expected))
             elif tuple(row[:5]) != expected:
                 raise ReviewLifecycleError("Worker objective identity conflicts with committed state")
             connection.commit()
-            return _objective_projection(objective.objective_id, *expected, *(row[5:] if row is not None else (ObjectiveState.ACTIVE.value, None, None)))
+            return _objective_projection(objective.objective_id, *expected, *(row[5:] if row is not None else (ObjectiveState.ACTIVE.value, None, None, None, None)))
         except sqlite3.IntegrityError as error:
             connection.rollback()
             raise ReviewLifecycleError("Worker objective conflicts with an existing attempt") from error
@@ -192,10 +213,10 @@ class ReviewLifecycleStore:
         finally:
             connection.close()
 
-    def complete_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, objective: WorkerObjective, *, lease: object, completion_digest: str) -> WorkerObjective:
-        if not _digest(completion_digest):
+    def complete_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, objective: WorkerObjective, *, lease: object, result: WorkerObjectiveResult) -> WorkerObjective:
+        if type(result) is not WorkerObjectiveResult:
             raise ReviewLifecycleError("objective completion is invalid")
-        return self._terminal_objective(repository, identity, objective, lease, ObjectiveState.COMPLETED, completion_digest)
+        return self._terminal_objective(repository, identity, objective, lease, ObjectiveState.COMPLETED, result)
 
     def cancel_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, objective: WorkerObjective, *, lease: object, reason_digest: str) -> WorkerObjective:
         if not _digest(reason_digest):
@@ -282,30 +303,40 @@ class ReviewLifecycleStore:
             connection.close()
         return "\n".join(["review-items", *(f"item={a} kind={b} disposition={c} verification={d} blocking={e} destination={f}" for a, b, c, d, e, f in rows), "owner-commands", *(f"command={a} kind={b} target={c} state={d}" for a, b, c, d in commands)])
 
-    def _terminal_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, objective: WorkerObjective, lease: object, state: ObjectiveState, digest: str) -> WorkerObjective:
+    def _terminal_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, objective: WorkerObjective, lease: object, state: ObjectiveState, terminal: WorkerObjectiveResult | str) -> WorkerObjective:
         if objective.task_id != identity.task_id:
             raise ReviewLifecycleError("Worker objective task does not match its exact identity")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
             _require_lifecycle_authority(connection, identity, lease)
-            _require_current_candidate(connection, identity, objective.candidate_sha, lease)
-            retry = _require_worker_attempt(connection, identity, objective.provider_attempt_id, objective.candidate_sha)
-            expected = (objective.task_id, objective.candidate_sha, objective.provider_attempt_id, retry, objective.objective_digest)
-            row = connection.execute("SELECT task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest FROM worker_objective_records WHERE objective_id = ?", (objective.objective_id,)).fetchone()
+            retry = _require_worker_objective_attempt(connection, identity, objective.provider_attempt_id, objective.dispatch_sha)
+            expected = (objective.task_id, objective.dispatch_sha, objective.provider_attempt_id, retry, objective.objective_digest)
+            row = connection.execute("SELECT task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records WHERE objective_id = ?", (objective.objective_id,)).fetchone()
             if row is None or tuple(row[:5]) != expected:
                 raise ReviewLifecycleError("Worker objective is missing or has drifted")
             if row[5] == state.value:
-                if (row[6] if state is ObjectiveState.COMPLETED else row[7]) != digest:
+                if state is ObjectiveState.COMPLETED:
+                    if not isinstance(terminal, WorkerObjectiveResult) or tuple(row[6:9]) != (terminal.candidate_sha, terminal.completion_evidence_fingerprint, terminal.accepted_result_identity):
+                        raise ReviewLifecycleError("Worker objective terminal replay conflicts with committed state")
+                    _require_current_candidate(connection, identity, terminal.candidate_sha, lease)
+                    _require_worker_objective_result(connection, identity, objective.provider_attempt_id, objective.dispatch_sha, terminal)
+                if state is ObjectiveState.CANCELLED and (not isinstance(terminal, str) or row[9] != terminal):
                     raise ReviewLifecycleError("Worker objective terminal replay conflicts with committed state")
             elif row[5] != ObjectiveState.ACTIVE.value:
                 raise ReviewLifecycleError("Worker objective is already terminal")
             elif state is ObjectiveState.COMPLETED:
-                connection.execute("UPDATE worker_objective_records SET state = 'completed', completion_digest = ? WHERE objective_id = ?", (digest, objective.objective_id))
+                if not isinstance(terminal, WorkerObjectiveResult):
+                    raise ReviewLifecycleError("Worker objective completion is invalid")
+                _require_current_candidate(connection, identity, terminal.candidate_sha, lease)
+                _require_worker_objective_result(connection, identity, objective.provider_attempt_id, objective.dispatch_sha, terminal)
+                connection.execute("UPDATE worker_objective_records SET state = 'completed', candidate_sha = ?, completion_evidence_fingerprint = ?, accepted_result_identity = ? WHERE objective_id = ?", (terminal.candidate_sha, terminal.completion_evidence_fingerprint, terminal.accepted_result_identity, objective.objective_id))
             else:
-                connection.execute("UPDATE worker_objective_records SET state = 'cancelled', terminal_reason_digest = ? WHERE objective_id = ?", (digest, objective.objective_id))
+                if not isinstance(terminal, str):
+                    raise ReviewLifecycleError("Worker objective cancellation is invalid")
+                connection.execute("UPDATE worker_objective_records SET state = 'cancelled', terminal_reason_digest = ? WHERE objective_id = ?", (terminal, objective.objective_id))
             connection.commit()
-            return _objective_projection(objective.objective_id, *expected, state.value, digest if state is ObjectiveState.COMPLETED else None, digest if state is ObjectiveState.CANCELLED else None)
+            return _objective_projection(objective.objective_id, *expected, state.value, terminal.candidate_sha if state is ObjectiveState.COMPLETED and isinstance(terminal, WorkerObjectiveResult) else None, terminal.completion_evidence_fingerprint if state is ObjectiveState.COMPLETED and isinstance(terminal, WorkerObjectiveResult) else None, terminal.accepted_result_identity if state is ObjectiveState.COMPLETED and isinstance(terminal, WorkerObjectiveResult) else None, terminal if state is ObjectiveState.CANCELLED and isinstance(terminal, str) else None)
         except Exception:
             connection.rollback()
             raise
@@ -344,11 +375,25 @@ def _require_accepted_review(connection: sqlite3.Connection, identity: TaskIdent
     return row[5]
 
 
-def _require_worker_attempt(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, candidate_sha: str) -> str:
-    row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, candidates.candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id JOIN implementation_candidates AS candidates ON candidates.implementation_attempt_id = implementation.implementation_attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
-    if row is None or row[0] != identity.task_id or row[1] != "worker" or row[3] not in {"dispatched", "completed", "accepted"} or row[4] != candidate_sha:
+def _require_worker_dispatch(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
+    row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, attempts.session_identity, attempts.external_turn_identity, implementation.task_id, implementation.worker_thread_identity, implementation.external_turn_identity, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
+    if row is None or row[:2] != (identity.task_id, "worker") or row[3] != "dispatched" or not _token(row[4]) or not _token(row[5]) or row[4] != row[7] or row[6] != identity.task_id or row[5] != row[8] or row[9] != "dispatched" or dispatch_sha != (row[10] or identity.base_sha):
+        raise ReviewLifecycleError("Worker objective provider dispatch is unavailable or stale")
+    return f"worker-{row[2]}-{attempt_id}"
+
+
+def _require_worker_objective_attempt(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
+    row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, implementation.task_id, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
+    if row is None or row[:2] != (identity.task_id, "worker") or row[3] not in {"dispatched", "completed"} or row[4] != identity.task_id or row[5] not in {"dispatched", "recorded"} or dispatch_sha != (row[6] or identity.base_sha):
         raise ReviewLifecycleError("Worker objective provider attempt is unavailable or stale")
     return f"worker-{row[2]}-{attempt_id}"
+
+
+def _require_worker_objective_result(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str, result: WorkerObjectiveResult) -> None:
+    row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.state, attempts.session_identity, attempts.external_turn_identity, attempts.output_pointer, attempts.completion_evidence_fingerprint, outputs.output_fingerprint, implementation.task_id, implementation.state, implementation.worker_thread_identity, implementation.external_turn_identity, candidates.base_sha, candidates.candidate_sha, candidates.completion_evidence_fingerprint, candidates.content_digest FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id JOIN implementation_candidates AS candidates ON candidates.implementation_attempt_id = implementation.implementation_attempt_id LEFT JOIN provider_completion_outputs AS outputs ON outputs.attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
+    expected = (identity.task_id, "worker", "completed", identity.task_id, "recorded", dispatch_sha, result.candidate_sha, result.completion_evidence_fingerprint, result.accepted_result_identity)
+    if row is None or row[0:3] != expected[0:3] or not _token(row[3]) or not _token(row[4]) or row[3] != row[10] or row[4] != row[11] or type(row[5]) is not str or not row[5] or row[6:8] != (result.completion_evidence_fingerprint, result.accepted_result_identity) or row[8:10] != expected[3:5] or row[12:16] != expected[5:]:
+        raise ReviewLifecycleError("Worker objective result is missing, stale, or mismatched")
 
 
 def _owner_scope_digest(command: OwnerCommand) -> str:
@@ -365,9 +410,10 @@ def _valid_owner_grant(grant: object, owner_identity: str, command_scope: str, t
             and grant[4] == _owner_authority_digest(owner_identity, command_scope, task_id, candidate_sha))
 
 
-def _objective_projection(objective_id: str, task_id: str, candidate_sha: str, attempt_id: str, retry_identity: str, objective_digest: str, state: str, completion_digest: str | None, reason_digest: str | None) -> WorkerObjective:
+def _objective_projection(objective_id: str, task_id: str, dispatch_sha: str, attempt_id: str, retry_identity: str, objective_digest: str, state: str, candidate_sha: str | None, completion_evidence_fingerprint: str | None, accepted_result_identity: str | None, reason_digest: str | None) -> WorkerObjective:
     objective_state = ObjectiveState(state)
-    return WorkerObjective(objective_id, task_id, candidate_sha, attempt_id, retry_identity, objective_digest, objective_state, completion_digest if objective_state is ObjectiveState.COMPLETED else reason_digest)
+    result = WorkerObjectiveResult(candidate_sha, completion_evidence_fingerprint, accepted_result_identity) if objective_state is ObjectiveState.COMPLETED and candidate_sha is not None and completion_evidence_fingerprint is not None and accepted_result_identity is not None else None
+    return WorkerObjective(objective_id, task_id, dispatch_sha, attempt_id, retry_identity, objective_digest, objective_state, result, reason_digest if objective_state is ObjectiveState.CANCELLED else None)
 
 
 def _projection(item_id: object, kind: object, blocker: object, verification: object, disposition: object, destination: object) -> ReviewItemProjection:

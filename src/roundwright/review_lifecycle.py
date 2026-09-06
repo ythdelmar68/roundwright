@@ -157,24 +157,7 @@ class ReviewLifecycleStore:
             connection.execute("BEGIN IMMEDIATE")
             _require_lifecycle_authority(connection, identity, lease)
             _require_current_candidate(connection, identity, item.candidate_sha, lease)
-            source_owner = _require_accepted_review(connection, identity, item)
-            expected = (item.task_id, item.review_identity, item.candidate_sha, item.kind.value, item.source.value, item.source_attempt_id, source_owner, item.content_digest, item.destination, "blocking" if item.blocking else "non-blocking", item.created_at)
-            row = connection.execute("SELECT task_id, review_identity, candidate_sha, item_kind, source_kind, source_attempt_id, source_owner_identity, content_digest, destination, blocker_state, created_at, disposition, verification_state FROM review_item_records WHERE item_id = ?", (item.item_id,)).fetchone()
-            if row is None:
-                semantic = connection.execute("SELECT item_id, source_kind, source_attempt_id, source_owner_identity, destination, blocker_state, item_kind, verification_state, disposition FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND item_kind = ? AND content_digest = ?", (item.task_id, item.candidate_sha, item.kind.value, item.content_digest)).fetchone()
-                if semantic is not None:
-                    if tuple(semantic[4:6]) != (item.destination, "blocking" if item.blocking else "non-blocking"):
-                        raise ReviewLifecycleError("review item semantic identity has materially conflicting state")
-                    connection.execute("INSERT INTO review_item_provenance(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, review_identity, source_kind, source_attempt_id) DO NOTHING", (semantic[0], item.task_id, item.candidate_sha, item.review_identity, item.source.value, item.source_attempt_id, source_owner))
-                    connection.commit()
-                    return _projection(semantic[0], semantic[6], semantic[5], semantic[7], semantic[8], semantic[4])
-                connection.execute("INSERT INTO review_item_records(item_id, task_id, review_identity, candidate_sha, item_kind, source_kind, source_attempt_id, source_owner_identity, content_digest, destination, blocker_state, verification_state, disposition, created_at, resolved_command_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, NULL)", (item.item_id, *expected))
-                connection.execute("INSERT INTO review_item_provenance(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) VALUES (?, ?, ?, ?, ?, ?, ?)", (item.item_id, item.task_id, item.candidate_sha, item.review_identity, item.source.value, item.source_attempt_id, source_owner))
-                result = ReviewItemProjection(item.item_id, item.kind, ReviewItemDisposition.PENDING, VerificationState.PENDING, item.blocking, item.destination)
-            elif tuple(row[:11]) == expected:
-                result = _projection(item.item_id, row[3], row[9], row[12], row[11], row[8])
-            else:
-                raise ReviewLifecycleError("review item identity conflicts with committed state")
+            result = _record_review_item_connection(connection, identity, item)
             connection.commit()
             return result
         except sqlite3.IntegrityError as error:
@@ -222,6 +205,25 @@ class ReviewLifecycleStore:
         if not _digest(reason_digest):
             raise ReviewLifecycleError("objective cancellation is invalid")
         return self._terminal_objective(repository, identity, objective, lease, ObjectiveState.CANCELLED, reason_digest)
+
+    def read_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, *, objective_id: str) -> WorkerObjective:
+        """Reconstruct one durable objective and reject incomplete terminal evidence."""
+        if not _token(objective_id):
+            raise ReviewLifecycleError("Worker objective identity is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            _require_matching_task(connection, identity)
+            row = connection.execute("SELECT task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records WHERE objective_id = ?", (objective_id,)).fetchone()
+            if row is None:
+                raise ReviewLifecycleError("Worker objective is unavailable")
+            objective = _objective_projection(objective_id, *row)
+            if objective.state is ObjectiveState.COMPLETED:
+                _require_worker_objective_result(connection, identity, objective.provider_attempt_id, objective.dispatch_sha, objective.result)
+            elif objective.state is ObjectiveState.ACTIVE:
+                _require_worker_objective_attempt(connection, identity, objective.provider_attempt_id, objective.dispatch_sha)
+            return objective
+        finally:
+            connection.close()
 
     def queue_owner_command(self, repository: RepositoryIdentity, identity: TaskIdentity, command: OwnerCommand, *, lease: object) -> OwnerCommand:
         if command.task_id != identity.task_id:
@@ -348,6 +350,28 @@ def unresolved_final_gate_blockers(connection: sqlite3.Connection, task_id: str,
     return connection.execute("SELECT 1 FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND item_kind = 'pass-follow-up' AND blocker_state = 'blocking' AND disposition = 'pending' LIMIT 1", (task_id, candidate_sha)).fetchone() is not None
 
 
+def _record_review_item_connection(connection: sqlite3.Connection, identity: TaskIdentity, item: ReviewItem) -> ReviewItemProjection:
+    """Insert one canonical item and its exact source provenance in the caller's transaction."""
+    source_owner = _require_accepted_review(connection, identity, item)
+    blocker = "blocking" if item.blocking else "non-blocking"
+    expected = (item.task_id, item.review_identity, item.candidate_sha, item.kind.value, item.source.value,
+                item.source_attempt_id, source_owner, item.content_digest, item.destination, blocker, item.created_at)
+    row = connection.execute("SELECT task_id, review_identity, candidate_sha, item_kind, source_kind, source_attempt_id, source_owner_identity, content_digest, destination, blocker_state, created_at, disposition, verification_state FROM review_item_records WHERE item_id = ?", (item.item_id,)).fetchone()
+    if row is not None:
+        if tuple(row[:11]) != expected:
+            raise ReviewLifecycleError("review item identity conflicts with committed state")
+        return _projection(item.item_id, row[3], row[9], row[12], row[11], row[8])
+    semantic = connection.execute("SELECT item_id, destination, blocker_state, item_kind, verification_state, disposition FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND item_kind = ? AND content_digest = ?", (item.task_id, item.candidate_sha, item.kind.value, item.content_digest)).fetchone()
+    if semantic is not None:
+        if semantic[1:3] != (item.destination, blocker):
+            raise ReviewLifecycleError("review item semantic identity has materially conflicting state")
+        connection.execute("INSERT INTO review_item_provenance(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, review_identity, source_kind, source_attempt_id) DO NOTHING", (semantic[0], item.task_id, item.candidate_sha, item.review_identity, item.source.value, item.source_attempt_id, source_owner))
+        return _projection(semantic[0], semantic[3], semantic[2], semantic[4], semantic[5], semantic[1])
+    connection.execute("INSERT INTO review_item_records(item_id, task_id, review_identity, candidate_sha, item_kind, source_kind, source_attempt_id, source_owner_identity, content_digest, destination, blocker_state, verification_state, disposition, created_at, resolved_command_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, NULL)", (item.item_id, *expected))
+    connection.execute("INSERT INTO review_item_provenance(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) VALUES (?, ?, ?, ?, ?, ?, ?)", (item.item_id, item.task_id, item.candidate_sha, item.review_identity, item.source.value, item.source_attempt_id, source_owner))
+    return ReviewItemProjection(item.item_id, item.kind, ReviewItemDisposition.PENDING, VerificationState.PENDING, item.blocking, item.destination)
+
+
 def _require_lifecycle_authority(connection: sqlite3.Connection, identity: TaskIdentity, lease: object) -> None:
     try:
         _require_current_transition_lease(connection, lease, identity.repository_id)
@@ -377,14 +401,16 @@ def _require_accepted_review(connection: sqlite3.Connection, identity: TaskIdent
 
 def _require_worker_dispatch(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
     row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, attempts.session_identity, attempts.external_turn_identity, implementation.task_id, implementation.worker_thread_identity, implementation.external_turn_identity, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
-    if row is None or row[:2] != (identity.task_id, "worker") or row[3] != "dispatched" or not _token(row[4]) or not _token(row[5]) or row[4] != row[7] or row[6] != identity.task_id or row[5] != row[8] or row[9] != "dispatched" or dispatch_sha != identity.base_sha:
+    expected_dispatch_sha = row[10] or identity.base_sha if row is not None else None
+    if row is None or row[:2] != (identity.task_id, "worker") or row[3] != "dispatched" or not _token(row[4]) or not _token(row[5]) or row[4] != row[7] or row[6] != identity.task_id or row[5] != row[8] or row[9] != "dispatched" or dispatch_sha != expected_dispatch_sha:
         raise ReviewLifecycleError("Worker objective provider dispatch is unavailable or stale")
     return f"worker-{row[2]}-{attempt_id}"
 
 
 def _require_worker_objective_attempt(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
     row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, implementation.task_id, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
-    if row is None or row[:2] != (identity.task_id, "worker") or row[3] not in {"dispatched", "completed"} or row[4] != identity.task_id or row[5] not in {"dispatched", "recorded"} or dispatch_sha != identity.base_sha:
+    expected_dispatch_sha = row[6] or identity.base_sha if row is not None else None
+    if row is None or row[:2] != (identity.task_id, "worker") or row[3] not in {"dispatched", "completed"} or row[4] != identity.task_id or row[5] not in {"dispatched", "recorded"} or dispatch_sha != expected_dispatch_sha:
         raise ReviewLifecycleError("Worker objective provider attempt is unavailable or stale")
     return f"worker-{row[2]}-{attempt_id}"
 

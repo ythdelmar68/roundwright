@@ -78,6 +78,19 @@ class ReviewLifecycleTests(unittest.TestCase):
             first = store.record_review_item(repository, identity, self.item(identity), lease=lease)
             alias = store.record_review_item(repository, identity, self.item(identity, item_id="item-116"), lease=lease)
             self.assertEqual((first.item_id, alias.item_id, first.blocking), ("item-115", "item-115", True))
+            # Distinct accepted Supervisor/provider identities with the same
+            # semantic follow-up retain both provenance rows under one item.
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                now = int(time.time()) + 60
+                connection.execute("INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES ('attempt-review-116', ?, 'supervisor', 2, 'lease-116', ?, 'session-116', 'turn-116', ?, 'pointer-116', ?, 'review-116', 'accepted')", (identity.task_id, now, "d" * 64, "e" * 64))
+                connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, selected_profile_identity) VALUES ('review-116', ?, 'attempt-review-116', ?, ?)", (identity.task_id, "e" * 64, "sha256:" + "3" * 64))
+                connection.execute("INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, accepted_review_identity) VALUES ('review-116', ?, 'implementation-115', 'attempt-review-116', 'review-session-116', 'review-turn-116', 'review-message-116', ?, ?, ?, 'accepted', 1, 'review-116')", (identity.task_id, identity.base_sha, self.candidate, "d" * 64))
+                connection.commit()
+            second = ReviewItem("item-117", identity.task_id, "review-116", self.candidate, "attempt-review-116", ReviewItemKind.PASS_FOLLOW_UP, ReviewItemSource.ACCEPTED_REVIEW, "d" * 64, "owner-review", True, 1)
+            self.assertEqual(store.record_review_item(repository, identity, second, lease=lease).item_id, "item-115")
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_records").fetchone(), (1,))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM review_item_provenance WHERE item_id = 'item-115'").fetchone(), (2,))
             with closing(sqlite3.connect(database_path(repository))) as connection:
                 self.assertTrue(unresolved_final_gate_blockers(connection, identity.task_id, self.candidate))
             with self.assertRaises(ReviewLifecycleError):

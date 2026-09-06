@@ -809,6 +809,17 @@ MIGRATIONS = (
             ("worker_objective_records", "CREATE TABLE worker_objective_records (objective_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), dispatch_sha TEXT NOT NULL, provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), retry_identity TEXT NOT NULL UNIQUE, objective_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active', 'cancelled', 'completed')), candidate_sha TEXT, completion_evidence_fingerprint TEXT, accepted_result_identity TEXT, terminal_reason_digest TEXT, UNIQUE(task_id, dispatch_sha, objective_digest), CHECK((state = 'active' AND candidate_sha IS NULL AND completion_evidence_fingerprint IS NULL AND accepted_result_identity IS NULL AND terminal_reason_digest IS NULL) OR (state = 'cancelled' AND candidate_sha IS NULL AND completion_evidence_fingerprint IS NULL AND accepted_result_identity IS NULL AND terminal_reason_digest IS NOT NULL) OR (state = 'completed' AND candidate_sha IS NOT NULL AND completion_evidence_fingerprint IS NOT NULL AND accepted_result_identity IS NOT NULL AND terminal_reason_digest IS NULL)))"),
         ),
     ),
+    Migration(
+        64,
+        (
+            "ALTER TABLE plan_review_artifacts ADD COLUMN pass_follow_ups_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE diff_review_artifacts ADD COLUMN pass_follow_ups_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            ("plan_review_artifacts", "CREATE TABLE plan_review_artifacts (review_attempt_id TEXT PRIMARY KEY REFERENCES plan_review_attempts(review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, missing_tests_json TEXT NOT NULL, ambiguous_criteria_json TEXT NOT NULL, residual_risks_json TEXT NOT NULL, content_digest TEXT NOT NULL, pass_follow_ups_json TEXT NOT NULL DEFAULT '[]')"),
+            ("diff_review_artifacts", "CREATE TABLE diff_review_artifacts (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, content_digest TEXT NOT NULL, pass_follow_ups_json TEXT NOT NULL DEFAULT '[]')"),
+        ),
+    ),
 )
 
 

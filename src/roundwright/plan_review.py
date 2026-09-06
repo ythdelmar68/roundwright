@@ -114,6 +114,8 @@ class PlanReviewOutput:
             raise PlanReviewError("PASS must not include findings or residual review fields")
         if verdict is PlanReviewVerdict.FINDINGS and not details:
             raise PlanReviewError("FINDINGS requires at least one structured detail")
+        if verdict is PlanReviewVerdict.FINDINGS and result.pass_follow_ups:
+            raise PlanReviewError("FINDINGS must not include PASS follow-ups")
         return result
 
     @property
@@ -425,13 +427,13 @@ def _persist_artifact(repository, identity, dispatch, output, lease, now) -> Non
         _require_current_lease(connection, lease, identity.repository_id, _clock(now))
         _require_matching_task(connection, identity, "plan-review")
         existing = connection.execute(
-            "SELECT verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, content_digest FROM plan_review_artifacts WHERE review_attempt_id = ?",
+            "SELECT verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, pass_follow_ups_json, content_digest FROM plan_review_artifacts WHERE review_attempt_id = ?",
             (dispatch.review_attempt_id,),
         ).fetchone()
-        expected = (output.verdict.value, json.dumps(output.findings), json.dumps(output.missing_tests), json.dumps(output.ambiguous_criteria), json.dumps(output.residual_risks), output.digest)
+        expected = (output.verdict.value, json.dumps(output.findings), json.dumps(output.missing_tests), json.dumps(output.ambiguous_criteria), json.dumps(output.residual_risks), json.dumps(output.pass_follow_ups), output.digest)
         if existing is None:
             connection.execute(
-                "INSERT INTO plan_review_artifacts(review_attempt_id, task_id, verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO plan_review_artifacts(review_attempt_id, task_id, verdict, findings_json, missing_tests_json, ambiguous_criteria_json, residual_risks_json, pass_follow_ups_json, content_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (dispatch.review_attempt_id, identity.task_id, *expected),
             )
             connection.execute("UPDATE plan_review_attempts SET state = ? WHERE review_attempt_id = ?", (PlanReviewState.RECORDED.value, dispatch.review_attempt_id))

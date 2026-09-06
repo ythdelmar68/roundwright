@@ -434,6 +434,18 @@ def begin_implementation(
         if claim_token is not None:
             _release_repair_claim(repository, identity, repair_parent, claim_token, lease, now)
         raise
+    # The objective begins at the durable Worker/provider dispatch boundary, not
+    # when a later local candidate happens to exist.  Its deterministic identity
+    # also makes a post-crash replay reconstruct the same durable objective.
+    from .review_lifecycle import ReviewLifecycleStore, WorkerObjective
+    objective_digest = _digest({"implementation": implementation_attempt_id, "provider": provider_attempt_id, "input": input_digest})
+    ReviewLifecycleStore().start_objective(
+        repository, identity,
+        WorkerObjective(f"worker-objective-{objective_digest[:24]}", identity.task_id,
+                        identity.base_sha, provider_attempt_id,
+                        f"worker-{provider.attempt_number}-{provider_attempt_id}", objective_digest),
+        lease=lease,
+    )
     return expected
 
 
@@ -488,6 +500,16 @@ def record_implementation_candidate(
         raise
     finally:
         connection.close()
+    from .review_lifecycle import ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
+    objective_digest = _digest({"implementation": implementation_attempt_id, "provider": dispatch.provider_attempt_id, "input": dispatch.input_digest})
+    ReviewLifecycleStore().complete_objective(
+        repository, identity,
+        WorkerObjective(f"worker-objective-{objective_digest[:24]}", identity.task_id,
+                        identity.base_sha, dispatch.provider_attempt_id,
+                        f"worker-{read_attempt(repository, identity, dispatch.provider_attempt_id, context=context, now=now).attempt_number}-{dispatch.provider_attempt_id}", objective_digest),
+        lease=lease,
+        result=WorkerObjectiveResult(seal.candidate_sha, completion_evidence_fingerprint, output_digest),
+    )
     transition_task(repository, identity, expected_state="implementing", next_state="diff-review", evidence_fingerprint=output_digest, lease=lease)
     return seal
 
@@ -872,6 +894,18 @@ def record_diff_review(
         connection.close()
     bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=completion_evidence_fingerprint, lease=lease)
     if normalized.verdict is DiffReviewVerdict.FINDINGS:
+        from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, ReviewLifecycleStore
+        store = ReviewLifecycleStore()
+        for finding, finding_id in zip(findings, finding_ids, strict=True):
+            digest = _digest({"candidate": seal.candidate_sha, "review": diff_review_attempt_id, "finding": finding})
+            store.record_review_item(
+                repository, identity,
+                ReviewItem(finding_id, identity.task_id, diff_review_attempt_id, seal.candidate_sha,
+                           dispatch.provider_attempt_id, ReviewItemKind.FINDING,
+                           ReviewItemSource.SUPERVISOR_FINDING, digest, "worker-repair", True,
+                           int(time.time() if now is None else now)),
+                lease=lease,
+            )
         transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=bound_output_digest, lease=lease)
     else:
         _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)

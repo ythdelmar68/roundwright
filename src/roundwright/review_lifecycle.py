@@ -377,14 +377,14 @@ def _require_accepted_review(connection: sqlite3.Connection, identity: TaskIdent
 
 def _require_worker_dispatch(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
     row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, attempts.session_identity, attempts.external_turn_identity, implementation.task_id, implementation.worker_thread_identity, implementation.external_turn_identity, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
-    if row is None or row[:2] != (identity.task_id, "worker") or row[3] != "dispatched" or not _token(row[4]) or not _token(row[5]) or row[4] != row[7] or row[6] != identity.task_id or row[5] != row[8] or row[9] != "dispatched" or dispatch_sha != (row[10] or identity.base_sha):
+    if row is None or row[:2] != (identity.task_id, "worker") or row[3] != "dispatched" or not _token(row[4]) or not _token(row[5]) or row[4] != row[7] or row[6] != identity.task_id or row[5] != row[8] or row[9] != "dispatched" or dispatch_sha != identity.base_sha:
         raise ReviewLifecycleError("Worker objective provider dispatch is unavailable or stale")
     return f"worker-{row[2]}-{attempt_id}"
 
 
 def _require_worker_objective_attempt(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
     row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, implementation.task_id, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
-    if row is None or row[:2] != (identity.task_id, "worker") or row[3] not in {"dispatched", "completed"} or row[4] != identity.task_id or row[5] not in {"dispatched", "recorded"} or dispatch_sha != (row[6] or identity.base_sha):
+    if row is None or row[:2] != (identity.task_id, "worker") or row[3] not in {"dispatched", "completed"} or row[4] != identity.task_id or row[5] not in {"dispatched", "recorded"} or dispatch_sha != identity.base_sha:
         raise ReviewLifecycleError("Worker objective provider attempt is unavailable or stale")
     return f"worker-{row[2]}-{attempt_id}"
 

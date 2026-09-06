@@ -206,6 +206,21 @@ class ReviewLifecycleStore:
             raise ReviewLifecycleError("objective cancellation is invalid")
         return self._terminal_objective(repository, identity, objective, lease, ObjectiveState.CANCELLED, reason_digest)
 
+    def cancel_objective_for_provider_attempt(self, repository: RepositoryIdentity, identity: TaskIdentity, *, provider_attempt_id: str, reason_digest: str, lease: object) -> WorkerObjective | None:
+        """Terminalize the active objective attached to one recovered Worker turn."""
+
+        connection = _open_writable_connection(repository)
+        try:
+            row = connection.execute("SELECT objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records WHERE task_id = ? AND provider_attempt_id = ?", (identity.task_id, provider_attempt_id)).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        objective = _objective_projection(*row)
+        if objective.state is ObjectiveState.COMPLETED:
+            return objective
+        return self.cancel_objective(repository, identity, objective, lease=lease, reason_digest=reason_digest)
+
     def read_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, *, objective_id: str) -> WorkerObjective:
         """Reconstruct one durable objective and reject incomplete terminal evidence."""
         if not _token(objective_id):

@@ -1114,6 +1114,12 @@ def recover_attempt(
         raise
     finally:
         connection.close()
+    if row.role is ProviderRole.WORKER and action in {RecoveryAction.BLOCKED_STALE_WORKER, RecoveryAction.BLOCKED_AMBIGUOUS_TURN, RecoveryAction.BLOCKED_IDENTITY_DRIFT, RecoveryAction.BLOCKED_RETRY_LIMIT}:
+        # Provider recovery is the production abandonment boundary.  Couple it
+        # to the durable Worker objective with a replay-stable public digest.
+        from .review_lifecycle import ReviewLifecycleStore
+        reason = hashlib.sha256("\x1f".join(("worker-objective-recovery/v1", attempt_id, action.value, blocker or "")).encode("ascii")).hexdigest()
+        ReviewLifecycleStore().cancel_objective_for_provider_attempt(repository, identity, provider_attempt_id=attempt_id, reason_digest=reason, lease=lease)
     return _projection(row, action, blocker)
 
 

@@ -510,6 +510,10 @@ def _decision_from_connection(connection, identity) -> GateDecision:
     ).fetchone()
     if seal is None or lease is None or seal[0] != identity.base_sha or seal[2] != lease[0]:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "candidate seal is unavailable or stale"),))
+    from .review_lifecycle import unresolved_final_gate_blockers
+
+    if unresolved_final_gate_blockers(connection, identity.task_id, seal[1]):
+        return GateDecision(GateOutcome.BLOCKED, (GateResult("review-items", GateOutcome.BLOCKED, "unresolved PASS follow-up remains"),))
     context = _read_gate_context(connection, identity.task_id, seal[1])
     if context is None:
         return GateDecision(GateOutcome.BLOCKED, (GateResult("context", GateOutcome.BLOCKED, "gate context is unavailable"),))

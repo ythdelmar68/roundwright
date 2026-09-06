@@ -1100,7 +1100,7 @@ def recover_attempt(
             row = replace(row, state=next_state)
         if blocker is not None:
             _persist_recovery_outcome(connection, attempt_id, action, blocker, observed)
-        if row.role is ProviderRole.WORKER and action in {RecoveryAction.BLOCKED_STALE_WORKER, RecoveryAction.BLOCKED_AMBIGUOUS_TURN, RecoveryAction.BLOCKED_IDENTITY_DRIFT, RecoveryAction.BLOCKED_RETRY_LIMIT}:
+        if row.role is ProviderRole.WORKER and _terminal_worker_abandonment(action, blocker):
             # Recovery outcome and objective terminalization share this one
             # transaction, so a crash cannot leave an abandoned Worker active.
             from .review_lifecycle import _cancel_objective_for_recovery_connection
@@ -1274,6 +1274,19 @@ def _abandonment_state(row: ProviderAttempt) -> AttemptState:
     """Use the only terminal state compatible with persisted turn evidence."""
 
     return AttemptState.AMBIGUOUS if row.external_turn_identity is not None else AttemptState.BLOCKED
+
+
+def _terminal_worker_abandonment(action: RecoveryAction, blocker: str | None) -> bool:
+    """Distinguish irreversible abandonment from evidence awaiting verification."""
+
+    return (
+        action in {
+            RecoveryAction.BLOCKED_STALE_WORKER,
+            RecoveryAction.BLOCKED_IDENTITY_DRIFT,
+            RecoveryAction.BLOCKED_RETRY_LIMIT,
+        }
+        or (action is RecoveryAction.BLOCKED_AMBIGUOUS_TURN and blocker != "completion-evidence-unverified")
+    )
 
 
 def _stale_unvalidated_diff_review(connection, identity: TaskIdentity, row: ProviderAttempt) -> None:

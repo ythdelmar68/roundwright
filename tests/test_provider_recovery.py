@@ -34,7 +34,7 @@ from roundwright.provider_recovery import (
     record_session_identity,
     recover_attempt,
 )
-from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleStore, WorkerObjective
+from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 
@@ -547,6 +547,36 @@ class ProviderRecoveryTests(unittest.TestCase):
             replay = recover_attempt(repository, identity, context, attempt_id="objective-worker", max_attempts=1, lease=lease, now=int(time.time()) + 11)
             self.assertEqual((first.next_action, replay.next_action), (RecoveryAction.BLOCKED_STALE_WORKER, RecoveryAction.BLOCKED_STALE_WORKER))
             self.assertEqual(ReviewLifecycleStore().read_objective(repository, identity, objective_id=objective.objective_id).state, ObjectiveState.CANCELLED)
+
+    def test_late_verified_worker_completion_keeps_the_objective_active_until_it_completes(self) -> None:
+        """A crash after output persistence remains recoverable by its exact receipt."""
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("late-objective"); self.admit(repository, identity, lease)
+            context = self.context(identity)
+            self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="late-worker")
+            record_session_identity(repository, identity, context, attempt_id="late-worker", session_identity="late-session", lease=lease)
+            record_external_turn(repository, identity, context, attempt_id="late-worker", session_identity="late-session", external_turn_identity="late-turn", lease=lease)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                connection.execute("INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at) VALUES ('late-implementation', ?, 'plan-late', 'review-late', 'late-worker', 'late-session', 'late-turn', ?, 'dispatched', 1)", (identity.task_id, "a" * 64))
+                connection.commit()
+            objective = WorkerObjective("late-objective", identity.task_id, identity.base_sha, "late-worker", "worker-1-late-worker", "e" * 64)
+            store = ReviewLifecycleStore(); store.start_objective(repository, identity, objective, lease=lease)
+            evidence, accepted, candidate = "1" * 64, "2" * 64, "c" * 40
+            record_completed_output(repository, identity, context, attempt_id="late-worker", output_pointer="implementation:late-implementation", completion_evidence_fingerprint=evidence, output_fingerprint=accepted, lease=lease)
+            ambiguous = recover_attempt(repository, identity, context, attempt_id="late-worker", max_attempts=1, lease=lease)
+            self.assertEqual((ambiguous.next_action, ambiguous.state), (RecoveryAction.BLOCKED_AMBIGUOUS_TURN, AttemptState.AMBIGUOUS))
+            self.assertEqual(store.read_objective(repository, identity, objective_id=objective.objective_id).state, ObjectiveState.ACTIVE)
+            restored = recover_attempt(repository, identity, context, attempt_id="late-worker", verified_completion_evidence=evidence, max_attempts=1, lease=lease)
+            self.assertEqual((restored.next_action, restored.state), (RecoveryAction.CONSUME_VERIFIED_OUTPUT, AttemptState.COMPLETED))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                connection.execute("UPDATE implementation_attempts SET state = 'recorded' WHERE implementation_attempt_id = 'late-implementation'")
+                connection.execute("INSERT INTO implementation_candidates(implementation_attempt_id, task_id, base_sha, candidate_sha, completion_evidence_fingerprint, content_digest) VALUES ('late-implementation', ?, ?, ?, ?, ?)", (identity.task_id, identity.base_sha, candidate, evidence, accepted))
+                connection.execute("INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)", (identity.task_id, identity.base_sha, candidate, lease.state_identity))
+                connection.commit()
+            result = store.complete_objective(repository, identity, objective, lease=lease, result=WorkerObjectiveResult(candidate, evidence, accepted))
+            self.assertEqual(result.state, ObjectiveState.COMPLETED)
+            self.assertEqual(store.complete_objective(repository, identity, objective, lease=lease, result=WorkerObjectiveResult(candidate, evidence, accepted)), result)
 
     def test_context_is_bound_to_each_attempt_after_candidate_and_policy_revalidation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

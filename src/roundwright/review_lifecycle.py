@@ -500,9 +500,10 @@ def _require_worker_dispatch(connection: sqlite3.Connection, identity: TaskIdent
 
 
 def _require_worker_objective_attempt(connection: sqlite3.Connection, identity: TaskIdentity, attempt_id: str, dispatch_sha: str) -> str:
-    row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, implementation.task_id, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
-    expected_dispatch_sha = row[6] or identity.base_sha if row is not None else None
-    if row is None or row[:2] != (identity.task_id, "worker") or row[3] not in {"dispatched", "completed"} or row[4] != identity.task_id or row[5] not in {"dispatched", "recorded"} or dispatch_sha != expected_dispatch_sha:
+    row = connection.execute("SELECT attempts.task_id, attempts.provider_role, attempts.attempt_number, attempts.state, attempts.completion_evidence_fingerprint, outcomes.recovery_action, outcomes.blocker, implementation.task_id, implementation.state, implementation.repair_candidate_sha FROM provider_attempts AS attempts JOIN implementation_attempts AS implementation ON implementation.provider_attempt_id = attempts.attempt_id LEFT JOIN provider_recovery_outcomes AS outcomes ON outcomes.attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (attempt_id,)).fetchone()
+    expected_dispatch_sha = row[9] or identity.base_sha if row is not None else None
+    recoverable_ambiguity = row is not None and row[3] == "ambiguous" and _digest(row[4]) and row[5:7] == ("blocked-ambiguous-turn", "completion-evidence-unverified")
+    if row is None or row[:2] != (identity.task_id, "worker") or (row[3] not in {"dispatched", "completed"} and not recoverable_ambiguity) or row[7] != identity.task_id or row[8] not in {"dispatched", "recorded"} or dispatch_sha != expected_dispatch_sha:
         raise ReviewLifecycleError("Worker objective provider attempt is unavailable or stale")
     return f"worker-{row[2]}-{attempt_id}"
 

@@ -820,6 +820,15 @@ MIGRATIONS = (
             ("diff_review_artifacts", "CREATE TABLE diff_review_artifacts (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), verdict TEXT NOT NULL CHECK(verdict IN ('pass', 'findings')), findings_json TEXT NOT NULL, content_digest TEXT NOT NULL, pass_follow_ups_json TEXT NOT NULL DEFAULT '[]')"),
         ),
     ),
+    Migration(
+        65,
+        (
+            "CREATE TABLE legacy_objective_migration_receipts (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), source_count INTEGER NOT NULL CHECK(source_count >= 0))",
+        ),
+        (
+            ("legacy_objective_migration_receipts", "CREATE TABLE legacy_objective_migration_receipts (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), source_count INTEGER NOT NULL CHECK(source_count >= 0))"),
+        ),
+    ),
 )
 
 
@@ -1574,8 +1583,12 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
         _validate_applied(applied, ordered)
         _validate_schema(connection, ordered[:len(applied)])
         for migration in ordered[len(applied):]:
+            if migration.version == 62:
+                _stage_legacy_worker_objectives(connection)
             for statement in migration.statements:
                 connection.execute(statement)
+            if migration.version == 65:
+                _migrate_legacy_worker_objectives(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
@@ -1604,6 +1617,79 @@ def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migr
     _validate_schema(connection, ordered)
     _validate_task_ownership(connection)
     return ordered[-1].version if ordered else 0, _read_state_identity(connection)
+
+
+def _migrate_legacy_worker_objectives(connection: sqlite3.Connection) -> None:
+    """Forward-migrate only legacy objective shapes from durable evidence.
+
+    Historical migrations remain byte-stable.  This adapter runs once in v65,
+    within the migration transaction, and refuses rows which cannot be
+    reconstructed from their provider, implementation, and candidate records.
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(worker_objective_records)")}
+    legacy_records = "dispatch_sha" not in columns
+    if legacy_records:
+        connection.execute("ALTER TABLE worker_objective_records RENAME TO worker_objective_records_v65_legacy")
+        statement = next(statement for migration in reversed(MIGRATIONS) for name, statement in migration.schema if name == "worker_objective_records")
+        connection.execute(statement)
+    sources = ["worker_objectives"]
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'legacy_objective_stage_v65'").fetchone() is not None:
+        sources.append("legacy_objective_stage_v65")
+    if legacy_records:
+        sources.append("worker_objective_records_v65_legacy")
+    source_rows: list[tuple[object, ...]] = []
+    for source in sources:
+        source_rows.extend(connection.execute(f"SELECT objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest FROM {source}").fetchall())
+    migrated = 0
+    for objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, reason in source_rows:
+        task = connection.execute("SELECT base_sha FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        provider = connection.execute("SELECT state, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ? AND provider_role = 'worker'", (provider_attempt_id, task_id)).fetchone()
+        implementation = connection.execute("SELECT implementation_attempt_id, state, repair_candidate_sha FROM implementation_attempts WHERE provider_attempt_id = ? AND task_id = ?", (provider_attempt_id, task_id)).fetchone()
+        output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (provider_attempt_id,)).fetchone()
+        if task is None or provider is None or implementation is None:
+            raise StateError("legacy Worker objective provenance is incomplete")
+        dispatch_sha = implementation[2] or task[0]
+        if state == "active":
+            if provider[0] != "dispatched" or implementation[1] != "dispatched":
+                raise StateError("legacy active Worker objective provenance is contradictory")
+            values = (objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, None, None, None, None)
+        elif state == "cancelled":
+            if not isinstance(reason, str) or len(reason) != 64:
+                raise StateError("legacy cancelled Worker objective provenance is incomplete")
+            values = (objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, None, None, None, reason)
+        elif state == "completed":
+            candidate = connection.execute("SELECT candidate_sha, completion_evidence_fingerprint, content_digest FROM implementation_candidates WHERE implementation_attempt_id = ? AND task_id = ?", (implementation[0], task_id)).fetchone()
+            if provider[0] != "completed" or implementation[1] != "recorded" or candidate is None or candidate[0] != candidate_sha or candidate[1] != provider[1] or output is None or candidate[2] != output[0]:
+                raise StateError("legacy completed Worker objective provenance is contradictory or incomplete")
+            values = (objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate[0], candidate[1], candidate[2], None)
+        else:
+            raise StateError("legacy Worker objective state is unsupported")
+        existing = connection.execute("SELECT task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records WHERE objective_id = ?", (objective_id,)).fetchone()
+        if existing is None:
+            connection.execute("INSERT INTO worker_objective_records(objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+        elif existing != values[1:]:
+            raise StateError("legacy Worker objective conflicts with reconstructed state")
+        migrated += 1
+    if legacy_records:
+        connection.execute("DROP TABLE worker_objective_records_v65_legacy")
+    connection.execute("DROP TABLE IF EXISTS legacy_objective_stage_v65")
+    connection.execute("INSERT INTO legacy_objective_migration_receipts(singleton, source_count) VALUES (1, ?)", (migrated,))
+
+
+def _stage_legacy_worker_objectives(connection: sqlite3.Connection) -> None:
+    """Carry populated v58-v62 objective rows past their historical empty guards."""
+    records = {row[1] for row in connection.execute("PRAGMA table_info(worker_objective_records)")}
+    count = connection.execute("SELECT COUNT(*) FROM worker_objectives").fetchone()[0]
+    if records and "dispatch_sha" not in records:
+        count += connection.execute("SELECT COUNT(*) FROM worker_objective_records").fetchone()[0]
+    if not count:
+        return
+    connection.execute("CREATE TABLE legacy_objective_stage_v65 (objective_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, candidate_sha TEXT NOT NULL, provider_attempt_id TEXT NOT NULL, retry_identity TEXT NOT NULL, objective_digest TEXT NOT NULL, state TEXT NOT NULL, completion_digest TEXT, terminal_reason_digest TEXT)")
+    connection.execute("INSERT INTO legacy_objective_stage_v65 SELECT objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest FROM worker_objectives")
+    connection.execute("DELETE FROM worker_objectives")
+    if records and "dispatch_sha" not in records:
+        connection.execute("INSERT INTO legacy_objective_stage_v65 SELECT objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest FROM worker_objective_records")
+        connection.execute("DELETE FROM worker_objective_records")
 
 
 def _backfill_task_ownership(connection: sqlite3.Connection) -> None:

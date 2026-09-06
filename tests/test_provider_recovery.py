@@ -34,7 +34,7 @@ from roundwright.provider_recovery import (
     record_session_identity,
     recover_attempt,
 )
-from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
+from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 
@@ -566,6 +566,8 @@ class ProviderRecoveryTests(unittest.TestCase):
             record_completed_output(repository, identity, context, attempt_id="late-worker", output_pointer="implementation:late-implementation", completion_evidence_fingerprint=evidence, output_fingerprint=accepted, lease=lease)
             ambiguous = recover_attempt(repository, identity, context, attempt_id="late-worker", max_attempts=1, lease=lease)
             self.assertEqual((ambiguous.next_action, ambiguous.state), (RecoveryAction.BLOCKED_AMBIGUOUS_TURN, AttemptState.AMBIGUOUS))
+            with self.assertRaisesRegex(ReviewLifecycleError, "completion evidence remains recoverable"):
+                store.cancel_objective_for_provider_attempt(repository, identity, provider_attempt_id="late-worker", reason_digest="3" * 64, lease=lease)
             self.assertEqual(store.read_objective(repository, identity, objective_id=objective.objective_id).state, ObjectiveState.ACTIVE)
             restored = recover_attempt(repository, identity, context, attempt_id="late-worker", verified_completion_evidence=evidence, max_attempts=1, lease=lease)
             self.assertEqual((restored.next_action, restored.state), (RecoveryAction.CONSUME_VERIFIED_OUTPUT, AttemptState.COMPLETED))

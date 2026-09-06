@@ -407,6 +407,8 @@ def _cancel_objective_for_recovery_connection(
     allowed = {"blocked-stale-worker", "blocked-ambiguous-turn", "blocked-identity-drift", "blocked-retry-limit"}
     if recovery is None or recovery[0] != "worker" or recovery[1] not in {"blocked", "ambiguous"} or recovery[2] not in allowed or not _token(recovery[3]):
         raise ReviewLifecycleError("Worker recovery cancellation lacks terminal abandonment evidence")
+    if recovery[1:] == ("ambiguous", "blocked-ambiguous-turn", "completion-evidence-unverified"):
+        raise ReviewLifecycleError("Worker recovery cancellation is unavailable while completion evidence remains recoverable")
     row = connection.execute(
         "SELECT objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest "
         "FROM worker_objective_records WHERE task_id = ? AND provider_attempt_id = ?",

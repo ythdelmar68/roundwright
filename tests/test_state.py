@@ -463,6 +463,7 @@ class StateTests(unittest.TestCase):
         *,
         version: int,
         candidate_content_digest: str = "f" * 64,
+        legacy_state: str = "completed",
     ) -> tuple[str, str, str, str, str]:
         """Create a populated pre-v65 objective ledger from its durable inputs."""
 
@@ -485,25 +486,22 @@ class StateTests(unittest.TestCase):
                 "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state, blocked_from_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (task_id, "legacy-source", "example/roundwright", "codex/legacy-worker", str(path.parent / "legacy-worker"), "legacy-worker-base", "implementing", None),
             )
+            provider_state = "completed" if legacy_state == "completed" else "dispatched"
             connection.execute(
-                "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES (?, ?, 'worker', 1, ?, 1, ?, ?, ?, ?, ?, NULL, 'completed')",
-                (provider_attempt_id, task_id, "legacy-lease", "legacy-session", "legacy-turn", "b" * 64, "legacy-output", evidence),
+                "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state) VALUES (?, ?, 'worker', 1, ?, 1, ?, ?, ?, ?, ?, NULL, ?)",
+                (provider_attempt_id, task_id, "legacy-lease", "legacy-session", "legacy-turn", "b" * 64, "legacy-output" if legacy_state == "completed" else None, evidence if legacy_state == "completed" else None, provider_state),
             )
+            if legacy_state == "completed":
+                connection.execute("INSERT INTO provider_completion_outputs(attempt_id, output_fingerprint) VALUES (?, ?)", (provider_attempt_id, "f" * 64))
             connection.execute(
-                "INSERT INTO provider_completion_outputs(attempt_id, output_fingerprint) VALUES (?, ?)",
-                (provider_attempt_id, "f" * 64),
+                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (implementation_attempt_id, task_id, "legacy-plan", "legacy-plan-review", provider_attempt_id, "legacy-worker-thread", "legacy-turn", "c" * 64, "recorded" if legacy_state == "completed" else "dispatched"),
             )
+            if legacy_state == "completed":
+                connection.execute("INSERT INTO implementation_candidates(implementation_attempt_id, task_id, base_sha, candidate_sha, completion_evidence_fingerprint, content_digest) VALUES (?, ?, ?, ?, ?, ?)", (implementation_attempt_id, task_id, "legacy-worker-base", candidate_sha, evidence, candidate_content_digest))
             connection.execute(
-                "INSERT INTO implementation_attempts(implementation_attempt_id, task_id, plan_attempt_id, accepted_plan_review_identity, provider_attempt_id, worker_thread_identity, external_turn_identity, input_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recorded', 1)",
-                (implementation_attempt_id, task_id, "legacy-plan", "legacy-plan-review", provider_attempt_id, "legacy-worker-thread", "legacy-turn", "c" * 64),
-            )
-            connection.execute(
-                "INSERT INTO implementation_candidates(implementation_attempt_id, task_id, base_sha, candidate_sha, completion_evidence_fingerprint, content_digest) VALUES (?, ?, ?, ?, ?, ?)",
-                (implementation_attempt_id, task_id, "legacy-worker-base", candidate_sha, evidence, candidate_content_digest),
-            )
-            connection.execute(
-                "INSERT INTO worker_objectives(objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest) VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, NULL)",
-                (objective_id, task_id, candidate_sha, provider_attempt_id, "legacy-retry", objective_digest, "c" * 64),
+                "INSERT INTO worker_objectives(objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, terminal_reason_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (objective_id, task_id, candidate_sha, provider_attempt_id, "legacy-retry", objective_digest, legacy_state, "c" * 64 if legacy_state == "completed" else None, "c" * 64 if legacy_state == "cancelled" else None),
             )
             connection.commit()
         finally:
@@ -565,6 +563,24 @@ class StateTests(unittest.TestCase):
                 self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'legacy_objective_migration_receipts'").fetchone())
             finally:
                 connection.close()
+
+    def test_active_and_cancelled_v58_v60_v62_objectives_reconstruct_canonical_retry_identity(self) -> None:
+        """Legacy nonterminal objectives keep replayable provider-bound retry IDs."""
+
+        for version in (58, 60, 62):
+            for legacy_state in ("active", "cancelled"):
+                with self.subTest(version=version, state=legacy_state), tempfile.TemporaryDirectory() as temporary:
+                    repository = self.repository(Path(temporary))
+                    path = database_path(repository)
+                    path.parent.mkdir()
+                    self._seed_legacy_worker_objective(path, version=version, legacy_state=legacy_state)
+                    self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                    self.assertEqual(initialize(repository), check_database(repository))
+                    connection = sqlite3.connect(path)
+                    try:
+                        self.assertEqual(connection.execute("SELECT retry_identity, state, terminal_reason_digest FROM worker_objective_records").fetchone(), ("worker-1-legacy-worker-provider", legacy_state, "c" * 64 if legacy_state == "cancelled" else None))
+                    finally:
+                        connection.close()
 
     def test_version_three_lease_handles_cannot_reappear_after_upgrade(self) -> None:
         for active in (False, True):

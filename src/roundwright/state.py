@@ -1643,12 +1643,16 @@ def _migrate_legacy_worker_objectives(connection: sqlite3.Connection) -> None:
     migrated = 0
     for objective_id, task_id, candidate_sha, provider_attempt_id, retry_identity, objective_digest, state, completion_digest, reason in source_rows:
         task = connection.execute("SELECT base_sha FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
-        provider = connection.execute("SELECT state, completion_evidence_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ? AND provider_role = 'worker'", (provider_attempt_id, task_id)).fetchone()
+        provider = connection.execute("SELECT state, completion_evidence_fingerprint, attempt_number FROM provider_attempts WHERE attempt_id = ? AND task_id = ? AND provider_role = 'worker'", (provider_attempt_id, task_id)).fetchone()
         implementation = connection.execute("SELECT implementation_attempt_id, state, repair_candidate_sha FROM implementation_attempts WHERE provider_attempt_id = ? AND task_id = ?", (provider_attempt_id, task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (provider_attempt_id,)).fetchone()
         if task is None or provider is None or implementation is None:
             raise StateError("legacy Worker objective provenance is incomplete")
         dispatch_sha = implementation[2] or task[0]
+        # v58-v62 persisted an unbound retry token.  Reconstruct the current
+        # lifecycle identity from the only durable authority: provider ordinal
+        # plus provider attempt ID.
+        retry_identity = f"worker-{provider[2]}-{provider_attempt_id}"
         if state == "active":
             if provider[0] != "dispatched" or implementation[1] != "dispatched":
                 raise StateError("legacy active Worker objective provenance is contradictory")

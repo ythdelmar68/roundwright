@@ -536,7 +536,7 @@ class StateTests(unittest.TestCase):
                         connection.execute(
                             "SELECT objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records"
                         ).fetchall(),
-                        [(objective_id, task_id, "legacy-worker-base", provider_attempt_id, "legacy-retry", objective_digest, "completed", candidate_sha, "e" * 64, "f" * 64, None)],
+                        [(objective_id, task_id, "legacy-worker-base", provider_attempt_id, "worker-1-legacy-worker-provider", objective_digest, "completed", candidate_sha, "e" * 64, "f" * 64, None)],
                     )
                     self.assertEqual(
                         connection.execute("SELECT singleton, source_count FROM legacy_objective_migration_receipts").fetchall(),

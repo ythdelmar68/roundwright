@@ -380,6 +380,7 @@ def begin_implementation(
         if existing != expected:
             raise CandidateReviewError("implementation dispatch replay conflicts with committed state")
         _require_replayed_repair_parent(repository, identity, repair_parent, worker_thread_identity, implementation_attempt_id)
+        _ensure_worker_objective(repository, identity, context, existing, lease)
         return existing
     repair_parent = _repair_parent(
         repository, identity, repair_diff_review_id, repair_candidate_sha, routed_finding_ids, worker_thread_identity,
@@ -434,20 +435,24 @@ def begin_implementation(
         if claim_token is not None:
             _release_repair_claim(repository, identity, repair_parent, claim_token, lease, now)
         raise
-    # The objective begins at the durable Worker/provider dispatch boundary, not
-    # when a later local candidate happens to exist.  Its deterministic identity
-    # also makes a post-crash replay reconstruct the same durable objective.
+    _ensure_worker_objective(repository, identity, context, expected, lease)
+    return expected
+
+
+def _ensure_worker_objective(repository, identity, context, dispatch, lease) -> None:
+    """Backfill the deterministic objective after a crash-safe dispatch replay."""
+
     from .review_lifecycle import ReviewLifecycleStore, WorkerObjective
-    objective_digest = _digest({"implementation": implementation_attempt_id, "provider": provider_attempt_id, "input": input_digest})
-    dispatch_sha = repair_parent.candidate_sha or identity.base_sha
+    provider = read_attempt(repository, identity, dispatch.provider_attempt_id, context=context)
+    objective_digest = _digest({"implementation": dispatch.implementation_attempt_id, "provider": dispatch.provider_attempt_id, "input": dispatch.input_digest})
+    dispatch_sha = dispatch.repair_candidate_sha or identity.base_sha
     ReviewLifecycleStore().start_objective(
         repository, identity,
         WorkerObjective(f"worker-objective-{objective_digest[:24]}", identity.task_id,
-                        dispatch_sha, provider_attempt_id,
-                        f"worker-{provider.attempt_number}-{provider_attempt_id}", objective_digest),
+                        dispatch_sha, dispatch.provider_attempt_id,
+                        f"worker-{provider.attempt_number}-{dispatch.provider_attempt_id}", objective_digest),
         lease=lease,
     )
-    return expected
 
 
 def record_implementation_candidate(
@@ -888,6 +893,20 @@ def record_diff_review(
                 connection.execute("INSERT INTO diff_review_routes(diff_review_attempt_id, task_id, worker_thread_identity, finding_ids_json) VALUES (?, ?, ?, ?)", (diff_review_attempt_id, identity.task_id, *expected_route))
             elif route != expected_route:
                 raise CandidateReviewError("diff review findings route conflicts with committed state")
+            # Artifact, route, and every canonical lifecycle item share this
+            # transaction.  Recovery can therefore observe only the whole
+            # finding set, never a prefix left by a process crash.
+            from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, _record_review_item_connection
+            timestamp = connection.execute("SELECT created_at FROM diff_review_attempts WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,)).fetchone()
+            if timestamp is None:
+                raise CandidateReviewError("diff review timestamp is unavailable")
+            for finding, finding_id in zip(findings, finding_ids, strict=True):
+                digest = _digest({"candidate": seal.candidate_sha, "finding": finding})
+                _record_review_item_connection(connection, identity, ReviewItem(
+                    finding_id, identity.task_id, diff_review_attempt_id, seal.candidate_sha,
+                    dispatch.provider_attempt_id, ReviewItemKind.FINDING,
+                    ReviewItemSource.SUPERVISOR_FINDING, digest, "worker-repair", True, timestamp[0],
+                ))
         connection.commit()
     except Exception:
         connection.rollback()
@@ -896,18 +915,6 @@ def record_diff_review(
         connection.close()
     bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=completion_evidence_fingerprint, lease=lease)
     if normalized.verdict is DiffReviewVerdict.FINDINGS:
-        from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, ReviewLifecycleStore
-        store = ReviewLifecycleStore()
-        for finding, finding_id in zip(findings, finding_ids, strict=True):
-            digest = _digest({"candidate": seal.candidate_sha, "review": diff_review_attempt_id, "finding": finding})
-            store.record_review_item(
-                repository, identity,
-                ReviewItem(finding_id, identity.task_id, diff_review_attempt_id, seal.candidate_sha,
-                           dispatch.provider_attempt_id, ReviewItemKind.FINDING,
-                           ReviewItemSource.SUPERVISOR_FINDING, digest, "worker-repair", True,
-                           int(time.time() if now is None else now)),
-                lease=lease,
-            )
         transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=bound_output_digest, lease=lease)
     else:
         _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
@@ -1373,7 +1380,7 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now, pass_
             from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, _record_review_item_connection
             timestamp = int(time.time() if now is None else now)
             for follow_up in pass_follow_ups:
-                digest = _digest({"candidate": dispatch.candidate_sha, "review": dispatch.diff_review_attempt_id, "follow_up": follow_up})
+                digest = _digest({"candidate": dispatch.candidate_sha, "follow_up": follow_up})
                 _record_review_item_connection(
                     connection, identity,
                     ReviewItem(f"pass-follow-up-{digest[:24]}", identity.task_id, dispatch.diff_review_attempt_id,

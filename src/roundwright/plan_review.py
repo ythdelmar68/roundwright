@@ -160,6 +160,7 @@ class PersistedPlanReview:
     verdict: PlanReviewVerdict
     state: PlanReviewState
     routed_finding_ids: tuple[str, ...]
+    pass_follow_up_ids: tuple[str, ...] = ()
 
 
 def dispatch_plan_review(
@@ -411,7 +412,19 @@ def read_plan_review(
                 raise PlanReviewError("accepted provider review conflicts with committed state")
             _require_exact_provider_context(connection, identity, provider[0], context)
             _require_sealed_provider_authorization(connection, identity, provider[0], context, now)
-        return PersistedPlanReview(review_attempt_id, row[0], row[1], row[2], PlanReviewVerdict(row[4]), PlanReviewState(row[3]), tuple(json.loads(row[5] or "[]")))
+        follow_ups = ()
+        if row[4] == PlanReviewVerdict.PASS.value:
+            artifact_follow_ups = connection.execute("SELECT pass_follow_ups_json FROM plan_review_artifacts WHERE review_attempt_id = ?", (review_attempt_id,)).fetchone()
+            if artifact_follow_ups is None:
+                raise PlanReviewError("review PASS artifact is unavailable")
+            try:
+                values = tuple(json.loads(artifact_follow_ups[0]))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise PlanReviewError("review PASS follow-up schema is invalid") from error
+            if any(type(value) is not str for value in values):
+                raise PlanReviewError("review PASS follow-up schema is invalid")
+            follow_ups = tuple(f"pass-follow-up-{_digest({'task': identity.task_id, 'candidate': identity.base_sha, 'follow_up': value})[:24]}" for value in values)
+        return PersistedPlanReview(review_attempt_id, row[0], row[1], row[2], PlanReviewVerdict(row[4]), PlanReviewState(row[3]), tuple(json.loads(row[5] or "[]")), follow_ups)
     finally:
         connection.close()
 
@@ -481,9 +494,15 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
         expected = (dispatch.plan_attempt_id, dispatch.review_attempt_id, dispatch.plan_digest)
         if submitted != (dispatch.plan_attempt_id, dispatch.plan_digest):
             raise PlanReviewError("accepted PASS no longer matches the submitted plan")
-        artifact = connection.execute("SELECT verdict FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?", (dispatch.review_attempt_id, identity.task_id)).fetchone()
-        if artifact != (PlanReviewVerdict.PASS.value,):
+        artifact = connection.execute("SELECT verdict, pass_follow_ups_json FROM plan_review_artifacts WHERE review_attempt_id = ? AND task_id = ?", (dispatch.review_attempt_id, identity.task_id)).fetchone()
+        if artifact is None or artifact[0] != PlanReviewVerdict.PASS.value:
             raise PlanReviewError("only a recorded PASS can be accepted")
+        try:
+            pass_follow_ups = tuple(json.loads(artifact[1]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise PlanReviewError("accepted PASS follow-up schema is invalid") from error
+        if any(type(value) is not str for value in pass_follow_ups):
+            raise PlanReviewError("accepted PASS follow-up schema is invalid")
         provider = connection.execute("SELECT provider_role, state, accepted_review_identity, completion_evidence_fingerprint, selected_profile_identity FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (dispatch.provider_attempt_id, identity.task_id)).fetchone()
         if provider is None or provider[0] != ProviderRole.SUPERVISOR.value or provider[3] is None:
             raise PlanReviewError("accepted PASS provider attempt is incomplete")
@@ -503,6 +522,18 @@ def _accept_pass_atomically(repository, identity, context, dispatch, lease, now)
             connection.execute("INSERT INTO accepted_plan_reviews(task_id, plan_attempt_id, review_identity, review_digest) VALUES (?, ?, ?, ?)", (identity.task_id, *expected))
         elif existing != expected:
             raise PlanReviewError("accepted plan review conflicts with committed state")
+        if pass_follow_ups:
+            from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, _record_review_item_connection
+            timestamp = connection.execute("SELECT created_at FROM plan_review_attempts WHERE review_attempt_id = ?", (dispatch.review_attempt_id,)).fetchone()
+            if timestamp is None:
+                raise PlanReviewError("accepted plan review timestamp is unavailable")
+            for follow_up in pass_follow_ups:
+                digest = _digest({"task": identity.task_id, "candidate": identity.base_sha, "follow_up": follow_up})
+                _record_review_item_connection(connection, identity, ReviewItem(
+                    f"pass-follow-up-{digest[:24]}", identity.task_id, dispatch.review_attempt_id,
+                    identity.base_sha, dispatch.provider_attempt_id, ReviewItemKind.PASS_FOLLOW_UP,
+                    ReviewItemSource.ACCEPTED_REVIEW, digest, "owner-review", True, timestamp[0],
+                ))
         connection.commit()
     except Exception:
         connection.rollback()

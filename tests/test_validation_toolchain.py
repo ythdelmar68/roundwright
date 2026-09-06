@@ -273,6 +273,15 @@ class ValidationToolchainTests(unittest.TestCase):
             with mock.patch.object(resolver.os, "name", "nt"):
                 self.assertEqual(resolver._runtime_executable(executable), "\\\\?\\" + str(executable.resolve(strict=True)))
 
+    def test_posix_runtime_launch_preserves_the_virtualenv_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = Path(temporary) / "venv"
+            environment.mkdir()
+            executable = environment / "python"
+            executable.write_bytes(b"tool")
+            with mock.patch.object(resolver.os, "name", "posix"):
+                self.assertEqual(resolver._runtime_executable(executable), str(executable))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -89,8 +89,9 @@ def _executable(environment: Path, name: str) -> Path:
 
 def _runtime_executable(path: Path) -> str:
     """Return the receipt-bound interpreter path without Windows MAX_PATH loss."""
-    resolved = str(path.resolve(strict=True))
-    return "\\\\?\\" + resolved if os.name == "nt" else resolved
+    if os.name != "nt":
+        return str(path)
+    return "\\\\?\\" + str(path.resolve(strict=True))
 
 
 def _toolchain_environment(root: Path) -> dict[str, str]:

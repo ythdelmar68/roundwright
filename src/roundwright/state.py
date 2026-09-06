@@ -765,6 +765,18 @@ MIGRATIONS = (
             ("owner_command_records", "CREATE TABLE owner_command_records (command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), command_kind TEXT NOT NULL CHECK(command_kind IN ('resolve-review-item', 'waive-review-item')), owner_identity TEXT NOT NULL, authority_grant_id TEXT NOT NULL REFERENCES owner_authority_grants(grant_id), target_item_id TEXT NOT NULL REFERENCES review_item_records(item_id), candidate_sha TEXT NOT NULL, command_digest TEXT NOT NULL, scope_digest TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('pending', 'consumed')), result_digest TEXT, CHECK((state = 'pending' AND result_digest IS NULL) OR (state = 'consumed' AND result_digest IS NOT NULL)))"),
         ),
     ),
+    Migration(
+        60,
+        (
+            "CREATE TABLE review_item_provenance_v2 (item_id TEXT PRIMARY KEY REFERENCES review_item_records(item_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, review_identity TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('accepted-review', 'supervisor-finding')), source_attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), source_owner_identity TEXT NOT NULL)",
+            "INSERT INTO review_item_provenance_v2(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) SELECT item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity FROM review_item_provenance",
+            "DROP TABLE review_item_provenance",
+            "ALTER TABLE review_item_provenance_v2 RENAME TO review_item_provenance",
+        ),
+        (
+            ("review_item_provenance", "CREATE TABLE \"review_item_provenance\" (item_id TEXT PRIMARY KEY REFERENCES review_item_records(item_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, review_identity TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('accepted-review', 'supervisor-finding')), source_attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), source_owner_identity TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 

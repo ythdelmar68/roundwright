@@ -777,6 +777,16 @@ MIGRATIONS = (
             ("review_item_provenance", "CREATE TABLE \"review_item_provenance\" (item_id TEXT PRIMARY KEY REFERENCES review_item_records(item_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, review_identity TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('accepted-review', 'supervisor-finding')), source_attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), source_owner_identity TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        61,
+        (
+            "CREATE TABLE review_item_provenance_v3 (item_id TEXT NOT NULL REFERENCES review_item_records(item_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, review_identity TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('accepted-review', 'supervisor-finding')), source_attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), source_owner_identity TEXT NOT NULL, PRIMARY KEY(item_id, review_identity, source_kind, source_attempt_id))",
+            "INSERT INTO review_item_provenance_v3(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) SELECT item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity FROM review_item_provenance",
+            "DROP TABLE review_item_provenance",
+            "ALTER TABLE review_item_provenance_v3 RENAME TO review_item_provenance",
+        ),
+        (("review_item_provenance", "CREATE TABLE \"review_item_provenance\" (item_id TEXT NOT NULL REFERENCES review_item_records(item_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, review_identity TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('accepted-review', 'supervisor-finding')), source_attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), source_owner_identity TEXT NOT NULL, PRIMARY KEY(item_id, review_identity, source_kind, source_attempt_id))"),),
+    ),
 )
 
 

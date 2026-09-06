@@ -275,6 +275,7 @@ class DiffReviewOutput:
     candidate_sha: str
     verdict: DiffReviewVerdict
     findings: tuple[str, ...] = ()
+    pass_follow_ups: tuple[str, ...] = ()
 
     def normalized(self) -> "DiffReviewOutput":
         for value, name in (
@@ -292,13 +293,16 @@ class DiffReviewOutput:
         except (TypeError, ValueError) as error:
             raise CandidateReviewError("diff review verdict is unsupported") from error
         findings = _items(self.findings, "diff review findings", allow_empty=True)
+        follow_ups = _items(self.pass_follow_ups, "diff review PASS follow-ups", allow_empty=True)
         if verdict is DiffReviewVerdict.PASS and findings:
             raise CandidateReviewError("PASS must not include findings")
+        if verdict is DiffReviewVerdict.FINDINGS and follow_ups:
+            raise CandidateReviewError("FINDINGS must not include PASS follow-ups")
         if verdict is DiffReviewVerdict.FINDINGS and not findings:
             raise CandidateReviewError("FINDINGS requires at least one finding")
         return DiffReviewOutput(
             self.diff_review_attempt_id, self.provider_attempt_id, self.supervisor_session_identity,
-            self.external_turn_identity, self.message_identity, self.base_sha, self.candidate_sha, verdict, findings,
+            self.external_turn_identity, self.message_identity, self.base_sha, self.candidate_sha, verdict, findings, follow_ups,
         )
 
     @property
@@ -308,7 +312,7 @@ class DiffReviewOutput:
             "review": value.diff_review_attempt_id, "provider": value.provider_attempt_id,
             "session": value.supervisor_session_identity, "turn": value.external_turn_identity,
             "message": value.message_identity, "base": value.base_sha, "candidate": value.candidate_sha,
-            "verdict": value.verdict.value, "findings": value.findings,
+            "verdict": value.verdict.value, "findings": value.findings, "pass_follow_ups": value.pass_follow_ups,
         })
 
 
@@ -872,6 +876,18 @@ def record_diff_review(
     else:
         _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
         _accept_diff_pass(repository, identity, context, dispatch, lease, now)
+        if normalized.pass_follow_ups:
+            from .review_lifecycle import ReviewItem, ReviewItemKind, ReviewItemSource, ReviewLifecycleStore
+            store = ReviewLifecycleStore()
+            for follow_up in normalized.pass_follow_ups:
+                digest = _digest({"candidate": seal.candidate_sha, "review": diff_review_attempt_id, "follow_up": follow_up})
+                store.record_review_item(
+                    repository, identity,
+                    ReviewItem(f"pass-follow-up-{digest[:24]}", identity.task_id, diff_review_attempt_id,
+                               seal.candidate_sha, dispatch.provider_attempt_id, ReviewItemKind.PASS_FOLLOW_UP,
+                               ReviewItemSource.ACCEPTED_REVIEW, digest, "owner-review", True, int(time.time() if now is None else now)),
+                    lease=lease,
+                )
     return read_diff_review(repository, identity, diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
 
 

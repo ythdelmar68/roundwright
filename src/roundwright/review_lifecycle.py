@@ -139,10 +139,11 @@ class ReviewLifecycleStore:
             expected = (item.task_id, item.review_identity, item.candidate_sha, item.kind.value, item.source.value, item.source_attempt_id, source_owner, item.content_digest, item.destination, "blocking" if item.blocking else "non-blocking", item.created_at)
             row = connection.execute("SELECT task_id, review_identity, candidate_sha, item_kind, source_kind, source_attempt_id, source_owner_identity, content_digest, destination, blocker_state, created_at, disposition, verification_state FROM review_item_records WHERE item_id = ?", (item.item_id,)).fetchone()
             if row is None:
-                semantic = connection.execute("SELECT item_id, source_kind, source_attempt_id, source_owner_identity, destination, blocker_state, item_kind, verification_state, disposition FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND review_identity = ? AND item_kind = ? AND content_digest = ?", (item.task_id, item.candidate_sha, item.review_identity, item.kind.value, item.content_digest)).fetchone()
+                semantic = connection.execute("SELECT item_id, source_kind, source_attempt_id, source_owner_identity, destination, blocker_state, item_kind, verification_state, disposition FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND item_kind = ? AND content_digest = ?", (item.task_id, item.candidate_sha, item.kind.value, item.content_digest)).fetchone()
                 if semantic is not None:
-                    if tuple(semantic[1:6]) != (item.source.value, item.source_attempt_id, source_owner, item.destination, "blocking" if item.blocking else "non-blocking"):
+                    if tuple(semantic[4:6]) != (item.destination, "blocking" if item.blocking else "non-blocking"):
                         raise ReviewLifecycleError("review item semantic identity has materially conflicting state")
+                    connection.execute("INSERT INTO review_item_provenance(item_id, task_id, candidate_sha, review_identity, source_kind, source_attempt_id, source_owner_identity) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, review_identity, source_kind, source_attempt_id) DO NOTHING", (semantic[0], item.task_id, item.candidate_sha, item.review_identity, item.source.value, item.source_attempt_id, source_owner))
                     connection.commit()
                     return _projection(semantic[0], semantic[6], semantic[5], semantic[7], semantic[8], semantic[4])
                 connection.execute("INSERT INTO review_item_records(item_id, task_id, review_identity, candidate_sha, item_kind, source_kind, source_attempt_id, source_owner_identity, content_digest, destination, blocker_state, verification_state, disposition, created_at, resolved_command_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, NULL)", (item.item_id, *expected))
@@ -330,12 +331,16 @@ def _require_current_candidate(connection: sqlite3.Connection, identity: TaskIde
 
 
 def _require_accepted_review(connection: sqlite3.Connection, identity: TaskIdentity, item: ReviewItem) -> str:
-    row = connection.execute("SELECT accepted.task_id, accepted.attempt_id, attempts.provider_role, attempts.state, attempts.accepted_review_identity, accepted.selected_profile_identity FROM accepted_provider_reviews AS accepted JOIN provider_attempts AS attempts ON attempts.attempt_id = accepted.attempt_id WHERE accepted.accepted_review_identity = ?", (item.review_identity,)).fetchone()
-    if row is None or row[:5] != (identity.task_id, item.source_attempt_id, "supervisor", "accepted", item.review_identity) or not _durable_identity(row[5]):
+    row = connection.execute("SELECT attempts.task_id, attempts.attempt_id, attempts.provider_role, attempts.state, attempts.accepted_review_identity, COALESCE(NULLIF(attempts.selected_profile_identity, ''), accepted.selected_profile_identity) FROM provider_attempts AS attempts LEFT JOIN accepted_provider_reviews AS accepted ON accepted.attempt_id = attempts.attempt_id WHERE attempts.attempt_id = ?", (item.source_attempt_id,)).fetchone()
+    if row is None or row[:3] != (identity.task_id, item.source_attempt_id, "supervisor") or not _durable_identity(row[5]):
         raise ReviewLifecycleError("review item provenance is missing, stale, or not an accepted supervisor review")
     diff = connection.execute("SELECT task_id, candidate_sha, provider_attempt_id, state, accepted_review_identity FROM diff_review_attempts WHERE diff_review_attempt_id = ?", (item.review_identity,)).fetchone()
-    if diff != (identity.task_id, item.candidate_sha, item.source_attempt_id, "accepted", item.review_identity):
+    if item.source is ReviewItemSource.ACCEPTED_REVIEW and (row[3:5] != ("accepted", item.review_identity) or diff != (identity.task_id, item.candidate_sha, item.source_attempt_id, "accepted", item.review_identity)):
         raise ReviewLifecycleError("review item accepted review is not bound to the current candidate")
+    if item.source is ReviewItemSource.SUPERVISOR_FINDING:
+        output = connection.execute("SELECT 1 FROM provider_completion_outputs WHERE attempt_id = ?", (item.source_attempt_id,)).fetchone()
+        if row[3] not in {"completed", "accepted"} or diff is None or diff[:4] != (identity.task_id, item.candidate_sha, item.source_attempt_id, "recorded") or output is None:
+            raise ReviewLifecycleError("review finding provenance is not bound to a recorded supervisor output")
     return row[5]
 
 

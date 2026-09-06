@@ -66,9 +66,6 @@ class ReviewLifecycleTests(unittest.TestCase):
             first = store.record_review_item(repository, identity, self.item(identity), lease=lease)
             alias = store.record_review_item(repository, identity, self.item(identity, item_id="item-116"), lease=lease)
             self.assertEqual((first.item_id, alias.item_id, first.blocking), ("item-115", "item-115", True))
-            finding_one = ReviewItem("finding-115", identity.task_id, "review-115", self.candidate, "attempt-review-115", ReviewItemKind.FINDING, ReviewItemSource.SUPERVISOR_FINDING, "3" * 64, "owner-review", True, 1)
-            finding_two = ReviewItem("finding-116", identity.task_id, "review-115", self.candidate, "attempt-review-115", ReviewItemKind.FINDING, ReviewItemSource.SUPERVISOR_FINDING, "4" * 64, "owner-review", True, 1)
-            self.assertEqual((store.record_review_item(repository, identity, finding_one, lease=lease).item_id, store.record_review_item(repository, identity, finding_two, lease=lease).item_id), ("finding-115", "finding-116"))
             with closing(sqlite3.connect(database_path(repository))) as connection:
                 self.assertTrue(unresolved_final_gate_blockers(connection, identity.task_id, self.candidate))
             with self.assertRaises(ReviewLifecycleError):

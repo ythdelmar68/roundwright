@@ -77,6 +77,7 @@ class PlanReviewOutput:
     missing_tests: tuple[str, ...]
     ambiguous_criteria: tuple[str, ...]
     residual_risks: tuple[str, ...]
+    pass_follow_ups: tuple[str, ...] = ()
 
     def normalized(self) -> "PlanReviewOutput":
         for value, name in (
@@ -106,6 +107,7 @@ class PlanReviewOutput:
             _items(self.missing_tests, "missing tests"),
             _items(self.ambiguous_criteria, "ambiguous criteria"),
             _items(self.residual_risks, "residual risks"),
+            _items(self.pass_follow_ups, "PASS follow-ups"),
         )
         details = (*result.findings, *result.missing_tests, *result.ambiguous_criteria, *result.residual_risks)
         if verdict is PlanReviewVerdict.PASS and details:
@@ -126,7 +128,7 @@ class PlanReviewOutput:
                 "plan_attempt": value.plan_attempt_id,
                 "source": value.source_digest,
                 "plan": value.plan_digest,
-                "verdict": value.verdict.value,
+                "verdict": value.verdict.value, "pass_follow_ups": value.pass_follow_ups,
                 "findings": value.findings,
                 "missing_tests": value.missing_tests,
                 "ambiguous_criteria": value.ambiguous_criteria,

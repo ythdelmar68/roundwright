@@ -211,15 +211,16 @@ class ReviewLifecycleStore:
 
         connection = _open_writable_connection(repository)
         try:
-            row = connection.execute("SELECT objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest FROM worker_objective_records WHERE task_id = ? AND provider_attempt_id = ?", (identity.task_id, provider_attempt_id)).fetchone()
+            connection.execute("BEGIN IMMEDIATE")
+            _require_lifecycle_authority(connection, identity, lease)
+            objective = _cancel_objective_for_recovery_connection(connection, identity, provider_attempt_id, reason_digest)
+            connection.commit()
+            return objective
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
-        if row is None:
-            return None
-        objective = _objective_projection(*row)
-        if objective.state is ObjectiveState.COMPLETED:
-            return objective
-        return self.cancel_objective(repository, identity, objective, lease=lease, reason_digest=reason_digest)
 
     def read_objective(self, repository: RepositoryIdentity, identity: TaskIdentity, *, objective_id: str) -> WorkerObjective:
         """Reconstruct one durable objective and reject incomplete terminal evidence."""
@@ -248,7 +249,7 @@ class ReviewLifecycleStore:
             connection.execute("BEGIN IMMEDIATE")
             _require_lifecycle_authority(connection, identity, lease)
             _require_current_candidate(connection, identity, command.candidate_sha, lease)
-            if connection.execute("SELECT task_id, candidate_sha FROM review_item_records WHERE item_id = ?", (command.target_item_id,)).fetchone() != (command.task_id, command.candidate_sha):
+            if not _owner_command_target(connection, identity, command.target_item_id, command.candidate_sha):
                 raise ReviewLifecycleError("owner command target is stale or outside its scope")
             scope = _owner_scope_digest(command)
             grant = connection.execute("SELECT owner_identity, command_scope, task_id, candidate_sha, authority_digest, state FROM owner_authority_grants WHERE grant_id = ?", (command.authority_grant_id,)).fetchone()
@@ -285,7 +286,7 @@ class ReviewLifecycleStore:
             if not _valid_owner_grant(row[5:], row[5], row[0], identity.task_id, row[2]):
                 raise ReviewLifecycleError("owner command authority is stale or no longer allowlisted")
             _require_current_candidate(connection, identity, row[2], lease)
-            item = connection.execute("SELECT item_kind, blocker_state, disposition, verification_state, destination, resolved_command_id FROM review_item_records WHERE item_id = ? AND task_id = ? AND candidate_sha = ?", (row[1], identity.task_id, row[2])).fetchone()
+            item = connection.execute("SELECT item_kind, blocker_state, disposition, verification_state, destination, resolved_command_id FROM review_item_records WHERE item_id = ? AND task_id = ?", (row[1], identity.task_id)).fetchone()
             if item is None:
                 raise ReviewLifecycleError("owner command target is stale or outside its scope")
             if row[3] == "consumed":
@@ -314,7 +315,7 @@ class ReviewLifecycleStore:
             raise ReviewLifecycleError("owner rendering scope is invalid")
         connection = _open_writable_connection(repository)
         try:
-            rows = connection.execute("SELECT item_id, item_kind, disposition, verification_state, blocker_state, destination FROM review_item_records WHERE task_id = ? AND candidate_sha = ? ORDER BY item_id", (task_id, candidate_sha)).fetchall()
+            rows = connection.execute("SELECT item_id, item_kind, disposition, verification_state, blocker_state, destination FROM review_item_records WHERE task_id = ? AND (candidate_sha = ? OR (item_kind = 'pass-follow-up' AND source_kind = 'accepted-review')) ORDER BY item_id", (task_id, candidate_sha)).fetchall()
             commands = connection.execute("SELECT command_id, command_kind, target_item_id, state FROM owner_command_records WHERE task_id = ? AND candidate_sha = ? ORDER BY command_id", (task_id, candidate_sha)).fetchall()
         finally:
             connection.close()
@@ -367,6 +368,68 @@ def unresolved_final_gate_blockers(connection: sqlite3.Connection, task_id: str,
     # transition, so readiness deliberately scopes these terminal blockers to
     # the task rather than only to the current seal.
     return connection.execute("SELECT 1 FROM review_item_records WHERE task_id = ? AND item_kind = 'pass-follow-up' AND blocker_state = 'blocking' AND disposition = 'pending' LIMIT 1", (task_id,)).fetchone() is not None
+
+
+def _owner_command_target(connection: sqlite3.Connection, identity: TaskIdentity, item_id: str, current_candidate_sha: str) -> bool:
+    """Allow current-seal commands to resolve immutable plan-base obligations.
+
+    Plan PASS records predate implementation candidate sealing.  Their stored
+    SHA is therefore provenance, while an owner command is always authorized
+    at the current seal.  Candidate-created items remain exact-seal scoped.
+    """
+
+    row = connection.execute(
+        "SELECT candidate_sha, item_kind, source_kind FROM review_item_records WHERE item_id = ? AND task_id = ?",
+        (item_id, identity.task_id),
+    ).fetchone()
+    return row is not None and (
+        row[0] == current_candidate_sha
+        or row[1:] == (ReviewItemKind.PASS_FOLLOW_UP.value, ReviewItemSource.ACCEPTED_REVIEW.value)
+    )
+
+
+def _cancel_objective_for_recovery_connection(
+    connection: sqlite3.Connection,
+    identity: TaskIdentity,
+    provider_attempt_id: str,
+    reason_digest: str,
+) -> WorkerObjective | None:
+    """Cancel only after an exact persisted Worker abandonment outcome."""
+
+    if not _token(provider_attempt_id) or not _digest(reason_digest):
+        raise ReviewLifecycleError("Worker recovery cancellation is invalid")
+    recovery = connection.execute(
+        "SELECT attempts.provider_role, attempts.state, outcomes.recovery_action, outcomes.blocker "
+        "FROM provider_attempts AS attempts JOIN provider_recovery_outcomes AS outcomes "
+        "ON outcomes.attempt_id = attempts.attempt_id WHERE attempts.task_id = ? AND attempts.attempt_id = ?",
+        (identity.task_id, provider_attempt_id),
+    ).fetchone()
+    allowed = {"blocked-stale-worker", "blocked-ambiguous-turn", "blocked-identity-drift", "blocked-retry-limit"}
+    if recovery is None or recovery[0] != "worker" or recovery[1] not in {"blocked", "ambiguous"} or recovery[2] not in allowed or not _token(recovery[3]):
+        raise ReviewLifecycleError("Worker recovery cancellation lacks terminal abandonment evidence")
+    row = connection.execute(
+        "SELECT objective_id, task_id, dispatch_sha, provider_attempt_id, retry_identity, objective_digest, state, candidate_sha, completion_evidence_fingerprint, accepted_result_identity, terminal_reason_digest "
+        "FROM worker_objective_records WHERE task_id = ? AND provider_attempt_id = ?",
+        (identity.task_id, provider_attempt_id),
+    ).fetchone()
+    if row is None:
+        return None
+    objective = _objective_projection(*row)
+    if objective.state is ObjectiveState.COMPLETED:
+        return objective
+    if objective.state is ObjectiveState.CANCELLED:
+        if objective.cancellation_reason_digest != reason_digest:
+            raise ReviewLifecycleError("Worker objective terminal replay conflicts with committed state")
+        return objective
+    connection.execute(
+        "UPDATE worker_objective_records SET state = 'cancelled', terminal_reason_digest = ? WHERE objective_id = ? AND state = 'active'",
+        (reason_digest, objective.objective_id),
+    )
+    return WorkerObjective(
+        objective.objective_id, objective.task_id, objective.dispatch_sha, objective.provider_attempt_id,
+        objective.retry_identity, objective.objective_digest, ObjectiveState.CANCELLED,
+        cancellation_reason_digest=reason_digest,
+    )
 
 
 def _record_review_item_connection(connection: sqlite3.Connection, identity: TaskIdentity, item: ReviewItem) -> ReviewItemProjection:

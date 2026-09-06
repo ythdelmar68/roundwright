@@ -134,6 +134,26 @@ class ReviewLifecycleTests(unittest.TestCase):
             with self.assertRaises(ReviewLifecycleError):
                 store.consume_owner_command(repository, identity, command_id=command.command_id, lease=lease, result_digest="1" * 64)
 
+    def test_plan_base_follow_up_remains_visible_and_resolvable_after_candidate_moves(self) -> None:
+        """A current-seal command discharges, but never rewrites, plan provenance."""
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease = self.setup(Path(temporary))
+            store = ReviewLifecycleStore()
+            store.record_review_item(repository, identity, self.item(identity), lease=lease)
+            moved = "d" * 40
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                connection.execute("UPDATE candidate_seals SET candidate_sha = ? WHERE task_id = ?", (moved, identity.task_id))
+                connection.execute("INSERT INTO owner_authority_grants(grant_id, owner_identity, command_scope, task_id, candidate_sha, authority_digest, state) VALUES ('grant-resolve-moved', 'ythdelmar68', 'resolve-review-item', ?, ?, ?, 'active')", (identity.task_id, moved, _owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, moved)))
+                connection.commit()
+            command = OwnerCommand("command-moved", identity.task_id, OwnerCommandKind.RESOLVE_REVIEW_ITEM, "item-115", moved, "1" * 64, "key-moved", "ythdelmar68", "grant-resolve-moved")
+            self.assertEqual(store.queue_owner_command(repository, identity, command, lease=lease), command)
+            self.assertIn("item=item-115", store.render_owner_view(repository, task_id=identity.task_id, candidate_sha=moved))
+            self.assertTrue(store.consume_owner_command(repository, identity, command_id=command.command_id, lease=lease, result_digest="2" * 64).disposition is not None)
+            self.assertEqual(store.consume_owner_command(repository, identity, command_id=command.command_id, lease=lease, result_digest="2" * 64).disposition.value, "resolved")
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertFalse(unresolved_final_gate_blockers(connection, identity.task_id, moved))
+                self.assertEqual(connection.execute("SELECT candidate_sha FROM review_item_records WHERE item_id = 'item-115'").fetchone(), (self.candidate,))
+
     def test_worker_objective_starts_from_dispatch_then_completes_only_from_persisted_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, lease = self.setup(Path(temporary))

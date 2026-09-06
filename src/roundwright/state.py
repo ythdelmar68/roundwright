@@ -787,6 +787,15 @@ MIGRATIONS = (
         ),
         (("review_item_provenance", "CREATE TABLE \"review_item_provenance\" (item_id TEXT NOT NULL REFERENCES review_item_records(item_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, review_identity TEXT NOT NULL, source_kind TEXT NOT NULL CHECK(source_kind IN ('accepted-review', 'supervisor-finding')), source_attempt_id TEXT NOT NULL REFERENCES provider_attempts(attempt_id), source_owner_identity TEXT NOT NULL, PRIMARY KEY(item_id, review_identity, source_kind, source_attempt_id))"),),
     ),
+    Migration(
+        62,
+        (
+            "CREATE TABLE phase5_legacy_guard (value INTEGER NOT NULL CHECK(value = 1))",
+            "INSERT INTO phase5_legacy_guard(value) SELECT 0 WHERE EXISTS (SELECT 1 FROM structured_review_items) OR EXISTS (SELECT 1 FROM worker_objectives) OR EXISTS (SELECT 1 FROM owner_commands)",
+            "DROP TABLE phase5_legacy_guard",
+        ),
+        (),
+    ),
 )
 
 

@@ -583,6 +583,41 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
+    def record_blocked(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str, reason_code: str, owner_route: str = "owner-review") -> None:
+        """Retain an uncertain provider turn without permitting a retry in place.
+
+        A blocked attempt is terminal evidence: a caller must create a successor
+        with a new subset/attempt identity.  This prevents an uncheckpointed
+        provider turn from being silently replayed or accepted later.
+        """
+
+        if not _token(attempt_id) or not _digest(output_digest) or not _REASON.fullmatch(reason_code) or not _REASON.fullmatch(owner_route):
+            raise DependencyReviewError("dependency review blocked outcome is malformed")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            if row[6] not in {"prepared", "blocked"}:
+                raise DependencyReviewError("dependency review attempt is not available")
+            self._verify_task_lineage(connection, row[0])
+            outcome = ("blocked", reason_code, output_digest, owner_route)
+            stored = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if row[6] == "blocked":
+                if tuple(stored) != outcome:
+                    raise DependencyReviewError("dependency review blocked outcome has drifted")
+                connection.commit()
+                return
+            if stored is not None:
+                raise DependencyReviewError("dependency review blocked outcome has drifted")
+            connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, ?, ?, ?, ?)", (attempt_id, *outcome))
+            connection.execute("UPDATE dependency_review_attempts SET state = 'blocked' WHERE attempt_id = ?", (attempt_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
 
 def _digest_value(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()

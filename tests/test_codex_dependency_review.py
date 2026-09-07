@@ -16,6 +16,7 @@ from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse,
 )
+from roundwright.dependency_review_toolbox import _schema
 from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
 from roundwright.dependency_review import (
@@ -99,6 +100,14 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 "conflicts_digest": digest("6"), "trusted_relation_digest": relation.relation_digest,
             }],
         }
+
+    def test_native_bridge_schema_uses_the_supported_single_value_enum(self) -> None:
+        schema = _schema()
+        self.assertEqual(
+            schema["properties"]["schema"],
+            {"type": "string", "enum": ["roundwright-dependency-review-proposal/v2"]},
+        )
+        self.assertNotIn("const", str(schema))
 
     def test_fresh_no_tools_attempt_accepts_only_the_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

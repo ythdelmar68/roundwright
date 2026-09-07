@@ -18,7 +18,7 @@ from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field,
 
 def _schema() -> dict[str, object]:
     return {"type": "object", "properties": {
-        "schema": {"type": "string", "const": "roundwright-dependency-review-proposal/v2"},
+        "schema": {"type": "string", "enum": ["roundwright-dependency-review-proposal/v2"]},
         "proposal_id": {"type": "string"}, "attempt_id": {"type": "string"},
         "requested_disposition": {"type": "string", "enum": ["auto-activate", "owner-review", "reject"]},
         "owner_route": {"type": "string"}, "edges": {"type": "array", "minItems": 1},

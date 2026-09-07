@@ -232,6 +232,13 @@ def provider_attempt_accounting_component_identities() -> tuple[str, str, str]:
 DEPENDENCY_REVIEW_ATTEMPT_PRODUCER_IDENTITY = _digest(
     {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "durable-dependency-review-attempt-producer"}
 )
+from .codex_dependency_review import (
+    DependencyReviewDispatchError,
+    DependencyReviewHostInputs,
+    DependencyReviewResultKind,
+    DependencyReviewService,
+)
+from .dependency_review import DependencyReviewStore
 DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
     {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
 )
@@ -507,10 +514,13 @@ class DependencyReviewAttemptAdapter:
     provider evidence from a readiness receipt.
     """
 
+    host_inputs: DependencyReviewHostInputs | None = None
     profile_id: str = DEPENDENCY_REVIEW_ATTEMPT_PROFILE
 
     def __post_init__(self) -> None:
-        if self.profile_id != DEPENDENCY_REVIEW_ATTEMPT_PROFILE:
+        if self.profile_id != DEPENDENCY_REVIEW_ATTEMPT_PROFILE or (
+            self.host_inputs is not None and type(self.host_inputs) is not DependencyReviewHostInputs
+        ):
             raise ExternalValidationAdapterError("executor profile is unsupported")
 
     @property
@@ -533,18 +543,67 @@ class DependencyReviewAttemptAdapter:
             raise ExternalValidationAdapterError("dependency review attempt components have drifted")
 
     def execute(self, binding: object) -> object:
-        _dependency_review_attempt_binding_identity(binding)
-        raise ExternalValidationAdapterError(
-            f"{DEPENDENCY_REVIEW_PREFLIGHT_BLOCKER}: hosted fresh-session dispatch is required"
+        identity = _dependency_review_attempt_binding_identity(binding)
+        host = self.host_inputs
+        if host is None:
+            raise ExternalValidationAdapterError(
+                f"{DEPENDENCY_REVIEW_PREFLIGHT_BLOCKER}: hosted fresh-session dispatch is required"
+            )
+        if (
+            host.subset.candidate_sha != binding.candidate_sha
+            or host.binding.profile_identity != host.adapter.profile_identity
+            or host.binding.candidate_sha != binding.candidate_sha
+            or host.subset.configuration_digest != host.binding.configuration_digest
+            or host.subset.policy_digest != host.binding.policy_digest
+            or binding.case_id != host.subset.snapshot_id
+        ):
+            raise ExternalValidationAdapterError("dependency review host inputs have drifted")
+        try:
+            result = DependencyReviewService().run(
+                host.repository, host.subset, attempt_id=binding.case_id,
+                binding=host.binding, adapter=host.adapter,
+                checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn,
+                source_owned_relations=host.source_owned_relations,
+                supersedes_attempt_id=host.supersedes_attempt_id,
+            )
+        except (DependencyReviewDispatchError, ValueError) as error:
+            raise ExternalValidationAdapterError("dependency review hosted dispatch failed") from error
+        snapshot = {
+            "attempt_id": binding.case_id,
+            "input_digest": _digest(DependencyReviewStore.model_input(
+                host.subset, attempt_id=binding.case_id,
+                profile_identity=host.binding.profile_identity,
+                source_owned_relations=host.source_owned_relations,
+            )),
+            "output_digest": result.output_digest,
+            "outcome": result.kind.value,
+            "proposal_count": 1 if result.kind is DependencyReviewResultKind.ACCEPTED else 0,
+            "validation_state": "accepted" if result.kind is DependencyReviewResultKind.ACCEPTED else "terminal",
+        }
+        return _harness_executor().ProfileExecution(
+            {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "binding_identity": identity, "snapshot": snapshot},
+            mutation_count=0,
         )
 
     def project(self, binding: object, execution: object) -> Mapping[str, object]:
-        _dependency_review_attempt_binding_identity(binding)
-        raise ExternalValidationAdapterError("dependency review attempt cannot project an unexecuted live attempt")
+        identity = _dependency_review_attempt_binding_identity(binding)
+        try:
+            value, mutation_count = execution.value, execution.mutation_count
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("dependency review attempt result is invalid") from error
+        if type(value) is not dict or set(value) != {"schema", "binding_identity", "snapshot"} or value["schema"] != DEPENDENCY_REVIEW_ATTEMPT_SCHEMA or value["binding_identity"] != identity or type(value["snapshot"]) is not dict or mutation_count != 0:
+            raise ExternalValidationAdapterError("dependency review attempt result has drifted")
+        return {
+            "schema": "roundwright-shadow-case/v2", "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+            "dependency_review": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "capture_mode": "armed-live-events", "binding_identity": identity, "snapshot": value["snapshot"], "mutation_count": 0},
+        }
 
     def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
-        _dependency_review_attempt_binding_identity(binding)
-        raise ExternalValidationAdapterError("dependency review attempt cannot compare an unexecuted live attempt")
+        expected = self.project(binding, type("Execution", (), {"value": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "binding_identity": _dependency_review_attempt_binding_identity(binding), "snapshot": evidence.get("dependency_review", {}).get("snapshot") if type(evidence) is dict and type(evidence.get("dependency_review")) is dict else None}, "mutation_count": 0})())
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        return _harness_executor().ProfileComparison(status, _digest({"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "status": status, "ready_at": binding.ready_at, "expected_identity": _digest(expected), "observed_identity": _digest(evidence)}))
 
 
 def _read_only_external_observation_binding_identity(binding: object) -> str:
@@ -4381,7 +4440,7 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
         return SyntheticExecutorAdapter(profile_id)
     if profile_id == DEPENDENCY_REVIEW_ATTEMPT_PROFILE:
-        return DependencyReviewAttemptAdapter(profile_id)
+        return DependencyReviewAttemptAdapter(profile_id=profile_id)
     if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
         raise ExternalValidationAdapterError(
             "read-only external observation requires the product-hosted V2 entrypoint"
@@ -4811,3 +4870,46 @@ def run_provider_attempt_accounting_profile(
         raise
     except (AttributeError, KeyError, TypeError, ValueError, ProviderAttemptRuntimeError) as error:
         raise ExternalValidationAdapterError("provider attempt hosted entrypoint binding is invalid") from error
+
+
+def run_dependency_review_attempt_profile(
+    mode: Literal["validate", "execute"],
+    request_value: Mapping[str, Any],
+    store_root: Path,
+    host_inputs: DependencyReviewHostInputs,
+    *,
+    expected_readiness_digest: str | None = None,
+) -> object:
+    """Run #116's one fresh-session dependency-review lane through Harness V2.
+
+    Validation constructs no provider session. Execute uses the same request,
+    plan, adapter, and Recorder root, and only then calls the injected
+    credential-isolated no-tools adapter once.
+    """
+
+    harness = _harness_executor()
+    try:
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != DEPENDENCY_REVIEW_ATTEMPT_PROFILE
+            or not isinstance(store_root, Path)
+            or type(host_inputs) is not DependencyReviewHostInputs
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        if (
+            plan.candidate_sha != host_inputs.subset.candidate_sha
+            or plan.case_id != host_inputs.subset.snapshot_id
+            or host_inputs.binding.candidate_sha != plan.candidate_sha
+            or host_inputs.adapter.profile_identity != host_inputs.binding.profile_identity
+        ):
+            raise ValueError
+        return harness.run_profile_executor(
+            mode, request_value, DependencyReviewAttemptAdapter(host_inputs), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except ExternalValidationAdapterError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, DependencyReviewDispatchError) as error:
+        raise ExternalValidationAdapterError("dependency review hosted entrypoint binding is invalid") from error

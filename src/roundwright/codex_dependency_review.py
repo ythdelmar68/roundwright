@@ -196,6 +196,41 @@ class DependencyReviewService:
         return result
 
 
+@dataclass(frozen=True)
+class DependencyReviewHostInputs:
+    """Trusted product inputs for one hosted V2 dependency-review attempt.
+
+    The Harness receives this value only through the product entrypoint.  It
+    contains no credential, repository mutation, or tool capability; the
+    injected adapter can open exactly one fresh no-tools model session.
+    """
+
+    repository: RepositoryIdentity
+    subset: AffectedSubset
+    binding: DependencyReviewBinding
+    adapter: CodexDependencyReviewAdapter
+    checkpoint_session: Callable[[str], None]
+    checkpoint_turn: Callable[[str, str], None]
+    source_owned_relations: tuple[SourceOwnedRelation, ...] = ()
+    supersedes_attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.repository) is not RepositoryIdentity
+            or type(self.subset) is not AffectedSubset
+            or type(self.binding) is not DependencyReviewBinding
+            or type(self.adapter) is not CodexDependencyReviewAdapter
+            or not callable(self.checkpoint_session)
+            or not callable(self.checkpoint_turn)
+            or type(self.source_owned_relations) is not tuple
+            or any(type(item) is not SourceOwnedRelation for item in self.source_owned_relations)
+            or (self.supersedes_attempt_id is not None and not _TOKEN.fullmatch(self.supersedes_attempt_id))
+            or self.adapter.profile_identity != self.binding.profile_identity
+        ):
+            raise DependencyReviewDispatchError("dependency review host inputs are invalid")
+        self.binding.require_subset(self.subset)
+
+
 def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 

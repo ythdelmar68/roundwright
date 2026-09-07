@@ -44,6 +44,7 @@ from roundwright.shadow import (
     LifecycleAttempt,
     LifecycleAttemptKind,
     EXECUTOR_CONTRACT_SYNTHETIC_PROFILE,
+    DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
     HOSTED_CHECK_PROFILE,
     INTEGRATED_BOUNDARY_PROFILE,
     PROVENANCE_DECISION_PROFILE,
@@ -1057,6 +1058,7 @@ class ShadowV2Tests(unittest.TestCase):
         worker = shadow_evidence_profile("roundwright-shadow-profile/worker-adapter/v1")
         synthetic = shadow_evidence_profile(EXECUTOR_CONTRACT_SYNTHETIC_PROFILE)
         provider_attempts = shadow_evidence_profile("roundwright-shadow-profile/provider-attempt-accounting/v1")
+        dependency_reviews = shadow_evidence_profile(DEPENDENCY_REVIEW_ATTEMPT_PROFILE)
         hosted_checks = shadow_evidence_profile(HOSTED_CHECK_PROFILE)
         live_lifecycle = shadow_evidence_profile("roundwright-shadow-profile/live-lifecycle-shadow/v1")
         read_only_external_observation = shadow_evidence_profile(READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)
@@ -1066,7 +1068,7 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(
             shadow_evidence_profiles(),
-            (profile, worker, synthetic, provider_attempts, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary, qualification_consumer, cross_environment),
+            (profile, worker, synthetic, provider_attempts, dependency_reviews, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary, qualification_consumer, cross_environment),
         )
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
@@ -1076,6 +1078,15 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(synthetic.event_kinds, ("executor-contract-result",))
         self.assertEqual(provider_attempts.capture_mode, CaptureMode.LIFECYCLE_GRAPH)
         self.assertEqual(provider_attempts.arm_before, "before-first-selected-provider-attempt")
+        self.assertEqual(dependency_reviews.profile_id, DEPENDENCY_REVIEW_ATTEMPT_PROFILE)
+        self.assertEqual(dependency_reviews.capture_mode, CaptureMode.ARMED_LIVE_EVENTS)
+        self.assertEqual(dependency_reviews.producer, ShadowProducer.PROFILE_DEFINED)
+        self.assertEqual(dependency_reviews.readiness_point, "v2-dependency-review-subset-profile-schema-recorder-store-readback-bound")
+        self.assertEqual(dependency_reviews.arm_before, "before-first-live-dependency-review-provider-attempt")
+        self.assertEqual(dependency_reviews.retention_readback_contract, "append-only-content-addressed-readback")
+        self.assertEqual(dependency_reviews.missing_history_recapture, "missing-history-or-input-movement-requires-fresh-dependency-review-attempt")
+        self.assertEqual(dependency_reviews.event_kinds, ("dependency-review-attempt", "dependency-review-proposal", "dependency-review-validation"))
+        self.assertEqual((dependency_reviews.minimum_commits, dependency_reviews.maximum_commits, dependency_reviews.requires_accepted_result), (0, 1, False))
         self.assertEqual(live_lifecycle.capture_mode, CaptureMode.ARMED_LIVE_EVENTS)
         self.assertEqual(live_lifecycle.arm_before, "before-first-live-lifecycle-event")
         self.assertEqual(read_only_external_observation.profile_id, READ_ONLY_EXTERNAL_OBSERVATION_PROFILE)

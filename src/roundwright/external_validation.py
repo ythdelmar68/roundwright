@@ -271,7 +271,7 @@ def _dependency_review_store_root_identity(store_root: Path) -> str:
         raise ExternalValidationAdapterError("dependency review store root is invalid")
     return _digest({
         "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
-        "store_root": str(store_root.resolve(strict=False)).replace("\\\\", "/"),
+        "store_root": store_root.resolve(strict=False).as_posix(),
     })
 
 
@@ -285,6 +285,7 @@ class DependencyReviewRequestInputs:
     """
 
     repository: RepositoryIdentity
+    base_sha: str
     subset: AffectedSubset
     binding: DependencyReviewBinding
     audit: ProviderHealthAuditIdentity
@@ -297,6 +298,7 @@ class DependencyReviewRequestInputs:
     def __post_init__(self) -> None:
         if (
             type(self.repository) is not RepositoryIdentity
+            or _SHA.fullmatch(self.base_sha) is None
             or type(self.subset) is not AffectedSubset
             or type(self.binding) is not DependencyReviewBinding
             or type(self.audit) is not ProviderHealthAuditIdentity
@@ -350,7 +352,7 @@ class DependencyReviewPreparedRequest:
         return {
             "schema": "roundwright-dependency-review-prepared-request/v1",
             "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
-            "base_sha": self.inputs.binding.candidate_sha,
+            "base_sha": self.inputs.base_sha,
             "candidate_sha": self.inputs.subset.candidate_sha,
             "case_id": self.inputs.attempt_id,
             "ready_at": self.inputs.ready_at,
@@ -5082,7 +5084,7 @@ def _dependency_review_host_inputs_identity(host_inputs: DependencyReviewHostInp
     subset = host_inputs.subset
     return _digest({
         "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
-        "repository_root": str(host_inputs.repository.root.resolve(strict=False)).replace("\\", "/"),
+        "repository_root": host_inputs.repository.root.resolve(strict=False).as_posix(),
         "subset_digest": subset.content_digest,
         "candidate_sha": subset.candidate_sha,
         "configuration_digest": subset.configuration_digest,
@@ -5099,10 +5101,10 @@ def _dependency_review_execution_context(
 ) -> dict[str, object]:
     return {
         "schema": "roundwright-dependency-review-execution-context/v1",
-        "repository_root": str(inputs.repository.root.resolve(strict=False)).replace("\\", "/"),
+        "repository_root": inputs.repository.root.resolve(strict=False).as_posix(),
         "subset_digest": inputs.subset.content_digest,
         "candidate_sha": inputs.subset.candidate_sha,
-        "base_sha": inputs.binding.candidate_sha,
+        "base_sha": inputs.base_sha,
         "case_id": inputs.attempt_id,
         "ready_at": inputs.ready_at,
         "configuration_digest": inputs.binding.configuration_digest,
@@ -5151,7 +5153,8 @@ def _prepare_dependency_review_attempt_request(
     })
     observation_identity = _digest({
         "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
-        "repository_root": str(inputs.repository.root.resolve(strict=False)).replace("\\", "/"),
+        "repository_root": inputs.repository.root.resolve(strict=False).as_posix(),
+        "base_sha": inputs.base_sha,
         "subset_digest": inputs.subset.content_digest,
         "candidate_sha": inputs.subset.candidate_sha,
         "configuration_digest": inputs.binding.configuration_digest,

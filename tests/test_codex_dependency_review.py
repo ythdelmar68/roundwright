@@ -203,16 +203,27 @@ class DependencyReviewServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.object(external_validation, "_harness_executor", return_value=Harness):
             repository, subset, binding, _profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal(subset.snapshot_id)))
+            base_sha = "a" * 40
             inputs = external_validation.DependencyReviewRequestInputs(
-                repository, subset, binding, audit, subset.snapshot_id, 17, backend,
+                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
             )
             prepared, readiness, capsule = external_validation.prepare_dependency_review_attempt_profile(inputs, Path(temporary).resolve())
             self.assertEqual(len(backend.sessions), 0)
             self.assertEqual(prepared.capture_plan_digest, readiness.capture_plan_digest)
-            external_validation.materialize_dependency_review_attempt_profile(capsule, Path(temporary).resolve())
+            self.assertEqual(prepared.public_receipt()["base_sha"], base_sha)
+            self.assertEqual(prepared._request_value["execution_context"]["base_sha"], base_sha)
+            object.__setattr__(inputs, "base_sha", "b" * 40)
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "prepared request has drifted"):
+                external_validation.materialize_dependency_review_attempt_profile(capsule, Path(temporary).resolve())
+            self.assertEqual(len(backend.sessions), 0)
+            fresh_inputs = external_validation.DependencyReviewRequestInputs(
+                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
+            )
+            _prepared, _readiness, fresh_capsule = external_validation.prepare_dependency_review_attempt_profile(fresh_inputs, Path(temporary).resolve())
+            external_validation.materialize_dependency_review_attempt_profile(fresh_capsule, Path(temporary).resolve())
             self.assertEqual(len(backend.sessions), 1)
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unavailable"):
-                external_validation.materialize_dependency_review_attempt_profile(capsule, Path(temporary).resolve())
+                external_validation.materialize_dependency_review_attempt_profile(fresh_capsule, Path(temporary).resolve())
 
 
 if __name__ == "__main__":

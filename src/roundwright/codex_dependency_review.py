@@ -231,6 +231,24 @@ class DependencyReviewHostInputs:
         self.binding.require_subset(self.subset)
 
 
+def prepare_dependency_review_host(
+    repository: RepositoryIdentity, subset: AffectedSubset, binding: DependencyReviewBinding,
+    audit: ProviderHealthAuditIdentity, *, backend: NativeCodexDependencyReviewBackend | None = None,
+) -> DependencyReviewHostInputs:
+    """Construct the closed product host from exact durable identities only."""
+
+    if type(repository) is not RepositoryIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity:
+        raise DependencyReviewDispatchError("dependency review preparation inputs are invalid")
+    binding.require_subset(subset)
+    if audit.profile_identity != binding.profile_identity or (audit.profile.model, audit.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high"):
+        raise DependencyReviewDispatchError("dependency review profile is unavailable")
+    if backend is None:
+        from .dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend
+        from .worker_toolbox import CompletionDeadline
+        backend = HarnessNativeCodexDependencyReviewBackend(cwd=repository.root, completion=CompletionDeadline(100, 600))
+    return DependencyReviewHostInputs(repository, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit), lambda _session: None, lambda _session, _turn: None)
+
+
 def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 

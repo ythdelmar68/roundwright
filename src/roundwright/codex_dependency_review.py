@@ -234,6 +234,8 @@ class DependencyReviewHostInputs:
 def prepare_dependency_review_host(
     repository: RepositoryIdentity, subset: AffectedSubset, binding: DependencyReviewBinding,
     audit: ProviderHealthAuditIdentity, *, backend: NativeCodexDependencyReviewBackend | None = None,
+    source_owned_relations: tuple[SourceOwnedRelation, ...] = (),
+    supersedes_attempt_id: str | None = None,
 ) -> DependencyReviewHostInputs:
     """Construct the closed product host from exact durable identities only."""
 
@@ -246,7 +248,11 @@ def prepare_dependency_review_host(
         from .dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend
         from .worker_toolbox import CompletionDeadline
         backend = HarnessNativeCodexDependencyReviewBackend(cwd=repository.root, completion=CompletionDeadline(100, 600))
-    return DependencyReviewHostInputs(repository, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit), lambda _session: None, lambda _session, _turn: None)
+    return DependencyReviewHostInputs(
+        repository, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit),
+        lambda _session: None, lambda _session, _turn: None,
+        source_owned_relations, supersedes_attempt_id,
+    )
 
 
 def _digest(value: object) -> str:

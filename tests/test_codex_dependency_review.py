@@ -16,7 +16,7 @@ from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse,
 )
-from roundwright.dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend, _schema
+from roundwright.dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend, _Turn, _schema
 from roundwright.worker_toolbox import CompletionDeadline
 from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
@@ -35,35 +35,38 @@ def digest(character: str) -> str:
 
 
 class Turn:
-    def __init__(self, response: NativeDependencyReviewResponse) -> None:
+    def __init__(self, response: NativeDependencyReviewResponse, identity: str = "turn-116") -> None:
         self.response = response
+        self._identity = identity
         self.aborted = False
 
-    def identity(self) -> str: return "turn-116"
+    def identity(self) -> str: return self._identity
     def abort(self) -> None: self.aborted = True
     def read_response(self) -> NativeDependencyReviewResponse: return self.response
 
 
 class Session:
-    def __init__(self, response: NativeDependencyReviewResponse) -> None:
+    def __init__(self, response: NativeDependencyReviewResponse, identity: str = "session-116", turn_identity: str = "turn-116") -> None:
         self.response = response
+        self._identity, self._turn_identity = identity, turn_identity
         self.requests = []
         self.closed = False
 
-    def identity(self) -> str: return "session-116"
+    def identity(self) -> str: return self._identity
     def close(self) -> None: self.closed = True
     def start_turn(self, request):
         self.requests.append(request)
-        return Turn(self.response)
+        return Turn(self.response, self._turn_identity)
 
 
 class Backend:
-    def __init__(self, response: NativeDependencyReviewResponse) -> None:
+    def __init__(self, response: NativeDependencyReviewResponse, session_identity: str = "session-116", turn_identity: str = "turn-116") -> None:
         self.response = response
+        self.session_identity, self.turn_identity = session_identity, turn_identity
         self.sessions = []
 
     def open_fresh_session(self, profile: ProviderProfile) -> Session:
-        session = Session(self.response)
+        session = Session(self.response, self.session_identity, self.turn_identity)
         self.sessions.append(session)
         return session
 
@@ -134,8 +137,25 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertTrue(calls[0]["ephemeral"])
                 self.assertNotEqual(Path(calls[0]["cwd"]), repository.root)
                 self.assertIn("Deny all tools", calls[0]["developer_instructions"])
+                self.assertEqual(calls[0]["config"], {"tools": []})
             finally:
                 session.close()
+
+    def test_native_bridge_rejects_a_tool_item_before_accepting_schema_output(self) -> None:
+        class Handle:
+            id = "turn-116"
+            def stream(self):
+                class Stream(list):
+                    def close(self): return None
+                return Stream((
+                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "commandExecution"}}},
+                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": "{}"}}},
+                    {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}},
+                ))
+
+        session = SimpleNamespace(completion=CompletionDeadline(100, 600), clock=lambda: 0, close=lambda: None)
+        response = _Turn(Handle(), session).read_response()
+        self.assertEqual(response.kind, DependencyReviewResultKind.INVALID)
 
     def test_fresh_no_tools_attempt_accepts_only_the_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -179,6 +199,26 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
             )
             self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
+
+    def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(
+                NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS),
+                session_identity="01a07bb4-2916-73b1-97c6-68712c35667c",
+                turn_identity="01a07bb4-2916-73b1-97c6-68712c35667d",
+            )
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding,
+                adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+            )
+            self.assertEqual(result.kind, DependencyReviewResultKind.AMBIGUOUS)
+            DependencyReviewStore().require_turn_claim(
+                repository, attempt_id="attempt-116",
+                session_identity="01a07bb4-2916-73b1-97c6-68712c35667c",
+                turn_identity="01a07bb4-2916-73b1-97c6-68712c35667d",
+            )
 
     def test_live_lane_preflight_is_candidate_bound_and_provider_free(self) -> None:
         plan = SimpleNamespace(

@@ -242,7 +242,7 @@ from .codex_dependency_review import (
     prepare_dependency_review_host,
 )
 from .configuration import RepositoryIdentity
-from .dependency_review import AffectedSubset, DependencyReviewBinding, DependencyReviewStore, SourceOwnedRelation
+from .dependency_review import AffectedSubset, DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, SourceOwnedRelation
 from .provider_health import ProviderHealthAuditIdentity
 DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
     {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
@@ -868,7 +868,13 @@ class DependencyReviewAttemptAdapter:
                 source_owned_relations=host.source_owned_relations,
                 supersedes_attempt_id=host.supersedes_attempt_id,
             )
-        except (DependencyReviewDispatchError, ValueError) as error:
+            if result.session_identity is None or result.turn_identity is None:
+                raise DependencyReviewError("dependency review durable turn claim is unavailable")
+            DependencyReviewStore().require_turn_claim(
+                host.repository, attempt_id=binding.case_id,
+                session_identity=result.session_identity, turn_identity=result.turn_identity,
+            )
+        except (DependencyReviewDispatchError, DependencyReviewError, ValueError) as error:
             raise ExternalValidationAdapterError("dependency review hosted dispatch failed") from error
         snapshot = self._durable_snapshot(binding)
         if snapshot["output_digest"] != result.output_digest or snapshot["outcome"] != result.kind.value:

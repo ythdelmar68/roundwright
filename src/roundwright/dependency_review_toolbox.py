@@ -18,6 +18,7 @@ from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field,
 
 
 _NO_TOOL_INSTRUCTIONS = "Deny all tools, filesystem access, network access, credential access, and repository inspection. Use only the supplied normalized input."
+_NO_TOOLS_CONFIG = {"tools": []}
 
 
 def _schema() -> dict[str, object]:
@@ -48,7 +49,7 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
             codex = factory(); client = codex.__enter__() if hasattr(codex, "__enter__") else codex
             thread = client.thread_start(
                 approval_mode=approval, cwd=workspace.name, developer_instructions=_NO_TOOL_INSTRUCTIONS,
-                ephemeral=True, model=profile.model, sandbox=sandbox,
+                ephemeral=True, model=profile.model, sandbox=sandbox, config=_NO_TOOLS_CONFIG,
             )
             if not isinstance(getattr(thread, "id", None), str): raise ValueError
             return _Session(thread, codex, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace)
@@ -91,6 +92,8 @@ class _Turn(NativeDependencyReviewTurn):
                     if status != "completed": return NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)
                 if _field(event, "method") == "item/completed" and _field(payload, "turn_id", "turnId") == _field(self.handle, "id"):
                     item = _field(_field(payload, "item"), "root") or _field(payload, "item")
+                    if _field(item, "type") not in {"agentMessage", "reasoning"}:
+                        return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
                     if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer":
                         text = _field(item, "text")
                         if answer is not None or not isinstance(text, str): return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)

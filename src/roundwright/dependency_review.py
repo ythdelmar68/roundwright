@@ -20,6 +20,7 @@ from .state import _open_writable_connection
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _TOKEN = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
+_OPAQUE_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _REASON = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 
 
@@ -655,7 +656,7 @@ class DependencyReviewStore:
             connection.close()
 
     def claim_session(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str) -> None:
-        if not _token(attempt_id) or not _token(session_identity):
+        if not _token(attempt_id) or not _opaque_identity(session_identity):
             raise DependencyReviewError("dependency review dispatch claim is invalid")
         connection = _open_writable_connection(repository)
         try:
@@ -675,7 +676,7 @@ class DependencyReviewStore:
             connection.close()
 
     def claim_turn(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str) -> None:
-        if not _token(attempt_id) or not _token(session_identity) or not _token(turn_identity):
+        if not _token(attempt_id) or not _opaque_identity(session_identity) or not _opaque_identity(turn_identity):
             raise DependencyReviewError("dependency review dispatch claim is invalid")
         connection = _open_writable_connection(repository)
         try:
@@ -689,6 +690,24 @@ class DependencyReviewStore:
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def require_turn_claim(
+        self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str,
+    ) -> None:
+        """Require the exact durable provider-turn claim before using its output."""
+
+        if not _token(attempt_id) or not _opaque_identity(session_identity) or not _opaque_identity(turn_identity):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            claim = connection.execute(
+                "SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if claim != (session_identity, turn_identity, "turn-dispatched"):
+                raise DependencyReviewError("dependency review durable turn claim is unavailable")
         finally:
             connection.close()
 
@@ -724,6 +743,10 @@ def _digest_value(value: object) -> str:
 
 def _token(value: object) -> bool:
     return type(value) is str and bool(_TOKEN.fullmatch(value))
+
+
+def _opaque_identity(value: object) -> bool:
+    return type(value) is str and bool(_OPAQUE_IDENTITY.fullmatch(value))
 
 
 def _digest(value: object) -> bool:

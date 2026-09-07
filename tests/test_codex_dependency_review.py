@@ -113,15 +113,15 @@ class DependencyReviewServiceTests(unittest.TestCase):
         )
         self.assertNotIn("const", str(schema))
 
-    def test_native_bridge_starts_an_ephemeral_isolated_no_tools_session(self) -> None:
+    def test_native_bridge_starts_an_ephemeral_isolated_session_with_an_explicit_empty_tool_surface(self) -> None:
         calls: list[dict[str, object]] = []
 
         class Thread: id = "session-116"
         class Codex:
             def __enter__(self): return self
             def close(self): return None
-            def thread_start(self, **keywords):
-                calls.append(keywords)
+            def thread_start(self, *, approval_mode, cwd, developer_instructions, ephemeral, model, sandbox, tools):
+                calls.append({"approval_mode": approval_mode, "cwd": cwd, "developer_instructions": developer_instructions, "ephemeral": ephemeral, "model": model, "sandbox": sandbox, "tools": tools})
                 return Thread()
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -137,9 +137,34 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertTrue(calls[0]["ephemeral"])
                 self.assertNotEqual(Path(calls[0]["cwd"]), repository.root)
                 self.assertIn("Deny all tools", calls[0]["developer_instructions"])
-                self.assertEqual(calls[0]["config"], {"tools": []})
+                self.assertEqual(calls[0]["tools"], ())
             finally:
                 session.close()
+
+    def test_native_bridge_rejects_a_mock_only_or_missing_tools_control_before_session_start(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class MockOnlyCodex:
+            def __enter__(self): return self
+            def close(self): return None
+            def thread_start(self, **keywords): calls.append(keywords)
+
+        class MissingToolsCodex:
+            def __enter__(self): return self
+            def close(self): return None
+            def thread_start(self, *, approval_mode, cwd, developer_instructions, ephemeral, model, sandbox):
+                calls.append({"approval_mode": approval_mode, "cwd": cwd, "developer_instructions": developer_instructions, "ephemeral": ephemeral, "model": model, "sandbox": sandbox})
+
+        for factory in (MockOnlyCodex, MissingToolsCodex):
+            with self.subTest(factory=factory.__name__), tempfile.TemporaryDirectory() as temporary:
+                repository, _subset, _binding, profile, _audit = self.setup(Path(temporary))
+                backend = HarnessNativeCodexDependencyReviewBackend(
+                    cwd=repository.root, completion=CompletionDeadline(100, 600), codex_factory=factory,
+                    approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+                )
+                with self.assertRaisesRegex(Exception, "sdk-incompatible"):
+                    backend.open_fresh_session(profile)
+        self.assertEqual(calls, [])
 
     def test_native_bridge_rejects_a_tool_item_before_accepting_schema_output(self) -> None:
         class Handle:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import tempfile
 import time
@@ -18,7 +19,7 @@ from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field,
 
 
 _NO_TOOL_INSTRUCTIONS = "Deny all tools, filesystem access, network access, credential access, and repository inspection. Use only the supplied normalized input."
-_NO_TOOLS_CONFIG = {"tools": []}
+_NO_TOOLS = ()
 
 
 def _schema() -> dict[str, object]:
@@ -40,21 +41,48 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
     def open_fresh_session(self, profile: ProviderProfile) -> NativeDependencyReviewSession:
         if type(profile) is not ProviderProfile or (profile.model, profile.reasoning_effort.value) != ("gpt-5.6-terra", "high"):
             raise CodexAdapterError(CodexFailure.UNSUPPORTED_CAPABILITY)
+        codex = workspace = None
         try:
             if self.factory is None:
                 sdk = importlib.import_module("openai_codex"); generated = importlib.import_module("openai_codex.generated.v2_all")
                 factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             else: factory, approval, sandbox, effort = self.factory, self.approval, self.sandbox, self.effort
-            workspace = tempfile.TemporaryDirectory(prefix="roundwright-dependency-review-")
             codex = factory(); client = codex.__enter__() if hasattr(codex, "__enter__") else codex
-            thread = client.thread_start(
+            thread_start = _require_empty_tool_surface_control(client)
+            workspace = tempfile.TemporaryDirectory(prefix="roundwright-dependency-review-")
+            thread = thread_start(
                 approval_mode=approval, cwd=workspace.name, developer_instructions=_NO_TOOL_INSTRUCTIONS,
-                ephemeral=True, model=profile.model, sandbox=sandbox, config=_NO_TOOLS_CONFIG,
+                ephemeral=True, model=profile.model, sandbox=sandbox, tools=_NO_TOOLS,
             )
             if not isinstance(getattr(thread, "id", None), str): raise ValueError
             return _Session(thread, codex, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace)
-        except CodexAdapterError: raise
-        except Exception: raise CodexAdapterError(CodexFailure.UNKNOWN) from None
+        except CodexAdapterError:
+            if workspace is not None: workspace.cleanup()
+            if codex is not None: _close(codex)
+            raise
+        except Exception:
+            if workspace is not None: workspace.cleanup()
+            if codex is not None: _close(codex)
+            raise CodexAdapterError(CodexFailure.UNKNOWN) from None
+
+
+def _require_empty_tool_surface_control(client: object) -> Callable[..., object]:
+    """Return only an SDK endpoint with an explicit, empty-tools control.
+
+    A permissive ``**kwargs`` test double or an opaque ``config`` override is
+    not evidence that the native endpoint withheld its tool surface.
+    """
+
+    thread_start = getattr(client, "thread_start", None)
+    if not callable(thread_start):
+        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+    try:
+        tools = inspect.signature(thread_start).parameters.get("tools")
+    except (TypeError, ValueError):
+        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from None
+    if tools is None or tools.kind not in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}:
+        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+    return thread_start
 
 
 class _Session(NativeDependencyReviewSession):

@@ -20,6 +20,7 @@ from .shadow import (
     HOSTED_CHECK_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     INTEGRATED_BOUNDARY_PROFILE,
     PHASE_3_QUALIFICATION_PROFILE,
@@ -77,6 +78,7 @@ from .cross_environment import (
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
+DEPENDENCY_REVIEW_ATTEMPT_SCHEMA = "roundwright-dependency-review-evidence/v1"
 HOSTED_CHECK_SCHEMA = "roundwright-hosted-check-evidence/v1"
 LIVE_LIFECYCLE_SHADOW_SCHEMA = "roundwright-live-lifecycle-shadow/v1"
 READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA = "roundwright-read-only-external-observation/v1"
@@ -178,6 +180,7 @@ PROVIDER_ATTEMPT_COMPARATOR_IDENTITY = _digest(
     {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "component": "capture-time-v2-comparator"}
 )
 PROVIDER_ATTEMPT_HISTORY_BLOCKER = "provider-attempt-runtime-unavailable"
+DEPENDENCY_REVIEW_PREFLIGHT_BLOCKER = "dependency-review-provider-dispatch-unavailable"
 HOSTED_CHECK_OBSERVATION_BLOCKER = "hosted-check-observation-unavailable"
 LIVE_LIFECYCLE_OBSERVATION_BLOCKER = "live-lifecycle-shadow-observation-unavailable"
 INTEGRATED_BOUNDARY_SCHEMA = "roundwright-integrated-boundary-composition/v1"
@@ -223,6 +226,27 @@ def provider_attempt_accounting_component_identities() -> tuple[str, str, str]:
         PROVIDER_ATTEMPT_PRODUCER_IDENTITY,
         PROVIDER_ATTEMPT_EXPORTER_IDENTITY,
         PROVIDER_ATTEMPT_COMPARATOR_IDENTITY,
+    )
+
+
+DEPENDENCY_REVIEW_ATTEMPT_PRODUCER_IDENTITY = _digest(
+    {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "durable-dependency-review-attempt-producer"}
+)
+DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
+    {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
+)
+DEPENDENCY_REVIEW_ATTEMPT_COMPARATOR_IDENTITY = _digest(
+    {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "exact-input-proposal-accounting-comparator"}
+)
+
+
+def dependency_review_attempt_component_identities() -> tuple[str, str, str]:
+    """Return the immutable components for #116's armed live-event lane."""
+
+    return (
+        DEPENDENCY_REVIEW_ATTEMPT_PRODUCER_IDENTITY,
+        DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY,
+        DEPENDENCY_REVIEW_ATTEMPT_COMPARATOR_IDENTITY,
     )
 
 
@@ -445,6 +469,82 @@ class SyntheticExecutorAdapter:
         )
         harness = _harness_executor()
         return harness.ProfileComparison(status, result_identity)
+
+
+def _dependency_review_attempt_binding_identity(binding: object) -> str:
+    """Bind the live lane's readiness to one exact candidate capture plan."""
+
+    try:
+        value = {
+            "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+            "profile": binding.profile,
+            "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at,
+            "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("dependency review attempt binding is invalid") from error
+    if (
+        value["profile"] != DEPENDENCY_REVIEW_ATTEMPT_PROFILE
+        or not _safe_token(value["case_id"])
+        or _SHA.fullmatch(value["candidate_sha"]) is None
+        or type(value["ready_at"]) is not int or value["ready_at"] < 0
+        or _DIGEST.fullmatch(value["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("dependency review attempt binding is invalid")
+    return _digest(value)
+
+
+@dataclass(frozen=True)
+class DependencyReviewAttemptAdapter:
+    """Provider-free preflight for the armed dependency-review evidence lane.
+
+    ``validate`` checks only exact public plan/component identities and creates
+    no attempt, session, Recorder record, or provider call. The live hosted
+    entrypoint must supply the same plan and a fresh no-tools adapter at
+    execute time; this generic adapter fails closed rather than manufacturing
+    provider evidence from a readiness receipt.
+    """
+
+    profile_id: str = DEPENDENCY_REVIEW_ATTEMPT_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile_id != DEPENDENCY_REVIEW_ATTEMPT_PROFILE:
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(
+            *dependency_review_attempt_component_identities(),
+        )
+
+    def validate(self, binding: object) -> None:
+        _dependency_review_attempt_binding_identity(binding)
+        try:
+            actual = (
+                binding.components.producer_identity,
+                binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("dependency review attempt components are invalid") from error
+        if actual != dependency_review_attempt_component_identities():
+            raise ExternalValidationAdapterError("dependency review attempt components have drifted")
+
+    def execute(self, binding: object) -> object:
+        _dependency_review_attempt_binding_identity(binding)
+        raise ExternalValidationAdapterError(
+            f"{DEPENDENCY_REVIEW_PREFLIGHT_BLOCKER}: hosted fresh-session dispatch is required"
+        )
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        _dependency_review_attempt_binding_identity(binding)
+        raise ExternalValidationAdapterError("dependency review attempt cannot project an unexecuted live attempt")
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        _dependency_review_attempt_binding_identity(binding)
+        raise ExternalValidationAdapterError("dependency review attempt cannot compare an unexecuted live attempt")
 
 
 def _read_only_external_observation_binding_identity(binding: object) -> str:
@@ -4275,11 +4375,13 @@ class CrossEnvironmentCanaryAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter:
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | DependencyReviewAttemptAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
         return SyntheticExecutorAdapter(profile_id)
+    if profile_id == DEPENDENCY_REVIEW_ATTEMPT_PROFILE:
+        return DependencyReviewAttemptAdapter(profile_id)
     if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
         raise ExternalValidationAdapterError(
             "read-only external observation requires the product-hosted V2 entrypoint"

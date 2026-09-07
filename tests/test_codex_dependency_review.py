@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -14,6 +15,7 @@ from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse,
 )
+from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
 from roundwright.dependency_review import (
     AffectedMember, AffectedSubset, Confidence, DependencyReviewBinding, EdgeDirection,
@@ -22,6 +24,7 @@ from roundwright.dependency_review import (
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 
 
 def digest(character: str) -> str:
@@ -124,6 +127,30 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("blocked",))
             finally:
                 connection.close()
+
+    def test_live_lane_preflight_is_candidate_bound_and_provider_free(self) -> None:
+        plan = SimpleNamespace(
+            plan_digest=digest("a"), profile=DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            case_id="case-116", candidate_sha="c" * 40, ready_at=1,
+        )
+        components = SimpleNamespace(
+            producer_identity=external_validation.DEPENDENCY_REVIEW_ATTEMPT_PRODUCER_IDENTITY,
+            exporter_identity=external_validation.DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY,
+            comparator_identity=external_validation.DEPENDENCY_REVIEW_ATTEMPT_COMPARATOR_IDENTITY,
+        )
+        binding = SimpleNamespace(
+            plan=plan, profile=plan.profile, case_id=plan.case_id,
+            candidate_sha=plan.candidate_sha, ready_at=plan.ready_at, components=components,
+        )
+        adapter = external_validation.DependencyReviewAttemptAdapter()
+        self.assertEqual(shadow_evidence_profile(DEPENDENCY_REVIEW_ATTEMPT_PROFILE).capture_mode.value, "armed-live-events")
+        adapter.validate(binding)
+        self.assertIsInstance(
+            external_validation.roundwright_profile_adapter_factory(DEPENDENCY_REVIEW_ATTEMPT_PROFILE),
+            external_validation.DependencyReviewAttemptAdapter,
+        )
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "hosted fresh-session dispatch"):
+            adapter.execute(binding)
 
 
 if __name__ == "__main__":

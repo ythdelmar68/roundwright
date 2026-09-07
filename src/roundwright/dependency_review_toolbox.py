@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable
@@ -14,6 +15,9 @@ from .codex_dependency_review import (
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
+
+
+_NO_TOOL_INSTRUCTIONS = "Deny all tools, filesystem access, network access, credential access, and repository inspection. Use only the supplied normalized input."
 
 
 def _schema() -> dict[str, object]:
@@ -40,17 +44,22 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
                 sdk = importlib.import_module("openai_codex"); generated = importlib.import_module("openai_codex.generated.v2_all")
                 factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             else: factory, approval, sandbox, effort = self.factory, self.approval, self.sandbox, self.effort
-            codex = factory(); client = codex.__enter__() if hasattr(codex, "__enter__") else codex; thread = client.thread_start()
+            workspace = tempfile.TemporaryDirectory(prefix="roundwright-dependency-review-")
+            codex = factory(); client = codex.__enter__() if hasattr(codex, "__enter__") else codex
+            thread = client.thread_start(
+                approval_mode=approval, cwd=workspace.name, developer_instructions=_NO_TOOL_INSTRUCTIONS,
+                ephemeral=True, model=profile.model, sandbox=sandbox,
+            )
             if not isinstance(getattr(thread, "id", None), str): raise ValueError
-            return _Session(thread, codex, self.cwd, profile, approval, sandbox, effort, self.completion, self.clock)
+            return _Session(thread, codex, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace)
         except CodexAdapterError: raise
         except Exception: raise CodexAdapterError(CodexFailure.UNKNOWN) from None
 
 
 class _Session(NativeDependencyReviewSession):
-    def __init__(self, thread, codex, cwd, profile, approval, sandbox, effort, completion, clock): self.thread, self.codex, self.cwd, self.profile, self.approval, self.sandbox, self.effort, self.completion, self.clock, self.started = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, False
+    def __init__(self, thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, workspace): self.thread, self.codex, self.cwd, self.profile, self.approval, self.sandbox, self.effort, self.completion, self.clock, self.workspace, self.started = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, workspace, False
     def identity(self) -> str: return self.thread.id
-    def close(self) -> None: _close(self.codex)
+    def close(self) -> None: _close(self.codex); self.workspace.cleanup()
     def start_turn(self, request: DependencyReviewRequest) -> NativeDependencyReviewTurn:
         if self.started or type(request) is not DependencyReviewRequest: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self.started = True
@@ -74,12 +83,20 @@ class _Turn(NativeDependencyReviewTurn):
             for event in _bounded_events(self.handle.stream(), completion=self.session.completion, clock=self.session.clock, cancel=self.abort):
                 payload = _field(event, "payload") or event
                 if _field(event, "method") == "turn/completed":
-                    turn = _field(payload, "turn"); status = _value(_field(turn, "status")); complete = status == "completed"
+                    turn = _field(payload, "turn")
+                    if turn is None or _field(turn, "id") != _field(self.handle, "id") or complete:
+                        return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
+                    status = _value(_field(turn, "status")); complete = status == "completed"
                     if status == "failed": return NativeDependencyReviewResponse(DependencyReviewResultKind.BLOCKED, failure=_turn_failure(_field(turn, "error"))[0])
+                    if status != "completed": return NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)
                 if _field(event, "method") == "item/completed" and _field(payload, "turn_id", "turnId") == _field(self.handle, "id"):
                     item = _field(_field(payload, "item"), "root") or _field(payload, "item")
-                    if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer": answer = _field(item, "text")
+                    if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer":
+                        text = _field(item, "text")
+                        if answer is not None or not isinstance(text, str): return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
+                        answer = text
             if not complete: return NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)
+            if answer is None: return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
             try: value = json.loads(answer)
             except Exception: return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
             return NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, value) if type(value) is dict else NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)

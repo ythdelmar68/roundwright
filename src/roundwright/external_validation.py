@@ -870,18 +870,9 @@ class DependencyReviewAttemptAdapter:
             )
         except (DependencyReviewDispatchError, ValueError) as error:
             raise ExternalValidationAdapterError("dependency review hosted dispatch failed") from error
-        snapshot = {
-            "attempt_id": binding.case_id,
-            "input_digest": _digest(DependencyReviewStore.model_input(
-                host.subset, attempt_id=binding.case_id,
-                profile_identity=host.binding.profile_identity,
-                source_owned_relations=host.source_owned_relations,
-            )),
-            "output_digest": result.output_digest,
-            "outcome": result.kind.value,
-            "proposal_count": 1 if result.kind is DependencyReviewResultKind.ACCEPTED else 0,
-            "validation_state": "accepted" if result.kind is DependencyReviewResultKind.ACCEPTED else "terminal",
-        }
+        snapshot = self._durable_snapshot(binding)
+        if snapshot["output_digest"] != result.output_digest or snapshot["outcome"] != result.kind.value:
+            raise ExternalValidationAdapterError("dependency review durable result has drifted")
         return _harness_executor().ProfileExecution(
             {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "binding_identity": identity, "snapshot": snapshot},
             mutation_count=0,
@@ -893,19 +884,40 @@ class DependencyReviewAttemptAdapter:
             value, mutation_count = execution.value, execution.mutation_count
         except AttributeError as error:
             raise ExternalValidationAdapterError("dependency review attempt result is invalid") from error
-        if type(value) is not dict or set(value) != {"schema", "binding_identity", "snapshot"} or value["schema"] != DEPENDENCY_REVIEW_ATTEMPT_SCHEMA or value["binding_identity"] != identity or type(value["snapshot"]) is not dict or mutation_count != 0:
+        snapshot = self._durable_snapshot(binding)
+        if type(value) is not dict or set(value) != {"schema", "binding_identity", "snapshot"} or value["schema"] != DEPENDENCY_REVIEW_ATTEMPT_SCHEMA or value["binding_identity"] != identity or value["snapshot"] != snapshot or mutation_count != 0:
             raise ExternalValidationAdapterError("dependency review attempt result has drifted")
         return {
             "schema": "roundwright-shadow-case/v2", "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
             "ready_at": binding.ready_at, "case_id": binding.case_id,
             "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
-            "dependency_review": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "capture_mode": "armed-live-events", "binding_identity": identity, "snapshot": value["snapshot"], "mutation_count": 0},
+            "dependency_review": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "capture_mode": "armed-live-events", "binding_identity": identity, "snapshot": snapshot, "mutation_count": 0},
         }
 
     def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
-        expected = self.project(binding, type("Execution", (), {"value": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "binding_identity": _dependency_review_attempt_binding_identity(binding), "snapshot": evidence.get("dependency_review", {}).get("snapshot") if type(evidence) is dict and type(evidence.get("dependency_review")) is dict else None}, "mutation_count": 0})())
+        identity = _dependency_review_attempt_binding_identity(binding)
+        snapshot = self._durable_snapshot(binding)
+        expected = {
+            "schema": "roundwright-shadow-case/v2", "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+            "dependency_review": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "capture_mode": "armed-live-events", "binding_identity": identity, "snapshot": snapshot, "mutation_count": 0},
+        }
         status = "pass" if type(evidence) is dict and evidence == expected else "fail"
         return _harness_executor().ProfileComparison(status, _digest({"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "status": status, "ready_at": binding.ready_at, "expected_identity": _digest(expected), "observed_identity": _digest(evidence)}))
+
+    def _durable_snapshot(self, binding: object) -> dict[str, object]:
+        host = self.host_inputs
+        if host is None:
+            raise ExternalValidationAdapterError("dependency review durable readback is unavailable")
+        if binding.case_id != host.subset.snapshot_id:
+            raise ExternalValidationAdapterError("dependency review durable readback has drifted")
+        try:
+            return DependencyReviewStore().terminal_snapshot(
+                host.repository, attempt_id=binding.case_id, binding=host.binding,
+            )
+        except ValueError as error:
+            raise ExternalValidationAdapterError("dependency review durable readback has drifted") from error
 
 
 def _read_only_external_observation_binding_identity(binding: object) -> str:

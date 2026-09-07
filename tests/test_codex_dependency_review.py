@@ -16,12 +16,13 @@ from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse,
 )
-from roundwright.dependency_review_toolbox import _schema
+from roundwright.dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend, _schema
+from roundwright.worker_toolbox import CompletionDeadline
 from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
 from roundwright.dependency_review import (
     AffectedMember, AffectedSubset, Confidence, DependencyReviewBinding, EdgeDirection,
-    EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation,
+    EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyReviewStore,
 )
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
@@ -109,6 +110,33 @@ class DependencyReviewServiceTests(unittest.TestCase):
         )
         self.assertNotIn("const", str(schema))
 
+    def test_native_bridge_starts_an_ephemeral_isolated_no_tools_session(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class Thread: id = "session-116"
+        class Codex:
+            def __enter__(self): return self
+            def close(self): return None
+            def thread_start(self, **keywords):
+                calls.append(keywords)
+                return Thread()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, _subset, _binding, profile, _audit = self.setup(Path(temporary))
+            backend = HarnessNativeCodexDependencyReviewBackend(
+                cwd=repository.root, completion=CompletionDeadline(100, 600), codex_factory=Codex,
+                approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            )
+            session = backend.open_fresh_session(profile)
+            try:
+                self.assertEqual(calls[0]["approval_mode"], "deny-all")
+                self.assertEqual(calls[0]["sandbox"], "read-only")
+                self.assertTrue(calls[0]["ephemeral"])
+                self.assertNotEqual(Path(calls[0]["cwd"]), repository.root)
+                self.assertIn("Deny all tools", calls[0]["developer_instructions"])
+            finally:
+                session.close()
+
     def test_fresh_no_tools_attempt_accepts_only_the_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
@@ -130,13 +158,27 @@ class DependencyReviewServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
-            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=CodexDependencyReviewAdapter(backend, profile, audit), checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: (_ for _ in ()).throw(RuntimeError("checkpoint unavailable")))
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=CodexDependencyReviewAdapter(backend, profile, audit), checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None)
             self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn"))
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("blocked",))
             finally:
                 connection.close()
+
+    def test_restart_after_persisted_session_claim_blocks_without_a_second_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="attempt-116", binding=binding)
+            store.claim_session(repository, attempt_id="attempt-116", session_identity="session-116")
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding,
+                adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+            )
+            self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
 
     def test_live_lane_preflight_is_candidate_bound_and_provider_free(self) -> None:
         plan = SimpleNamespace(

@@ -829,6 +829,15 @@ MIGRATIONS = (
             ("legacy_objective_migration_receipts", "CREATE TABLE legacy_objective_migration_receipts (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), source_count INTEGER NOT NULL CHECK(source_count >= 0))"),
         ),
     ),
+    Migration(
+        66,
+        (
+            "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT NOT NULL, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('session-opened', 'turn-dispatched')), CHECK((turn_identity IS NULL AND state = 'session-opened') OR (turn_identity IS NOT NULL AND state = 'turn-dispatched')))",
+        ),
+        (
+            ("dependency_review_dispatch_claims", "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT NOT NULL, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('session-opened', 'turn-dispatched')), CHECK((turn_identity IS NULL AND state = 'session-opened') OR (turn_identity IS NOT NULL AND state = 'turn-dispatched')))"),
+        ),
+    ),
 )
 
 

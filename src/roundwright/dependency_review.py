@@ -618,6 +618,105 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
+    def terminal_snapshot(
+        self, repository: RepositoryIdentity, *, attempt_id: str, binding: DependencyReviewBinding,
+    ) -> dict[str, object]:
+        """Independently reread one complete, terminal review attempt."""
+
+        if not _token(attempt_id) or type(binding) is not DependencyReviewBinding:
+            raise DependencyReviewError("dependency review snapshot is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            row, subset = self._read_attempt(connection, attempt_id)
+            binding.require_subset(subset)
+            if (row[2], row[3]) != (binding.profile_identity, binding.configuration_digest) or row[6] == "prepared":
+                raise DependencyReviewError("dependency review snapshot is unavailable")
+            outcome = connection.execute(
+                "SELECT outcome, reason_code, output_digest FROM dependency_review_validation_outcomes WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if outcome is None:
+                raise DependencyReviewError("dependency review snapshot is unavailable")
+            proposal_count = connection.execute(
+                "SELECT COUNT(*) FROM dependency_review_proposals WHERE attempt_id = ?", (attempt_id,),
+            ).fetchone()
+            if proposal_count is None:
+                raise DependencyReviewError("dependency review snapshot is unavailable")
+            result_kind = "ambiguous" if outcome[0] == "blocked" and outcome[1] == "uncertain-provider-turn" else outcome[0]
+            return {
+                "attempt_id": attempt_id,
+                "input_digest": row[4],
+                "output_digest": outcome[2],
+                "outcome": result_kind,
+                "proposal_count": proposal_count[0],
+                "validation_state": "accepted" if outcome[0] == "accepted" else "terminal",
+            }
+        finally:
+            connection.close()
+
+    def claim_session(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str) -> None:
+        if not _token(attempt_id) or not _token(session_identity):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            if row[6] != "prepared":
+                raise DependencyReviewError("dependency review dispatch claim is unavailable")
+            existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if existing is not None:
+                raise DependencyReviewError("dependency review dispatch claim is already consumed")
+            connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, ?, NULL, 'session-opened')", (attempt_id, session_identity))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_turn(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str) -> None:
+        if not _token(attempt_id) or not _token(session_identity) or not _token(turn_identity):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if row[6] != "prepared" or existing != (session_identity, None, "session-opened"):
+                raise DependencyReviewError("dependency review dispatch claim has drifted")
+            connection.execute("UPDATE dependency_review_dispatch_claims SET turn_identity = ?, state = 'turn-dispatched' WHERE attempt_id = ?", (turn_identity, attempt_id))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def recover_dispatch_claim(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str) -> bool:
+        """Terminally block any persisted in-flight claim before a restart can dispatch."""
+        if not _token(attempt_id) or not _digest(output_digest):
+            raise DependencyReviewError("dependency review dispatch recovery is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            claim = connection.execute("SELECT state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if claim is None:
+                connection.commit()
+                return False
+            if row[6] != "prepared":
+                connection.commit()
+                return False
+            connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, 'blocked', 'uncertain-provider-turn', ?, 'owner-review')", (attempt_id, output_digest))
+            connection.execute("UPDATE dependency_review_attempts SET state = 'blocked' WHERE attempt_id = ?", (attempt_id,))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
 
 def _digest_value(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()

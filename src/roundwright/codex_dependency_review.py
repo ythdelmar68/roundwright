@@ -163,7 +163,11 @@ class CodexDependencyReviewAdapter:
             except (DependencyReviewError, TypeError, ValueError):
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, session_id, turn_id, None, _digest(response.proposal), "malformed-response")
             return DependencyReviewDispatchResult(response.kind, session_id, turn_id, proposal, proposal.proposal_digest, "schema-valid")
-        reason = "provider-blocked" if response.kind is DependencyReviewResultKind.BLOCKED else "malformed-response"
+        reason = (
+            "provider-blocked" if response.kind is DependencyReviewResultKind.BLOCKED
+            else "uncertain-provider-turn" if response.kind is DependencyReviewResultKind.AMBIGUOUS
+            else "malformed-response"
+        )
         return DependencyReviewDispatchResult(response.kind, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "status": response.kind.value, "failure": None if response.failure is None else response.failure.value}), reason)
 
 
@@ -181,7 +185,19 @@ class DependencyReviewService:
         store = DependencyReviewStore()
         attempt = store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding, source_owned_relations=source_owned_relations, supersedes_attempt_id=supersedes_attempt_id)
         request = DependencyReviewRequest(attempt.attempt_id, store.model_input(subset, attempt_id=attempt.attempt_id, profile_identity=binding.profile_identity, source_owned_relations=source_owned_relations), attempt.input_digest, binding.profile_identity)
-        result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+        recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
+        if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
+            return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")
+
+        def claimed_session(session_identity: str) -> None:
+            store.claim_session(repository, attempt_id=attempt.attempt_id, session_identity=session_identity)
+            checkpoint_session(session_identity)
+
+        def claimed_turn(session_identity: str, turn_identity: str) -> None:
+            store.claim_turn(repository, attempt_id=attempt.attempt_id, session_identity=session_identity, turn_identity=turn_identity)
+            checkpoint_turn(session_identity, turn_identity)
+
+        result = adapter.dispatch(request, checkpoint_session=claimed_session, checkpoint_turn=claimed_turn)
         if result.kind is DependencyReviewResultKind.ACCEPTED:
             assert result.proposal is not None
             try:

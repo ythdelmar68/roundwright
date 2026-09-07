@@ -145,12 +145,13 @@ class DependencyReviewServiceTests(unittest.TestCase):
         )
         adapter = external_validation.DependencyReviewAttemptAdapter()
         self.assertEqual(shadow_evidence_profile(DEPENDENCY_REVIEW_ATTEMPT_PROFILE).capture_mode.value, "armed-live-events")
-        adapter.validate(binding)
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "V2 execution context is unavailable"):
+            adapter.validate(binding)
         self.assertIsInstance(
             external_validation.roundwright_profile_adapter_factory(DEPENDENCY_REVIEW_ATTEMPT_PROFILE),
             external_validation.DependencyReviewAttemptAdapter,
         )
-        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "hosted fresh-session dispatch"):
+        with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "V2 execution context is unavailable"):
             adapter.execute(binding)
 
     def test_sealed_lane_preflight_is_provider_free_and_executes_once(self) -> None:
@@ -163,9 +164,13 @@ class DependencyReviewServiceTests(unittest.TestCase):
         class Execution:
             def __init__(self, value, mutation_count=0): self.value, self.mutation_count = value, mutation_count
 
+        class ContextValue:
+            def __init__(self, identity, value): self.identity, self.value = identity, value
+
         class Harness:
             ExecutorReadinessReceipt = Receipt
             ProfileExecution = Execution
+            ProfileExecutionContext = ContextValue
 
             @staticmethod
             def prepare_capture(capture):
@@ -179,15 +184,23 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 request = dict(request_value)
                 capture = request["capture_plan"]
                 plan = Harness.prepare_capture(capture)
+                components = SimpleNamespace(
+                    producer_identity=capture["producer_identity"], exporter_identity=capture["exporter_identity"],
+                    comparator_identity=capture["comparator_identity"],
+                )
+                prepared_context = adapter.prepare_execution_context(SimpleNamespace(
+                    descriptor=request["execution_context"], plan=plan,
+                    input_digest=external_validation._digest(request["execution_context"]), components=components,
+                ))
+                bound = SimpleNamespace(
+                    plan=plan, profile=plan.profile, case_id=plan.case_id,
+                    candidate_sha=plan.candidate_sha, ready_at=plan.ready_at, components=components,
+                    execution_context=prepared_context,
+                    execution_context_input_digest=external_validation._digest(request["execution_context"]),
+                )
                 if mode == "execute":
-                    components = SimpleNamespace(
-                        producer_identity=capture["producer_identity"], exporter_identity=capture["exporter_identity"],
-                        comparator_identity=capture["comparator_identity"],
-                    )
-                    return adapter.execute(SimpleNamespace(
-                        plan=plan, profile=plan.profile, case_id=plan.case_id,
-                        candidate_sha=plan.candidate_sha, ready_at=plan.ready_at, components=components,
-                    ))
+                    return adapter.execute(bound)
+                adapter.validate(bound)
                 core = {
                     "schema": "roundwright-harness-profile-executor-readiness/v2", "status": "ready", "state": "PREFLIGHT_READY",
                     "plan_digest": plan.plan_digest, "profile": plan.profile, "case_id": plan.case_id,
@@ -196,7 +209,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
                     "comparator_identity": capture["comparator_identity"], "dispatch_count": 0, "record_count": 0,
                     "verify_count": 0, "mutation_count": 0,
                     "execution_context_input_digest": external_validation._digest(request["execution_context"]),
-                    "execution_context_identity": external_validation._dependency_review_context_identity(request["execution_context"]),
+                    "execution_context_identity": prepared_context.identity,
                 }
                 return Receipt({**core, "receipt_digest": external_validation._digest(core)})
 
@@ -212,6 +225,25 @@ class DependencyReviewServiceTests(unittest.TestCase):
             self.assertEqual(prepared.capture_plan_digest, readiness.capture_plan_digest)
             self.assertEqual(prepared.public_receipt()["base_sha"], base_sha)
             self.assertEqual(prepared._request_value["execution_context"]["base_sha"], base_sha)
+            plan = Harness.prepare_capture(dict(prepared._request_value["capture_plan"]))
+            components = SimpleNamespace(
+                producer_identity=prepared._request_value["capture_plan"]["producer_identity"],
+                exporter_identity=prepared._request_value["capture_plan"]["exporter_identity"],
+                comparator_identity=prepared._request_value["capture_plan"]["comparator_identity"],
+            )
+            adapter = external_validation.DependencyReviewAttemptAdapter(prepared._host_inputs)
+            materialized_context = adapter.prepare_execution_context(SimpleNamespace(
+                descriptor=prepared._request_value["execution_context"], plan=plan,
+            ))
+            contextual_binding = SimpleNamespace(
+                plan=plan, profile=plan.profile, case_id=plan.case_id, candidate_sha=plan.candidate_sha,
+                ready_at=plan.ready_at, components=components, execution_context=materialized_context,
+                execution_context_input_digest=external_validation._digest(prepared._request_value["execution_context"]),
+            )
+            adapter.validate(contextual_binding)
+            object.__setattr__(materialized_context.value, "identity", digest("f"))
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "execution context has drifted"):
+                adapter.validate(contextual_binding)
             object.__setattr__(inputs, "base_sha", "b" * 40)
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "prepared request has drifted"):
                 external_validation.materialize_dependency_review_attempt_profile(capsule, Path(temporary).resolve())

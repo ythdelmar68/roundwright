@@ -708,6 +708,80 @@ def _dependency_review_attempt_binding_identity(binding: object) -> str:
 
 
 @dataclass(frozen=True)
+class DependencyReviewExecutionContext:
+    """One materialized V2 descriptor for the sealed dependency-review lane."""
+
+    descriptor: Mapping[str, object]
+    identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.descriptor) is not MappingProxyType or _DIGEST.fullmatch(self.identity) is None:
+            raise ExternalValidationAdapterError("dependency review execution context is invalid")
+
+
+def _prepare_dependency_review_execution_context(
+    descriptor: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
+) -> DependencyReviewExecutionContext:
+    """Materialize and close the V2 descriptor before adapter validation."""
+
+    try:
+        value = _canonical_json_materialize(descriptor)
+        if type(value) is not dict or set(value) != {
+            "schema", "repository_root", "subset_digest", "candidate_sha", "base_sha", "case_id", "ready_at",
+            "configuration_digest", "policy_digest", "profile_identity", "audit", "recorder_identity",
+            "store_identity", "observation_identity", "host_inputs_identity", "capture_plan_digest",
+        }:
+            raise ValueError
+        audit_value = value["audit"]
+        if type(audit_value) is not dict or type(audit_value.get("capabilities")) is not list:
+            raise ValueError
+        audit = dict(audit_value)
+        audit["capabilities"] = tuple(tuple(item) for item in audit["capabilities"])
+        audit_identity = ProviderHealthAuditIdentity.from_evidence(audit)
+        if (
+            value["schema"] != "roundwright-dependency-review-execution-context/v1"
+            or not isinstance(value["repository_root"], str) or not value["repository_root"]
+            or not _DIGEST.fullmatch(value["subset_digest"])
+            or _SHA.fullmatch(value["base_sha"]) is None
+            or (value["candidate_sha"], value["case_id"], value["ready_at"], value["capture_plan_digest"])
+            != (candidate_sha, case_id, ready_at, plan_digest)
+            or any(_DIGEST.fullmatch(value[key]) is None for key in (
+                "configuration_digest", "policy_digest", "profile_identity", "recorder_identity",
+                "store_identity", "observation_identity", "host_inputs_identity",
+            ))
+            or audit_identity.profile_identity != value["profile_identity"]
+            or (audit_identity.profile.model, audit_identity.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high")
+        ):
+            raise ValueError
+        return DependencyReviewExecutionContext(
+            MappingProxyType(value), _dependency_review_context_identity(value),
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("dependency review V2 execution context is invalid") from error
+
+
+def _dependency_review_context(binding: object) -> DependencyReviewExecutionContext:
+    try:
+        prepared = binding.execution_context
+        context = prepared.value
+        input_digest = binding.execution_context_input_digest
+        plan = binding.plan
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("dependency review V2 execution context is unavailable") from error
+    if (
+        type(context) is not DependencyReviewExecutionContext
+        or type(input_digest) is not str
+        or input_digest != _digest(_canonical_json_materialize(context.descriptor))
+        or prepared.identity != context.identity
+    ):
+        raise ExternalValidationAdapterError("dependency review V2 execution context has drifted")
+    return _prepare_dependency_review_execution_context(
+        context.descriptor, plan_digest=plan.plan_digest, candidate_sha=plan.candidate_sha,
+        case_id=plan.case_id, ready_at=plan.ready_at,
+    )
+
+
+@dataclass(frozen=True)
 class DependencyReviewAttemptAdapter:
     """Provider-free preflight for the armed dependency-review evidence lane.
 
@@ -733,8 +807,20 @@ class DependencyReviewAttemptAdapter:
             *dependency_review_attempt_component_identities(),
         )
 
+    def prepare_execution_context(self, preparation: object) -> object:
+        try:
+            context = _prepare_dependency_review_execution_context(
+                preparation.descriptor, plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha, case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("dependency review V2 execution context is invalid") from error
+
     def validate(self, binding: object) -> None:
         _dependency_review_attempt_binding_identity(binding)
+        context = _dependency_review_context(binding)
         try:
             actual = (
                 binding.components.producer_identity,
@@ -745,9 +831,19 @@ class DependencyReviewAttemptAdapter:
             raise ExternalValidationAdapterError("dependency review attempt components are invalid") from error
         if actual != dependency_review_attempt_component_identities():
             raise ExternalValidationAdapterError("dependency review attempt components have drifted")
+        host = self.host_inputs
+        if host is not None and (
+            _dependency_review_host_inputs_identity(host) != context.descriptor["host_inputs_identity"]
+            or host.subset.candidate_sha != binding.candidate_sha
+            or host.binding.profile_identity != context.descriptor["profile_identity"]
+            or (host.subset.configuration_digest, host.subset.policy_digest)
+            != (context.descriptor["configuration_digest"], context.descriptor["policy_digest"])
+        ):
+            raise ExternalValidationAdapterError("dependency review V2 host inputs have drifted")
 
     def execute(self, binding: object) -> object:
         identity = _dependency_review_attempt_binding_identity(binding)
+        context = _dependency_review_context(binding)
         host = self.host_inputs
         if host is None:
             raise ExternalValidationAdapterError(
@@ -760,6 +856,8 @@ class DependencyReviewAttemptAdapter:
             or host.subset.configuration_digest != host.binding.configuration_digest
             or host.subset.policy_digest != host.binding.policy_digest
             or binding.case_id != host.subset.snapshot_id
+            or _dependency_review_host_inputs_identity(host) != context.descriptor["host_inputs_identity"]
+            or host.binding.profile_identity != context.descriptor["profile_identity"]
         ):
             raise ExternalValidationAdapterError("dependency review host inputs have drifted")
         try:
@@ -5308,7 +5406,7 @@ def prepare_dependency_review_attempt_profile(
     harness = _harness_executor()
     try:
         receipt = harness.run_profile_executor(
-            "validate", request_value, DependencyReviewAttemptAdapter(), store_root,
+            "validate", request_value, DependencyReviewAttemptAdapter(prepared._host_inputs), store_root,
         )
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("dependency review preflight validation failed") from error

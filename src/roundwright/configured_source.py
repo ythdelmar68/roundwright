@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import secrets
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -20,6 +19,8 @@ from typing import Protocol
 
 from .configuration import ConfigurationError, RepositoryIdentity, ResolvedConfigurationBinding
 from .dependency_graph import DependencyGraphBinding, DependencyGraphStore, GraphSnapshot
+from .github import GitHubReadOperation, GitHubReadRequest, IssueSnapshot, RepositoryRef
+from .github_runtime import OwnerGitHubReadIpcClient, credentialed_github_read_capability_identity
 from .shadow import CONFIGURED_SOURCE_INGESTION_PROFILE, shadow_evidence_profile
 from .state import _open_writable_connection, database_path
 
@@ -131,57 +132,138 @@ _CONFIGURED_SOURCE_ENDPOINT_SEAL = object()
 class IssueListReadHost:
     """Factory-sealed ISSUE_LIST endpoint over the owner GitHub read boundary."""
 
-    read_page: object = field(repr=False, compare=False)
+    read_capability: OwnerGitHubReadIpcClient = field(repr=False, compare=False)
     endpoint_identity: str = ""
     _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or not callable(self.read_page) or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity):
+        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or not isinstance(self.read_capability, OwnerGitHubReadIpcClient) or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity):
             raise ConfiguredSourceError("issue-list read host is invalid")
+
+    def read_page(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
+        parsed = _issue_list_identity(source)
+        if cursor is not None or parsed is None:
+            raise ConfiguredSourceError("configured issue-list request is invalid")
+        repository, number = parsed
+        result = self.read_capability.read(GitHubReadRequest(GitHubReadOperation.ISSUE, repository, number=number))
+        if not result.ok or type(result.snapshot) is not IssueSnapshot:
+            raise ConfiguredSourceError("configured issue-list read is unavailable")
+        issue = result.snapshot
+        if issue.repository != repository or issue.number != number:
+            raise ConfiguredSourceError("configured issue-list response has drifted")
+        item = SourceItem(
+            f"issue-{issue.number}", f"issue-{issue.number}",
+            _digest_value({"issue_evidence": issue.issue_evidence_identity, "relationship_evidence": issue.relationship_evidence_identity, "state": issue.state.value}),
+            _digest_value({"repository": issue.repository.slug, "issue_id": issue.issue_id, "number": issue.number}),
+        )
+        return SourcePage(source, None, None, (item,))
 
 
 @dataclass(frozen=True)
 class TaskFeedReadHost:
     """Factory-sealed TASK_FEED endpoint with no command or discovery surface."""
 
-    read_page: object = field(repr=False, compare=False)
+    read_capability: "TaskFeedReadIpcClient" = field(repr=False, compare=False)
     endpoint_identity: str = ""
     _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or not callable(self.read_page) or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity):
+        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or type(self.read_capability) is not TaskFeedReadIpcClient or self.endpoint_identity != self.read_capability.endpoint_identity:
             raise ConfiguredSourceError("task-feed read host is invalid")
+    def read_page(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
+        return self.read_capability.read_page(source, cursor=cursor)
 
 
-def _sealed_page_endpoint(source_type: SourceType, read_page: object) -> tuple[object, str, object]:
-    """Mint one unforgeable public-safe endpoint identity with its reader."""
+class _TaskFeedOwnerEndpoint:
+    """Owner-only typed IPC endpoint; it is never a public callback seam."""
 
-    if type(source_type) is not SourceType or not callable(read_page):
-        raise ConfiguredSourceError("configured source page endpoint is invalid")
-    nonce = secrets.token_hex(32)
-    return read_page, _digest_value({
-        "schema": "roundwright-configured-source-owner-page-endpoint/v1",
-        "source_type": source_type.value, "nonce": nonce,
-    }), _CONFIGURED_SOURCE_ENDPOINT_SEAL
+    def __init__(self, pages: Mapping[tuple[str, str | None], SourcePage]) -> None:
+        if type(pages) is not dict or any(type(key) is not tuple or len(key) != 2 or type(key[0]) is not str or (key[1] is not None and type(key[1]) is not str) or type(value) is not SourcePage for key, value in pages.items()):
+            raise ConfiguredSourceError("task-feed owner IPC endpoint is invalid")
+        self._pages = dict(pages)
+        self.identity = _digest_value({
+            "schema": "roundwright-configured-source-task-feed-ipc/v1",
+            "pages": [
+                {"source": key[0], "cursor": key[1], "page": {
+                    "source": value.source.payload(), "requested_cursor": value.requested_cursor,
+                    "next_cursor": value.next_cursor, "items": [item.payload() for item in value.items],
+                }}
+                for key, value in sorted(self._pages.items(), key=lambda item: (item[0][0], item[0][1] or ""))
+            ],
+        })
+        self.calls = 0
+
+    def exchange_page(self, source: ConfiguredSource, cursor: str | None) -> SourcePage:
+        self.calls += 1
+        try:
+            return self._pages[(source.public_identity, cursor)]
+        except KeyError as error:
+            raise ConfiguredSourceError("task-feed IPC page is unavailable") from error
 
 
-def create_issue_list_read_host(read_page: object) -> IssueListReadHost:
+class TaskFeedReadIpcClient:
+    """Minimal sealed TASK_FEED IPC client; no commands or provider surface."""
+
+    __slots__ = ("__endpoint", "endpoint_identity")
+
+    def __init__(self, endpoint: _TaskFeedOwnerEndpoint, seal: object) -> None:
+        if type(endpoint) is not _TaskFeedOwnerEndpoint or seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL:
+            raise ConfiguredSourceError("task-feed IPC capability is invalid")
+        self.__endpoint = endpoint
+        self.endpoint_identity = endpoint.identity
+
+    def read_page(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
+        if type(source) is not ConfiguredSource or source.source_type is not SourceType.TASK_FEED:
+            raise ConfiguredSourceError("task-feed IPC request is invalid")
+        return self.__endpoint.exchange_page(source, cursor)
+
+    @property
+    def source_read_count(self) -> int:
+        return self.__endpoint.calls
+
+
+def _create_task_feed_fixture_capability(pages: Mapping[tuple[str, str | None], SourcePage]) -> TaskFeedReadIpcClient:
+    """Internal hermetic owner-endpoint fixture; not a production callback API."""
+
+    return TaskFeedReadIpcClient(_TaskFeedOwnerEndpoint(pages), _CONFIGURED_SOURCE_ENDPOINT_SEAL)
+
+
+def create_issue_list_read_host(read_capability: OwnerGitHubReadIpcClient) -> IssueListReadHost:
     """Seal one typed ISSUE_LIST page endpoint owned by the host factory.
 
-    Production implementations call the existing credentialed GitHub read IPC
-    client inside ``read_page``; the callback and its identity cannot be
-    supplied separately to a configured-source caller.
+    It consumes only the existing credentialed GitHub IPC capability; callers
+    cannot supply a callback, endpoint name, implementation digest, or query.
     """
 
-    callback, identity, seal = _sealed_page_endpoint(SourceType.ISSUE_LIST, read_page)
-    return IssueListReadHost(callback, identity, seal)
+    identity = credentialed_github_read_capability_identity(read_capability)
+    if identity is None:
+        raise ConfiguredSourceError("issue-list requires a credentialed owner read capability")
+    return IssueListReadHost(read_capability, _digest_value({
+        "schema": "roundwright-configured-source-issue-list-endpoint/v1",
+        "credentialed_read_identity": identity, "operation": GitHubReadOperation.ISSUE.value,
+    }), _CONFIGURED_SOURCE_ENDPOINT_SEAL)
 
 
-def create_task_feed_read_host(read_page: object) -> TaskFeedReadHost:
+def create_task_feed_read_host(read_capability: TaskFeedReadIpcClient) -> TaskFeedReadHost:
     """Seal the minimal typed TASK_FEED page endpoint."""
 
-    callback, identity, seal = _sealed_page_endpoint(SourceType.TASK_FEED, read_page)
-    return TaskFeedReadHost(callback, identity, seal)
+    if type(read_capability) is not TaskFeedReadIpcClient:
+        raise ConfiguredSourceError("task-feed requires a sealed owner IPC capability")
+    return TaskFeedReadHost(read_capability, read_capability.endpoint_identity, _CONFIGURED_SOURCE_ENDPOINT_SEAL)
+
+
+def _issue_list_identity(source: ConfiguredSource) -> tuple[RepositoryRef, int] | None:
+    """Parse the fixed public ``owner/repository/issue/number`` source form."""
+
+    if type(source) is not ConfiguredSource or source.source_type is not SourceType.ISSUE_LIST:
+        return None
+    try:
+        owner, name, kind, raw_number = source.public_identity.split("/")
+        if kind != "issue" or not raw_number.isdecimal():
+            raise ValueError
+        return RepositoryRef(owner, name), int(raw_number)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -823,6 +905,33 @@ def configured_source_executor_request(inputs: ConfiguredSourceHostInputs) -> di
         "capture_plan": capture_plan,
         "execution_context": inputs.execution_context(plan.plan_digest),
     }
+
+
+def prepare_configured_source_ingestion(
+    repository: RepositoryIdentity, configuration: ResolvedConfigurationBinding,
+    candidate_sha: str, base_sha: str, case_id: str, ready_at: int,
+    recorder_identity: str, store_identity: str, *,
+    issue_list: IssueListReadHost | None = None,
+    task_feed: TaskFeedReadHost | None = None,
+    unresolved_owner_member_ids: tuple[str, ...] = (),
+) -> tuple[ConfiguredSourceHostInputs, dict[str, object]]:
+    """Prepare #117's sole host inputs and V2 request from closed authority.
+
+    The durable graph is resolved through ``DependencyGraphStore.current``;
+    source lists, graph snapshots, readers, endpoint identities, and Harness
+    bindings are deliberately absent from this public production interface.
+    """
+
+    authority = resolve_configured_source_authority(repository, configuration, candidate_sha)
+    capability = create_configured_source_read_capability(
+        authority, issue_list=issue_list, task_feed=task_feed,
+    )
+    inputs = ConfiguredSourceHostInputs(
+        base_sha, authority, case_id, ready_at,
+        TrustedConfiguredSourceReadHost(authority, capability),
+        recorder_identity, store_identity, unresolved_owner_member_ids,
+    )
+    return inputs, configured_source_executor_request(inputs)
 
 
 def _configured_source_binding_identity(binding: object) -> str:

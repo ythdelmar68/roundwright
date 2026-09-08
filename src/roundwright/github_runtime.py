@@ -1393,11 +1393,12 @@ class _OwnerGitHubReadHostChannel:
 class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
     """Factory-sealed read client retaining safe failure provenance privately."""
 
-    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure", "__read_generation")
+    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure", "__read_generation", "__capability_identity")
 
-    def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel) -> None:
+    def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel, capability_identity: str) -> None:
         if type(channel) is not _OwnerGitHubReadHostChannel:
             raise GitHubRuntimeError("credentialed GitHub read channel is invalid")
+        _digest(capability_identity, "credentialed GitHub read capability")
         super().__init__(health, channel)
         self.__inventory_failure_lock = RLock()
         self.__pending_inventory_failure: tuple[
@@ -1406,6 +1407,11 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
             RepositoryInventoryTransportSubcategory,
         ] | None = None
         self.__read_generation = 0
+        self.__capability_identity = capability_identity
+
+    @property
+    def capability_identity(self) -> str:
+        return self.__capability_identity
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
         # A second read always makes an earlier result stale, including when
@@ -1478,6 +1484,12 @@ def credentialed_repository_inventory_failure_code(
 
     retained = credentialed_repository_inventory_failure(capability, request, result)
     return None if retained is None else retained[0]
+
+
+def credentialed_github_read_capability_identity(capability: object) -> str | None:
+    """Expose the sealed public identity of the production read capability."""
+
+    return capability.capability_identity if type(capability) is _CredentialedGitHubReadCapability else None
 
 
 class _CredentialedGhRunnerAdapter:
@@ -1574,7 +1586,11 @@ def create_credentialed_github_read_capability(
     endpoint = _OwnerGitHubReadHostEndpoint(
         _CredentialedGhRunnerAdapter(runner), binding, control, capability_health, clock=clock,
     )
-    return _CredentialedGitHubReadCapability(capability_health, _OwnerGitHubReadHostChannel(endpoint))
+    identity = _sha256((
+        "roundwright-credentialed-github-read-capability/v1", binding.repository,
+        binding.task_id, binding.candidate_sha, capability_health.identity,
+    ))
+    return _CredentialedGitHubReadCapability(capability_health, _OwnerGitHubReadHostChannel(endpoint), identity)
 
 
 def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapabilityHealth:

@@ -20,7 +20,7 @@ from roundwright.configured_source import (
     SourceType, TrustedConfiguredSourceReadHost, configured_source_capture_plan,
     configured_source_component_identities, configured_source_executor_request,
     _seal_configured_source_authority, create_configured_source_read_capability,
-    create_task_feed_read_host,
+    _create_task_feed_fixture_capability, create_task_feed_read_host,
     resolve_source_ingestion_binding,
     scan_configured_sources, select_runnable_work,
 )
@@ -160,10 +160,12 @@ class ConfiguredSourceTests(unittest.TestCase):
 
     @staticmethod
     def source_host(authority, reader):
+        capability = _create_task_feed_fixture_capability(reader.pages)
+        reader.source_capability = capability
         return TrustedConfiguredSourceReadHost(
             authority,
             create_configured_source_read_capability(
-                authority, task_feed=create_task_feed_read_host(reader.read),
+                authority, task_feed=create_task_feed_read_host(capability),
             ),
         )
 
@@ -196,6 +198,26 @@ class ConfiguredSourceTests(unittest.TestCase):
         self.assertEqual(binding.policy_digest, "sha256:" + resolved.runtime_binding().review_policy_digest)
         with self.assertRaises(ConfiguredSourceError):
             resolve_source_ingestion_binding(resolved, "not-a-sha")
+
+    def test_owner_host_factories_expose_no_callback_or_claimed_identity_seam(self):
+        source = self.source()
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
+        with self.assertRaises(ConfiguredSourceError):
+            create_task_feed_read_host(reader.read)
+        from roundwright.configured_source import create_issue_list_read_host
+        with self.assertRaises(ConfiguredSourceError):
+            create_issue_list_read_host(reader.read)
+
+    def test_identical_typed_endpoint_reconstruction_is_stable_and_changed_endpoint_is_not(self):
+        source = self.source()
+        page = SourcePage(source, None, None, (self.item("item/a", "task-a"),))
+        stable_first = _create_task_feed_fixture_capability({(source.public_identity, None): page})
+        stable_second = _create_task_feed_fixture_capability({(source.public_identity, None): page})
+        changed = _create_task_feed_fixture_capability({
+            (source.public_identity, None): SourcePage(source, None, None, (self.item("item/a", "task-a", content="changed"),)),
+        })
+        self.assertEqual(stable_first.endpoint_identity, stable_second.endpoint_identity)
+        self.assertNotEqual(stable_first.endpoint_identity, changed.endpoint_identity)
 
     def test_only_mechanically_identical_items_merge_and_content_collision_blocks(self):
         first, second = self.source("team/one"), self.source("team/two")
@@ -325,9 +347,12 @@ class ConfiguredSourceTests(unittest.TestCase):
             "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
             digest("recorder"), digest("store"),
         )
+        different_reader = Adapter({
+            (source.public_identity, None): SourcePage(source, None, None, (self.item("item/a", "task-a", content="replacement"),)),
+        })
         changed_capability = ConfiguredSourceHostInputs(
             host.base_sha, authority, host.case_id, host.ready_at,
-            self.source_host(authority, reader), host.recorder_identity, host.store_identity,
+            self.source_host(authority, different_reader), host.recorder_identity, host.store_identity,
         )
         changed_graph = GraphSnapshot("graph-118", graph.binding, graph.members, graph.edges, graph.proposal_ids)
         changed_graph_authority = _seal_configured_source_authority(binding, changed_graph)
@@ -366,6 +391,8 @@ class ConfiguredSourceTests(unittest.TestCase):
                     run_configured_source_ingestion_profile("validate", request, Path("unused-store"), moved)
         self.assertEqual(ExactHarnessV2.run_calls, 0)
         self.assertEqual(reader.calls, [])
+        self.assertEqual(reader.source_capability.source_read_count, 0)
+        self.assertEqual(different_reader.source_capability.source_read_count, 0)
         self.assertEqual(changed_source_reader.calls, [])
 
 

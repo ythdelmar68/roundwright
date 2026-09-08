@@ -8,13 +8,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright.configured_source import (
     ConfiguredSource, ConfiguredSourceError, ConfiguredSourceStore, SourceIngestionBinding,
-    SourceItem, SourcePage, SourceType, scan_configured_sources, select_runnable_work,
+    ConfiguredSourceHostInputs, ConfiguredSourceIngestionAdapter, SourceItem, SourcePage,
+    SourceType, configured_source_capture_plan, configured_source_component_identities,
+    scan_configured_sources, select_runnable_work,
 )
 from roundwright.dependency_graph import DependencyGraphBinding, GraphEdge, GraphMember, GraphSnapshot
 from roundwright.dependency_review import AffectedMember, EdgeKind
@@ -30,6 +34,18 @@ class Adapter:
     def read(self, source, *, cursor):
         self.calls.append((source.public_identity, cursor))
         return self.pages[(source.public_identity, cursor)]
+
+
+class Harness:
+    class ProfileComponentIdentities:
+        def __init__(self, *values): self.values = values
+        def __eq__(self, other): return isinstance(other, Harness.ProfileComponentIdentities) and self.values == other.values
+    class ProfileExecution:
+        def __init__(self, value, *, mutation_count): self.value, self.mutation_count = value, mutation_count
+    class ProfileExecutionContext:
+        def __init__(self, identity, value): self.identity, self.value = identity, value
+    class ProfileComparison:
+        def __init__(self, status, result_identity): self.status, self.result_identity = status, result_identity
 
 
 class ConfiguredSourceTests(unittest.TestCase):
@@ -100,6 +116,40 @@ class ConfiguredSourceTests(unittest.TestCase):
             self.assertEqual(store.record(repository, inventory), inventory.inventory_digest)
             self.assertEqual(store.record(repository, inventory), inventory.inventory_digest)
             self.assertEqual(json.loads(store.read(repository, inventory.inventory_digest))["candidate_sha"], self.candidate)
+
+    def test_profile_exports_public_safe_capture_time_evidence_without_a_provider(self):
+        source = self.source()
+        item = self.item("item/private-looking", "task-a")
+        source_binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,))
+        graph_binding = DependencyGraphBinding(self.candidate, self.policy, self.configuration)
+        graph = GraphSnapshot(
+            "graph-117", graph_binding,
+            (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
+        )
+        capture = digest("capture-plan")
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
+        host = ConfiguredSourceHostInputs("b" * 40, source_binding, graph, "configured-source-case", 71, capture, reader)
+        plan = SimpleNamespace(candidate_sha=self.candidate, case_id=host.case_id, plan_digest=capture, ready_at=71)
+        binding = SimpleNamespace(
+            profile="roundwright-shadow-profile/configured-source-ingestion/v1", case_id=host.case_id,
+            candidate_sha=self.candidate, ready_at=71, plan=plan,
+            components=SimpleNamespace(**dict(zip(("producer_identity", "exporter_identity", "comparator_identity"), configured_source_component_identities(), strict=True))),
+            execution_context=SimpleNamespace(value=host, identity=host.observation_identity),
+            execution_context_input_digest=host.observation_identity,
+        )
+        with patch("roundwright.external_validation._harness_executor", return_value=Harness):
+            adapter = ConfiguredSourceIngestionAdapter(host)
+            adapter.validate(binding)
+            execution = adapter.execute(binding)
+            evidence = adapter.project(binding, execution)
+            comparison = adapter.compare(binding, evidence)
+            self.assertEqual((execution.mutation_count, comparison.status), (0, "pass"))
+            self.assertEqual(evidence["ready_at"], 71)
+            self.assertNotIn("item/private-looking", json.dumps(evidence))
+            self.assertEqual(evidence["configured_source_ingestion"]["zero_mutation_proof"]["provider_dispatch_count"], 0)
+            changed = dict(evidence); changed["ready_at"] = 72
+            self.assertEqual(adapter.compare(binding, changed).status, "fail")
+            self.assertEqual(configured_source_capture_plan(host)["observation_identity"], host.observation_identity)
 
 
 if __name__ == "__main__":

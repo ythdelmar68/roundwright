@@ -25,6 +25,7 @@ from .shadow import (
     INTEGRATED_BOUNDARY_PROFILE,
     PHASE_3_QUALIFICATION_PROFILE,
     CROSS_ENVIRONMENT_CANARY_PROFILE,
+    CONFIGURED_SOURCE_INGESTION_PROFILE,
     EvidenceRole,
     FormalReviewRoundReference,
     LifecycleAttempt,
@@ -74,6 +75,10 @@ from .cross_environment import (
     compare_cross_environment_evidence,
     is_safe_cross_environment_public_string,
     semantic_read_back,
+)
+from .configured_source import (
+    ConfiguredSourceError, ConfiguredSourceHostInputs, ConfiguredSourceIngestionAdapter,
+    configured_source_capture_plan,
 )
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
@@ -4761,7 +4766,7 @@ class CrossEnvironmentCanaryAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | DependencyReviewAttemptAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter:
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | DependencyReviewAttemptAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter | ConfiguredSourceIngestionAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
@@ -4785,6 +4790,10 @@ def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAda
     if profile_id == CROSS_ENVIRONMENT_CANARY_PROFILE:
         raise ExternalValidationAdapterError(
             "cross-environment qualification requires the repository-hosted V2 entrypoint"
+        )
+    if profile_id == CONFIGURED_SOURCE_INGESTION_PROFILE:
+        raise ExternalValidationAdapterError(
+            "configured source ingestion requires the product-hosted V2 entrypoint"
         )
     raise ExternalValidationAdapterError("executor profile is unsupported")
 
@@ -5005,6 +5014,59 @@ def run_phase_3_qualification_profile(mode: Literal["validate", "execute"], requ
         raise
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ExternalValidationAdapterError("phase-3 qualification hosted validate binding is invalid") from error
+
+
+def run_configured_source_ingestion_profile(
+    mode: Literal["validate", "execute"],
+    request_value: Mapping[str, Any],
+    store_root: Path,
+    host_inputs: ConfiguredSourceHostInputs,
+    *,
+    expected_readiness_digest: str | None = None,
+) -> object:
+    """Run #117 only through one product-hosted reviewed Harness entrypoint.
+
+    Validation binds the V2 request and typed inputs without reading a source.
+    In execute mode the adapter performs the one bounded read selected by that
+    same request; callers cannot substitute a synthetic inventory or a second
+    candidate wrapper.
+    """
+
+    harness = _harness_executor()
+    try:
+        request = harness.ExecutorRequest.parse(request_value)
+        if (
+            mode not in {"validate", "execute"}
+            or type(host_inputs) is not ConfiguredSourceHostInputs
+            or not isinstance(store_root, Path)
+            or request.schema != "roundwright-harness-profile-executor-request/v2"
+            or request.capture_plan["profile"] != CONFIGURED_SOURCE_INGESTION_PROFILE
+            or not _canonical_json_equivalent(request.capture_plan, configured_source_capture_plan(host_inputs))
+            or not _canonical_json_equivalent(request.execution_context, host_inputs.execution_context())
+            or (mode == "validate" and expected_readiness_digest is not None)
+            or (mode == "execute" and _DIGEST.fullmatch(expected_readiness_digest or "") is None)
+        ):
+            raise ValueError
+        plan = harness.prepare_capture(request.capture_plan)
+        if (
+            (plan.profile, plan.case_id, plan.candidate_sha, plan.plan_digest, plan.ready_at)
+            != (
+                CONFIGURED_SOURCE_INGESTION_PROFILE, host_inputs.case_id,
+                host_inputs.binding.candidate_sha, host_inputs.capture_plan_digest,
+                host_inputs.ready_at,
+            )
+        ):
+            raise ValueError
+        return harness.run_profile_executor(
+            mode, request_value, ConfiguredSourceIngestionAdapter(host_inputs), store_root,
+            expected_readiness_digest=expected_readiness_digest,
+        )
+    except (ConfiguredSourceError, ExternalValidationAdapterError):
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError(
+            "configured source ingestion hosted entrypoint binding is invalid"
+        ) from error
 
 
 def run_cross_environment_canary_profile(

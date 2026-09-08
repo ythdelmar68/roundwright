@@ -18,6 +18,7 @@ from typing import Protocol
 
 from .configuration import RepositoryIdentity
 from .dependency_graph import DependencyGraphBinding, GraphSnapshot
+from .shadow import CONFIGURED_SOURCE_INGESTION_PROFILE, shadow_evidence_profile
 from .state import _open_writable_connection, database_path
 
 
@@ -26,7 +27,9 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _TOKEN = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
 _PUBLIC_ID = re.compile(r"[a-z][a-z0-9._/-]{0,255}\Z")
 _CURSOR = re.compile(r"[A-Za-z0-9._~-]{1,256}\Z")
-SOURCE_INGESTION_PROFILE = "roundwright-shadow-profile/configured-source-ingestion/v1"
+SOURCE_INGESTION_PROFILE = CONFIGURED_SOURCE_INGESTION_PROFILE
+CONFIGURED_SOURCE_EVIDENCE_SCHEMA = "roundwright-configured-source-evidence/v1"
+CONFIGURED_SOURCE_EXECUTION_CONTEXT_SCHEMA = "roundwright-configured-source-ingestion-context/v1"
 
 
 class ConfiguredSourceError(ValueError):
@@ -361,3 +364,304 @@ def _digest_value(value: object) -> str:
     return "sha256:" + hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     ).hexdigest()
+
+
+# These identities are part of the selected profile contract.  They are not
+# loaded from a source configuration or an adapter, so neither can widen the
+# capture surface.
+CONFIGURED_SOURCE_PRODUCER_IDENTITY = _digest_value(
+    {"schema": CONFIGURED_SOURCE_EVIDENCE_SCHEMA, "component": "typed-read-only-configured-source-reader"}
+)
+CONFIGURED_SOURCE_EXPORTER_IDENTITY = _digest_value(
+    {"schema": CONFIGURED_SOURCE_EVIDENCE_SCHEMA, "component": "public-safe-normalized-inventory-exporter"}
+)
+CONFIGURED_SOURCE_COMPARATOR_IDENTITY = _digest_value(
+    {"schema": CONFIGURED_SOURCE_EVIDENCE_SCHEMA, "component": "capture-time-configured-source-comparator"}
+)
+
+
+def configured_source_component_identities() -> tuple[str, str, str]:
+    """Return the exact producer/exporter/comparator identities for #117."""
+
+    return (
+        CONFIGURED_SOURCE_PRODUCER_IDENTITY,
+        CONFIGURED_SOURCE_EXPORTER_IDENTITY,
+        CONFIGURED_SOURCE_COMPARATOR_IDENTITY,
+    )
+
+
+@dataclass(frozen=True)
+class ConfiguredSourceHostInputs:
+    """Typed product inputs for one future live, read-only observation.
+
+    Construction binds only public configuration, graph, and time facts.  The
+    adapter is deliberately not called until a reviewed Harness executes the
+    profile; this makes validate mode incapable of opening a source read.
+    """
+
+    base_sha: str
+    binding: SourceIngestionBinding
+    graph: GraphSnapshot
+    case_id: str
+    ready_at: int
+    capture_plan_digest: str
+    source_adapter: ConfiguredSourceAdapter
+    unresolved_owner_member_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        expected = DependencyGraphBinding(
+            self.binding.candidate_sha, self.binding.policy_digest, self.binding.configuration_digest,
+        ) if type(self.binding) is SourceIngestionBinding else None
+        if (
+            not _SHA.fullmatch(self.base_sha) or type(self.binding) is not SourceIngestionBinding
+            or type(self.graph) is not GraphSnapshot or self.graph.binding != expected
+            or not _TOKEN.fullmatch(self.case_id) or type(self.ready_at) is not int or self.ready_at < 0
+            or not _DIGEST_PATTERN.fullmatch(self.capture_plan_digest)
+            or not callable(getattr(self.source_adapter, "read", None))
+            or type(self.unresolved_owner_member_ids) is not tuple
+            or any(not _TOKEN.fullmatch(member) for member in self.unresolved_owner_member_ids)
+            or len(set(self.unresolved_owner_member_ids)) != len(self.unresolved_owner_member_ids)
+        ):
+            raise ConfiguredSourceError("configured source host inputs are invalid")
+        # This lookup also proves that the profile is registered with the
+        # immutable Shadow capture-readiness registry.
+        if shadow_evidence_profile(SOURCE_INGESTION_PROFILE).capture_mode.value != "terminal-snapshot":
+            raise ConfiguredSourceError("configured source profile is unavailable")
+
+    @property
+    def observation_identity(self) -> str:
+        return _digest_value(self.execution_context())
+
+    def execution_context(self) -> dict[str, object]:
+        return {
+            "schema": CONFIGURED_SOURCE_EXECUTION_CONTEXT_SCHEMA,
+            "base_sha": self.base_sha,
+            "candidate_sha": self.binding.candidate_sha,
+            "policy_digest": self.binding.policy_digest,
+            "configuration_digest": self.binding.configuration_digest,
+            "configured_sources": [source.payload() for source in sorted(self.binding.configured_sources, key=lambda item: item.public_identity)],
+            "source_set_digest": self.binding.source_set_digest,
+            "graph_digest": self.graph.graph_digest,
+            "case_id": self.case_id,
+            "ready_at": self.ready_at,
+            "capture_plan_digest": self.capture_plan_digest,
+            "unresolved_owner_member_ids": list(self.unresolved_owner_member_ids),
+        }
+
+
+@dataclass(frozen=True)
+class ConfiguredSourceExecution:
+    inventory: SourceInventory
+    selection: RunnableSelection
+
+    def __post_init__(self) -> None:
+        if type(self.inventory) is not SourceInventory or type(self.selection) is not RunnableSelection or self.selection.inventory_digest != self.inventory.inventory_digest:
+            raise ConfiguredSourceError("configured source execution is invalid")
+
+
+def configured_source_capture_plan(inputs: ConfiguredSourceHostInputs) -> dict[str, object]:
+    """Construct the sole public V2 capture-plan input for the selected lane."""
+
+    if type(inputs) is not ConfiguredSourceHostInputs:
+        raise ConfiguredSourceError("configured source host inputs are invalid")
+    producer, exporter, comparator = configured_source_component_identities()
+    return {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": SOURCE_INGESTION_PROFILE,
+        "case_id": inputs.case_id,
+        "candidate_sha": inputs.binding.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "observation_identity": inputs.observation_identity,
+    }
+
+
+def _configured_source_binding_identity(binding: object) -> str:
+    try:
+        value = {
+            "schema": CONFIGURED_SOURCE_EVIDENCE_SCHEMA, "profile": binding.profile,
+            "case_id": binding.case_id, "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at, "capture_plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ConfiguredSourceError("configured source executor binding is invalid") from error
+    if (
+        value["profile"] != SOURCE_INGESTION_PROFILE or not _TOKEN.fullmatch(value["case_id"])
+        or not _SHA.fullmatch(value["candidate_sha"]) or type(value["ready_at"]) is not int or value["ready_at"] < 0
+        or not _DIGEST_PATTERN.fullmatch(value["capture_plan_digest"])
+    ):
+        raise ConfiguredSourceError("configured source executor binding is invalid")
+    return _digest_value(value)
+
+
+def _source_execution_context(binding: object, inputs: ConfiguredSourceHostInputs) -> ConfiguredSourceHostInputs:
+    try:
+        context = binding.execution_context
+        value = context.value
+        input_digest = binding.execution_context_input_digest
+        plan = binding.plan
+    except AttributeError as error:
+        raise ConfiguredSourceError("configured source execution context is unavailable") from error
+    if (
+        type(value) is not ConfiguredSourceHostInputs or value != inputs
+        or context.identity != inputs.observation_identity
+        or input_digest != _digest_value(inputs.execution_context())
+        or (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at)
+        != (inputs.binding.candidate_sha, inputs.case_id, inputs.capture_plan_digest, inputs.ready_at)
+    ):
+        raise ConfiguredSourceError("configured source execution context has drifted")
+    return value
+
+
+def configured_source_evidence(
+    binding: object, execution: ConfiguredSourceExecution,
+) -> dict[str, object]:
+    """Export only the selected lane's public-safe terminal projection."""
+
+    identity = _configured_source_binding_identity(binding)
+    inventory, selection = execution.inventory, execution.selection
+    decisions = [
+        {"opaque_id": item.opaque_id, "state": item.state.value, "blockers": list(item.blockers)}
+        for item in selection.decisions
+    ]
+    return {
+        "schema": "roundwright-shadow-case/v2", "profile": SOURCE_INGESTION_PROFILE,
+        "ready_at": binding.ready_at, "case_id": binding.case_id,
+        "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+        "configured_source_ingestion": {
+            "schema": CONFIGURED_SOURCE_EVIDENCE_SCHEMA,
+            "binding_identity": identity,
+            "producer_identity": CONFIGURED_SOURCE_PRODUCER_IDENTITY,
+            "exporter_identity": CONFIGURED_SOURCE_EXPORTER_IDENTITY,
+            "comparator_identity": CONFIGURED_SOURCE_COMPARATOR_IDENTITY,
+            "source_set_digest": inventory.binding.source_set_digest,
+            "source_content_digests": [
+                {"public_identity": source, "content_digest": digest}
+                for source, digest in inventory.source_content_digests
+            ],
+            "normalized_inventory_digest": inventory.inventory_digest,
+            "graph_digest": selection.graph_digest,
+            "selection_decisions": decisions,
+            "selection_digest": _digest_value(decisions),
+            "runnable_ids": list(selection.runnable_ids),
+            "zero_mutation_proof": {
+                "source_mutation_count": 0, "git_mutation_count": 0,
+                "github_mutation_count": 0, "provider_dispatch_count": 0,
+            },
+        },
+    }
+
+
+class ConfiguredSourceIngestionAdapter:
+    """Product-hosted Harness adapter for the configured-source terminal lane."""
+
+    profile_id = SOURCE_INGESTION_PROFILE
+
+    def __init__(self, inputs: ConfiguredSourceHostInputs | None = None) -> None:
+        if inputs is not None and type(inputs) is not ConfiguredSourceHostInputs:
+            raise ConfiguredSourceError("configured source adapter inputs are invalid")
+        self._inputs = inputs
+
+    @property
+    def component_identities(self) -> object:
+        from .external_validation import _harness_executor
+        return _harness_executor().ProfileComponentIdentities(*configured_source_component_identities())
+
+    def prepare_execution_context(self, preparation: object) -> object:
+        from .external_validation import _harness_executor
+        inputs = self._require_inputs()
+        try:
+            if (
+                preparation.descriptor != inputs.execution_context()
+                or preparation.input_digest != _digest_value(inputs.execution_context())
+                or preparation.components != self.component_identities
+                or (preparation.plan.candidate_sha, preparation.plan.case_id, preparation.plan.plan_digest, preparation.plan.ready_at)
+                != (inputs.binding.candidate_sha, inputs.case_id, inputs.capture_plan_digest, inputs.ready_at)
+            ):
+                raise ValueError
+        except (AttributeError, ValueError) as error:
+            raise ConfiguredSourceError("configured source execution context is invalid") from error
+        return _harness_executor().ProfileExecutionContext(inputs.observation_identity, inputs)
+
+    def validate(self, binding: object) -> None:
+        inputs = self._require_inputs()
+        _configured_source_binding_identity(binding)
+        _source_execution_context(binding, inputs)
+        try:
+            actual = (
+                binding.components.producer_identity, binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ConfiguredSourceError("configured source components are invalid") from error
+        if actual != configured_source_component_identities():
+            raise ConfiguredSourceError("configured source components have drifted")
+
+    def execute(self, binding: object) -> object:
+        self.validate(binding)
+        inputs = self._require_inputs()
+        # This is the only source-read point.  Validate, compare, and project
+        # never invoke an adapter, provider, Git, or GitHub operation.
+        inventory = scan_configured_sources(inputs.binding, inputs.source_adapter)
+        selection = select_runnable_work(
+            inventory, inputs.graph, unresolved_owner_member_ids=inputs.unresolved_owner_member_ids,
+        )
+        execution = ConfiguredSourceExecution(inventory, selection)
+        from .external_validation import _harness_executor
+        return _harness_executor().ProfileExecution(execution, mutation_count=0)
+
+    def project(self, binding: object, execution: object) -> dict[str, object]:
+        self.validate(binding)
+        try:
+            if execution.mutation_count != 0 or type(execution.value) is not ConfiguredSourceExecution:
+                raise ValueError
+        except (AttributeError, ValueError) as error:
+            raise ConfiguredSourceError("configured source execution has drifted") from error
+        return configured_source_evidence(binding, execution.value)
+
+    def compare(self, binding: object, evidence: object) -> object:
+        self.validate(binding)
+        status = "pass" if _valid_configured_source_evidence(binding, evidence) else "fail"
+        from .external_validation import _harness_executor
+        return _harness_executor().ProfileComparison(status, _digest_value({
+            "schema": CONFIGURED_SOURCE_EVIDENCE_SCHEMA, "status": status,
+            "ready_at": binding.ready_at,
+            "expected_binding_identity": _configured_source_binding_identity(binding),
+            "observed_identity": _digest_value(evidence),
+        }))
+
+    def _require_inputs(self) -> ConfiguredSourceHostInputs:
+        if type(self._inputs) is not ConfiguredSourceHostInputs:
+            raise ConfiguredSourceError("configured source profile requires product-hosted inputs")
+        return self._inputs
+
+
+def _valid_configured_source_evidence(binding: object, evidence: object) -> bool:
+    """Compare a sealed terminal projection without a second live source read."""
+
+    try:
+        value = evidence
+        if (
+            type(value) is not dict or set(value) != {
+                "schema", "profile", "ready_at", "case_id", "candidate_sha", "capture_plan_digest", "configured_source_ingestion",
+            } or (value["schema"], value["profile"], value["ready_at"], value["case_id"], value["candidate_sha"], value["capture_plan_digest"])
+            != ("roundwright-shadow-case/v2", SOURCE_INGESTION_PROFILE, binding.ready_at, binding.case_id, binding.candidate_sha, binding.plan.plan_digest)
+        ):
+            return False
+        lane = value["configured_source_ingestion"]
+        zero = lane["zero_mutation_proof"]
+        decisions = lane["selection_decisions"]
+        return (
+            type(lane) is dict and lane["schema"] == CONFIGURED_SOURCE_EVIDENCE_SCHEMA
+            and lane["binding_identity"] == _configured_source_binding_identity(binding)
+            and (lane["producer_identity"], lane["exporter_identity"], lane["comparator_identity"])
+            == configured_source_component_identities()
+            and type(lane["source_content_digests"]) is list and type(decisions) is list
+            and lane["selection_digest"] == _digest_value(decisions)
+            and type(lane["normalized_inventory_digest"]) is str and _DIGEST_PATTERN.fullmatch(lane["normalized_inventory_digest"])
+            and all(zero[name] == 0 for name in ("source_mutation_count", "git_mutation_count", "github_mutation_count", "provider_dispatch_count"))
+        )
+    except (KeyError, TypeError, AttributeError):
+        return False

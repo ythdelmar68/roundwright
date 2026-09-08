@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -442,12 +443,19 @@ class ResolvedConfigurationBinding:
             if type(material) is not dict or json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != self.canonical_material or self.digest != _digest(material):
                 raise ValueError
             base_keys = {"schema_version", "worker", "dependency_review", "supervisor_attempt_profiles", "paths", "review", "trusted_review_floor", "sources"}
+            configured_source_keys = base_keys | {"configured_sources"}
             if set(material) not in (base_keys, base_keys | {"trusted_floor_evidence"}) or set(material["paths"]) != {"repository_root", "cache_directory"}:
-                raise ValueError
+                # Earlier bindings did not contain the closed source allowlist.
+                # They remain readable for unrelated historical review receipts,
+                # but cannot be used to resolve configured-source authority.
+                if set(material) not in (configured_source_keys, configured_source_keys | {"trusted_floor_evidence"}) or set(material["paths"]) != {"repository_root", "cache_directory"}:
+                    raise ValueError
             policy = material["review"]
             profiles = tuple(_digest(item) for item in material["supervisor_attempt_profiles"])
             sources = {name: value.value for name, value in self.sources.items()}
             expected_source_keys = {"repository_root", "cache_directory", "roles.worker", "roles.dependency_review", "roles.supervisor.attempt_profiles", "review.complete_rounds", "review.max_rounds", "review.max_supervisor_attempts_per_round", "review.on_final_findings"}
+            if "configured_sources" in material:
+                expected_source_keys = expected_source_keys | {"configured_sources"}
             if set(material["sources"]) != expected_source_keys or set(sources) != expected_source_keys or material["schema_version"] != self.schema_version or _digest(material["worker"]) != self.worker_profile_identity or _digest(material["dependency_review"]) != self.dependency_review_profile_identity or profiles != self.supervisor_profile_identities or len(set(profiles)) != len(profiles) or material["sources"] != sources or material["review"] != _review_policy_payload(self.review_policy) or material["trusted_review_floor"] != _review_policy_payload(self.trusted_review_floor) or material["paths"]["repository_root"] != self.repository_root_identity or material["paths"]["cache_directory"] != self.cache_directory_identity:
                 raise ValueError
             self.review_policy.enforce_floor(self.trusted_review_floor)
@@ -477,6 +485,22 @@ class ResolvedConfigurationBinding:
             policy.complete_rounds, policy.max_rounds, policy.max_supervisor_attempts_per_round,
             policy.on_final_findings.value, policy_digest,
         )
+
+    def configured_source_allowlist(self) -> tuple[dict[str, object], ...]:
+        """Return the exact canonical source material, never ambient input.
+
+        The typed ingestion boundary is intentionally the only consumer which
+        turns this material into source objects.  A legacy binding has no
+        allowlist and consequently cannot authorize a source read.
+        """
+
+        try:
+            value = json.loads(self.canonical_material)["configured_sources"]
+            if type(value) is not list or any(type(item) is not dict for item in value):
+                raise ValueError
+            return tuple({str(key): item[key] for key in item} for item in value)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ConfigurationError("configured source allowlist is unavailable") from error
 
     @property
     def trusted_floor_source_identity(self) -> str | None:
@@ -554,6 +578,7 @@ class Configuration:
     dependency_review: EffectiveValue[ProviderProfile]
     supervisor_attempt_profiles: EffectiveValue[tuple[ProviderProfile, ...]]
     review: Mapping[str, EffectiveValue[object]]
+    configured_sources: EffectiveValue[tuple[dict[str, object], ...]]
     schema_version: str = _SCHEMA_VERSION
     repository_configuration_root: Path | None = None
     trusted_review_floor: ReviewPolicy | None = None
@@ -584,6 +609,7 @@ class Configuration:
             "roles.supervisor.attempt_profiles": self.supervisor_attempt_profiles.source,
         }
         values.update({f"review.{name}": value.source for name, value in self.review.items()})
+        values["configured_sources"] = self.configured_sources.source
         return values
 
     @property
@@ -602,6 +628,7 @@ class Configuration:
                 name: value.value.value if isinstance(value.value, Enum) else value.value
                 for name, value in sorted(self.review.items())
             },
+            "configured_sources": list(self.configured_sources.value),
             "trusted_review_floor": _review_policy_payload(trusted_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         })
@@ -615,6 +642,7 @@ class Configuration:
             "supervisor_attempt_profiles": [_profile_payload(profile) for profile in self.supervisor_attempt_profiles.value],
             "paths": {"repository_root": None if self.repository_root.value is None else _digest({"path": os.fspath(self.repository_root.value)}), "cache_directory": _digest({"path": os.fspath(self.cache_directory.value)})},
             "review": _review_policy_payload(self.review_policy),
+            "configured_sources": list(self.configured_sources.value),
             "trusted_review_floor": _review_policy_payload(trusted_floor),
             "sources": {name: value.value for name, value in sorted(self.sources.items())},
         }
@@ -737,6 +765,7 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     dependency_review = _parse_profile(raw["roles"]["dependency_review"], name_required=False)
     supervisors = tuple(_parse_profile(value, name_required=True) for value in raw["roles"]["supervisor"]["attempt_profiles"])
     review = _parse_review(raw["review"])
+    configured_sources = _parse_configured_sources(raw["runtime"]["configured_sources"])
     if trusted_review_floor is not None:
         review.enforce_floor(trusted_review_floor)
     if len(supervisors) != review.max_supervisor_attempts_per_round:
@@ -750,6 +779,7 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
         dependency_review=EffectiveValue(dependency_review, sources["roles.dependency_review"]),
         supervisor_attempt_profiles=EffectiveValue(supervisors, sources["roles.supervisor.attempt_profiles"]),
         review={name: EffectiveValue(value, sources[f"review.{name}"]) for name, value in review.__dict__.items()},
+        configured_sources=EffectiveValue(configured_sources, sources["configured_sources"]),
         repository_configuration_root=repository_config_root,
         trusted_review_floor=trusted_review_floor,
     )
@@ -953,8 +983,10 @@ def _validate_document(document: object, *, complete: bool) -> None:
         raise ConfigurationError("packaged runtime defaults are incomplete")
     runtime = document.get("runtime")
     if runtime is not None:
-        if type(runtime) is not dict or set(runtime) != {"schema_version"} or runtime.get("schema_version") != _SCHEMA_VERSION:
+        if type(runtime) is not dict or set(runtime) not in ({"schema_version"}, {"schema_version", "configured_sources"}) or runtime.get("schema_version") != _SCHEMA_VERSION:
             raise ConfigurationError("configuration schema version is unsupported")
+        if "configured_sources" in runtime:
+            _parse_configured_sources(runtime["configured_sources"])
     elif complete:
         raise ConfigurationError("configuration schema version is missing")
     paths = document.get("paths")
@@ -996,6 +1028,31 @@ def _validate_profile_document(value: object, *, name_required: bool) -> None:
         raise ConfigurationError("role profile data is partial, aliased, or unsupported")
 
 
+def _parse_configured_sources(value: object) -> tuple[dict[str, object], ...]:
+    """Validate the closed, public-safe configured-source allowlist."""
+
+    identity = re.compile(r"[a-z][a-z0-9._/-]{0,255}\Z")
+    if type(value) is not list:
+        raise ConfigurationError("configured source allowlist is invalid")
+    parsed: list[dict[str, object]] = []
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item) != {"source_type", "public_identity", "max_pages", "max_items"}
+            or item["source_type"] not in {"issue-list", "task-feed"}
+            or type(item["public_identity"]) is not str
+            or identity.fullmatch(item["public_identity"]) is None
+            or "*" in item["public_identity"]
+            or type(item["max_pages"]) is not int or not 1 <= item["max_pages"] <= 1000
+            or type(item["max_items"]) is not int or not 1 <= item["max_items"] <= 100_000
+        ):
+            raise ConfigurationError("configured source allowlist is invalid")
+        parsed.append(dict(item))
+    if len({item["public_identity"] for item in parsed}) != len(parsed):
+        raise ConfigurationError("configured source allowlist is invalid")
+    return tuple(parsed)
+
+
 def _merge_runtime(current: dict[str, Any], sources: dict[str, ConfigurationSource], update: dict[str, Any], source: ConfigurationSource) -> None:
     if not update:
         return
@@ -1014,12 +1071,16 @@ def _merge_runtime(current: dict[str, Any], sources: dict[str, ConfigurationSour
         current["review"].update(update["review"])
         for name in update["review"]:
             sources[f"review.{name}"] = source
+    if "runtime" in update and "configured_sources" in update["runtime"]:
+        current["runtime"]["configured_sources"] = update["runtime"]["configured_sources"]
+        sources["configured_sources"] = source
 
 
 def _mark_all(sources: dict[str, ConfigurationSource], runtime: dict[str, Any], source: ConfigurationSource) -> None:
     sources["roles.worker"] = source
     sources["roles.dependency_review"] = source
     sources["roles.supervisor.attempt_profiles"] = source
+    sources["configured_sources"] = source
     for name in runtime["review"]:
         sources[f"review.{name}"] = source
 

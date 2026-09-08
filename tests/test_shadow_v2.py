@@ -32,6 +32,7 @@ from roundwright.shadow import (
     AppendOnlyEvidenceStore,
     AttemptCommitReference,
     CaptureMode,
+    CONFIGURED_SOURCE_INGESTION_PROFILE,
     CandidateCommitReference,
     ComparisonOutcome,
     CandidateArtifactProjection,
@@ -1065,10 +1066,11 @@ class ShadowV2Tests(unittest.TestCase):
         integrated_boundary = shadow_evidence_profile(INTEGRATED_BOUNDARY_PROFILE)
         qualification_consumer = shadow_evidence_profile("roundwright-shadow-profile/phase-3-qualification/v1")
         cross_environment = shadow_evidence_profile("roundwright-shadow-profile/cross-environment-canary/v1")
+        configured_sources = shadow_evidence_profile(CONFIGURED_SOURCE_INGESTION_PROFILE)
         self.assertEqual(hosted_checks.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(
             shadow_evidence_profiles(),
-            (profile, worker, synthetic, provider_attempts, dependency_reviews, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary, qualification_consumer, cross_environment),
+            (profile, worker, synthetic, provider_attempts, dependency_reviews, hosted_checks, live_lifecycle, read_only_external_observation, integrated_boundary, qualification_consumer, cross_environment, configured_sources),
         )
         self.assertEqual(profile.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
         self.assertEqual(profile.event_kinds, ("provenance-decision",))
@@ -1099,6 +1101,9 @@ class ShadowV2Tests(unittest.TestCase):
         self.assertEqual(qualification_consumer.event_kinds, ("qualification-inventory", "qualification-decision"))
         self.assertEqual(cross_environment.capture_mode, CaptureMode.SYNTHETIC_ONE_SHOT)
         self.assertEqual(cross_environment.event_kinds, ("cross-environment-profile-qualification",))
+        self.assertEqual(configured_sources.capture_mode, CaptureMode.TERMINAL_SNAPSHOT)
+        self.assertEqual(configured_sources.arm_before, "before-first-selected-live-configured-source-observation")
+        self.assertEqual(configured_sources.event_kinds, ("configured-source-inventory", "configured-source-selection", "zero-mutation-readback"))
         with self.assertRaises(ShadowV2Error):
             shadow_evidence_profile("roundwright-shadow-profile/future/v1")
 

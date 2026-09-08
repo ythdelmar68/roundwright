@@ -13,13 +13,15 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from roundwright.configuration import RepositoryIdentity
+from roundwright.configuration import RepositoryIdentity, load_configuration
 from roundwright.configured_source import (
     ConfiguredSource, ConfiguredSourceError, ConfiguredSourceStore, SourceIngestionBinding,
     ConfiguredSourceHostInputs, ConfiguredSourceIngestionAdapter, SourceItem, SourcePage,
-    SourceType, TaskFeedReadHost, TrustedConfiguredSourceReadHost, configured_source_capture_plan,
+    SourceType, TrustedConfiguredSourceReadHost, configured_source_capture_plan,
     configured_source_component_identities, configured_source_executor_request,
     _seal_configured_source_authority, create_configured_source_read_capability,
+    create_task_feed_read_host,
+    resolve_source_ingestion_binding,
     scan_configured_sources, select_runnable_work,
 )
 from roundwright.dependency_graph import DependencyGraphBinding, GraphEdge, GraphMember, GraphSnapshot
@@ -157,11 +159,11 @@ class ConfiguredSourceTests(unittest.TestCase):
         return scan_configured_sources(SourceIngestionBinding(self.candidate, self.policy, self.configuration, tuple(sources)), Adapter(pages))
 
     @staticmethod
-    def source_host(authority, reader, *, capability="read-capability"):
+    def source_host(authority, reader):
         return TrustedConfiguredSourceReadHost(
             authority,
             create_configured_source_read_capability(
-                authority, digest(capability), task_feed=TaskFeedReadHost(reader.read),
+                authority, task_feed=create_task_feed_read_host(reader.read),
             ),
         )
 
@@ -176,6 +178,24 @@ class ConfiguredSourceTests(unittest.TestCase):
         loop = SourcePage(source, None, "same", ())
         with self.assertRaises(ConfiguredSourceError):
             self.inventory((source,), {(source.public_identity, None): loop, (source.public_identity, "same"): SourcePage(source, "same", "same", ())})
+
+    def test_production_binding_derives_only_the_resolved_typed_allowlist(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "configured-sources.toml"
+            config.write_text(
+                "[runtime]\n"
+                "schema_version = \"roundwright-runtime/v1\"\n"
+                "configured_sources = [{ source_type = \"task-feed\", public_identity = \"team/queue\", max_pages = 2, max_items = 10 }]\n",
+                encoding="utf-8",
+            )
+            resolved = load_configuration(cwd=root, user_config=config, environment={}, home=root / "home").pin()
+        binding = resolve_source_ingestion_binding(resolved, self.candidate)
+        self.assertEqual(binding.configured_sources, (self.source(),))
+        self.assertEqual(binding.configuration_digest, resolved.digest)
+        self.assertEqual(binding.policy_digest, "sha256:" + resolved.runtime_binding().review_policy_digest)
+        with self.assertRaises(ConfiguredSourceError):
+            resolve_source_ingestion_binding(resolved, "not-a-sha")
 
     def test_only_mechanically_identical_items_merge_and_content_collision_blocks(self):
         first, second = self.source("team/one"), self.source("team/two")
@@ -307,7 +327,7 @@ class ConfiguredSourceTests(unittest.TestCase):
         )
         changed_capability = ConfiguredSourceHostInputs(
             host.base_sha, authority, host.case_id, host.ready_at,
-            self.source_host(authority, reader, capability="other-capability"), host.recorder_identity, host.store_identity,
+            self.source_host(authority, reader), host.recorder_identity, host.store_identity,
         )
         changed_graph = GraphSnapshot("graph-118", graph.binding, graph.members, graph.edges, graph.proposal_ids)
         changed_graph_authority = _seal_configured_source_authority(binding, changed_graph)

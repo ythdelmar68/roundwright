@@ -11,13 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
-from .configuration import RepositoryIdentity, ResolvedConfigurationBinding
+from .configuration import ConfigurationError, RepositoryIdentity, ResolvedConfigurationBinding
 from .dependency_graph import DependencyGraphBinding, DependencyGraphStore, GraphSnapshot
 from .shadow import CONFIGURED_SOURCE_INGESTION_PROFILE, shadow_evidence_profile
 from .state import _open_writable_connection, database_path
@@ -121,30 +122,66 @@ class ConfiguredSourceAdapter(Protocol):
     def read(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage: ...
 
 
+_CONFIGURED_SOURCE_AUTHORITY_SEAL = object()
+_CONFIGURED_SOURCE_CAPABILITY_SEAL = object()
+_CONFIGURED_SOURCE_ENDPOINT_SEAL = object()
+
+
 @dataclass(frozen=True)
 class IssueListReadHost:
-    """Candidate-owned read capability for explicitly configured issue lists."""
+    """Factory-sealed ISSUE_LIST endpoint over the owner GitHub read boundary."""
 
-    read_page: object
+    read_page: object = field(repr=False, compare=False)
+    endpoint_identity: str = ""
+    _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if not callable(self.read_page):
+        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or not callable(self.read_page) or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity):
             raise ConfiguredSourceError("issue-list read host is invalid")
 
 
 @dataclass(frozen=True)
 class TaskFeedReadHost:
-    """Candidate-owned read capability for explicitly configured task feeds."""
+    """Factory-sealed TASK_FEED endpoint with no command or discovery surface."""
 
-    read_page: object
+    read_page: object = field(repr=False, compare=False)
+    endpoint_identity: str = ""
+    _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if not callable(self.read_page):
+        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or not callable(self.read_page) or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity):
             raise ConfiguredSourceError("task-feed read host is invalid")
 
 
-_CONFIGURED_SOURCE_AUTHORITY_SEAL = object()
-_CONFIGURED_SOURCE_CAPABILITY_SEAL = object()
+def _sealed_page_endpoint(source_type: SourceType, read_page: object) -> tuple[object, str, object]:
+    """Mint one unforgeable public-safe endpoint identity with its reader."""
+
+    if type(source_type) is not SourceType or not callable(read_page):
+        raise ConfiguredSourceError("configured source page endpoint is invalid")
+    nonce = secrets.token_hex(32)
+    return read_page, _digest_value({
+        "schema": "roundwright-configured-source-owner-page-endpoint/v1",
+        "source_type": source_type.value, "nonce": nonce,
+    }), _CONFIGURED_SOURCE_ENDPOINT_SEAL
+
+
+def create_issue_list_read_host(read_page: object) -> IssueListReadHost:
+    """Seal one typed ISSUE_LIST page endpoint owned by the host factory.
+
+    Production implementations call the existing credentialed GitHub read IPC
+    client inside ``read_page``; the callback and its identity cannot be
+    supplied separately to a configured-source caller.
+    """
+
+    callback, identity, seal = _sealed_page_endpoint(SourceType.ISSUE_LIST, read_page)
+    return IssueListReadHost(callback, identity, seal)
+
+
+def create_task_feed_read_host(read_page: object) -> TaskFeedReadHost:
+    """Seal the minimal typed TASK_FEED page endpoint."""
+
+    callback, identity, seal = _sealed_page_endpoint(SourceType.TASK_FEED, read_page)
+    return TaskFeedReadHost(callback, identity, seal)
 
 
 @dataclass(frozen=True)
@@ -217,9 +254,30 @@ def _seal_configured_source_authority(
     return ConfiguredSourceAuthority(binding, graph, configuration, graph_receipt, authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL)
 
 
+def resolve_source_ingestion_binding(
+    configuration: ResolvedConfigurationBinding, candidate_sha: str,
+) -> "SourceIngestionBinding":
+    """Derive the only production source binding from resolved material."""
+
+    if type(configuration) is not ResolvedConfigurationBinding or not _SHA.fullmatch(candidate_sha):
+        raise ConfiguredSourceError("configured source resolved inputs are invalid")
+    try:
+        sources = tuple(ConfiguredSource(
+            SourceType(item["source_type"]), item["public_identity"], item["max_pages"], item["max_items"],
+        ) for item in configuration.configured_source_allowlist())
+    except (ConfigurationError, KeyError, TypeError, ValueError) as error:
+        raise ConfiguredSourceError("configured source allowlist is invalid") from error
+    if not sources:
+        raise ConfiguredSourceError("configured source allowlist is empty")
+    return SourceIngestionBinding(
+        candidate_sha, "sha256:" + configuration.runtime_binding().review_policy_digest,
+        configuration.digest, sources,
+    )
+
+
 def resolve_configured_source_authority(
     repository: RepositoryIdentity, configuration: ResolvedConfigurationBinding,
-    binding: SourceIngestionBinding,
+    candidate_sha: str,
 ) -> ConfiguredSourceAuthority:
     """Read the accepted graph only through the durable product boundaries.
 
@@ -230,11 +288,10 @@ def resolve_configured_source_authority(
 
     if (
         type(repository) is not RepositoryIdentity or type(configuration) is not ResolvedConfigurationBinding
-        or type(binding) is not SourceIngestionBinding
-        or binding.configuration_digest != configuration.digest
-        or binding.policy_digest != "sha256:" + configuration.runtime_binding().review_policy_digest
+        or not _SHA.fullmatch(candidate_sha)
     ):
         raise ConfiguredSourceError("configured source authoritative inputs are invalid")
+    binding = resolve_source_ingestion_binding(configuration, candidate_sha)
     graph_binding = DependencyGraphBinding(
         binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
     )
@@ -250,6 +307,7 @@ class ConfiguredSourceReadCapability:
     """Factory-sealed read-only capability, with no provider command surface."""
 
     binding: SourceIngestionBinding
+    authority_identity: str
     capability_identity: str
     issue_list: IssueListReadHost | None
     task_feed: TaskFeedReadHost | None
@@ -257,9 +315,16 @@ class ConfiguredSourceReadCapability:
 
     def __post_init__(self) -> None:
         required = {source.source_type for source in self.binding.configured_sources} if type(self.binding) is SourceIngestionBinding else set()
+        expected_identity = _digest_value({
+            "schema": "roundwright-configured-source-owner-read-capability/v1",
+            "authority_identity": self.authority_identity,
+            "issue_list_endpoint": None if self.issue_list is None else self.issue_list.endpoint_identity,
+            "task_feed_endpoint": None if self.task_feed is None else self.task_feed.endpoint_identity,
+        })
         if (
             self._seal is not _CONFIGURED_SOURCE_CAPABILITY_SEAL or type(self.binding) is not SourceIngestionBinding
-            or not _DIGEST_PATTERN.fullmatch(self.capability_identity)
+            or not _DIGEST_PATTERN.fullmatch(self.authority_identity)
+            or self.capability_identity != expected_identity
             or (SourceType.ISSUE_LIST in required) != (type(self.issue_list) is IssueListReadHost)
             or (SourceType.TASK_FEED in required) != (type(self.task_feed) is TaskFeedReadHost)
             or (SourceType.ISSUE_LIST not in required and self.issue_list is not None)
@@ -280,7 +345,7 @@ class ConfiguredSourceReadCapability:
 
 
 def create_configured_source_read_capability(
-    authority: ConfiguredSourceAuthority, capability_identity: str, *,
+    authority: ConfiguredSourceAuthority, *,
     issue_list: IssueListReadHost | None = None, task_feed: TaskFeedReadHost | None = None,
 ) -> ConfiguredSourceReadCapability:
     """Bind an owner-resolved typed source capability to exact source bounds.
@@ -289,10 +354,16 @@ def create_configured_source_read_capability(
     provider commands, and mutation surfaces remain outside this product seam.
     """
 
-    if type(authority) is not ConfiguredSourceAuthority or not _DIGEST_PATTERN.fullmatch(capability_identity):
+    if type(authority) is not ConfiguredSourceAuthority:
         raise ConfiguredSourceError("configured source capability inputs are invalid")
+    capability_identity = _digest_value({
+        "schema": "roundwright-configured-source-owner-read-capability/v1",
+        "authority_identity": authority.authority_identity,
+        "issue_list_endpoint": None if issue_list is None else issue_list.endpoint_identity,
+        "task_feed_endpoint": None if task_feed is None else task_feed.endpoint_identity,
+    })
     return ConfiguredSourceReadCapability(
-        authority.binding, capability_identity, issue_list, task_feed, _CONFIGURED_SOURCE_CAPABILITY_SEAL,
+        authority.binding, authority.authority_identity, capability_identity, issue_list, task_feed, _CONFIGURED_SOURCE_CAPABILITY_SEAL,
     )
 
 
@@ -308,7 +379,7 @@ class TrustedConfiguredSourceReadHost:
         self,
         authority: ConfiguredSourceAuthority, capability: ConfiguredSourceReadCapability,
     ) -> None:
-        if type(authority) is not ConfiguredSourceAuthority or type(capability) is not ConfiguredSourceReadCapability or capability.binding != authority.binding:
+        if type(authority) is not ConfiguredSourceAuthority or type(capability) is not ConfiguredSourceReadCapability or capability.binding != authority.binding or capability.authority_identity != authority.authority_identity:
             raise ConfiguredSourceError("trusted configured-source readers are invalid")
         self._authority = authority
         self._capability = capability

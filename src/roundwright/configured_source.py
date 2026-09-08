@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
-from .configuration import RepositoryIdentity
-from .dependency_graph import DependencyGraphBinding, GraphSnapshot
+from .configuration import RepositoryIdentity, ResolvedConfigurationBinding
+from .dependency_graph import DependencyGraphBinding, DependencyGraphStore, GraphSnapshot
 from .shadow import CONFIGURED_SOURCE_INGESTION_PROFILE, shadow_evidence_profile
 from .state import _open_writable_connection, database_path
 
@@ -190,10 +190,10 @@ class ConfiguredSourceAuthority:
             raise ConfiguredSourceError("configured source authority is invalid")
 
 
-def resolve_configured_source_authority(
+def _seal_configured_source_authority(
     binding: SourceIngestionBinding, graph: GraphSnapshot,
 ) -> ConfiguredSourceAuthority:
-    """Create the only product-owned receipt for resolved configuration and graph."""
+    """Internal constructor for a graph that has already been read back."""
 
     expected = DependencyGraphBinding(
         binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
@@ -215,6 +215,34 @@ def resolve_configured_source_authority(
         "configuration_receipt_identity": configuration, "graph_receipt_identity": graph_receipt,
     })
     return ConfiguredSourceAuthority(binding, graph, configuration, graph_receipt, authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL)
+
+
+def resolve_configured_source_authority(
+    repository: RepositoryIdentity, configuration: ResolvedConfigurationBinding,
+    binding: SourceIngestionBinding,
+) -> ConfiguredSourceAuthority:
+    """Read the accepted graph only through the durable product boundaries.
+
+    Callers cannot supply a graph snapshot.  The source binding must agree
+    with the independently resolved configuration before the durable #114
+    graph is read and replay-verified by :class:`DependencyGraphStore`.
+    """
+
+    if (
+        type(repository) is not RepositoryIdentity or type(configuration) is not ResolvedConfigurationBinding
+        or type(binding) is not SourceIngestionBinding
+        or binding.configuration_digest != configuration.digest
+        or binding.policy_digest != "sha256:" + configuration.runtime_binding().review_policy_digest
+    ):
+        raise ConfiguredSourceError("configured source authoritative inputs are invalid")
+    graph_binding = DependencyGraphBinding(
+        binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+    )
+    try:
+        graph = DependencyGraphStore().current(repository, binding=graph_binding)
+    except Exception as error:
+        raise ConfiguredSourceError("configured source accepted graph is unavailable") from error
+    return _seal_configured_source_authority(binding, graph)
 
 
 @dataclass(frozen=True)

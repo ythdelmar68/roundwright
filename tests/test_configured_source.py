@@ -19,7 +19,7 @@ from roundwright.configured_source import (
     ConfiguredSourceHostInputs, ConfiguredSourceIngestionAdapter, SourceItem, SourcePage,
     SourceType, TaskFeedReadHost, TrustedConfiguredSourceReadHost, configured_source_capture_plan,
     configured_source_component_identities, configured_source_executor_request,
-    create_configured_source_read_capability, resolve_configured_source_authority,
+    _seal_configured_source_authority, create_configured_source_read_capability,
     scan_configured_sources, select_runnable_work,
 )
 from roundwright.dependency_graph import DependencyGraphBinding, GraphEdge, GraphMember, GraphSnapshot
@@ -230,7 +230,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = resolve_configured_source_authority(source_binding, graph)
+        authority = _seal_configured_source_authority(source_binding, graph)
         read_host = self.source_host(authority, reader)
         host = ConfiguredSourceHostInputs(
             "b" * 40, authority, "configured-source-case", 71, read_host,
@@ -272,7 +272,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = resolve_configured_source_authority(source_binding, graph)
+        authority = _seal_configured_source_authority(source_binding, graph)
         host = ConfiguredSourceHostInputs(
             "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
             digest("recorder"), digest("store"),
@@ -300,7 +300,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = resolve_configured_source_authority(binding, graph)
+        authority = _seal_configured_source_authority(binding, graph)
         host = ConfiguredSourceHostInputs(
             "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
             digest("recorder"), digest("store"),
@@ -310,7 +310,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             self.source_host(authority, reader, capability="other-capability"), host.recorder_identity, host.store_identity,
         )
         changed_graph = GraphSnapshot("graph-118", graph.binding, graph.members, graph.edges, graph.proposal_ids)
-        changed_graph_authority = resolve_configured_source_authority(binding, changed_graph)
+        changed_graph_authority = _seal_configured_source_authority(binding, changed_graph)
         changed_authority = ConfiguredSourceHostInputs(
             host.base_sha, changed_graph_authority, host.case_id, host.ready_at,
             self.source_host(changed_graph_authority, reader), host.recorder_identity, host.store_identity,
@@ -318,7 +318,7 @@ class ConfiguredSourceTests(unittest.TestCase):
         changed_source = self.source("team/other")
         changed_binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (changed_source,))
         changed_source_graph = GraphSnapshot("graph-119", DependencyGraphBinding(self.candidate, self.policy, self.configuration), graph.members, graph.edges, graph.proposal_ids)
-        changed_source_authority = resolve_configured_source_authority(changed_binding, changed_source_graph)
+        changed_source_authority = _seal_configured_source_authority(changed_binding, changed_source_graph)
         changed_source_reader = Adapter({(changed_source.public_identity, None): SourcePage(changed_source, None, None, (item,))})
         changed_configuration = ConfiguredSourceHostInputs(
             host.base_sha, changed_source_authority, host.case_id, host.ready_at,
@@ -330,7 +330,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             "graph-120", DependencyGraphBinding(moved_candidate, self.policy, self.configuration),
             graph.members, graph.edges, graph.proposal_ids,
         )
-        moved_authority = resolve_configured_source_authority(moved_binding, moved_graph)
+        moved_authority = _seal_configured_source_authority(moved_binding, moved_graph)
         moved_candidate_host = ConfiguredSourceHostInputs(
             host.base_sha, moved_authority, host.case_id, host.ready_at,
             self.source_host(moved_authority, reader), host.recorder_identity, host.store_identity,

@@ -1,8 +1,8 @@
-"""Reviewed native Codex bridge for one no-tools dependency-review turn."""
+"""Reviewed native Codex bridge for one behaviorally tool-silent review turn."""
 from __future__ import annotations
 
+import hashlib
 import importlib
-import inspect
 import json
 import tempfile
 import time
@@ -19,7 +19,34 @@ from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field,
 
 
 _NO_TOOL_INSTRUCTIONS = "Deny all tools, filesystem access, network access, credential access, and repository inspection. Use only the supplied normalized input."
-_NO_TOOLS = ()
+_SAFE_ITEM_TYPES = frozenset({"agentMessage", "reasoning"})
+_TOOL_EVENT_TOKENS = ("tool", "command", "exec", "mcp", "filechange", "websearch")
+
+
+def dependency_review_native_control_contract() -> dict[str, object]:
+    """Return the public-safe native controls bound into every attempt."""
+
+    return {
+        "schema": "roundwright-dependency-review-native-controls/v1",
+        "session_freshness": "fresh-job-session",
+        "input_scope": "immutable-normalized-minimal-subset",
+        "workspace": "isolated-ephemeral",
+        "sandbox": "read-only",
+        "approval_policy": "deny-all",
+        "credential_handling": "sanitized-no-credential-material",
+        "mutation_authority": False,
+        "tool_configuration_override": "none",
+        "tool_use_policy": "behavioral-zero-tool-use",
+        "tool_event_disposition": "terminal-invalid-ineligible",
+    }
+
+
+def dependency_review_native_control_digest() -> str:
+    value = json.dumps(
+        dependency_review_native_control_contract(),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
 def _schema() -> dict[str, object]:
@@ -48,11 +75,13 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
                 factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             else: factory, approval, sandbox, effort = self.factory, self.approval, self.sandbox, self.effort
             codex = factory(); client = codex.__enter__() if hasattr(codex, "__enter__") else codex
-            thread_start = _require_empty_tool_surface_control(client)
+            thread_start = getattr(client, "thread_start", None)
+            if not callable(thread_start):
+                raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
             workspace = tempfile.TemporaryDirectory(prefix="roundwright-dependency-review-")
             thread = thread_start(
                 approval_mode=approval, cwd=workspace.name, developer_instructions=_NO_TOOL_INSTRUCTIONS,
-                ephemeral=True, model=profile.model, sandbox=sandbox, tools=_NO_TOOLS,
+                ephemeral=True, model=profile.model, sandbox=sandbox,
             )
             if not isinstance(getattr(thread, "id", None), str): raise ValueError
             return _Session(thread, codex, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace)
@@ -64,27 +93,6 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
             if workspace is not None: workspace.cleanup()
             if codex is not None: _close(codex)
             raise CodexAdapterError(CodexFailure.UNKNOWN) from None
-
-
-def _require_empty_tool_surface_control(client: object) -> Callable[..., object]:
-    """Return only an SDK endpoint with an explicit, empty-tools control.
-
-    A permissive ``**kwargs`` test double or an opaque ``config`` override is
-    not evidence that the native endpoint withheld its tool surface.
-    """
-
-    thread_start = getattr(client, "thread_start", None)
-    if not callable(thread_start):
-        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-    try:
-        tools = inspect.signature(thread_start).parameters.get("tools")
-    except (TypeError, ValueError):
-        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from None
-    if tools is None or tools.kind not in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}:
-        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-    return thread_start
-
-
 class _Session(NativeDependencyReviewSession):
     def __init__(self, thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, workspace): self.thread, self.codex, self.cwd, self.profile, self.approval, self.sandbox, self.effort, self.completion, self.clock, self.workspace, self.started = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, workspace, False
     def identity(self) -> str: return self.thread.id
@@ -92,7 +100,7 @@ class _Session(NativeDependencyReviewSession):
     def start_turn(self, request: DependencyReviewRequest) -> NativeDependencyReviewTurn:
         if self.started or type(request) is not DependencyReviewRequest: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self.started = True
-        payload = {"schema": "roundwright-dependency-review-native/v1", "capability_contract": "no-tools-self-contained/v1", "instruction": "Return only one dependency proposal for this normalized subset. Do not use tools, inspect repositories, request credentials, or emit prose.", "input": request.input_material, "tools": []}
+        payload = {"schema": "roundwright-dependency-review-native/v1", "capability_contract": "behavioral-zero-tool-use/v1", "instruction": "Return only one dependency proposal for this normalized subset. Do not request or use tools, inspect repositories, request credentials, or emit prose.", "input": request.input_material}
         try: return _Turn(self.thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self.approval, cwd=str(self.cwd), model=self.profile.model, effort=self.effort(self.profile.reasoning_effort.value), output_schema=_schema(), sandbox=self.sandbox), self)
         except Exception: self.close(); raise CodexAdapterError(CodexFailure.UNKNOWN) from None
 
@@ -111,6 +119,15 @@ class _Turn(NativeDependencyReviewTurn):
         try:
             for event in _bounded_events(self.handle.stream(), completion=self.session.completion, clock=self.session.clock, cancel=self.abort):
                 payload = _field(event, "payload") or event
+                if _is_tool_event(event, payload):
+                    return NativeDependencyReviewResponse(
+                        DependencyReviewResultKind.INVALID, reason_code="tool-event-observed",
+                    )
+                if (
+                    _field(event, "method") in {"item/started", "item/completed"}
+                    and _field(payload, "turn_id", "turnId") != _field(self.handle, "id")
+                ):
+                    return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
                 if _field(event, "method") == "turn/completed":
                     turn = _field(payload, "turn")
                     if turn is None or _field(turn, "id") != _field(self.handle, "id") or complete:
@@ -120,7 +137,7 @@ class _Turn(NativeDependencyReviewTurn):
                     if status != "completed": return NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)
                 if _field(event, "method") == "item/completed" and _field(payload, "turn_id", "turnId") == _field(self.handle, "id"):
                     item = _field(_field(payload, "item"), "root") or _field(payload, "item")
-                    if _field(item, "type") not in {"agentMessage", "reasoning"}:
+                    if _field(item, "type") not in _SAFE_ITEM_TYPES:
                         return NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
                     if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer":
                         text = _field(item, "text")
@@ -133,3 +150,18 @@ class _Turn(NativeDependencyReviewTurn):
             return NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, value) if type(value) is dict else NativeDependencyReviewResponse(DependencyReviewResultKind.INVALID)
         except Exception: return NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)
         finally: self.session.close()
+
+
+def _is_tool_event(event: object, payload: object) -> bool:
+    """Fail closed on every native event that can represent tool activity."""
+
+    method = _value(_field(event, "method"))
+    if isinstance(method, str):
+        normalized = "".join(character for character in method.casefold() if character.isalnum())
+        if any(token in normalized for token in _TOOL_EVENT_TOKENS):
+            return True
+        if method in {"item/started", "item/completed"}:
+            item = _field(_field(payload, "item"), "root") or _field(payload, "item")
+            if _field(item, "type") not in _SAFE_ITEM_TYPES:
+                return True
+    return False

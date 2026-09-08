@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -13,10 +15,13 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.codex_dependency_review import (
-    CodexDependencyReviewAdapter, DependencyReviewResultKind, DependencyReviewService,
+    CodexDependencyReviewAdapter, DependencyReviewRequest, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse,
 )
-from roundwright.dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend, _Turn, _schema
+from roundwright.dependency_review_toolbox import (
+    HarnessNativeCodexDependencyReviewBackend, _Turn, _schema,
+    dependency_review_native_control_contract, dependency_review_native_control_digest,
+)
 from roundwright.worker_toolbox import CompletionDeadline
 from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
@@ -113,74 +118,90 @@ class DependencyReviewServiceTests(unittest.TestCase):
         )
         self.assertNotIn("const", str(schema))
 
-    def test_native_bridge_starts_an_ephemeral_isolated_session_with_an_explicit_empty_tool_surface(self) -> None:
-        calls: list[dict[str, object]] = []
+    def test_native_bridge_uses_supported_ephemeral_read_only_controls_without_an_opaque_tools_override(self) -> None:
+        session_calls: list[dict[str, object]] = []
+        turn_calls: list[tuple[dict[str, object], dict[str, object]]] = []
 
-        class Thread: id = "session-116"
+        class Handle:
+            id = "turn-116"
+
+        class Thread:
+            id = "session-116"
+            def turn(self, prompt, **keywords):
+                turn_calls.append((json.loads(prompt), keywords))
+                return Handle()
+
         class Codex:
             def __enter__(self): return self
             def close(self): return None
-            def thread_start(self, *, approval_mode, cwd, developer_instructions, ephemeral, model, sandbox, tools):
-                calls.append({"approval_mode": approval_mode, "cwd": cwd, "developer_instructions": developer_instructions, "ephemeral": ephemeral, "model": model, "sandbox": sandbox, "tools": tools})
+            def thread_start(self, *, approval_mode, cwd, developer_instructions, ephemeral, model, sandbox):
+                session_calls.append({"approval_mode": approval_mode, "cwd": cwd, "developer_instructions": developer_instructions, "ephemeral": ephemeral, "model": model, "sandbox": sandbox})
                 return Thread()
 
         with tempfile.TemporaryDirectory() as temporary:
-            repository, _subset, _binding, profile, _audit = self.setup(Path(temporary))
+            repository, _subset, _binding, profile, audit = self.setup(Path(temporary))
             backend = HarnessNativeCodexDependencyReviewBackend(
                 cwd=repository.root, completion=CompletionDeadline(100, 600), codex_factory=Codex,
                 approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
             )
             session = backend.open_fresh_session(profile)
             try:
-                self.assertEqual(calls[0]["approval_mode"], "deny-all")
-                self.assertEqual(calls[0]["sandbox"], "read-only")
-                self.assertTrue(calls[0]["ephemeral"])
-                self.assertNotEqual(Path(calls[0]["cwd"]), repository.root)
-                self.assertIn("Deny all tools", calls[0]["developer_instructions"])
-                self.assertEqual(calls[0]["tools"], ())
+                material = {"schema": "roundwright-dependency-review-input/v1"}
+                input_digest = "sha256:" + hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+                session.start_turn(DependencyReviewRequest("attempt-116", material, input_digest, audit.profile_identity))
+                self.assertEqual(session_calls[0]["approval_mode"], "deny-all")
+                self.assertEqual(session_calls[0]["sandbox"], "read-only")
+                self.assertTrue(session_calls[0]["ephemeral"])
+                self.assertNotEqual(Path(session_calls[0]["cwd"]), repository.root)
+                self.assertIn("Deny all tools", session_calls[0]["developer_instructions"])
+                self.assertFalse({"tools", "tool_choice", "config"} & set(session_calls[0]))
+                prompt, controls = turn_calls[0]
+                self.assertEqual(prompt["capability_contract"], "behavioral-zero-tool-use/v1")
+                self.assertNotIn("tools", prompt)
+                self.assertFalse({"tools", "tool_choice", "config"} & set(controls))
+                self.assertEqual((controls["approval_mode"], controls["sandbox"], controls["cwd"]), ("deny-all", "read-only", str(session.cwd)))
             finally:
                 session.close()
 
-    def test_native_bridge_rejects_a_mock_only_or_missing_tools_control_before_session_start(self) -> None:
-        calls: list[dict[str, object]] = []
+    def test_native_bridge_rejects_every_tool_event_before_accepting_schema_output(self) -> None:
+        class Handle:
+            id = "turn-116"
+            events = ()
+            def stream(self):
+                class Stream(list):
+                    def close(self): return None
+                return Stream((*self.events,
+                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": "{}"}}},
+                    {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}},
+                ))
 
-        class MockOnlyCodex:
-            def __enter__(self): return self
-            def close(self): return None
-            def thread_start(self, **keywords): calls.append(keywords)
+        cases = (
+            {"method": "item/started", "payload": {"turn_id": Handle.id, "item": {"type": "commandExecution"}}},
+            {"method": "item/completed", "payload": {"turn_id": Handle.id, "item": {"type": "mcpToolCall"}}},
+            {"method": "item/completed", "payload": {"turn_id": "wrong-turn", "item": {"type": "dynamicToolCall"}}},
+            {"method": "tool/call", "payload": {"turn_id": Handle.id}},
+            {"method": "command/exec", "payload": {"turn_id": Handle.id}},
+        )
+        for event in cases:
+            with self.subTest(event=event["method"]):
+                Handle.events = (event,)
+                session = SimpleNamespace(completion=CompletionDeadline(100, 600), clock=lambda: 0, close=lambda: None)
+                response = _Turn(Handle(), session).read_response()
+                self.assertEqual((response.kind, response.reason_code), (DependencyReviewResultKind.INVALID, "tool-event-observed"))
 
-        class MissingToolsCodex:
-            def __enter__(self): return self
-            def close(self): return None
-            def thread_start(self, *, approval_mode, cwd, developer_instructions, ephemeral, model, sandbox):
-                calls.append({"approval_mode": approval_mode, "cwd": cwd, "developer_instructions": developer_instructions, "ephemeral": ephemeral, "model": model, "sandbox": sandbox})
-
-        for factory in (MockOnlyCodex, MissingToolsCodex):
-            with self.subTest(factory=factory.__name__), tempfile.TemporaryDirectory() as temporary:
-                repository, _subset, _binding, profile, _audit = self.setup(Path(temporary))
-                backend = HarnessNativeCodexDependencyReviewBackend(
-                    cwd=repository.root, completion=CompletionDeadline(100, 600), codex_factory=factory,
-                    approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
-                )
-                with self.assertRaisesRegex(Exception, "sdk-incompatible"):
-                    backend.open_fresh_session(profile)
-        self.assertEqual(calls, [])
-
-    def test_native_bridge_rejects_a_tool_item_before_accepting_schema_output(self) -> None:
+    def test_native_bridge_rejects_a_safe_item_from_another_turn_without_claiming_tool_use(self) -> None:
         class Handle:
             id = "turn-116"
             def stream(self):
                 class Stream(list):
                     def close(self): return None
                 return Stream((
-                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "commandExecution"}}},
-                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": "{}"}}},
-                    {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}},
+                    {"method": "item/completed", "payload": {"turn_id": "wrong-turn", "item": {"type": "agentMessage", "phase": "final_answer", "text": "{}"}}},
                 ))
 
         session = SimpleNamespace(completion=CompletionDeadline(100, 600), clock=lambda: 0, close=lambda: None)
         response = _Turn(Handle(), session).read_response()
-        self.assertEqual(response.kind, DependencyReviewResultKind.INVALID)
+        self.assertEqual((response.kind, response.reason_code), (DependencyReviewResultKind.INVALID, None))
 
     def test_fresh_no_tools_attempt_accepts_only_the_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -198,6 +219,35 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("accepted",))
             finally:
                 connection.close()
+            self.assertEqual(
+                DependencyReviewStore().terminal_snapshot(repository, attempt_id="attempt-116", binding=binding),
+                {
+                    "attempt_id": "attempt-116", "input_digest": request.input_digest,
+                    "output_digest": result.output_digest, "outcome": "accepted", "proposal_count": 1,
+                    "validation_state": "accepted", "tool_event_count": 0,
+                    "mutation_count": 0, "credential_exposure_count": 0,
+                },
+            )
+
+    def test_observed_tool_event_is_durable_terminal_and_ineligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.INVALID, reason_code="tool-event-observed",
+            ))
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding,
+                adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                checkpoint_session=lambda _session: None,
+                checkpoint_turn=lambda _session, _turn: None,
+            )
+            self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.INVALID, "tool-event-observed"))
+            snapshot = DependencyReviewStore().terminal_snapshot(repository, attempt_id="attempt-116", binding=binding)
+            self.assertEqual(
+                (snapshot["outcome"], snapshot["validation_state"], snapshot["proposal_count"], snapshot["tool_event_count"]),
+                ("invalid", "terminal", 0, 1),
+            )
+            self.assertEqual((snapshot["mutation_count"], snapshot["credential_exposure_count"]), (0, 0))
 
     def test_ambiguous_turn_is_terminal_and_requires_a_successor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -337,6 +387,12 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
             )
             prepared, readiness, capsule = external_validation.prepare_dependency_review_attempt_profile(inputs, Path(temporary).resolve())
+            self.assertEqual(prepared.native_control_digest, dependency_review_native_control_digest())
+            self.assertEqual(prepared.public_receipt()["native_control"], dependency_review_native_control_contract())
+            self.assertEqual(
+                prepared._request_value["execution_context"]["native_control_digest"],
+                dependency_review_native_control_digest(),
+            )
             self.assertEqual(len(backend.sessions), 0)
             self.assertEqual(prepared.capture_plan_digest, readiness.capture_plan_digest)
             self.assertEqual(prepared.public_receipt()["base_sha"], base_sha)

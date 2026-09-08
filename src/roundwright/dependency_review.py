@@ -651,6 +651,9 @@ class DependencyReviewStore:
                 "outcome": result_kind,
                 "proposal_count": proposal_count[0],
                 "validation_state": "accepted" if outcome[0] == "accepted" else "terminal",
+                "tool_event_count": 1 if outcome[1] == "tool-event-observed" else 0,
+                "mutation_count": 0,
+                "credential_exposure_count": 0,
             }
         finally:
             connection.close()

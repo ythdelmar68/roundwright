@@ -332,6 +332,7 @@ class DependencyReviewPreparedRequest:
     store_identity: str
     observation_identity: str
     host_inputs_identity: str
+    native_control_digest: str
     _request_value: Mapping[str, object] = field(repr=False, compare=False)
     _host_inputs: DependencyReviewHostInputs = field(repr=False, compare=False)
 
@@ -341,7 +342,7 @@ class DependencyReviewPreparedRequest:
             or any(_DIGEST.fullmatch(value) is None for value in (
                 self.capture_plan_digest, self.request_digest, self.recorder_identity,
                 self.store_root_identity, self.store_identity, self.observation_identity,
-                self.host_inputs_identity,
+                self.host_inputs_identity, self.native_control_digest,
             ))
             or type(self._request_value) is not MappingProxyType
             or type(self._host_inputs) is not DependencyReviewHostInputs
@@ -349,6 +350,8 @@ class DependencyReviewPreparedRequest:
             raise ExternalValidationAdapterError("dependency review prepared request is invalid")
 
     def public_receipt(self) -> dict[str, object]:
+        from .dependency_review_toolbox import dependency_review_native_control_contract
+
         return {
             "schema": "roundwright-dependency-review-prepared-request/v1",
             "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
@@ -365,6 +368,8 @@ class DependencyReviewPreparedRequest:
             "store_identity": self.store_identity,
             "observation_identity": self.observation_identity,
             "host_inputs_identity": self.host_inputs_identity,
+            "native_control_digest": self.native_control_digest,
+            "native_control": dependency_review_native_control_contract(),
         }
 
 
@@ -729,7 +734,8 @@ def _prepare_dependency_review_execution_context(
         if type(value) is not dict or set(value) != {
             "schema", "repository_root", "subset_digest", "candidate_sha", "base_sha", "case_id", "ready_at",
             "configuration_digest", "policy_digest", "profile_identity", "audit", "recorder_identity",
-            "store_identity", "observation_identity", "host_inputs_identity", "capture_plan_digest",
+            "store_identity", "observation_identity", "host_inputs_identity", "native_control_digest",
+            "capture_plan_digest",
         }:
             raise ValueError
         audit_value = value["audit"]
@@ -748,6 +754,7 @@ def _prepare_dependency_review_execution_context(
             or any(_DIGEST.fullmatch(value[key]) is None for key in (
                 "configuration_digest", "policy_digest", "profile_identity", "recorder_identity",
                 "store_identity", "observation_identity", "host_inputs_identity",
+                "native_control_digest",
             ))
             or audit_identity.profile_identity != value["profile_identity"]
             or (audit_identity.profile.model, audit_identity.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high")
@@ -5197,6 +5204,8 @@ def _dependency_review_host_inputs_identity(host_inputs: DependencyReviewHostInp
 
     if type(host_inputs) is not DependencyReviewHostInputs:
         raise ExternalValidationAdapterError("dependency review host inputs are invalid")
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
     subset = host_inputs.subset
     return _digest({
         "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
@@ -5206,6 +5215,7 @@ def _dependency_review_host_inputs_identity(host_inputs: DependencyReviewHostInp
         "configuration_digest": subset.configuration_digest,
         "policy_digest": subset.policy_digest,
         "profile_identity": host_inputs.binding.profile_identity,
+        "native_control_digest": dependency_review_native_control_digest(),
         "source_owned_relation_digests": [item.relation_digest for item in host_inputs.source_owned_relations],
         "supersedes_attempt_id": host_inputs.supersedes_attempt_id,
     })
@@ -5215,6 +5225,8 @@ def _dependency_review_execution_context(
     inputs: DependencyReviewRequestInputs, *, recorder_identity: str, store_identity: str,
     observation_identity: str, host_inputs_identity: str, plan_digest: str,
 ) -> dict[str, object]:
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
     return {
         "schema": "roundwright-dependency-review-execution-context/v1",
         "repository_root": inputs.repository.root.resolve(strict=False).as_posix(),
@@ -5231,6 +5243,7 @@ def _dependency_review_execution_context(
         "store_identity": store_identity,
         "observation_identity": observation_identity,
         "host_inputs_identity": host_inputs_identity,
+        "native_control_digest": dependency_review_native_control_digest(),
         "capture_plan_digest": plan_digest,
     }
 
@@ -5267,6 +5280,9 @@ def _prepare_dependency_review_attempt_request(
         "recorder_identity": recorder_identity,
         "store_root_identity": store_root_identity,
     })
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
+    native_control_digest = dependency_review_native_control_digest()
     observation_identity = _digest({
         "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
         "repository_root": inputs.repository.root.resolve(strict=False).as_posix(),
@@ -5279,6 +5295,7 @@ def _prepare_dependency_review_attempt_request(
         "audit": inputs.audit.evidence(),
         "store_identity": store_identity,
         "host_inputs_identity": host_inputs_identity,
+        "native_control_digest": native_control_digest,
     })
     producer, exporter, comparator = dependency_review_attempt_component_identities()
     capture_plan = {
@@ -5317,13 +5334,16 @@ def _prepare_dependency_review_attempt_request(
     }
     return DependencyReviewPreparedRequest(
         inputs, plan.plan_digest, _digest(request_value), recorder_identity, store_root_identity,
-        store_identity, observation_identity, host_inputs_identity, MappingProxyType(request_value), host_inputs,
+        store_identity, observation_identity, host_inputs_identity, native_control_digest,
+        MappingProxyType(request_value), host_inputs,
     )
 
 
 def _validated_dependency_review_request(
     prepared_request: DependencyReviewPreparedRequest, store_root: Path,
 ) -> dict[str, object]:
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
     if type(prepared_request) is not DependencyReviewPreparedRequest:
         raise ExternalValidationAdapterError("dependency review prepared request is invalid")
     inputs = prepared_request.inputs
@@ -5336,6 +5356,7 @@ def _validated_dependency_review_request(
     host = prepared_request._host_inputs
     if (
         _dependency_review_host_inputs_identity(host) != prepared_request.host_inputs_identity
+        or dependency_review_native_control_digest() != prepared_request.native_control_digest
         or host.repository != inputs.repository or host.subset != inputs.subset or host.binding != inputs.binding
         or host.adapter.profile_identity != inputs.binding.profile_identity
     ):

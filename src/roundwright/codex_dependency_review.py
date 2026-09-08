@@ -39,7 +39,7 @@ class DependencyReviewResultKind(StrEnum):
 
 @dataclass(frozen=True)
 class DependencyReviewRequest:
-    """One immutable, fresh-session request with no tool surface."""
+    """One immutable request for a fresh behaviorally tool-silent session."""
 
     attempt_id: str
     input_material: Mapping[str, object]
@@ -62,6 +62,7 @@ class NativeDependencyReviewResponse:
     kind: DependencyReviewResultKind
     proposal: Mapping[str, object] | None = None
     failure: CodexFailure | None = None
+    reason_code: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -71,6 +72,7 @@ class NativeDependencyReviewResponse:
             or (self.kind is DependencyReviewResultKind.ACCEPTED and (self.proposal is None or self.failure is not None))
             or (self.kind is DependencyReviewResultKind.BLOCKED and (self.proposal is not None or self.failure is None))
             or (self.kind in {DependencyReviewResultKind.INVALID, DependencyReviewResultKind.AMBIGUOUS} and (self.proposal is not None or self.failure is not None))
+            or (self.reason_code is not None and (self.kind is not DependencyReviewResultKind.INVALID or self.reason_code != "tool-event-observed"))
         ):
             raise DependencyReviewDispatchError("dependency review response is invalid")
 
@@ -114,7 +116,7 @@ class DependencyReviewDispatchResult:
 
 
 class CodexDependencyReviewAdapter:
-    """Open exactly one fresh, no-tools session for the configured role."""
+    """Open exactly one fresh, behaviorally tool-silent configured session."""
 
     def __init__(self, backend: NativeCodexDependencyReviewBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity) -> None:
         if (
@@ -163,12 +165,12 @@ class CodexDependencyReviewAdapter:
             except (DependencyReviewError, TypeError, ValueError):
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, session_id, turn_id, None, _digest(response.proposal), "malformed-response")
             return DependencyReviewDispatchResult(response.kind, session_id, turn_id, proposal, proposal.proposal_digest, "schema-valid")
-        reason = (
+        reason = response.reason_code or (
             "provider-blocked" if response.kind is DependencyReviewResultKind.BLOCKED
             else "uncertain-provider-turn" if response.kind is DependencyReviewResultKind.AMBIGUOUS
             else "malformed-response"
         )
-        return DependencyReviewDispatchResult(response.kind, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "status": response.kind.value, "failure": None if response.failure is None else response.failure.value}), reason)
+        return DependencyReviewDispatchResult(response.kind, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "status": response.kind.value, "failure": None if response.failure is None else response.failure.value, "reason_code": reason}), reason)
 
 
 class DependencyReviewService:
@@ -218,7 +220,8 @@ class DependencyReviewHostInputs:
 
     The Harness receives this value only through the product entrypoint.  It
     contains no credential, repository mutation, or tool capability; the
-    injected adapter can open exactly one fresh no-tools model session.
+    injected adapter can open exactly one fresh behaviorally tool-silent model
+    session under read-only sandbox and deny-all approval controls.
     """
 
     repository: RepositoryIdentity

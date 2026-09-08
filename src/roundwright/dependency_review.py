@@ -20,6 +20,7 @@ from .state import _open_writable_connection
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _TOKEN = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
+_OPAQUE_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _REASON = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 
 
@@ -583,6 +584,161 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
+    def record_blocked(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str, reason_code: str, owner_route: str = "owner-review") -> None:
+        """Retain an uncertain provider turn without permitting a retry in place.
+
+        A blocked attempt is terminal evidence: a caller must create a successor
+        with a new subset/attempt identity.  This prevents an uncheckpointed
+        provider turn from being silently replayed or accepted later.
+        """
+
+        if not _token(attempt_id) or not _digest(output_digest) or not _REASON.fullmatch(reason_code) or not _REASON.fullmatch(owner_route):
+            raise DependencyReviewError("dependency review blocked outcome is malformed")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            if row[6] not in {"prepared", "blocked"}:
+                raise DependencyReviewError("dependency review attempt is not available")
+            self._verify_task_lineage(connection, row[0])
+            outcome = ("blocked", reason_code, output_digest, owner_route)
+            stored = connection.execute("SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if row[6] == "blocked":
+                if tuple(stored) != outcome:
+                    raise DependencyReviewError("dependency review blocked outcome has drifted")
+                connection.commit()
+                return
+            if stored is not None:
+                raise DependencyReviewError("dependency review blocked outcome has drifted")
+            connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, ?, ?, ?, ?)", (attempt_id, *outcome))
+            connection.execute("UPDATE dependency_review_attempts SET state = 'blocked' WHERE attempt_id = ?", (attempt_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def terminal_snapshot(
+        self, repository: RepositoryIdentity, *, attempt_id: str, binding: DependencyReviewBinding,
+    ) -> dict[str, object]:
+        """Independently reread one complete, terminal review attempt."""
+
+        if not _token(attempt_id) or type(binding) is not DependencyReviewBinding:
+            raise DependencyReviewError("dependency review snapshot is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            row, subset = self._read_attempt(connection, attempt_id)
+            binding.require_subset(subset)
+            if (row[2], row[3]) != (binding.profile_identity, binding.configuration_digest) or row[6] == "prepared":
+                raise DependencyReviewError("dependency review snapshot is unavailable")
+            outcome = connection.execute(
+                "SELECT outcome, reason_code, output_digest FROM dependency_review_validation_outcomes WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if outcome is None:
+                raise DependencyReviewError("dependency review snapshot is unavailable")
+            proposal_count = connection.execute(
+                "SELECT COUNT(*) FROM dependency_review_proposals WHERE attempt_id = ?", (attempt_id,),
+            ).fetchone()
+            if proposal_count is None:
+                raise DependencyReviewError("dependency review snapshot is unavailable")
+            result_kind = "ambiguous" if outcome[0] == "blocked" and outcome[1] == "uncertain-provider-turn" else outcome[0]
+            return {
+                "attempt_id": attempt_id,
+                "input_digest": row[4],
+                "output_digest": outcome[2],
+                "outcome": result_kind,
+                "proposal_count": proposal_count[0],
+                "validation_state": "accepted" if outcome[0] == "accepted" else "terminal",
+                "tool_event_count": 1 if outcome[1] == "tool-event-observed" else 0,
+                "mutation_count": 0,
+                "credential_exposure_count": 0,
+            }
+        finally:
+            connection.close()
+
+    def claim_session(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str) -> None:
+        if not _token(attempt_id) or not _opaque_identity(session_identity):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            if row[6] != "prepared":
+                raise DependencyReviewError("dependency review dispatch claim is unavailable")
+            existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if existing is not None:
+                raise DependencyReviewError("dependency review dispatch claim is already consumed")
+            connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, ?, NULL, 'session-opened')", (attempt_id, session_identity))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_turn(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str) -> None:
+        if not _token(attempt_id) or not _opaque_identity(session_identity) or not _opaque_identity(turn_identity):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if row[6] != "prepared" or existing != (session_identity, None, "session-opened"):
+                raise DependencyReviewError("dependency review dispatch claim has drifted")
+            connection.execute("UPDATE dependency_review_dispatch_claims SET turn_identity = ?, state = 'turn-dispatched' WHERE attempt_id = ?", (turn_identity, attempt_id))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def require_turn_claim(
+        self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str,
+    ) -> None:
+        """Require the exact durable provider-turn claim before using its output."""
+
+        if not _token(attempt_id) or not _opaque_identity(session_identity) or not _opaque_identity(turn_identity):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            claim = connection.execute(
+                "SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if claim != (session_identity, turn_identity, "turn-dispatched"):
+                raise DependencyReviewError("dependency review durable turn claim is unavailable")
+        finally:
+            connection.close()
+
+    def recover_dispatch_claim(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str) -> bool:
+        """Terminally block any persisted in-flight claim before a restart can dispatch."""
+        if not _token(attempt_id) or not _digest(output_digest):
+            raise DependencyReviewError("dependency review dispatch recovery is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, _ = self._read_attempt(connection, attempt_id)
+            claim = connection.execute("SELECT state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if claim is None:
+                connection.commit()
+                return False
+            if row[6] != "prepared":
+                connection.commit()
+                return False
+            connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, 'blocked', 'uncertain-provider-turn', ?, 'owner-review')", (attempt_id, output_digest))
+            connection.execute("UPDATE dependency_review_attempts SET state = 'blocked' WHERE attempt_id = ?", (attempt_id,))
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
 
 def _digest_value(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
@@ -590,6 +746,10 @@ def _digest_value(value: object) -> str:
 
 def _token(value: object) -> bool:
     return type(value) is str and bool(_TOKEN.fullmatch(value))
+
+
+def _opaque_identity(value: object) -> bool:
+    return type(value) is str and bool(_OPAQUE_IDENTITY.fullmatch(value))
 
 
 def _digest(value: object) -> bool:

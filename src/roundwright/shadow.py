@@ -873,6 +873,7 @@ SHADOW_CASE_SCHEMA_V2 = "roundwright-shadow-case/v2"
 PROVENANCE_DECISION_PROFILE = "roundwright-shadow-profile/provenance-decision/v1"
 EXECUTOR_CONTRACT_SYNTHETIC_PROFILE = "roundwright-shadow-profile/executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = "roundwright-shadow-profile/provider-attempt-accounting/v1"
+DEPENDENCY_REVIEW_ATTEMPT_PROFILE = "roundwright-shadow-profile/dependency-review-attempt/v1"
 HOSTED_CHECK_PROFILE = "roundwright-shadow-profile/hosted-check/v1"
 LIVE_LIFECYCLE_SHADOW_PROFILE = "roundwright-shadow-profile/live-lifecycle-shadow/v1"
 READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = "roundwright-shadow-profile/read-only-external-observation/v1"
@@ -1065,6 +1066,19 @@ _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE = ShadowEvidenceProfile(
     64,
 )
 
+_DEPENDENCY_REVIEW_ATTEMPT_PROFILE = ShadowEvidenceProfile(
+    DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+    CaptureMode.ARMED_LIVE_EVENTS,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-dependency-review-subset-profile-schema-recorder-store-readback-bound",
+    "before-first-live-dependency-review-provider-attempt",
+    "append-only-content-addressed-readback",
+    "missing-history-or-input-movement-requires-fresh-dependency-review-attempt",
+    ("dependency-review-attempt", "dependency-review-proposal", "dependency-review-validation"),
+    0,
+    1,
+)
+
 _HOSTED_CHECK_PROFILE = ShadowEvidenceProfile(
     HOSTED_CHECK_PROFILE,
     CaptureMode.TERMINAL_SNAPSHOT,
@@ -1155,6 +1169,7 @@ def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
         _WORKER_ADAPTER_PROFILE,
         _EXECUTOR_CONTRACT_PROFILE,
         _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+        _DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
         _HOSTED_CHECK_PROFILE,
         _LIVE_LIFECYCLE_SHADOW_PROFILE,
         _READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
@@ -1171,6 +1186,8 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _EXECUTOR_CONTRACT_PROFILE
     if profile_id == PROVIDER_ATTEMPT_ACCOUNTING_PROFILE:
         return _PROVIDER_ATTEMPT_ACCOUNTING_PROFILE
+    if profile_id == DEPENDENCY_REVIEW_ATTEMPT_PROFILE:
+        return _DEPENDENCY_REVIEW_ATTEMPT_PROFILE
     if profile_id == HOSTED_CHECK_PROFILE:
         return _HOSTED_CHECK_PROFILE
     if profile_id == LIVE_LIFECYCLE_SHADOW_PROFILE:

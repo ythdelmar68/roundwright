@@ -20,6 +20,7 @@ from .shadow import (
     HOSTED_CHECK_PROFILE,
     LIVE_LIFECYCLE_SHADOW_PROFILE,
     PROVIDER_ATTEMPT_ACCOUNTING_PROFILE,
+    DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
     READ_ONLY_EXTERNAL_OBSERVATION_PROFILE,
     INTEGRATED_BOUNDARY_PROFILE,
     PHASE_3_QUALIFICATION_PROFILE,
@@ -77,6 +78,7 @@ from .cross_environment import (
 
 EXECUTOR_CONTRACT_SCHEMA = "roundwright-executor-contract-synthetic/v1"
 PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA = "roundwright-provider-attempt-accounting/v2"
+DEPENDENCY_REVIEW_ATTEMPT_SCHEMA = "roundwright-dependency-review-evidence/v1"
 HOSTED_CHECK_SCHEMA = "roundwright-hosted-check-evidence/v1"
 LIVE_LIFECYCLE_SHADOW_SCHEMA = "roundwright-live-lifecycle-shadow/v1"
 READ_ONLY_EXTERNAL_OBSERVATION_SCHEMA = "roundwright-read-only-external-observation/v1"
@@ -178,6 +180,7 @@ PROVIDER_ATTEMPT_COMPARATOR_IDENTITY = _digest(
     {"schema": PROVIDER_ATTEMPT_ACCOUNTING_SCHEMA, "component": "capture-time-v2-comparator"}
 )
 PROVIDER_ATTEMPT_HISTORY_BLOCKER = "provider-attempt-runtime-unavailable"
+DEPENDENCY_REVIEW_PREFLIGHT_BLOCKER = "dependency-review-provider-dispatch-unavailable"
 HOSTED_CHECK_OBSERVATION_BLOCKER = "hosted-check-observation-unavailable"
 LIVE_LIFECYCLE_OBSERVATION_BLOCKER = "live-lifecycle-shadow-observation-unavailable"
 INTEGRATED_BOUNDARY_SCHEMA = "roundwright-integrated-boundary-composition/v1"
@@ -224,6 +227,243 @@ def provider_attempt_accounting_component_identities() -> tuple[str, str, str]:
         PROVIDER_ATTEMPT_EXPORTER_IDENTITY,
         PROVIDER_ATTEMPT_COMPARATOR_IDENTITY,
     )
+
+
+DEPENDENCY_REVIEW_ATTEMPT_PRODUCER_IDENTITY = _digest(
+    {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "durable-dependency-review-attempt-producer"}
+)
+from .codex_dependency_review import (
+    CodexDependencyReviewAdapter,
+    DependencyReviewDispatchError,
+    DependencyReviewHostInputs,
+    DependencyReviewResultKind,
+    DependencyReviewService,
+    NativeCodexDependencyReviewBackend,
+    prepare_dependency_review_host,
+)
+from .configuration import RepositoryIdentity
+from .dependency_review import AffectedSubset, DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, SourceOwnedRelation
+from .provider_health import ProviderHealthAuditIdentity
+DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
+    {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
+)
+DEPENDENCY_REVIEW_ATTEMPT_COMPARATOR_IDENTITY = _digest(
+    {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "exact-input-proposal-accounting-comparator"}
+)
+
+
+def dependency_review_attempt_component_identities() -> tuple[str, str, str]:
+    """Return the immutable components for #116's armed live-event lane."""
+
+    return (
+        DEPENDENCY_REVIEW_ATTEMPT_PRODUCER_IDENTITY,
+        DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY,
+        DEPENDENCY_REVIEW_ATTEMPT_COMPARATOR_IDENTITY,
+    )
+
+
+_DEPENDENCY_REVIEW_READY_SEAL = object()
+_DEPENDENCY_REVIEW_CAPSULE_SEAL = object()
+
+
+def _dependency_review_store_root_identity(store_root: Path) -> str:
+    if not isinstance(store_root, Path) or not store_root.is_absolute():
+        raise ExternalValidationAdapterError("dependency review store root is invalid")
+    return _digest({
+        "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+        "store_root": store_root.resolve(strict=False).as_posix(),
+    })
+
+
+@dataclass(frozen=True)
+class DependencyReviewRequestInputs:
+    """The authoritative, public facts required to arm one review attempt.
+
+    This deliberately accepts no Harness request, capture plan, adapter, or
+    host input.  Those values are product-owned derived state, constructed
+    only after the exact repository/subset/binding/audit tuple is checked.
+    """
+
+    repository: RepositoryIdentity
+    base_sha: str
+    subset: AffectedSubset
+    binding: DependencyReviewBinding
+    audit: ProviderHealthAuditIdentity
+    attempt_id: str
+    ready_at: int
+    backend: NativeCodexDependencyReviewBackend | None = field(repr=False, compare=False, default=None)
+    source_owned_relations: tuple[SourceOwnedRelation, ...] = ()
+    supersedes_attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.repository) is not RepositoryIdentity
+            or _SHA.fullmatch(self.base_sha) is None
+            or type(self.subset) is not AffectedSubset
+            or type(self.binding) is not DependencyReviewBinding
+            or type(self.audit) is not ProviderHealthAuditIdentity
+            or not _safe_token(self.attempt_id)
+            or self.attempt_id != self.subset.snapshot_id
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or (self.backend is not None and not callable(getattr(self.backend, "open_fresh_session", None)))
+            or type(self.source_owned_relations) is not tuple
+            or any(type(item) is not SourceOwnedRelation for item in self.source_owned_relations)
+            or len({item.relation_digest for item in self.source_owned_relations}) != len(self.source_owned_relations)
+            or (self.supersedes_attempt_id is not None and not _safe_token(self.supersedes_attempt_id))
+            or self.binding.profile_identity != self.audit.profile_identity
+            or (self.audit.profile.model, self.audit.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high")
+        ):
+            raise ExternalValidationAdapterError("dependency review request inputs are invalid")
+        try:
+            self.binding.require_subset(self.subset)
+        except ValueError as error:
+            raise ExternalValidationAdapterError("dependency review request inputs have drifted") from error
+
+
+@dataclass(frozen=True)
+class DependencyReviewPreparedRequest:
+    """A sealed, non-stitchable V2 dependency-review execution request."""
+
+    inputs: DependencyReviewRequestInputs
+    capture_plan_digest: str
+    request_digest: str
+    recorder_identity: str
+    store_root_identity: str
+    store_identity: str
+    observation_identity: str
+    host_inputs_identity: str
+    native_control_digest: str
+    _request_value: Mapping[str, object] = field(repr=False, compare=False)
+    _host_inputs: DependencyReviewHostInputs = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.inputs) is not DependencyReviewRequestInputs
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.capture_plan_digest, self.request_digest, self.recorder_identity,
+                self.store_root_identity, self.store_identity, self.observation_identity,
+                self.host_inputs_identity, self.native_control_digest,
+            ))
+            or type(self._request_value) is not MappingProxyType
+            or type(self._host_inputs) is not DependencyReviewHostInputs
+        ):
+            raise ExternalValidationAdapterError("dependency review prepared request is invalid")
+
+    def public_receipt(self) -> dict[str, object]:
+        from .dependency_review_toolbox import dependency_review_native_control_contract
+
+        return {
+            "schema": "roundwright-dependency-review-prepared-request/v1",
+            "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "base_sha": self.inputs.base_sha,
+            "candidate_sha": self.inputs.subset.candidate_sha,
+            "case_id": self.inputs.attempt_id,
+            "ready_at": self.inputs.ready_at,
+            "configuration_digest": self.inputs.binding.configuration_digest,
+            "policy_digest": self.inputs.binding.policy_digest,
+            "profile_identity": self.inputs.binding.profile_identity,
+            "capture_plan_digest": self.capture_plan_digest,
+            "request_digest": self.request_digest,
+            "recorder_identity": self.recorder_identity,
+            "store_identity": self.store_identity,
+            "observation_identity": self.observation_identity,
+            "host_inputs_identity": self.host_inputs_identity,
+            "native_control_digest": self.native_control_digest,
+            "native_control": dependency_review_native_control_contract(),
+        }
+
+
+@dataclass(frozen=True)
+class DependencyReviewReadinessReceipt:
+    """Path-free readiness receipt for a still-unconsumed review attempt."""
+
+    capture_plan_digest: str
+    candidate_sha: str
+    case_id: str
+    ready_at: int
+    producer_identity: str
+    exporter_identity: str
+    comparator_identity: str
+    execution_context_input_digest: str
+    execution_context_identity: str
+    receipt_digest: str
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        producer, exporter, comparator = dependency_review_attempt_component_identities()
+        core = {
+            "schema": "roundwright-harness-profile-executor-readiness/v2",
+            "status": "ready", "state": "PREFLIGHT_READY",
+            "plan_digest": self.capture_plan_digest,
+            "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "case_id": self.case_id, "candidate_sha": self.candidate_sha,
+            "ready_at": self.ready_at,
+            "producer_identity": self.producer_identity,
+            "exporter_identity": self.exporter_identity,
+            "comparator_identity": self.comparator_identity,
+            "dispatch_count": 0, "record_count": 0, "verify_count": 0, "mutation_count": 0,
+            "execution_context_input_digest": self.execution_context_input_digest,
+            "execution_context_identity": self.execution_context_identity,
+        }
+        if (
+            self._seal is not _DEPENDENCY_REVIEW_READY_SEAL
+            or _DIGEST.fullmatch(self.capture_plan_digest) is None
+            or _SHA.fullmatch(self.candidate_sha) is None
+            or not _safe_token(self.case_id)
+            or type(self.ready_at) is not int or self.ready_at < 0
+            or (self.producer_identity, self.exporter_identity, self.comparator_identity) != (producer, exporter, comparator)
+            or any(_DIGEST.fullmatch(value) is None for value in (
+                self.execution_context_input_digest, self.execution_context_identity, self.receipt_digest,
+            ))
+            or self.receipt_digest != _digest(core)
+        ):
+            raise ExternalValidationAdapterError("dependency review readiness receipt is invalid")
+
+    def public_receipt(self) -> dict[str, object]:
+        return {
+            "schema": "roundwright-dependency-review-readiness/v1",
+            "capture_plan_digest": self.capture_plan_digest,
+            "candidate_sha": self.candidate_sha,
+            "case_id": self.case_id,
+            "ready_at": self.ready_at,
+            "producer_identity": self.producer_identity,
+            "exporter_identity": self.exporter_identity,
+            "comparator_identity": self.comparator_identity,
+            "execution_context_input_digest": self.execution_context_input_digest,
+            "execution_context_identity": self.execution_context_identity,
+            "receipt_digest": self.receipt_digest,
+        }
+
+
+@dataclass(frozen=True)
+class _DependencyReviewReadyCapsule:
+    """Private one-shot binding; callers cannot assemble its internal state."""
+
+    prepared_request: DependencyReviewPreparedRequest
+    readiness: DependencyReviewReadinessReceipt
+    capsule_digest: str = ""
+    _consumed: bool = field(default=False, repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        payload = {
+            "schema": "roundwright-dependency-review-ready-capsule/v1",
+            "request_digest": self.prepared_request.request_digest,
+            "capture_plan_digest": self.prepared_request.capture_plan_digest,
+            "store_identity": self.prepared_request.store_identity,
+            "host_inputs_identity": self.prepared_request.host_inputs_identity,
+            "readiness": self.readiness.public_receipt(),
+        }
+        digest = _digest(payload)
+        if (
+            self._seal is not _DEPENDENCY_REVIEW_CAPSULE_SEAL
+            or type(self.prepared_request) is not DependencyReviewPreparedRequest
+            or type(self.readiness) is not DependencyReviewReadinessReceipt
+            or type(self._consumed) is not bool
+            or (self.capsule_digest and self.capsule_digest != digest)
+        ):
+            raise ExternalValidationAdapterError("dependency review ready capsule is invalid")
+        object.__setattr__(self, "capsule_digest", digest)
 
 
 HOSTED_CHECK_PRODUCER_IDENTITY = _digest(
@@ -445,6 +685,252 @@ class SyntheticExecutorAdapter:
         )
         harness = _harness_executor()
         return harness.ProfileComparison(status, result_identity)
+
+
+def _dependency_review_attempt_binding_identity(binding: object) -> str:
+    """Bind the live lane's readiness to one exact candidate capture plan."""
+
+    try:
+        value = {
+            "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+            "profile": binding.profile,
+            "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha,
+            "ready_at": binding.ready_at,
+            "plan_digest": binding.plan.plan_digest,
+        }
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("dependency review attempt binding is invalid") from error
+    if (
+        value["profile"] != DEPENDENCY_REVIEW_ATTEMPT_PROFILE
+        or not _safe_token(value["case_id"])
+        or _SHA.fullmatch(value["candidate_sha"]) is None
+        or type(value["ready_at"]) is not int or value["ready_at"] < 0
+        or _DIGEST.fullmatch(value["plan_digest"]) is None
+    ):
+        raise ExternalValidationAdapterError("dependency review attempt binding is invalid")
+    return _digest(value)
+
+
+@dataclass(frozen=True)
+class DependencyReviewExecutionContext:
+    """One materialized V2 descriptor for the sealed dependency-review lane."""
+
+    descriptor: Mapping[str, object]
+    identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.descriptor) is not MappingProxyType or _DIGEST.fullmatch(self.identity) is None:
+            raise ExternalValidationAdapterError("dependency review execution context is invalid")
+
+
+def _prepare_dependency_review_execution_context(
+    descriptor: object, *, plan_digest: str, candidate_sha: str, case_id: str, ready_at: int,
+) -> DependencyReviewExecutionContext:
+    """Materialize and close the V2 descriptor before adapter validation."""
+
+    try:
+        value = _canonical_json_materialize(descriptor)
+        if type(value) is not dict or set(value) != {
+            "schema", "repository_root", "subset_digest", "candidate_sha", "base_sha", "case_id", "ready_at",
+            "configuration_digest", "policy_digest", "profile_identity", "audit", "recorder_identity",
+            "store_identity", "observation_identity", "host_inputs_identity", "native_control_digest",
+            "capture_plan_digest",
+        }:
+            raise ValueError
+        audit_value = value["audit"]
+        if type(audit_value) is not dict or type(audit_value.get("capabilities")) is not list:
+            raise ValueError
+        audit = dict(audit_value)
+        audit["capabilities"] = tuple(tuple(item) for item in audit["capabilities"])
+        audit_identity = ProviderHealthAuditIdentity.from_evidence(audit)
+        if (
+            value["schema"] != "roundwright-dependency-review-execution-context/v1"
+            or not isinstance(value["repository_root"], str) or not value["repository_root"]
+            or not _DIGEST.fullmatch(value["subset_digest"])
+            or _SHA.fullmatch(value["base_sha"]) is None
+            or (value["candidate_sha"], value["case_id"], value["ready_at"], value["capture_plan_digest"])
+            != (candidate_sha, case_id, ready_at, plan_digest)
+            or any(_DIGEST.fullmatch(value[key]) is None for key in (
+                "configuration_digest", "policy_digest", "profile_identity", "recorder_identity",
+                "store_identity", "observation_identity", "host_inputs_identity",
+                "native_control_digest",
+            ))
+            or audit_identity.profile_identity != value["profile_identity"]
+            or (audit_identity.profile.model, audit_identity.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high")
+        ):
+            raise ValueError
+        return DependencyReviewExecutionContext(
+            MappingProxyType(value), _dependency_review_context_identity(value),
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("dependency review V2 execution context is invalid") from error
+
+
+def _dependency_review_context(binding: object) -> DependencyReviewExecutionContext:
+    try:
+        prepared = binding.execution_context
+        context = prepared.value
+        input_digest = binding.execution_context_input_digest
+        plan = binding.plan
+    except AttributeError as error:
+        raise ExternalValidationAdapterError("dependency review V2 execution context is unavailable") from error
+    if (
+        type(context) is not DependencyReviewExecutionContext
+        or type(input_digest) is not str
+        or input_digest != _digest(_canonical_json_materialize(context.descriptor))
+        or prepared.identity != context.identity
+    ):
+        raise ExternalValidationAdapterError("dependency review V2 execution context has drifted")
+    return _prepare_dependency_review_execution_context(
+        context.descriptor, plan_digest=plan.plan_digest, candidate_sha=plan.candidate_sha,
+        case_id=plan.case_id, ready_at=plan.ready_at,
+    )
+
+
+@dataclass(frozen=True)
+class DependencyReviewAttemptAdapter:
+    """Provider-free preflight for the armed dependency-review evidence lane.
+
+    ``validate`` checks only exact public plan/component identities and creates
+    no attempt, session, Recorder record, or provider call. The live hosted
+    entrypoint must supply the same plan and a fresh no-tools adapter at
+    execute time; this generic adapter fails closed rather than manufacturing
+    provider evidence from a readiness receipt.
+    """
+
+    host_inputs: DependencyReviewHostInputs | None = None
+    profile_id: str = DEPENDENCY_REVIEW_ATTEMPT_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile_id != DEPENDENCY_REVIEW_ATTEMPT_PROFILE or (
+            self.host_inputs is not None and type(self.host_inputs) is not DependencyReviewHostInputs
+        ):
+            raise ExternalValidationAdapterError("executor profile is unsupported")
+
+    @property
+    def component_identities(self) -> object:
+        return _harness_executor().ProfileComponentIdentities(
+            *dependency_review_attempt_component_identities(),
+        )
+
+    def prepare_execution_context(self, preparation: object) -> object:
+        try:
+            context = _prepare_dependency_review_execution_context(
+                preparation.descriptor, plan_digest=preparation.plan.plan_digest,
+                candidate_sha=preparation.plan.candidate_sha, case_id=preparation.plan.case_id,
+                ready_at=preparation.plan.ready_at,
+            )
+            return _harness_executor().ProfileExecutionContext(context.identity, context)
+        except (AttributeError, ExternalValidationAdapterError) as error:
+            raise ExternalValidationAdapterError("dependency review V2 execution context is invalid") from error
+
+    def validate(self, binding: object) -> None:
+        _dependency_review_attempt_binding_identity(binding)
+        context = _dependency_review_context(binding)
+        try:
+            actual = (
+                binding.components.producer_identity,
+                binding.components.exporter_identity,
+                binding.components.comparator_identity,
+            )
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("dependency review attempt components are invalid") from error
+        if actual != dependency_review_attempt_component_identities():
+            raise ExternalValidationAdapterError("dependency review attempt components have drifted")
+        host = self.host_inputs
+        if host is not None and (
+            _dependency_review_host_inputs_identity(host) != context.descriptor["host_inputs_identity"]
+            or host.subset.candidate_sha != binding.candidate_sha
+            or host.binding.profile_identity != context.descriptor["profile_identity"]
+            or (host.subset.configuration_digest, host.subset.policy_digest)
+            != (context.descriptor["configuration_digest"], context.descriptor["policy_digest"])
+        ):
+            raise ExternalValidationAdapterError("dependency review V2 host inputs have drifted")
+
+    def execute(self, binding: object) -> object:
+        identity = _dependency_review_attempt_binding_identity(binding)
+        context = _dependency_review_context(binding)
+        host = self.host_inputs
+        if host is None:
+            raise ExternalValidationAdapterError(
+                f"{DEPENDENCY_REVIEW_PREFLIGHT_BLOCKER}: hosted fresh-session dispatch is required"
+            )
+        if (
+            host.subset.candidate_sha != binding.candidate_sha
+            or host.binding.profile_identity != host.adapter.profile_identity
+            or host.binding.candidate_sha != binding.candidate_sha
+            or host.subset.configuration_digest != host.binding.configuration_digest
+            or host.subset.policy_digest != host.binding.policy_digest
+            or binding.case_id != host.subset.snapshot_id
+            or _dependency_review_host_inputs_identity(host) != context.descriptor["host_inputs_identity"]
+            or host.binding.profile_identity != context.descriptor["profile_identity"]
+        ):
+            raise ExternalValidationAdapterError("dependency review host inputs have drifted")
+        try:
+            result = DependencyReviewService().run(
+                host.repository, host.subset, attempt_id=binding.case_id,
+                binding=host.binding, adapter=host.adapter,
+                checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn,
+                source_owned_relations=host.source_owned_relations,
+                supersedes_attempt_id=host.supersedes_attempt_id,
+            )
+            if result.session_identity is None or result.turn_identity is None:
+                raise DependencyReviewError("dependency review durable turn claim is unavailable")
+            DependencyReviewStore().require_turn_claim(
+                host.repository, attempt_id=binding.case_id,
+                session_identity=result.session_identity, turn_identity=result.turn_identity,
+            )
+        except (DependencyReviewDispatchError, DependencyReviewError, ValueError) as error:
+            raise ExternalValidationAdapterError("dependency review hosted dispatch failed") from error
+        snapshot = self._durable_snapshot(binding)
+        if snapshot["output_digest"] != result.output_digest or snapshot["outcome"] != result.kind.value:
+            raise ExternalValidationAdapterError("dependency review durable result has drifted")
+        return _harness_executor().ProfileExecution(
+            {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "binding_identity": identity, "snapshot": snapshot},
+            mutation_count=0,
+        )
+
+    def project(self, binding: object, execution: object) -> Mapping[str, object]:
+        identity = _dependency_review_attempt_binding_identity(binding)
+        try:
+            value, mutation_count = execution.value, execution.mutation_count
+        except AttributeError as error:
+            raise ExternalValidationAdapterError("dependency review attempt result is invalid") from error
+        snapshot = self._durable_snapshot(binding)
+        if type(value) is not dict or set(value) != {"schema", "binding_identity", "snapshot"} or value["schema"] != DEPENDENCY_REVIEW_ATTEMPT_SCHEMA or value["binding_identity"] != identity or value["snapshot"] != snapshot or mutation_count != 0:
+            raise ExternalValidationAdapterError("dependency review attempt result has drifted")
+        return {
+            "schema": "roundwright-shadow-case/v2", "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+            "dependency_review": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "capture_mode": "armed-live-events", "binding_identity": identity, "snapshot": snapshot, "mutation_count": 0},
+        }
+
+    def compare(self, binding: object, evidence: Mapping[str, object]) -> object:
+        identity = _dependency_review_attempt_binding_identity(binding)
+        snapshot = self._durable_snapshot(binding)
+        expected = {
+            "schema": "roundwright-shadow-case/v2", "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "ready_at": binding.ready_at, "case_id": binding.case_id,
+            "candidate_sha": binding.candidate_sha, "capture_plan_digest": binding.plan.plan_digest,
+            "dependency_review": {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "capture_mode": "armed-live-events", "binding_identity": identity, "snapshot": snapshot, "mutation_count": 0},
+        }
+        status = "pass" if type(evidence) is dict and evidence == expected else "fail"
+        return _harness_executor().ProfileComparison(status, _digest({"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "status": status, "ready_at": binding.ready_at, "expected_identity": _digest(expected), "observed_identity": _digest(evidence)}))
+
+    def _durable_snapshot(self, binding: object) -> dict[str, object]:
+        host = self.host_inputs
+        if host is None:
+            raise ExternalValidationAdapterError("dependency review durable readback is unavailable")
+        if binding.case_id != host.subset.snapshot_id:
+            raise ExternalValidationAdapterError("dependency review durable readback has drifted")
+        try:
+            return DependencyReviewStore().terminal_snapshot(
+                host.repository, attempt_id=binding.case_id, binding=host.binding,
+            )
+        except ValueError as error:
+            raise ExternalValidationAdapterError("dependency review durable readback has drifted") from error
 
 
 def _read_only_external_observation_binding_identity(binding: object) -> str:
@@ -4275,11 +4761,13 @@ class CrossEnvironmentCanaryAdapter:
         }))
 
 
-def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter:
+def roundwright_profile_adapter_factory(profile_id: str) -> SyntheticExecutorAdapter | DependencyReviewAttemptAdapter | ReadOnlyExternalObservationAdapter | ProviderAttemptAccountingAdapter | HostedCheckProfileAdapter | LiveLifecycleShadowProfileAdapter | IntegratedBoundaryCompositionAdapter | Phase3QualificationAdapter | CrossEnvironmentCanaryAdapter:
     """Return the exact public adapter selected by the Harness executor."""
 
     if profile_id == EXECUTOR_CONTRACT_SYNTHETIC_PROFILE:
         return SyntheticExecutorAdapter(profile_id)
+    if profile_id == DEPENDENCY_REVIEW_ATTEMPT_PROFILE:
+        return DependencyReviewAttemptAdapter(profile_id=profile_id)
     if profile_id == READ_ONLY_EXTERNAL_OBSERVATION_PROFILE:
         raise ExternalValidationAdapterError(
             "read-only external observation requires the product-hosted V2 entrypoint"
@@ -4709,3 +5197,338 @@ def run_provider_attempt_accounting_profile(
         raise
     except (AttributeError, KeyError, TypeError, ValueError, ProviderAttemptRuntimeError) as error:
         raise ExternalValidationAdapterError("provider attempt hosted entrypoint binding is invalid") from error
+
+
+def _dependency_review_host_inputs_identity(host_inputs: DependencyReviewHostInputs) -> str:
+    """Bind the opaque host to only immutable, credential-free facts."""
+
+    if type(host_inputs) is not DependencyReviewHostInputs:
+        raise ExternalValidationAdapterError("dependency review host inputs are invalid")
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
+    subset = host_inputs.subset
+    return _digest({
+        "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+        "repository_root": host_inputs.repository.root.resolve(strict=False).as_posix(),
+        "subset_digest": subset.content_digest,
+        "candidate_sha": subset.candidate_sha,
+        "configuration_digest": subset.configuration_digest,
+        "policy_digest": subset.policy_digest,
+        "profile_identity": host_inputs.binding.profile_identity,
+        "native_control_digest": dependency_review_native_control_digest(),
+        "source_owned_relation_digests": [item.relation_digest for item in host_inputs.source_owned_relations],
+        "supersedes_attempt_id": host_inputs.supersedes_attempt_id,
+    })
+
+
+def _dependency_review_execution_context(
+    inputs: DependencyReviewRequestInputs, *, recorder_identity: str, store_identity: str,
+    observation_identity: str, host_inputs_identity: str, plan_digest: str,
+) -> dict[str, object]:
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
+    return {
+        "schema": "roundwright-dependency-review-execution-context/v1",
+        "repository_root": inputs.repository.root.resolve(strict=False).as_posix(),
+        "subset_digest": inputs.subset.content_digest,
+        "candidate_sha": inputs.subset.candidate_sha,
+        "base_sha": inputs.base_sha,
+        "case_id": inputs.attempt_id,
+        "ready_at": inputs.ready_at,
+        "configuration_digest": inputs.binding.configuration_digest,
+        "policy_digest": inputs.binding.policy_digest,
+        "profile_identity": inputs.binding.profile_identity,
+        "audit": inputs.audit.evidence(),
+        "recorder_identity": recorder_identity,
+        "store_identity": store_identity,
+        "observation_identity": observation_identity,
+        "host_inputs_identity": host_inputs_identity,
+        "native_control_digest": dependency_review_native_control_digest(),
+        "capture_plan_digest": plan_digest,
+    }
+
+
+def _dependency_review_context_identity(context: Mapping[str, object]) -> str:
+    # The reviewed executor owns this generic context envelope.  The identity
+    # is deliberately over the concrete context, not an ambient host value.
+    return _digest({"schema": "roundwright-live-lifecycle-context/v1", "descriptor": context})
+
+
+def _prepare_dependency_review_attempt_request(
+    inputs: DependencyReviewRequestInputs, store_root: Path,
+) -> DependencyReviewPreparedRequest:
+    if type(inputs) is not DependencyReviewRequestInputs:
+        raise ExternalValidationAdapterError("dependency review preflight inputs are invalid")
+    store_root_identity = _dependency_review_store_root_identity(store_root)
+    try:
+        host_inputs = prepare_dependency_review_host(
+            inputs.repository, inputs.subset, inputs.binding, inputs.audit, backend=inputs.backend,
+            source_owned_relations=inputs.source_owned_relations,
+            supersedes_attempt_id=inputs.supersedes_attempt_id,
+        )
+    except (DependencyReviewDispatchError, ValueError) as error:
+        raise ExternalValidationAdapterError("dependency review host preparation failed") from error
+    recorder_identity = _digest({
+        "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+        "recorder": "roundwright.dependency_review.DependencyReviewStore/v1",
+    })
+    host_inputs_identity = _dependency_review_host_inputs_identity(host_inputs)
+    store_identity = _digest({
+        "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+        "candidate_sha": inputs.subset.candidate_sha,
+        "attempt_id": inputs.attempt_id,
+        "recorder_identity": recorder_identity,
+        "store_root_identity": store_root_identity,
+    })
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
+    native_control_digest = dependency_review_native_control_digest()
+    observation_identity = _digest({
+        "schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA,
+        "repository_root": inputs.repository.root.resolve(strict=False).as_posix(),
+        "base_sha": inputs.base_sha,
+        "subset_digest": inputs.subset.content_digest,
+        "candidate_sha": inputs.subset.candidate_sha,
+        "configuration_digest": inputs.binding.configuration_digest,
+        "policy_digest": inputs.binding.policy_digest,
+        "profile_identity": inputs.binding.profile_identity,
+        "audit": inputs.audit.evidence(),
+        "store_identity": store_identity,
+        "host_inputs_identity": host_inputs_identity,
+        "native_control_digest": native_control_digest,
+    })
+    producer, exporter, comparator = dependency_review_attempt_component_identities()
+    capture_plan = {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+        "case_id": inputs.attempt_id,
+        "candidate_sha": inputs.subset.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "recorder_identity": recorder_identity,
+        "store_identity": store_identity,
+        "observation_identity": observation_identity,
+    }
+    harness = _harness_executor()
+    try:
+        plan = harness.prepare_capture(capture_plan)
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("dependency review capture plan is invalid") from error
+    if (
+        _DIGEST.fullmatch(getattr(plan, "plan_digest", "")) is None
+        or (plan.profile, plan.case_id, plan.candidate_sha, plan.ready_at)
+        != (DEPENDENCY_REVIEW_ATTEMPT_PROFILE, inputs.attempt_id, inputs.subset.candidate_sha, inputs.ready_at)
+    ):
+        raise ExternalValidationAdapterError("dependency review capture plan is invalid")
+    context = _dependency_review_execution_context(
+        inputs, recorder_identity=recorder_identity, store_identity=store_identity,
+        observation_identity=observation_identity, host_inputs_identity=host_inputs_identity,
+        plan_digest=plan.plan_digest,
+    )
+    request_value = {
+        "schema": "roundwright-harness-profile-executor-request/v2",
+        "capture_plan": capture_plan,
+        "execution_context": context,
+    }
+    return DependencyReviewPreparedRequest(
+        inputs, plan.plan_digest, _digest(request_value), recorder_identity, store_root_identity,
+        store_identity, observation_identity, host_inputs_identity, native_control_digest,
+        MappingProxyType(request_value), host_inputs,
+    )
+
+
+def _validated_dependency_review_request(
+    prepared_request: DependencyReviewPreparedRequest, store_root: Path,
+) -> dict[str, object]:
+    from .dependency_review_toolbox import dependency_review_native_control_digest
+
+    if type(prepared_request) is not DependencyReviewPreparedRequest:
+        raise ExternalValidationAdapterError("dependency review prepared request is invalid")
+    inputs = prepared_request.inputs
+    if _dependency_review_store_root_identity(store_root) != prepared_request.store_root_identity:
+        raise ExternalValidationAdapterError("dependency review prepared request has drifted")
+    try:
+        inputs.binding.require_subset(inputs.subset)
+    except ValueError as error:
+        raise ExternalValidationAdapterError("dependency review prepared request has drifted") from error
+    host = prepared_request._host_inputs
+    if (
+        _dependency_review_host_inputs_identity(host) != prepared_request.host_inputs_identity
+        or dependency_review_native_control_digest() != prepared_request.native_control_digest
+        or host.repository != inputs.repository or host.subset != inputs.subset or host.binding != inputs.binding
+        or host.adapter.profile_identity != inputs.binding.profile_identity
+    ):
+        raise ExternalValidationAdapterError("dependency review host inputs have drifted")
+    producer, exporter, comparator = dependency_review_attempt_component_identities()
+    request_value = dict(prepared_request._request_value)
+    expected_capture_plan = {
+        "schema": "roundwright-harness-capture-plan/v1",
+        "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+        "case_id": inputs.attempt_id,
+        "candidate_sha": inputs.subset.candidate_sha,
+        "ready_at": inputs.ready_at,
+        "producer_identity": producer,
+        "exporter_identity": exporter,
+        "comparator_identity": comparator,
+        "recorder_identity": prepared_request.recorder_identity,
+        "store_identity": prepared_request.store_identity,
+        "observation_identity": prepared_request.observation_identity,
+    }
+    expected_context = _dependency_review_execution_context(
+        inputs, recorder_identity=prepared_request.recorder_identity,
+        store_identity=prepared_request.store_identity, observation_identity=prepared_request.observation_identity,
+        host_inputs_identity=prepared_request.host_inputs_identity, plan_digest=prepared_request.capture_plan_digest,
+    )
+    if (
+        _digest(request_value) != prepared_request.request_digest
+        or set(request_value) != {"schema", "capture_plan", "execution_context"}
+        or request_value.get("schema") != "roundwright-harness-profile-executor-request/v2"
+        or request_value.get("capture_plan") != expected_capture_plan
+        or request_value.get("execution_context") != expected_context
+        or _digest(request_value["capture_plan"]) != prepared_request.capture_plan_digest
+        or _dependency_review_context_identity(expected_context) == ""
+    ):
+        raise ExternalValidationAdapterError("dependency review prepared request has drifted")
+    return request_value
+
+
+def _dependency_review_readiness_receipt(
+    harness_receipt: object, prepared_request: DependencyReviewPreparedRequest,
+) -> DependencyReviewReadinessReceipt:
+    harness = _harness_executor()
+    try:
+        if type(harness_receipt) is not harness.ExecutorReadinessReceipt:
+            raise ValueError
+        value = harness_receipt.as_dict()
+        required = {
+            "schema", "status", "state", "plan_digest", "profile", "case_id", "candidate_sha", "ready_at",
+            "producer_identity", "exporter_identity", "comparator_identity", "dispatch_count", "record_count",
+            "verify_count", "mutation_count", "execution_context_input_digest", "execution_context_identity", "receipt_digest",
+        }
+        producer, exporter, comparator = dependency_review_attempt_component_identities()
+        core = {key: item for key, item in value.items() if key != "receipt_digest"}
+        context = prepared_request._request_value["execution_context"]
+        if (
+            type(value) is not dict or set(value) != required
+            or (value["schema"], value["status"], value["state"], value["plan_digest"], value["profile"])
+            != ("roundwright-harness-profile-executor-readiness/v2", "ready", "PREFLIGHT_READY", prepared_request.capture_plan_digest, DEPENDENCY_REVIEW_ATTEMPT_PROFILE)
+            or (value["case_id"], value["candidate_sha"], value["ready_at"])
+            != (prepared_request.inputs.attempt_id, prepared_request.inputs.subset.candidate_sha, prepared_request.inputs.ready_at)
+            or (value["producer_identity"], value["exporter_identity"], value["comparator_identity"])
+            != (producer, exporter, comparator)
+            or (value["dispatch_count"], value["record_count"], value["verify_count"], value["mutation_count"])
+            != (0, 0, 0, 0)
+            or value["execution_context_input_digest"] != _digest(context)
+            or value["execution_context_identity"] != _dependency_review_context_identity(context)
+            or type(value["receipt_digest"]) is not str or _digest(core) != value["receipt_digest"]
+        ):
+            raise ValueError
+        return DependencyReviewReadinessReceipt(
+            prepared_request.capture_plan_digest, prepared_request.inputs.subset.candidate_sha,
+            prepared_request.inputs.attempt_id, prepared_request.inputs.ready_at,
+            producer, exporter, comparator, value["execution_context_input_digest"],
+            value["execution_context_identity"], value["receipt_digest"], _DEPENDENCY_REVIEW_READY_SEAL,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("dependency review readiness receipt is invalid") from error
+
+
+def prepare_dependency_review_attempt_profile(
+    inputs: DependencyReviewRequestInputs, store_root: Path,
+) -> tuple[DependencyReviewPreparedRequest, DependencyReviewReadinessReceipt, _DependencyReviewReadyCapsule]:
+    """Prepare and preflight one complete, provider-free dependency-review binding."""
+
+    prepared = _prepare_dependency_review_attempt_request(inputs, store_root)
+    request_value = _validated_dependency_review_request(prepared, store_root)
+    harness = _harness_executor()
+    try:
+        receipt = harness.run_profile_executor(
+            "validate", request_value, DependencyReviewAttemptAdapter(prepared._host_inputs), store_root,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ExternalValidationAdapterError("dependency review preflight validation failed") from error
+    readiness = _dependency_review_readiness_receipt(receipt, prepared)
+    return prepared, readiness, _DependencyReviewReadyCapsule(
+        prepared, readiness, _seal=_DEPENDENCY_REVIEW_CAPSULE_SEAL,
+    )
+
+
+def _validated_dependency_review_ready_capsule(
+    capsule: _DependencyReviewReadyCapsule, store_root: Path,
+) -> DependencyReviewPreparedRequest:
+    if type(capsule) is not _DependencyReviewReadyCapsule or capsule._consumed:
+        raise ExternalValidationAdapterError("dependency review ready capsule is unavailable")
+    if (
+        capsule._seal is not _DEPENDENCY_REVIEW_CAPSULE_SEAL
+        or type(capsule.prepared_request) is not DependencyReviewPreparedRequest
+        or type(capsule.readiness) is not DependencyReviewReadinessReceipt
+    ):
+        raise ExternalValidationAdapterError("dependency review ready capsule is invalid")
+    prepared = capsule.prepared_request
+    _validated_dependency_review_request(prepared, store_root)
+    readiness = capsule.readiness
+    producer, exporter, comparator = dependency_review_attempt_component_identities()
+    expected_digest = _digest({
+        "schema": "roundwright-dependency-review-ready-capsule/v1",
+        "request_digest": prepared.request_digest,
+        "capture_plan_digest": prepared.capture_plan_digest,
+        "store_identity": prepared.store_identity,
+        "host_inputs_identity": prepared.host_inputs_identity,
+        "readiness": readiness.public_receipt(),
+    })
+    if (
+        readiness._seal is not _DEPENDENCY_REVIEW_READY_SEAL
+        or capsule.capsule_digest != expected_digest
+        or readiness.receipt_digest != _digest({
+            "schema": "roundwright-harness-profile-executor-readiness/v2", "status": "ready", "state": "PREFLIGHT_READY",
+            "plan_digest": readiness.capture_plan_digest, "profile": DEPENDENCY_REVIEW_ATTEMPT_PROFILE,
+            "case_id": readiness.case_id, "candidate_sha": readiness.candidate_sha, "ready_at": readiness.ready_at,
+            "producer_identity": readiness.producer_identity, "exporter_identity": readiness.exporter_identity,
+            "comparator_identity": readiness.comparator_identity,
+            "dispatch_count": 0, "record_count": 0, "verify_count": 0, "mutation_count": 0,
+            "execution_context_input_digest": readiness.execution_context_input_digest,
+            "execution_context_identity": readiness.execution_context_identity,
+        })
+        or (readiness.capture_plan_digest, readiness.candidate_sha, readiness.case_id, readiness.ready_at)
+        != (prepared.capture_plan_digest, prepared.inputs.subset.candidate_sha, prepared.inputs.attempt_id, prepared.inputs.ready_at)
+        or (readiness.producer_identity, readiness.exporter_identity, readiness.comparator_identity)
+        != (producer, exporter, comparator)
+        or readiness.execution_context_input_digest != _digest(prepared._request_value["execution_context"])
+        or readiness.execution_context_identity != _dependency_review_context_identity(prepared._request_value["execution_context"])
+    ):
+        raise ExternalValidationAdapterError("dependency review ready capsule has drifted")
+    return prepared
+
+
+def materialize_dependency_review_attempt_profile(
+    capsule: _DependencyReviewReadyCapsule, store_root: Path,
+) -> object:
+    """Consume one sealed readiness binding before opening its sole provider session."""
+
+    prepared = _validated_dependency_review_ready_capsule(capsule, store_root)
+    # Consumption intentionally precedes the V2 call: any partial/terminal
+    # provider outcome remains one durable attempt and cannot be replayed.
+    object.__setattr__(capsule, "_consumed", True)
+    harness = _harness_executor()
+    try:
+        return harness.run_profile_executor(
+            "execute", dict(prepared._request_value), DependencyReviewAttemptAdapter(prepared._host_inputs), store_root,
+            expected_readiness_digest=capsule.readiness.receipt_digest,
+        )
+    except ExternalValidationAdapterError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, DependencyReviewDispatchError) as error:
+        raise ExternalValidationAdapterError("dependency review hosted execution failed") from error
+
+
+def run_dependency_review_attempt_profile(*_args: object, **_kwargs: object) -> object:
+    """Removed stitching entrypoint.
+
+    Call ``prepare_dependency_review_attempt_profile`` then
+    ``materialize_dependency_review_attempt_profile`` so a caller never owns
+    independently assembled request and host state.
+    """
+
+    raise ExternalValidationAdapterError("dependency review execution requires a sealed ready capsule")

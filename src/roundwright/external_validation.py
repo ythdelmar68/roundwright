@@ -5042,7 +5042,6 @@ def run_configured_source_ingestion_profile(
             or request.schema != "roundwright-harness-profile-executor-request/v2"
             or request.capture_plan["profile"] != CONFIGURED_SOURCE_INGESTION_PROFILE
             or not _canonical_json_equivalent(request.capture_plan, configured_source_capture_plan(host_inputs))
-            or not _canonical_json_equivalent(request.execution_context, host_inputs.execution_context())
             or (mode == "validate" and expected_readiness_digest is not None)
             or (mode == "execute" and _DIGEST.fullmatch(expected_readiness_digest or "") is None)
         ):
@@ -5052,8 +5051,11 @@ def run_configured_source_ingestion_profile(
             (plan.profile, plan.case_id, plan.candidate_sha, plan.plan_digest, plan.ready_at)
             != (
                 CONFIGURED_SOURCE_INGESTION_PROFILE, host_inputs.case_id,
-                host_inputs.binding.candidate_sha, host_inputs.capture_plan_digest,
+                host_inputs.binding.candidate_sha, plan.plan_digest,
                 host_inputs.ready_at,
+            )
+            or not _canonical_json_equivalent(
+                request.execution_context, host_inputs.execution_context(plan.plan_digest),
             )
         ):
             raise ValueError

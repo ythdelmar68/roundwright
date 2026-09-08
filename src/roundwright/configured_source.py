@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -118,6 +119,87 @@ class ConfiguredSourceAdapter(Protocol):
     """Read-only adapter seam; no mutation operation is part of this protocol."""
 
     def read(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage: ...
+
+
+@dataclass(frozen=True)
+class IssueListReadHost:
+    """Candidate-owned read capability for explicitly configured issue lists."""
+
+    read_page: object
+
+    def __post_init__(self) -> None:
+        if not callable(self.read_page):
+            raise ConfiguredSourceError("issue-list read host is invalid")
+
+
+@dataclass(frozen=True)
+class TaskFeedReadHost:
+    """Candidate-owned read capability for explicitly configured task feeds."""
+
+    read_page: object
+
+    def __post_init__(self) -> None:
+        if not callable(self.read_page):
+            raise ConfiguredSourceError("task-feed read host is invalid")
+
+
+class TrustedConfiguredSourceReadHost:
+    """Concrete, typed, read-only host for the closed configured-source set.
+
+    This is intentionally not a structural provider protocol.  The host owns
+    the exact allowlist, query/cursor contract, and the only two typed read
+    capabilities.  It exposes no mutation or provider-discovery operation.
+    """
+
+    def __init__(
+        self,
+        binding: SourceIngestionBinding,
+        *,
+        issue_list: IssueListReadHost | None = None,
+        task_feed: TaskFeedReadHost | None = None,
+    ) -> None:
+        if type(binding) is not SourceIngestionBinding:
+            raise ConfiguredSourceError("trusted source binding is invalid")
+        required = {source.source_type for source in binding.configured_sources}
+        if (
+            (SourceType.ISSUE_LIST in required) != (type(issue_list) is IssueListReadHost)
+            or (SourceType.TASK_FEED in required) != (type(task_feed) is TaskFeedReadHost)
+            or (SourceType.ISSUE_LIST not in required and issue_list is not None)
+            or (SourceType.TASK_FEED not in required and task_feed is not None)
+        ):
+            raise ConfiguredSourceError("trusted configured-source readers are invalid")
+        self._binding = binding
+        self._issue_list = issue_list
+        self._task_feed = task_feed
+
+    @property
+    def binding(self) -> SourceIngestionBinding:
+        return self._binding
+
+    @property
+    def query_identity(self) -> str:
+        return _digest_value({
+            "schema": "roundwright-configured-source-read-host/v1",
+            "source_set_digest": self._binding.source_set_digest,
+            "queries": [
+                {"source": source.payload(), "cursor_contract": "bounded-opaque-cursor/v1"}
+                for source in sorted(self._binding.configured_sources, key=lambda value: value.public_identity)
+            ],
+        })
+
+    def read(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
+        if type(source) is not ConfiguredSource or source not in self._binding.configured_sources:
+            raise ConfiguredSourceError("configured source is outside the trusted allowlist")
+        reader = self._issue_list if source.source_type is SourceType.ISSUE_LIST else self._task_feed
+        if reader is None:
+            raise ConfiguredSourceError("configured source reader is unavailable")
+        page = reader.read_page(source, cursor=cursor)
+        if type(page) is not SourcePage or page.source != source or page.requested_cursor != cursor:
+            raise ConfiguredSourceError("trusted source reader identity has drifted")
+        return page
+
+    def scan(self) -> SourceInventory:
+        return scan_configured_sources(self._binding, self)
 
 
 @dataclass(frozen=True)
@@ -366,6 +448,18 @@ def _digest_value(value: object) -> str:
     ).hexdigest()
 
 
+def _materialize_json(value: object) -> object:
+    """Canonicalize the Harness V2 immutable JSON view for local comparison."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _materialize_json(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_materialize_json(item) for item in value]
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    raise ConfiguredSourceError("configured source execution context is not JSON")
+
+
 # These identities are part of the selected profile contract.  They are not
 # loaded from a source configuration or an adapter, so neither can widen the
 # capture surface.
@@ -404,8 +498,9 @@ class ConfiguredSourceHostInputs:
     graph: GraphSnapshot
     case_id: str
     ready_at: int
-    capture_plan_digest: str
-    source_adapter: ConfiguredSourceAdapter
+    read_host: TrustedConfiguredSourceReadHost
+    recorder_identity: str
+    store_identity: str
     unresolved_owner_member_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -416,8 +511,8 @@ class ConfiguredSourceHostInputs:
             not _SHA.fullmatch(self.base_sha) or type(self.binding) is not SourceIngestionBinding
             or type(self.graph) is not GraphSnapshot or self.graph.binding != expected
             or not _TOKEN.fullmatch(self.case_id) or type(self.ready_at) is not int or self.ready_at < 0
-            or not _DIGEST_PATTERN.fullmatch(self.capture_plan_digest)
-            or not callable(getattr(self.source_adapter, "read", None))
+            or type(self.read_host) is not TrustedConfiguredSourceReadHost or self.read_host.binding != self.binding
+            or not _DIGEST_PATTERN.fullmatch(self.recorder_identity) or not _DIGEST_PATTERN.fullmatch(self.store_identity)
             or type(self.unresolved_owner_member_ids) is not tuple
             or any(not _TOKEN.fullmatch(member) for member in self.unresolved_owner_member_ids)
             or len(set(self.unresolved_owner_member_ids)) != len(self.unresolved_owner_member_ids)
@@ -430,9 +525,12 @@ class ConfiguredSourceHostInputs:
 
     @property
     def observation_identity(self) -> str:
-        return _digest_value(self.execution_context())
+        return _digest_value({
+            "schema": "roundwright-configured-source-observation/v1",
+            "descriptor": self.observation_descriptor(),
+        })
 
-    def execution_context(self) -> dict[str, object]:
+    def observation_descriptor(self) -> dict[str, object]:
         return {
             "schema": CONFIGURED_SOURCE_EXECUTION_CONTEXT_SCHEMA,
             "base_sha": self.base_sha,
@@ -441,11 +539,21 @@ class ConfiguredSourceHostInputs:
             "configuration_digest": self.binding.configuration_digest,
             "configured_sources": [source.payload() for source in sorted(self.binding.configured_sources, key=lambda item: item.public_identity)],
             "source_set_digest": self.binding.source_set_digest,
+            "trusted_query_identity": self.read_host.query_identity,
             "graph_digest": self.graph.graph_digest,
             "case_id": self.case_id,
             "ready_at": self.ready_at,
-            "capture_plan_digest": self.capture_plan_digest,
+            "recorder_identity": self.recorder_identity,
+            "store_identity": self.store_identity,
             "unresolved_owner_member_ids": list(self.unresolved_owner_member_ids),
+        }
+
+    def execution_context(self, capture_plan_digest: str) -> dict[str, object]:
+        if not _DIGEST_PATTERN.fullmatch(capture_plan_digest):
+            raise ConfiguredSourceError("configured source capture plan identity is invalid")
+        return {
+            **self.observation_descriptor(),
+            "capture_plan_digest": capture_plan_digest,
         }
 
 
@@ -474,7 +582,29 @@ def configured_source_capture_plan(inputs: ConfiguredSourceHostInputs) -> dict[s
         "producer_identity": producer,
         "exporter_identity": exporter,
         "comparator_identity": comparator,
+        "recorder_identity": inputs.recorder_identity,
+        "store_identity": inputs.store_identity,
         "observation_identity": inputs.observation_identity,
+    }
+
+
+def configured_source_executor_request(inputs: ConfiguredSourceHostInputs) -> dict[str, object]:
+    """Close a V2 request in two acyclic phases before any source read.
+
+    The observation identity is derived only from stable host facts.  Harness
+    then derives the plan digest, which is bound into the execution context.
+    The resulting request has no self-referential digest dependency.
+    """
+
+    if type(inputs) is not ConfiguredSourceHostInputs:
+        raise ConfiguredSourceError("configured source host inputs are invalid")
+    from .external_validation import _harness_executor
+    capture_plan = configured_source_capture_plan(inputs)
+    plan = _harness_executor().prepare_capture(capture_plan)
+    return {
+        "schema": "roundwright-harness-profile-executor-request/v2",
+        "capture_plan": capture_plan,
+        "execution_context": inputs.execution_context(plan.plan_digest),
     }
 
 
@@ -506,10 +636,14 @@ def _source_execution_context(binding: object, inputs: ConfiguredSourceHostInput
         raise ConfiguredSourceError("configured source execution context is unavailable") from error
     if (
         type(value) is not ConfiguredSourceHostInputs or value != inputs
-        or context.identity != inputs.observation_identity
-        or input_digest != _digest_value(inputs.execution_context())
+        or context.identity != _digest_value({
+            "observation_identity": inputs.observation_identity,
+            "capture_plan_digest": plan.plan_digest,
+            "execution_context_input_digest": input_digest,
+        })
+        or input_digest != _digest_value(inputs.execution_context(plan.plan_digest))
         or (plan.candidate_sha, plan.case_id, plan.plan_digest, plan.ready_at)
-        != (inputs.binding.candidate_sha, inputs.case_id, inputs.capture_plan_digest, inputs.ready_at)
+        != (inputs.binding.candidate_sha, inputs.case_id, plan.plan_digest, inputs.ready_at)
     ):
         raise ConfiguredSourceError("configured source execution context has drifted")
     return value
@@ -574,16 +708,20 @@ class ConfiguredSourceIngestionAdapter:
         inputs = self._require_inputs()
         try:
             if (
-                preparation.descriptor != inputs.execution_context()
-                or preparation.input_digest != _digest_value(inputs.execution_context())
+                _materialize_json(preparation.descriptor) != inputs.execution_context(preparation.plan.plan_digest)
+                or preparation.input_digest != _digest_value(inputs.execution_context(preparation.plan.plan_digest))
                 or preparation.components != self.component_identities
                 or (preparation.plan.candidate_sha, preparation.plan.case_id, preparation.plan.plan_digest, preparation.plan.ready_at)
-                != (inputs.binding.candidate_sha, inputs.case_id, inputs.capture_plan_digest, inputs.ready_at)
+                != (inputs.binding.candidate_sha, inputs.case_id, preparation.plan.plan_digest, inputs.ready_at)
             ):
                 raise ValueError
         except (AttributeError, ValueError) as error:
             raise ConfiguredSourceError("configured source execution context is invalid") from error
-        return _harness_executor().ProfileExecutionContext(inputs.observation_identity, inputs)
+        return _harness_executor().ProfileExecutionContext(_digest_value({
+            "observation_identity": inputs.observation_identity,
+            "capture_plan_digest": preparation.plan.plan_digest,
+            "execution_context_input_digest": preparation.input_digest,
+        }), inputs)
 
     def validate(self, binding: object) -> None:
         inputs = self._require_inputs()
@@ -604,7 +742,7 @@ class ConfiguredSourceIngestionAdapter:
         inputs = self._require_inputs()
         # This is the only source-read point.  Validate, compare, and project
         # never invoke an adapter, provider, Git, or GitHub operation.
-        inventory = scan_configured_sources(inputs.binding, inputs.source_adapter)
+        inventory = inputs.read_host.scan()
         selection = select_runnable_work(
             inventory, inputs.graph, unresolved_owner_member_ids=inputs.unresolved_owner_member_ids,
         )

@@ -19,6 +19,7 @@ from roundwright.configured_source import (
     ConfiguredSourceHostInputs, ConfiguredSourceIngestionAdapter, SourceItem, SourcePage,
     SourceType, TaskFeedReadHost, TrustedConfiguredSourceReadHost, configured_source_capture_plan,
     configured_source_component_identities, configured_source_executor_request,
+    create_configured_source_read_capability, resolve_configured_source_authority,
     scan_configured_sources, select_runnable_work,
 )
 from roundwright.dependency_graph import DependencyGraphBinding, GraphEdge, GraphMember, GraphSnapshot
@@ -72,6 +73,7 @@ class ExactHarnessV2:
         "recorder_identity", "store_identity", "observation_identity",
     }
     calls = {"dispatch": 0, "record": 0, "verify": 0, "mutation": 0}
+    run_calls = 0
 
     class ProfileComponentIdentities:
         def __init__(self, producer_identity, exporter_identity, comparator_identity):
@@ -118,6 +120,7 @@ class ExactHarnessV2:
 
     @staticmethod
     def run_profile_executor(mode, request_value, adapter, store_root, *, expected_readiness_digest=None):
+        ExactHarnessV2.run_calls += 1
         if mode != "validate" or expected_readiness_digest is not None:
             raise ValueError("this hermetic gate only validates")
         request = ExactHarnessV2.ExecutorRequest.parse(request_value)
@@ -152,6 +155,15 @@ class ConfiguredSourceTests(unittest.TestCase):
 
     def inventory(self, sources, pages):
         return scan_configured_sources(SourceIngestionBinding(self.candidate, self.policy, self.configuration, tuple(sources)), Adapter(pages))
+
+    @staticmethod
+    def source_host(authority, reader, *, capability="read-capability"):
+        return TrustedConfiguredSourceReadHost(
+            authority,
+            create_configured_source_read_capability(
+                authority, digest(capability), task_feed=TaskFeedReadHost(reader.read),
+            ),
+        )
 
     def test_only_explicit_bounded_sources_and_cursor_progress_are_accepted(self):
         source = self.source()
@@ -218,9 +230,10 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        read_host = TrustedConfiguredSourceReadHost(source_binding, task_feed=TaskFeedReadHost(reader.read))
+        authority = resolve_configured_source_authority(source_binding, graph)
+        read_host = self.source_host(authority, reader)
         host = ConfiguredSourceHostInputs(
-            "b" * 40, source_binding, graph, "configured-source-case", 71, read_host,
+            "b" * 40, authority, "configured-source-case", 71, read_host,
             digest("recorder"), digest("store"),
         )
         capture = digest(configured_source_capture_plan(host))
@@ -259,9 +272,9 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
+        authority = resolve_configured_source_authority(source_binding, graph)
         host = ConfiguredSourceHostInputs(
-            "b" * 40, source_binding, graph, "configured-source-case", 71,
-            TrustedConfiguredSourceReadHost(source_binding, task_feed=TaskFeedReadHost(reader.read)),
+            "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
             digest("recorder"), digest("store"),
         )
         ExactHarnessV2.calls = {"dispatch": 0, "record": 0, "verify": 0, "mutation": 0}
@@ -277,6 +290,63 @@ class ConfiguredSourceTests(unittest.TestCase):
         self.assertEqual(ExactHarnessV2.calls, {"dispatch": 0, "record": 0, "verify": 0, "mutation": 0})
         self.assertEqual(set(request["capture_plan"]), ExactHarnessV2.plan_fields)
         self.assertEqual(request["capture_plan"]["observation_identity"], host.observation_identity)
+
+    def test_preflight_rejects_capability_authority_and_request_movement_before_read(self):
+        source = self.source()
+        item = self.item("item/a", "task-a")
+        binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,))
+        graph = GraphSnapshot(
+            "graph-117", DependencyGraphBinding(self.candidate, self.policy, self.configuration),
+            (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
+        )
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
+        authority = resolve_configured_source_authority(binding, graph)
+        host = ConfiguredSourceHostInputs(
+            "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
+            digest("recorder"), digest("store"),
+        )
+        changed_capability = ConfiguredSourceHostInputs(
+            host.base_sha, authority, host.case_id, host.ready_at,
+            self.source_host(authority, reader, capability="other-capability"), host.recorder_identity, host.store_identity,
+        )
+        changed_graph = GraphSnapshot("graph-118", graph.binding, graph.members, graph.edges, graph.proposal_ids)
+        changed_graph_authority = resolve_configured_source_authority(binding, changed_graph)
+        changed_authority = ConfiguredSourceHostInputs(
+            host.base_sha, changed_graph_authority, host.case_id, host.ready_at,
+            self.source_host(changed_graph_authority, reader), host.recorder_identity, host.store_identity,
+        )
+        changed_source = self.source("team/other")
+        changed_binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (changed_source,))
+        changed_source_graph = GraphSnapshot("graph-119", DependencyGraphBinding(self.candidate, self.policy, self.configuration), graph.members, graph.edges, graph.proposal_ids)
+        changed_source_authority = resolve_configured_source_authority(changed_binding, changed_source_graph)
+        changed_source_reader = Adapter({(changed_source.public_identity, None): SourcePage(changed_source, None, None, (item,))})
+        changed_configuration = ConfiguredSourceHostInputs(
+            host.base_sha, changed_source_authority, host.case_id, host.ready_at,
+            self.source_host(changed_source_authority, changed_source_reader), host.recorder_identity, host.store_identity,
+        )
+        moved_candidate = "c" * 40
+        moved_binding = SourceIngestionBinding(moved_candidate, self.policy, self.configuration, (source,))
+        moved_graph = GraphSnapshot(
+            "graph-120", DependencyGraphBinding(moved_candidate, self.policy, self.configuration),
+            graph.members, graph.edges, graph.proposal_ids,
+        )
+        moved_authority = resolve_configured_source_authority(moved_binding, moved_graph)
+        moved_candidate_host = ConfiguredSourceHostInputs(
+            host.base_sha, moved_authority, host.case_id, host.ready_at,
+            self.source_host(moved_authority, reader), host.recorder_identity, host.store_identity,
+        )
+        changed_ready = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, 72, host.read_host, host.recorder_identity, host.store_identity)
+        changed_recorder = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, host.ready_at, host.read_host, digest("other-recorder"), host.store_identity)
+        changed_store = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, host.ready_at, host.read_host, host.recorder_identity, digest("other-store"))
+        ExactHarnessV2.run_calls = 0
+        with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
+            request = configured_source_executor_request(host)
+            for moved in (changed_capability, changed_authority, changed_configuration, moved_candidate_host, changed_ready, changed_recorder, changed_store):
+                with self.subTest(moved=moved.observation_identity), self.assertRaises(Exception):
+                    run_configured_source_ingestion_profile("validate", request, Path("unused-store"), moved)
+        self.assertEqual(ExactHarnessV2.run_calls, 0)
+        self.assertEqual(reader.calls, [])
+        self.assertEqual(changed_source_reader.calls, [])
 
 
 if __name__ == "__main__":

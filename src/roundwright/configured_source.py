@@ -13,7 +13,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
@@ -143,6 +143,131 @@ class TaskFeedReadHost:
             raise ConfiguredSourceError("task-feed read host is invalid")
 
 
+_CONFIGURED_SOURCE_AUTHORITY_SEAL = object()
+_CONFIGURED_SOURCE_CAPABILITY_SEAL = object()
+
+
+@dataclass(frozen=True)
+class ConfiguredSourceAuthority:
+    """Factory-sealed receipt for the resolved source configuration and graph."""
+
+    binding: SourceIngestionBinding
+    graph: GraphSnapshot
+    configuration_receipt_identity: str
+    graph_receipt_identity: str
+    authority_identity: str
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        expected = DependencyGraphBinding(
+            self.binding.candidate_sha, self.binding.policy_digest, self.binding.configuration_digest,
+        ) if type(self.binding) is SourceIngestionBinding else None
+        expected_configuration = _digest_value({
+            "schema": "roundwright-configured-source-configuration-receipt/v1",
+            "candidate_sha": self.binding.candidate_sha,
+            "policy_digest": self.binding.policy_digest,
+            "configuration_digest": self.binding.configuration_digest,
+            "source_set_digest": self.binding.source_set_digest,
+        }) if expected is not None else ""
+        expected_graph = _digest_value({
+            "schema": "roundwright-configured-source-accepted-graph-receipt/v1",
+            "configuration_receipt_identity": expected_configuration,
+            "graph_version_id": self.graph.graph_version_id if type(self.graph) is GraphSnapshot else None,
+            "graph_digest": self.graph.graph_digest if type(self.graph) is GraphSnapshot else None,
+        }) if expected is not None else ""
+        expected_authority = _digest_value({
+            "schema": "roundwright-configured-source-authority/v1",
+            "configuration_receipt_identity": expected_configuration,
+            "graph_receipt_identity": expected_graph,
+        }) if expected is not None else ""
+        if (
+            self._seal is not _CONFIGURED_SOURCE_AUTHORITY_SEAL
+            or type(self.binding) is not SourceIngestionBinding or type(self.graph) is not GraphSnapshot
+            or self.graph.binding != expected or self.graph.graph_version_id is None
+            or (self.configuration_receipt_identity, self.graph_receipt_identity, self.authority_identity)
+            != (expected_configuration, expected_graph, expected_authority)
+        ):
+            raise ConfiguredSourceError("configured source authority is invalid")
+
+
+def resolve_configured_source_authority(
+    binding: SourceIngestionBinding, graph: GraphSnapshot,
+) -> ConfiguredSourceAuthority:
+    """Create the only product-owned receipt for resolved configuration and graph."""
+
+    expected = DependencyGraphBinding(
+        binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+    ) if type(binding) is SourceIngestionBinding else None
+    if type(binding) is not SourceIngestionBinding or type(graph) is not GraphSnapshot or graph.binding != expected or graph.graph_version_id is None:
+        raise ConfiguredSourceError("configured source authority inputs are invalid")
+    configuration = _digest_value({
+        "schema": "roundwright-configured-source-configuration-receipt/v1",
+        "candidate_sha": binding.candidate_sha, "policy_digest": binding.policy_digest,
+        "configuration_digest": binding.configuration_digest, "source_set_digest": binding.source_set_digest,
+    })
+    graph_receipt = _digest_value({
+        "schema": "roundwright-configured-source-accepted-graph-receipt/v1",
+        "configuration_receipt_identity": configuration,
+        "graph_version_id": graph.graph_version_id, "graph_digest": graph.graph_digest,
+    })
+    authority = _digest_value({
+        "schema": "roundwright-configured-source-authority/v1",
+        "configuration_receipt_identity": configuration, "graph_receipt_identity": graph_receipt,
+    })
+    return ConfiguredSourceAuthority(binding, graph, configuration, graph_receipt, authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL)
+
+
+@dataclass(frozen=True)
+class ConfiguredSourceReadCapability:
+    """Factory-sealed read-only capability, with no provider command surface."""
+
+    binding: SourceIngestionBinding
+    capability_identity: str
+    issue_list: IssueListReadHost | None
+    task_feed: TaskFeedReadHost | None
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        required = {source.source_type for source in self.binding.configured_sources} if type(self.binding) is SourceIngestionBinding else set()
+        if (
+            self._seal is not _CONFIGURED_SOURCE_CAPABILITY_SEAL or type(self.binding) is not SourceIngestionBinding
+            or not _DIGEST_PATTERN.fullmatch(self.capability_identity)
+            or (SourceType.ISSUE_LIST in required) != (type(self.issue_list) is IssueListReadHost)
+            or (SourceType.TASK_FEED in required) != (type(self.task_feed) is TaskFeedReadHost)
+            or (SourceType.ISSUE_LIST not in required and self.issue_list is not None)
+            or (SourceType.TASK_FEED not in required and self.task_feed is not None)
+        ):
+            raise ConfiguredSourceError("configured source read capability is invalid")
+
+    def read(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
+        if type(source) is not ConfiguredSource or source not in self.binding.configured_sources:
+            raise ConfiguredSourceError("configured source is outside the trusted allowlist")
+        reader = self.issue_list if source.source_type is SourceType.ISSUE_LIST else self.task_feed
+        if reader is None:
+            raise ConfiguredSourceError("configured source reader is unavailable")
+        page = reader.read_page(source, cursor=cursor)
+        if type(page) is not SourcePage or page.source != source or page.requested_cursor != cursor:
+            raise ConfiguredSourceError("configured source capability has drifted")
+        return page
+
+
+def create_configured_source_read_capability(
+    authority: ConfiguredSourceAuthority, capability_identity: str, *,
+    issue_list: IssueListReadHost | None = None, task_feed: TaskFeedReadHost | None = None,
+) -> ConfiguredSourceReadCapability:
+    """Bind an owner-resolved typed source capability to exact source bounds.
+
+    The constructor accepts only typed page readers; credentials, raw payloads,
+    provider commands, and mutation surfaces remain outside this product seam.
+    """
+
+    if type(authority) is not ConfiguredSourceAuthority or not _DIGEST_PATTERN.fullmatch(capability_identity):
+        raise ConfiguredSourceError("configured source capability inputs are invalid")
+    return ConfiguredSourceReadCapability(
+        authority.binding, capability_identity, issue_list, task_feed, _CONFIGURED_SOURCE_CAPABILITY_SEAL,
+    )
+
+
 class TrustedConfiguredSourceReadHost:
     """Concrete, typed, read-only host for the closed configured-source set.
 
@@ -153,53 +278,39 @@ class TrustedConfiguredSourceReadHost:
 
     def __init__(
         self,
-        binding: SourceIngestionBinding,
-        *,
-        issue_list: IssueListReadHost | None = None,
-        task_feed: TaskFeedReadHost | None = None,
+        authority: ConfiguredSourceAuthority, capability: ConfiguredSourceReadCapability,
     ) -> None:
-        if type(binding) is not SourceIngestionBinding:
-            raise ConfiguredSourceError("trusted source binding is invalid")
-        required = {source.source_type for source in binding.configured_sources}
-        if (
-            (SourceType.ISSUE_LIST in required) != (type(issue_list) is IssueListReadHost)
-            or (SourceType.TASK_FEED in required) != (type(task_feed) is TaskFeedReadHost)
-            or (SourceType.ISSUE_LIST not in required and issue_list is not None)
-            or (SourceType.TASK_FEED not in required and task_feed is not None)
-        ):
+        if type(authority) is not ConfiguredSourceAuthority or type(capability) is not ConfiguredSourceReadCapability or capability.binding != authority.binding:
             raise ConfiguredSourceError("trusted configured-source readers are invalid")
-        self._binding = binding
-        self._issue_list = issue_list
-        self._task_feed = task_feed
+        self._authority = authority
+        self._capability = capability
 
     @property
     def binding(self) -> SourceIngestionBinding:
-        return self._binding
+        return self._authority.binding
+
+    @property
+    def authority_identity(self) -> str:
+        return self._authority.authority_identity
 
     @property
     def query_identity(self) -> str:
         return _digest_value({
             "schema": "roundwright-configured-source-read-host/v1",
-            "source_set_digest": self._binding.source_set_digest,
+            "authority_identity": self._authority.authority_identity,
+            "capability_identity": self._capability.capability_identity,
+            "source_set_digest": self.binding.source_set_digest,
             "queries": [
                 {"source": source.payload(), "cursor_contract": "bounded-opaque-cursor/v1"}
-                for source in sorted(self._binding.configured_sources, key=lambda value: value.public_identity)
+                for source in sorted(self.binding.configured_sources, key=lambda value: value.public_identity)
             ],
         })
 
     def read(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
-        if type(source) is not ConfiguredSource or source not in self._binding.configured_sources:
-            raise ConfiguredSourceError("configured source is outside the trusted allowlist")
-        reader = self._issue_list if source.source_type is SourceType.ISSUE_LIST else self._task_feed
-        if reader is None:
-            raise ConfiguredSourceError("configured source reader is unavailable")
-        page = reader.read_page(source, cursor=cursor)
-        if type(page) is not SourcePage or page.source != source or page.requested_cursor != cursor:
-            raise ConfiguredSourceError("trusted source reader identity has drifted")
-        return page
+        return self._capability.read(source, cursor=cursor)
 
     def scan(self) -> SourceInventory:
-        return scan_configured_sources(self._binding, self)
+        return scan_configured_sources(self.binding, self)
 
 
 @dataclass(frozen=True)
@@ -494,8 +605,7 @@ class ConfiguredSourceHostInputs:
     """
 
     base_sha: str
-    binding: SourceIngestionBinding
-    graph: GraphSnapshot
+    authority: ConfiguredSourceAuthority
     case_id: str
     ready_at: int
     read_host: TrustedConfiguredSourceReadHost
@@ -504,14 +614,11 @@ class ConfiguredSourceHostInputs:
     unresolved_owner_member_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        expected = DependencyGraphBinding(
-            self.binding.candidate_sha, self.binding.policy_digest, self.binding.configuration_digest,
-        ) if type(self.binding) is SourceIngestionBinding else None
         if (
-            not _SHA.fullmatch(self.base_sha) or type(self.binding) is not SourceIngestionBinding
-            or type(self.graph) is not GraphSnapshot or self.graph.binding != expected
+            not _SHA.fullmatch(self.base_sha) or type(self.authority) is not ConfiguredSourceAuthority
             or not _TOKEN.fullmatch(self.case_id) or type(self.ready_at) is not int or self.ready_at < 0
-            or type(self.read_host) is not TrustedConfiguredSourceReadHost or self.read_host.binding != self.binding
+            or type(self.read_host) is not TrustedConfiguredSourceReadHost or self.read_host.binding != self.authority.binding
+            or self.read_host.authority_identity != self.authority.authority_identity
             or not _DIGEST_PATTERN.fullmatch(self.recorder_identity) or not _DIGEST_PATTERN.fullmatch(self.store_identity)
             or type(self.unresolved_owner_member_ids) is not tuple
             or any(not _TOKEN.fullmatch(member) for member in self.unresolved_owner_member_ids)
@@ -522,6 +629,14 @@ class ConfiguredSourceHostInputs:
         # immutable Shadow capture-readiness registry.
         if shadow_evidence_profile(SOURCE_INGESTION_PROFILE).capture_mode.value != "terminal-snapshot":
             raise ConfiguredSourceError("configured source profile is unavailable")
+
+    @property
+    def binding(self) -> SourceIngestionBinding:
+        return self.authority.binding
+
+    @property
+    def graph(self) -> GraphSnapshot:
+        return self.authority.graph
 
     @property
     def observation_identity(self) -> str:
@@ -539,6 +654,9 @@ class ConfiguredSourceHostInputs:
             "configuration_digest": self.binding.configuration_digest,
             "configured_sources": [source.payload() for source in sorted(self.binding.configured_sources, key=lambda item: item.public_identity)],
             "source_set_digest": self.binding.source_set_digest,
+            "configuration_receipt_identity": self.authority.configuration_receipt_identity,
+            "graph_receipt_identity": self.authority.graph_receipt_identity,
+            "authority_identity": self.authority.authority_identity,
             "trusted_query_identity": self.read_host.query_identity,
             "graph_digest": self.graph.graph_digest,
             "case_id": self.case_id,

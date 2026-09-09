@@ -49,6 +49,13 @@ class SelectionState(StrEnum):
     BLOCKED = "blocked"
 
 
+class GraphApplicability(StrEnum):
+    """Whether this closed source selection has a dependency-graph lane."""
+
+    NOT_APPLICABLE = "not-applicable"
+    REQUIRED = "required"
+
+
 @dataclass(frozen=True)
 class ConfiguredSource:
     """One exact source selected by trusted configuration, never a pattern."""
@@ -271,7 +278,8 @@ class ConfiguredSourceAuthority:
     """Factory-sealed receipt for the resolved source configuration and graph."""
 
     binding: SourceIngestionBinding
-    graph: GraphSnapshot
+    graph_applicability: GraphApplicability
+    graph: GraphSnapshot | None
     configuration_receipt_identity: str
     graph_receipt_identity: str
     authority_identity: str
@@ -288,9 +296,11 @@ class ConfiguredSourceAuthority:
             "configuration_digest": self.binding.configuration_digest,
             "source_set_digest": self.binding.source_set_digest,
         }) if expected is not None else ""
+        applicability = _graph_applicability(self.binding) if type(self.binding) is SourceIngestionBinding else None
         expected_graph = _digest_value({
             "schema": "roundwright-configured-source-accepted-graph-receipt/v1",
             "configuration_receipt_identity": expected_configuration,
+            "applicability": applicability.value if applicability is not None else None,
             "graph_version_id": self.graph.graph_version_id if type(self.graph) is GraphSnapshot else None,
             "graph_digest": self.graph.graph_digest if type(self.graph) is GraphSnapshot else None,
         }) if expected is not None else ""
@@ -301,8 +311,9 @@ class ConfiguredSourceAuthority:
         }) if expected is not None else ""
         if (
             self._seal is not _CONFIGURED_SOURCE_AUTHORITY_SEAL
-            or type(self.binding) is not SourceIngestionBinding or type(self.graph) is not GraphSnapshot
-            or self.graph.binding != expected or self.graph.graph_version_id is None
+            or type(self.binding) is not SourceIngestionBinding or self.graph_applicability is not applicability
+            or (applicability is GraphApplicability.NOT_APPLICABLE and self.graph is not None)
+            or (applicability is GraphApplicability.REQUIRED and (type(self.graph) is not GraphSnapshot or self.graph.binding != expected or self.graph.graph_version_id is None))
             or (self.configuration_receipt_identity, self.graph_receipt_identity, self.authority_identity)
             != (expected_configuration, expected_graph, expected_authority)
         ):
@@ -310,14 +321,19 @@ class ConfiguredSourceAuthority:
 
 
 def _seal_configured_source_authority(
-    binding: SourceIngestionBinding, graph: GraphSnapshot,
+    binding: SourceIngestionBinding, graph: GraphSnapshot | None = None,
 ) -> ConfiguredSourceAuthority:
     """Internal constructor for a graph that has already been read back."""
 
     expected = DependencyGraphBinding(
         binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
     ) if type(binding) is SourceIngestionBinding else None
-    if type(binding) is not SourceIngestionBinding or type(graph) is not GraphSnapshot or graph.binding != expected or graph.graph_version_id is None:
+    applicability = _graph_applicability(binding) if type(binding) is SourceIngestionBinding else None
+    if (
+        type(binding) is not SourceIngestionBinding or applicability is None
+        or (applicability is GraphApplicability.NOT_APPLICABLE and graph is not None)
+        or (applicability is GraphApplicability.REQUIRED and (type(graph) is not GraphSnapshot or graph.binding != expected or graph.graph_version_id is None))
+    ):
         raise ConfiguredSourceError("configured source authority inputs are invalid")
     configuration = _digest_value({
         "schema": "roundwright-configured-source-configuration-receipt/v1",
@@ -327,13 +343,15 @@ def _seal_configured_source_authority(
     graph_receipt = _digest_value({
         "schema": "roundwright-configured-source-accepted-graph-receipt/v1",
         "configuration_receipt_identity": configuration,
-        "graph_version_id": graph.graph_version_id, "graph_digest": graph.graph_digest,
+        "applicability": applicability.value,
+        "graph_version_id": graph.graph_version_id if graph is not None else None,
+        "graph_digest": graph.graph_digest if graph is not None else None,
     })
     authority = _digest_value({
         "schema": "roundwright-configured-source-authority/v1",
         "configuration_receipt_identity": configuration, "graph_receipt_identity": graph_receipt,
     })
-    return ConfiguredSourceAuthority(binding, graph, configuration, graph_receipt, authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL)
+    return ConfiguredSourceAuthority(binding, applicability, graph, configuration, graph_receipt, authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL)
 
 
 def resolve_source_ingestion_binding(
@@ -374,9 +392,9 @@ def resolve_configured_source_authority(
     ):
         raise ConfiguredSourceError("configured source authoritative inputs are invalid")
     binding = resolve_source_ingestion_binding(configuration, candidate_sha)
-    graph_binding = DependencyGraphBinding(
-        binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
-    )
+    if _graph_applicability(binding) is GraphApplicability.NOT_APPLICABLE:
+        return _seal_configured_source_authority(binding)
+    graph_binding = DependencyGraphBinding(binding.candidate_sha, binding.policy_digest, binding.configuration_digest)
     try:
         graph = DependencyGraphStore().current(repository, binding=graph_binding)
     except Exception as error:
@@ -512,6 +530,14 @@ class SourceIngestionBinding:
     @property
     def source_set_digest(self) -> str:
         return _digest_value({"sources": [source.payload() for source in sorted(self.configured_sources, key=lambda item: item.public_identity)]})
+
+
+def _graph_applicability(binding: SourceIngestionBinding) -> GraphApplicability:
+    """A graph is meaningful only when selection joins multiple sources."""
+
+    if type(binding) is not SourceIngestionBinding:
+        raise ConfiguredSourceError("source ingestion binding is invalid")
+    return GraphApplicability.NOT_APPLICABLE if len(binding.configured_sources) == 1 else GraphApplicability.REQUIRED
 
 
 @dataclass(frozen=True)
@@ -816,7 +842,7 @@ class ConfiguredSourceHostInputs:
         return self.authority.binding
 
     @property
-    def graph(self) -> GraphSnapshot:
+    def graph(self) -> GraphSnapshot | None:
         return self.authority.graph
 
     @property
@@ -837,9 +863,10 @@ class ConfiguredSourceHostInputs:
             "source_set_digest": self.binding.source_set_digest,
             "configuration_receipt_identity": self.authority.configuration_receipt_identity,
             "graph_receipt_identity": self.authority.graph_receipt_identity,
+            "graph_applicability": self.authority.graph_applicability.value,
             "authority_identity": self.authority.authority_identity,
             "trusted_query_identity": self.read_host.query_identity,
-            "graph_digest": self.graph.graph_digest,
+            "graph_digest": None if self.graph is None else self.graph.graph_digest,
             "case_id": self.case_id,
             "ready_at": self.ready_at,
             "recorder_identity": self.recorder_identity,

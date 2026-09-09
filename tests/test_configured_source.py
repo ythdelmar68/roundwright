@@ -21,10 +21,12 @@ from roundwright.configured_source import (
     configured_source_component_identities, configured_source_executor_request,
     _seal_configured_source_authority, create_configured_source_read_capability,
     _create_task_feed_fixture_capability, create_task_feed_read_host,
+    create_issue_list_read_host, prepare_configured_source_ingestion,
     resolve_source_ingestion_binding,
     scan_configured_sources, select_runnable_work,
 )
-from roundwright.dependency_graph import DependencyGraphBinding, GraphEdge, GraphMember, GraphSnapshot
+from roundwright.dependency_graph import DependencyGraphBinding, DependencyGraphStore, GraphEdge, GraphMember, GraphSnapshot
+from roundwright.github_runtime import OwnerGitHubReadIpcClient, unavailable_capability_health
 from roundwright.dependency_review import AffectedMember, EdgeKind
 from roundwright.external_validation import run_configured_source_ingestion_profile
 from roundwright.state import initialize
@@ -152,6 +154,27 @@ class ConfiguredSourceTests(unittest.TestCase):
     def source(self, identity="team/queue", *, pages=2):
         return ConfiguredSource(SourceType.TASK_FEED, identity, pages, 10)
 
+    def production_configuration(self, root, sources):
+        config = root / "configured-sources.toml"
+        rendered = ", ".join(
+            "{ source_type = \"%s\", public_identity = \"%s\", max_pages = %d, max_items = %d }"
+            % (source["source_type"], source["public_identity"], source["max_pages"], source["max_items"])
+            for source in sources
+        )
+        config.write_text(
+            "[runtime]\n"
+            "schema_version = \"roundwright-runtime/v1\"\n"
+            f"configured_sources = [{rendered}]\n",
+            encoding="utf-8",
+        )
+        return load_configuration(cwd=root, user_config=config, environment={}, home=root / "home").pin()
+
+    @staticmethod
+    def issue_host():
+        client = OwnerGitHubReadIpcClient(unavailable_capability_health())
+        with patch("roundwright.configured_source.credentialed_github_read_capability_identity", return_value=digest("issue-host")):
+            return create_issue_list_read_host(client)
+
     def item(self, public, member, content="a", mechanical="1"):
         return SourceItem(public, member, digest({"content": content}), digest({"mechanical": mechanical}))
 
@@ -198,6 +221,48 @@ class ConfiguredSourceTests(unittest.TestCase):
         self.assertEqual(binding.policy_digest, "sha256:" + resolved.runtime_binding().review_policy_digest)
         with self.assertRaises(ConfiguredSourceError):
             resolve_source_ingestion_binding(resolved, "not-a-sha")
+
+    def test_production_prepare_treats_one_source_graph_as_not_applicable(self):
+        source = {"source_type": "issue-list", "public_identity": "ythdelmar68/roundwright/issue/117", "max_pages": 1, "max_items": 1}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = object.__new__(RepositoryIdentity)
+            object.__setattr__(repository, "root", root.resolve())
+            initialize(repository)
+            configuration = self.production_configuration(root, [source])
+            ExactHarnessV2.run_calls = 0
+            with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
+                inputs, request = prepare_configured_source_ingestion(
+                    repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71,
+                    digest("recorder"), digest("store"), issue_list=self.issue_host(),
+                )
+        self.assertIsNone(inputs.graph)
+        self.assertEqual(inputs.authority.graph_applicability.value, "not-applicable")
+        self.assertIsNone(request["execution_context"]["graph_digest"])
+        self.assertEqual(ExactHarnessV2.run_calls, 0)
+
+    def test_production_prepare_requires_matching_current_graph_for_multiple_sources(self):
+        sources = [
+            {"source_type": "issue-list", "public_identity": "ythdelmar68/roundwright/issue/117", "max_pages": 1, "max_items": 1},
+            {"source_type": "issue-list", "public_identity": "ythdelmar68/roundwright/issue/118", "max_pages": 1, "max_items": 1},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = object.__new__(RepositoryIdentity)
+            object.__setattr__(repository, "root", root.resolve())
+            initialize(repository)
+            configuration = self.production_configuration(root, sources)
+            with self.assertRaises(ConfiguredSourceError):
+                prepare_configured_source_ingestion(repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71, digest("recorder"), digest("store"), issue_list=self.issue_host())
+            binding = resolve_source_ingestion_binding(configuration, self.candidate)
+            graph_binding = DependencyGraphBinding(binding.candidate_sha, binding.policy_digest, binding.configuration_digest)
+            current = GraphSnapshot("graph-117", graph_binding, (), (), ())
+            ExactHarnessV2.run_calls = 0
+            with patch.object(DependencyGraphStore, "current", return_value=current), patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
+                inputs, _ = prepare_configured_source_ingestion(repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71, digest("recorder"), digest("store"), issue_list=self.issue_host())
+        self.assertEqual(inputs.graph, current)
+        self.assertEqual(inputs.authority.graph_applicability.value, "required")
+        self.assertEqual(ExactHarnessV2.run_calls, 0)
 
     def test_owner_host_factories_expose_no_callback_or_claimed_identity_seam(self):
         source = self.source()
@@ -272,7 +337,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = _seal_configured_source_authority(source_binding, graph)
+        authority = _seal_configured_source_authority(source_binding)
         read_host = self.source_host(authority, reader)
         host = ConfiguredSourceHostInputs(
             "b" * 40, authority, "configured-source-case", 71, read_host,
@@ -314,7 +379,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = _seal_configured_source_authority(source_binding, graph)
+        authority = _seal_configured_source_authority(source_binding)
         host = ConfiguredSourceHostInputs(
             "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
             digest("recorder"), digest("store"),
@@ -342,7 +407,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = _seal_configured_source_authority(binding, graph)
+        authority = _seal_configured_source_authority(binding)
         host = ConfiguredSourceHostInputs(
             "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
             digest("recorder"), digest("store"),
@@ -354,16 +419,10 @@ class ConfiguredSourceTests(unittest.TestCase):
             host.base_sha, authority, host.case_id, host.ready_at,
             self.source_host(authority, different_reader), host.recorder_identity, host.store_identity,
         )
-        changed_graph = GraphSnapshot("graph-118", graph.binding, graph.members, graph.edges, graph.proposal_ids)
-        changed_graph_authority = _seal_configured_source_authority(binding, changed_graph)
-        changed_authority = ConfiguredSourceHostInputs(
-            host.base_sha, changed_graph_authority, host.case_id, host.ready_at,
-            self.source_host(changed_graph_authority, reader), host.recorder_identity, host.store_identity,
-        )
         changed_source = self.source("team/other")
         changed_binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (changed_source,))
         changed_source_graph = GraphSnapshot("graph-119", DependencyGraphBinding(self.candidate, self.policy, self.configuration), graph.members, graph.edges, graph.proposal_ids)
-        changed_source_authority = _seal_configured_source_authority(changed_binding, changed_source_graph)
+        changed_source_authority = _seal_configured_source_authority(changed_binding)
         changed_source_reader = Adapter({(changed_source.public_identity, None): SourcePage(changed_source, None, None, (item,))})
         changed_configuration = ConfiguredSourceHostInputs(
             host.base_sha, changed_source_authority, host.case_id, host.ready_at,
@@ -375,7 +434,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             "graph-120", DependencyGraphBinding(moved_candidate, self.policy, self.configuration),
             graph.members, graph.edges, graph.proposal_ids,
         )
-        moved_authority = _seal_configured_source_authority(moved_binding, moved_graph)
+        moved_authority = _seal_configured_source_authority(moved_binding)
         moved_candidate_host = ConfiguredSourceHostInputs(
             host.base_sha, moved_authority, host.case_id, host.ready_at,
             self.source_host(moved_authority, reader), host.recorder_identity, host.store_identity,
@@ -386,7 +445,7 @@ class ConfiguredSourceTests(unittest.TestCase):
         ExactHarnessV2.run_calls = 0
         with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
             request = configured_source_executor_request(host)
-            for moved in (changed_capability, changed_authority, changed_configuration, moved_candidate_host, changed_ready, changed_recorder, changed_store):
+            for moved in (changed_capability, changed_configuration, moved_candidate_host, changed_ready, changed_recorder, changed_store):
                 with self.subTest(moved=moved.observation_identity), self.assertRaises(Exception):
                     run_configured_source_ingestion_profile("validate", request, Path("unused-store"), moved)
         self.assertEqual(ExactHarnessV2.run_calls, 0)

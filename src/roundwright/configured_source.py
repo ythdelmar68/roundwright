@@ -25,6 +25,9 @@ from .github_runtime import (
     credentialed_github_read_capability_binding,
     credentialed_github_read_capability_identity,
 )
+from .review_lifecycle import (
+    OwnerBlockerStateReceipt, ReviewLifecycleError, owner_blocker_state_receipt,
+)
 from .shadow import CONFIGURED_SOURCE_INGESTION_PROFILE, shadow_evidence_profile
 from .state import _open_writable_connection, database_path
 
@@ -137,6 +140,7 @@ class ConfiguredSourceAdapter(Protocol):
 _CONFIGURED_SOURCE_AUTHORITY_SEAL = object()
 _CONFIGURED_SOURCE_CAPABILITY_SEAL = object()
 _CONFIGURED_SOURCE_ENDPOINT_SEAL = object()
+_OWNER_BLOCKER_STATE_SEAL = object()
 
 
 @dataclass(frozen=True)
@@ -806,21 +810,61 @@ class ConfiguredSourceStore:
         return row[0]
 
 
-def _owner_blockers_pending(repository: RepositoryIdentity, task_id: str, candidate_sha: str) -> bool:
-    """Read the durable #115 owner-item state before a capture plan exists."""
+class OwnerBlockerStateReadHost:
+    """Factory-sealed canonical owner-blocker state boundary."""
+
+    __slots__ = ("__repository", "__task_id", "__candidate_sha", "__receipt")
+
+    def __init__(
+        self, repository: RepositoryIdentity, task_id: str, candidate_sha: str,
+        receipt: OwnerBlockerStateReceipt, seal: object,
+    ) -> None:
+        if (
+            seal is not _OWNER_BLOCKER_STATE_SEAL or type(repository) is not RepositoryIdentity
+            or type(receipt) is not OwnerBlockerStateReceipt
+            or receipt.task_id != task_id or receipt.candidate_sha != candidate_sha
+        ):
+            raise ConfiguredSourceError("configured source owner-blocker host is invalid")
+        self.__repository = repository
+        self.__task_id = task_id
+        self.__candidate_sha = candidate_sha
+        self.__receipt = receipt
+
+    @property
+    def receipt(self) -> OwnerBlockerStateReceipt:
+        return self.__receipt
+
+    def current(self) -> OwnerBlockerStateReceipt:
+        current = _owner_blocker_state_receipt(
+            self.__repository, self.__task_id, self.__candidate_sha,
+        )
+        if current != self.__receipt:
+            raise ConfiguredSourceError("configured source owner-blocker state has drifted")
+        return current
+
+
+def _owner_blocker_state_receipt(
+    repository: RepositoryIdentity, task_id: str, candidate_sha: str,
+) -> OwnerBlockerStateReceipt:
+    """Read the canonical task-scoped owner-blocker receipt without mutation."""
 
     try:
         connection = sqlite3.connect(f"{database_path(repository).resolve().as_uri()}?mode=ro", uri=True)
         try:
-            row = connection.execute(
-                "SELECT 1 FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND blocker_state = 'blocking' AND (verification_state = 'pending' OR disposition = 'pending') LIMIT 1",
-                (task_id, candidate_sha),
-            ).fetchone()
+            return owner_blocker_state_receipt(connection, task_id, candidate_sha)
         finally:
             connection.close()
-    except (OSError, sqlite3.DatabaseError) as error:
+    except (OSError, sqlite3.DatabaseError, ReviewLifecycleError) as error:
         raise ConfiguredSourceError("configured source owner-blocker state is unavailable") from error
-    return row is not None
+
+
+def _create_owner_blocker_state_read_host(
+    repository: RepositoryIdentity, task_id: str, candidate_sha: str,
+) -> OwnerBlockerStateReadHost:
+    receipt = _owner_blocker_state_receipt(repository, task_id, candidate_sha)
+    return OwnerBlockerStateReadHost(
+        repository, task_id, candidate_sha, receipt, _OWNER_BLOCKER_STATE_SEAL,
+    )
 
 
 def _digest_value(value: object) -> str:
@@ -882,6 +926,8 @@ class ConfiguredSourceHostInputs:
     recorder_identity: str
     store_identity: str
     owner_blockers_pending: bool
+    owner_blocker_receipt: OwnerBlockerStateReceipt
+    owner_blocker_read_host: OwnerBlockerStateReadHost = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if (
@@ -891,6 +937,11 @@ class ConfiguredSourceHostInputs:
             or self.read_host.authority_identity != self.authority.authority_identity
             or not _DIGEST_PATTERN.fullmatch(self.recorder_identity) or not _DIGEST_PATTERN.fullmatch(self.store_identity)
             or type(self.owner_blockers_pending) is not bool
+            or type(self.owner_blocker_receipt) is not OwnerBlockerStateReceipt
+            or type(self.owner_blocker_read_host) is not OwnerBlockerStateReadHost
+            or self.owner_blocker_receipt.candidate_sha != self.authority.binding.candidate_sha
+            or self.owner_blocker_receipt.blockers_pending != self.owner_blockers_pending
+            or self.owner_blocker_read_host.receipt != self.owner_blocker_receipt
         ):
             raise ConfiguredSourceError("configured source host inputs are invalid")
         # This lookup also proves that the profile is registered with the
@@ -933,6 +984,7 @@ class ConfiguredSourceHostInputs:
             "recorder_identity": self.recorder_identity,
             "store_identity": self.store_identity,
             "owner_blockers_pending": self.owner_blockers_pending,
+            "owner_blocker_state_receipt": self.owner_blocker_receipt.receipt_identity,
         }
 
     def execution_context(self, capture_plan_digest: str) -> dict[str, object]:
@@ -942,6 +994,13 @@ class ConfiguredSourceHostInputs:
             **self.observation_descriptor(),
             "capture_plan_digest": capture_plan_digest,
         }
+
+    def verify_owner_blocker_state(self) -> None:
+        """Deny execution when the current canonical owner state moved."""
+
+        current = self.owner_blocker_read_host.current()
+        if current != self.owner_blocker_receipt:
+            raise ConfiguredSourceError("configured source owner-blocker state has drifted")
 
 
 @dataclass(frozen=True)
@@ -1015,10 +1074,12 @@ def prepare_configured_source_ingestion(
     capability = create_configured_source_read_capability(
         authority, task_id=task_id, issue_list=issue_list, task_feed=task_feed,
     )
+    owner_blocker_host = _create_owner_blocker_state_read_host(repository, task_id, candidate_sha)
     inputs = ConfiguredSourceHostInputs(
         base_sha, authority, case_id, ready_at,
         TrustedConfiguredSourceReadHost(authority, capability),
-        recorder_identity, store_identity, _owner_blockers_pending(repository, task_id, candidate_sha),
+        recorder_identity, store_identity, owner_blocker_host.receipt.blockers_pending,
+        owner_blocker_host.receipt, owner_blocker_host,
     )
     return inputs, configured_source_executor_request(inputs)
 
@@ -1155,6 +1216,7 @@ class ConfiguredSourceIngestionAdapter:
     def execute(self, binding: object) -> object:
         self.validate(binding)
         inputs = self._require_inputs()
+        inputs.verify_owner_blocker_state()
         # This is the only source-read point.  Validate, compare, and project
         # never invoke an adapter, provider, Git, or GitHub operation.
         inventory = inputs.read_host.scan()

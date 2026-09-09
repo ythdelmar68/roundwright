@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ from roundwright.configured_source import (
     ConfiguredSourceHostInputs, ConfiguredSourceIngestionAdapter, SourceItem, SourcePage,
     SourceType, TrustedConfiguredSourceReadHost, configured_source_capture_plan,
     configured_source_component_identities, configured_source_executor_request,
-    _seal_configured_source_authority, create_configured_source_read_capability,
+    _create_owner_blocker_state_read_host, _seal_configured_source_authority, create_configured_source_read_capability,
     _create_task_feed_fixture_capability, create_task_feed_read_host,
     create_issue_list_read_host, prepare_configured_source_ingestion,
     resolve_source_ingestion_binding,
@@ -32,7 +33,8 @@ from roundwright.github_runtime import (
 )
 from roundwright.dependency_review import AffectedMember, EdgeKind
 from roundwright.external_validation import run_configured_source_ingestion_profile
-from roundwright.state import initialize
+from roundwright.git_identity import acquire_transition_lease
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 
 
 def digest(value: object) -> str:
@@ -154,6 +156,13 @@ class ConfiguredSourceTests(unittest.TestCase):
     policy = digest("policy")
     configuration = digest("configuration")
 
+    def setUp(self):
+        self.owner_state_directories = []
+
+    def tearDown(self):
+        for temporary in self.owner_state_directories:
+            temporary.cleanup()
+
     def source(self, identity="team/queue", *, pages=2):
         return ConfiguredSource(SourceType.TASK_FEED, identity, pages, 10)
 
@@ -197,6 +206,31 @@ class ConfiguredSourceTests(unittest.TestCase):
 
     def inventory(self, sources, pages):
         return scan_configured_sources(SourceIngestionBinding(self.candidate, self.policy, self.configuration, tuple(sources)), Adapter(pages))
+
+    @staticmethod
+    def seal_owner_blocker_state(repository, candidate, task_id="task-117"):
+        identity = TaskIdentity(task_id, "source-117", "repo-117", "codex/117", "C:/configured-source-117", "b" * 40)
+        lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="configured-source-tests", ttl_seconds=60)
+        admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "c" * 64),), lease=lease)
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute(
+                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                (identity.task_id, identity.base_sha, candidate, lease.state_identity),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return identity
+
+    def owner_blocker_host(self, candidate=None):
+        temporary = tempfile.TemporaryDirectory()
+        self.owner_state_directories.append(temporary)
+        repository = object.__new__(RepositoryIdentity)
+        object.__setattr__(repository, "root", Path(temporary.name).resolve())
+        initialize(repository)
+        self.seal_owner_blocker_state(repository, candidate or self.candidate)
+        return _create_owner_blocker_state_read_host(repository, "task-117", candidate or self.candidate)
 
     @staticmethod
     def source_host(authority, reader):
@@ -265,6 +299,14 @@ class ConfiguredSourceTests(unittest.TestCase):
         changed_candidate = _seal_configured_source_authority(
             SourceIngestionBinding("b" * 40, self.policy, self.configuration, (source,)),
         )
+
+    def configured_host_inputs(self, authority, read_host, *, base_sha="b" * 40, case_id="configured-source-case", ready_at=71, recorder=None, store=None):
+        blocker_host = self.owner_blocker_host(authority.binding.candidate_sha)
+        return ConfiguredSourceHostInputs(
+            base_sha, authority, case_id, ready_at, read_host,
+            recorder or digest("recorder"), store or digest("store"),
+            blocker_host.receipt.blockers_pending, blocker_host.receipt, blocker_host,
+        )
         with self.assertRaises(ConfiguredSourceError):
             create_configured_source_read_capability(changed_candidate, task_id="task-117", issue_list=host)
         other_repository = _seal_configured_source_authority(SourceIngestionBinding(
@@ -281,6 +323,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             repository = object.__new__(RepositoryIdentity)
             object.__setattr__(repository, "root", root.resolve())
             initialize(repository)
+            self.seal_owner_blocker_state(repository, self.candidate)
             configuration = self.production_configuration(root, [source])
             ExactHarnessV2.run_calls = 0
             with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
@@ -293,6 +336,64 @@ class ConfiguredSourceTests(unittest.TestCase):
         self.assertIsNone(request["execution_context"]["graph_digest"])
         self.assertEqual(ExactHarnessV2.run_calls, 0)
 
+    def test_production_prepare_requires_current_owner_blocker_seal(self):
+        source = {"source_type": "issue-list", "public_identity": "ythdelmar68/roundwright/issue/117", "max_pages": 1, "max_items": 1}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = object.__new__(RepositoryIdentity)
+            object.__setattr__(repository, "root", root.resolve())
+            initialize(repository)
+            configuration = self.production_configuration(root, [source])
+            with self.assertRaises(ConfiguredSourceError):
+                prepare_configured_source_ingestion(
+                    repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71,
+                    digest("recorder"), digest("store"), "task-117", issue_list=self.issue_host(),
+                )
+
+    def test_execution_rejects_owner_blocker_receipt_drift_before_source_read(self):
+        source = ConfiguredSource(SourceType.TASK_FEED, "team/queue", 1, 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = object.__new__(RepositoryIdentity)
+            object.__setattr__(repository, "root", root.resolve())
+            initialize(repository)
+            self.seal_owner_blocker_state(repository, self.candidate)
+            configuration = self.production_configuration(root, [{
+                "source_type": source.source_type.value, "public_identity": source.public_identity,
+                "max_pages": source.max_pages, "max_items": source.max_items,
+            }])
+            capability = _create_task_feed_fixture_capability({
+                (source.public_identity, None): SourcePage(source, None, None, ()),
+            })
+            with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
+                inputs, _ = prepare_configured_source_ingestion(
+                    repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71,
+                    digest("recorder"), digest("store"), "task-117",
+                    task_feed=create_task_feed_read_host(capability),
+                )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE candidate_seals SET candidate_sha = ? WHERE task_id = ?", ("c" * 40, "task-117"))
+                connection.commit()
+            finally:
+                connection.close()
+            capture = digest(configured_source_capture_plan(inputs))
+            plan = SimpleNamespace(candidate_sha=self.candidate, case_id=inputs.case_id, plan_digest=capture, ready_at=inputs.ready_at)
+            context = inputs.execution_context(capture)
+            binding = SimpleNamespace(
+                profile="roundwright-shadow-profile/configured-source-ingestion/v1", case_id=inputs.case_id,
+                candidate_sha=self.candidate, ready_at=inputs.ready_at, plan=plan,
+                components=SimpleNamespace(**dict(zip(("producer_identity", "exporter_identity", "comparator_identity"), configured_source_component_identities(), strict=True))),
+                execution_context=SimpleNamespace(value=inputs, identity=digest({
+                    "observation_identity": inputs.observation_identity, "capture_plan_digest": capture,
+                    "execution_context_input_digest": digest(context),
+                })),
+                execution_context_input_digest=digest(context),
+            )
+            with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2), self.assertRaises(ConfiguredSourceError):
+                ConfiguredSourceIngestionAdapter(inputs).execute(binding)
+        self.assertEqual(capability.source_read_count, 0)
+
     def test_production_prepare_requires_matching_current_graph_for_multiple_sources(self):
         sources = [
             {"source_type": "issue-list", "public_identity": "ythdelmar68/roundwright/issue/117", "max_pages": 1, "max_items": 1},
@@ -303,6 +404,7 @@ class ConfiguredSourceTests(unittest.TestCase):
             repository = object.__new__(RepositoryIdentity)
             object.__setattr__(repository, "root", root.resolve())
             initialize(repository)
+            self.seal_owner_blocker_state(repository, self.candidate)
             configuration = self.production_configuration(root, sources)
             with self.assertRaises(ConfiguredSourceError):
                 prepare_configured_source_ingestion(repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71, digest("recorder"), digest("store"), "task-117", issue_list=self.issue_host())
@@ -324,6 +426,21 @@ class ConfiguredSourceTests(unittest.TestCase):
         from roundwright.configured_source import create_issue_list_read_host
         with self.assertRaises(ConfiguredSourceError):
             create_issue_list_read_host(reader.read)
+
+    def test_host_inputs_require_a_sealed_owner_blocker_receipt_before_source_or_harness(self):
+        source = self.source()
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
+        authority = _seal_configured_source_authority(
+            SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,)),
+        )
+        read_host = self.source_host(authority, reader)
+        with self.assertRaises(ConfiguredSourceError):
+            ConfiguredSourceHostInputs(
+                "b" * 40, authority, "configured-source-case", 71, read_host,
+                digest("recorder"), digest("store"), False, None, None,
+            )
+        self.assertEqual(reader.calls, [])
+        self.assertEqual(reader.source_capability.source_read_count, 0)
 
     def test_identical_typed_endpoint_reconstruction_is_stable_and_changed_endpoint_is_not(self):
         source = self.source()
@@ -391,10 +508,7 @@ class ConfiguredSourceTests(unittest.TestCase):
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
         authority = _seal_configured_source_authority(source_binding)
         read_host = self.source_host(authority, reader)
-        host = ConfiguredSourceHostInputs(
-            "b" * 40, authority, "configured-source-case", 71, read_host,
-            digest("recorder"), digest("store"), False,
-        )
+        host = self.configured_host_inputs(authority, read_host)
         capture = digest(configured_source_capture_plan(host))
         plan = SimpleNamespace(candidate_sha=self.candidate, case_id=host.case_id, plan_digest=capture, ready_at=71)
         context_value = host.execution_context(capture)
@@ -432,10 +546,7 @@ class ConfiguredSourceTests(unittest.TestCase):
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
         authority = _seal_configured_source_authority(source_binding)
-        host = ConfiguredSourceHostInputs(
-            "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
-            digest("recorder"), digest("store"), False,
-        )
+        host = self.configured_host_inputs(authority, self.source_host(authority, reader))
         ExactHarnessV2.calls = {"dispatch": 0, "record": 0, "verify": 0, "mutation": 0}
         with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
             request = configured_source_executor_request(host)
@@ -460,25 +571,23 @@ class ConfiguredSourceTests(unittest.TestCase):
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
         authority = _seal_configured_source_authority(binding)
-        host = ConfiguredSourceHostInputs(
-            "b" * 40, authority, "configured-source-case", 71, self.source_host(authority, reader),
-            digest("recorder"), digest("store"), False,
-        )
+        host = self.configured_host_inputs(authority, self.source_host(authority, reader))
         different_reader = Adapter({
             (source.public_identity, None): SourcePage(source, None, None, (self.item("item/a", "task-a", content="replacement"),)),
         })
-        changed_capability = ConfiguredSourceHostInputs(
-            host.base_sha, authority, host.case_id, host.ready_at,
-            self.source_host(authority, different_reader), host.recorder_identity, host.store_identity, False,
+        changed_capability = self.configured_host_inputs(
+            authority, self.source_host(authority, different_reader), base_sha=host.base_sha,
+            case_id=host.case_id, ready_at=host.ready_at, recorder=host.recorder_identity, store=host.store_identity,
         )
         changed_source = self.source("team/other")
         changed_binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (changed_source,))
         changed_source_graph = GraphSnapshot("graph-119", DependencyGraphBinding(self.candidate, self.policy, self.configuration), graph.members, graph.edges, graph.proposal_ids)
         changed_source_authority = _seal_configured_source_authority(changed_binding)
         changed_source_reader = Adapter({(changed_source.public_identity, None): SourcePage(changed_source, None, None, (item,))})
-        changed_configuration = ConfiguredSourceHostInputs(
-            host.base_sha, changed_source_authority, host.case_id, host.ready_at,
-            self.source_host(changed_source_authority, changed_source_reader), host.recorder_identity, host.store_identity, False,
+        changed_configuration = self.configured_host_inputs(
+            changed_source_authority, self.source_host(changed_source_authority, changed_source_reader),
+            base_sha=host.base_sha, case_id=host.case_id, ready_at=host.ready_at,
+            recorder=host.recorder_identity, store=host.store_identity,
         )
         moved_candidate = "c" * 40
         moved_binding = SourceIngestionBinding(moved_candidate, self.policy, self.configuration, (source,))
@@ -487,13 +596,13 @@ class ConfiguredSourceTests(unittest.TestCase):
             graph.members, graph.edges, graph.proposal_ids,
         )
         moved_authority = _seal_configured_source_authority(moved_binding)
-        moved_candidate_host = ConfiguredSourceHostInputs(
-            host.base_sha, moved_authority, host.case_id, host.ready_at,
-            self.source_host(moved_authority, reader), host.recorder_identity, host.store_identity, False,
+        moved_candidate_host = self.configured_host_inputs(
+            moved_authority, self.source_host(moved_authority, reader), base_sha=host.base_sha,
+            case_id=host.case_id, ready_at=host.ready_at, recorder=host.recorder_identity, store=host.store_identity,
         )
-        changed_ready = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, 72, host.read_host, host.recorder_identity, host.store_identity, False)
-        changed_recorder = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, host.ready_at, host.read_host, digest("other-recorder"), host.store_identity, False)
-        changed_store = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, host.ready_at, host.read_host, host.recorder_identity, digest("other-store"), False)
+        changed_ready = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, 72, host.read_host, host.recorder_identity, host.store_identity, host.owner_blockers_pending, host.owner_blocker_receipt, host.owner_blocker_read_host)
+        changed_recorder = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, host.ready_at, host.read_host, digest("other-recorder"), host.store_identity, host.owner_blockers_pending, host.owner_blocker_receipt, host.owner_blocker_read_host)
+        changed_store = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, host.ready_at, host.read_host, host.recorder_identity, digest("other-store"), host.owner_blockers_pending, host.owner_blocker_receipt, host.owner_blocker_read_host)
         ExactHarnessV2.run_calls = 0
         with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
             request = configured_source_executor_request(host)

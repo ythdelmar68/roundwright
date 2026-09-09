@@ -18,7 +18,7 @@ from roundwright.git_identity import acquire_transition_lease
 from roundwright.review_lifecycle import (
     ObjectiveState, OwnerCommand, OwnerCommandKind, ReviewItem, ReviewItemKind,
     ReviewItemSource, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult,
-    _owner_authority_digest, unresolved_final_gate_blockers,
+    _owner_authority_digest, owner_blocker_state_receipt, unresolved_final_gate_blockers,
 )
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 
@@ -153,6 +153,25 @@ class ReviewLifecycleTests(unittest.TestCase):
             with closing(sqlite3.connect(database_path(repository))) as connection:
                 self.assertFalse(unresolved_final_gate_blockers(connection, identity.task_id, moved))
                 self.assertEqual(connection.execute("SELECT candidate_sha FROM review_item_records WHERE item_id = 'item-115'").fetchone(), (self.candidate,))
+
+    def test_owner_blocker_receipt_retains_prior_candidate_pass_follow_up_and_requires_current_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, identity, lease = self.setup(Path(temporary))
+            ReviewLifecycleStore().record_review_item(repository, identity, self.item(identity), lease=lease)
+            moved = "d" * 40
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                connection.execute("UPDATE candidate_seals SET candidate_sha = ? WHERE task_id = ?", (moved, identity.task_id))
+                connection.commit()
+                receipt = owner_blocker_state_receipt(connection, identity.task_id, moved)
+                self.assertTrue(receipt.blockers_pending)
+                self.assertEqual(receipt.candidate_sha, moved)
+                self.assertNotEqual(receipt.blocker_state_digest, "0" * 64)
+                with self.assertRaises(ReviewLifecycleError):
+                    owner_blocker_state_receipt(connection, identity.task_id, self.candidate)
+                connection.execute("DELETE FROM candidate_seals WHERE task_id = ?", (identity.task_id,))
+                connection.commit()
+                with self.assertRaises(ReviewLifecycleError):
+                    owner_blocker_state_receipt(connection, identity.task_id, moved)
 
     def test_worker_objective_starts_from_dispatch_then_completes_only_from_persisted_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

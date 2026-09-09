@@ -208,8 +208,12 @@ class ConfiguredSourceTests(unittest.TestCase):
         return scan_configured_sources(SourceIngestionBinding(self.candidate, self.policy, self.configuration, tuple(sources)), Adapter(pages))
 
     @staticmethod
-    def seal_owner_blocker_state(repository, candidate, task_id="task-117"):
-        identity = TaskIdentity(task_id, "source-117", "repo-117", "codex/117", "C:/configured-source-117", "b" * 40)
+    def seal_owner_blocker_state(repository, candidate, task_id="task-117", repository_id="repo-117"):
+        suffix = task_id.removeprefix("task-")
+        identity = TaskIdentity(
+            task_id, f"source-{suffix}", repository_id, f"codex/{suffix}",
+            f"C:/configured-source-{suffix}", "b" * 40,
+        )
         lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="configured-source-tests", ttl_seconds=60)
         admit_task(repository, identity, (SourceSnapshot(identity.source_id, identity.repository_id, "c" * 64),), lease=lease)
         connection = sqlite3.connect(database_path(repository))
@@ -223,23 +227,32 @@ class ConfiguredSourceTests(unittest.TestCase):
             connection.close()
         return identity
 
-    def owner_blocker_host(self, candidate=None):
+    def owner_blocker_host(self, candidate=None, *, task_id="task-117", repository_id="repo-117"):
         temporary = tempfile.TemporaryDirectory()
         self.owner_state_directories.append(temporary)
         repository = object.__new__(RepositoryIdentity)
         object.__setattr__(repository, "root", Path(temporary.name).resolve())
         initialize(repository)
-        self.seal_owner_blocker_state(repository, candidate or self.candidate)
-        return _create_owner_blocker_state_read_host(repository, "task-117", candidate or self.candidate)
+        self.seal_owner_blocker_state(
+            repository, candidate or self.candidate, task_id, repository_id,
+        )
+        return _create_owner_blocker_state_read_host(repository, task_id, candidate or self.candidate)
 
     @staticmethod
-    def source_host(authority, reader):
+    def source_authority(binding, graph=None, *, repository_id="repo-117", task_id="task-117"):
+        return _seal_configured_source_authority(
+            binding, graph, repository_id=repository_id, task_id=task_id,
+        )
+
+    def source_host(self, authority, reader, blocker_host):
         capability = _create_task_feed_fixture_capability(reader.pages)
         reader.source_capability = capability
         return TrustedConfiguredSourceReadHost(
             authority,
             create_configured_source_read_capability(
-                authority, task_feed=create_task_feed_read_host(capability),
+                authority, task_id=blocker_host.receipt.task_id,
+                owner_blocker_receipt=blocker_host.receipt,
+                task_feed=create_task_feed_read_host(capability, authority, blocker_host.receipt),
             ),
         )
 
@@ -292,29 +305,31 @@ class ConfiguredSourceTests(unittest.TestCase):
     def test_issue_list_capability_receipt_must_match_repository_task_and_candidate(self):
         source = ConfiguredSource(SourceType.ISSUE_LIST, "ythdelmar68/roundwright/issue/117", 1, 1)
         host = self.issue_host()
+        owner_blocker_host = self.owner_blocker_host()
         binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,))
-        authority = _seal_configured_source_authority(binding)
+        authority = self.source_authority(binding)
         with self.assertRaises(ConfiguredSourceError):
-            create_configured_source_read_capability(authority, task_id="task-118", issue_list=host)
-        changed_candidate = _seal_configured_source_authority(
+            create_configured_source_read_capability(authority, task_id="task-118", owner_blocker_receipt=owner_blocker_host.receipt, issue_list=host)
+        changed_candidate = self.source_authority(
             SourceIngestionBinding("b" * 40, self.policy, self.configuration, (source,)),
         )
+        with self.assertRaises(ConfiguredSourceError):
+            create_configured_source_read_capability(changed_candidate, task_id="task-117", owner_blocker_receipt=owner_blocker_host.receipt, issue_list=host)
+        other_repository = self.source_authority(SourceIngestionBinding(
+            self.candidate, self.policy, self.configuration,
+            (ConfiguredSource(SourceType.ISSUE_LIST, "other/repository/issue/117", 1, 1),),
+        ))
+        with self.assertRaises(ConfiguredSourceError):
+            create_configured_source_read_capability(other_repository, task_id="task-117", owner_blocker_receipt=owner_blocker_host.receipt, issue_list=host)
 
-    def configured_host_inputs(self, authority, read_host, *, base_sha="b" * 40, case_id="configured-source-case", ready_at=71, recorder=None, store=None):
+    def configured_host_inputs(self, authority, reader, *, base_sha="b" * 40, case_id="configured-source-case", ready_at=71, recorder=None, store=None):
         blocker_host = self.owner_blocker_host(authority.binding.candidate_sha)
+        read_host = self.source_host(authority, reader, blocker_host)
         return ConfiguredSourceHostInputs(
             base_sha, authority, case_id, ready_at, read_host,
             recorder or digest("recorder"), store or digest("store"),
             blocker_host.receipt.blockers_pending, blocker_host.receipt, blocker_host,
         )
-        with self.assertRaises(ConfiguredSourceError):
-            create_configured_source_read_capability(changed_candidate, task_id="task-117", issue_list=host)
-        other_repository = _seal_configured_source_authority(SourceIngestionBinding(
-            self.candidate, self.policy, self.configuration,
-            (ConfiguredSource(SourceType.ISSUE_LIST, "other/repository/issue/117", 1, 1),),
-        ))
-        with self.assertRaises(ConfiguredSourceError):
-            create_configured_source_read_capability(other_repository, task_id="task-117", issue_list=host)
 
     def test_production_prepare_treats_one_source_graph_as_not_applicable(self):
         source = {"source_type": "issue-list", "public_identity": "ythdelmar68/roundwright/issue/117", "max_pages": 1, "max_items": 1}
@@ -369,7 +384,7 @@ class ConfiguredSourceTests(unittest.TestCase):
                 inputs, _ = prepare_configured_source_ingestion(
                     repository, configuration, self.candidate, "b" * 40, "configured-source-case", 71,
                     digest("recorder"), digest("store"), "task-117",
-                    task_feed=create_task_feed_read_host(capability),
+                    task_feed=capability,
                 )
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -422,7 +437,7 @@ class ConfiguredSourceTests(unittest.TestCase):
         source = self.source()
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
         with self.assertRaises(ConfiguredSourceError):
-            create_task_feed_read_host(reader.read)
+            create_task_feed_read_host(reader.read, None, None)
         from roundwright.configured_source import create_issue_list_read_host
         with self.assertRaises(ConfiguredSourceError):
             create_issue_list_read_host(reader.read)
@@ -430,10 +445,11 @@ class ConfiguredSourceTests(unittest.TestCase):
     def test_host_inputs_require_a_sealed_owner_blocker_receipt_before_source_or_harness(self):
         source = self.source()
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
-        authority = _seal_configured_source_authority(
+        authority = self.source_authority(
             SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,)),
         )
-        read_host = self.source_host(authority, reader)
+        blocker_host = self.owner_blocker_host()
+        read_host = self.source_host(authority, reader, blocker_host)
         with self.assertRaises(ConfiguredSourceError):
             ConfiguredSourceHostInputs(
                 "b" * 40, authority, "configured-source-case", 71, read_host,
@@ -441,6 +457,75 @@ class ConfiguredSourceTests(unittest.TestCase):
             )
         self.assertEqual(reader.calls, [])
         self.assertEqual(reader.source_capability.source_read_count, 0)
+
+    def test_task_feed_authority_rejects_cross_task_and_repository_before_read(self):
+        source = self.source()
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
+        authority = self.source_authority(
+            SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,)),
+        )
+        expected = self.owner_blocker_host()
+        task_mismatch = self.owner_blocker_host(task_id="task-118")
+        repository_mismatch = self.owner_blocker_host(repository_id="repo-118")
+        capability = _create_task_feed_fixture_capability(reader.pages)
+
+        for mismatched in (task_mismatch, repository_mismatch):
+            with self.subTest(mismatched=mismatched.receipt), self.assertRaises(ConfiguredSourceError):
+                create_configured_source_read_capability(
+                    authority, task_id=expected.receipt.task_id,
+                    owner_blocker_receipt=expected.receipt,
+                    task_feed=create_task_feed_read_host(capability, authority, mismatched.receipt),
+                )
+            self.assertEqual(capability.source_read_count, 0)
+
+    def test_host_inputs_reject_cross_task_feed_receipt_before_read(self):
+        source = self.source()
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
+        binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,))
+        authority = self.source_authority(binding)
+        expected = self.owner_blocker_host()
+        mismatched = self.owner_blocker_host(task_id="task-118")
+        mismatched_authority = self.source_authority(binding, task_id="task-118")
+        capability = _create_task_feed_fixture_capability(reader.pages)
+        read_host = TrustedConfiguredSourceReadHost(
+            mismatched_authority,
+            create_configured_source_read_capability(
+                mismatched_authority, task_id=mismatched.receipt.task_id,
+                owner_blocker_receipt=mismatched.receipt,
+                task_feed=create_task_feed_read_host(capability, mismatched_authority, mismatched.receipt),
+            ),
+        )
+        with self.assertRaises(ConfiguredSourceError):
+            ConfiguredSourceHostInputs(
+                "b" * 40, authority, "configured-source-case", 71, read_host,
+                digest("recorder"), digest("store"), expected.receipt.blockers_pending,
+                expected.receipt, expected,
+            )
+        self.assertEqual(capability.source_read_count, 0)
+
+    def test_host_inputs_reject_self_consistent_foreign_repository_before_read(self):
+        source = self.source()
+        reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, ())})
+        binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (source,))
+        authority_a = self.source_authority(binding, repository_id="repo-117")
+        authority_b = self.source_authority(binding, repository_id="repo-118")
+        owner_b = self.owner_blocker_host(repository_id="repo-118")
+        capability = _create_task_feed_fixture_capability(reader.pages)
+        read_host_b = TrustedConfiguredSourceReadHost(
+            authority_b,
+            create_configured_source_read_capability(
+                authority_b, task_id=owner_b.receipt.task_id,
+                owner_blocker_receipt=owner_b.receipt,
+                task_feed=create_task_feed_read_host(capability, authority_b, owner_b.receipt),
+            ),
+        )
+        with self.assertRaises(ConfiguredSourceError):
+            ConfiguredSourceHostInputs(
+                "b" * 40, authority_a, "configured-source-case", 71, read_host_b,
+                digest("recorder"), digest("store"), owner_b.receipt.blockers_pending,
+                owner_b.receipt, owner_b,
+            )
+        self.assertEqual(capability.source_read_count, 0)
 
     def test_identical_typed_endpoint_reconstruction_is_stable_and_changed_endpoint_is_not(self):
         source = self.source()
@@ -506,9 +591,8 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = _seal_configured_source_authority(source_binding)
-        read_host = self.source_host(authority, reader)
-        host = self.configured_host_inputs(authority, read_host)
+        authority = self.source_authority(source_binding)
+        host = self.configured_host_inputs(authority, reader)
         capture = digest(configured_source_capture_plan(host))
         plan = SimpleNamespace(candidate_sha=self.candidate, case_id=host.case_id, plan_digest=capture, ready_at=71)
         context_value = host.execution_context(capture)
@@ -545,8 +629,8 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = _seal_configured_source_authority(source_binding)
-        host = self.configured_host_inputs(authority, self.source_host(authority, reader))
+        authority = self.source_authority(source_binding)
+        host = self.configured_host_inputs(authority, reader)
         ExactHarnessV2.calls = {"dispatch": 0, "record": 0, "verify": 0, "mutation": 0}
         with patch("roundwright.external_validation._harness_executor", return_value=ExactHarnessV2):
             request = configured_source_executor_request(host)
@@ -570,22 +654,22 @@ class ConfiguredSourceTests(unittest.TestCase):
             (GraphMember("task-117", "subset-117", AffectedMember("task-a", digest("member"), item.content_digest)),), (), (),
         )
         reader = Adapter({(source.public_identity, None): SourcePage(source, None, None, (item,))})
-        authority = _seal_configured_source_authority(binding)
-        host = self.configured_host_inputs(authority, self.source_host(authority, reader))
+        authority = self.source_authority(binding)
+        host = self.configured_host_inputs(authority, reader)
         different_reader = Adapter({
             (source.public_identity, None): SourcePage(source, None, None, (self.item("item/a", "task-a", content="replacement"),)),
         })
         changed_capability = self.configured_host_inputs(
-            authority, self.source_host(authority, different_reader), base_sha=host.base_sha,
+            authority, different_reader, base_sha=host.base_sha,
             case_id=host.case_id, ready_at=host.ready_at, recorder=host.recorder_identity, store=host.store_identity,
         )
         changed_source = self.source("team/other")
         changed_binding = SourceIngestionBinding(self.candidate, self.policy, self.configuration, (changed_source,))
         changed_source_graph = GraphSnapshot("graph-119", DependencyGraphBinding(self.candidate, self.policy, self.configuration), graph.members, graph.edges, graph.proposal_ids)
-        changed_source_authority = _seal_configured_source_authority(changed_binding)
+        changed_source_authority = self.source_authority(changed_binding)
         changed_source_reader = Adapter({(changed_source.public_identity, None): SourcePage(changed_source, None, None, (item,))})
         changed_configuration = self.configured_host_inputs(
-            changed_source_authority, self.source_host(changed_source_authority, changed_source_reader),
+            changed_source_authority, changed_source_reader,
             base_sha=host.base_sha, case_id=host.case_id, ready_at=host.ready_at,
             recorder=host.recorder_identity, store=host.store_identity,
         )
@@ -595,9 +679,9 @@ class ConfiguredSourceTests(unittest.TestCase):
             "graph-120", DependencyGraphBinding(moved_candidate, self.policy, self.configuration),
             graph.members, graph.edges, graph.proposal_ids,
         )
-        moved_authority = _seal_configured_source_authority(moved_binding)
+        moved_authority = self.source_authority(moved_binding)
         moved_candidate_host = self.configured_host_inputs(
-            moved_authority, self.source_host(moved_authority, reader), base_sha=host.base_sha,
+            moved_authority, reader, base_sha=host.base_sha,
             case_id=host.case_id, ready_at=host.ready_at, recorder=host.recorder_identity, store=host.store_identity,
         )
         changed_ready = ConfiguredSourceHostInputs(host.base_sha, authority, host.case_id, 72, host.read_host, host.recorder_identity, host.store_identity, host.owner_blockers_pending, host.owner_blocker_receipt, host.owner_blocker_read_host)

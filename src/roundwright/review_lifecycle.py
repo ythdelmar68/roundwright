@@ -153,6 +153,7 @@ class OwnerBlockerStateReceipt:
     """Content-addressed current-seal view of task-scoped owner blockers."""
 
     task_id: str
+    repository_id: str
     candidate_sha: str
     seal_state_identity: str
     blockers_pending: bool
@@ -161,11 +162,11 @@ class OwnerBlockerStateReceipt:
 
     def __post_init__(self) -> None:
         expected = _owner_blocker_receipt_identity(
-            self.task_id, self.candidate_sha, self.seal_state_identity,
+            self.task_id, self.repository_id, self.candidate_sha, self.seal_state_identity,
             self.blockers_pending, self.blocker_state_digest,
         )
         if (
-            not _token(self.task_id) or not _sha(self.candidate_sha)
+            not _token(self.task_id) or not _token(self.repository_id) or not _sha(self.candidate_sha)
             or not _state_identity(self.seal_state_identity)
             or type(self.blockers_pending) is not bool
             or not _digest(self.blocker_state_digest)
@@ -403,9 +404,10 @@ def owner_blocker_state_receipt(
     if type(connection) is not sqlite3.Connection or not _token(task_id) or not _sha(candidate_sha):
         raise ReviewLifecycleError("owner blocker state scope is invalid")
     seal = connection.execute(
-        "SELECT candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?", (task_id,),
+        "SELECT seals.candidate_sha, seals.state_identity, tasks.repository_id FROM candidate_seals AS seals "
+        "JOIN tasks ON tasks.task_id = seals.task_id WHERE seals.task_id = ?", (task_id,),
     ).fetchone()
-    if seal is None or seal[0] != candidate_sha or not _state_identity(seal[1]):
+    if seal is None or seal[0] != candidate_sha or not _state_identity(seal[1]) or not _token(seal[2]):
         raise ReviewLifecycleError("owner blocker state lacks the exact current candidate seal")
     rows = connection.execute(
         "SELECT item_id, candidate_sha, source_attempt_id, content_digest, destination, verification_state, disposition "
@@ -430,8 +432,8 @@ def owner_blocker_state_receipt(
         for row in rows
     ], sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
     return OwnerBlockerStateReceipt(
-        task_id, candidate_sha, seal[1], bool(rows), state_digest,
-        _owner_blocker_receipt_identity(task_id, candidate_sha, seal[1], bool(rows), state_digest),
+        task_id, seal[2], candidate_sha, seal[1], bool(rows), state_digest,
+        _owner_blocker_receipt_identity(task_id, seal[2], candidate_sha, seal[1], bool(rows), state_digest),
     )
 
 
@@ -599,12 +601,12 @@ def _owner_authority_digest(owner_identity: str, command_scope: str, task_id: st
 
 
 def _owner_blocker_receipt_identity(
-    task_id: str, candidate_sha: str, seal_state_identity: str,
+    task_id: str, repository_id: str, candidate_sha: str, seal_state_identity: str,
     blockers_pending: bool, blocker_state_digest: str,
 ) -> str:
     return hashlib.sha256(json.dumps({
         "schema": "roundwright-owner-blocker-state-receipt/v1",
-        "task_id": task_id, "candidate_sha": candidate_sha,
+        "task_id": task_id, "repository_id": repository_id, "candidate_sha": candidate_sha,
         "seal_state_identity": seal_state_identity,
         "blockers_pending": blockers_pending,
         "blocker_state_digest": blocker_state_digest,

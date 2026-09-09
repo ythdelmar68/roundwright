@@ -186,10 +186,24 @@ class TaskFeedReadHost:
 
     read_capability: "TaskFeedReadIpcClient" = field(repr=False, compare=False)
     endpoint_identity: str = ""
+    authority_identity: str = ""
+    authority_receipt: OwnerBlockerStateReceipt | None = field(repr=False, compare=False, default=None)
     _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or type(self.read_capability) is not TaskFeedReadIpcClient or self.endpoint_identity != self.read_capability.endpoint_identity:
+        expected = _digest_value({
+            "schema": "roundwright-configured-source-task-feed-endpoint/v2",
+            "ipc_endpoint": self.read_capability.endpoint_identity,
+            "authority_identity": self.authority_identity,
+            "owner_blocker_receipt": self.authority_receipt.receipt_identity if type(self.authority_receipt) is OwnerBlockerStateReceipt else None,
+        }) if type(self.read_capability) is TaskFeedReadIpcClient else ""
+        if (
+            self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL
+            or type(self.read_capability) is not TaskFeedReadIpcClient
+            or not _DIGEST_PATTERN.fullmatch(self.authority_identity)
+            or type(self.authority_receipt) is not OwnerBlockerStateReceipt
+            or self.endpoint_identity != expected
+        ):
             raise ConfiguredSourceError("task-feed read host is invalid")
     def read_page(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
         return self.read_capability.read_page(source, cursor=cursor)
@@ -271,12 +285,25 @@ def create_issue_list_read_host(read_capability: OwnerGitHubReadIpcClient) -> Is
     }), receipt, _CONFIGURED_SOURCE_ENDPOINT_SEAL)
 
 
-def create_task_feed_read_host(read_capability: TaskFeedReadIpcClient) -> TaskFeedReadHost:
+def create_task_feed_read_host(
+    read_capability: TaskFeedReadIpcClient, authority: "ConfiguredSourceAuthority",
+    authority_receipt: OwnerBlockerStateReceipt,
+) -> TaskFeedReadHost:
     """Seal the minimal typed TASK_FEED page endpoint."""
 
-    if type(read_capability) is not TaskFeedReadIpcClient:
+    if (
+        type(read_capability) is not TaskFeedReadIpcClient or type(authority) is not ConfiguredSourceAuthority
+        or type(authority_receipt) is not OwnerBlockerStateReceipt
+        or (authority_receipt.repository_id, authority_receipt.task_id, authority_receipt.candidate_sha)
+        != (authority.repository_id, authority.task_id, authority.binding.candidate_sha)
+    ):
         raise ConfiguredSourceError("task-feed requires a sealed owner IPC capability")
-    return TaskFeedReadHost(read_capability, read_capability.endpoint_identity, _CONFIGURED_SOURCE_ENDPOINT_SEAL)
+    return TaskFeedReadHost(read_capability, _digest_value({
+        "schema": "roundwright-configured-source-task-feed-endpoint/v2",
+        "ipc_endpoint": read_capability.endpoint_identity,
+        "authority_identity": authority.authority_identity,
+        "owner_blocker_receipt": authority_receipt.receipt_identity,
+    }), authority.authority_identity, authority_receipt, _CONFIGURED_SOURCE_ENDPOINT_SEAL)
 
 
 def _issue_list_identity(source: ConfiguredSource) -> tuple[RepositoryRef, int] | None:
@@ -298,6 +325,8 @@ class ConfiguredSourceAuthority:
     """Factory-sealed receipt for the resolved source configuration and graph."""
 
     binding: SourceIngestionBinding
+    repository_id: str
+    task_id: str
     graph_applicability: GraphApplicability
     graph: GraphSnapshot | None
     configuration_receipt_identity: str
@@ -311,6 +340,8 @@ class ConfiguredSourceAuthority:
         ) if type(self.binding) is SourceIngestionBinding else None
         expected_configuration = _digest_value({
             "schema": "roundwright-configured-source-configuration-receipt/v1",
+            "repository_id": self.repository_id,
+            "task_id": self.task_id,
             "candidate_sha": self.binding.candidate_sha,
             "policy_digest": self.binding.policy_digest,
             "configuration_digest": self.binding.configuration_digest,
@@ -325,13 +356,16 @@ class ConfiguredSourceAuthority:
             "graph_digest": self.graph.graph_digest if type(self.graph) is GraphSnapshot else None,
         }) if expected is not None else ""
         expected_authority = _digest_value({
-            "schema": "roundwright-configured-source-authority/v1",
+            "schema": "roundwright-configured-source-authority/v2",
+            "repository_id": self.repository_id,
+            "task_id": self.task_id,
             "configuration_receipt_identity": expected_configuration,
             "graph_receipt_identity": expected_graph,
         }) if expected is not None else ""
         if (
             self._seal is not _CONFIGURED_SOURCE_AUTHORITY_SEAL
             or type(self.binding) is not SourceIngestionBinding or self.graph_applicability is not applicability
+            or not _TOKEN.fullmatch(self.repository_id) or not _TOKEN.fullmatch(self.task_id)
             or (applicability is GraphApplicability.NOT_APPLICABLE and self.graph is not None)
             or (applicability is GraphApplicability.REQUIRED and (type(self.graph) is not GraphSnapshot or self.graph.binding != expected or self.graph.graph_version_id is None))
             or (self.configuration_receipt_identity, self.graph_receipt_identity, self.authority_identity)
@@ -341,7 +375,8 @@ class ConfiguredSourceAuthority:
 
 
 def _seal_configured_source_authority(
-    binding: SourceIngestionBinding, graph: GraphSnapshot | None = None,
+    binding: SourceIngestionBinding, graph: GraphSnapshot | None = None, *,
+    repository_id: str, task_id: str,
 ) -> ConfiguredSourceAuthority:
     """Internal constructor for a graph that has already been read back."""
 
@@ -351,12 +386,14 @@ def _seal_configured_source_authority(
     applicability = _graph_applicability(binding) if type(binding) is SourceIngestionBinding else None
     if (
         type(binding) is not SourceIngestionBinding or applicability is None
+        or not _TOKEN.fullmatch(repository_id) or not _TOKEN.fullmatch(task_id)
         or (applicability is GraphApplicability.NOT_APPLICABLE and graph is not None)
         or (applicability is GraphApplicability.REQUIRED and (type(graph) is not GraphSnapshot or graph.binding != expected or graph.graph_version_id is None))
     ):
         raise ConfiguredSourceError("configured source authority inputs are invalid")
     configuration = _digest_value({
         "schema": "roundwright-configured-source-configuration-receipt/v1",
+        "repository_id": repository_id, "task_id": task_id,
         "candidate_sha": binding.candidate_sha, "policy_digest": binding.policy_digest,
         "configuration_digest": binding.configuration_digest, "source_set_digest": binding.source_set_digest,
     })
@@ -368,10 +405,14 @@ def _seal_configured_source_authority(
         "graph_digest": graph.graph_digest if graph is not None else None,
     })
     authority = _digest_value({
-        "schema": "roundwright-configured-source-authority/v1",
+        "schema": "roundwright-configured-source-authority/v2",
+        "repository_id": repository_id, "task_id": task_id,
         "configuration_receipt_identity": configuration, "graph_receipt_identity": graph_receipt,
     })
-    return ConfiguredSourceAuthority(binding, applicability, graph, configuration, graph_receipt, authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL)
+    return ConfiguredSourceAuthority(
+        binding, repository_id, task_id, applicability, graph, configuration, graph_receipt,
+        authority, _CONFIGURED_SOURCE_AUTHORITY_SEAL,
+    )
 
 
 def resolve_source_ingestion_binding(
@@ -397,7 +438,7 @@ def resolve_source_ingestion_binding(
 
 def resolve_configured_source_authority(
     repository: RepositoryIdentity, configuration: ResolvedConfigurationBinding,
-    candidate_sha: str,
+    candidate_sha: str, task_id: str,
 ) -> ConfiguredSourceAuthority:
     """Read the accepted graph only through the durable product boundaries.
 
@@ -408,18 +449,24 @@ def resolve_configured_source_authority(
 
     if (
         type(repository) is not RepositoryIdentity or type(configuration) is not ResolvedConfigurationBinding
-        or not _SHA.fullmatch(candidate_sha)
+        or not _SHA.fullmatch(candidate_sha) or not _TOKEN.fullmatch(task_id)
     ):
         raise ConfiguredSourceError("configured source authoritative inputs are invalid")
+    authority_receipt = _owner_blocker_state_receipt(repository, task_id, candidate_sha)
     binding = resolve_source_ingestion_binding(configuration, candidate_sha)
     if _graph_applicability(binding) is GraphApplicability.NOT_APPLICABLE:
-        return _seal_configured_source_authority(binding)
+        return _seal_configured_source_authority(
+            binding, repository_id=authority_receipt.repository_id, task_id=authority_receipt.task_id,
+        )
     graph_binding = DependencyGraphBinding(binding.candidate_sha, binding.policy_digest, binding.configuration_digest)
     try:
         graph = DependencyGraphStore().current(repository, binding=graph_binding)
     except Exception as error:
         raise ConfiguredSourceError("configured source accepted graph is unavailable") from error
-    return _seal_configured_source_authority(binding, graph)
+    return _seal_configured_source_authority(
+        binding, graph, repository_id=authority_receipt.repository_id,
+        task_id=authority_receipt.task_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -427,7 +474,10 @@ class ConfiguredSourceReadCapability:
     """Factory-sealed read-only capability, with no provider command surface."""
 
     binding: SourceIngestionBinding
+    repository_id: str
+    task_id: str
     authority_identity: str
+    owner_blocker_receipt_identity: str
     capability_identity: str
     issue_list: IssueListReadHost | None
     task_feed: TaskFeedReadHost | None
@@ -438,15 +488,21 @@ class ConfiguredSourceReadCapability:
         expected_identity = _digest_value({
             "schema": "roundwright-configured-source-owner-read-capability/v1",
             "authority_identity": self.authority_identity,
+            "repository_id": self.repository_id,
+            "task_id": self.task_id,
+            "owner_blocker_receipt": self.owner_blocker_receipt_identity,
             "issue_list_endpoint": None if self.issue_list is None else self.issue_list.endpoint_identity,
             "task_feed_endpoint": None if self.task_feed is None else self.task_feed.endpoint_identity,
         })
         if (
             self._seal is not _CONFIGURED_SOURCE_CAPABILITY_SEAL or type(self.binding) is not SourceIngestionBinding
+            or not _TOKEN.fullmatch(self.repository_id) or not _TOKEN.fullmatch(self.task_id)
             or not _DIGEST_PATTERN.fullmatch(self.authority_identity)
+            or not _DIGEST_PATTERN.fullmatch(self.owner_blocker_receipt_identity)
             or self.capability_identity != expected_identity
             or (SourceType.ISSUE_LIST in required) != (type(self.issue_list) is IssueListReadHost)
             or (SourceType.TASK_FEED in required) != (type(self.task_feed) is TaskFeedReadHost)
+            or (self.task_feed is not None and self.task_feed.authority_identity != self.authority_identity)
             or (SourceType.ISSUE_LIST not in required and self.issue_list is not None)
             or (SourceType.TASK_FEED not in required and self.task_feed is not None)
         ):
@@ -466,6 +522,7 @@ class ConfiguredSourceReadCapability:
 
 def create_configured_source_read_capability(
     authority: ConfiguredSourceAuthority, *, task_id: str | None = None,
+    owner_blocker_receipt: OwnerBlockerStateReceipt | None = None,
     issue_list: IssueListReadHost | None = None, task_feed: TaskFeedReadHost | None = None,
 ) -> ConfiguredSourceReadCapability:
     """Bind an owner-resolved typed source capability to exact source bounds.
@@ -474,11 +531,18 @@ def create_configured_source_read_capability(
     provider commands, and mutation surfaces remain outside this product seam.
     """
 
-    if type(authority) is not ConfiguredSourceAuthority:
+    if (
+        type(authority) is not ConfiguredSourceAuthority or type(task_id) is not str
+        or not _TOKEN.fullmatch(task_id) or type(owner_blocker_receipt) is not OwnerBlockerStateReceipt
+        or (owner_blocker_receipt.repository_id, owner_blocker_receipt.task_id, owner_blocker_receipt.candidate_sha)
+        != (authority.repository_id, authority.task_id, authority.binding.candidate_sha)
+        or task_id != authority.task_id
+    ):
         raise ConfiguredSourceError("configured source capability inputs are invalid")
+    owner_receipt_identity = _owner_blocker_receipt_identity(owner_blocker_receipt)
     issue_sources = tuple(source for source in authority.binding.configured_sources if source.source_type is SourceType.ISSUE_LIST)
     if issue_sources:
-        if type(task_id) is not str or not _TOKEN.fullmatch(task_id) or type(issue_list) is not IssueListReadHost:
+        if type(issue_list) is not IssueListReadHost:
             raise ConfiguredSourceError("configured source issue-list binding is invalid")
         parsed = tuple(_issue_list_identity(source) for source in issue_sources)
         if any(value is None for value in parsed):
@@ -493,16 +557,24 @@ def create_configured_source_read_capability(
             or receipt.candidate_sha != authority.binding.candidate_sha
         ):
             raise ConfiguredSourceError("configured source issue-list binding has drifted")
-    elif task_id is not None and (type(task_id) is not str or not _TOKEN.fullmatch(task_id)):
-        raise ConfiguredSourceError("configured source task identity is invalid")
+    if SourceType.TASK_FEED in {source.source_type for source in authority.binding.configured_sources} and (
+        type(task_feed) is not TaskFeedReadHost
+        or task_feed.authority_receipt != owner_blocker_receipt
+        or task_feed.authority_identity != authority.authority_identity
+    ):
+        raise ConfiguredSourceError("configured source task-feed binding has drifted")
     capability_identity = _digest_value({
         "schema": "roundwright-configured-source-owner-read-capability/v1",
         "authority_identity": authority.authority_identity,
+        "repository_id": authority.repository_id,
+        "task_id": authority.task_id,
+        "owner_blocker_receipt": owner_receipt_identity,
         "issue_list_endpoint": None if issue_list is None else issue_list.endpoint_identity,
         "task_feed_endpoint": None if task_feed is None else task_feed.endpoint_identity,
     })
     return ConfiguredSourceReadCapability(
-        authority.binding, authority.authority_identity, capability_identity, issue_list, task_feed, _CONFIGURED_SOURCE_CAPABILITY_SEAL,
+        authority.binding, authority.repository_id, authority.task_id, authority.authority_identity, owner_receipt_identity,
+        capability_identity, issue_list, task_feed, _CONFIGURED_SOURCE_CAPABILITY_SEAL,
     )
 
 
@@ -518,7 +590,11 @@ class TrustedConfiguredSourceReadHost:
         self,
         authority: ConfiguredSourceAuthority, capability: ConfiguredSourceReadCapability,
     ) -> None:
-        if type(authority) is not ConfiguredSourceAuthority or type(capability) is not ConfiguredSourceReadCapability or capability.binding != authority.binding or capability.authority_identity != authority.authority_identity:
+        if (
+            type(authority) is not ConfiguredSourceAuthority or type(capability) is not ConfiguredSourceReadCapability
+            or capability.binding != authority.binding or capability.authority_identity != authority.authority_identity
+            or (capability.repository_id, capability.task_id) != (authority.repository_id, authority.task_id)
+        ):
             raise ConfiguredSourceError("trusted configured-source readers are invalid")
         self._authority = authority
         self._capability = capability
@@ -530,6 +606,10 @@ class TrustedConfiguredSourceReadHost:
     @property
     def authority_identity(self) -> str:
         return self._authority.authority_identity
+
+    @property
+    def owner_blocker_receipt_identity(self) -> str:
+        return self._capability.owner_blocker_receipt_identity
 
     @property
     def query_identity(self) -> str:
@@ -867,6 +947,18 @@ def _create_owner_blocker_state_read_host(
     )
 
 
+def _owner_blocker_receipt_identity(receipt: OwnerBlockerStateReceipt) -> str:
+    if type(receipt) is not OwnerBlockerStateReceipt:
+        raise ConfiguredSourceError("configured source owner-blocker receipt is invalid")
+    return _digest_value({
+        "schema": "roundwright-configured-source-owner-blocker-binding/v1",
+        "repository_id": receipt.repository_id,
+        "task_id": receipt.task_id,
+        "candidate_sha": receipt.candidate_sha,
+        "receipt_identity": receipt.receipt_identity,
+    })
+
+
 def _digest_value(value: object) -> str:
     return "sha256:" + hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -940,8 +1032,11 @@ class ConfiguredSourceHostInputs:
             or type(self.owner_blocker_receipt) is not OwnerBlockerStateReceipt
             or type(self.owner_blocker_read_host) is not OwnerBlockerStateReadHost
             or self.owner_blocker_receipt.candidate_sha != self.authority.binding.candidate_sha
+            or (self.owner_blocker_receipt.repository_id, self.owner_blocker_receipt.task_id)
+            != (self.authority.repository_id, self.authority.task_id)
             or self.owner_blocker_receipt.blockers_pending != self.owner_blockers_pending
             or self.owner_blocker_read_host.receipt != self.owner_blocker_receipt
+            or self.read_host.owner_blocker_receipt_identity != _owner_blocker_receipt_identity(self.owner_blocker_receipt)
         ):
             raise ConfiguredSourceError("configured source host inputs are invalid")
         # This lookup also proves that the profile is registered with the
@@ -968,6 +1063,8 @@ class ConfiguredSourceHostInputs:
         return {
             "schema": CONFIGURED_SOURCE_EXECUTION_CONTEXT_SCHEMA,
             "base_sha": self.base_sha,
+            "repository_id": self.authority.repository_id,
+            "task_id": self.authority.task_id,
             "candidate_sha": self.binding.candidate_sha,
             "policy_digest": self.binding.policy_digest,
             "configuration_digest": self.binding.configuration_digest,
@@ -999,7 +1096,11 @@ class ConfiguredSourceHostInputs:
         """Deny execution when the current canonical owner state moved."""
 
         current = self.owner_blocker_read_host.current()
-        if current != self.owner_blocker_receipt:
+        if (
+            current != self.owner_blocker_receipt
+            or (current.repository_id, current.task_id, current.candidate_sha)
+            != (self.authority.repository_id, self.authority.task_id, self.authority.binding.candidate_sha)
+        ):
             raise ConfiguredSourceError("configured source owner-blocker state has drifted")
 
 
@@ -1059,7 +1160,7 @@ def prepare_configured_source_ingestion(
     candidate_sha: str, base_sha: str, case_id: str, ready_at: int,
     recorder_identity: str, store_identity: str, task_id: str, *,
     issue_list: IssueListReadHost | None = None,
-    task_feed: TaskFeedReadHost | None = None,
+    task_feed: TaskFeedReadIpcClient | None = None,
 ) -> tuple[ConfiguredSourceHostInputs, dict[str, object]]:
     """Prepare #117's sole host inputs and V2 request from closed authority.
 
@@ -1070,11 +1171,18 @@ def prepare_configured_source_ingestion(
 
     if not _TOKEN.fullmatch(task_id):
         raise ConfiguredSourceError("configured source task identity is invalid")
-    authority = resolve_configured_source_authority(repository, configuration, candidate_sha)
-    capability = create_configured_source_read_capability(
-        authority, task_id=task_id, issue_list=issue_list, task_feed=task_feed,
-    )
     owner_blocker_host = _create_owner_blocker_state_read_host(repository, task_id, candidate_sha)
+    authority = resolve_configured_source_authority(
+        repository, configuration, candidate_sha, task_id,
+    )
+    task_feed_host = (
+        create_task_feed_read_host(task_feed, authority, owner_blocker_host.receipt)
+        if task_feed is not None else None
+    )
+    capability = create_configured_source_read_capability(
+        authority, task_id=task_id, owner_blocker_receipt=owner_blocker_host.receipt,
+        issue_list=issue_list, task_feed=task_feed_host,
+    )
     inputs = ConfiguredSourceHostInputs(
         base_sha, authority, case_id, ready_at,
         TrustedConfiguredSourceReadHost(authority, capability),

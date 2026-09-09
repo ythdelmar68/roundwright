@@ -1390,15 +1390,50 @@ class _OwnerGitHubReadHostChannel:
         return self.__endpoint.read_collection_page(request, cursor)
 
 
+@dataclass(frozen=True)
+class CredentialedGitHubReadCapabilityBinding:
+    """Public-safe receipt retained by the credentialed read-capability factory."""
+
+    repository: str
+    task_id: str
+    candidate_sha: str
+    capability_identity: str
+    receipt_identity: str
+
+    def __post_init__(self) -> None:
+        try:
+            CandidateBinding(self.repository, self.task_id, self.candidate_sha)
+            _digest(self.capability_identity, "credentialed GitHub read capability")
+        except (DependencyPolicyError, GitHubRuntimeError) as error:
+            raise GitHubRuntimeError("credentialed GitHub read capability binding is invalid") from error
+        expected = _sha256({
+            "schema": "roundwright-credentialed-github-read-capability-binding/v1",
+            "repository": self.repository,
+            "task_id": self.task_id,
+            "candidate_sha": self.candidate_sha,
+            "capability_identity": self.capability_identity,
+        })
+        if self.receipt_identity != expected:
+            raise GitHubRuntimeError("credentialed GitHub read capability binding is invalid")
+
+
 class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
     """Factory-sealed read client retaining safe failure provenance privately."""
 
-    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure", "__read_generation", "__capability_identity")
+    __slots__ = ("__inventory_failure_lock", "__pending_inventory_failure", "__read_generation", "__capability_identity", "__binding_receipt")
 
-    def __init__(self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel, capability_identity: str) -> None:
+    def __init__(
+        self, health: GitHubCapabilityHealth, channel: _OwnerGitHubReadHostChannel,
+        capability_identity: str, binding_receipt: CredentialedGitHubReadCapabilityBinding,
+    ) -> None:
         if type(channel) is not _OwnerGitHubReadHostChannel:
             raise GitHubRuntimeError("credentialed GitHub read channel is invalid")
         _digest(capability_identity, "credentialed GitHub read capability")
+        if (
+            type(binding_receipt) is not CredentialedGitHubReadCapabilityBinding
+            or binding_receipt.capability_identity != capability_identity
+        ):
+            raise GitHubRuntimeError("credentialed GitHub read capability binding is invalid")
         super().__init__(health, channel)
         self.__inventory_failure_lock = RLock()
         self.__pending_inventory_failure: tuple[
@@ -1408,10 +1443,15 @@ class _CredentialedGitHubReadCapability(OwnerGitHubReadIpcClient):
         ] | None = None
         self.__read_generation = 0
         self.__capability_identity = capability_identity
+        self.__binding_receipt = binding_receipt
 
     @property
     def capability_identity(self) -> str:
         return self.__capability_identity
+
+    @property
+    def binding_receipt(self) -> CredentialedGitHubReadCapabilityBinding:
+        return self.__binding_receipt
 
     def read(self, request: GitHubReadRequest) -> GitHubReadResult:
         # A second read always makes an earlier result stale, including when
@@ -1490,6 +1530,14 @@ def credentialed_github_read_capability_identity(capability: object) -> str | No
     """Expose the sealed public identity of the production read capability."""
 
     return capability.capability_identity if type(capability) is _CredentialedGitHubReadCapability else None
+
+
+def credentialed_github_read_capability_binding(
+    capability: object,
+) -> CredentialedGitHubReadCapabilityBinding | None:
+    """Expose the factory-retained repository/task/candidate receipt only."""
+
+    return capability.binding_receipt if type(capability) is _CredentialedGitHubReadCapability else None
 
 
 class _CredentialedGhRunnerAdapter:
@@ -1590,7 +1638,19 @@ def create_credentialed_github_read_capability(
         "roundwright-credentialed-github-read-capability/v1", binding.repository,
         binding.task_id, binding.candidate_sha, capability_health.identity,
     ))
-    return _CredentialedGitHubReadCapability(capability_health, _OwnerGitHubReadHostChannel(endpoint), identity)
+    receipt = CredentialedGitHubReadCapabilityBinding(
+        binding.repository, binding.task_id, binding.candidate_sha, identity,
+        _sha256({
+            "schema": "roundwright-credentialed-github-read-capability-binding/v1",
+            "repository": binding.repository,
+            "task_id": binding.task_id,
+            "candidate_sha": binding.candidate_sha,
+            "capability_identity": identity,
+        }),
+    )
+    return _CredentialedGitHubReadCapability(
+        capability_health, _OwnerGitHubReadHostChannel(endpoint), identity, receipt,
+    )
 
 
 def unavailable_capability_health(*, now: datetime | None = None) -> GitHubCapabilityHealth:

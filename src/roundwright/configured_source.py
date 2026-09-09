@@ -20,7 +20,11 @@ from typing import Protocol
 from .configuration import ConfigurationError, RepositoryIdentity, ResolvedConfigurationBinding
 from .dependency_graph import DependencyGraphBinding, DependencyGraphStore, GraphSnapshot
 from .github import GitHubReadOperation, GitHubReadRequest, IssueSnapshot, RepositoryRef
-from .github_runtime import OwnerGitHubReadIpcClient, credentialed_github_read_capability_identity
+from .github_runtime import (
+    CredentialedGitHubReadCapabilityBinding, OwnerGitHubReadIpcClient,
+    credentialed_github_read_capability_binding,
+    credentialed_github_read_capability_identity,
+)
 from .shadow import CONFIGURED_SOURCE_INGESTION_PROFILE, shadow_evidence_profile
 from .state import _open_writable_connection, database_path
 
@@ -141,10 +145,16 @@ class IssueListReadHost:
 
     read_capability: OwnerGitHubReadIpcClient = field(repr=False, compare=False)
     endpoint_identity: str = ""
+    binding_receipt: CredentialedGitHubReadCapabilityBinding | None = field(repr=False, compare=False, default=None)
     _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL or not isinstance(self.read_capability, OwnerGitHubReadIpcClient) or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity):
+        if (
+            self._seal is not _CONFIGURED_SOURCE_ENDPOINT_SEAL
+            or not isinstance(self.read_capability, OwnerGitHubReadIpcClient)
+            or type(self.binding_receipt) is not CredentialedGitHubReadCapabilityBinding
+            or not _DIGEST_PATTERN.fullmatch(self.endpoint_identity)
+        ):
             raise ConfiguredSourceError("issue-list read host is invalid")
 
     def read_page(self, source: ConfiguredSource, *, cursor: str | None) -> SourcePage:
@@ -243,12 +253,18 @@ def create_issue_list_read_host(read_capability: OwnerGitHubReadIpcClient) -> Is
     """
 
     identity = credentialed_github_read_capability_identity(read_capability)
-    if identity is None:
+    receipt = credentialed_github_read_capability_binding(read_capability)
+    if (
+        identity is None or type(receipt) is not CredentialedGitHubReadCapabilityBinding
+        or receipt.capability_identity != identity
+    ):
         raise ConfiguredSourceError("issue-list requires a credentialed owner read capability")
     return IssueListReadHost(read_capability, _digest_value({
         "schema": "roundwright-configured-source-issue-list-endpoint/v1",
-        "credentialed_read_identity": identity, "operation": GitHubReadOperation.ISSUE.value,
-    }), _CONFIGURED_SOURCE_ENDPOINT_SEAL)
+        "credentialed_read_identity": identity,
+        "credentialed_binding_receipt": receipt.receipt_identity,
+        "operation": GitHubReadOperation.ISSUE.value,
+    }), receipt, _CONFIGURED_SOURCE_ENDPOINT_SEAL)
 
 
 def create_task_feed_read_host(read_capability: TaskFeedReadIpcClient) -> TaskFeedReadHost:
@@ -445,7 +461,7 @@ class ConfiguredSourceReadCapability:
 
 
 def create_configured_source_read_capability(
-    authority: ConfiguredSourceAuthority, *,
+    authority: ConfiguredSourceAuthority, *, task_id: str | None = None,
     issue_list: IssueListReadHost | None = None, task_feed: TaskFeedReadHost | None = None,
 ) -> ConfiguredSourceReadCapability:
     """Bind an owner-resolved typed source capability to exact source bounds.
@@ -456,6 +472,25 @@ def create_configured_source_read_capability(
 
     if type(authority) is not ConfiguredSourceAuthority:
         raise ConfiguredSourceError("configured source capability inputs are invalid")
+    issue_sources = tuple(source for source in authority.binding.configured_sources if source.source_type is SourceType.ISSUE_LIST)
+    if issue_sources:
+        if type(task_id) is not str or not _TOKEN.fullmatch(task_id) or type(issue_list) is not IssueListReadHost:
+            raise ConfiguredSourceError("configured source issue-list binding is invalid")
+        parsed = tuple(_issue_list_identity(source) for source in issue_sources)
+        if any(value is None for value in parsed):
+            raise ConfiguredSourceError("configured source issue-list identity is invalid")
+        repositories = {value[0].slug for value in parsed if value is not None}
+        receipt = issue_list.binding_receipt
+        if (
+            len(repositories) != 1
+            or type(receipt) is not CredentialedGitHubReadCapabilityBinding
+            or receipt.repository not in repositories
+            or receipt.task_id != task_id
+            or receipt.candidate_sha != authority.binding.candidate_sha
+        ):
+            raise ConfiguredSourceError("configured source issue-list binding has drifted")
+    elif task_id is not None and (type(task_id) is not str or not _TOKEN.fullmatch(task_id)):
+        raise ConfiguredSourceError("configured source task identity is invalid")
     capability_identity = _digest_value({
         "schema": "roundwright-configured-source-owner-read-capability/v1",
         "authority_identity": authority.authority_identity,
@@ -635,6 +670,10 @@ def scan_configured_sources(binding: SourceIngestionBinding, adapter: Configured
                 raise ConfiguredSourceError("configured source bounds exceeded")
             if page.next_cursor is None:
                 break
+            # A continuation after the final authorized page is a rejection,
+            # never permission to over-read one extra provider page.
+            if pages == source.max_pages:
+                raise ConfiguredSourceError("configured source bounds exceeded")
             if page.next_cursor in seen_cursors:
                 raise ConfiguredSourceError("configured source cursor is unsafe")
             seen_cursors.add(page.next_cursor)
@@ -671,53 +710,60 @@ def _normalize(binding: SourceIngestionBinding, observations: tuple[tuple[str, t
     return SourceInventory(binding, source_digests, tuple(sorted(normalized, key=lambda item: (item.member_id, item.opaque_id))))
 
 
-def select_runnable_work(inventory: SourceInventory, graph: GraphSnapshot | None, *, unresolved_owner_member_ids: tuple[str, ...] = ()) -> RunnableSelection:
+def select_runnable_work(
+    inventory: SourceInventory, graph: GraphSnapshot | None, *, owner_blockers_pending: bool = False,
+) -> RunnableSelection:
     """Return only independently eligible roots in deterministic topological order.
 
     A graph is evidence, not an inference source: for multi-source work every
     item must match the current graph exactly.  A graph mismatch blocks the
     affected selection, while unrelated valid roots remain selectable.
     """
-    if type(inventory) is not SourceInventory or type(unresolved_owner_member_ids) is not tuple or any(not _TOKEN.fullmatch(value) for value in unresolved_owner_member_ids):
+    if type(inventory) is not SourceInventory or type(owner_blockers_pending) is not bool:
         raise ConfiguredSourceError("runnable selection input is invalid")
-    items = {item.member_id: item for item in inventory.items}
-    if len(items) != len(inventory.items):
-        raise ConfiguredSourceError("normalized graph members are ambiguous")
-    blockers: dict[str, set[str]] = {member_id: set() for member_id in items}
+    by_member: dict[str, list[NormalizedItem]] = {}
+    for item in inventory.items:
+        by_member.setdefault(item.member_id, []).append(item)
+    items = {item.opaque_id: item for item in inventory.items}
+    blockers: dict[str, set[str]] = {opaque_id: set() for opaque_id in items}
     for item in inventory.items:
         if item.ambiguous:
-            blockers[item.member_id].add("ambiguous-deduplication")
-        if item.member_id in unresolved_owner_member_ids:
-            blockers[item.member_id].add("owner-item-unresolved")
+            blockers[item.opaque_id].add("ambiguous-deduplication")
+        if len(by_member[item.member_id]) > 1:
+            blockers[item.opaque_id].add("member-identity-ambiguous")
+        if owner_blockers_pending:
+            blockers[item.opaque_id].add("owner-item-unresolved")
     graph_digest: str | None = None
     edges: tuple[tuple[str, str], ...] = ()
     if graph is not None:
         expected_binding = DependencyGraphBinding(inventory.binding.candidate_sha, inventory.binding.policy_digest, inventory.binding.configuration_digest)
         if type(graph) is not GraphSnapshot or graph.binding != expected_binding:
-            for member_id in blockers:
-                blockers[member_id].add("current-graph-unavailable")
+            for opaque_id in blockers:
+                blockers[opaque_id].add("current-graph-unavailable")
         else:
             graph_digest = graph.graph_digest
         if type(graph) is GraphSnapshot and graph.binding == expected_binding:
             graph_members = {member.member.member_id: member.member.content_digest for member in graph.members}
-            for member_id, item in items.items():
-                if graph_members.get(member_id) != item.content_digest:
-                    blockers[member_id].add("graph-member-unavailable")
+            for opaque_id, item in items.items():
+                if graph_members.get(item.member_id) != item.content_digest:
+                    blockers[opaque_id].add("graph-member-unavailable")
             edges = tuple((edge.subject_member_id, edge.object_member_id) for edge in graph.edges)
     elif len(inventory.binding.configured_sources) > 1:
-        for member_id in blockers: blockers[member_id].add("current-graph-unavailable")
+        for opaque_id in blockers: blockers[opaque_id].add("current-graph-unavailable")
     if len(inventory.binding.configured_sources) > 1 and graph is not None and graph.binding is None:
-        for member_id in blockers: blockers[member_id].add("current-graph-unavailable")
+        for opaque_id in blockers: blockers[opaque_id].add("current-graph-unavailable")
     for subject, dependency in edges:
-        if subject in blockers and dependency not in items:
-            blockers[subject].add("dependency-outside-inventory")
-        if subject in blockers and dependency in blockers and blockers[dependency]:
-            blockers[subject].add("dependency-blocked")
-        if subject in blockers and dependency in items:
-            blockers[subject].add("dependency-not-complete")
-    ready_members = sorted(member_id for member_id, reasons in blockers.items() if not reasons)
-    decisions = tuple(SelectionDecision(items[member_id].opaque_id, SelectionState.RUNNABLE if not blockers[member_id] else SelectionState.BLOCKED, tuple(sorted(blockers[member_id]))) for member_id in sorted(items))
-    return RunnableSelection(inventory.inventory_digest, graph_digest, decisions, tuple(items[member_id].opaque_id for member_id in ready_members))
+        subjects, dependencies = by_member.get(subject, ()), by_member.get(dependency, ())
+        for item in subjects:
+            if not dependencies:
+                blockers[item.opaque_id].add("dependency-outside-inventory")
+            else:
+                if any(blockers[dependency_item.opaque_id] for dependency_item in dependencies):
+                    blockers[item.opaque_id].add("dependency-blocked")
+                blockers[item.opaque_id].add("dependency-not-complete")
+    ready = sorted(opaque_id for opaque_id, reasons in blockers.items() if not reasons)
+    decisions = tuple(SelectionDecision(opaque_id, SelectionState.RUNNABLE if not blockers[opaque_id] else SelectionState.BLOCKED, tuple(sorted(blockers[opaque_id]))) for opaque_id in sorted(items))
+    return RunnableSelection(inventory.inventory_digest, graph_digest, decisions, tuple(ready))
 
 
 class ConfiguredSourceStore:
@@ -758,6 +804,23 @@ class ConfiguredSourceStore:
         if row is None or _digest_value(json.loads(row[0])) != inventory_digest:
             raise ConfiguredSourceError("source inventory is unavailable")
         return row[0]
+
+
+def _owner_blockers_pending(repository: RepositoryIdentity, task_id: str, candidate_sha: str) -> bool:
+    """Read the durable #115 owner-item state before a capture plan exists."""
+
+    try:
+        connection = sqlite3.connect(f"{database_path(repository).resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM review_item_records WHERE task_id = ? AND candidate_sha = ? AND blocker_state = 'blocking' AND (verification_state = 'pending' OR disposition = 'pending') LIMIT 1",
+                (task_id, candidate_sha),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ConfiguredSourceError("configured source owner-blocker state is unavailable") from error
+    return row is not None
 
 
 def _digest_value(value: object) -> str:
@@ -818,7 +881,7 @@ class ConfiguredSourceHostInputs:
     read_host: TrustedConfiguredSourceReadHost
     recorder_identity: str
     store_identity: str
-    unresolved_owner_member_ids: tuple[str, ...] = ()
+    owner_blockers_pending: bool
 
     def __post_init__(self) -> None:
         if (
@@ -827,9 +890,7 @@ class ConfiguredSourceHostInputs:
             or type(self.read_host) is not TrustedConfiguredSourceReadHost or self.read_host.binding != self.authority.binding
             or self.read_host.authority_identity != self.authority.authority_identity
             or not _DIGEST_PATTERN.fullmatch(self.recorder_identity) or not _DIGEST_PATTERN.fullmatch(self.store_identity)
-            or type(self.unresolved_owner_member_ids) is not tuple
-            or any(not _TOKEN.fullmatch(member) for member in self.unresolved_owner_member_ids)
-            or len(set(self.unresolved_owner_member_ids)) != len(self.unresolved_owner_member_ids)
+            or type(self.owner_blockers_pending) is not bool
         ):
             raise ConfiguredSourceError("configured source host inputs are invalid")
         # This lookup also proves that the profile is registered with the
@@ -871,7 +932,7 @@ class ConfiguredSourceHostInputs:
             "ready_at": self.ready_at,
             "recorder_identity": self.recorder_identity,
             "store_identity": self.store_identity,
-            "unresolved_owner_member_ids": list(self.unresolved_owner_member_ids),
+            "owner_blockers_pending": self.owner_blockers_pending,
         }
 
     def execution_context(self, capture_plan_digest: str) -> dict[str, object]:
@@ -937,10 +998,9 @@ def configured_source_executor_request(inputs: ConfiguredSourceHostInputs) -> di
 def prepare_configured_source_ingestion(
     repository: RepositoryIdentity, configuration: ResolvedConfigurationBinding,
     candidate_sha: str, base_sha: str, case_id: str, ready_at: int,
-    recorder_identity: str, store_identity: str, *,
+    recorder_identity: str, store_identity: str, task_id: str, *,
     issue_list: IssueListReadHost | None = None,
     task_feed: TaskFeedReadHost | None = None,
-    unresolved_owner_member_ids: tuple[str, ...] = (),
 ) -> tuple[ConfiguredSourceHostInputs, dict[str, object]]:
     """Prepare #117's sole host inputs and V2 request from closed authority.
 
@@ -949,14 +1009,16 @@ def prepare_configured_source_ingestion(
     bindings are deliberately absent from this public production interface.
     """
 
+    if not _TOKEN.fullmatch(task_id):
+        raise ConfiguredSourceError("configured source task identity is invalid")
     authority = resolve_configured_source_authority(repository, configuration, candidate_sha)
     capability = create_configured_source_read_capability(
-        authority, issue_list=issue_list, task_feed=task_feed,
+        authority, task_id=task_id, issue_list=issue_list, task_feed=task_feed,
     )
     inputs = ConfiguredSourceHostInputs(
         base_sha, authority, case_id, ready_at,
         TrustedConfiguredSourceReadHost(authority, capability),
-        recorder_identity, store_identity, unresolved_owner_member_ids,
+        recorder_identity, store_identity, _owner_blockers_pending(repository, task_id, candidate_sha),
     )
     return inputs, configured_source_executor_request(inputs)
 
@@ -1097,7 +1159,7 @@ class ConfiguredSourceIngestionAdapter:
         # never invoke an adapter, provider, Git, or GitHub operation.
         inventory = inputs.read_host.scan()
         selection = select_runnable_work(
-            inventory, inputs.graph, unresolved_owner_member_ids=inputs.unresolved_owner_member_ids,
+            inventory, inputs.graph, owner_blockers_pending=inputs.owner_blockers_pending,
         )
         execution = ConfiguredSourceExecution(inventory, selection)
         from .external_validation import _harness_executor

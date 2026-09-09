@@ -838,6 +838,15 @@ MIGRATIONS = (
             ("dependency_review_dispatch_claims", "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT NOT NULL, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('session-opened', 'turn-dispatched')), CHECK((turn_identity IS NULL AND state = 'session-opened') OR (turn_identity IS NOT NULL AND state = 'turn-dispatched')))"),
         ),
     ),
+    Migration(
+        67,
+        (
+            "CREATE TABLE configured_source_inventories (inventory_digest TEXT PRIMARY KEY, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_set_digest TEXT NOT NULL, content_json TEXT NOT NULL)",
+        ),
+        (
+            ("configured_source_inventories", "CREATE TABLE configured_source_inventories (inventory_digest TEXT PRIMARY KEY, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_set_digest TEXT NOT NULL, content_json TEXT NOT NULL)"),
+        ),
+    ),
 )
 
 

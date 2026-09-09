@@ -880,6 +880,7 @@ READ_ONLY_EXTERNAL_OBSERVATION_PROFILE = "roundwright-shadow-profile/read-only-e
 INTEGRATED_BOUNDARY_PROFILE = "roundwright-shadow-profile/integrated-boundary/v1"
 PHASE_3_QUALIFICATION_PROFILE = "roundwright-shadow-profile/phase-3-qualification/v1"
 CROSS_ENVIRONMENT_CANARY_PROFILE = "roundwright-shadow-profile/cross-environment-canary/v1"
+CONFIGURED_SOURCE_INGESTION_PROFILE = "roundwright-shadow-profile/configured-source-ingestion/v1"
 _V2_TOKEN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 _V2_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _V2_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,38}/[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1160,6 +1161,17 @@ _CROSS_ENVIRONMENT_CANARY_PROFILE = ShadowEvidenceProfile(
     ("cross-environment-profile-qualification",),
 )
 
+_CONFIGURED_SOURCE_INGESTION_PROFILE = ShadowEvidenceProfile(
+    CONFIGURED_SOURCE_INGESTION_PROFILE,
+    CaptureMode.TERMINAL_SNAPSHOT,
+    ShadowProducer.PROFILE_DEFINED,
+    "v2-configured-source-allowlist-graph-exporter-comparator-recorder-store-readback-bound",
+    "before-first-selected-live-configured-source-observation",
+    "append-only-content-addressed-readback",
+    "source-configuration-candidate-or-graph-movement-requires-fresh-capture",
+    ("configured-source-inventory", "configured-source-selection", "zero-mutation-readback"),
+)
+
 
 def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
     """Return the closed registry; later leaves cannot silently add a profile."""
@@ -1176,6 +1188,7 @@ def shadow_evidence_profiles() -> tuple[ShadowEvidenceProfile, ...]:
         _INTEGRATED_BOUNDARY_PROFILE,
         _PHASE_3_QUALIFICATION_PROFILE,
         _CROSS_ENVIRONMENT_CANARY_PROFILE,
+        _CONFIGURED_SOURCE_INGESTION_PROFILE,
     )
 
 
@@ -1200,6 +1213,8 @@ def shadow_evidence_profile(profile_id: str) -> ShadowEvidenceProfile:
         return _PHASE_3_QUALIFICATION_PROFILE
     if profile_id == CROSS_ENVIRONMENT_CANARY_PROFILE:
         return _CROSS_ENVIRONMENT_CANARY_PROFILE
+    if profile_id == CONFIGURED_SOURCE_INGESTION_PROFILE:
+        return _CONFIGURED_SOURCE_INGESTION_PROFILE
     if profile_id != PROVENANCE_DECISION_PROFILE:
         raise ShadowV2Error("shadow evidence profile is unavailable")
     return _PROVENANCE_PROFILE

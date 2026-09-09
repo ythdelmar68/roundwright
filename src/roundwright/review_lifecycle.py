@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
+from uuid import UUID
 
 from .configuration import RepositoryIdentity
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_current_transition_lease, _require_matching_task
@@ -144,6 +146,33 @@ class ReviewItemProjection:
     verification: VerificationState
     blocking: bool
     destination: str
+
+
+@dataclass(frozen=True)
+class OwnerBlockerStateReceipt:
+    """Content-addressed current-seal view of task-scoped owner blockers."""
+
+    task_id: str
+    repository_id: str
+    candidate_sha: str
+    seal_state_identity: str
+    blockers_pending: bool
+    blocker_state_digest: str
+    receipt_identity: str
+
+    def __post_init__(self) -> None:
+        expected = _owner_blocker_receipt_identity(
+            self.task_id, self.repository_id, self.candidate_sha, self.seal_state_identity,
+            self.blockers_pending, self.blocker_state_digest,
+        )
+        if (
+            not _token(self.task_id) or not _token(self.repository_id) or not _sha(self.candidate_sha)
+            or not _state_identity(self.seal_state_identity)
+            or type(self.blockers_pending) is not bool
+            or not _digest(self.blocker_state_digest)
+            or self.receipt_identity != expected
+        ):
+            raise ReviewLifecycleError("owner blocker state receipt is invalid")
 
 
 class ReviewLifecycleStore:
@@ -362,12 +391,58 @@ class ReviewLifecycleStore:
             connection.close()
 
 
+def owner_blocker_state_receipt(
+    connection: sqlite3.Connection, task_id: str, candidate_sha: str,
+) -> OwnerBlockerStateReceipt:
+    """Read the exact current seal and its task-scoped PASS obligations.
+
+    Accepted plan PASS follow-ups intentionally survive candidate movement, so
+    their immutable provenance SHA is included in the content-addressed state
+    rather than used to filter them out.
+    """
+
+    if type(connection) is not sqlite3.Connection or not _token(task_id) or not _sha(candidate_sha):
+        raise ReviewLifecycleError("owner blocker state scope is invalid")
+    seal = connection.execute(
+        "SELECT seals.candidate_sha, seals.state_identity, tasks.repository_id FROM candidate_seals AS seals "
+        "JOIN tasks ON tasks.task_id = seals.task_id WHERE seals.task_id = ?", (task_id,),
+    ).fetchone()
+    if seal is None or seal[0] != candidate_sha or not _state_identity(seal[1]) or not _token(seal[2]):
+        raise ReviewLifecycleError("owner blocker state lacks the exact current candidate seal")
+    rows = connection.execute(
+        "SELECT item_id, candidate_sha, source_attempt_id, content_digest, destination, verification_state, disposition "
+        "FROM review_item_records WHERE task_id = ? AND item_kind = 'pass-follow-up' "
+        "AND source_kind = 'accepted-review' AND blocker_state = 'blocking' AND disposition = 'pending' "
+        "ORDER BY item_id, candidate_sha, source_attempt_id, content_digest, destination, verification_state, disposition",
+        (task_id,),
+    ).fetchall()
+    if any(
+        not _token(row[0]) or not _sha(row[1]) or not _token(row[2])
+        or not _digest(row[3]) or not _token(row[4])
+        or row[5:] != (VerificationState.PENDING.value, ReviewItemDisposition.PENDING.value)
+        for row in rows
+    ):
+        raise ReviewLifecycleError("owner blocker state is invalid")
+    state_digest = hashlib.sha256(json.dumps([
+        {
+            "item_id": row[0], "provenance_candidate_sha": row[1],
+            "source_attempt_id": row[2], "content_digest": row[3],
+            "destination": row[4], "verification_state": row[5], "disposition": row[6],
+        }
+        for row in rows
+    ], sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    return OwnerBlockerStateReceipt(
+        task_id, seal[2], candidate_sha, seal[1], bool(rows), state_digest,
+        _owner_blocker_receipt_identity(task_id, seal[2], candidate_sha, seal[1], bool(rows), state_digest),
+    )
+
+
 def unresolved_final_gate_blockers(connection: sqlite3.Connection, task_id: str, candidate_sha: str) -> bool:
     # A plan PASS is bound to the task base before a later implementation
     # candidate exists.  It remains an owner obligation across that candidate
     # transition, so readiness deliberately scopes these terminal blockers to
     # the task rather than only to the current seal.
-    return connection.execute("SELECT 1 FROM review_item_records WHERE task_id = ? AND item_kind = 'pass-follow-up' AND blocker_state = 'blocking' AND disposition = 'pending' LIMIT 1", (task_id,)).fetchone() is not None
+    return owner_blocker_state_receipt(connection, task_id, candidate_sha).blockers_pending
 
 
 def _owner_command_target(connection: sqlite3.Connection, identity: TaskIdentity, item_id: str, current_candidate_sha: str) -> bool:
@@ -525,6 +600,19 @@ def _owner_authority_digest(owner_identity: str, command_scope: str, task_id: st
     return hashlib.sha256("\x1f".join(("review-owner-authority/v1", owner_identity, command_scope, task_id, candidate_sha, *sorted(_OWNER_ALLOWLIST))).encode("ascii")).hexdigest()
 
 
+def _owner_blocker_receipt_identity(
+    task_id: str, repository_id: str, candidate_sha: str, seal_state_identity: str,
+    blockers_pending: bool, blocker_state_digest: str,
+) -> str:
+    return hashlib.sha256(json.dumps({
+        "schema": "roundwright-owner-blocker-state-receipt/v1",
+        "task_id": task_id, "repository_id": repository_id, "candidate_sha": candidate_sha,
+        "seal_state_identity": seal_state_identity,
+        "blockers_pending": blockers_pending,
+        "blocker_state_digest": blocker_state_digest,
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
 def _valid_owner_grant(grant: object, owner_identity: str, command_scope: str, task_id: str, candidate_sha: str) -> bool:
     return (type(grant) is tuple and len(grant) == 6 and grant[:4] == (owner_identity, command_scope, task_id, candidate_sha)
             and grant[5] == "active" and owner_identity in _OWNER_ALLOWLIST
@@ -550,6 +638,15 @@ def _token(value: object) -> bool:
 
 def _sha(value: object) -> bool:
     return type(value) is str and bool(_SHA.fullmatch(value))
+
+
+def _state_identity(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        return str(UUID(value)) == value
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _digest(value: object) -> bool:

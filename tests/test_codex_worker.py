@@ -195,6 +195,21 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:turn-43", "step", "submit:1", "step"])
 
+    def test_out_of_order_step_is_ambiguous_without_callback(self) -> None:
+        events=[]; request=self.request(); turn=FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))
+        result=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events).dispatch(request, checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None, execute_tool_request=lambda _: self.fail("callback"))
+        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertIn("abort",events); self.assertIn("close",events); self.assertNotIn("submit:2",events)
+
+    def test_mismatched_tool_reply_is_ambiguous_without_submission(self) -> None:
+        events=[]; request=self.request(); item=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_READ,path="a"); turn=FakeTurn("turn-43",None,events,(NativeWorkerTurnStep(request=item),))
+        result=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events).dispatch(request,checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None,execute_tool_request=lambda _:NativeWorkerToolResult(2,WorkerTool.WORKSPACE_READ,"allowed"))
+        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertNotIn("submit:2",events)
+
+    def test_legacy_path_uses_terminal_response_only(self) -> None:
+        events=[]; turn=FakeTurn("turn-43",NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}),events)
+        result=self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events),self.request(),events)
+        self.assertEqual(result.kind,WorkerResultKind.ACCEPTED); self.assertIn("read",events); self.assertNotIn("step",events)
+
 
 if __name__ == "__main__":
     unittest.main()

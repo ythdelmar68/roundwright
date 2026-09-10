@@ -34,14 +34,16 @@ def digest(value: str) -> str:
 
 
 class FakeTurn:
-    def __init__(self, identity: str, response: object, events: list[str]) -> None:
-        self._identity, self._response, self._events = identity, response, events
+    def __init__(self, identity: str, response: object, events: list[str], steps=()) -> None:
+        self._identity, self._response, self._events, self._steps = identity, response, events, iter(steps)
     def identity(self) -> str: return self._identity
     def abort(self): self._events.append("abort")
     def read_response(self):
         self._events.append("read")
         if isinstance(self._response, Exception): raise self._response
         return self._response
+    def read_step(self): self._events.append("step"); return next(self._steps)
+    def submit_tool_result(self, result): self._events.append(f"submit:{result.sequence}")
 
 
 class FakeSession:
@@ -181,6 +183,17 @@ class CodexWorkerAdapterTests(unittest.TestCase):
             NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_READ, path="a", content="x")
         with self.assertRaises(CodexWorkerError):
             NativeWorkerToolRequest(0, WorkerTool.VALIDATION_EXECUTE, command=("python",))
+
+    def test_adapter_routes_ordered_tool_step_before_terminal_response(self) -> None:
+        events = []
+        request = self.request()
+        step = NativeWorkerTurnStep(request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="src/a.py", content="x"))
+        terminal = NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}))
+        turn = FakeTurn("turn-43", None, events, (step, terminal))
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        result = adapter.dispatch(request, checkpoint_session=lambda value: events.append("session:" + value), checkpoint_turn=lambda _a, value: events.append("turn:" + value), execute_tool_request=lambda item: NativeWorkerToolResult(item.sequence, item.tool, "allowed"))
+        self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
+        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:turn-43", "step", "submit:1", "step"])
 
 
 if __name__ == "__main__":

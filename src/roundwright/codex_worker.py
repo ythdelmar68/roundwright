@@ -410,6 +410,7 @@ class CodexWorkerAdapter:
         *,
         checkpoint_session: Callable[[str], None],
         checkpoint_turn: Callable[[str, str], None],
+        execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -456,7 +457,10 @@ class CodexWorkerAdapter:
             _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         try:
-            response = turn.read_response()
+            if execute_tool_request is None:
+                response = turn.read_response()
+            else:
+                response = _consume_steps(turn, execute_tool_request)
         except CodexAdapterError:
             _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
@@ -472,6 +476,27 @@ class CodexWorkerAdapter:
                 return CodexWorkerResult(WorkerResultKind.INVALID, session_identity, turn_identity, None, None, None, diagnostic=WorkerParserDiagnostic.SHAPE)
             return CodexWorkerResult(WorkerResultKind.ACCEPTED, session_identity, turn_identity, output, _digest(output), None)
         return CodexWorkerResult(response.kind, session_identity, turn_identity, None, None, response.failure, response.blocker, response.diagnostic, response.outcome_source, response.sdk_error_category)
+
+
+_MAX_TOOL_STEPS = 32
+
+
+def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult]) -> NativeWorkerResponse:
+    """Consume one exact turn; malformed/uncertain tool exchange is ambiguous."""
+    expected = 1
+    while expected <= _MAX_TOOL_STEPS:
+        step = turn.read_step()
+        if step.response is not None:
+            return step.response
+        request = step.request
+        if request is None or request.sequence != expected:
+            raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        result = execute(request)
+        if type(result) is not NativeWorkerToolResult or (result.sequence, result.tool) != (request.sequence, request.tool):
+            raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        turn.submit_tool_result(result)
+        expected += 1
+    raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
 
 
 def worker_request_digest(*, attempt_id: str, action: WorkerAction, context: CodexWorkerContext, objective: str, constraints: tuple[str, ...], acceptance_criteria: tuple[str, ...], resume_session_identity: str | None) -> str:

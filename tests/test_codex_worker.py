@@ -20,6 +20,9 @@ from roundwright.codex_worker import (
     WorkerAction,
     WorkerResultKind,
     WorkerTool,
+    NativeWorkerToolRequest,
+    NativeWorkerToolResult,
+    NativeWorkerTurnStep,
     worker_request_digest,
 )
 from roundwright.configuration import ProviderProfile, ReasoningEffort
@@ -165,6 +168,19 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(BoundedWorkerToolSurface(()).capability_contract.value, "no-tools-self-contained/v1")
         with self.assertRaises(CodexWorkerError):
             CodexWorkerAdapter(FakeBackend(None), ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH), audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
+
+    def test_executable_coding_contract_requires_the_complete_bounded_surface(self) -> None:
+        self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)).capability_contract.value, "executable-bounded-coding/v1")
+        self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)).capability_contract.value, "orchestration-declared-only/v1")
+
+    def test_closed_tool_step_roundtrip_and_cross_tool_rejection(self) -> None:
+        request = NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="src/a.py", content="x")
+        result = NativeWorkerToolResult(1, WorkerTool.WORKSPACE_WRITE, "allowed", after_digest=digest("x"))
+        self.assertEqual((NativeWorkerTurnStep(request=request).request, result.sequence), (request, 1))
+        with self.assertRaises(CodexWorkerError):
+            NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_READ, path="a", content="x")
+        with self.assertRaises(CodexWorkerError):
+            NativeWorkerToolRequest(0, WorkerTool.VALIDATION_EXECUTE, command=("python",))
 
 
 if __name__ == "__main__":

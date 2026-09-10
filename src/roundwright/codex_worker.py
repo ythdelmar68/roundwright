@@ -48,6 +48,7 @@ class WorkerCapabilityContract(StrEnum):
 
     NO_TOOLS_SELF_CONTAINED = "no-tools-self-contained/v1"
     ORCHESTRATION_DECLARED_ONLY = "orchestration-declared-only/v1"
+    EXECUTABLE_BOUNDED_CODING = "executable-bounded-coding/v1"
 
 
 class WorkerResultKind(StrEnum):
@@ -90,6 +91,65 @@ class WorkerSdkTurnErrorCategory(StrEnum):
     MISSING_OR_UNKNOWN = "missing-or-unknown"
 
 
+class WorkerToolRequestKind(StrEnum):
+    READ = "read"
+    WRITE = "write"
+    VALIDATE = "validate"
+
+
+@dataclass(frozen=True)
+class NativeWorkerToolRequest:
+    """One closed, ordered SDK request; never a shell or general payload."""
+    sequence: int
+    tool: WorkerTool
+    path: str | None = None
+    content: str | None = None
+    command: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        token = lambda value: type(value) is str and bool(value) and len(value) <= 100_000
+        valid = type(self.sequence) is int and self.sequence > 0 and type(self.tool) is WorkerTool
+        if self.tool is WorkerTool.WORKSPACE_READ:
+            valid = valid and token(self.path) and self.content is None and self.command is None
+        elif self.tool is WorkerTool.WORKSPACE_WRITE:
+            valid = valid and token(self.path) and token(self.content) and self.command is None
+        elif self.tool is WorkerTool.VALIDATION_EXECUTE:
+            valid = valid and self.path is None and self.content is None and type(self.command) is tuple and bool(self.command) and all(token(item) for item in self.command)
+        if not valid:
+            raise CodexWorkerError("native Worker tool request is invalid")
+
+
+@dataclass(frozen=True)
+class NativeWorkerToolResult:
+    """Closed reply to exactly one native tool request."""
+    sequence: int
+    tool: WorkerTool
+    outcome: str
+    before_digest: str | None = None
+    after_digest: str | None = None
+    exit_code: int | None = None
+    output_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        valid = type(self.sequence) is int and self.sequence > 0 and type(self.tool) is WorkerTool and self.outcome in {"allowed", "failed", "denied"}
+        for value in (self.before_digest, self.after_digest, self.output_digest):
+            valid = valid and (value is None or (type(value) is str and _DIGEST.fullmatch(value)))
+        valid = valid and (self.exit_code is None or type(self.exit_code) is int)
+        if not valid:
+            raise CodexWorkerError("native Worker tool result is invalid")
+
+
+@dataclass(frozen=True)
+class NativeWorkerTurnStep:
+    """A stream step is exclusively a tool request or its terminal response."""
+    request: NativeWorkerToolRequest | None = None
+    response: "NativeWorkerResponse | None" = None
+
+    def __post_init__(self) -> None:
+        if (self.request is None) == (self.response is None) or (self.request is not None and type(self.request) is not NativeWorkerToolRequest) or (self.response is not None and type(self.response) is not NativeWorkerResponse):
+            raise CodexWorkerError("native Worker turn step is invalid")
+
+
 def expected_lifecycle(action: WorkerAction) -> tuple[str, str | None, str]:
     """The provider-neutral terminal projection for each Worker lifecycle role."""
 
@@ -124,7 +184,11 @@ class BoundedWorkerToolSurface:
 
     @property
     def capability_contract(self) -> WorkerCapabilityContract:
-        return WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED if not self.tools else WorkerCapabilityContract.ORCHESTRATION_DECLARED_ONLY
+        if not self.tools:
+            return WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED
+        if self.tools == (WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE):
+            return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
+        return WorkerCapabilityContract.ORCHESTRATION_DECLARED_ONLY
 
 
 @dataclass(frozen=True)
@@ -284,6 +348,8 @@ class NativeWorkerTurn(Protocol):
     def identity(self) -> str: ...
     def abort(self) -> None: ...
     def read_response(self) -> NativeWorkerResponse: ...
+    def read_step(self) -> NativeWorkerTurnStep: ...
+    def submit_tool_result(self, result: NativeWorkerToolResult) -> None: ...
 
 
 class NativeWorkerSession(Protocol):

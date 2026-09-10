@@ -54,6 +54,7 @@ class CodingToolEventStore:
     def __init__(self, database: Path):
         if not isinstance(database, Path) or not database.parent.is_dir(): raise CodingWorkerStateError("coding tool store is invalid")
         connection = sqlite3.connect(database)
+        self._database = database
         try:
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_event_metadata(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)")
             connection.execute("INSERT OR IGNORE INTO coding_tool_event_metadata VALUES (?, ?)", ("roundwright-coding-tool-event-store", 1))
@@ -62,3 +63,12 @@ class CodingToolEventStore:
             connection.commit()
         finally:
             connection.close()
+    def append(self, record):
+        if type(record) is not CodingToolEventRecord: raise CodingWorkerStateError("coding tool event is invalid")
+        payload=json.dumps(record.to_closed_dict(),sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
+        connection=sqlite3.connect(self._database)
+        try:
+            connection.execute("INSERT INTO coding_tool_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",(record.task_id,record.implementation_attempt_id,record.session_identity,record.external_turn_identity,record.candidate_sha,record.sequence,record.record_digest,payload)); connection.commit(); return record
+        except sqlite3.Error as error:
+            connection.rollback(); raise CodingWorkerStateError("coding tool store append failed") from error
+        finally: connection.close()

@@ -2,6 +2,7 @@ import sys
 import unittest
 import sqlite3
 import tempfile
+import json
 from dataclasses import replace
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -46,3 +47,13 @@ class CodingWorkerStateTests(unittest.TestCase):
             finally:
                 connection.close()
             CodingToolEventStore(path)
+
+    def test_store_appends_one_closed_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store=CodingToolEventStore(Path(temp)/"state.db")
+            record=CodingToolEventRecord(SCHEMA,"task","sha256:"+"a"*64,WorkerAction.IMPLEMENTATION,"attempt","session","turn","a"*40,1,WorkerTool.WORKSPACE_WRITE,"sha256:"+"b"*64,"sha256:"+"c"*64,"allowed",None,"sha256:"+"d"*64,None,None,CodingProcessState.COMPLETED,CodingCancellationState.NOT_REQUESTED,CodingAmbiguityState.CLEAR)
+            self.assertEqual(store.append(record),record)
+            connection=sqlite3.connect(Path(temp)/"state.db")
+            try:
+                row=connection.execute("SELECT task_id,sequence,record_digest,payload_json FROM coding_tool_events").fetchall(); self.assertEqual(len(row),1); self.assertEqual(row[0][:3],("task",1,record.record_digest)); self.assertEqual(json.loads(row[0][3]),record.to_closed_dict()); self.assertFalse(any(x in row[0][3] for x in ("raw_content","private_path","provider","error","credential")))
+            finally: connection.close()

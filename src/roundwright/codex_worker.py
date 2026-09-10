@@ -186,8 +186,6 @@ class BoundedWorkerToolSurface:
     def capability_contract(self) -> WorkerCapabilityContract:
         if not self.tools:
             return WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED
-        if self.tools == (WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE):
-            return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
         return WorkerCapabilityContract.ORCHESTRATION_DECLARED_ONLY
 
 

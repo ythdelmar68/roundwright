@@ -170,7 +170,7 @@ class CodexWorkerAdapterTests(unittest.TestCase):
             CodexWorkerAdapter(FakeBackend(None), ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH), audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
 
     def test_executable_coding_contract_requires_the_complete_bounded_surface(self) -> None:
-        self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)).capability_contract.value, "executable-bounded-coding/v1")
+        self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)).capability_contract.value, "orchestration-declared-only/v1")
         self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)).capability_contract.value, "orchestration-declared-only/v1")
 
     def test_closed_tool_step_roundtrip_and_cross_tool_rejection(self) -> None:

@@ -509,6 +509,12 @@ class ProductionCodingWorkerRuntime:
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         self._local_tools = local_tools
 
+    @property
+    def capability_contract(self):
+        """Executable only because this binding owns a real local executor."""
+        from .codex_worker import WorkerCapabilityContract
+        return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
+
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
         return self._adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
 

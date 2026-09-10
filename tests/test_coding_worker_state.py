@@ -39,7 +39,10 @@ class CodingWorkerStateTests(unittest.TestCase):
     def test_store_bootstrap_and_reopen(self):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/"state.db"; CodingToolEventStore(path)
-            with sqlite3.connect(path) as connection:
+            connection = sqlite3.connect(path)
+            try:
                 self.assertEqual(set(x[0] for x in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")), {"coding_tool_event_metadata","coding_tool_events"})
                 self.assertEqual(connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall(), [("roundwright-coding-tool-event-store",1)])
+            finally:
+                connection.close()
             CodingToolEventStore(path)

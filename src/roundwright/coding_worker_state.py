@@ -52,9 +52,13 @@ class CodingToolEventRecord:
 
 class CodingToolEventStore:
     def __init__(self, database: Path):
-        if type(database) is not Path or not database.parent.is_dir(): raise CodingWorkerStateError("coding tool store is invalid")
-        with sqlite3.connect(database) as connection:
+        if not isinstance(database, Path) or not database.parent.is_dir(): raise CodingWorkerStateError("coding tool store is invalid")
+        connection = sqlite3.connect(database)
+        try:
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_event_metadata(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)")
             connection.execute("INSERT OR IGNORE INTO coding_tool_event_metadata VALUES (?, ?)", ("roundwright-coding-tool-event-store", 1))
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_events(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, candidate_sha TEXT NOT NULL, sequence INTEGER NOT NULL, record_digest TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
             if connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall() != [("roundwright-coding-tool-event-store", 1)]: raise CodingWorkerStateError("coding tool store is invalid")
+            connection.commit()
+        finally:
+            connection.close()

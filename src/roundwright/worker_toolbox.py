@@ -33,8 +33,10 @@ from .codex_worker import (
     WorkerOutcomeSource,
     WorkerSdkTurnErrorCategory,
     WorkerTool,
+    NativeWorkerToolRequest,
+    NativeWorkerToolResult,
 )
-from .coding_tools import BoundedCodingTools, CodingToolEvent
+from .coding_tools import BoundedCodingTools, CodingToolError
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .shadow import RecorderBinding
@@ -516,13 +518,18 @@ class ProductionCodingWorkerRuntime:
         return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
 
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
-        return self._adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+        callback = self._execute_request if request.action is not WorkerAction.PLANNING else None
+        return self._adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, execute_tool_request=callback)
 
-    def execute(self, tool: WorkerTool, *, path: str | None = None, content: str | None = None, command: tuple[str, ...] | None = None) -> CodingToolEvent:
-        if tool is WorkerTool.WORKSPACE_READ and path is not None: return self._local_tools.read(path)[1]
-        if tool is WorkerTool.WORKSPACE_WRITE and path is not None and content is not None: return self._local_tools.write(path, content)
-        if tool is WorkerTool.VALIDATION_EXECUTE and command is not None: return self._local_tools.validate(command)
-        raise WorkerShadowError("production coding Worker tool request is invalid")
+    def _execute_request(self, request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+        try:
+            if request.tool is WorkerTool.WORKSPACE_READ: event = self._local_tools.read(request.path)[1]
+            elif request.tool is WorkerTool.WORKSPACE_WRITE: event = self._local_tools.write(request.path, request.content)
+            elif request.tool is WorkerTool.VALIDATION_EXECUTE: event = self._local_tools.validate(request.command)
+            else: raise CodingToolError("tool denied")
+            return NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest)
+        except CodingToolError:
+            return NativeWorkerToolResult(request.sequence, request.tool, "denied")
 
 
 def main() -> int:

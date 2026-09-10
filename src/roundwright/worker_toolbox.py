@@ -32,7 +32,11 @@ from .codex_worker import (
     WorkerParserDiagnostic,
     WorkerOutcomeSource,
     WorkerSdkTurnErrorCategory,
+    WorkerTool,
+    NativeWorkerToolRequest,
+    NativeWorkerToolResult,
 )
+from .coding_tools import BoundedCodingTools, CodingToolError
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .shadow import RecorderBinding
@@ -499,6 +503,33 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
 def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
     return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+
+
+class ProductionCodingWorkerRuntime:
+    """Selectable production seam; default CLI activation remains blocked."""
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools) -> None:
+        self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
+        self._local_tools = local_tools
+
+    @property
+    def capability_contract(self):
+        """Executable only because this binding owns a real local executor."""
+        from .codex_worker import WorkerCapabilityContract
+        return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
+
+    def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+        callback = self._execute_request if request.action is not WorkerAction.PLANNING else None
+        return self._adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, execute_tool_request=callback)
+
+    def _execute_request(self, request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+        try:
+            if request.tool is WorkerTool.WORKSPACE_READ: event = self._local_tools.read(request.path)[1]
+            elif request.tool is WorkerTool.WORKSPACE_WRITE: event = self._local_tools.write(request.path, request.content)
+            elif request.tool is WorkerTool.VALIDATION_EXECUTE: event = self._local_tools.validate(request.command)
+            else: raise CodingToolError("tool denied")
+            return NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest)
+        except CodingToolError:
+            return NativeWorkerToolResult(request.sequence, request.tool, "denied")
 
 
 def main() -> int:

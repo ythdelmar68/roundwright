@@ -20,6 +20,9 @@ from roundwright.codex_worker import (
     WorkerAction,
     WorkerResultKind,
     WorkerTool,
+    NativeWorkerToolRequest,
+    NativeWorkerToolResult,
+    NativeWorkerTurnStep,
     worker_request_digest,
 )
 from roundwright.configuration import ProviderProfile, ReasoningEffort
@@ -31,14 +34,16 @@ def digest(value: str) -> str:
 
 
 class FakeTurn:
-    def __init__(self, identity: str, response: object, events: list[str]) -> None:
-        self._identity, self._response, self._events = identity, response, events
+    def __init__(self, identity: str, response: object, events: list[str], steps=()) -> None:
+        self._identity, self._response, self._events, self._steps = identity, response, events, iter(steps)
     def identity(self) -> str: return self._identity
     def abort(self): self._events.append("abort")
     def read_response(self):
         self._events.append("read")
         if isinstance(self._response, Exception): raise self._response
         return self._response
+    def read_step(self): self._events.append("step"); return next(self._steps)
+    def submit_tool_result(self, result): self._events.append(f"submit:{result.sequence}")
 
 
 class FakeSession:
@@ -165,6 +170,45 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(BoundedWorkerToolSurface(()).capability_contract.value, "no-tools-self-contained/v1")
         with self.assertRaises(CodexWorkerError):
             CodexWorkerAdapter(FakeBackend(None), ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH), audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
+
+    def test_executable_coding_contract_requires_the_complete_bounded_surface(self) -> None:
+        self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)).capability_contract.value, "orchestration-declared-only/v1")
+        self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)).capability_contract.value, "orchestration-declared-only/v1")
+
+    def test_closed_tool_step_roundtrip_and_cross_tool_rejection(self) -> None:
+        request = NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="src/a.py", content="x")
+        result = NativeWorkerToolResult(1, WorkerTool.WORKSPACE_WRITE, "allowed", after_digest=digest("x"))
+        self.assertEqual((NativeWorkerTurnStep(request=request).request, result.sequence), (request, 1))
+        with self.assertRaises(CodexWorkerError):
+            NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_READ, path="a", content="x")
+        with self.assertRaises(CodexWorkerError):
+            NativeWorkerToolRequest(0, WorkerTool.VALIDATION_EXECUTE, command=("python",))
+
+    def test_adapter_routes_ordered_tool_step_before_terminal_response(self) -> None:
+        events = []
+        request = self.request()
+        step = NativeWorkerTurnStep(request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="src/a.py", content="x"))
+        terminal = NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}))
+        turn = FakeTurn("turn-43", None, events, (step, terminal))
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        result = adapter.dispatch(request, checkpoint_session=lambda value: events.append("session:" + value), checkpoint_turn=lambda _a, value: events.append("turn:" + value), execute_tool_request=lambda item: NativeWorkerToolResult(item.sequence, item.tool, "allowed"))
+        self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
+        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:turn-43", "step", "submit:1", "step"])
+
+    def test_out_of_order_step_is_ambiguous_without_callback(self) -> None:
+        events=[]; request=self.request(); turn=FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))
+        result=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events).dispatch(request, checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None, execute_tool_request=lambda _: self.fail("callback"))
+        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertIn("abort",events); self.assertIn("close",events); self.assertNotIn("submit:2",events)
+
+    def test_mismatched_tool_reply_is_ambiguous_without_submission(self) -> None:
+        events=[]; request=self.request(); item=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_READ,path="a"); turn=FakeTurn("turn-43",None,events,(NativeWorkerTurnStep(request=item),))
+        result=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events).dispatch(request,checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None,execute_tool_request=lambda _:NativeWorkerToolResult(2,WorkerTool.WORKSPACE_READ,"allowed"))
+        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertNotIn("submit:2",events)
+
+    def test_legacy_path_uses_terminal_response_only(self) -> None:
+        events=[]; turn=FakeTurn("turn-43",NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}),events)
+        result=self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events),self.request(),events)
+        self.assertEqual(result.kind,WorkerResultKind.ACCEPTED); self.assertIn("read",events); self.assertNotIn("step",events)
 
 
 if __name__ == "__main__":

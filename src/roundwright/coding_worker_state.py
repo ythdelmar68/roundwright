@@ -41,3 +41,9 @@ class CodingToolEventRecord:
     @property
     def record_digest(self):
         return "sha256:" + hashlib.sha256(json.dumps(self.to_closed_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
+    @classmethod
+    def from_closed_dict(cls, value):
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__): raise CodingWorkerStateError("coding tool event is invalid")
+        try:
+            copy=dict(value); copy["action"]=WorkerAction(copy["action"]); copy["tool"]=WorkerTool(copy["tool"]); copy["process_state"]=CodingProcessState(copy["process_state"]); copy["cancellation_state"]=CodingCancellationState(copy["cancellation_state"]); copy["ambiguity_state"]=CodingAmbiguityState(copy["ambiguity_state"]); return cls(**copy)
+        except (KeyError, TypeError, ValueError) as error: raise CodingWorkerStateError("coding tool event is invalid") from error

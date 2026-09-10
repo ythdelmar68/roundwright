@@ -18,6 +18,7 @@ class CodingWorkerStateTests(unittest.TestCase):
         self.assertEqual(record.to_closed_dict()["tool"], "workspace-write")
         self.assertTrue(record.record_digest.startswith("sha256:"))
         self.assertNotEqual(record.record_digest, replace(record, sequence=2).record_digest)
+        self.assertEqual(CodingToolEventRecord.from_closed_dict(record.to_closed_dict()), record)
 
     def test_denied_record_cannot_retain_effect(self):
         record = CodingToolEventRecord(SCHEMA,"task","sha256:"+"a"*64,WorkerAction.IMPLEMENTATION,"attempt","session","turn","a"*40,1,WorkerTool.WORKSPACE_WRITE,"sha256:"+"b"*64,"sha256:"+"c"*64,"allowed",None,"sha256:"+"d"*64,None,None,CodingProcessState.COMPLETED,CodingCancellationState.NOT_REQUESTED,CodingAmbiguityState.CLEAR)

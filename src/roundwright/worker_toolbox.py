@@ -32,7 +32,9 @@ from .codex_worker import (
     WorkerParserDiagnostic,
     WorkerOutcomeSource,
     WorkerSdkTurnErrorCategory,
+    WorkerTool,
 )
+from .coding_tools import BoundedCodingTools, CodingToolEvent
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .shadow import RecorderBinding
@@ -499,6 +501,22 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
 def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
     return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+
+
+class ProductionCodingWorkerRuntime:
+    """Selectable production seam; default CLI activation remains blocked."""
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools) -> None:
+        self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
+        self._local_tools = local_tools
+
+    def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+        return self._adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+
+    def execute(self, tool: WorkerTool, *, path: str | None = None, content: str | None = None, command: tuple[str, ...] | None = None) -> CodingToolEvent:
+        if tool is WorkerTool.WORKSPACE_READ and path is not None: return self._local_tools.read(path)[1]
+        if tool is WorkerTool.WORKSPACE_WRITE and path is not None and content is not None: return self._local_tools.write(path, content)
+        if tool is WorkerTool.VALIDATION_EXECUTE and command is not None: return self._local_tools.validate(command)
+        raise WorkerShadowError("production coding Worker tool request is invalid")
 
 
 def main() -> int:

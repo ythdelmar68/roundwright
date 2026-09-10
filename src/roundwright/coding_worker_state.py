@@ -2,6 +2,8 @@
 from enum import StrEnum
 from dataclasses import dataclass
 import re
+import hashlib
+import json
 from .codex_worker import WorkerAction, WorkerTool
 
 SCHEMA = "roundwright-coding-tool-event/v1"
@@ -36,3 +38,6 @@ class CodingToolEventRecord:
         if self.schema!=SCHEMA or any(type(x) is not str or not token.fullmatch(x) for x in (self.task_id,self.implementation_attempt_id,self.session_identity,self.external_turn_identity)) or any(type(x) is not str or not digest.fullmatch(x) for x in values) or any(x is not None and (type(x) is not str or not digest.fullmatch(x)) for x in optional) or not re.fullmatch(r"[0-9a-f]{40}",self.candidate_sha) or type(self.sequence) is not int or self.sequence<1 or type(self.action) is not WorkerAction or type(self.tool) is not WorkerTool or type(self.process_state) is not CodingProcessState or type(self.cancellation_state) is not CodingCancellationState or type(self.ambiguity_state) is not CodingAmbiguityState or self.outcome not in {"allowed","failed","denied"} or (self.exit_code is not None and type(self.exit_code) is not int) or (self.outcome == "denied" and any(x is not None for x in (self.before_digest,self.after_digest,self.exit_code,self.output_digest))) or invalid_metadata or invalid_lifecycle: raise CodingWorkerStateError("coding tool event is invalid")
     def to_closed_dict(self):
         return {**self.__dict__, "action": self.action.value, "tool": self.tool.value, "process_state": self.process_state.value, "cancellation_state": self.cancellation_state.value, "ambiguity_state": self.ambiguity_state.value}
+    @property
+    def record_digest(self):
+        return "sha256:" + hashlib.sha256(json.dumps(self.to_closed_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()

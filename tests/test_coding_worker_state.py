@@ -1,9 +1,11 @@
 import sys
 import unittest
+import sqlite3
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from roundwright.coding_worker_state import SCHEMA, CodingProcessState, CodingCancellationState, CodingAmbiguityState, CodingToolEventRecord, CodingWorkerStateError
+from roundwright.coding_worker_state import SCHEMA, CodingProcessState, CodingCancellationState, CodingAmbiguityState, CodingToolEventRecord, CodingWorkerStateError, CodingToolEventStore
 from roundwright.codex_worker import WorkerAction, WorkerTool
 
 class CodingWorkerStateTests(unittest.TestCase):
@@ -33,3 +35,11 @@ class CodingWorkerStateTests(unittest.TestCase):
         record = CodingToolEventRecord(SCHEMA,"task","sha256:"+"a"*64,WorkerAction.IMPLEMENTATION,"attempt","session","turn","a"*40,1,WorkerTool.WORKSPACE_WRITE,"sha256:"+"b"*64,"sha256:"+"c"*64,"allowed",None,"sha256:"+"d"*64,None,None,CodingProcessState.COMPLETED,CodingCancellationState.NOT_REQUESTED,CodingAmbiguityState.CLEAR)
         for change in (lambda: replace(record, ambiguity_state=CodingAmbiguityState.SUBMISSION_UNCERTAIN), lambda: replace(record, ambiguity_state=CodingAmbiguityState.TERMINAL_UNCERTAIN), lambda: replace(record, cancellation_state=CodingCancellationState.REQUESTED), lambda: replace(record, cancellation_state=CodingCancellationState.CONFIRMED)):
             with self.assertRaises(CodingWorkerStateError): change()
+
+    def test_store_bootstrap_and_reopen(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"state.db"; CodingToolEventStore(path)
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(set(x[0] for x in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")), {"coding_tool_event_metadata","coding_tool_events"})
+                self.assertEqual(connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall(), [("roundwright-coding-tool-event-store",1)])
+            CodingToolEventStore(path)

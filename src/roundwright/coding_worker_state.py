@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import re
 import hashlib
 import json
+import sqlite3
+from pathlib import Path
 from .codex_worker import WorkerAction, WorkerTool
 
 SCHEMA = "roundwright-coding-tool-event/v1"
@@ -47,3 +49,12 @@ class CodingToolEventRecord:
         try:
             copy=dict(value); copy["action"]=WorkerAction(copy["action"]); copy["tool"]=WorkerTool(copy["tool"]); copy["process_state"]=CodingProcessState(copy["process_state"]); copy["cancellation_state"]=CodingCancellationState(copy["cancellation_state"]); copy["ambiguity_state"]=CodingAmbiguityState(copy["ambiguity_state"]); return cls(**copy)
         except (KeyError, TypeError, ValueError) as error: raise CodingWorkerStateError("coding tool event is invalid") from error
+
+class CodingToolEventStore:
+    def __init__(self, database: Path):
+        if type(database) is not Path or not database.parent.is_dir(): raise CodingWorkerStateError("coding tool store is invalid")
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_event_metadata(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)")
+            connection.execute("INSERT OR IGNORE INTO coding_tool_event_metadata VALUES (?, ?)", ("roundwright-coding-tool-event-store", 1))
+            connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_events(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, candidate_sha TEXT NOT NULL, sequence INTEGER NOT NULL, record_digest TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
+            if connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall() != [("roundwright-coding-tool-event-store", 1)]: raise CodingWorkerStateError("coding tool store is invalid")

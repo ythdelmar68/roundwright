@@ -197,9 +197,17 @@ class WorkerToolboxTests(unittest.TestCase):
             '{"status":"tool","action":"implementation","sequence":1,"tool":"workspace-read","path":"a.txt","content":null,"command":null,"blocker":null}',
             '{"status":"complete","action":"implementation","blocker":null}',
         ))
+        class OneShotHandle(FakeHandle):
+            def __init__(inner, events, text):
+                super().__init__(events, text); inner._stream_opened = False
+            def stream(inner):
+                if inner._stream_opened:
+                    raise AssertionError("native SDK streams are one-shot")
+                inner._stream_opened = True
+                return super().stream()
         class Thread(FakeThread):
             def turn(inner, prompt, **kwargs):
-                self.events.append(("coding-turn", prompt, kwargs)); return FakeHandle(self.events, next(replies))
+                self.events.append(("coding-turn", prompt, kwargs)); return OneShotHandle(self.events, next(replies))
         class Codex(FakeCodex):
             def thread_start(inner, **kwargs): self.events.append(("start", kwargs)); return Thread(self.events)
         backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: Codex(self.events), approval_mode="deny-all", sandbox="reviewed-sandbox", effort_factory=lambda value: value)

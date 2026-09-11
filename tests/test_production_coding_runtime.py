@@ -43,6 +43,8 @@ class Backend:
 class Sandbox(ReviewedValidationSandbox):
     @property
     def identity(self): return digest("sandbox")
+    @property
+    def receipt_digest(self): return digest("reviewed-sandbox-pin")
     def execute(self, **_kwargs): return CodingSandboxResult(0, b"")
 
 class ProductionRuntimeTests(unittest.TestCase):
@@ -54,7 +56,7 @@ class ProductionRuntimeTests(unittest.TestCase):
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
         tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), sandbox_identity=digest("sandbox")), validation_sandbox=Sandbox())
         context = self.request().context
-        receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"))
+        receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
         return ProductionCodingWorkerRuntime(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40)
     def test_dispatch_writes_only_allowlisted_file_and_submits_closed_result(self):
         with tempfile.TemporaryDirectory() as temp:

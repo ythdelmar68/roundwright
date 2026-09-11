@@ -100,10 +100,11 @@ class CodingDispatchReceipt:
     worktree_fingerprint: str
     validation_toolchain_receipt: str
     sandbox_identity: str
+    capability_digest: str
     receipt_digest: str
 
     @classmethod
-    def seal(cls, *, task_id: str, attempt_id: str, candidate_sha: str, candidate_fingerprint: str, policy_fingerprint: str, configuration_digest: str, worktree_fingerprint: str, validation_toolchain_receipt: str, sandbox_identity: str) -> "CodingDispatchReceipt":
+    def seal(cls, *, task_id: str, attempt_id: str, candidate_sha: str, candidate_fingerprint: str, policy_fingerprint: str, configuration_digest: str, worktree_fingerprint: str, validation_toolchain_receipt: str, sandbox_identity: str, capability_digest: str) -> "CodingDispatchReceipt":
         core = {
             "schema": "roundwright-coding-dispatch-receipt/v1", "task_id": task_id,
             "attempt_id": attempt_id, "candidate_sha": candidate_sha,
@@ -113,11 +114,12 @@ class CodingDispatchReceipt:
             "worktree_fingerprint": worktree_fingerprint,
             "validation_toolchain_receipt": validation_toolchain_receipt,
             "sandbox_identity": sandbox_identity,
+            "capability_digest": capability_digest,
         }
-        return cls(task_id, attempt_id, candidate_sha, candidate_fingerprint, policy_fingerprint, configuration_digest, worktree_fingerprint, validation_toolchain_receipt, sandbox_identity, _digest(core))
+        return cls(task_id, attempt_id, candidate_sha, candidate_fingerprint, policy_fingerprint, configuration_digest, worktree_fingerprint, validation_toolchain_receipt, sandbox_identity, capability_digest, _digest(core))
 
     def __post_init__(self) -> None:
-        values = (self.candidate_fingerprint, self.policy_fingerprint, self.configuration_digest, self.worktree_fingerprint, self.validation_toolchain_receipt, self.sandbox_identity)
+        values = (self.candidate_fingerprint, self.policy_fingerprint, self.configuration_digest, self.worktree_fingerprint, self.validation_toolchain_receipt, self.sandbox_identity, self.capability_digest)
         core = {
             "schema": "roundwright-coding-dispatch-receipt/v1", "task_id": self.task_id,
             "attempt_id": self.attempt_id, "candidate_sha": self.candidate_sha,
@@ -127,6 +129,7 @@ class CodingDispatchReceipt:
             "worktree_fingerprint": self.worktree_fingerprint,
             "validation_toolchain_receipt": self.validation_toolchain_receipt,
             "sandbox_identity": self.sandbox_identity,
+            "capability_digest": self.capability_digest,
         }
         if (not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.attempt_id)
                 or not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha)
@@ -679,7 +682,9 @@ def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBacken
 class ProductionCodingWorkerRuntime:
     """Candidate-bound production coding seam; CLI activation remains blocked."""
     def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str]) -> None:
-        if type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore or not callable(candidate_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity:
+        if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
+                or not callable(candidate_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
+                or local_tools.capability_digest != dispatch_receipt.capability_digest):
             raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         self._local_tools = local_tools
@@ -715,11 +720,22 @@ class ProductionCodingWorkerRuntime:
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe())
+        if self._local_tools.capability_digest != self._dispatch_receipt.capability_digest:
+            raise WorkerShadowError("coding capability receipt drifted")
         session_identity = checkpoint.get("session_identity")
         turn_identity = checkpoint.get("turn_identity")
         if session_identity is None or turn_identity is None:
             raise WorkerShadowError("coding tool effect lacks durable turn checkpoint")
+        request_digest = _digest({"sequence": request.sequence, "tool": request.tool.value, "path": request.path, "content_digest": _digest(request.content) if request.content is not None else None, "command": request.command})
+        if not self._event_store.claim_effect(
+            worker_request.context.task_id, worker_request.attempt_id, session_identity,
+            turn_identity, request.sequence, request_digest,
+        ):
+            result = NativeWorkerToolResult(request.sequence, request.tool, "ambiguous")
+            self._persist_tool_event(worker_request, session_identity, turn_identity, request, result)
+            return result
         try:
+            lifecycle = (CodingProcessState.COMPLETED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.CLEAR)
             feedback = None
             if request.tool is WorkerTool.WORKSPACE_READ:
                 feedback, event = self._local_tools.read(request.path)
@@ -731,14 +747,18 @@ class ProductionCodingWorkerRuntime:
             result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
         except CodingToolError as error:
             result = NativeWorkerToolResult(request.sequence, request.tool, error.outcome)
-        self._persist_tool_event(worker_request, session_identity, turn_identity, request, result)
+            try:
+                lifecycle = (CodingProcessState(error.process_state), CodingCancellationState(error.cancellation_state), CodingAmbiguityState(error.ambiguity_state))
+            except ValueError as state_error:
+                raise WorkerShadowError("coding tool returned invalid lifecycle evidence") from state_error
+        self._persist_tool_event(worker_request, session_identity, turn_identity, request, result, lifecycle=lifecycle)
         return result
 
-    def _persist_tool_event(self, worker_request: CodexWorkerRequest, session_identity: str, turn_identity: str, request: NativeWorkerToolRequest, result: NativeWorkerToolResult) -> None:
+    def _persist_tool_event(self, worker_request: CodexWorkerRequest, session_identity: str, turn_identity: str, request: NativeWorkerToolRequest, result: NativeWorkerToolResult, *, lifecycle: tuple[CodingProcessState, CodingCancellationState, CodingAmbiguityState] | None = None) -> None:
         outcome = result.outcome
-        process_state = CodingProcessState.COMPLETED if outcome in {"allowed", "failed"} else CodingProcessState.FAILED
-        cancellation_state = CodingCancellationState.CONFIRMED if outcome in {"timed-out", "cancelled"} else CodingCancellationState.NOT_REQUESTED
-        ambiguity_state = CodingAmbiguityState.TERMINAL_UNCERTAIN if outcome == "ambiguous" else CodingAmbiguityState.CLEAR
+        if lifecycle is None:
+            lifecycle = (CodingProcessState.FAILED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.TERMINAL_UNCERTAIN)
+        process_state, cancellation_state, ambiguity_state = lifecycle
         request_digest = _digest({"sequence": request.sequence, "tool": request.tool.value, "path": request.path, "content_digest": _digest(request.content) if request.content is not None else None, "command": request.command})
         result_digest = _digest({"sequence": result.sequence, "tool": result.tool.value, "outcome": result.outcome, "before_digest": result.before_digest, "after_digest": result.after_digest, "exit_code": result.exit_code, "output_digest": result.output_digest})
         record = CodingToolEventRecord(

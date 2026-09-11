@@ -59,10 +59,34 @@ class CodingToolEventStore:
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_event_metadata(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)")
             connection.execute("INSERT OR IGNORE INTO coding_tool_event_metadata VALUES (?, ?)", ("roundwright-coding-tool-event-store", 1))
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_events(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, candidate_sha TEXT NOT NULL, sequence INTEGER NOT NULL, record_digest TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
+            connection.execute("CREATE TABLE IF NOT EXISTS coding_effect_intents(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, sequence INTEGER NOT NULL, request_digest TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
             if connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall() != [("roundwright-coding-tool-event-store", 1)]: raise CodingWorkerStateError("coding tool store is invalid")
             connection.commit()
         finally:
             connection.close()
+    def claim_effect(self, task_id, implementation_attempt_id, session_identity, external_turn_identity, sequence, request_digest):
+        """Durably reserve an effect before invoking the local capability.
+
+        A replayed reservation is never treated as permission to repeat a
+        potentially completed filesystem or process effect.  The caller must
+        surface a typed ambiguous result instead.
+        """
+        token=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+        digest=re.compile(r"sha256:[0-9a-f]{64}\Z")
+        if (any(type(value) is not str or not token.fullmatch(value) for value in (task_id,implementation_attempt_id,session_identity,external_turn_identity))
+                or type(sequence) is not int or sequence < 1 or type(request_digest) is not str or not digest.fullmatch(request_digest)):
+            raise CodingWorkerStateError("coding effect intent is invalid")
+        connection=sqlite3.connect(self._database)
+        try:
+            existing=connection.execute("SELECT request_digest FROM coding_effect_intents WHERE task_id=? AND implementation_attempt_id=? AND session_identity=? AND external_turn_identity=? AND sequence=?",(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence)).fetchone()
+            if existing is not None:
+                if existing != (request_digest,): raise CodingWorkerStateError("coding effect intent replay conflicts")
+                return False
+            connection.execute("INSERT INTO coding_effect_intents VALUES (?, ?, ?, ?, ?, ?)",(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence,request_digest))
+            connection.commit(); return True
+        except sqlite3.Error as error:
+            connection.rollback(); raise CodingWorkerStateError("coding effect intent checkpoint failed") from error
+        finally: connection.close()
     def append(self, record):
         if type(record) is not CodingToolEventRecord: raise CodingWorkerStateError("coding tool event is invalid")
         payload=json.dumps(record.to_closed_dict(),sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)

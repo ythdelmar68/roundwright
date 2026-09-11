@@ -71,6 +71,16 @@ class ReviewedValidationSandbox:
     def identity(self) -> str:
         raise NotImplementedError
 
+    @property
+    def receipt_digest(self) -> str:
+        """Digest of the reviewed sandbox implementation and resource seal.
+
+        The reviewed host issues this digest.  It binds its infrastructure
+        pin, mounts, network and credential policy, child containment, and
+        cleanup protocol; a Worker never derives it from local input.
+        """
+        raise NotImplementedError
+
     def execute(self, *, command: tuple[str, ...], root: Path, timeout_seconds: int, output_limit: int) -> CodingSandboxResult:
         raise NotImplementedError
 
@@ -120,7 +130,9 @@ class BoundedCodingTools:
         if not self._root.is_dir() or _is_link(self._root):
             raise CodingToolError("selected workspace is invalid")
         if validation_sandbox is not None:
-            if not isinstance(validation_sandbox, ReviewedValidationSandbox) or capability.sandbox_identity != validation_sandbox.identity:
+            if (not isinstance(validation_sandbox, ReviewedValidationSandbox)
+                    or capability.sandbox_identity != validation_sandbox.identity
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", validation_sandbox.receipt_digest)):
                 raise CodingToolError("reviewed validation sandbox is invalid")
         elif capability.sandbox_identity is not None:
             raise CodingToolError("reviewed validation sandbox is required")
@@ -135,6 +147,30 @@ class BoundedCodingTools:
     @property
     def reviewed_sandbox_identity(self) -> str | None:
         return self._capability.sandbox_identity
+
+    @property
+    def capability_digest(self) -> str:
+        """Digest every observed path, command, budget, executable, and seal."""
+        executables: list[dict[str, str]] = []
+        for command in self._capability.validation_commands:
+            try:
+                executable = Path(command[0]).resolve(strict=True)
+                executable_digest = _digest(executable.read_bytes())
+            except OSError as error:
+                raise CodingToolError("validation executable is invalid") from error
+            executables.append({"path": str(executable), "digest": executable_digest})
+        return _object_digest({
+            "schema": "roundwright-bounded-coding-capability/v1",
+            "root_identity": _digest(str(self._root).encode("utf-8")),
+            "readable_paths": self._capability.readable_paths,
+            "writable_paths": self._capability.writable_paths,
+            "validation_commands": self._capability.validation_commands,
+            "executables": executables,
+            "timeout_seconds": self._capability.timeout_seconds,
+            "output_limit": self._capability.output_limit,
+            "sandbox_identity": self._capability.sandbox_identity,
+            "sandbox_receipt": self._validation_sandbox.receipt_digest if self._validation_sandbox is not None else None,
+        })
 
     def read(self, relative_path: str) -> tuple[str, CodingToolEvent]:
         path, display = self._path(relative_path, self._capability.readable_paths)
@@ -257,6 +293,11 @@ def _is_link(path: Path) -> bool:
 
 def _digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _object_digest(value: object) -> str:
+    import json
+    return _digest(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
 
 
 def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, output_limit: int) -> bytes:

@@ -58,7 +58,7 @@ class FakeSession:
 
 class FakeBackend:
     def __init__(self, session: object) -> None: self.session, self.resumes = session, []
-    def open_session(self, profile, *, resume_session_identity):
+    def open_session(self, profile, *, resume_session_identity, action):
         self.resumes.append(resume_session_identity)
         if isinstance(self.session, Exception): raise self.session
         return self.session

@@ -65,6 +65,7 @@ from .codex_worker import CodexWorkerAdapter
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _NO_TOOL_INSTRUCTIONS = "One bounded planning observation only. No provider tools or repository inspection are declared or required. Decide only from the normalized public turn input. Return only the requested schema."
+_CODING_TOOL_INSTRUCTIONS = "Execute only bounded workspace-read, workspace-write, and validation-execute requests declared by the host. Never invoke a shell, repository command, network, credential, or undeclared tool. Return only the requested structured schema."
 @dataclass(frozen=True)
 class CompletionDeadline:
     """Explicit bounded completion contract, always inside the host deadline."""
@@ -137,9 +138,10 @@ class CodingDispatchReceipt:
                 or self.receipt_digest != _digest(core)):
             raise WorkerShadowError("coding dispatch receipt is invalid")
 
-    def validate_for(self, request: CodexWorkerRequest, observed_candidate_sha: str) -> None:
+    def validate_for(self, request: CodexWorkerRequest, observed_candidate_sha: str, observed_toolchain_receipt: str) -> None:
         if (type(request) is not CodexWorkerRequest or type(observed_candidate_sha) is not str
                 or observed_candidate_sha != self.candidate_sha
+                or observed_toolchain_receipt != self.validation_toolchain_receipt
                 or request.context.task_id != self.task_id or request.attempt_id != self.attempt_id
                 or request.context.candidate_fingerprint != self.candidate_fingerprint
                 or request.context.policy_fingerprint != self.policy_fingerprint
@@ -293,19 +295,20 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
         self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
 
-    def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None) -> NativeWorkerSession:
-        if type(profile) is not ProviderProfile:
+    def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None, action: WorkerAction) -> NativeWorkerSession:
+        if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+        instructions = _NO_TOOL_INSTRUCTIONS if action is WorkerAction.PLANNING else _CODING_TOOL_INSTRUCTIONS
         codex = self._codex_factory()
         try:
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
             if resume_session_identity is None:
-                thread = client.thread_start(approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=_NO_TOOL_INSTRUCTIONS, ephemeral=False, model=profile.model, sandbox=self._sandbox)
+                thread = client.thread_start(approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=instructions, ephemeral=False, model=profile.model, sandbox=self._sandbox)
             else:
                 resume = getattr(client, "thread_resume", None)
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-                thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=_NO_TOOL_INSTRUCTIONS, model=profile.model, sandbox=self._sandbox)
+                thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=instructions, model=profile.model, sandbox=self._sandbox)
             return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value, self._completion, self._clock)
         except CodexAdapterError:
             _close(codex)
@@ -681,9 +684,9 @@ def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBacken
 
 class ProductionCodingWorkerRuntime:
     """Candidate-bound production coding seam; CLI activation remains blocked."""
-    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str]) -> None:
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str]) -> None:
         if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
-                or not callable(candidate_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
+                or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
                 or local_tools.capability_digest != dispatch_receipt.capability_digest):
             raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
@@ -691,6 +694,7 @@ class ProductionCodingWorkerRuntime:
         self._dispatch_receipt = dispatch_receipt
         self._event_store = event_store
         self._candidate_probe = candidate_probe
+        self._toolchain_receipt_probe = toolchain_receipt_probe
 
     @property
     def capability_contract(self):
@@ -701,7 +705,7 @@ class ProductionCodingWorkerRuntime:
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
-        self._dispatch_receipt.validate_for(request, self._candidate_probe())
+        self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
         checkpoint: dict[str, str] = {}
 
         def record_session(session_identity: str) -> None:
@@ -721,7 +725,7 @@ class ProductionCodingWorkerRuntime:
         return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback)
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
-        self._dispatch_receipt.validate_for(worker_request, self._candidate_probe())
+        self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
         if self._local_tools.capability_digest != self._dispatch_receipt.capability_digest:
             raise WorkerShadowError("coding capability receipt drifted")
         session_identity = checkpoint.get("session_identity")
@@ -746,6 +750,8 @@ class ProductionCodingWorkerRuntime:
             elif request.tool is WorkerTool.VALIDATION_EXECUTE:
                 feedback, event = self._local_tools.validate_with_feedback(request.command)
             else: raise CodingToolError("tool denied")
+            if feedback is not None and len(json.dumps({"feedback": feedback}, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > 65_536:
+                raise CodingToolError("coding feedback exceeded serialized SDK budget", outcome="failed")
             result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
         except CodingToolError as error:
             result = NativeWorkerToolResult(request.sequence, request.tool, error.outcome)
@@ -793,11 +799,12 @@ class ProductionCodingWorkerEntrypointInputs:
     dispatch_receipt: CodingDispatchReceipt
     event_store: CodingToolEventStore
     candidate_probe: Callable[[], str]
+    toolchain_receipt_probe: Callable[[], str]
 
     def __post_init__(self) -> None:
         if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
                 or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
-                or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe)
+                or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
                 or not callable(getattr(self.backend, "open_session", None))):
             raise WorkerShadowError("production coding entrypoint inputs are invalid")
 
@@ -814,7 +821,7 @@ def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInpu
     return ProductionCodingWorkerRuntime(
         backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
         local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
-        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe,
+        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe,
     ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
 
 

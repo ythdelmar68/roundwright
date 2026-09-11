@@ -368,7 +368,7 @@ class NativeWorkerSession(Protocol):
 class NativeCodexWorkerBackend(Protocol):
     """SDK-facing seam implemented only by the reviewed native harness."""
 
-    def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None) -> NativeWorkerSession: ...
+    def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None, action: WorkerAction) -> NativeWorkerSession: ...
 
 
 class CodexWorkerAdapter:
@@ -435,7 +435,7 @@ class CodexWorkerAdapter:
         session: NativeWorkerSession | None = None
         turn: NativeWorkerTurn | None = None
         try:
-            session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity)
+            session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity, action=request.action)
             session_identity = _identity(session, "session")
             if request.resume_session_identity is not None and session_identity != request.resume_session_identity:
                 _close_session(session)

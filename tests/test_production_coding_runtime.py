@@ -62,10 +62,10 @@ class ProductionRuntimeTests(unittest.TestCase):
         tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), sandbox_identity=digest("sandbox")), validation_sandbox=Sandbox())
         context = self.request().context
         receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
-        return ProductionCodingWorkerEntrypointInputs(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40)
+        return ProductionCodingWorkerEntrypointInputs(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40, toolchain_receipt_probe=lambda: digest("toolchain"))
     def runtime(self, root, turn, events):
         values=self.inputs(root,turn,events)
-        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe)
+        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe, toolchain_receipt_probe=values.toolchain_receipt_probe)
     def test_dispatch_writes_only_allowlisted_file_and_submits_closed_result(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
@@ -103,6 +103,12 @@ class ProductionRuntimeTests(unittest.TestCase):
     def test_candidate_drift_blocks_before_provider_or_tool_effect(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; runtime=self.runtime(Path(temp),Turn(events,()),events); runtime._candidate_probe=lambda: "b" * 40
+            with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
+            self.assertEqual(events,[])
+
+    def test_toolchain_receipt_drift_blocks_before_provider_or_tool_effect(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; runtime=self.runtime(Path(temp),Turn(events,()),events); runtime._toolchain_receipt_probe=lambda: digest("other-toolchain")
             with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
             self.assertEqual(events,[])
 

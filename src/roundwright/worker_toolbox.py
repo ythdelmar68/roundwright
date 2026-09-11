@@ -764,8 +764,14 @@ class ProductionCodingWorkerRuntime:
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
+        try:
+            if self._event_store.requires_reconciliation(request.context.task_id, request.attempt_id, frozenset()):
+                raise WorkerShadowError("coding effect requires durable reconciliation")
+        except CodingWorkerStateError as error:
+            raise WorkerShadowError("coding reconciliation is unavailable") from error
         checkpoint: dict[str, str] = {}
         submission_turns: dict[int, str] = {}
+        acknowledged_sequences: set[int] = set()
 
         def record_session(session_identity: str) -> None:
             checkpoint["session_identity"] = session_identity
@@ -778,7 +784,7 @@ class ProductionCodingWorkerRuntime:
             checkpoint_turn(session_identity, turn_identity)
 
         def execute(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
-            return self._execute_request(request, checkpoint, item)
+            return self._execute_request(request, checkpoint, item, frozenset(acknowledged_sequences))
 
         def submission(item: NativeWorkerToolRequest, result: NativeWorkerToolResult, state: str, next_turn_identity: str | None) -> None:
             session_identity = checkpoint.get("session_identity"); turn_identity = checkpoint.get("turn_identity") if state == "intent" else submission_turns.get(item.sequence)
@@ -787,11 +793,12 @@ class ProductionCodingWorkerRuntime:
             try:
                 self._event_store.record_submission(request.context.task_id, request.attempt_id, session_identity, turn_identity, item.sequence, state, next_turn_identity)
             except CodingWorkerStateError as error: raise WorkerShadowError("coding submission checkpoint failed") from error
+            if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
         return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None)
 
-    def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+    def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest, acknowledged_sequences: frozenset[int]) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
         if self._local_tools.capability_digest != self._dispatch_receipt.capability_digest:
             raise WorkerShadowError("coding capability receipt drifted")
@@ -799,10 +806,14 @@ class ProductionCodingWorkerRuntime:
         turn_identity = checkpoint.get("turn_identity")
         if session_identity is None or turn_identity is None:
             raise WorkerShadowError("coding tool effect lacks durable turn checkpoint")
+        try:
+            if self._event_store.requires_reconciliation(worker_request.context.task_id, worker_request.attempt_id, acknowledged_sequences):
+                raise WorkerShadowError("coding effect requires durable reconciliation")
+        except CodingWorkerStateError as error:
+            raise WorkerShadowError("coding reconciliation is unavailable") from error
         request_digest = _digest({"sequence": request.sequence, "tool": request.tool.value, "path": request.path, "content_digest": _digest(request.content) if request.content is not None else None, "command": request.command})
         if not self._event_store.claim_effect(
-            worker_request.context.task_id, worker_request.attempt_id, session_identity,
-            turn_identity, request.sequence, request_digest,
+            worker_request.context.task_id, worker_request.attempt_id, request.sequence, request_digest,
         ):
             result = NativeWorkerToolResult(request.sequence, request.tool, "ambiguous")
             self._persist_tool_event(worker_request, session_identity, turn_identity, request, result)
@@ -823,8 +834,10 @@ class ProductionCodingWorkerRuntime:
                 exit_code=event.exit_code, output_digest=event.output_digest,
                 feedback=feedback,
             ):
-                raise CodingToolError("coding feedback exceeded serialized SDK budget", outcome="failed")
-            result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
+                result = NativeWorkerToolResult(request.sequence, request.tool, "feedback-budget-exceeded", event.before_digest, event.after_digest, event.exit_code, event.output_digest)
+                lifecycle = (CodingProcessState.COMPLETED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.CLEAR)
+            else:
+                result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
         except CodingToolError as error:
             result = NativeWorkerToolResult(request.sequence, request.tool, error.outcome)
             try:

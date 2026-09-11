@@ -37,7 +37,7 @@ class CodingToolEventRecord:
         optional=(self.before_digest,self.after_digest,self.output_digest)
         invalid_metadata = (self.tool is WorkerTool.VALIDATION_EXECUTE and (self.before_digest is not None or self.after_digest is not None)) or (self.tool in {WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE} and (self.exit_code is not None or self.output_digest is not None)) or (self.tool is WorkerTool.WORKSPACE_READ and self.before_digest is not None)
         invalid_lifecycle = self.process_state is CodingProcessState.COMPLETED and (self.ambiguity_state is not CodingAmbiguityState.CLEAR or self.cancellation_state is not CodingCancellationState.NOT_REQUESTED)
-        if self.schema!=SCHEMA or any(type(x) is not str or not token.fullmatch(x) for x in (self.task_id,self.implementation_attempt_id,self.session_identity,self.external_turn_identity)) or any(type(x) is not str or not digest.fullmatch(x) for x in values) or any(x is not None and (type(x) is not str or not digest.fullmatch(x)) for x in optional) or not re.fullmatch(r"[0-9a-f]{40}",self.candidate_sha) or type(self.sequence) is not int or self.sequence<1 or type(self.action) is not WorkerAction or type(self.tool) is not WorkerTool or type(self.process_state) is not CodingProcessState or type(self.cancellation_state) is not CodingCancellationState or type(self.ambiguity_state) is not CodingAmbiguityState or self.outcome not in {"allowed","failed","denied","timed-out","cancelled","ambiguous"} or (self.exit_code is not None and type(self.exit_code) is not int) or (self.outcome in {"denied","timed-out","cancelled","ambiguous"} and any(x is not None for x in (self.before_digest,self.after_digest,self.exit_code,self.output_digest))) or invalid_metadata or invalid_lifecycle: raise CodingWorkerStateError("coding tool event is invalid")
+        if self.schema!=SCHEMA or any(type(x) is not str or not token.fullmatch(x) for x in (self.task_id,self.implementation_attempt_id,self.session_identity,self.external_turn_identity)) or any(type(x) is not str or not digest.fullmatch(x) for x in values) or any(x is not None and (type(x) is not str or not digest.fullmatch(x)) for x in optional) or not re.fullmatch(r"[0-9a-f]{40}",self.candidate_sha) or type(self.sequence) is not int or self.sequence<1 or type(self.action) is not WorkerAction or type(self.tool) is not WorkerTool or type(self.process_state) is not CodingProcessState or type(self.cancellation_state) is not CodingCancellationState or type(self.ambiguity_state) is not CodingAmbiguityState or self.outcome not in {"allowed","failed","feedback-budget-exceeded","denied","timed-out","cancelled","ambiguous"} or (self.exit_code is not None and type(self.exit_code) is not int) or (self.outcome in {"denied","timed-out","cancelled","ambiguous"} and any(x is not None for x in (self.before_digest,self.after_digest,self.exit_code,self.output_digest))) or invalid_metadata or invalid_lifecycle: raise CodingWorkerStateError("coding tool event is invalid")
     def to_closed_dict(self):
         return {**self.__dict__, "action": self.action.value, "tool": self.tool.value, "process_state": self.process_state.value, "cancellation_state": self.cancellation_state.value, "ambiguity_state": self.ambiguity_state.value}
     @property
@@ -59,13 +59,17 @@ class CodingToolEventStore:
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_event_metadata(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)")
             connection.execute("INSERT OR IGNORE INTO coding_tool_event_metadata VALUES (?, ?)", ("roundwright-coding-tool-event-store", 1))
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_events(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, candidate_sha TEXT NOT NULL, sequence INTEGER NOT NULL, record_digest TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
+            # Retain the prior turn-scoped table solely to fail closed when a
+            # pre-upgrade local effect was interrupted. New claims below bind
+            # the one-shot effect independently of an SDK turn identity.
             connection.execute("CREATE TABLE IF NOT EXISTS coding_effect_intents(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, sequence INTEGER NOT NULL, request_digest TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
+            connection.execute("CREATE TABLE IF NOT EXISTS coding_effect_claims(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, sequence INTEGER NOT NULL, request_digest TEXT NOT NULL, PRIMARY KEY(task_id,implementation_attempt_id,sequence))")
             connection.execute("CREATE TABLE IF NOT EXISTS coding_tool_submissions(task_id TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, session_identity TEXT NOT NULL, external_turn_identity TEXT NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL, next_turn_identity TEXT, PRIMARY KEY(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence))")
             if connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall() != [("roundwright-coding-tool-event-store", 1)]: raise CodingWorkerStateError("coding tool store is invalid")
             connection.commit()
         finally:
             connection.close()
-    def claim_effect(self, task_id, implementation_attempt_id, session_identity, external_turn_identity, sequence, request_digest):
+    def claim_effect(self, task_id, implementation_attempt_id, sequence, request_digest):
         """Durably reserve an effect before invoking the local capability.
 
         A replayed reservation is never treated as permission to repeat a
@@ -74,19 +78,35 @@ class CodingToolEventStore:
         """
         token=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
         digest=re.compile(r"sha256:[0-9a-f]{64}\Z")
-        if (any(type(value) is not str or not token.fullmatch(value) for value in (task_id,implementation_attempt_id,session_identity,external_turn_identity))
+        if (any(type(value) is not str or not token.fullmatch(value) for value in (task_id,implementation_attempt_id))
                 or type(sequence) is not int or sequence < 1 or type(request_digest) is not str or not digest.fullmatch(request_digest)):
             raise CodingWorkerStateError("coding effect intent is invalid")
         connection=sqlite3.connect(self._database)
         try:
-            existing=connection.execute("SELECT request_digest FROM coding_effect_intents WHERE task_id=? AND implementation_attempt_id=? AND session_identity=? AND external_turn_identity=? AND sequence=?",(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence)).fetchone()
+            existing=connection.execute("SELECT request_digest FROM coding_effect_claims WHERE task_id=? AND implementation_attempt_id=? AND sequence=?",(task_id,implementation_attempt_id,sequence)).fetchone()
             if existing is not None:
                 if existing != (request_digest,): raise CodingWorkerStateError("coding effect intent replay conflicts")
                 return False
-            connection.execute("INSERT INTO coding_effect_intents VALUES (?, ?, ?, ?, ?, ?)",(task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence,request_digest))
+            connection.execute("INSERT INTO coding_effect_claims VALUES (?, ?, ?, ?)",(task_id,implementation_attempt_id,sequence,request_digest))
             connection.commit(); return True
         except sqlite3.Error as error:
             connection.rollback(); raise CodingWorkerStateError("coding effect intent checkpoint failed") from error
+        finally: connection.close()
+    def requires_reconciliation(self, task_id, implementation_attempt_id, acknowledged_sequences=()):
+        """Reject restart or replay while an earlier local effect is unresolved."""
+        token=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+        if (any(type(value) is not str or not token.fullmatch(value) for value in (task_id,implementation_attempt_id))
+                or type(acknowledged_sequences) is not frozenset
+                or any(type(value) is not int or value < 1 for value in acknowledged_sequences)):
+            raise CodingWorkerStateError("coding reconciliation lookup is invalid")
+        connection=sqlite3.connect(self._database)
+        try:
+            submissions=connection.execute("SELECT 1 FROM coding_tool_submissions WHERE task_id=? AND implementation_attempt_id=? AND state IN ('intent','uncertain') LIMIT 1",(task_id,implementation_attempt_id)).fetchone()
+            claims=connection.execute("SELECT sequence FROM coding_effect_claims WHERE task_id=? AND implementation_attempt_id=?",(task_id,implementation_attempt_id)).fetchall()
+            legacy_claim=connection.execute("SELECT 1 FROM coding_effect_intents WHERE task_id=? AND implementation_attempt_id=? LIMIT 1",(task_id,implementation_attempt_id)).fetchone()
+            return submissions is not None or legacy_claim is not None or any(sequence not in acknowledged_sequences for (sequence,) in claims)
+        except sqlite3.Error as error:
+            raise CodingWorkerStateError("coding reconciliation lookup failed") from error
         finally: connection.close()
     def record_submission(self, task_id, implementation_attempt_id, session_identity, external_turn_identity, sequence, state, next_turn_identity=None):
         token=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")

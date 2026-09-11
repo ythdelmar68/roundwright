@@ -42,7 +42,7 @@ class CodingWorkerStateTests(unittest.TestCase):
             path=Path(temp)/"state.db"; CodingToolEventStore(path)
             connection = sqlite3.connect(path)
             try:
-                self.assertEqual(set(x[0] for x in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")), {"coding_tool_event_metadata","coding_tool_events","coding_effect_intents","coding_tool_submissions"})
+                self.assertEqual(set(x[0] for x in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")), {"coding_tool_event_metadata","coding_tool_events","coding_effect_intents","coding_effect_claims","coding_tool_submissions"})
                 self.assertEqual(connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall(), [("roundwright-coding-tool-event-store",1)])
             finally:
                 connection.close()
@@ -58,11 +58,25 @@ class CodingWorkerStateTests(unittest.TestCase):
                 row=connection.execute("SELECT task_id,sequence,record_digest,payload_json FROM coding_tool_events").fetchall(); self.assertEqual(len(row),1); self.assertEqual(row[0][:3],("task",1,record.record_digest)); self.assertEqual(json.loads(row[0][3]),record.to_closed_dict()); self.assertFalse(any(x in row[0][3] for x in ("raw_content","private_path","provider","error","credential")))
             finally: connection.close()
 
-    def test_effect_intent_is_one_shot_and_conflicts_fail_closed(self):
+    def test_effect_claim_is_one_shot_across_restarted_turns_and_requires_reconciliation(self):
         with tempfile.TemporaryDirectory() as temp:
             store=CodingToolEventStore(Path(temp)/"state.db")
             first="sha256:" + "a" * 64; second="sha256:" + "b" * 64
-            self.assertTrue(store.claim_effect("task-1","attempt-1","session-1","turn-1",1,first))
-            self.assertFalse(store.claim_effect("task-1","attempt-1","session-1","turn-1",1,first))
+            self.assertTrue(store.claim_effect("task-1","attempt-1",1,first))
+            self.assertFalse(store.claim_effect("task-1","attempt-1",1,first))
             with self.assertRaises(CodingWorkerStateError):
-                store.claim_effect("task-1","attempt-1","session-1","turn-1",1,second)
+                store.claim_effect("task-1","attempt-1",1,second)
+            self.assertTrue(store.requires_reconciliation("task-1","attempt-1",frozenset()))
+            self.assertFalse(store.requires_reconciliation("task-1","attempt-1",frozenset({1})))
+
+    def test_incomplete_submission_requires_reconciliation_even_when_effect_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"state.db"; store=CodingToolEventStore(path)
+            store.record_submission("task-1","attempt-1","session-1","turn-1",1,"intent")
+            self.assertTrue(store.requires_reconciliation("task-1","attempt-1",frozenset({1})))
+            connection=sqlite3.connect(path)
+            try:
+                connection.execute("INSERT INTO coding_effect_intents VALUES (?, ?, ?, ?, ?, ?)",("task-2","attempt-2","session-1","turn-1",1,"sha256:" + "a" * 64)); connection.commit()
+            finally:
+                connection.close()
+            self.assertTrue(store.requires_reconciliation("task-2","attempt-2",frozenset({1})))

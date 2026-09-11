@@ -137,7 +137,7 @@ class NativeWorkerToolResult:
     feedback: str | None = None
 
     def __post_init__(self) -> None:
-        valid = type(self.sequence) is int and self.sequence > 0 and type(self.tool) is WorkerTool and self.outcome in {"allowed", "failed", "denied", "timed-out", "cancelled", "ambiguous"}
+        valid = type(self.sequence) is int and self.sequence > 0 and type(self.tool) is WorkerTool and self.outcome in {"allowed", "failed", "feedback-budget-exceeded", "denied", "timed-out", "cancelled", "ambiguous"}
         for value in (self.before_digest, self.after_digest, self.output_digest):
             valid = valid and (value is None or (type(value) is str and _DIGEST.fullmatch(value)))
         valid = valid and (self.exit_code is None or type(self.exit_code) is int)

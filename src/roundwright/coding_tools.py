@@ -25,7 +25,7 @@ class CodingToolError(ValueError):
 
     def __init__(self, message: str, *, outcome: str = "denied", process_state: str = "failed", cancellation_state: str = "not-requested", ambiguity_state: str = "clear") -> None:
         super().__init__(message)
-        if outcome not in {"denied", "failed", "timed-out", "cancelled", "ambiguous"}:
+        if outcome not in {"denied", "failed", "feedback-budget-exceeded", "timed-out", "cancelled", "ambiguous"}:
             raise ValueError("coding tool failure outcome is invalid")
         self.outcome = outcome
         self.process_state = process_state

@@ -707,6 +707,7 @@ class ProductionCodingWorkerRuntime:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
         checkpoint: dict[str, str] = {}
+        submission_turns: dict[int, str] = {}
 
         def record_session(session_identity: str) -> None:
             checkpoint["session_identity"] = session_identity
@@ -721,8 +722,16 @@ class ProductionCodingWorkerRuntime:
         def execute(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
             return self._execute_request(request, checkpoint, item)
 
+        def submission(item: NativeWorkerToolRequest, result: NativeWorkerToolResult, state: str) -> None:
+            session_identity = checkpoint.get("session_identity"); turn_identity = checkpoint.get("turn_identity") if state == "intent" else submission_turns.get(item.sequence)
+            if session_identity is None or turn_identity is None: raise WorkerShadowError("coding submission lacks durable turn checkpoint")
+            if state == "intent": submission_turns[item.sequence] = turn_identity
+            try:
+                self._event_store.record_submission(request.context.task_id, request.attempt_id, session_identity, turn_identity, item.sequence, state, checkpoint.get("turn_identity") if state == "submitted" else None)
+            except CodingWorkerStateError as error: raise WorkerShadowError("coding submission checkpoint failed") from error
+
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback)
+        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None)
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
@@ -741,7 +750,7 @@ class ProductionCodingWorkerRuntime:
             self._persist_tool_event(worker_request, session_identity, turn_identity, request, result)
             return result
         try:
-            lifecycle = (CodingProcessState.COMPLETED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.CLEAR)
+            lifecycle = (CodingProcessState.STARTED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.SUBMISSION_UNCERTAIN)
             feedback = None
             if request.tool is WorkerTool.WORKSPACE_READ:
                 feedback, event = self._local_tools.read(request.path)

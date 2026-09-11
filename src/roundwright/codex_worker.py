@@ -420,6 +420,7 @@ class CodexWorkerAdapter:
         checkpoint_session: Callable[[str], None],
         checkpoint_turn: Callable[[str, str], None],
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
+        checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str], None] | None = None,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -472,6 +473,7 @@ class CodexWorkerAdapter:
                 response = _consume_steps(
                     turn, execute_tool_request,
                     checkpoint_next_turn=lambda: checkpoint_turn(session_identity, _identity(turn, "turn")),
+                    checkpoint_submission=checkpoint_submission,
                 )
         except CodexAdapterError:
             _abort_turn(turn); _close_session(session)
@@ -493,7 +495,7 @@ class CodexWorkerAdapter:
 _MAX_TOOL_STEPS = 32
 
 
-def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], None]) -> NativeWorkerResponse:
+def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], None], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str], None] | None = None) -> NativeWorkerResponse:
     """Consume one exact turn; malformed/uncertain tool exchange is ambiguous."""
     expected = 1
     while expected <= _MAX_TOOL_STEPS:
@@ -506,11 +508,13 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
         result = execute(request)
         if type(result) is not NativeWorkerToolResult or (result.sequence, result.tool) != (request.sequence, request.tool):
             raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        if checkpoint_submission is not None: checkpoint_submission(request, result, "intent")
         turn.submit_tool_result(result)
         # A coding result creates a fresh exact SDK turn.  Its identity must
         # become durable before this loop asks it for a stream, otherwise a
         # recovery could attribute a subsequent effect to the prior turn.
         checkpoint_next_turn()
+        if checkpoint_submission is not None: checkpoint_submission(request, result, "submitted")
         expected += 1
     raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
 

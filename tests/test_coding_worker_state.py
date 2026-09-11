@@ -42,7 +42,7 @@ class CodingWorkerStateTests(unittest.TestCase):
             path=Path(temp)/"state.db"; CodingToolEventStore(path)
             connection = sqlite3.connect(path)
             try:
-                self.assertEqual(set(x[0] for x in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")), {"coding_tool_event_metadata","coding_tool_events","coding_effect_intents"})
+                self.assertEqual(set(x[0] for x in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")), {"coding_tool_event_metadata","coding_tool_events","coding_effect_intents","coding_tool_submissions"})
                 self.assertEqual(connection.execute("SELECT schema_name, schema_version FROM coding_tool_event_metadata").fetchall(), [("roundwright-coding-tool-event-store",1)])
             finally:
                 connection.close()

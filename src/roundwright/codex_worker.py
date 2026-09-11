@@ -121,7 +121,12 @@ class NativeWorkerToolRequest:
 
 @dataclass(frozen=True)
 class NativeWorkerToolResult:
-    """Closed reply to exactly one native tool request."""
+    """Reply to one native tool request with bounded transient feedback.
+
+    ``feedback`` is delivered only to the current SDK turn.  It is deliberately
+    excluded from every durable Worker result and event projection; those use
+    the digest fields below.
+    """
     sequence: int
     tool: WorkerTool
     outcome: str
@@ -129,12 +134,16 @@ class NativeWorkerToolResult:
     after_digest: str | None = None
     exit_code: int | None = None
     output_digest: str | None = None
+    feedback: str | None = None
 
     def __post_init__(self) -> None:
-        valid = type(self.sequence) is int and self.sequence > 0 and type(self.tool) is WorkerTool and self.outcome in {"allowed", "failed", "denied"}
+        valid = type(self.sequence) is int and self.sequence > 0 and type(self.tool) is WorkerTool and self.outcome in {"allowed", "failed", "denied", "timed-out", "cancelled", "ambiguous"}
         for value in (self.before_digest, self.after_digest, self.output_digest):
             valid = valid and (value is None or (type(value) is str and _DIGEST.fullmatch(value)))
         valid = valid and (self.exit_code is None or type(self.exit_code) is int)
+        valid = valid and (self.feedback is None or (type(self.feedback) is str and len(self.feedback.encode("utf-8")) <= 65_536))
+        if self.outcome in {"denied", "timed-out", "cancelled", "ambiguous"}:
+            valid = valid and self.feedback is None
         if not valid:
             raise CodexWorkerError("native Worker tool result is invalid")
 

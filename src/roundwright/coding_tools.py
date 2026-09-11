@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -21,6 +22,15 @@ from pathlib import Path
 
 class CodingToolError(ValueError):
     """A requested operation is outside the sealed local capability."""
+
+    def __init__(self, message: str, *, outcome: str = "denied", process_state: str = "failed", cancellation_state: str = "not-requested", ambiguity_state: str = "clear") -> None:
+        super().__init__(message)
+        if outcome not in {"denied", "failed", "timed-out", "cancelled", "ambiguous"}:
+            raise ValueError("coding tool failure outcome is invalid")
+        self.outcome = outcome
+        self.process_state = process_state
+        self.cancellation_state = cancellation_state
+        self.ambiguity_state = ambiguity_state
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,35 @@ class CodingToolEvent:
 
 
 @dataclass(frozen=True)
+class CodingSandboxResult:
+    """Bounded result supplied by a reviewed OS-enforced sandbox."""
+
+    exit_code: int
+    output: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.exit_code) is not int or type(self.output) is not bytes:
+            raise CodingToolError("coding sandbox result is invalid", outcome="failed")
+
+
+class ReviewedValidationSandbox:
+    """Operational boundary for an OS-enforced validation sandbox.
+
+    Product hosts must bind a reviewed implementation which seals the mounted
+    worktree, denies network and ambient credentials, and owns all children.
+    The local direct launcher below is retained only for disposable unit-test
+    fixtures and cannot satisfy a production runtime receipt.
+    """
+
+    @property
+    def identity(self) -> str:
+        raise NotImplementedError
+
+    def execute(self, *, command: tuple[str, ...], root: Path, timeout_seconds: int, output_limit: int) -> CodingSandboxResult:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
 class BoundedCodingCapability:
     """Immutable local authority for one selected disposable worktree."""
 
@@ -46,6 +85,7 @@ class BoundedCodingCapability:
     validation_commands: tuple[tuple[str, ...], ...]
     timeout_seconds: int = 30
     output_limit: int = 65_536
+    sandbox_identity: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -64,6 +104,7 @@ class BoundedCodingCapability:
                 or not Path(command[0]).is_absolute()
                 for command in self.validation_commands
             )
+            or (self.sandbox_identity is not None and (type(self.sandbox_identity) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.sandbox_identity)))
         ):
             raise CodingToolError("bounded coding capability is invalid")
 
@@ -71,13 +112,29 @@ class BoundedCodingCapability:
 class BoundedCodingTools:
     """Execute the only three coding capabilities permitted to a Worker."""
 
-    def __init__(self, capability: BoundedCodingCapability) -> None:
+    def __init__(self, capability: BoundedCodingCapability, *, validation_sandbox: ReviewedValidationSandbox | None = None) -> None:
         if type(capability) is not BoundedCodingCapability:
             raise CodingToolError("bounded coding capability is invalid")
         self._capability = capability
         self._root = capability.root.resolve(strict=True)
         if not self._root.is_dir() or _is_link(self._root):
             raise CodingToolError("selected workspace is invalid")
+        if validation_sandbox is not None:
+            if not isinstance(validation_sandbox, ReviewedValidationSandbox) or capability.sandbox_identity != validation_sandbox.identity:
+                raise CodingToolError("reviewed validation sandbox is invalid")
+        elif capability.sandbox_identity is not None:
+            raise CodingToolError("reviewed validation sandbox is required")
+        self._validation_sandbox = validation_sandbox
+
+    @property
+    def capability_root(self) -> Path:
+        """Private operational root used only for candidate read-back."""
+
+        return self._root
+
+    @property
+    def reviewed_sandbox_identity(self) -> str | None:
+        return self._capability.sandbox_identity
 
     def read(self, relative_path: str) -> tuple[str, CodingToolEvent]:
         path, display = self._path(relative_path, self._capability.readable_paths)
@@ -105,32 +162,62 @@ class BoundedCodingTools:
         return CodingToolEvent("workspace-write", display, "allowed", _digest(before) if before is not None else None, _digest(after))
 
     def validate(self, command: tuple[str, ...]) -> CodingToolEvent:
+        _, event = self.validate_with_feedback(command)
+        return event
+
+    def validate_with_feedback(self, command: tuple[str, ...]) -> tuple[str, CodingToolEvent]:
+        """Run one command and return bounded diagnostics for the active turn.
+
+        Callers retain only the returned event; the text is transient SDK
+        feedback and bounded by ``output_limit``.
+        """
         if type(command) is not tuple or command not in self._capability.validation_commands:
             raise CodingToolError("validation command is not allowlisted")
-        executable = Path(command[0])
-        if not executable.is_file() or _is_link(executable):
-            raise CodingToolError("validation executable is invalid")
+        # The command tuple itself is the sealed executable identity.  Hosted
+        # CPython installations commonly expose that exact executable through
+        # a launcher symlink, so reject only a missing or non-file resolved
+        # target rather than treating the platform's managed launcher as an
+        # untrusted workspace link.
         try:
-            process = subprocess.Popen(
-                list(command), cwd=self._root, shell=False, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                # A new process group lets the cleanup path own the validation
-                # tree rather than merely timing out its immediate parent.
-                start_new_session=os.name != "nt",
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
-                env={"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")},
-            )
+            executable = Path(command[0]).resolve(strict=True)
         except OSError as error:
-            raise CodingToolError("bounded validation could not start") from error
-        try:
-            output = _bounded_output(process, self._capability.timeout_seconds, self._capability.output_limit)
-        except CodingToolError:
-            _terminate_tree(process)
-            raise
-        finally:
-            if process.stdout is not None:
-                process.stdout.close()
-        return CodingToolEvent("validation-execute", None, "allowed" if process.returncode == 0 else "failed", exit_code=process.returncode, output_digest=_digest(output))
+            raise CodingToolError("validation executable is invalid") from error
+        if not executable.is_file():
+            raise CodingToolError("validation executable is invalid")
+        if self._validation_sandbox is not None:
+            try:
+                sandbox_result = self._validation_sandbox.execute(command=command, root=self._root, timeout_seconds=self._capability.timeout_seconds, output_limit=self._capability.output_limit)
+            except CodingToolError:
+                raise
+            except Exception as error:
+                raise CodingToolError("reviewed validation sandbox failed", outcome="failed") from error
+            if type(sandbox_result) is not CodingSandboxResult or len(sandbox_result.output) > self._capability.output_limit:
+                raise CodingToolError("reviewed validation sandbox returned invalid output", outcome="failed")
+            output, exit_code = sandbox_result.output, sandbox_result.exit_code
+        else:
+            try:
+                process = subprocess.Popen(
+                    list(command), cwd=self._root, shell=False, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    # This launcher is for disposable test fixtures only.  The
+                    # production runtime requires ``ReviewedValidationSandbox``.
+                    start_new_session=os.name != "nt",
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
+                    env={"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")},
+                )
+            except OSError as error:
+                raise CodingToolError("bounded validation could not start", outcome="failed") from error
+            try:
+                output = _bounded_output(process, self._capability.timeout_seconds, self._capability.output_limit)
+            except CodingToolError:
+                _terminate_tree(process)
+                raise
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+            exit_code = process.returncode
+        event = CodingToolEvent("validation-execute", None, "allowed" if exit_code == 0 else "failed", exit_code=exit_code, output_digest=_digest(output))
+        return output.decode("utf-8", errors="replace"), event
 
     def _path(self, relative_path: str, allowed: tuple[str, ...]) -> tuple[Path, str]:
         if type(relative_path) is not str or relative_path not in allowed or not _relative(relative_path):
@@ -172,7 +259,7 @@ def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, outp
     """Read incrementally, so a noisy child cannot first exhaust host memory."""
 
     if process.stdout is None:
-        raise CodingToolError("validation output pipe is unavailable")
+        raise CodingToolError("validation output pipe is unavailable", outcome="failed")
     chunks: queue.Queue[bytes | None] = queue.Queue()
 
     def drain() -> None:
@@ -190,11 +277,11 @@ def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, outp
     while not closed:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise CodingToolError("bounded validation timed out")
+            raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="confirmed")
         try:
             chunk = chunks.get(timeout=remaining)
         except queue.Empty as error:
-            raise CodingToolError("bounded validation timed out") from error
+            raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="confirmed") from error
         if chunk is None:
             closed = True
             continue
@@ -202,12 +289,12 @@ def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, outp
             # Preserve a bounded prefix only for the digest; no raw output is
             # retained and the producer is stopped immediately.
             output.extend(chunk[: output_limit - len(output)])
-            raise CodingToolError("bounded validation exceeded output budget")
+            raise CodingToolError("bounded validation exceeded output budget", outcome="failed", cancellation_state="confirmed")
         output.extend(chunk)
     try:
         process.wait(timeout=max(0.1, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
-        raise CodingToolError("bounded validation timed out") from error
+        raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="confirmed") from error
     return bytes(output)
 
 

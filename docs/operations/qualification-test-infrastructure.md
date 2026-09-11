@@ -361,6 +361,23 @@ gates.
 
 ## Reuse by phase
 
+### Phase 5 bounded coding Worker fixtures
+
+Issue #127's hermetic coding fixtures use the versioned
+`roundwright-coding-dispatch-receipt/v1` contract documented in
+[`coding-worker-execution-contract.md`](../architecture/coding-worker-execution-contract.md).
+Fixture writes and validation are bounded local execution, not read-only
+observation.  They require an exact disposable worktree, declared relative
+paths and command tuple, candidate probe, receipt-bound toolchain identity,
+and a reviewed sandbox identity.  Fixture feedback is transient; the retained
+projection contains only closed request/result and process-state digests.
+
+The direct fixture launcher is never a downstream live-execution authority.
+The Phase 5 live capture profile remains
+`roundwright-shadow-profile/coding-worker-e2e/v1`, is owned by #128, and must
+bind a separately reviewed OS sandbox implementation before it can arm.  This
+leaf selects no external-validation route and no lifecycle-observation sink.
+
 - **Phase 3:** read-only native Codex, hosted, forward-target, and typed Shadow
   qualification; zero target mutation.
 - **Phase 4:** bounded cross-environment and disposable-target Canary under the

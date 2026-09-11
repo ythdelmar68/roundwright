@@ -37,6 +37,14 @@ from .codex_worker import (
     NativeWorkerToolResult,
 )
 from .coding_tools import BoundedCodingTools, CodingToolError
+from .coding_worker_state import (
+    CodingAmbiguityState,
+    CodingCancellationState,
+    CodingProcessState,
+    CodingToolEventRecord,
+    CodingToolEventStore,
+    CodingWorkerStateError,
+)
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .shadow import RecorderBinding
@@ -70,6 +78,70 @@ class CompletionDeadline:
 
     def receipt(self) -> dict[str, object]:
         return {"schema": "roundwright-worker-completion-timeout/v1", "application_timeout_ms": self.application_timeout_ms, "host_timeout_ms": self.host_timeout_ms, "headroom_ms": self.host_timeout_ms - self.application_timeout_ms}
+
+
+@dataclass(frozen=True)
+class CodingDispatchReceipt:
+    """Sealed authority tuple for one executable coding Worker attempt.
+
+    The receipt carries public-safe identifiers only.  Its candidate probe is
+    deliberately supplied by the product host and read before dispatch and
+    before each local effect, preventing a moved fixture from borrowing a
+    still-valid capability.
+    """
+
+    task_id: str
+    attempt_id: str
+    candidate_sha: str
+    candidate_fingerprint: str
+    policy_fingerprint: str
+    configuration_digest: str
+    worktree_fingerprint: str
+    validation_toolchain_receipt: str
+    sandbox_identity: str
+    receipt_digest: str
+
+    @classmethod
+    def seal(cls, *, task_id: str, attempt_id: str, candidate_sha: str, candidate_fingerprint: str, policy_fingerprint: str, configuration_digest: str, worktree_fingerprint: str, validation_toolchain_receipt: str, sandbox_identity: str) -> "CodingDispatchReceipt":
+        core = {
+            "schema": "roundwright-coding-dispatch-receipt/v1", "task_id": task_id,
+            "attempt_id": attempt_id, "candidate_sha": candidate_sha,
+            "candidate_fingerprint": candidate_fingerprint,
+            "policy_fingerprint": policy_fingerprint,
+            "configuration_digest": configuration_digest,
+            "worktree_fingerprint": worktree_fingerprint,
+            "validation_toolchain_receipt": validation_toolchain_receipt,
+            "sandbox_identity": sandbox_identity,
+        }
+        return cls(task_id, attempt_id, candidate_sha, candidate_fingerprint, policy_fingerprint, configuration_digest, worktree_fingerprint, validation_toolchain_receipt, sandbox_identity, _digest(core))
+
+    def __post_init__(self) -> None:
+        values = (self.candidate_fingerprint, self.policy_fingerprint, self.configuration_digest, self.worktree_fingerprint, self.validation_toolchain_receipt, self.sandbox_identity)
+        core = {
+            "schema": "roundwright-coding-dispatch-receipt/v1", "task_id": self.task_id,
+            "attempt_id": self.attempt_id, "candidate_sha": self.candidate_sha,
+            "candidate_fingerprint": self.candidate_fingerprint,
+            "policy_fingerprint": self.policy_fingerprint,
+            "configuration_digest": self.configuration_digest,
+            "worktree_fingerprint": self.worktree_fingerprint,
+            "validation_toolchain_receipt": self.validation_toolchain_receipt,
+            "sandbox_identity": self.sandbox_identity,
+        }
+        if (not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.attempt_id)
+                or not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha)
+                or any(type(value) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in values)
+                or self.receipt_digest != _digest(core)):
+            raise WorkerShadowError("coding dispatch receipt is invalid")
+
+    def validate_for(self, request: CodexWorkerRequest, observed_candidate_sha: str) -> None:
+        if (type(request) is not CodexWorkerRequest or type(observed_candidate_sha) is not str
+                or observed_candidate_sha != self.candidate_sha
+                or request.context.task_id != self.task_id or request.attempt_id != self.attempt_id
+                or request.context.candidate_fingerprint != self.candidate_fingerprint
+                or request.context.policy_fingerprint != self.policy_fingerprint
+                or request.context.configuration_digest != self.configuration_digest
+                or request.context.worktree_fingerprint != self.worktree_fingerprint):
+            raise WorkerShadowError("coding dispatch receipt drifted")
 
 
 def _result_schema(action: str) -> dict[str, object]:
@@ -506,10 +578,15 @@ def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBacken
 
 
 class ProductionCodingWorkerRuntime:
-    """Selectable production seam; default CLI activation remains blocked."""
-    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools) -> None:
+    """Candidate-bound production coding seam; CLI activation remains blocked."""
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str]) -> None:
+        if type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore or not callable(candidate_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity:
+            raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         self._local_tools = local_tools
+        self._dispatch_receipt = dispatch_receipt
+        self._event_store = event_store
+        self._candidate_probe = candidate_probe
 
     @property
     def capability_contract(self):
@@ -518,18 +595,65 @@ class ProductionCodingWorkerRuntime:
         return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
 
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
-        callback = self._execute_request if request.action is not WorkerAction.PLANNING else None
-        return self._adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, execute_tool_request=callback)
+        self._dispatch_receipt.validate_for(request, self._candidate_probe())
+        checkpoint: dict[str, str] = {}
 
-    def _execute_request(self, request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+        def record_session(session_identity: str) -> None:
+            checkpoint["session_identity"] = session_identity
+            checkpoint_session(session_identity)
+
+        def record_turn(session_identity: str, turn_identity: str) -> None:
+            if checkpoint.get("session_identity") != session_identity:
+                raise WorkerShadowError("coding turn checkpoint is not session-bound")
+            checkpoint["turn_identity"] = turn_identity
+            checkpoint_turn(session_identity, turn_identity)
+
+        def execute(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+            return self._execute_request(request, checkpoint, item)
+
+        callback = execute if request.action is not WorkerAction.PLANNING else None
+        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback)
+
+    def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+        self._dispatch_receipt.validate_for(worker_request, self._candidate_probe())
+        session_identity = checkpoint.get("session_identity")
+        turn_identity = checkpoint.get("turn_identity")
+        if session_identity is None or turn_identity is None:
+            raise WorkerShadowError("coding tool effect lacks durable turn checkpoint")
         try:
-            if request.tool is WorkerTool.WORKSPACE_READ: event = self._local_tools.read(request.path)[1]
-            elif request.tool is WorkerTool.WORKSPACE_WRITE: event = self._local_tools.write(request.path, request.content)
-            elif request.tool is WorkerTool.VALIDATION_EXECUTE: event = self._local_tools.validate(request.command)
+            feedback = None
+            if request.tool is WorkerTool.WORKSPACE_READ:
+                feedback, event = self._local_tools.read(request.path)
+            elif request.tool is WorkerTool.WORKSPACE_WRITE:
+                event = self._local_tools.write(request.path, request.content)
+            elif request.tool is WorkerTool.VALIDATION_EXECUTE:
+                feedback, event = self._local_tools.validate_with_feedback(request.command)
             else: raise CodingToolError("tool denied")
-            return NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest)
-        except CodingToolError:
-            return NativeWorkerToolResult(request.sequence, request.tool, "denied")
+            result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
+        except CodingToolError as error:
+            result = NativeWorkerToolResult(request.sequence, request.tool, error.outcome)
+        self._persist_tool_event(worker_request, session_identity, turn_identity, request, result)
+        return result
+
+    def _persist_tool_event(self, worker_request: CodexWorkerRequest, session_identity: str, turn_identity: str, request: NativeWorkerToolRequest, result: NativeWorkerToolResult) -> None:
+        outcome = result.outcome
+        process_state = CodingProcessState.COMPLETED if outcome in {"allowed", "failed"} else CodingProcessState.FAILED
+        cancellation_state = CodingCancellationState.CONFIRMED if outcome in {"timed-out", "cancelled"} else CodingCancellationState.NOT_REQUESTED
+        ambiguity_state = CodingAmbiguityState.TERMINAL_UNCERTAIN if outcome == "ambiguous" else CodingAmbiguityState.CLEAR
+        request_digest = _digest({"sequence": request.sequence, "tool": request.tool.value, "path": request.path, "content_digest": _digest(request.content) if request.content is not None else None, "command": request.command})
+        result_digest = _digest({"sequence": result.sequence, "tool": result.tool.value, "outcome": result.outcome, "before_digest": result.before_digest, "after_digest": result.after_digest, "exit_code": result.exit_code, "output_digest": result.output_digest})
+        record = CodingToolEventRecord(
+            "roundwright-coding-tool-event/v1", worker_request.context.task_id,
+            worker_request.input_digest, worker_request.action, worker_request.attempt_id,
+            session_identity, turn_identity, self._dispatch_receipt.candidate_sha,
+            request.sequence, request.tool, request_digest, result_digest, outcome,
+            result.before_digest, result.after_digest, result.exit_code, result.output_digest,
+            process_state, cancellation_state, ambiguity_state,
+        )
+        try:
+            self._event_store.append(record)
+        except CodingWorkerStateError as error:
+            raise WorkerShadowError("coding tool event checkpoint failed") from error
 
 
 def main() -> int:

@@ -68,6 +68,10 @@ class CodingToolEventStore:
         payload=json.dumps(record.to_closed_dict(),sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
         connection=sqlite3.connect(self._database)
         try:
+            existing=connection.execute("SELECT record_digest,payload_json FROM coding_tool_events WHERE task_id=? AND implementation_attempt_id=? AND session_identity=? AND external_turn_identity=? AND sequence=?",(record.task_id,record.implementation_attempt_id,record.session_identity,record.external_turn_identity,record.sequence)).fetchone()
+            if existing is not None:
+                if existing != (record.record_digest,payload): raise CodingWorkerStateError("coding tool event replay conflicts")
+                return CodingToolEventRecord.from_closed_dict(json.loads(existing[1]))
             connection.execute("INSERT INTO coding_tool_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",(record.task_id,record.implementation_attempt_id,record.session_identity,record.external_turn_identity,record.candidate_sha,record.sequence,record.record_digest,payload)); connection.commit(); return record
         except sqlite3.Error as error:
             connection.rollback(); raise CodingWorkerStateError("coding tool store append failed") from error

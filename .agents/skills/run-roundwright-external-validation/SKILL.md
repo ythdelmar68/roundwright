@@ -5,6 +5,18 @@ description: Execute or replay a declared Roundwright external-validation gate t
 
 # Run Roundwright External Validation
 
+## Phase 5 coding Worker boundary
+
+For issue #127, the declared route is `none`.  Do not invoke this skill's
+Harness or forward-target operations for its hermetic coding fixtures.  Require
+the versioned `roundwright-coding-dispatch-receipt/v1` contract, an exact
+candidate probe, closed event records, and a reviewed sandbox receipt before a
+local tool effect.  Fixture feedback is transient and is never external
+evidence.  The downstream live profile
+`roundwright-shadow-profile/coding-worker-e2e/v1` is owned by #128; only that
+later leaf may select and bind an external route, reviewed OS sandbox, capture
+plan, exporter/comparator, retention, or readiness transition.
+
 Execute only the route already declared by the selected leaf. Treat this skill
 as Roundwright's repository-owned operations contract; generic Roundlet owns
 orchestration, not Roundwright-specific repositories, commits, commands, or

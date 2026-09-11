@@ -25,6 +25,7 @@ from .codex_worker import (
     CodexWorkerRequest,
     NativeCodexWorkerBackend,
     NativeWorkerResponse,
+    NativeWorkerTurnStep,
     NativeWorkerSession,
     NativeWorkerTurn,
     WorkerResultKind,
@@ -359,9 +360,16 @@ class _HarnessWorkerSession(NativeWorkerSession):
         self._cleanup.close()
 
     def start_turn(self, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> NativeWorkerTurn:
-        if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface or request.action is not WorkerAction.PLANNING or tools.capability_contract.value != "no-tools-self-contained/v1":
+        if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
+        if request.action is not WorkerAction.PLANNING:
+            required = {WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE}
+            if set(tools.tools) != required:
+                raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock)
+        if tools.capability_contract.value != "no-tools-self-contained/v1":
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         # The full canonical request is transient. Only the validated structured
         # lifecycle projection below can cross the SDK boundary.
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
@@ -400,6 +408,42 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
             raise
         finally:
             self._cleanup.close()
+
+
+class _HarnessCodingWorkerTurn(NativeWorkerTurn):
+    """Repeated constrained SDK turns over one persistent native thread."""
+
+    def __init__(self, thread: object, cleanup: _HarnessCleanupOwner, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface, approval: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+        self._thread, self._cleanup, self._request, self._tools = thread, cleanup, request, tools
+        self._approval, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock = approval, cwd, model, sandbox, effort_factory, effort, completion, clock
+        self._handle: object | None = None
+        self._start({"schema": "roundwright-coding-turn/v1", "request": _native_coding_payload(request, tools), "previous_result": None})
+
+    def identity(self) -> str:
+        value = getattr(self._handle, "id", None)
+        if type(value) is not str: raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        return value
+
+    def abort(self) -> None:
+        if self._handle is not None: self._cleanup.abort(self._handle)
+
+    def read_response(self) -> NativeWorkerResponse:
+        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+
+    def read_step(self) -> NativeWorkerTurnStep:
+        if self._handle is None: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+        return _consume_coding_step(self._handle, self._request.action, self._completion, self._clock, self.abort)
+
+    def submit_tool_result(self, result: NativeWorkerToolResult) -> None:
+        if type(result) is not NativeWorkerToolResult: raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        # Result feedback is deliberately present only in this next prompt.
+        self._start({"schema": "roundwright-coding-turn/v1", "request": None, "previous_result": {"sequence": result.sequence, "tool": result.tool.value, "outcome": result.outcome, "before_digest": result.before_digest, "after_digest": result.after_digest, "exit_code": result.exit_code, "output_digest": result.output_digest, "feedback": result.feedback}})
+
+    def _start(self, payload: Mapping[str, object]) -> None:
+        try:
+            self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
+        except Exception as error:
+            self._cleanup.close(); raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 def _consume_public_result(handle: object, action: WorkerAction, *, completion: CompletionDeadline | None = None, clock: Callable[[], float] = time.monotonic, cancel: Callable[[], None] | None = None) -> NativeWorkerResponse:
@@ -476,6 +520,52 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
         # Iterator and transport failure leave terminal completion unknown;
         # retain no stream details and require exact-turn recovery.
         return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
+
+
+def _coding_schema(action: WorkerAction) -> dict[str, object]:
+    return {"type": "object", "properties": {
+        "status": {"type": "string", "enum": ["tool", "complete", "blocked"]},
+        "action": {"type": "string", "enum": [action.value]},
+        "sequence": {"type": ["integer", "null"]},
+        "tool": {"type": ["string", "null"], "enum": [None, *(tool.value for tool in WorkerTool)]},
+        "path": {"type": ["string", "null"]}, "content": {"type": ["string", "null"]},
+        "command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "blocker": {"type": ["string", "null"], "enum": [None, "provider-blocked"]},
+    }, "required": ["status", "action", "blocker"], "additionalProperties": False}
+
+
+def _native_coding_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> dict[str, object]:
+    return {"schema": "roundwright-coding-worker-native/v1", "capability_contract": "executable-bounded-coding/v1", "action": request.action.value, "request_digest": request.input_digest, "context_digest": request.context.digest, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "tools": [tool.value for tool in tools.tools], "instruction": "Return exactly one bounded tool request or terminal result. Never invoke a shell or name an undeclared tool."}
+
+
+def _consume_coding_step(handle: object, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None]) -> NativeWorkerTurnStep:
+    response = _consume_public_result(handle, action, completion=completion, clock=clock, cancel=cancel)
+    # The legacy parser recognizes only terminal responses.  A coding turn
+    # instead reads the same final SDK item directly to admit one typed request.
+    if response.kind is not WorkerResultKind.INVALID:
+        return NativeWorkerTurnStep(response=response)
+    try:
+        text = None; completed = False
+        stream = handle.stream()
+        try:
+            for event in _bounded_events(stream, completion=completion, clock=clock, cancel=cancel):
+                payload = _field(event, "payload") or event
+                if _field(event, "method") == "turn/completed":
+                    turn = _field(payload, "turn"); completed = turn is not None and _field(turn, "id") == _field(handle, "id") and _value(_field(turn, "status")) == "completed"
+                if _field(event, "method") == "item/completed" and _field(payload, "turn_id", "turnId") == _field(handle, "id"):
+                    item = _field(_field(payload, "item"), "root") or _field(payload, "item")
+                    if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer": text = _field(item, "text")
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close): close()
+        value = json.loads(text) if completed and type(text) is str else None
+        if type(value) is not dict or value.get("action") != action.value: raise ValueError
+        if value.get("status") != "tool":
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.INVALID, diagnostic=WorkerParserDiagnostic.SHAPE))
+        request = NativeWorkerToolRequest(int(value["sequence"]), WorkerTool(value["tool"]), value.get("path"), value.get("content"), tuple(value["command"]) if type(value.get("command")) is list else None)
+        return NativeWorkerTurnStep(request=request)
+    except Exception:
+        return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.INVALID, diagnostic=WorkerParserDiagnostic.SHAPE))
 
 
 def _invalid(diagnostic: WorkerParserDiagnostic) -> NativeWorkerResponse:

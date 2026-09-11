@@ -15,7 +15,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.shadow import RecorderBinding
@@ -189,6 +189,25 @@ class WorkerToolboxTests(unittest.TestCase):
         with self.assertRaises(Exception):
             session.start_turn(self.request, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
         self.assertEqual(self.events[0], "enter")
+
+    def test_coding_bridge_reuses_one_thread_for_typed_tool_turns(self):
+        context = self.request.context
+        request = CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="write", constraints=("bounded",), acceptance_criteria=("complete",), resume_session_identity=None), context, "write", ("bounded",), ("complete",))
+        replies = iter((
+            '{"status":"tool","action":"implementation","sequence":1,"tool":"workspace-read","path":"a.txt","content":null,"command":null,"blocker":null}',
+            '{"status":"complete","action":"implementation","blocker":null}',
+        ))
+        class Thread(FakeThread):
+            def turn(inner, prompt, **kwargs):
+                self.events.append(("coding-turn", prompt, kwargs)); return FakeHandle(self.events, next(replies))
+        class Codex(FakeCodex):
+            def thread_start(inner, **kwargs): self.events.append(("start", kwargs)); return Thread(self.events)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: Codex(self.events), approval_mode="deny-all", sandbox="reviewed-sandbox", effort_factory=lambda value: value)
+        turn = backend.open_session(self.profile, resume_session_identity=None).start_turn(request, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
+        first = turn.read_step(); self.assertEqual((first.request.sequence, first.request.tool), (1, WorkerTool.WORKSPACE_READ))
+        turn.submit_tool_result(NativeWorkerToolResult(1, WorkerTool.WORKSPACE_READ, "allowed", after_digest=digest("read"), feedback="bounded"))
+        self.assertEqual(turn.read_step().response.kind, "accepted")
+        self.assertEqual(len([event for event in self.events if event[0] == "coding-turn"]), 2)
 
     def test_no_tool_contract_is_bound_at_adapter_readiness_and_prompt(self):
         self.assertEqual(BoundedWorkerToolSurface(()).capability_contract, WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED)

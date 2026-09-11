@@ -539,29 +539,38 @@ def _native_coding_payload(request: CodexWorkerRequest, tools: BoundedWorkerTool
 
 
 def _consume_coding_step(handle: object, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None]) -> NativeWorkerTurnStep:
-    response = _consume_public_result(handle, action, completion=completion, clock=clock, cancel=cancel)
-    # The legacy parser recognizes only terminal responses.  A coding turn
-    # instead reads the same final SDK item directly to admit one typed request.
-    if response.kind is not WorkerResultKind.INVALID:
-        return NativeWorkerTurnStep(response=response)
     try:
-        text = None; completed = False
+        text = None; completed = False; failed = None
         stream = handle.stream()
         try:
             for event in _bounded_events(stream, completion=completion, clock=clock, cancel=cancel):
                 payload = _field(event, "payload") or event
                 if _field(event, "method") == "turn/completed":
-                    turn = _field(payload, "turn"); completed = turn is not None and _field(turn, "id") == _field(handle, "id") and _value(_field(turn, "status")) == "completed"
+                    turn = _field(payload, "turn")
+                    if turn is None or _field(turn, "id") != _field(handle, "id"):
+                        raise ValueError
+                    status = _value(_field(turn, "status"))
+                    if status == "failed": failed = _field(turn, "error")
+                    elif status == "completed": completed = True
+                    else: return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.AMBIGUOUS))
                 if _field(event, "method") == "item/completed" and _field(payload, "turn_id", "turnId") == _field(handle, "id"):
                     item = _field(_field(payload, "item"), "root") or _field(payload, "item")
-                    if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer": text = _field(item, "text")
+                    if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer":
+                        if text is not None: raise ValueError
+                        text = _field(item, "text")
         finally:
             close = getattr(stream, "close", None)
             if callable(close): close()
+        if failed is not None:
+            failure, category = _turn_failure(failed)
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=failure, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category))
         value = json.loads(text) if completed and type(text) is str else None
         if type(value) is not dict or value.get("action") != action.value: raise ValueError
-        if value.get("status") != "tool":
-            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.INVALID, diagnostic=WorkerParserDiagnostic.SHAPE))
+        if value.get("status") == "complete" and set(value) == {"status", "action", "blocker"} and value.get("blocker") is None:
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": action.value}))
+        if value.get("status") == "blocked" and set(value) == {"status", "action", "blocker"} and value.get("blocker") == "provider-blocked":
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-blocked", outcome_source=WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED))
+        if value.get("status") != "tool": raise ValueError
         request = NativeWorkerToolRequest(int(value["sequence"]), WorkerTool(value["tool"]), value.get("path"), value.get("content"), tuple(value["command"]) if type(value.get("command")) is list else None)
         return NativeWorkerTurnStep(request=request)
     except Exception:

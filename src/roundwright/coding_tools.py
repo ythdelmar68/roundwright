@@ -96,7 +96,7 @@ class BoundedCodingCapability:
             or type(self.timeout_seconds) is not int
             or not 1 <= self.timeout_seconds <= 300
             or type(self.output_limit) is not int
-            or not 1 <= self.output_limit <= 1_000_000
+            or not 1 <= self.output_limit <= 65_536
             or any(not _relative(path) for path in self.readable_paths + self.writable_paths)
             or any(
                 not command
@@ -139,10 +139,14 @@ class BoundedCodingTools:
     def read(self, relative_path: str) -> tuple[str, CodingToolEvent]:
         path, display = self._path(relative_path, self._capability.readable_paths)
         try:
-            value = path.read_text(encoding="utf-8")
+            with path.open("rb") as source:
+                raw = source.read(self._capability.output_limit + 1)
+            if len(raw) > self._capability.output_limit:
+                raise CodingToolError("workspace read exceeded output budget", outcome="failed")
+            value = raw.decode("utf-8")
         except (OSError, UnicodeError) as error:
             raise CodingToolError("workspace read failed") from error
-        return value, CodingToolEvent("workspace-read", display, "allowed", after_digest=_digest(value.encode("utf-8")))
+        return value, CodingToolEvent("workspace-read", display, "allowed", after_digest=_digest(raw))
 
     def write(self, relative_path: str, content: str) -> CodingToolEvent:
         if type(content) is not str or len(content.encode("utf-8")) > self._capability.output_limit:

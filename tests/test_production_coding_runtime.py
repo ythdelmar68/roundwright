@@ -14,7 +14,7 @@ from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools
 from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.worker_toolbox import CodingDispatchReceipt, ProductionCodingWorkerRuntime
+from roundwright.worker_toolbox import CODING_RUNTIME_REGISTRY, CodingDispatchReceipt, CodingWorkerRuntimeDescriptor, ProductionCodingWorkerEntrypointInputs, ProductionCodingWorkerRuntime, run_production_coding_worker, run_registered_production_coding_worker
 from roundwright.worker_shadow import WorkerShadowError
 
 
@@ -56,13 +56,16 @@ class ProductionRuntimeTests(unittest.TestCase):
     def request(self):
         context = CodexWorkerContext("task-1", *(digest(x) for x in ("s","r","w","b","base","candidate","p","c")))
         return CodexWorkerRequest("attempt-1", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-1", action=WorkerAction.IMPLEMENTATION, context=context, objective="write", constraints=("bounded",), acceptance_criteria=("write",), resume_session_identity=None), context, "write", ("bounded",), ("write",))
-    def runtime(self, root, turn, events):
+    def inputs(self, root, turn, events):
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
         tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), sandbox_identity=digest("sandbox")), validation_sandbox=Sandbox())
         context = self.request().context
         receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
-        return ProductionCodingWorkerRuntime(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40)
+        return ProductionCodingWorkerEntrypointInputs(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40)
+    def runtime(self, root, turn, events):
+        values=self.inputs(root,turn,events)
+        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe)
     def test_dispatch_writes_only_allowlisted_file_and_submits_closed_result(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
@@ -71,6 +74,25 @@ class ProductionRuntimeTests(unittest.TestCase):
             self.assertEqual((result.kind, Path(temp,"out.txt").read_text(), events[:5]), (WorkerResultKind.ACCEPTED,"ok",["session","start","turn","step","submit"]))
             self.assertTrue(turn.submitted[0].after_digest.startswith("sha256:"))
             self.assertFalse(hasattr(turn.submitted[0], "path"))
+
+    def test_public_production_entrypoint_constructs_the_coding_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
+            turn=Turn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
+            result=run_production_coding_worker(inputs=self.inputs(Path(temp),turn,events), request=self.request(), checkpoint_session=lambda _:events.append("session"), checkpoint_turn=lambda *_:events.append("turn"))
+            self.assertEqual((result.kind,Path(temp,"out.txt").read_text()),(WorkerResultKind.ACCEPTED,"ok"))
+
+    def test_registered_public_lifecycle_requires_an_exact_installed_resource(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
+            turn=Turn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
+            inputs=self.inputs(Path(temp),turn,events); receipt=inputs.dispatch_receipt
+            descriptor=CodingWorkerRuntimeDescriptor("coding-resource-1",receipt.task_id,receipt.attempt_id,receipt.candidate_sha,receipt.capability_digest,receipt.receipt_digest)
+            with self.assertRaises(WorkerShadowError):
+                run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            CODING_RUNTIME_REGISTRY.install("coding-resource-1",inputs)
+            result=run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:events.append("session"),checkpoint_turn=lambda *_:events.append("turn"))
+            self.assertEqual((result.kind,Path(temp,"out.txt").read_text()),(WorkerResultKind.ACCEPTED,"ok"))
     def test_denied_write_has_no_effect(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="no.txt", content="no")

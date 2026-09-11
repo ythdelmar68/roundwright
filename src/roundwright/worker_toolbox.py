@@ -699,6 +699,8 @@ class ProductionCodingWorkerRuntime:
         return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
 
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+        if request.action is WorkerAction.PLANNING:
+            raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         self._dispatch_receipt.validate_for(request, self._candidate_probe())
         checkpoint: dict[str, str] = {}
 
@@ -773,6 +775,121 @@ class ProductionCodingWorkerRuntime:
             self._event_store.append(record)
         except CodingWorkerStateError as error:
             raise WorkerShadowError("coding tool event checkpoint failed") from error
+
+
+@dataclass(frozen=True)
+class ProductionCodingWorkerEntrypointInputs:
+    """Closed, host-owned dependencies for the public coding entrypoint.
+
+    This is deliberately a process-local object rather than CLI arguments:
+    none of its capability, provider, sandbox, store, or candidate-probe
+    dependencies can be reconstructed from ambient input.
+    """
+
+    backend: NativeCodexWorkerBackend
+    profile: ProviderProfile
+    audit: ProviderHealthAuditIdentity
+    local_tools: BoundedCodingTools
+    dispatch_receipt: CodingDispatchReceipt
+    event_store: CodingToolEventStore
+    candidate_probe: Callable[[], str]
+
+    def __post_init__(self) -> None:
+        if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
+                or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
+                or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe)
+                or not callable(getattr(self.backend, "open_session", None))):
+            raise WorkerShadowError("production coding entrypoint inputs are invalid")
+
+
+def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInputs, request: CodexWorkerRequest, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+    """Public production task-lifecycle entrypoint for executable coding.
+
+    Planning remains separately routed through
+    :func:`run_bounded_worker_adapter_qualification` with its no-tools
+    capability; this entrypoint accepts only implementation or repair work.
+    """
+    if type(inputs) is not ProductionCodingWorkerEntrypointInputs or type(request) is not CodexWorkerRequest or request.action is WorkerAction.PLANNING:
+        raise WorkerShadowError("production coding entrypoint is invalid")
+    return ProductionCodingWorkerRuntime(
+        backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
+        local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
+        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe,
+    ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+
+
+@dataclass(frozen=True)
+class CodingWorkerRuntimeDescriptor:
+    """Closed public identity for one installed production coding resource."""
+
+    resource_id: str
+    task_id: str
+    attempt_id: str
+    candidate_sha: str
+    capability_digest: str
+    dispatch_receipt_digest: str
+
+    @classmethod
+    def parse(cls, value: object) -> "CodingWorkerRuntimeDescriptor":
+        required = {"schema", "resource_id", "task_id", "attempt_id", "candidate_sha", "capability_digest", "dispatch_receipt_digest"}
+        if type(value) is not dict or set(value) != required or value.get("schema") != "roundwright-coding-runtime-descriptor/v1":
+            raise WorkerShadowError("coding runtime descriptor is invalid")
+        try:
+            return cls(**{key: value[key] for key in required - {"schema"}})
+        except TypeError as error:
+            raise WorkerShadowError("coding runtime descriptor is invalid") from error
+
+    def __post_init__(self) -> None:
+        if (not _TOKEN.fullmatch(self.resource_id) or not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.attempt_id)
+                or not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha)
+                or any(type(value) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in (self.capability_digest, self.dispatch_receipt_digest))):
+            raise WorkerShadowError("coding runtime descriptor is invalid")
+
+    def payload(self) -> dict[str, str]:
+        return {"schema": "roundwright-coding-runtime-descriptor/v1", "resource_id": self.resource_id,
+                "task_id": self.task_id, "attempt_id": self.attempt_id, "candidate_sha": self.candidate_sha,
+                "capability_digest": self.capability_digest, "dispatch_receipt_digest": self.dispatch_receipt_digest}
+
+
+class CodingWorkerRuntimeRegistry:
+    """Process-local trusted capability registry for the public lifecycle seam."""
+
+    def __init__(self) -> None:
+        self._resources: dict[str, ProductionCodingWorkerEntrypointInputs] = {}
+
+    def install(self, resource_id: str, inputs: ProductionCodingWorkerEntrypointInputs) -> None:
+        if not _TOKEN.fullmatch(resource_id) or type(inputs) is not ProductionCodingWorkerEntrypointInputs:
+            raise WorkerShadowError("coding runtime resource is invalid")
+        existing = self._resources.get(resource_id)
+        if existing is not None and existing != inputs:
+            raise WorkerShadowError("coding runtime resource conflicts")
+        self._resources[resource_id] = inputs
+
+    def materialize(self, descriptor: CodingWorkerRuntimeDescriptor) -> ProductionCodingWorkerEntrypointInputs:
+        if type(descriptor) is not CodingWorkerRuntimeDescriptor:
+            raise WorkerShadowError("coding runtime descriptor is invalid")
+        inputs = self._resources.get(descriptor.resource_id)
+        if inputs is None:
+            raise WorkerShadowError("coding runtime resource is unavailable")
+        receipt = inputs.dispatch_receipt
+        if (receipt.task_id != descriptor.task_id or receipt.attempt_id != descriptor.attempt_id
+                or receipt.candidate_sha != descriptor.candidate_sha or receipt.capability_digest != descriptor.capability_digest
+                or receipt.receipt_digest != descriptor.dispatch_receipt_digest
+                or inputs.local_tools.capability_digest != descriptor.capability_digest):
+            raise WorkerShadowError("coding runtime resource drifted")
+        return inputs
+
+
+CODING_RUNTIME_REGISTRY = CodingWorkerRuntimeRegistry()
+
+
+def run_registered_production_coding_worker(*, descriptor_value: object, request: CodexWorkerRequest, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+    """Public task-lifecycle seam consuming only a closed resource descriptor."""
+    descriptor = CodingWorkerRuntimeDescriptor.parse(descriptor_value)
+    inputs = CODING_RUNTIME_REGISTRY.materialize(descriptor)
+    return run_production_coding_worker(
+        inputs=inputs, request=request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+    )
 
 
 def main() -> int:

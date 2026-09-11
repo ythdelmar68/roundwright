@@ -475,6 +475,9 @@ class CodexWorkerAdapter:
                     checkpoint_next_turn=lambda: checkpoint_turn(session_identity, _identity(turn, "turn")),
                     checkpoint_submission=checkpoint_submission,
                 )
+                # A coding tool result may advance the native handle.  Bind
+                # the returned terminal outcome to that actual final turn.
+                turn_identity = _identity(turn, "turn")
         except CodexAdapterError:
             _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)

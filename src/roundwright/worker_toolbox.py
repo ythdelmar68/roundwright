@@ -438,7 +438,10 @@ class _HarnessCodingWorkerTurn(NativeWorkerTurn):
 
     def read_step(self) -> NativeWorkerTurnStep:
         if self._handle is None: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-        return _consume_coding_step(self._handle, self._request.action, self._completion, self._clock, self.abort)
+        step = _consume_coding_step(self._handle, self._request.action, self._completion, self._clock, self.abort)
+        if step.response is not None:
+            self._cleanup.close()
+        return step
 
     def submit_tool_result(self, result: NativeWorkerToolResult) -> None:
         if type(result) is not NativeWorkerToolResult: raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
@@ -579,8 +582,14 @@ def _consume_coding_step(handle: object, action: WorkerAction, completion: Compl
         if value.get("status") != "tool": raise ValueError
         request = NativeWorkerToolRequest(int(value["sequence"]), WorkerTool(value["tool"]), value.get("path"), value.get("content"), tuple(value["command"]) if type(value.get("command")) is list else None)
         return NativeWorkerTurnStep(request=request)
+    except TimeoutError:
+        cancel()
+        return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.AMBIGUOUS))
     except Exception:
-        return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.INVALID, diagnostic=WorkerParserDiagnostic.SHAPE))
+        # A coding stream can have produced an unobserved terminal result.  Do
+        # not recast that transport uncertainty as malformed provider output.
+        cancel()
+        return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.AMBIGUOUS))
 
 
 def _invalid(diagnostic: WorkerParserDiagnostic) -> NativeWorkerResponse:

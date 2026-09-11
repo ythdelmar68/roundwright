@@ -25,6 +25,7 @@ from .codex_worker import (
     CodexWorkerRequest,
     NativeCodexWorkerBackend,
     NativeWorkerResponse,
+    NativeWorkerTurnStep,
     NativeWorkerSession,
     NativeWorkerTurn,
     WorkerResultKind,
@@ -32,6 +33,18 @@ from .codex_worker import (
     WorkerParserDiagnostic,
     WorkerOutcomeSource,
     WorkerSdkTurnErrorCategory,
+    WorkerTool,
+    NativeWorkerToolRequest,
+    NativeWorkerToolResult,
+)
+from .coding_tools import BoundedCodingTools, CodingToolError
+from .coding_worker_state import (
+    CodingAmbiguityState,
+    CodingCancellationState,
+    CodingProcessState,
+    CodingToolEventRecord,
+    CodingToolEventStore,
+    CodingWorkerStateError,
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
@@ -52,6 +65,8 @@ from .codex_worker import CodexWorkerAdapter
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _NO_TOOL_INSTRUCTIONS = "One bounded planning observation only. No provider tools or repository inspection are declared or required. Decide only from the normalized public turn input. Return only the requested schema."
+_CODING_TOOL_INSTRUCTIONS = "Execute only bounded workspace-read, workspace-write, and validation-execute requests declared by the host. Never invoke a shell, repository command, network, credential, or undeclared tool. Return only the requested structured schema."
+_MAX_CODING_TOOL_RESULT_BYTES = 65_536
 @dataclass(frozen=True)
 class CompletionDeadline:
     """Explicit bounded completion contract, always inside the host deadline."""
@@ -66,6 +81,74 @@ class CompletionDeadline:
 
     def receipt(self) -> dict[str, object]:
         return {"schema": "roundwright-worker-completion-timeout/v1", "application_timeout_ms": self.application_timeout_ms, "host_timeout_ms": self.host_timeout_ms, "headroom_ms": self.host_timeout_ms - self.application_timeout_ms}
+
+
+@dataclass(frozen=True)
+class CodingDispatchReceipt:
+    """Sealed authority tuple for one executable coding Worker attempt.
+
+    The receipt carries public-safe identifiers only.  Its candidate probe is
+    deliberately supplied by the product host and read before dispatch and
+    before each local effect, preventing a moved fixture from borrowing a
+    still-valid capability.
+    """
+
+    task_id: str
+    attempt_id: str
+    candidate_sha: str
+    candidate_fingerprint: str
+    policy_fingerprint: str
+    configuration_digest: str
+    worktree_fingerprint: str
+    validation_toolchain_receipt: str
+    sandbox_identity: str
+    capability_digest: str
+    receipt_digest: str
+
+    @classmethod
+    def seal(cls, *, task_id: str, attempt_id: str, candidate_sha: str, candidate_fingerprint: str, policy_fingerprint: str, configuration_digest: str, worktree_fingerprint: str, validation_toolchain_receipt: str, sandbox_identity: str, capability_digest: str) -> "CodingDispatchReceipt":
+        core = {
+            "schema": "roundwright-coding-dispatch-receipt/v1", "task_id": task_id,
+            "attempt_id": attempt_id, "candidate_sha": candidate_sha,
+            "candidate_fingerprint": candidate_fingerprint,
+            "policy_fingerprint": policy_fingerprint,
+            "configuration_digest": configuration_digest,
+            "worktree_fingerprint": worktree_fingerprint,
+            "validation_toolchain_receipt": validation_toolchain_receipt,
+            "sandbox_identity": sandbox_identity,
+            "capability_digest": capability_digest,
+        }
+        return cls(task_id, attempt_id, candidate_sha, candidate_fingerprint, policy_fingerprint, configuration_digest, worktree_fingerprint, validation_toolchain_receipt, sandbox_identity, capability_digest, _digest(core))
+
+    def __post_init__(self) -> None:
+        values = (self.candidate_fingerprint, self.policy_fingerprint, self.configuration_digest, self.worktree_fingerprint, self.validation_toolchain_receipt, self.sandbox_identity, self.capability_digest)
+        core = {
+            "schema": "roundwright-coding-dispatch-receipt/v1", "task_id": self.task_id,
+            "attempt_id": self.attempt_id, "candidate_sha": self.candidate_sha,
+            "candidate_fingerprint": self.candidate_fingerprint,
+            "policy_fingerprint": self.policy_fingerprint,
+            "configuration_digest": self.configuration_digest,
+            "worktree_fingerprint": self.worktree_fingerprint,
+            "validation_toolchain_receipt": self.validation_toolchain_receipt,
+            "sandbox_identity": self.sandbox_identity,
+            "capability_digest": self.capability_digest,
+        }
+        if (not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.attempt_id)
+                or not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha)
+                or any(type(value) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in values)
+                or self.receipt_digest != _digest(core)):
+            raise WorkerShadowError("coding dispatch receipt is invalid")
+
+    def validate_for(self, request: CodexWorkerRequest, observed_candidate_sha: str, observed_toolchain_receipt: str) -> None:
+        if (type(request) is not CodexWorkerRequest or type(observed_candidate_sha) is not str
+                or observed_candidate_sha != self.candidate_sha
+                or observed_toolchain_receipt != self.validation_toolchain_receipt
+                or request.context.task_id != self.task_id or request.attempt_id != self.attempt_id
+                or request.context.candidate_fingerprint != self.candidate_fingerprint
+                or request.context.policy_fingerprint != self.policy_fingerprint
+                or request.context.configuration_digest != self.configuration_digest
+                or request.context.worktree_fingerprint != self.worktree_fingerprint):
+            raise WorkerShadowError("coding dispatch receipt drifted")
 
 
 def _result_schema(action: str) -> dict[str, object]:
@@ -213,19 +296,20 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
         self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
 
-    def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None) -> NativeWorkerSession:
-        if type(profile) is not ProviderProfile:
+    def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None, action: WorkerAction) -> NativeWorkerSession:
+        if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+        instructions = _NO_TOOL_INSTRUCTIONS if action is WorkerAction.PLANNING else _CODING_TOOL_INSTRUCTIONS
         codex = self._codex_factory()
         try:
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
             if resume_session_identity is None:
-                thread = client.thread_start(approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=_NO_TOOL_INSTRUCTIONS, ephemeral=False, model=profile.model, sandbox=self._sandbox)
+                thread = client.thread_start(approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=instructions, ephemeral=False, model=profile.model, sandbox=self._sandbox)
             else:
                 resume = getattr(client, "thread_resume", None)
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-                thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=_NO_TOOL_INSTRUCTIONS, model=profile.model, sandbox=self._sandbox)
+                thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=instructions, model=profile.model, sandbox=self._sandbox)
             return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value, self._completion, self._clock)
         except CodexAdapterError:
             _close(codex)
@@ -283,9 +367,16 @@ class _HarnessWorkerSession(NativeWorkerSession):
         self._cleanup.close()
 
     def start_turn(self, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> NativeWorkerTurn:
-        if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface or request.action is not WorkerAction.PLANNING or tools.capability_contract.value != "no-tools-self-contained/v1":
+        if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
+        if request.action is not WorkerAction.PLANNING:
+            required = {WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE}
+            if set(tools.tools) != required:
+                raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock)
+        if tools.capability_contract.value != "no-tools-self-contained/v1":
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         # The full canonical request is transient. Only the validated structured
         # lifecycle projection below can cross the SDK boundary.
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
@@ -324,6 +415,48 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
             raise
         finally:
             self._cleanup.close()
+
+
+class _HarnessCodingWorkerTurn(NativeWorkerTurn):
+    """Repeated constrained SDK turns over one persistent native thread."""
+
+    def __init__(self, thread: object, cleanup: _HarnessCleanupOwner, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface, approval: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+        self._thread, self._cleanup, self._request, self._tools = thread, cleanup, request, tools
+        self._approval, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock = approval, cwd, model, sandbox, effort_factory, effort, completion, clock
+        self._handle: object | None = None
+        self._start({"schema": "roundwright-coding-turn/v1", "request": _native_coding_payload(request, tools), "previous_result": None})
+
+    def identity(self) -> str:
+        value = getattr(self._handle, "id", None)
+        if type(value) is not str: raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        return value
+
+    def abort(self) -> None:
+        if self._handle is not None: self._cleanup.abort(self._handle)
+
+    def read_response(self) -> NativeWorkerResponse:
+        raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+
+    def read_step(self) -> NativeWorkerTurnStep:
+        if self._handle is None: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
+        step = _consume_coding_step(self._handle, self._request.action, self._completion, self._clock, self.abort)
+        if step.response is not None:
+            self._cleanup.close()
+        return step
+
+    def submit_tool_result(self, result: NativeWorkerToolResult) -> None:
+        if type(result) is not NativeWorkerToolResult: raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        # Result feedback is deliberately present only in this next prompt.
+        payload = _coding_result_payload(result)
+        if len(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > _MAX_CODING_TOOL_RESULT_BYTES:
+            raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        self._start(payload)
+
+    def _start(self, payload: Mapping[str, object]) -> None:
+        try:
+            self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
+        except Exception as error:
+            self._cleanup.close(); raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
 
 def _consume_public_result(handle: object, action: WorkerAction, *, completion: CompletionDeadline | None = None, clock: Callable[[], float] = time.monotonic, cancel: Callable[[], None] | None = None) -> NativeWorkerResponse:
@@ -400,6 +533,112 @@ def _consume_public_result(handle: object, action: WorkerAction, *, completion: 
         # Iterator and transport failure leave terminal completion unknown;
         # retain no stream details and require exact-turn recovery.
         return NativeWorkerResponse(WorkerResultKind.AMBIGUOUS)
+
+
+def _coding_schema(action: WorkerAction) -> dict[str, object]:
+    return {"type": "object", "properties": {
+        "status": {"type": "string", "enum": ["tool", "complete", "blocked"]},
+        "action": {"type": "string", "enum": [action.value]},
+        "sequence": {"type": ["integer", "null"]},
+        "tool": {"type": ["string", "null"], "enum": [None, *(tool.value for tool in WorkerTool)]},
+        "path": {"type": ["string", "null"]}, "content": {"type": ["string", "null"]},
+        "command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "blocker": {"type": ["string", "null"], "enum": [None, "provider-blocked"]},
+    }, "required": ["status", "action", "blocker"], "additionalProperties": False}
+
+
+def _native_coding_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> dict[str, object]:
+    return {"schema": "roundwright-coding-worker-native/v1", "capability_contract": "executable-bounded-coding/v1", "action": request.action.value, "request_digest": request.input_digest, "context_digest": request.context.digest, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "tools": [tool.value for tool in tools.tools], "instruction": "Return exactly one bounded tool request or terminal result. Never invoke a shell or name an undeclared tool."}
+
+
+def _coding_result_payload_values(
+    *, sequence: int, tool: WorkerTool, outcome: str,
+    before_digest: str | None, after_digest: str | None,
+    exit_code: int | None, output_digest: str | None, feedback: str | None,
+) -> dict[str, object]:
+    """The exact SDK frame for a local tool result, including feedback."""
+
+    return {
+        "schema": "roundwright-coding-turn/v1",
+        "request": None,
+        "previous_result": {
+            "sequence": sequence,
+            "tool": tool.value,
+            "outcome": outcome,
+            "before_digest": before_digest,
+            "after_digest": after_digest,
+            "exit_code": exit_code,
+            "output_digest": output_digest,
+            "feedback": feedback,
+        },
+    }
+
+
+def _coding_result_payload(result: NativeWorkerToolResult) -> dict[str, object]:
+    return _coding_result_payload_values(
+        sequence=result.sequence, tool=result.tool, outcome=result.outcome,
+        before_digest=result.before_digest, after_digest=result.after_digest,
+        exit_code=result.exit_code, output_digest=result.output_digest,
+        feedback=result.feedback,
+    )
+
+
+def _coding_result_values_fit_sdk_budget(
+    *, sequence: int, tool: WorkerTool, outcome: str,
+    before_digest: str | None, after_digest: str | None,
+    exit_code: int | None, output_digest: str | None, feedback: str | None,
+) -> bool:
+    payload = _coding_result_payload_values(
+        sequence=sequence, tool=tool, outcome=outcome,
+        before_digest=before_digest, after_digest=after_digest,
+        exit_code=exit_code, output_digest=output_digest, feedback=feedback,
+    )
+    return len(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) <= _MAX_CODING_TOOL_RESULT_BYTES
+
+
+def _consume_coding_step(handle: object, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None]) -> NativeWorkerTurnStep:
+    try:
+        text = None; completed = False; failed = None
+        stream = handle.stream()
+        try:
+            for event in _bounded_events(stream, completion=completion, clock=clock, cancel=cancel):
+                payload = _field(event, "payload") or event
+                if _field(event, "method") == "turn/completed":
+                    turn = _field(payload, "turn")
+                    if turn is None or _field(turn, "id") != _field(handle, "id"):
+                        raise ValueError
+                    status = _value(_field(turn, "status"))
+                    if status == "failed": failed = _field(turn, "error")
+                    elif status == "completed": completed = True
+                    else: return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.AMBIGUOUS))
+                if _field(event, "method") == "item/completed" and _field(payload, "turn_id", "turnId") == _field(handle, "id"):
+                    item = _field(_field(payload, "item"), "root") or _field(payload, "item")
+                    if _field(item, "type") == "agentMessage" and _value(_field(item, "phase")) == "final_answer":
+                        if text is not None: raise ValueError
+                        text = _field(item, "text")
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close): close()
+        if failed is not None:
+            failure, category = _turn_failure(failed)
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=failure, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category))
+        value = json.loads(text) if completed and type(text) is str else None
+        if type(value) is not dict or value.get("action") != action.value: raise ValueError
+        if value.get("status") == "complete" and set(value) == {"status", "action", "blocker"} and value.get("blocker") is None:
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": action.value}))
+        if value.get("status") == "blocked" and set(value) == {"status", "action", "blocker"} and value.get("blocker") == "provider-blocked":
+            return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.UNKNOWN, blocker="provider-blocked", outcome_source=WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED))
+        if value.get("status") != "tool": raise ValueError
+        request = NativeWorkerToolRequest(int(value["sequence"]), WorkerTool(value["tool"]), value.get("path"), value.get("content"), tuple(value["command"]) if type(value.get("command")) is list else None)
+        return NativeWorkerTurnStep(request=request)
+    except TimeoutError:
+        cancel()
+        return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.AMBIGUOUS))
+    except Exception:
+        # A coding stream can have produced an unobserved terminal result.  Do
+        # not recast that transport uncertainty as malformed provider output.
+        cancel()
+        return NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.AMBIGUOUS))
 
 
 def _invalid(diagnostic: WorkerParserDiagnostic) -> NativeWorkerResponse:
@@ -499,6 +738,250 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
 def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
     return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+
+
+class ProductionCodingWorkerRuntime:
+    """Candidate-bound production coding seam; CLI activation remains blocked."""
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str]) -> None:
+        if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
+                or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
+                or local_tools.capability_digest != dispatch_receipt.capability_digest):
+            raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
+        self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
+        self._local_tools = local_tools
+        self._dispatch_receipt = dispatch_receipt
+        self._event_store = event_store
+        self._candidate_probe = candidate_probe
+        self._toolchain_receipt_probe = toolchain_receipt_probe
+
+    @property
+    def capability_contract(self):
+        """Executable only because this binding owns a real local executor."""
+        from .codex_worker import WorkerCapabilityContract
+        return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
+
+    def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+        if request.action is WorkerAction.PLANNING:
+            raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
+        self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
+        try:
+            if self._event_store.requires_reconciliation(request.context.task_id, request.attempt_id, frozenset()):
+                raise WorkerShadowError("coding effect requires durable reconciliation")
+        except CodingWorkerStateError as error:
+            raise WorkerShadowError("coding reconciliation is unavailable") from error
+        checkpoint: dict[str, str] = {}
+        submission_turns: dict[int, str] = {}
+        acknowledged_sequences: set[int] = set()
+
+        def record_session(session_identity: str) -> None:
+            checkpoint["session_identity"] = session_identity
+            checkpoint_session(session_identity)
+
+        def record_turn(session_identity: str, turn_identity: str) -> None:
+            if checkpoint.get("session_identity") != session_identity:
+                raise WorkerShadowError("coding turn checkpoint is not session-bound")
+            checkpoint["turn_identity"] = turn_identity
+            checkpoint_turn(session_identity, turn_identity)
+
+        def execute(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+            return self._execute_request(request, checkpoint, item, frozenset(acknowledged_sequences))
+
+        def submission(item: NativeWorkerToolRequest, result: NativeWorkerToolResult, state: str, next_turn_identity: str | None) -> None:
+            session_identity = checkpoint.get("session_identity"); turn_identity = checkpoint.get("turn_identity") if state == "intent" else submission_turns.get(item.sequence)
+            if session_identity is None or turn_identity is None: raise WorkerShadowError("coding submission lacks durable turn checkpoint")
+            if state == "intent": submission_turns[item.sequence] = turn_identity
+            try:
+                self._event_store.record_submission(request.context.task_id, request.attempt_id, session_identity, turn_identity, item.sequence, state, next_turn_identity)
+            except CodingWorkerStateError as error: raise WorkerShadowError("coding submission checkpoint failed") from error
+            if state == "submitted": acknowledged_sequences.add(item.sequence)
+
+        callback = execute if request.action is not WorkerAction.PLANNING else None
+        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None)
+
+    def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest, acknowledged_sequences: frozenset[int]) -> NativeWorkerToolResult:
+        self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
+        if self._local_tools.capability_digest != self._dispatch_receipt.capability_digest:
+            raise WorkerShadowError("coding capability receipt drifted")
+        session_identity = checkpoint.get("session_identity")
+        turn_identity = checkpoint.get("turn_identity")
+        if session_identity is None or turn_identity is None:
+            raise WorkerShadowError("coding tool effect lacks durable turn checkpoint")
+        try:
+            if self._event_store.requires_reconciliation(worker_request.context.task_id, worker_request.attempt_id, acknowledged_sequences):
+                raise WorkerShadowError("coding effect requires durable reconciliation")
+        except CodingWorkerStateError as error:
+            raise WorkerShadowError("coding reconciliation is unavailable") from error
+        request_digest = _digest({"sequence": request.sequence, "tool": request.tool.value, "path": request.path, "content_digest": _digest(request.content) if request.content is not None else None, "command": request.command})
+        if not self._event_store.claim_effect(
+            worker_request.context.task_id, worker_request.attempt_id, request.sequence, request_digest,
+        ):
+            result = NativeWorkerToolResult(request.sequence, request.tool, "ambiguous")
+            self._persist_tool_event(worker_request, session_identity, turn_identity, request, result)
+            return result
+        try:
+            lifecycle = (CodingProcessState.STARTED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.SUBMISSION_UNCERTAIN)
+            feedback = None
+            if request.tool is WorkerTool.WORKSPACE_READ:
+                feedback, event = self._local_tools.read(request.path)
+            elif request.tool is WorkerTool.WORKSPACE_WRITE:
+                event = self._local_tools.write(request.path, request.content)
+            elif request.tool is WorkerTool.VALIDATION_EXECUTE:
+                feedback, event = self._local_tools.validate_with_feedback(request.command)
+            else: raise CodingToolError("tool denied")
+            if not _coding_result_values_fit_sdk_budget(
+                sequence=request.sequence, tool=request.tool, outcome=event.outcome,
+                before_digest=event.before_digest, after_digest=event.after_digest,
+                exit_code=event.exit_code, output_digest=event.output_digest,
+                feedback=feedback,
+            ):
+                result = NativeWorkerToolResult(request.sequence, request.tool, "feedback-budget-exceeded", event.before_digest, event.after_digest, event.exit_code, event.output_digest)
+                lifecycle = (CodingProcessState.COMPLETED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.CLEAR)
+            else:
+                result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
+        except CodingToolError as error:
+            result = NativeWorkerToolResult(request.sequence, request.tool, error.outcome)
+            try:
+                lifecycle = (CodingProcessState(error.process_state), CodingCancellationState(error.cancellation_state), CodingAmbiguityState(error.ambiguity_state))
+            except ValueError as state_error:
+                raise WorkerShadowError("coding tool returned invalid lifecycle evidence") from state_error
+        self._persist_tool_event(worker_request, session_identity, turn_identity, request, result, lifecycle=lifecycle)
+        return result
+
+    def _persist_tool_event(self, worker_request: CodexWorkerRequest, session_identity: str, turn_identity: str, request: NativeWorkerToolRequest, result: NativeWorkerToolResult, *, lifecycle: tuple[CodingProcessState, CodingCancellationState, CodingAmbiguityState] | None = None) -> None:
+        outcome = result.outcome
+        if lifecycle is None:
+            lifecycle = (CodingProcessState.FAILED, CodingCancellationState.NOT_REQUESTED, CodingAmbiguityState.TERMINAL_UNCERTAIN)
+        process_state, cancellation_state, ambiguity_state = lifecycle
+        request_digest = _digest({"sequence": request.sequence, "tool": request.tool.value, "path": request.path, "content_digest": _digest(request.content) if request.content is not None else None, "command": request.command})
+        result_digest = _digest({"sequence": result.sequence, "tool": result.tool.value, "outcome": result.outcome, "before_digest": result.before_digest, "after_digest": result.after_digest, "exit_code": result.exit_code, "output_digest": result.output_digest})
+        record = CodingToolEventRecord(
+            "roundwright-coding-tool-event/v1", worker_request.context.task_id,
+            worker_request.input_digest, worker_request.action, worker_request.attempt_id,
+            session_identity, turn_identity, self._dispatch_receipt.candidate_sha,
+            request.sequence, request.tool, request_digest, result_digest, outcome,
+            result.before_digest, result.after_digest, result.exit_code, result.output_digest,
+            process_state, cancellation_state, ambiguity_state,
+        )
+        try:
+            self._event_store.append(record)
+        except CodingWorkerStateError as error:
+            raise WorkerShadowError("coding tool event checkpoint failed") from error
+
+
+@dataclass(frozen=True)
+class ProductionCodingWorkerEntrypointInputs:
+    """Closed, host-owned dependencies for the public coding entrypoint.
+
+    This is deliberately a process-local object rather than CLI arguments:
+    none of its capability, provider, sandbox, store, or candidate-probe
+    dependencies can be reconstructed from ambient input.
+    """
+
+    backend: NativeCodexWorkerBackend
+    profile: ProviderProfile
+    audit: ProviderHealthAuditIdentity
+    local_tools: BoundedCodingTools
+    dispatch_receipt: CodingDispatchReceipt
+    event_store: CodingToolEventStore
+    candidate_probe: Callable[[], str]
+    toolchain_receipt_probe: Callable[[], str]
+
+    def __post_init__(self) -> None:
+        if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
+                or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
+                or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
+                or not callable(getattr(self.backend, "open_session", None))):
+            raise WorkerShadowError("production coding entrypoint inputs are invalid")
+
+
+def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInputs, request: CodexWorkerRequest, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+    """Public production task-lifecycle entrypoint for executable coding.
+
+    Planning remains separately routed through
+    :func:`run_bounded_worker_adapter_qualification` with its no-tools
+    capability; this entrypoint accepts only implementation or repair work.
+    """
+    if type(inputs) is not ProductionCodingWorkerEntrypointInputs or type(request) is not CodexWorkerRequest or request.action is WorkerAction.PLANNING:
+        raise WorkerShadowError("production coding entrypoint is invalid")
+    return ProductionCodingWorkerRuntime(
+        backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
+        local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
+        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe,
+    ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
+
+
+@dataclass(frozen=True)
+class CodingWorkerRuntimeDescriptor:
+    """Closed public identity for one installed production coding resource."""
+
+    resource_id: str
+    task_id: str
+    attempt_id: str
+    candidate_sha: str
+    capability_digest: str
+    dispatch_receipt_digest: str
+
+    @classmethod
+    def parse(cls, value: object) -> "CodingWorkerRuntimeDescriptor":
+        required = {"schema", "resource_id", "task_id", "attempt_id", "candidate_sha", "capability_digest", "dispatch_receipt_digest"}
+        if type(value) is not dict or set(value) != required or value.get("schema") != "roundwright-coding-runtime-descriptor/v1":
+            raise WorkerShadowError("coding runtime descriptor is invalid")
+        try:
+            return cls(**{key: value[key] for key in required - {"schema"}})
+        except TypeError as error:
+            raise WorkerShadowError("coding runtime descriptor is invalid") from error
+
+    def __post_init__(self) -> None:
+        if (not _TOKEN.fullmatch(self.resource_id) or not _TOKEN.fullmatch(self.task_id) or not _TOKEN.fullmatch(self.attempt_id)
+                or not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha)
+                or any(type(value) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in (self.capability_digest, self.dispatch_receipt_digest))):
+            raise WorkerShadowError("coding runtime descriptor is invalid")
+
+    def payload(self) -> dict[str, str]:
+        return {"schema": "roundwright-coding-runtime-descriptor/v1", "resource_id": self.resource_id,
+                "task_id": self.task_id, "attempt_id": self.attempt_id, "candidate_sha": self.candidate_sha,
+                "capability_digest": self.capability_digest, "dispatch_receipt_digest": self.dispatch_receipt_digest}
+
+
+class CodingWorkerRuntimeRegistry:
+    """Process-local trusted capability registry for the public lifecycle seam."""
+
+    def __init__(self) -> None:
+        self._resources: dict[str, ProductionCodingWorkerEntrypointInputs] = {}
+
+    def install(self, resource_id: str, inputs: ProductionCodingWorkerEntrypointInputs) -> None:
+        if not _TOKEN.fullmatch(resource_id) or type(inputs) is not ProductionCodingWorkerEntrypointInputs:
+            raise WorkerShadowError("coding runtime resource is invalid")
+        existing = self._resources.get(resource_id)
+        if existing is not None and existing != inputs:
+            raise WorkerShadowError("coding runtime resource conflicts")
+        self._resources[resource_id] = inputs
+
+    def materialize(self, descriptor: CodingWorkerRuntimeDescriptor) -> ProductionCodingWorkerEntrypointInputs:
+        if type(descriptor) is not CodingWorkerRuntimeDescriptor:
+            raise WorkerShadowError("coding runtime descriptor is invalid")
+        inputs = self._resources.get(descriptor.resource_id)
+        if inputs is None:
+            raise WorkerShadowError("coding runtime resource is unavailable")
+        receipt = inputs.dispatch_receipt
+        if (receipt.task_id != descriptor.task_id or receipt.attempt_id != descriptor.attempt_id
+                or receipt.candidate_sha != descriptor.candidate_sha or receipt.capability_digest != descriptor.capability_digest
+                or receipt.receipt_digest != descriptor.dispatch_receipt_digest
+                or inputs.local_tools.capability_digest != descriptor.capability_digest):
+            raise WorkerShadowError("coding runtime resource drifted")
+        return inputs
+
+
+CODING_RUNTIME_REGISTRY = CodingWorkerRuntimeRegistry()
+
+
+def run_registered_production_coding_worker(*, descriptor_value: object, request: CodexWorkerRequest, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+    """Public task-lifecycle seam consuming only a closed resource descriptor."""
+    descriptor = CodingWorkerRuntimeDescriptor.parse(descriptor_value)
+    inputs = CODING_RUNTIME_REGISTRY.materialize(descriptor)
+    return run_production_coding_worker(
+        inputs=inputs, request=request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+    )
 
 
 def main() -> int:

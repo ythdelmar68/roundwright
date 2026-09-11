@@ -124,6 +124,16 @@ evidence routes only and never expand the authority stated in this roadmap.
 
 ## Deferred Phase 5 dependency-review lifecycle
 
+## Phase 5 bounded coding Worker boundary
+
+Issue #127 supplies only the sealed local coding execution contract and
+hermetic fixture evidence.  Its production seam requires a candidate-bound
+dispatch receipt, durable closed tool-event store, and reviewed sandbox
+identity; it does not activate a provider or external validation.  #128 owns
+the separate live coding profile, its capture/readiness/export/comparison and
+retention proof.  Neither issue changes Roundlet authority, enables a runtime,
+or substitutes fixture process evidence for live qualification.
+
 Phase 3 records, but does not implement or activate, dependency review. Its
 default future profile is Codex `gpt-5.6-terra` with `high` reasoning effort.
 There is no Phase 3 activation key, runnable job, provider adapter, or created

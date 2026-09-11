@@ -42,7 +42,7 @@ class Session:
 
 class Backend:
     def __init__(self, events, response): self.events, self.calls, self.response = events, 0, response
-    def open_session(self, _profile, *, resume_session_identity): self.calls += 1; self.events.append(f"open:{resume_session_identity}"); return Session(self.events, self.response)
+    def open_session(self, _profile, *, resume_session_identity, action): self.calls += 1; self.events.append(f"open:{resume_session_identity}:{action.value}"); return Session(self.events, self.response)
 
 
 class Recorder:
@@ -86,7 +86,7 @@ class WorkerShadowTests(unittest.TestCase):
 
     def test_pre_dispatch_arming_and_exact_time_flow_through_turn_envelope_seal_and_readback(self):
         result = self.qualify()
-        self.assertEqual(self.events, [("prepare", self.readiness.capture_plan_digest, self.readiness.store_identity), "open:None", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted:::", ("seal", self.readiness.capture_plan_digest, 101, self.readiness.store_identity), ("verify", self.readiness.capture_plan_digest, digest("bundle"), self.readiness.store_identity)])
+        self.assertEqual(self.events, [("prepare", self.readiness.capture_plan_digest, self.readiness.store_identity), "open:None:implementation", "session:thread-43", "turn-start", "turn:thread-43:turn-43", "read", "result:thread-43:turn-43:accepted:::", ("seal", self.readiness.capture_plan_digest, 101, self.readiness.store_identity), ("verify", self.readiness.capture_plan_digest, digest("bundle"), self.readiness.store_identity)])
         self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at, result.comparison.disposition), (101, 101, WorkerShadowDisposition.MATCH))
         self.assertEqual(result.envelope.capture_plan_digest, self.readiness.capture_plan_digest)
         self.assertNotIn("complete", json.dumps(result.record.receipt.__dict__))

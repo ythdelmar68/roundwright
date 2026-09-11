@@ -512,11 +512,14 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
         if type(result) is not NativeWorkerToolResult or (result.sequence, result.tool) != (request.sequence, request.tool):
             raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
         if checkpoint_submission is not None: checkpoint_submission(request, result, "intent")
-        turn.submit_tool_result(result)
-        # A coding result creates a fresh exact SDK turn.  Its identity must
-        # become durable before this loop asks it for a stream, otherwise a
-        # recovery could attribute a subsequent effect to the prior turn.
-        checkpoint_next_turn()
+        try:
+            turn.submit_tool_result(result)
+            # A coding result creates a fresh exact SDK turn.  Its identity
+            # must become durable before this loop asks it for a stream.
+            checkpoint_next_turn()
+        except Exception:
+            if checkpoint_submission is not None: checkpoint_submission(request, result, "uncertain")
+            raise
         if checkpoint_submission is not None: checkpoint_submission(request, result, "submitted")
         expected += 1
     raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)

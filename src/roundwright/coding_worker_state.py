@@ -90,7 +90,7 @@ class CodingToolEventStore:
         finally: connection.close()
     def record_submission(self, task_id, implementation_attempt_id, session_identity, external_turn_identity, sequence, state, next_turn_identity=None):
         token=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-        if (any(type(value) is not str or not token.fullmatch(value) for value in (task_id,implementation_attempt_id,session_identity,external_turn_identity)) or type(sequence) is not int or sequence < 1 or state not in {"intent","submitted"} or (next_turn_identity is not None and (state != "submitted" or type(next_turn_identity) is not str or not token.fullmatch(next_turn_identity)))):
+        if (any(type(value) is not str or not token.fullmatch(value) for value in (task_id,implementation_attempt_id,session_identity,external_turn_identity)) or type(sequence) is not int or sequence < 1 or state not in {"intent","submitted","uncertain"} or (next_turn_identity is not None and (state != "submitted" or type(next_turn_identity) is not str or not token.fullmatch(next_turn_identity)))):
             raise CodingWorkerStateError("coding submission transition is invalid")
         connection=sqlite3.connect(self._database)
         try:
@@ -98,7 +98,7 @@ class CodingToolEventStore:
             value=(state,next_turn_identity)
             if existing is not None:
                 if existing == value: return
-                if existing == ("intent", None) and state == "submitted":
+                if existing == ("intent", None) and state in {"submitted","uncertain"}:
                     connection.execute("UPDATE coding_tool_submissions SET state=?,next_turn_identity=? WHERE task_id=? AND implementation_attempt_id=? AND session_identity=? AND external_turn_identity=? AND sequence=?",(state,next_turn_identity,task_id,implementation_attempt_id,session_identity,external_turn_identity,sequence)); connection.commit(); return
                 raise CodingWorkerStateError("coding submission transition conflicts")
             if state == "submitted": raise CodingWorkerStateError("coding submission lacks intent")

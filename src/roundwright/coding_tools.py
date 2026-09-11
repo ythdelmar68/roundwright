@@ -373,11 +373,11 @@ def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, outp
     while not closed:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="confirmed")
+            raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="requested", ambiguity_state="terminal-uncertain")
         try:
             chunk = chunks.get(timeout=remaining)
         except queue.Empty as error:
-            raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="confirmed") from error
+            raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="requested", ambiguity_state="terminal-uncertain") from error
         if chunk is None:
             closed = True
             continue
@@ -385,12 +385,12 @@ def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, outp
             # Preserve a bounded prefix only for the digest; no raw output is
             # retained and the producer is stopped immediately.
             output.extend(chunk[: output_limit - len(output)])
-            raise CodingToolError("bounded validation exceeded output budget", outcome="failed", cancellation_state="confirmed")
+            raise CodingToolError("bounded validation exceeded output budget", outcome="ambiguous", cancellation_state="requested", ambiguity_state="terminal-uncertain")
         output.extend(chunk)
     try:
         process.wait(timeout=max(0.1, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
-        raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="confirmed") from error
+        raise CodingToolError("bounded validation timed out", outcome="timed-out", cancellation_state="requested", ambiguity_state="terminal-uncertain") from error
     return bytes(output)
 
 

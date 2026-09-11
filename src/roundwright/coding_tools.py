@@ -300,8 +300,18 @@ class BoundedCodingTools:
                 raise CodingToolError("bounded validation could not start", outcome="failed") from error
             try:
                 output = _bounded_output(process, self._capability.timeout_seconds, self._capability.output_limit)
-            except CodingToolError:
-                _terminate_tree(process)
+            except CodingToolError as error:
+                # A cancellation is confirmed only after the owned process has
+                # actually exited.  Do not write a clear terminal state before
+                # that read-back, even when a best-effort termination command
+                # itself returns successfully.
+                terminated = _terminate_tree(process)
+                if error.cancellation_state == "requested" and terminated:
+                    raise CodingToolError(
+                        str(error), outcome=error.outcome,
+                        process_state=error.process_state,
+                        cancellation_state="confirmed", ambiguity_state="clear",
+                    ) from error
                 raise
             finally:
                 if process.stdout is not None:
@@ -394,11 +404,11 @@ def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, outp
     return bytes(output)
 
 
-def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
-    """Best-effort process-tree cleanup for cancellation, cap, and timeout."""
+def _terminate_tree(process: subprocess.Popen[bytes]) -> bool:
+    """Terminate the owned process tree and report a verified exit only."""
 
     if process.poll() is not None:
-        return
+        return True
     try:
         if os.name == "nt":
             subprocess.run(
@@ -418,3 +428,4 @@ def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+    return process.poll() is not None

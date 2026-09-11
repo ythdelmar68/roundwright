@@ -420,7 +420,7 @@ class CodexWorkerAdapter:
         checkpoint_session: Callable[[str], None],
         checkpoint_turn: Callable[[str, str], None],
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
-        checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str], None] | None = None,
+        checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -472,7 +472,9 @@ class CodexWorkerAdapter:
             else:
                 response = _consume_steps(
                     turn, execute_tool_request,
-                    checkpoint_next_turn=lambda: checkpoint_turn(session_identity, _identity(turn, "turn")),
+                    checkpoint_next_turn=lambda: _checkpoint_next_turn(
+                        turn, session_identity, checkpoint_turn
+                    ),
                     checkpoint_submission=checkpoint_submission,
                 )
                 # A coding tool result may advance the native handle.  Bind
@@ -498,7 +500,19 @@ class CodexWorkerAdapter:
 _MAX_TOOL_STEPS = 32
 
 
-def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], None], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str], None] | None = None) -> NativeWorkerResponse:
+def _checkpoint_next_turn(
+    turn: NativeWorkerTurn,
+    session_identity: str,
+    checkpoint_turn: Callable[[str, str], None],
+) -> str:
+    """Checkpoint and return the exact turn created by a tool submission."""
+
+    next_turn_identity = _identity(turn, "turn")
+    checkpoint_turn(session_identity, next_turn_identity)
+    return next_turn_identity
+
+
+def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], str], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None) -> NativeWorkerResponse:
     """Consume one exact turn; malformed/uncertain tool exchange is ambiguous."""
     expected = 1
     while expected <= _MAX_TOOL_STEPS:
@@ -511,16 +525,22 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
         result = execute(request)
         if type(result) is not NativeWorkerToolResult or (result.sequence, result.tool) != (request.sequence, request.tool):
             raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
-        if checkpoint_submission is not None: checkpoint_submission(request, result, "intent")
+        if checkpoint_submission is not None:
+            # This durable intent is bound to the already checkpointed source
+            # turn.  A crash from here through the provider handoff can never
+            # be reconstructed as a clear delivery.
+            checkpoint_submission(request, result, "intent", None)
         try:
             turn.submit_tool_result(result)
             # A coding result creates a fresh exact SDK turn.  Its identity
             # must become durable before this loop asks it for a stream.
-            checkpoint_next_turn()
+            next_turn_identity = checkpoint_next_turn()
         except Exception:
-            if checkpoint_submission is not None: checkpoint_submission(request, result, "uncertain")
+            if checkpoint_submission is not None:
+                checkpoint_submission(request, result, "uncertain", None)
             raise
-        if checkpoint_submission is not None: checkpoint_submission(request, result, "submitted")
+        if checkpoint_submission is not None:
+            checkpoint_submission(request, result, "submitted", next_turn_identity)
         expected += 1
     raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
 

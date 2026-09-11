@@ -66,6 +66,7 @@ from .codex_worker import CodexWorkerAdapter
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _NO_TOOL_INSTRUCTIONS = "One bounded planning observation only. No provider tools or repository inspection are declared or required. Decide only from the normalized public turn input. Return only the requested schema."
 _CODING_TOOL_INSTRUCTIONS = "Execute only bounded workspace-read, workspace-write, and validation-execute requests declared by the host. Never invoke a shell, repository command, network, credential, or undeclared tool. Return only the requested structured schema."
+_MAX_CODING_TOOL_RESULT_BYTES = 65_536
 @dataclass(frozen=True)
 class CompletionDeadline:
     """Explicit bounded completion contract, always inside the host deadline."""
@@ -446,7 +447,10 @@ class _HarnessCodingWorkerTurn(NativeWorkerTurn):
     def submit_tool_result(self, result: NativeWorkerToolResult) -> None:
         if type(result) is not NativeWorkerToolResult: raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
         # Result feedback is deliberately present only in this next prompt.
-        self._start({"schema": "roundwright-coding-turn/v1", "request": None, "previous_result": {"sequence": result.sequence, "tool": result.tool.value, "outcome": result.outcome, "before_digest": result.before_digest, "after_digest": result.after_digest, "exit_code": result.exit_code, "output_digest": result.output_digest, "feedback": result.feedback}})
+        payload = _coding_result_payload(result)
+        if len(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > _MAX_CODING_TOOL_RESULT_BYTES:
+            raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+        self._start(payload)
 
     def _start(self, payload: Mapping[str, object]) -> None:
         try:
@@ -545,6 +549,51 @@ def _coding_schema(action: WorkerAction) -> dict[str, object]:
 
 def _native_coding_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface) -> dict[str, object]:
     return {"schema": "roundwright-coding-worker-native/v1", "capability_contract": "executable-bounded-coding/v1", "action": request.action.value, "request_digest": request.input_digest, "context_digest": request.context.digest, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "tools": [tool.value for tool in tools.tools], "instruction": "Return exactly one bounded tool request or terminal result. Never invoke a shell or name an undeclared tool."}
+
+
+def _coding_result_payload_values(
+    *, sequence: int, tool: WorkerTool, outcome: str,
+    before_digest: str | None, after_digest: str | None,
+    exit_code: int | None, output_digest: str | None, feedback: str | None,
+) -> dict[str, object]:
+    """The exact SDK frame for a local tool result, including feedback."""
+
+    return {
+        "schema": "roundwright-coding-turn/v1",
+        "request": None,
+        "previous_result": {
+            "sequence": sequence,
+            "tool": tool.value,
+            "outcome": outcome,
+            "before_digest": before_digest,
+            "after_digest": after_digest,
+            "exit_code": exit_code,
+            "output_digest": output_digest,
+            "feedback": feedback,
+        },
+    }
+
+
+def _coding_result_payload(result: NativeWorkerToolResult) -> dict[str, object]:
+    return _coding_result_payload_values(
+        sequence=result.sequence, tool=result.tool, outcome=result.outcome,
+        before_digest=result.before_digest, after_digest=result.after_digest,
+        exit_code=result.exit_code, output_digest=result.output_digest,
+        feedback=result.feedback,
+    )
+
+
+def _coding_result_values_fit_sdk_budget(
+    *, sequence: int, tool: WorkerTool, outcome: str,
+    before_digest: str | None, after_digest: str | None,
+    exit_code: int | None, output_digest: str | None, feedback: str | None,
+) -> bool:
+    payload = _coding_result_payload_values(
+        sequence=sequence, tool=tool, outcome=outcome,
+        before_digest=before_digest, after_digest=after_digest,
+        exit_code=exit_code, output_digest=output_digest, feedback=feedback,
+    )
+    return len(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) <= _MAX_CODING_TOOL_RESULT_BYTES
 
 
 def _consume_coding_step(handle: object, action: WorkerAction, completion: CompletionDeadline, clock: Callable[[], float], cancel: Callable[[], None]) -> NativeWorkerTurnStep:
@@ -731,12 +780,12 @@ class ProductionCodingWorkerRuntime:
         def execute(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
             return self._execute_request(request, checkpoint, item)
 
-        def submission(item: NativeWorkerToolRequest, result: NativeWorkerToolResult, state: str) -> None:
+        def submission(item: NativeWorkerToolRequest, result: NativeWorkerToolResult, state: str, next_turn_identity: str | None) -> None:
             session_identity = checkpoint.get("session_identity"); turn_identity = checkpoint.get("turn_identity") if state == "intent" else submission_turns.get(item.sequence)
             if session_identity is None or turn_identity is None: raise WorkerShadowError("coding submission lacks durable turn checkpoint")
             if state == "intent": submission_turns[item.sequence] = turn_identity
             try:
-                self._event_store.record_submission(request.context.task_id, request.attempt_id, session_identity, turn_identity, item.sequence, state, checkpoint.get("turn_identity") if state == "submitted" else None)
+                self._event_store.record_submission(request.context.task_id, request.attempt_id, session_identity, turn_identity, item.sequence, state, next_turn_identity)
             except CodingWorkerStateError as error: raise WorkerShadowError("coding submission checkpoint failed") from error
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
@@ -768,7 +817,12 @@ class ProductionCodingWorkerRuntime:
             elif request.tool is WorkerTool.VALIDATION_EXECUTE:
                 feedback, event = self._local_tools.validate_with_feedback(request.command)
             else: raise CodingToolError("tool denied")
-            if feedback is not None and len(json.dumps({"feedback": feedback}, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > 65_536:
+            if not _coding_result_values_fit_sdk_budget(
+                sequence=request.sequence, tool=request.tool, outcome=event.outcome,
+                before_digest=event.before_digest, after_digest=event.after_digest,
+                exit_code=event.exit_code, output_digest=event.output_digest,
+                feedback=feedback,
+            ):
                 raise CodingToolError("coding feedback exceeded serialized SDK budget", outcome="failed")
             result = NativeWorkerToolResult(request.sequence, request.tool, event.outcome, event.before_digest, event.after_digest, event.exit_code, event.output_digest, feedback)
         except CodingToolError as error:

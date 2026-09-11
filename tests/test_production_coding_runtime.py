@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -41,6 +43,7 @@ class Backend:
     def open_session(self, *_args, **_kwargs): self.calls += 1; return self.session
 
 class Sandbox(ReviewedValidationSandbox):
+    def __init__(self, output=b""): self.output = output
     @property
     def identity(self): return digest("sandbox")
     @property
@@ -50,16 +53,16 @@ class Sandbox(ReviewedValidationSandbox):
             network_policy_digest=digest("network"), credential_policy_digest=digest("credentials"),
             executable_policy_digest=digest("executables"), child_cleanup_digest=digest("cleanup"),
         )
-    def execute(self, **_kwargs): return CodingSandboxResult(0, b"")
+    def execute(self, **_kwargs): return CodingSandboxResult(0, self.output)
 
 class ProductionRuntimeTests(unittest.TestCase):
     def request(self):
         context = CodexWorkerContext("task-1", *(digest(x) for x in ("s","r","w","b","base","candidate","p","c")))
         return CodexWorkerRequest("attempt-1", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-1", action=WorkerAction.IMPLEMENTATION, context=context, objective="write", constraints=("bounded",), acceptance_criteria=("write",), resume_session_identity=None), context, "write", ("bounded",), ("write",))
-    def inputs(self, root, turn, events):
+    def inputs(self, root, turn, events, sandbox=None):
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), sandbox_identity=digest("sandbox")), validation_sandbox=Sandbox())
+        tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), sandbox_identity=digest("sandbox")), validation_sandbox=sandbox or Sandbox())
         context = self.request().context
         receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
         return ProductionCodingWorkerEntrypointInputs(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40, toolchain_receipt_probe=lambda: digest("toolchain"))
@@ -119,5 +122,37 @@ class ProductionRuntimeTests(unittest.TestCase):
             runtime=self.runtime(Path(temp),turn,events); runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
             self.assertEqual(turn.submitted[0].feedback,"bounded")
             self.assertTrue((Path(temp,"events.db").exists()))
+
+    def test_submission_binds_the_fresh_sdk_turn_before_a_terminal_result(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
+            class AdvancingTurn(Turn):
+                def submit_tool_result(self, result):
+                    super().submit_tool_result(result); self.id="turn-2"
+            turn=AdvancingTurn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
+            runtime=self.runtime(Path(temp),turn,events)
+            result=runtime.dispatch(self.request(), checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None)
+            self.assertEqual((result.kind,result.turn_identity),(WorkerResultKind.ACCEPTED,"turn-2"))
+            connection=sqlite3.connect(Path(temp,"events.db"))
+            try:
+                self.assertEqual(connection.execute("SELECT state,next_turn_identity FROM coding_tool_submissions").fetchall(),[("submitted","turn-2")])
+            finally:
+                connection.close()
+
+    def test_non_utf8_feedback_at_the_raw_cap_is_a_durable_budget_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.VALIDATION_EXECUTE, command=(sys.executable,"-c","pass"))
+            turn=Turn(events,(NativeWorkerTurnStep(request=request),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
+            inputs=self.inputs(Path(temp),turn,events,Sandbox(b"\xff" * 65_536))
+            result=run_production_coding_worker(inputs=inputs,request=self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            self.assertEqual(result.kind,WorkerResultKind.ACCEPTED)
+            self.assertEqual(turn.submitted[0].outcome,"failed")
+            self.assertIsNone(turn.submitted[0].feedback)
+            connection=sqlite3.connect(Path(temp,"events.db"))
+            try:
+                payloads=connection.execute("SELECT payload_json FROM coding_tool_events").fetchall()
+                self.assertEqual([json.loads(payload)["outcome"] for (payload,) in payloads],["failed"])
+            finally:
+                connection.close()
 
 if __name__ == "__main__": unittest.main()

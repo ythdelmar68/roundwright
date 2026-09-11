@@ -101,13 +101,16 @@ class CodexWorkerAdapterTests(unittest.TestCase):
                 super().submit_tool_result(result); self._identity = "turn-2"
         turn = ReplacingTurn()
         adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        submissions = []
         result = adapter.dispatch(
             self.request(), checkpoint_session=lambda session: events.append(f"session:{session}"),
             checkpoint_turn=lambda session, identity: events.append(f"turn:{session}:{identity}"),
             execute_tool_request=lambda request: NativeWorkerToolResult(request.sequence, request.tool, "allowed", after_digest=digest("read")),
+            checkpoint_submission=lambda request, result, state, next_turn: submissions.append((request.sequence, state, next_turn)),
         )
         self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
         self.assertLess(events.index("turn:thread-43:turn-2"), events.index("step", events.index("submit:1")))
+        self.assertEqual(submissions, [(1, "intent", None), (1, "submitted", "turn-2")])
 
     def test_resume_must_preserve_the_persisted_worker_thread(self) -> None:
         events: list[str] = []

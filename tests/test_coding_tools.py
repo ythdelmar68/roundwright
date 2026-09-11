@@ -99,6 +99,15 @@ class BoundedCodingToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(CodingToolError, "timed out"):
             tools.validate(command)
 
+    def test_verified_timeout_cleanup_is_not_recorded_as_uncertain(self) -> None:
+        command = (sys.executable, "-c", "import time; time.sleep(5)")
+        tools = BoundedCodingTools(BoundedCodingCapability(
+            self.root, ("src/allowed.txt",), ("src/allowed.txt",), (command,), timeout_seconds=1,
+        ))
+        with self.assertRaises(CodingToolError) as captured:
+            tools.validate(command)
+        self.assertEqual((captured.exception.outcome, captured.exception.cancellation_state, captured.exception.ambiguity_state), ("timed-out", "confirmed", "clear"))
+
 
 if __name__ == "__main__":
     unittest.main()

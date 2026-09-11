@@ -89,6 +89,26 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual((result.kind, result.session_identity, result.turn_identity, result.output), (WorkerResultKind.ACCEPTED, "thread-43", "turn-43", {"status": "done"}))
         self.assertTrue(result.output_fingerprint.startswith("sha256:"))
 
+    def test_each_post_tool_sdk_turn_is_checkpointed_before_consumption(self) -> None:
+        events: list[str] = []
+        class ReplacingTurn(FakeTurn):
+            def __init__(self):
+                super().__init__("turn-1", None, events, (
+                    NativeWorkerTurnStep(request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_READ, path="a.txt")),
+                    NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"})),
+                ))
+            def submit_tool_result(self, result):
+                super().submit_tool_result(result); self._identity = "turn-2"
+        turn = ReplacingTurn()
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        result = adapter.dispatch(
+            self.request(), checkpoint_session=lambda session: events.append(f"session:{session}"),
+            checkpoint_turn=lambda session, identity: events.append(f"turn:{session}:{identity}"),
+            execute_tool_request=lambda request: NativeWorkerToolResult(request.sequence, request.tool, "allowed", after_digest=digest("read")),
+        )
+        self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
+        self.assertLess(events.index("turn:thread-43:turn-2"), events.index("step", events.index("submit:1")))
+
     def test_resume_must_preserve_the_persisted_worker_thread(self) -> None:
         events: list[str] = []
         backend = FakeBackend(FakeSession("other-thread", FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.INCOMPLETE), events), events))
@@ -193,7 +213,7 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
         result = adapter.dispatch(request, checkpoint_session=lambda value: events.append("session:" + value), checkpoint_turn=lambda _a, value: events.append("turn:" + value), execute_tool_request=lambda item: NativeWorkerToolResult(item.sequence, item.tool, "allowed"))
         self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
-        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:turn-43", "step", "submit:1", "step"])
+        self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:turn-43", "step", "submit:1", "turn:turn-43", "step"])
 
     def test_out_of_order_step_is_ambiguous_without_callback(self) -> None:
         events=[]; request=self.request(); turn=FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))

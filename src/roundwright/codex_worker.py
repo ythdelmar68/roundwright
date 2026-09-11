@@ -469,7 +469,10 @@ class CodexWorkerAdapter:
             if execute_tool_request is None:
                 response = turn.read_response()
             else:
-                response = _consume_steps(turn, execute_tool_request)
+                response = _consume_steps(
+                    turn, execute_tool_request,
+                    checkpoint_next_turn=lambda: checkpoint_turn(session_identity, _identity(turn, "turn")),
+                )
         except CodexAdapterError:
             _abort_turn(turn); _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
@@ -490,7 +493,7 @@ class CodexWorkerAdapter:
 _MAX_TOOL_STEPS = 32
 
 
-def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult]) -> NativeWorkerResponse:
+def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], None]) -> NativeWorkerResponse:
     """Consume one exact turn; malformed/uncertain tool exchange is ambiguous."""
     expected = 1
     while expected <= _MAX_TOOL_STEPS:
@@ -504,6 +507,10 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
         if type(result) is not NativeWorkerToolResult or (result.sequence, result.tool) != (request.sequence, request.tool):
             raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
         turn.submit_tool_result(result)
+        # A coding result creates a fresh exact SDK turn.  Its identity must
+        # become durable before this loop asks it for a stream, otherwise a
+        # recovery could attribute a subsequent effect to the prior turn.
+        checkpoint_next_turn()
         expected += 1
     raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
 

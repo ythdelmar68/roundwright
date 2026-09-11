@@ -58,6 +58,50 @@ class CodingSandboxResult:
             raise CodingToolError("coding sandbox result is invalid", outcome="failed")
 
 
+_REVIEWED_HARNESS_SANDBOX_PIN = "0154817a6fba345b78af25017eb312a1b2349cd6"
+
+
+@dataclass(frozen=True)
+class ReviewedSandboxReceipt:
+    """Public-safe, host-issued assertion for the reviewed OS boundary."""
+
+    identity: str
+    filesystem_policy_digest: str
+    network_policy_digest: str
+    credential_policy_digest: str
+    executable_policy_digest: str
+    child_cleanup_digest: str
+    receipt_digest: str
+
+    @classmethod
+    def seal(cls, *, identity: str, filesystem_policy_digest: str, network_policy_digest: str, credential_policy_digest: str, executable_policy_digest: str, child_cleanup_digest: str) -> "ReviewedSandboxReceipt":
+        core = {
+            "schema": "roundwright-reviewed-sandbox-receipt/v1",
+            "infrastructure_pin": _REVIEWED_HARNESS_SANDBOX_PIN,
+            "identity": identity, "filesystem_policy_digest": filesystem_policy_digest,
+            "network_policy_digest": network_policy_digest,
+            "credential_policy_digest": credential_policy_digest,
+            "executable_policy_digest": executable_policy_digest,
+            "child_cleanup_digest": child_cleanup_digest,
+        }
+        return cls(identity, filesystem_policy_digest, network_policy_digest, credential_policy_digest, executable_policy_digest, child_cleanup_digest, _object_digest(core))
+
+    def __post_init__(self) -> None:
+        values = (self.identity, self.filesystem_policy_digest, self.network_policy_digest, self.credential_policy_digest, self.executable_policy_digest, self.child_cleanup_digest)
+        core = {
+            "schema": "roundwright-reviewed-sandbox-receipt/v1",
+            "infrastructure_pin": _REVIEWED_HARNESS_SANDBOX_PIN,
+            "identity": self.identity, "filesystem_policy_digest": self.filesystem_policy_digest,
+            "network_policy_digest": self.network_policy_digest,
+            "credential_policy_digest": self.credential_policy_digest,
+            "executable_policy_digest": self.executable_policy_digest,
+            "child_cleanup_digest": self.child_cleanup_digest,
+        }
+        if (any(type(value) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in values)
+                or self.receipt_digest != _object_digest(core)):
+            raise CodingToolError("reviewed sandbox receipt is invalid")
+
+
 class ReviewedValidationSandbox:
     """Operational boundary for an OS-enforced validation sandbox.
 
@@ -72,6 +116,10 @@ class ReviewedValidationSandbox:
         raise NotImplementedError
 
     @property
+    def receipt(self) -> ReviewedSandboxReceipt:
+        raise NotImplementedError
+
+    @property
     def receipt_digest(self) -> str:
         """Digest of the reviewed sandbox implementation and resource seal.
 
@@ -79,7 +127,10 @@ class ReviewedValidationSandbox:
         pin, mounts, network and credential policy, child containment, and
         cleanup protocol; a Worker never derives it from local input.
         """
-        raise NotImplementedError
+        receipt = self.receipt
+        if type(receipt) is not ReviewedSandboxReceipt or receipt.identity != self.identity:
+            raise CodingToolError("reviewed sandbox receipt is invalid")
+        return receipt.receipt_digest
 
     def execute(self, *, command: tuple[str, ...], root: Path, timeout_seconds: int, output_limit: int) -> CodingSandboxResult:
         raise NotImplementedError

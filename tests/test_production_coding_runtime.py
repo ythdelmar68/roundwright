@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.codex_worker import CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, NativeWorkerToolRequest, NativeWorkerTurnStep, WorkerAction, WorkerResultKind, WorkerTool, worker_request_digest
-from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools, CodingSandboxResult, ReviewedValidationSandbox
+from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools, CodingSandboxResult, ReviewedSandboxReceipt, ReviewedValidationSandbox
 from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
@@ -44,7 +44,12 @@ class Sandbox(ReviewedValidationSandbox):
     @property
     def identity(self): return digest("sandbox")
     @property
-    def receipt_digest(self): return digest("reviewed-sandbox-pin")
+    def receipt(self):
+        return ReviewedSandboxReceipt.seal(
+            identity=self.identity, filesystem_policy_digest=digest("filesystem"),
+            network_policy_digest=digest("network"), credential_policy_digest=digest("credentials"),
+            executable_policy_digest=digest("executables"), child_cleanup_digest=digest("cleanup"),
+        )
     def execute(self, **_kwargs): return CodingSandboxResult(0, b"")
 
 class ProductionRuntimeTests(unittest.TestCase):

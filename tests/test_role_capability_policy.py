@@ -115,6 +115,9 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
             resolve_authoritative_guidance(expectation=replace(self.guidance_expectation, trusted_revision="0" * 40), view=GuidanceView.SUPERVISOR, task_relative_path="src/task.py", binding=self.binding, git_entrypoint_control=self.control)
         with self.assertRaises(RoleCapabilityError):
             resolve_authoritative_guidance(expectation=replace(self.guidance_expectation, tree_digest=digest("9")), view=GuidanceView.DEPENDENCY_REVIEW, task_relative_path="src/task.py", binding=self.binding, git_entrypoint_control=self.control)
+        self._git("remote", "remove", "origin")
+        with self.assertRaises(RoleCapabilityError):
+            resolve_authoritative_guidance(expectation=self.guidance_expectation, view=GuidanceView.RECOVERY_ADVISOR, task_relative_path="src/task.py", binding=self.binding, git_entrypoint_control=self.control)
 
     def test_admission_requires_existing_pinned_record_not_coherent_caller_objects(self) -> None:
         contract = self.verified_contract()

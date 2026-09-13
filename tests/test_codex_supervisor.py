@@ -97,7 +97,7 @@ class SupervisorTests(unittest.TestCase):
         self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
         self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
         self.profiles = (
-            ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH, "primary"),
+            ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH, "primary"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback-retry"),
         )

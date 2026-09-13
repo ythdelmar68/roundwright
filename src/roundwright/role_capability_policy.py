@@ -571,3 +571,8 @@ def default_advisory_profiles(*, recovery_advisor: ProviderProfile, owner_intent
 
 def require_non_dispatching_production_entrypoint(contract: AdvisoryRoleContract, *, store: FileRoleAdmissionStore, expectation: RoleAdmissionExpectation) -> dict[str, object]:
     return require_verified_role_admission(contract, RoleExecutionSeam.RECOVERY_ADVISOR, store=store, expectation=expectation)
+
+
+def require_non_dispatching_owner_intent_entrypoint(contract: AdvisoryRoleContract, *, store: FileRoleAdmissionStore, expectation: RoleAdmissionExpectation) -> dict[str, object]:
+    """Typed, read-only boundary retained until an Interpreter provider exists."""
+    return require_verified_role_admission(contract, RoleExecutionSeam.OWNER_INTENT_INTERPRETER, store=store, expectation=expectation)

@@ -9,7 +9,7 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"9b999bf544377d1d5301e66b447859d17ffc27530705378a566d29ed22980388"},
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"ec05f4ecd5ccbf4766419759dc989874038e7411898d7fd82fc494527e0a51ce"},
       {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"4025ffd8e81ffc5cf318ab7a48c55f1a773d58ce46533889fb66ba3b96a2d108"},
       {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"fd3055afc6b92cadefccd7fb26f738aa831f5ba3d96f05ec771a34c151533fd6"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"8409aba7c95904e3e1e273231c560ae63d12f071d24b7d80d7c712df1a6801ee"},

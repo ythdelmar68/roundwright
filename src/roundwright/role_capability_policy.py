@@ -88,6 +88,7 @@ _WINDOWS_RESERVED = frozenset({
 })
 _ADMISSION_SEAL = object()
 _RUNTIME_SEAL = object()
+_EXECUTION_SEAL = object()
 _REVIEWED_SDK_CODES = {
     RoleCapability.READ_TRUSTED_GUIDANCE: "guidance.read/v1",
     RoleCapability.RENDER_OWNER_SAFE_ADVICE: "advice.render-owner-safe/v1",
@@ -132,7 +133,9 @@ def _relative_path(value: object) -> str:
         # accidentally widening a caller-selected scope.
         normalized = unicodedata.normalize("NFKC", part)
         stem = normalized.split(".", 1)[0].rstrip(". ").casefold()
-        if normalized != part or ":" in part or any(ord(character) < 32 for character in part) or part.endswith((".", " ")) or stem in _WINDOWS_RESERVED:
+        if (normalized != part or ":" in part or any(character in part for character in '*?<>|"')
+                or any(ord(character) < 32 for character in part)
+                or part.endswith((".", " ")) or stem in _WINDOWS_RESERVED):
             raise RoleCapabilityError("relative path is invalid")
     return path.as_posix()
 
@@ -459,7 +462,13 @@ class SealedRoleRuntimeContext:
         self.root, self.common_dir, self.binding, self.git_entrypoint_control, self.tree, self.task_candidate_sha, self._seal = root, common_dir, binding, git_entrypoint_control, tree, task_candidate_sha, _seal
 
 
-def resolve_sealed_role_runtime_context(*, root: Path, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl, task_candidate_sha: str) -> SealedRoleRuntimeContext:
+def resolve_sealed_role_runtime_context(**_caller_values: object) -> SealedRoleRuntimeContext:
+    """Public callers cannot assemble trusted owner/deployment admission state."""
+
+    raise RoleCapabilityError("role runtime context is available only from trusted composition")
+
+
+def _resolve_sealed_role_runtime_context(*, root: Path, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl, task_candidate_sha: str) -> SealedRoleRuntimeContext:
     if type(binding) is not CandidateBinding or type(git_entrypoint_control) is not GitEntrypointControl or type(task_candidate_sha) is not str or _SHA.fullmatch(task_candidate_sha) is None or task_candidate_sha == binding.candidate_sha:
         raise RoleCapabilityError("role runtime control is invalid")
     try:
@@ -481,7 +490,7 @@ class FileRoleAdmissionStore:
 
     def read(self) -> Mapping[str, object]:
         try:
-            runtime = resolve_sealed_role_runtime_context(root=self._runtime.root, binding=self._runtime.binding, git_entrypoint_control=self._runtime.git_entrypoint_control, task_candidate_sha=self._runtime.task_candidate_sha)
+            runtime = _resolve_sealed_role_runtime_context(root=self._runtime.root, binding=self._runtime.binding, git_entrypoint_control=self._runtime.git_entrypoint_control, task_candidate_sha=self._runtime.task_candidate_sha)
             if runtime.common_dir != self._runtime.common_dir or runtime.tree != self._runtime.tree or runtime.task_candidate_sha != self._runtime.task_candidate_sha:
                 raise RoleCapabilityError("authoritative role runtime has drifted")
             raw = _git(runtime.root, "show", f"{runtime.binding.candidate_sha}:{self._relative}")
@@ -570,6 +579,11 @@ class SealedRoleExecution:
     store: FileRoleAdmissionStore
     expectation: RoleAdmissionExpectation
     guidance_evidence: ProviderGuidanceEvidence
+    _seal: object | None = None
+
+    def __post_init__(self) -> None:
+        if self._seal is not _EXECUTION_SEAL:
+            raise RoleCapabilityError("sealed role execution is available only from trusted composition")
 
     def require_before_effect(self) -> dict[str, object]:
         expected_views = {RoleExecutionSeam.WORKER: GuidanceView.WORKER, RoleExecutionSeam.SUPERVISOR: GuidanceView.SUPERVISOR, RoleExecutionSeam.DEPENDENCY_REVIEW: GuidanceView.DEPENDENCY_REVIEW, RoleExecutionSeam.RECOVERY_ADVISOR: GuidanceView.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: GuidanceView.OWNER_INTENT_INTERPRETER}
@@ -581,6 +595,22 @@ class SealedRoleExecution:
                 or self.expectation.candidate_sha != runtime.task_candidate_sha):
             raise RoleCapabilityError("provider guidance evidence does not match the role seam")
         return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
+
+
+def _compose_sealed_role_execution(
+    contract: AdvisoryRoleContract,
+    seam: RoleExecutionSeam,
+    store: FileRoleAdmissionStore,
+    expectation: RoleAdmissionExpectation,
+    guidance_evidence: ProviderGuidanceEvidence,
+) -> SealedRoleExecution:
+    """Composition-root-only constructor; production defaults install none."""
+
+    if (type(contract) is not AdvisoryRoleContract or type(seam) is not RoleExecutionSeam
+            or type(store) is not FileRoleAdmissionStore or type(expectation) is not RoleAdmissionExpectation
+            or type(guidance_evidence) is not ProviderGuidanceEvidence):
+        raise RoleCapabilityError("trusted role composition is invalid")
+    return SealedRoleExecution(contract, seam, store, expectation, guidance_evidence, _seal=_EXECUTION_SEAL)
 
 
 def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, expectation: RoleAdmissionExpectation, owner_readable_reason: str, budget: RoleBudget, valid_from: int, valid_until: int, revocation_readback_digest: str) -> dict[str, object]:

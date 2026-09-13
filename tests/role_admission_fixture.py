@@ -30,7 +30,7 @@ from roundwright.role_capability_policy import (
     RoleCapability, RoleCapabilityGrant, RoleCapabilityProfile,
     RoleExecutionSeam, RoleScope, SealedRoleExecution,
     TrustedRoleAuthorityReceipt, read_verified_admission,
-    resolve_authoritative_guidance, resolve_sealed_role_runtime_context,
+    _compose_sealed_role_execution, _resolve_sealed_role_runtime_context, resolve_authoritative_guidance,
     reviewed_sdk_mapping,
 )
 
@@ -104,7 +104,7 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
 
     binding, entrypoint_control = control(revision)
     tree = git("rev-parse", "HEAD^{tree}")
-    runtime = resolve_sealed_role_runtime_context(
+    runtime = _resolve_sealed_role_runtime_context(
         root=root, binding=binding, git_entrypoint_control=entrypoint_control,
         task_candidate_sha=task_candidate,
     )
@@ -144,7 +144,7 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
     revision = git("rev-parse", "HEAD")
     git("update-ref", "refs/remotes/origin/main", revision)
     binding, entrypoint_control = control(revision)
-    final_runtime = resolve_sealed_role_runtime_context(
+    final_runtime = _resolve_sealed_role_runtime_context(
         root=root, binding=binding, git_entrypoint_control=entrypoint_control,
         task_candidate_sha=task_candidate,
     )
@@ -158,7 +158,7 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
     store = FileRoleAdmissionStore(runtime=final_runtime, record_relative_path="admission.json", store_identity=_digest("admission-store"))
     admission, verified_instance = read_verified_admission(expectation=expectation, store=store)
     contract = AdvisoryRoleContract(role_profile, guidance, verified_instance, admission)
-    execution = SealedRoleExecution(
+    execution = _compose_sealed_role_execution(
         contract, RoleExecutionSeam(role.value), store, expectation,
         ProviderGuidanceEvidence(view, _digest("provider-cwd"), True, _digest("injected-guidance"), guidance.receipt_digest, binding.candidate_sha, task_candidate),
     )

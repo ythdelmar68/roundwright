@@ -238,6 +238,25 @@ class TrustedGuidance:
         return _digest({"schema": "roundwright-trusted-guidance-receipt/v3", "expectation": self.expectation_identity, "view": self.view.value, "selected_paths": self.selected_paths, "guidance_digest": self.guidance_digest})
 
 
+@dataclass(frozen=True)
+class ProviderGuidanceEvidence:
+    """Immutable provider-side instruction boundary, checked before a turn."""
+    view: GuidanceView
+    provider_cwd_identity: str
+    implicit_discovery_disabled: bool
+    injected_context_digest: str
+    guidance_receipt_digest: str
+    accepted_main_sha: str
+    task_candidate_sha: str
+
+    def __post_init__(self) -> None:
+        _require_digest(self.provider_cwd_identity, "provider guidance cwd")
+        _require_digest(self.injected_context_digest, "provider injected guidance")
+        _require_digest(self.guidance_receipt_digest, "provider guidance receipt")
+        if type(self.view) is not GuidanceView or self.implicit_discovery_disabled is not True or type(self.accepted_main_sha) is not str or _SHA.fullmatch(self.accepted_main_sha) is None or type(self.task_candidate_sha) is not str or _SHA.fullmatch(self.task_candidate_sha) is None:
+            raise RoleCapabilityError("provider guidance evidence is invalid")
+
+
 def _git(root: Path, *arguments: str) -> bytes:
     try:
         return subprocess.run(("git", "-C", str(root), *arguments), check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
@@ -536,8 +555,12 @@ class SealedRoleExecution:
     seam: RoleExecutionSeam
     store: FileRoleAdmissionStore
     expectation: RoleAdmissionExpectation
+    guidance_evidence: ProviderGuidanceEvidence
 
     def require_before_effect(self) -> dict[str, object]:
+        expected_views = {RoleExecutionSeam.WORKER: GuidanceView.WORKER, RoleExecutionSeam.SUPERVISOR: GuidanceView.SUPERVISOR, RoleExecutionSeam.DEPENDENCY_REVIEW: GuidanceView.DEPENDENCY_REVIEW, RoleExecutionSeam.RECOVERY_ADVISOR: GuidanceView.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: GuidanceView.OWNER_INTENT_INTERPRETER}
+        if self.guidance_evidence.view is not expected_views[self.seam] or self.guidance_evidence.guidance_receipt_digest != self.contract.guidance.receipt_digest:
+            raise RoleCapabilityError("provider guidance evidence does not match the role seam")
         return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
 
 

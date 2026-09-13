@@ -28,6 +28,11 @@ session; a mismatched or denied capsule opens no session. Recovery Advisor and
 Owner Intent Interpreter retain their explicit non-dispatching gates until a
 dedicated provider route is introduced.
 
+Each capsule also carries immutable provider-guidance evidence: the matching
+role view, provider working-root identity, disabled implicit discovery, exact
+injected context digest, accepted-main identity, task candidate, and selected
+guidance receipt. A mismatched view or receipt fails before any provider call.
+
 Owner-facing grant drafts are complete canonical requests: they name bounded
 actions and descriptors together with every instance, repository, state,
 deployment, host, epoch, fence, candidate, profile, guidance, store, record,

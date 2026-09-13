@@ -422,7 +422,7 @@ class CodexWorkerAdapter:
         checkpoint_turn: Callable[[str, str], None],
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
         checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
-        advisory_execution: SealedRoleExecution | None = None,
+        advisory_execution: SealedRoleExecution,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -433,13 +433,12 @@ class CodexWorkerAdapter:
 
         if type(request) is not CodexWorkerRequest or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexWorkerError("Worker dispatch is invalid")
-        if advisory_execution is not None:
-            if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
-                raise CodexWorkerError("Worker advisory admission is invalid")
-            try:
-                advisory_execution.require_before_effect()
-            except RoleCapabilityError as error:
-                raise CodexWorkerError("Worker advisory admission is denied") from error
+        if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
+            raise CodexWorkerError("Worker advisory admission is unavailable")
+        try:
+            advisory_execution.require_before_effect()
+        except RoleCapabilityError as error:
+            raise CodexWorkerError("Worker advisory admission is denied") from error
         session_identity: str | None = None
         turn_identity: str | None = None
         session: NativeWorkerSession | None = None

@@ -248,6 +248,7 @@ from .codex_dependency_review import (
 )
 from .configuration import RepositoryIdentity
 from .dependency_review import AffectedSubset, DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, SourceOwnedRelation
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution
 from .provider_health import ProviderHealthAuditIdentity
 DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
     {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
@@ -296,6 +297,7 @@ class DependencyReviewRequestInputs:
     audit: ProviderHealthAuditIdentity
     attempt_id: str
     ready_at: int
+    advisory_execution: SealedRoleExecution | None = field(repr=False, compare=False, default=None)
     backend: NativeCodexDependencyReviewBackend | None = field(repr=False, compare=False, default=None)
     source_owned_relations: tuple[SourceOwnedRelation, ...] = ()
     supersedes_attempt_id: str | None = None
@@ -310,6 +312,8 @@ class DependencyReviewRequestInputs:
             or not _safe_token(self.attempt_id)
             or self.attempt_id != self.subset.snapshot_id
             or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.advisory_execution) is not SealedRoleExecution
+            or self.advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW
             or (self.backend is not None and not callable(getattr(self.backend, "open_fresh_session", None)))
             or type(self.source_owned_relations) is not tuple
             or any(type(item) is not SourceOwnedRelation for item in self.source_owned_relations)
@@ -876,7 +880,7 @@ class DependencyReviewAttemptAdapter:
             result = DependencyReviewService().run(
                 host.repository, host.subset, attempt_id=binding.case_id,
                 binding=host.binding, adapter=host.adapter,
-                checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn,
+                checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn, advisory_execution=host.advisory_execution,
                 source_owned_relations=host.source_owned_relations,
                 supersedes_attempt_id=host.supersedes_attempt_id,
             )
@@ -5327,6 +5331,7 @@ def _prepare_dependency_review_attempt_request(
     try:
         host_inputs = prepare_dependency_review_host(
             inputs.repository, inputs.subset, inputs.binding, inputs.audit, backend=inputs.backend,
+            advisory_execution=inputs.advisory_execution,
             source_owned_relations=inputs.source_owned_relations,
             supersedes_attempt_id=inputs.supersedes_attempt_id,
         )

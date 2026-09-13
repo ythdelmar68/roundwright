@@ -11,12 +11,12 @@
     "artifacts": [
       {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"ad19697a2892b68217557888e0ada431c18a827222d99a0bf634e5c245940fa8"},
       {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"7a60e9c0d1ad684bf917324b1e26ccb1ff16672bbb8b965742282d80d8430ea6"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"fd3055afc6b92cadefccd7fb26f738aa831f5ba3d96f05ec771a34c151533fd6"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"bc065c30edfe42faa806b1cf197d50eb7b1027657cfb5171bfbc87b5946fd082"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
-      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"97e5d271605df782ee0a9bce973af0ca91a1eb6a04583ae83ba5e89872594220"},
-      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"602de17fb2574b38c181da622be52fad7cdcedf20943bc4b6c9c24d0ba3f0e62"},
-      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"df4c1e393528306927bbdefb7e39583ef59f8d859fa7374b7162c12964174986"}
+      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"ddcf9b9765ad30f65c999547f01ec2ea95cbf5af55c3b4b03cbf39624b7964d6"},
+      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"f9f3f4f5bc1e4e10f6d5104236043d649f72632b18e571470f5a24a74915a379"},
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"22c8ce634dda6f4682e4917a445cd89d9538db6360d10a399fbbf5e83c6621f1"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

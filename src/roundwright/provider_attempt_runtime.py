@@ -29,6 +29,7 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
@@ -251,6 +252,7 @@ class DiffReviewSequenceEntry:
     """One closed, pre-authorized Supervisor position in a bounded round."""
 
     selection: DiffReviewSelection
+    advisory_execution: SealedRoleExecution
     recovery: RecoveryContext
     audit: ProviderHealthAuditIdentity
     backend: NativeCodexSupervisorBackend
@@ -325,6 +327,8 @@ class DurableDiffReviewRunner:
                 or not callable(getattr(item.backend, "open_fresh_session", None))
                 for item in entries
             )
+            or type(self.advisory_execution) is not SealedRoleExecution
+            or self.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
         deadline = self.completion_policy.deadline()
@@ -371,6 +375,10 @@ class DurableDiffReviewRunner:
     def execute(self) -> tuple[str, ...]:
         """Dispatch one bounded sequence and return only durable attempt IDs."""
 
+        try:
+            self.advisory_execution.require_before_effect()
+        except RoleCapabilityError as error:
+            raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
         entries = self.preflight_checkpoint_prerequisites()
         first = entries[0]
         try:
@@ -645,6 +653,7 @@ class DurableDiffReviewRunner:
         try:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+                advisory_execution=self.advisory_execution,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(
@@ -846,6 +855,7 @@ class ProviderAttemptHostInputs:
     selection: DiffReviewSelection
     backend: NativeCodexSupervisorBackend | None = None
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
+    advisory_execution: SealedRoleExecution | None = None
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
 
 
@@ -858,8 +868,12 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     existing backend protocol seam.
     """
 
-    if type(host) is not ProviderAttemptHostInputs:
+    if type(host) is not ProviderAttemptHostInputs or type(host.advisory_execution) is not SealedRoleExecution or host.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
         raise ProviderAttemptRuntimeError("provider attempt host inputs are invalid")
+    try:
+        host.advisory_execution.require_before_effect()
+    except RoleCapabilityError as error:
+        raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
     descriptor = ProviderAttemptRuntimeDescriptor.parse(descriptor_value)
     completion_policy = ProviderAttemptCompletionPolicy.parse(descriptor.completion_policy)
     if (
@@ -912,7 +926,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         provider_profile_identity=descriptor.provider_profile_identity,
         review_epoch=descriptor.review_epoch, review_round=descriptor.review_round,
         dependency_binding=host.dependency_binding, dispatch_control=host.dispatch_control,
-        audit=audit, backend=backend, selection=host.selection, sequence=host.sequence,
+        audit=audit, backend=backend, selection=host.selection, sequence=host.sequence, advisory_execution=host.advisory_execution,
         completion_policy=completion_policy,
     )
     return prepare_context(
@@ -942,6 +956,7 @@ def install_durable_diff_review_runtime(
     audit: ProviderHealthAuditIdentity,
     backend: NativeCodexSupervisorBackend,
     selection: DiffReviewSelection,
+    advisory_execution: SealedRoleExecution,
     sequence: tuple[DiffReviewSequenceEntry, ...] = (),
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY,
 ) -> None:
@@ -955,7 +970,7 @@ def install_durable_diff_review_runtime(
     runner = DurableDiffReviewRunner(
         repository, identity, recovery, worktree, seal, lease, dependency_binding,
         dispatch_control, audit, backend, source_digest, review_epoch, review_round,
-        selection, sequence, completion_policy, case_id, ready_at,
+        selection, advisory_execution, sequence, completion_policy, case_id, ready_at,
     )
     RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
         repository, identity, recovery, lease, seal, worktree, source_digest,

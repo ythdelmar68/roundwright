@@ -31,8 +31,10 @@ from roundwright.dependency_review import (
 )
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
+from role_admission_fixture import sealed_execution
 
 
 def digest(character: str) -> str:
@@ -77,6 +79,10 @@ class Backend:
 
 
 class DependencyReviewServiceTests(unittest.TestCase):
+    @staticmethod
+    def admission(profile):
+        return sealed_execution(AdvisoryRole.DEPENDENCY_REVIEW, profile)
+
     def repository(self, root: Path) -> RepositoryIdentity:
         repository = object.__new__(RepositoryIdentity)
         object.__setattr__(repository, "root", root.resolve())
@@ -208,7 +214,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116")))
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
-            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda session: self.assertEqual(session, "session-116"), checkpoint_turn=lambda session, turn: self.assertEqual((session, turn), ("session-116", "turn-116")), source_owned_relations=(SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda session: self.assertEqual(session, "session-116"), checkpoint_turn=lambda session, turn: self.assertEqual((session, turn), ("session-116", "turn-116")), advisory_execution=self.admission(profile), source_owned_relations=(SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
             self.assertEqual(result.kind, DependencyReviewResultKind.ACCEPTED)
             self.assertEqual(len(backend.sessions), 1)
             request = backend.sessions[0].requests[0]
@@ -240,6 +246,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 adapter=CodexDependencyReviewAdapter(backend, profile, audit),
                 checkpoint_session=lambda _session: None,
                 checkpoint_turn=lambda _session, _turn: None,
+                advisory_execution=self.admission(profile),
             )
             self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.INVALID, "tool-event-observed"))
             snapshot = DependencyReviewStore().terminal_snapshot(repository, attempt_id="attempt-116", binding=binding)
@@ -253,7 +260,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
-            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=CodexDependencyReviewAdapter(backend, profile, audit), checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None)
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=CodexDependencyReviewAdapter(backend, profile, audit), checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None, advisory_execution=self.admission(profile))
             self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn"))
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -272,6 +279,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 repository, subset, attempt_id="attempt-116", binding=binding,
                 adapter=CodexDependencyReviewAdapter(backend, profile, audit),
                 checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                advisory_execution=self.admission(profile),
             )
             self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
 
@@ -287,6 +295,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 repository, subset, attempt_id="attempt-116", binding=binding,
                 adapter=CodexDependencyReviewAdapter(backend, profile, audit),
                 checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                advisory_execution=self.admission(profile),
             )
             self.assertEqual(result.kind, DependencyReviewResultKind.AMBIGUOUS)
             DependencyReviewStore().require_turn_claim(
@@ -384,7 +393,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal(subset.snapshot_id)))
             base_sha = "a" * 40
             inputs = external_validation.DependencyReviewRequestInputs(
-                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
+                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, self.admission(audit.profile), backend,
             )
             prepared, readiness, capsule = external_validation.prepare_dependency_review_attempt_profile(inputs, Path(temporary).resolve())
             self.assertEqual(prepared.native_control_digest, dependency_review_native_control_digest())
@@ -421,7 +430,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 external_validation.materialize_dependency_review_attempt_profile(capsule, Path(temporary).resolve())
             self.assertEqual(len(backend.sessions), 0)
             fresh_inputs = external_validation.DependencyReviewRequestInputs(
-                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
+                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, self.admission(audit.profile), backend,
             )
             _prepared, _readiness, fresh_capsule = external_validation.prepare_dependency_review_attempt_profile(fresh_inputs, Path(temporary).resolve())
             external_validation.materialize_dependency_review_attempt_profile(fresh_capsule, Path(temporary).resolve())

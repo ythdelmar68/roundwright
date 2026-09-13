@@ -15,8 +15,10 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, WorkerAction, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerResultKind, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import ExternalCapturePlanReceipt, ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
+from role_admission_fixture import sealed_execution
 
 
 def digest(value: object) -> str:
@@ -78,7 +80,7 @@ class WorkerShadowTests(unittest.TestCase):
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, self.readiness.capture_plan_digest, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
-        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}:{'' if category is None else category.value}"))
+        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, sealed_execution(AdvisoryRole.WORKER, self.adapter._profile), checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}:{'' if category is None else category.value}"))
 
     def test_profile_declares_arm_before_and_recapture(self):
         profile = worker_adapter_shadow_profile()

@@ -17,11 +17,17 @@ disabled. Missing, stale, revoked, copied, reassigned, expanded, or unknown
 evidence denies the request. The admission-record reader requires the existing
 candidate/Git-entrypoint control that validates authoritative `origin/main`;
 it cannot be constructed from a role-local path alone. The shared pre-effect gate
-rereads that Git blob with current evidence time before every use. Guidance derives only the root-to-task
+rereads that Git blob using its sealed runtime clock before every use. Guidance derives only the root-to-task
 `AGENTS.md` chain at the pinned tree; candidate, global, unrelated, and ambient
 instructions are prohibited. A typed pre-effect gate is defined for Worker,
 Supervisor, dependency-review, and both advisory seams. No advisory dispatch
 is enabled in those existing runtime seams today.
+
+Owner-facing grant drafts are complete canonical requests: they name bounded
+actions and descriptors together with every instance, repository, state,
+deployment, host, epoch, fence, candidate, profile, guidance, store, record,
+authority, validity, and revocation binding. An owner selects the named existing
+grant; they never calculate a replacement identifier.
 
 ## Roles
 

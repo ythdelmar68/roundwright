@@ -20,6 +20,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -134,10 +135,17 @@ class CodexDependencyReviewAdapter:
         return self._audit.profile_identity
 
     def dispatch(
-        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None],
+        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution | None = None,
     ) -> DependencyReviewDispatchResult:
         if type(request) is not DependencyReviewRequest or request.profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise DependencyReviewDispatchError("dependency review dispatch is invalid")
+        if advisory_execution is not None:
+            if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
+                raise DependencyReviewDispatchError("dependency review advisory admission is invalid")
+            try:
+                advisory_execution.require_before_effect()
+            except RoleCapabilityError as error:
+                raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         session = None
         turn = None
         session_id = None

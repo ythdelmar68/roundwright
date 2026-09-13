@@ -28,6 +28,9 @@ class RoleCapabilityError(ValueError):
 
 
 class AdvisoryRole(str, Enum):
+    WORKER = "worker"
+    SUPERVISOR = "supervisor"
+    DEPENDENCY_REVIEW = "dependency-review"
     RECOVERY_ADVISOR = "recovery-advisor"
     OWNER_INTENT_INTERPRETER = "owner-intent-interpreter"
 
@@ -526,6 +529,18 @@ class AdvisoryRoleContract:
         return {"schema": "roundwright-advisory-role-contract-receipt/v3", "role": self.profile.role.value, "profile_identity": self.profile.profile_identity, "guidance_receipt_digest": self.guidance.receipt_digest, "instance_receipt_digest": self.instance.receipt_digest, "admission_receipt_digest": None if self.admission is None else self.admission.grant.receipt_digest, "capabilities": effective, "status": status.value, "effective_authority": "disabled"}
 
 
+@dataclass(frozen=True)
+class SealedRoleExecution:
+    """Typed pre-effect capsule carried only to a matching production seam."""
+    contract: AdvisoryRoleContract
+    seam: RoleExecutionSeam
+    store: FileRoleAdmissionStore
+    expectation: RoleAdmissionExpectation
+
+    def require_before_effect(self) -> dict[str, object]:
+        return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
+
+
 def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, expectation: RoleAdmissionExpectation, owner_readable_reason: str, budget: RoleBudget, valid_from: int, valid_until: int, revocation_readback_digest: str) -> dict[str, object]:
     if type(instance) is not DedicatedRoleInstance or type(scope) is not RoleScope or type(expectation) is not RoleAdmissionExpectation or type(owner_readable_reason) is not str or not owner_readable_reason.strip():
         raise RoleCapabilityError("grant draft is invalid")
@@ -537,7 +552,7 @@ def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, exp
 def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleExecutionSeam, *, store: FileRoleAdmissionStore, expectation: RoleAdmissionExpectation) -> dict[str, object]:
     if type(contract) is not AdvisoryRoleContract or type(seam) is not RoleExecutionSeam:
         raise RoleCapabilityError("role execution seam is invalid")
-    allowed = {RoleExecutionSeam.RECOVERY_ADVISOR: AdvisoryRole.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: AdvisoryRole.OWNER_INTENT_INTERPRETER}
+    allowed = {RoleExecutionSeam.WORKER: AdvisoryRole.WORKER, RoleExecutionSeam.SUPERVISOR: AdvisoryRole.SUPERVISOR, RoleExecutionSeam.DEPENDENCY_REVIEW: AdvisoryRole.DEPENDENCY_REVIEW, RoleExecutionSeam.RECOVERY_ADVISOR: AdvisoryRole.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: AdvisoryRole.OWNER_INTENT_INTERPRETER}
     if seam not in allowed or allowed[seam] is not contract.profile.role:
         raise RoleCapabilityError("role is not admitted for this execution seam")
     fresh, instance = read_verified_admission(expectation=expectation, store=store)

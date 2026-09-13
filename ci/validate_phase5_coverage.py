@@ -40,6 +40,9 @@ ISSUE_136_ARTIFACTS = {
     "advisory-migration-v2": "docs/migration/issue-136-trusted-advisory-role-coverage.md",
     "advisory-authority-model-v2": "docs/architecture/authority-model.md",
     "advisory-configuration-v1": "src/roundwright/configuration.py",
+    "advisory-worker-seam-v1": "src/roundwright/codex_worker.py",
+    "advisory-supervisor-seam-v1": "src/roundwright/codex_supervisor.py",
+    "advisory-dependency-review-seam-v1": "src/roundwright/codex_dependency_review.py",
 }
 
 # This is intentionally independent of the rendered map.  Adding, dropping,

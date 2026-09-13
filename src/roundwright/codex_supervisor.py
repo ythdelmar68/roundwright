@@ -18,6 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
 
 
 class CodexSupervisorError(ValueError):
@@ -256,9 +257,16 @@ class CodexSupervisorAdapter:
     def runtime_fingerprint(self) -> str:
         return self._audit.runtime_fingerprint
 
-    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]) -> CodexSupervisorResult:
+    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution | None = None) -> CodexSupervisorResult:
         if type(request) is not CodexSupervisorRequest or request.selected_profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexSupervisorError("Supervisor dispatch is invalid")
+        if advisory_execution is not None:
+            if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
+                raise CodexSupervisorError("Supervisor advisory admission is invalid")
+            try:
+                advisory_execution.require_before_effect()
+            except RoleCapabilityError as error:
+                raise CodexSupervisorError("Supervisor advisory admission is denied") from error
         session: NativeSupervisorSession | None = None
         turn: NativeSupervisorTurn | None = None
         session_identity: str | None = None

@@ -21,7 +21,12 @@ rereads that Git blob using its sealed runtime clock before every use. Guidance 
 `AGENTS.md` chain at the pinned tree; candidate, global, unrelated, and ambient
 instructions are prohibited. A typed pre-effect gate is defined for Worker,
 Supervisor, dependency-review, and both advisory seams. No advisory dispatch
-is enabled in those existing runtime seams today.
+is enabled in those existing runtime seams today. When an advisory capsule is
+provided, the persistent Worker, fresh Supervisor, and dependency-review
+adapters call its matching sealed pre-effect gate before opening a provider
+session; a mismatched or denied capsule opens no session. Recovery Advisor and
+Owner Intent Interpreter retain their explicit non-dispatching gates until a
+dedicated provider route is introduced.
 
 Owner-facing grant drafts are complete canonical requests: they name bounded
 actions and descriptors together with every instance, repository, state,

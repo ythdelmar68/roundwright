@@ -22,7 +22,7 @@ from roundwright.role_capability_policy import AdvisoryRole
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 
 
 def digest(value: object) -> str:

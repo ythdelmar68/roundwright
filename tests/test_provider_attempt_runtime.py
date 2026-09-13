@@ -49,7 +49,7 @@ from tests.provider_health_fixture import provider_context
 import tests.test_candidate_review as _candidate_test_module
 from tests.test_codex_supervisor import Backend
 from tests.test_external_validation import fake_harness
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 
 
 def digest(character: str) -> str:

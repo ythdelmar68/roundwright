@@ -34,7 +34,7 @@ from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, Prov
 from roundwright.role_capability_policy import AdvisoryRole
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 
 
 def digest(character: str) -> str:

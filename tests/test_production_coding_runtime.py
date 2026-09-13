@@ -17,7 +17,7 @@ from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 from roundwright.worker_toolbox import CODING_RUNTIME_REGISTRY, CodingDispatchReceipt, CodingWorkerRuntimeDescriptor, ProductionCodingWorkerEntrypointInputs, ProductionCodingWorkerRuntime, run_production_coding_worker, run_registered_production_coding_worker
 from roundwright.worker_shadow import WorkerShadowError
 

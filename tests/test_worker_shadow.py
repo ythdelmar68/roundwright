@@ -18,7 +18,7 @@ from roundwright.provider_health import CodexCapability, CodexFailure, CodexRunt
 from roundwright.role_capability_policy import AdvisoryRole
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import ExternalCapturePlanReceipt, ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 
 
 def digest(value: object) -> str:

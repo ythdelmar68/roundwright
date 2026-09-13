@@ -27,7 +27,7 @@ from roundwright.codex_supervisor import (
 from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.role_capability_policy import AdvisoryRole
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt

@@ -28,7 +28,7 @@ from roundwright.codex_worker import (
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole
-from role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import sealed_execution
 
 
 def digest(value: str) -> str:

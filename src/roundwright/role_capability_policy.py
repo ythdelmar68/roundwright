@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -76,7 +77,15 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _IDENTITY = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-_WINDOWS_RESERVED = frozenset({"con", "prn", "aux", "nul", *(f"com{number}" for number in range(1, 10)), *(f"lpt{number}" for number in range(1, 10))})
+# Win32 reserves these device stems irrespective of extension and treats
+# compatibility characters, trailing spaces, and trailing dots as aliases.
+# Keep this table explicit: accepting an alias here would make a path scope
+# mean something different to the Git reader and to the eventual Windows host.
+_WINDOWS_RESERVED = frozenset({
+    "con", "prn", "aux", "nul", "clock$", "conin$", "conout$",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+})
 _ADMISSION_SEAL = object()
 _RUNTIME_SEAL = object()
 _REVIEWED_SDK_CODES = {
@@ -118,8 +127,12 @@ def _relative_path(value: object) -> str:
     if path.is_absolute() or re.match(r"^[A-Za-z]:", value) or any(part in {"", ".", ".."} for part in path.parts) or path.as_posix() != value:
         raise RoleCapabilityError("relative path is invalid")
     for part in path.parts:
-        stem = part.split(".", 1)[0].casefold()
-        if ":" in part or part.endswith((".", " ")) or stem in _WINDOWS_RESERVED:
+        # NFKC maps e.g. COM¹ to COM1.  Windows treats the latter as a device
+        # alias, so reject compatibility spellings rather than normalising and
+        # accidentally widening a caller-selected scope.
+        normalized = unicodedata.normalize("NFKC", part)
+        stem = normalized.split(".", 1)[0].rstrip(". ").casefold()
+        if normalized != part or ":" in part or any(ord(character) < 32 for character in part) or part.endswith((".", " ")) or stem in _WINDOWS_RESERVED:
             raise RoleCapabilityError("relative path is invalid")
     return path.as_posix()
 
@@ -421,6 +434,7 @@ class RoleAdmissionExpectation:
     deployment_identity: str
     host_identity: str
     authority_epoch: int
+    candidate_sha: str
     scope_identity: str
     actions: frozenset[RoleCapability]
     valid_from: int
@@ -431,22 +445,22 @@ class RoleAdmissionExpectation:
         for value, label in ((self.store_identity, "admission store"), (self.record_digest, "admission record"), (self.authority_receipt_digest, "expected authority"), (self.instance_receipt_digest, "expected instance"), (self.repository_identity, "expected repository"), (self.state_identity, "expected state"), (self.deployment_identity, "expected deployment"), (self.host_identity, "expected host"), (self.scope_identity, "expected scope"), (self.revocation_readback_digest, "expected revocation read-back")):
             _require_digest(value, label)
         _require_identity(self.grant_reference, "grant reference"); _require_identity(self.task_identity, "expected task")
-        if type(self.authority_epoch) is not int or self.authority_epoch < 1 or type(self.actions) is not frozenset or not self.actions or any(type(item) is not RoleCapability for item in self.actions) or type(self.valid_from) is not int or type(self.valid_until) is not int or self.valid_until < self.valid_from:
+        if type(self.authority_epoch) is not int or self.authority_epoch < 1 or type(self.candidate_sha) is not str or _SHA.fullmatch(self.candidate_sha) is None or type(self.actions) is not frozenset or not self.actions or any(type(item) is not RoleCapability for item in self.actions) or type(self.valid_from) is not int or type(self.valid_until) is not int or self.valid_until < self.valid_from:
             raise RoleCapabilityError("role admission expectation is invalid")
 
 
 class SealedRoleRuntimeContext:
     """Factory-sealed authoritative Git/control context for advisory admission."""
-    __slots__ = ("root", "common_dir", "binding", "git_entrypoint_control", "tree", "_seal")
+    __slots__ = ("root", "common_dir", "binding", "git_entrypoint_control", "tree", "task_candidate_sha", "_seal")
 
-    def __init__(self, root: Path, common_dir: Path, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl, tree: str, *, _seal: object | None = None) -> None:
+    def __init__(self, root: Path, common_dir: Path, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl, tree: str, task_candidate_sha: str, *, _seal: object | None = None) -> None:
         if _seal is not _RUNTIME_SEAL:
             raise RoleCapabilityError("role runtime context must be resolved by authoritative control")
-        self.root, self.common_dir, self.binding, self.git_entrypoint_control, self.tree, self._seal = root, common_dir, binding, git_entrypoint_control, tree, _seal
+        self.root, self.common_dir, self.binding, self.git_entrypoint_control, self.tree, self.task_candidate_sha, self._seal = root, common_dir, binding, git_entrypoint_control, tree, task_candidate_sha, _seal
 
 
-def resolve_sealed_role_runtime_context(*, root: Path, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl) -> SealedRoleRuntimeContext:
-    if type(binding) is not CandidateBinding or type(git_entrypoint_control) is not GitEntrypointControl:
+def resolve_sealed_role_runtime_context(*, root: Path, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl, task_candidate_sha: str) -> SealedRoleRuntimeContext:
+    if type(binding) is not CandidateBinding or type(git_entrypoint_control) is not GitEntrypointControl or type(task_candidate_sha) is not str or _SHA.fullmatch(task_candidate_sha) is None or task_candidate_sha == binding.candidate_sha:
         raise RoleCapabilityError("role runtime control is invalid")
     try:
         authoritative = _validated_authoritative_repository(root, binding=binding, control=git_entrypoint_control)
@@ -454,7 +468,7 @@ def resolve_sealed_role_runtime_context(*, root: Path, binding: CandidateBinding
         tree = _git(authoritative, "rev-parse", f"{binding.candidate_sha}^{{tree}}").decode().strip()
     except Exception as error:
         raise RoleCapabilityError("role runtime control is unavailable") from error
-    return SealedRoleRuntimeContext(authoritative, common_dir, binding, git_entrypoint_control, tree, _seal=_RUNTIME_SEAL)
+    return SealedRoleRuntimeContext(authoritative, common_dir, binding, git_entrypoint_control, tree, task_candidate_sha, _seal=_RUNTIME_SEAL)
 
 
 class FileRoleAdmissionStore:
@@ -467,8 +481,8 @@ class FileRoleAdmissionStore:
 
     def read(self) -> Mapping[str, object]:
         try:
-            runtime = resolve_sealed_role_runtime_context(root=self._runtime.root, binding=self._runtime.binding, git_entrypoint_control=self._runtime.git_entrypoint_control)
-            if runtime.common_dir != self._runtime.common_dir or runtime.tree != self._runtime.tree:
+            runtime = resolve_sealed_role_runtime_context(root=self._runtime.root, binding=self._runtime.binding, git_entrypoint_control=self._runtime.git_entrypoint_control, task_candidate_sha=self._runtime.task_candidate_sha)
+            if runtime.common_dir != self._runtime.common_dir or runtime.tree != self._runtime.tree or runtime.task_candidate_sha != self._runtime.task_candidate_sha:
                 raise RoleCapabilityError("authoritative role runtime has drifted")
             raw = _git(runtime.root, "show", f"{runtime.binding.candidate_sha}:{self._relative}")
             parsed = json.loads(raw)
@@ -521,7 +535,7 @@ def read_verified_admission(*, expectation: RoleAdmissionExpectation, store: Fil
     if "sha256:" + hashlib.sha256(_canonical_record(record)).hexdigest() != expectation.record_digest:
         raise RoleCapabilityError("independent admission record digest has drifted")
     authority, instance, scope, grant, revoked, reference, revocation = _parse_record(record)
-    if (reference != expectation.grant_reference or authority.receipt_digest != expectation.authority_receipt_digest or instance.receipt_digest != expectation.instance_receipt_digest or grant.authority_receipt_digest != authority.receipt_digest or grant.instance_receipt_digest != instance.receipt_digest or grant.scope_identity != scope.identity or scope.identity != expectation.scope_identity or scope.actions != expectation.actions or revocation != expectation.revocation_readback_digest or authority.revocation_identity != revocation or (instance.repository_identity, instance.task_identity, instance.state_identity, instance.deployment_identity, instance.host_identity, instance.authority_epoch) != (expectation.repository_identity, expectation.task_identity, expectation.state_identity, expectation.deployment_identity, expectation.host_identity, expectation.authority_epoch) or (authority.repository_identity, authority.task_identity, authority.deployment_identity, authority.authority_epoch) != (expectation.repository_identity, expectation.task_identity, expectation.deployment_identity, expectation.authority_epoch) or grant.issued_at != expectation.valid_from or grant.expires_at != expectation.valid_until or not grant.issued_at <= evidence_time <= grant.expires_at or evidence_time > authority.expires_at or revoked):
+    if (reference != expectation.grant_reference or authority.receipt_digest != expectation.authority_receipt_digest or instance.receipt_digest != expectation.instance_receipt_digest or instance.candidate_sha != expectation.candidate_sha or instance.candidate_sha != store._runtime.task_candidate_sha or grant.authority_receipt_digest != authority.receipt_digest or grant.instance_receipt_digest != instance.receipt_digest or grant.scope_identity != scope.identity or scope.identity != expectation.scope_identity or scope.actions != expectation.actions or revocation != expectation.revocation_readback_digest or authority.revocation_identity != revocation or (instance.repository_identity, instance.task_identity, instance.state_identity, instance.deployment_identity, instance.host_identity, instance.authority_epoch) != (expectation.repository_identity, expectation.task_identity, expectation.state_identity, expectation.deployment_identity, expectation.host_identity, expectation.authority_epoch) or (authority.repository_identity, authority.task_identity, authority.deployment_identity, authority.authority_epoch) != (expectation.repository_identity, expectation.task_identity, expectation.deployment_identity, expectation.authority_epoch) or grant.issued_at != expectation.valid_from or grant.expires_at != expectation.valid_until or not grant.issued_at <= evidence_time <= grant.expires_at or evidence_time > authority.expires_at or revoked):
         raise RoleCapabilityError("independent role admission does not match its pinned expectation")
     return VerifiedRoleAdmission(authority, grant, scope, evidence_time, revoked, reference, _seal=_ADMISSION_SEAL), instance
 
@@ -559,7 +573,12 @@ class SealedRoleExecution:
 
     def require_before_effect(self) -> dict[str, object]:
         expected_views = {RoleExecutionSeam.WORKER: GuidanceView.WORKER, RoleExecutionSeam.SUPERVISOR: GuidanceView.SUPERVISOR, RoleExecutionSeam.DEPENDENCY_REVIEW: GuidanceView.DEPENDENCY_REVIEW, RoleExecutionSeam.RECOVERY_ADVISOR: GuidanceView.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: GuidanceView.OWNER_INTENT_INTERPRETER}
-        if self.guidance_evidence.view is not expected_views[self.seam] or self.guidance_evidence.guidance_receipt_digest != self.contract.guidance.receipt_digest:
+        runtime = self.store._runtime
+        if (self.guidance_evidence.view is not expected_views[self.seam]
+                or self.guidance_evidence.guidance_receipt_digest != self.contract.guidance.receipt_digest
+                or self.guidance_evidence.accepted_main_sha != runtime.binding.candidate_sha
+                or self.guidance_evidence.task_candidate_sha != runtime.task_candidate_sha
+                or self.expectation.candidate_sha != runtime.task_candidate_sha):
             raise RoleCapabilityError("provider guidance evidence does not match the role seam")
         return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
 
@@ -567,7 +586,11 @@ class SealedRoleExecution:
 def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, expectation: RoleAdmissionExpectation, owner_readable_reason: str, budget: RoleBudget, valid_from: int, valid_until: int, revocation_readback_digest: str) -> dict[str, object]:
     if type(instance) is not DedicatedRoleInstance or type(scope) is not RoleScope or type(expectation) is not RoleAdmissionExpectation or type(owner_readable_reason) is not str or not owner_readable_reason.strip():
         raise RoleCapabilityError("grant draft is invalid")
-    if type(budget) is not RoleBudget or type(valid_from) is not int or type(valid_until) is not int or valid_until < valid_from or _DIGEST.fullmatch(revocation_readback_digest) is None or (valid_from, valid_until, revocation_readback_digest) != (expectation.valid_from, expectation.valid_until, expectation.revocation_readback_digest):
+    if (type(budget) is not RoleBudget or type(valid_from) is not int or type(valid_until) is not int or valid_until < valid_from or _DIGEST.fullmatch(revocation_readback_digest) is None
+            or (valid_from, valid_until, revocation_readback_digest) != (expectation.valid_from, expectation.valid_until, expectation.revocation_readback_digest)
+            or instance.receipt_digest != expectation.instance_receipt_digest or instance.candidate_sha != expectation.candidate_sha
+            or (instance.repository_identity, instance.task_identity, instance.state_identity, instance.deployment_identity, instance.host_identity, instance.authority_epoch) != (expectation.repository_identity, expectation.task_identity, expectation.state_identity, expectation.deployment_identity, expectation.host_identity, expectation.authority_epoch)
+            or scope.identity != expectation.scope_identity or scope.actions != expectation.actions):
         raise RoleCapabilityError("grant draft bindings are invalid")
     return {"schema": "roundwright-advisory-grant-draft/v3", "role": instance.role.value, "task": instance.task_identity, "instance": instance.instance_identity, "repository": instance.repository_identity, "state": instance.state_identity, "deployment": instance.deployment_identity, "host": instance.host_identity, "epoch": instance.authority_epoch, "fence": instance.replacement_fence, "candidate": instance.candidate_sha, "profile": instance.profile_identity, "guidance": instance.guidance_receipt_digest, "requested_actions": sorted(item.value for item in scope.actions), "scope": [{"kind": item.kind.value, "root": item.root_identity, "value": item.value} for item in scope.descriptors], "budget": {"max_calls": budget.max_calls, "max_duration_seconds": budget.max_duration_seconds, "max_tokens": budget.max_tokens}, "validity": {"not_before": valid_from, "not_after": valid_until}, "authority": expectation.authority_receipt_digest, "grant": expectation.grant_reference, "store": expectation.store_identity, "record": expectation.record_digest, "revocation_readback": revocation_readback_digest, "evidence": "independent owner/deployment record required", "reason": owner_readable_reason.strip(), "owner_action": "Select the listed existing grant reference; do not calculate replacement identifiers."}
 

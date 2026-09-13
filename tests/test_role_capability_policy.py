@@ -24,7 +24,7 @@ from roundwright.git_identity import GitEntrypointControl
 from roundwright.role_capability_policy import (
     AdvisoryRole, AdvisoryRoleContract, AdvisoryRoleStatus,
     AuthoritativeGuidanceExpectation, DedicatedRoleInstance,
-    FileRoleAdmissionStore, GuidanceView, RoleAdmissionExpectation, SealedRoleRuntimeContext,
+    FileRoleAdmissionStore, GuidanceView, ProviderGuidanceEvidence, RoleAdmissionExpectation, SealedRoleExecution, SealedRoleRuntimeContext,
     RoleCapability, RoleCapabilityError, RoleCapabilityGrant, RoleExecutionSeam,
     RoleScope, ScopeKind, ScopedDescriptor, SdkAdapterMapping,
     TrustedRoleAuthorityReceipt, default_advisory_profiles,
@@ -60,9 +60,10 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         preliminary_binding, preliminary_control = self._control()
         tree = self._git("rev-parse", "HEAD^{tree}").decode().strip()
         preliminary_expectation = AuthoritativeGuidanceExpectation(digest("a"), self.root, self.revision, self._digest({"tree": tree, "repository": digest("a")}))
-        preliminary_runtime = resolve_sealed_role_runtime_context(root=self.root, binding=preliminary_binding, git_entrypoint_control=preliminary_control)
+        self.task_candidate = "a" * 40
+        preliminary_runtime = resolve_sealed_role_runtime_context(root=self.root, binding=preliminary_binding, git_entrypoint_control=preliminary_control, task_candidate_sha=self.task_candidate)
         self.guidance = resolve_authoritative_guidance(expectation=preliminary_expectation, view=GuidanceView.RECOVERY_ADVISOR, task_relative_path="src/nested/task.py", runtime=preliminary_runtime)
-        self.instance = DedicatedRoleInstance("recovery-136", AdvisoryRole.RECOVERY_ADVISOR, self.recovery.profile_identity, self.guidance.receipt_digest, digest("c"), "task-136", digest("d"), digest("e"), digest("f"), 1, "generation-1", "0" * 40)
+        self.instance = DedicatedRoleInstance("recovery-136", AdvisoryRole.RECOVERY_ADVISOR, self.recovery.profile_identity, self.guidance.receipt_digest, digest("c"), "task-136", digest("d"), digest("e"), digest("f"), 1, "generation-1", self.task_candidate)
         self.scope = RoleScope(frozenset({RoleCapability.READ_TRUSTED_GUIDANCE, RoleCapability.READ_ONLY_REVIEW}), (ScopedDescriptor(ScopeKind.PATH, digest("c"), "src/nested"),))
         self.now = int(time.time())
         self.authority = TrustedRoleAuthorityReceipt(digest("c"), "task-136", digest("e"), 1, digest("1"), self.now + 120, digest("2"))
@@ -70,9 +71,9 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         self.record = {"schema": "roundwright-independent-role-admission/v1", "grant_reference": "grant-136", "authority": self.authority.__dict__, "instance": self.instance.__dict__, "scope": {"actions": sorted(item.value for item in self.scope.actions), "descriptors": [{"kind": item.kind.value, "root_identity": item.root_identity, "value": item.value} for item in self.scope.descriptors]}, "grant": self.grant.__dict__, "revoked": False, "revocation_readback_digest": digest("2")}
         Path(self.root, "admission.json").write_bytes(canonical(self.record)); self._git("add", "admission.json"); self._git("commit", "-qm", "admission")
         self.revision = self._git("rev-parse", "HEAD").decode().strip(); self._git("update-ref", "refs/remotes/origin/main", self.revision)
-        self.expectation = RoleAdmissionExpectation(digest("3"), "sha256:" + hashlib.sha256(canonical(self.record)).hexdigest(), "grant-136", self.authority.receipt_digest, self.instance.receipt_digest, digest("c"), "task-136", digest("d"), digest("e"), digest("f"), 1, self.scope.identity, self.scope.actions, self.now - 10, self.now + 60, digest("2"))
+        self.expectation = RoleAdmissionExpectation(digest("3"), "sha256:" + hashlib.sha256(canonical(self.record)).hexdigest(), "grant-136", self.authority.receipt_digest, self.instance.receipt_digest, digest("c"), "task-136", digest("d"), digest("e"), digest("f"), 1, self.task_candidate, self.scope.identity, self.scope.actions, self.now - 10, self.now + 60, digest("2"))
         self.binding, self.control = self._control()
-        self.runtime = resolve_sealed_role_runtime_context(root=self.root, binding=self.binding, git_entrypoint_control=self.control)
+        self.runtime = resolve_sealed_role_runtime_context(root=self.root, binding=self.binding, git_entrypoint_control=self.control, task_candidate_sha=self.task_candidate)
         self.store = FileRoleAdmissionStore(runtime=self.runtime, record_relative_path="admission.json", store_identity=digest("3"))
         tree = self._git("rev-parse", "HEAD^{tree}").decode().strip()
         self.guidance_expectation = AuthoritativeGuidanceExpectation(digest("a"), self.root, self.revision, self._digest({"tree": tree, "repository": digest("a")}))
@@ -140,7 +141,7 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         with self.assertRaises(RoleCapabilityError):
             FileRoleAdmissionStore(runtime=object(), record_relative_path="admission.json", store_identity=digest("3"))  # type: ignore[arg-type]
         with self.assertRaises(RoleCapabilityError):
-            SealedRoleRuntimeContext(self.root, self.root, self.binding, self.control, "0" * 40)
+            SealedRoleRuntimeContext(self.root, self.root, self.binding, self.control, "0" * 40, self.task_candidate)
         self.record["grant"]["expires_at"] = 151
         Path(self.root, "admission.json").write_bytes(canonical(self.record))
         # Checkout mutation cannot replace the Git-blob-backed independent record.
@@ -151,7 +152,7 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
     def test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed(self) -> None:
         with self.assertRaises(RoleCapabilityError):
             ScopedDescriptor(ScopeKind.PATH, digest("c"), "safe/../outside")
-        for unsafe in ("C:/outside", "//server/share", "safe//nested", "/outside", "CON", "nul.txt", "aux ", "COM1.log", "safe/item:stream", "safe/item."):
+        for unsafe in ("C:/outside", "//server/share", "safe//nested", "/outside", "CON", "nul.txt", "NUL .txt", "aux ", "COM1.log", "COM¹.log", "LPT²", "CONIN$", "CONOUT$", "CLOCK$", "safe/item:stream", "safe/item."):
             with self.subTest(unsafe=unsafe), self.assertRaises(RoleCapabilityError):
                 ScopedDescriptor(ScopeKind.PATH, digest("c"), unsafe)
         with self.assertRaises(RoleCapabilityError):
@@ -160,6 +161,8 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         bad = replace(self.expectation, actions=expanded.actions, scope_identity=expanded.identity)
         with self.assertRaises(RoleCapabilityError):
             read_verified_admission(expectation=bad, store=self.store)
+        with self.assertRaises(RoleCapabilityError):
+            read_verified_admission(expectation=replace(self.expectation, candidate_sha="b" * 40), store=self.store)
 
     def test_instance_restart_and_fenced_generation_replacement_preserve_task_binding(self) -> None:
         self.assertEqual(validate_instance_continuity(self.instance, self.instance), "same-instance-restart")
@@ -178,6 +181,16 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         self.assertEqual(draft["requested_actions"], sorted(item.value for item in self.scope.actions))
         self.assertEqual(draft["validity"], {"not_before": self.now - 10, "not_after": self.now + 60})
         self.assertEqual(draft["owner_action"], "Select the listed existing grant reference; do not calculate replacement identifiers.")
+        with self.assertRaises(RoleCapabilityError):
+            render_grant_draft(instance=self.instance, scope=self.scope, expectation=replace(self.expectation, scope_identity=digest("9")), owner_readable_reason="Read current recovery state.", budget=self.recovery.budget, valid_from=self.now - 10, valid_until=self.now + 60, revocation_readback_digest=digest("2"))
+
+    def test_execution_evidence_binds_accepted_main_and_task_candidate_separately(self) -> None:
+        contract = self.verified_contract()
+        evidence = ProviderGuidanceEvidence(GuidanceView.RECOVERY_ADVISOR, digest("a"), True, digest("b"), self.guidance.receipt_digest, self.binding.candidate_sha, self.task_candidate)
+        sealed = SealedRoleExecution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, evidence)
+        self.assertEqual(sealed.require_before_effect()["status"], "ready")
+        with self.assertRaises(RoleCapabilityError):
+            SealedRoleExecution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, replace(evidence, task_candidate_sha="b" * 40)).require_before_effect()
 
     def test_verified_admission_and_sdk_mapping_cannot_be_mutated_after_readback(self) -> None:
         contract = self.verified_contract()

@@ -27,6 +27,13 @@ ISSUE = re.compile(r"#1(?:1[2-9]|20)\Z")
 DISPOSITIONS = frozenset({"adopt", "reframe", "merge", "defer", "retire"})
 STATUSES = frozenset({"proposed", "blocked", "owner-routed"})
 CONFIDENCES = frozenset({"low", "medium", "high"})
+ISSUE_136_REQUIREMENTS = {
+    "issue": "136",
+    "destinations": [
+        "trusted-advisory-admission", "accepted-guidance-resolution",
+        "typed-advisory-configuration", "public-safe-advisory-qualification",
+    ],
+}
 
 # This is intentionally independent of the rendered map.  Adding, dropping,
 # or reassigning a selected identifier requires a reviewed code change.
@@ -205,8 +212,10 @@ def _require_current_candidate(candidate: str) -> None:
 
 def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     document = _read_json(source)
-    if set(document) != {"schema", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
+    if set(document) != {"schema", "implementation_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
         raise CoverageError("coverage map schema is invalid")
+    if document["implementation_requirements"] != ISSUE_136_REQUIREMENTS:
+        raise CoverageError("issue 136 implementation coverage has drifted")
     if type(document["sources"]) is not dict or set(document["sources"]) != {"ledger_sha256", "test_disposition_sha256"}:
         raise CoverageError("coverage source bindings are invalid")
     source_bindings = document["sources"]

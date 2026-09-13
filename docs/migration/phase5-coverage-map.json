@@ -1,5 +1,14 @@
 {
   "schema": "roundwright-phase5-coverage/v1",
+  "implementation_requirements": {
+    "issue": "136",
+    "destinations": [
+      "trusted-advisory-admission",
+      "accepted-guidance-resolution",
+      "typed-advisory-configuration",
+      "public-safe-advisory-qualification"
+    ]
+  },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},
   "items": [
     {"id":"EV-0F91CDC81DEA","disposition":"merge","destination":"promotion-evaluation","owner_issue":"#120","prerequisites":["#112","#119"],"verification":"candidate-bound-promotion-package","confidence":"medium","status":"proposed"},

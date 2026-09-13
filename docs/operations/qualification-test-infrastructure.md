@@ -14,6 +14,15 @@ a candidate, or widen either repository's policy. A candidate policy edit is
 inert until reviewed, merged to authoritative `origin/main`, and acknowledged
 by the allowlisted owner.
 
+## Advisory-role qualification
+
+Recovery Advisor and Owner Intent Interpreter have no live provider route in
+this infrastructure. Qualification is hermetic: validate accepted-guidance
+manifest bytes, pinned adapter vocabulary, finite budget, dedicated-instance
+bindings, authority/grant expiry and revocation, and public-safe receipt
+projection. This proves admission validation only; it cannot open a provider
+session, schedule work, or activate authority.
+
 ## Approved infrastructure and immutable identities
 
 | Role | Public repository | Reviewed identity | Permitted use | Never use it as |

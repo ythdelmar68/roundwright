@@ -85,6 +85,7 @@ _PATH_ENVIRONMENT_KEYS = {
     "repository_root": "ROUNDWRIGHT_REPOSITORY_ROOT",
     "cache_directory": "ROUNDWRIGHT_CACHE_DIRECTORY",
 }
+_ADVISORY_PROFILES_ENVIRONMENT_KEY = "ROUNDWRIGHT_ADVISORY_PROFILES"
 
 
 @dataclass(frozen=True)
@@ -1123,7 +1124,17 @@ def _mark_all(sources: dict[str, ConfigurationSource], runtime: dict[str, Any], 
 
 def _environment_updates(environment: Mapping[str, str]) -> dict[str, Any]:
     review = {name: environment[variable] for name, variable in _REVIEW_ENVIRONMENT_KEYS.items() if variable in environment}
-    return {} if not review else {"review": review}
+    update: dict[str, Any] = {} if not review else {"review": review}
+    raw_profiles = environment.get(_ADVISORY_PROFILES_ENVIRONMENT_KEY)
+    if raw_profiles is not None:
+        try:
+            profiles = json.loads(raw_profiles)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ConfigurationError("advisory profile environment override is invalid") from error
+        if type(profiles) is not dict or set(profiles) != {"recovery_advisor", "owner_intent_interpreter"}:
+            raise ConfigurationError("advisory profile environment override is partial")
+        update["roles"] = profiles
+    return update
 
 
 def _environment_path_updates(environment: Mapping[str, str]) -> dict[str, object]:

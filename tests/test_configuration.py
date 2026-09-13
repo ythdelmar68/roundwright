@@ -191,6 +191,27 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(configuration.recovery_advisor.source, ConfigurationSource.COMMAND_LINE)
         self.assertIn("roles.recovery_advisor", configuration.sources)
 
+    def test_advisory_environment_override_is_typed_atomic_and_source_attributed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profiles = '{"recovery_advisor":{"model":"gpt-5.6-terra","reasoning_effort":"high"},"owner_intent_interpreter":{"model":"gpt-5.6-terra","reasoning_effort":"high"}}'
+            configuration = load_configuration(cwd=root, environment={"ROUNDWRIGHT_ADVISORY_PROFILES": profiles}, home=root / "home")
+            self.assertEqual(configuration.recovery_advisor.source, ConfigurationSource.ENVIRONMENT)
+            self.assertEqual(configuration.owner_intent_interpreter.source, ConfigurationSource.ENVIRONMENT)
+            self.assertEqual(configuration.recovery_advisor.value.model, "gpt-5.6-terra")
+            self.assertNotIn("gpt-5.6-terra", configuration.resolved_digest)
+            for environment in (
+                {"ROUNDWRIGHT_ADVISORY_PROFILES": "prose"},
+                {"ROUNDWRIGHT_ADVISORY_PROFILES": '{"recovery_advisor":{"model":"gpt-5.6-terra","reasoning_effort":"high"}}'},
+                {"ROUNDWRIGHT_RECOVERY_ADVISOR_MODEL": "gpt-5.6-terra"},
+            ):
+                with self.subTest(environment=environment):
+                    if "ROUNDWRIGHT_ADVISORY_PROFILES" in environment:
+                        with self.assertRaises(ConfigurationError):
+                            load_configuration(cwd=root, environment=environment, home=root / "home")
+                    else:
+                        self.assertEqual(load_configuration(cwd=root, environment=environment, home=root / "home").recovery_advisor.value.model, "gpt-5.6-sol")
+
     def test_config_free_authoritative_main_remains_the_init_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             main, candidate = self.authoritative_worktrees(Path(temporary), configuration=None)

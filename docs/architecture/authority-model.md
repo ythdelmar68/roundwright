@@ -1,5 +1,20 @@
 # Authority Model
 
+## Bounded advisory-role admission
+
+Recovery Advisor and Owner Intent Interpreter are opt-in advisory instances,
+not dispatchers. Admission requires independent authority evidence bound to the
+repository, task, deployment, epoch, expiry, revocation identity, host/state/
+fence-bound instance, accepted guidance at an exact trusted revision, and an
+allowlisted action/path/test/process/network/resource scope. The profile
+intersects that scope with a pinned SDK adapter mapping and finite budgets.
+
+Configuration resolves profiles only; it cannot create an admission or
+authority. A readiness receipt always leaves effective repository authority
+disabled. Missing, stale, revoked, copied, reassigned, expanded, or unknown
+evidence denies the request. Guidance uses an explicit trusted root and
+manifest-listed relative files; ambient discovery is prohibited.
+
 ## Roles
 
 - **Owner:** approves the exact reviewed candidate and is the only authority that may authorize merge, release, publication, or destructive cleanup.

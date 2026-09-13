@@ -7,13 +7,16 @@ not dispatchers. Admission requires independent authority evidence bound to the
 repository, task, deployment, epoch, expiry, revocation identity, host/state/
 fence-bound instance, accepted guidance at an exact trusted Git tree, and a
 root-normalized typed action/path/test/process/network/resource scope. The
-profile intersects that scope with a reviewed per-capability SDK mapping and
-finite budgets.
+profile intersects that scope with a reviewed, immutable per-capability SDK
+mapping and finite budgets. Drive-qualified, UNC, traversal, repeated-separator,
+and non-canonical scope paths fail closed.
 
 Configuration resolves profiles only; it cannot create an admission or
 authority. A readiness receipt always leaves effective repository authority
 disabled. Missing, stale, revoked, copied, reassigned, expanded, or unknown
-evidence denies the request. Guidance derives only the root-to-task
+evidence denies the request. The admission-record reader requires the existing
+candidate/Git-entrypoint control that validates authoritative `origin/main`;
+it cannot be constructed from a role-local path alone. Guidance derives only the root-to-task
 `AGENTS.md` chain at the pinned tree; candidate, global, unrelated, and ambient
 instructions are prohibited. A typed pre-effect gate is defined for Worker,
 Supervisor, dependency-review, and both advisory seams. No advisory dispatch

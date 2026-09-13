@@ -13,9 +13,13 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Mapping
 
 from .configuration import ProviderProfile
+from .configuration import _validated_authoritative_repository
+from .dependency_policy import CandidateBinding
+from .git_identity import GitEntrypointControl
 
 
 class RoleCapabilityError(ValueError):
@@ -102,10 +106,10 @@ def _canonical_record(value: object) -> bytes:
 
 
 def _relative_path(value: object) -> str:
-    if type(value) is not str or not value or "\\" in value:
+    if type(value) is not str or not value or "\\" in value or "//" in value:
         raise RoleCapabilityError("relative path is invalid")
     path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    if path.is_absolute() or re.match(r"^[A-Za-z]:", value) or any(part in {"", ".", ".."} for part in path.parts) or path.as_posix() != value:
         raise RoleCapabilityError("relative path is invalid")
     return path.as_posix()
 
@@ -133,8 +137,9 @@ class SdkAdapterExpectation:
     capability_codes: Mapping[RoleCapability, str]
 
     def __post_init__(self) -> None:
-        if (type(self.sdk_version) is not str or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", self.sdk_version) is None or _DIGEST.fullmatch(self.adapter_identity) is None or _DIGEST.fullmatch(self.mapping_digest) is None or type(self.capability_codes) is not dict or self.capability_codes != _REVIEWED_SDK_CODES):
+        if (type(self.sdk_version) is not str or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", self.sdk_version) is None or _DIGEST.fullmatch(self.adapter_identity) is None or _DIGEST.fullmatch(self.mapping_digest) is None or not isinstance(self.capability_codes, Mapping) or dict(self.capability_codes) != _REVIEWED_SDK_CODES):
             raise RoleCapabilityError("SDK adapter expectation is invalid")
+        object.__setattr__(self, "capability_codes", MappingProxyType(dict(self.capability_codes)))
 
 
 def reviewed_sdk_expectation() -> SdkAdapterExpectation:
@@ -152,8 +157,9 @@ class SdkAdapterMapping:
 
     def __post_init__(self) -> None:
         expected = reviewed_sdk_expectation()
-        if type(self.capability_codes) is not dict or (self.sdk_version, self.adapter_identity, self.capability_codes, self.mapping_digest) != (expected.sdk_version, expected.adapter_identity, expected.capability_codes, expected.mapping_digest):
+        if not isinstance(self.capability_codes, Mapping) or (self.sdk_version, self.adapter_identity, dict(self.capability_codes), self.mapping_digest) != (expected.sdk_version, expected.adapter_identity, dict(expected.capability_codes), expected.mapping_digest):
             raise RoleCapabilityError("SDK adapter mapping differs from the reviewed expectation")
+        object.__setattr__(self, "capability_codes", MappingProxyType(dict(self.capability_codes)))
 
     @property
     def supported_capabilities(self) -> frozenset[RoleCapability]:
@@ -402,9 +408,15 @@ class RoleAdmissionExpectation:
 
 class FileRoleAdmissionStore:
     """Read-only boundary for an owner/deployment-produced admission record."""
-    def __init__(self, *, root: Path, record_relative_path: str, store_identity: str) -> None:
+    def __init__(self, *, root: Path, record_relative_path: str, store_identity: str, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl) -> None:
         _require_digest(store_identity, "admission store identity")
-        self._root = root.resolve(strict=True); self._relative = _relative_path(record_relative_path); self.store_identity = store_identity
+        if type(binding) is not CandidateBinding or type(git_entrypoint_control) is not GitEntrypointControl:
+            raise RoleCapabilityError("admission store lacks authoritative Git control")
+        try:
+            authoritative = _validated_authoritative_repository(root, binding=binding, control=git_entrypoint_control)
+        except Exception as error:
+            raise RoleCapabilityError("admission store is not rooted at authoritative control") from error
+        self._root = authoritative; self._relative = _relative_path(record_relative_path); self.store_identity = store_identity
 
     def read(self) -> Mapping[str, object]:
         try:
@@ -419,12 +431,17 @@ class FileRoleAdmissionStore:
 
 class VerifiedRoleAdmission:
     """A verified result; direct construction is intentionally rejected."""
-    __slots__ = ("authority_receipt", "grant", "scope", "evidence_time", "revoked", "grant_reference", "_seal")
+    __slots__ = ("authority_receipt", "grant", "scope", "evidence_time", "revoked", "grant_reference", "_seal", "_locked")
     def __init__(self, authority_receipt: TrustedRoleAuthorityReceipt, grant: RoleCapabilityGrant, scope: RoleScope, evidence_time: int, revoked: bool, grant_reference: str, *, _seal: object | None = None) -> None:
         if _seal is not _ADMISSION_SEAL:
             raise RoleCapabilityError("verified admission must come from the independent store")
-        self.authority_receipt, self.grant, self.scope = authority_receipt, grant, scope
-        self.evidence_time, self.revoked, self.grant_reference, self._seal = evidence_time, revoked, grant_reference, _seal
+        object.__setattr__(self, "authority_receipt", authority_receipt); object.__setattr__(self, "grant", grant); object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "evidence_time", evidence_time); object.__setattr__(self, "revoked", revoked); object.__setattr__(self, "grant_reference", grant_reference); object.__setattr__(self, "_seal", _seal); object.__setattr__(self, "_locked", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_locked", False):
+            raise RoleCapabilityError("verified admission is immutable")
+        object.__setattr__(self, name, value)
 
 
 def _parse_record(record: Mapping[str, object]) -> tuple[TrustedRoleAuthorityReceipt, DedicatedRoleInstance, RoleScope, RoleCapabilityGrant, bool, str, str]:
@@ -480,15 +497,20 @@ class AdvisoryRoleContract:
         return {"schema": "roundwright-advisory-role-contract-receipt/v3", "role": self.profile.role.value, "profile_identity": self.profile.profile_identity, "guidance_receipt_digest": self.guidance.receipt_digest, "instance_receipt_digest": self.instance.receipt_digest, "admission_receipt_digest": None if self.admission is None else self.admission.grant.receipt_digest, "capabilities": effective, "status": status.value, "effective_authority": "disabled"}
 
 
-def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, owner_readable_reason: str) -> dict[str, object]:
+def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, owner_readable_reason: str, budget: RoleBudget | None = None, valid_from: int | None = None, valid_until: int | None = None, revocation_readback_digest: str | None = None) -> dict[str, object]:
     if type(instance) is not DedicatedRoleInstance or type(scope) is not RoleScope or type(owner_readable_reason) is not str or not owner_readable_reason.strip():
         raise RoleCapabilityError("grant draft is invalid")
-    return {"schema": "roundwright-advisory-grant-draft/v1", "role": instance.role.value, "task": instance.task_identity, "instance": instance.instance_identity, "requested_actions": sorted(item.value for item in scope.actions), "reason": owner_readable_reason.strip(), "owner_action": "Select an existing independent grant reference and provide its read-back expectation."}
+    if budget is not None and type(budget) is not RoleBudget or valid_from is not None and type(valid_from) is not int or valid_until is not None and type(valid_until) is not int or valid_from is not None and valid_until is not None and valid_until < valid_from or revocation_readback_digest is not None and _DIGEST.fullmatch(revocation_readback_digest) is None:
+        raise RoleCapabilityError("grant draft bindings are invalid")
+    return {"schema": "roundwright-advisory-grant-draft/v2", "role": instance.role.value, "task": instance.task_identity, "instance": instance.instance_identity, "requested_actions": sorted(item.value for item in scope.actions), "scope": [{"kind": item.kind.value, "value": item.value} for item in scope.descriptors], "budget": None if budget is None else {"max_calls": budget.max_calls, "max_duration_seconds": budget.max_duration_seconds, "max_tokens": budget.max_tokens}, "validity": {"not_before": valid_from, "not_after": valid_until}, "revocation_readback": "required" if revocation_readback_digest is None else "bound", "evidence": "independent owner/deployment record required", "reason": owner_readable_reason.strip(), "owner_action": "Select an existing independent grant reference and provide its read-back expectation."}
 
 
 def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleExecutionSeam) -> dict[str, object]:
     if type(contract) is not AdvisoryRoleContract or type(seam) is not RoleExecutionSeam:
         raise RoleCapabilityError("role execution seam is invalid")
+    allowed = {RoleExecutionSeam.RECOVERY_ADVISOR: AdvisoryRole.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: AdvisoryRole.OWNER_INTENT_INTERPRETER}
+    if seam not in allowed or allowed[seam] is not contract.profile.role:
+        raise RoleCapabilityError("role is not admitted for this execution seam")
     receipt = contract.public_receipt()
     if receipt["status"] != AdvisoryRoleStatus.READY.value:
         raise RoleCapabilityError("advisory role is disabled without verified admission")

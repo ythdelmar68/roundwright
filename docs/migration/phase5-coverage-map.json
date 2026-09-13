@@ -9,10 +9,10 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"2dd4d17bf56cb86b53c2688c9087e573abc8a973ef9fede0a01f6cccf1470e41"},
-      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"445d158337655c1255eed9e2ec55a445ec20ac6a1eb4c39040b369ccf88048d8"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"8c9c4c17f49cc3d5e83f3e09ccb166c1b1dbeaa6b9f7c49fe4eb8ecbbe74227d"},
-      {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"fd8613fea0040c58dfb6b84cdfa24b1359e58df18ce3cf02f59d971b7f01a168"},
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"0425402992bf8e7f89ae4888bbed07be42e653b6e1e484c86767d99a48e33243"},
+      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"0856b3565ad786c974687dd8e48558063b7fff6166a79b4c74de86da946edee1"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"112bae8d8e3f896e00d1117cd29e760e353f618b32b281403293cec78e321f3e"},
+      {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"985171ce5c9aeeecfa023369e2984a7ec5951422c45d1288b135c21b92a23407"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"fb0cc3df36b6e20990404aae7ac200ea017434508f8a43390fb424cf3829fab7"}
     ]
   },

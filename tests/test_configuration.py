@@ -105,8 +105,10 @@ class ConfigurationTests(unittest.TestCase):
             configuration = load_configuration(cwd=Path(temporary), environment={}, home=Path(temporary) / "home")
         self.assertEqual(configuration.schema_version, "roundwright-runtime/v1")
         self.assertEqual((configuration.worker.value.model, configuration.worker.value.reasoning_effort.value), ("gpt-5.6-terra", "high"))
+        self.assertEqual((configuration.recovery_advisor.value.model, configuration.recovery_advisor.value.reasoning_effort.value), ("gpt-5.6-sol", "high"))
+        self.assertEqual((configuration.owner_intent_interpreter.value.model, configuration.owner_intent_interpreter.value.reasoning_effort.value), ("gpt-5.6-sol", "high"))
         self.assertEqual([(item.name, item.model, item.reasoning_effort.value) for item in configuration.supervisor_attempt_profiles.value], [
-            ("primary", "gpt-5.6-sol", "xhigh"), ("fallback", "gpt-5.6-terra", "high"), ("fallback-retry", "gpt-5.6-terra", "high"),
+            ("primary", "gpt-5.6-sol", "high"), ("fallback", "gpt-5.6-terra", "high"), ("fallback-retry", "gpt-5.6-terra", "high"),
         ])
         self.assertEqual(configuration.review_policy.on_final_findings, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
         self.assertEqual(configuration.review_policy.mode_for_round(3), ReviewMode.COMPLETE)
@@ -172,6 +174,22 @@ class ConfigurationTests(unittest.TestCase):
             self.assertFalse((main / ".roundwright" / "state.sqlite3").exists())
             self.assertFalse((candidate / ".roundwright" / "state.sqlite3").exists())
             self.assertIn("review.max_rounds: default", output.getvalue())
+
+    def test_advisory_role_profiles_follow_normal_precedence_without_granting_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user = root / "user.toml"
+            self.write(user, "[roles.recovery_advisor]\nmodel = 'gpt-5.6-terra'\nreasoning_effort = 'high'\n")
+            with mock.patch("roundwright.configuration._validated_authoritative_repository", return_value=root), mock.patch(
+                "roundwright.configuration._read_authoritative_runtime_toml", return_value={"roles": {"recovery_advisor": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"}}}
+            ):
+                configuration = load_configuration(
+                    cwd=root, user_config=user, environment={}, authoritative_repository_root=root,
+                    cli_values={"roles.recovery_advisor": {"model": "gpt-5.6-terra", "reasoning_effort": "high"}},
+                )
+        self.assertEqual((configuration.recovery_advisor.value.model, configuration.recovery_advisor.value.reasoning_effort.value), ("gpt-5.6-terra", "high"))
+        self.assertEqual(configuration.recovery_advisor.source, ConfigurationSource.COMMAND_LINE)
+        self.assertIn("roles.recovery_advisor", configuration.sources)
 
     def test_config_free_authoritative_main_remains_the_init_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

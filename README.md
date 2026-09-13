@@ -41,6 +41,15 @@ cannot rebind repository identity or make a different repository dispatch-ready.
 Model and reasoning-effort defaults are typed configuration values with the
 same precedence; configured values must be supplied as a validated pair.
 
+The Recovery Advisor and Owner Intent Interpreter are opt-in, dedicated
+advisory-role contracts. Their resolved profiles use that same precedence, but
+each request must carry digest-only trusted-guidance, dedicated-instance, and
+explicit capability-grant receipts. Their public receipts intentionally omit
+guidance, candidate, instance, and source text. They never start a provider,
+scheduler, or orchestrator and never constitute effective repository authority.
+The public-safe migration map is in
+[Issue 136 trusted advisory-role coverage](docs/migration/issue-136-trusted-advisory-role-coverage.md).
+
 The Codex provider-health boundary is similarly typed and deliberately narrow.
 An external native credential store may supply an opaque, role-specific channel
 for an exact SDK/runtime audit and one content-free read-only qualification

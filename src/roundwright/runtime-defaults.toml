@@ -13,9 +13,17 @@ reasoning_effort = "high"
 model = "gpt-5.6-terra"
 reasoning_effort = "high"
 
+[roles.recovery_advisor]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+
+[roles.owner_intent_interpreter]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+
 [roles.supervisor]
 attempt_profiles = [
-  { name = "primary", model = "gpt-5.6-sol", reasoning_effort = "xhigh" },
+  { name = "primary", model = "gpt-5.6-sol", reasoning_effort = "high" },
   { name = "fallback", model = "gpt-5.6-terra", reasoning_effort = "high" },
   { name = "fallback-retry", model = "gpt-5.6-terra", reasoning_effort = "high" },
 ]

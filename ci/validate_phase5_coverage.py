@@ -230,8 +230,7 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     for artifact in artifacts:
         if set(artifact) != {"identity", "path", "sha256"} or type(artifact["sha256"]) is not str or not SHA256.fullmatch(artifact["sha256"]):
             raise CoverageError("issue 136 artifact digest is invalid")
-        artifact_path = ROOT / artifact["path"]
-        if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact["sha256"]:
+        if _git_blob_sha256(artifact["path"]) != artifact["sha256"]:
             raise CoverageError("issue 136 artifact digest has drifted")
     if type(document["sources"]) is not dict or set(document["sources"]) != {"ledger_sha256", "test_disposition_sha256"}:
         raise CoverageError("coverage source bindings are invalid")
@@ -288,6 +287,19 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     if not set(identifier for identifier in observed if identifier.startswith("TS-")) <= test_ids:
         raise CoverageError("coverage test identifier is stale")
     return document
+
+
+def _git_blob_sha256(relative_path: object) -> str:
+    """Hash the tracked Git blob, never platform-transformed checkout bytes."""
+    if type(relative_path) is not str or not relative_path or relative_path.startswith("/") or "\\" in relative_path or ".." in relative_path.split("/"):
+        raise CoverageError("issue 136 artifact path is invalid")
+    try:
+        result = subprocess.run(["git", "-C", str(ROOT), "show", f"HEAD:{relative_path}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        raise CoverageError("issue 136 artifact Git content is unavailable") from error
+    if result.returncode:
+        raise CoverageError("issue 136 artifact Git content is unavailable")
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path) -> None:

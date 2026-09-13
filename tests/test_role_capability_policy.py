@@ -55,18 +55,22 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         self._git("add", "."); self._git("commit", "-qm", "fixture"); self._git("branch", "-M", "main")
         self.revision = self._git("rev-parse", "HEAD").decode().strip()
         self._git("remote", "add", "origin", "https://github.com/ythdelmar68/roundwright.git"); self._git("update-ref", "refs/remotes/origin/main", self.revision)
+        preliminary_binding, preliminary_control = self._control()
         tree = self._git("rev-parse", "HEAD^{tree}").decode().strip()
-        self.guidance_expectation = AuthoritativeGuidanceExpectation(digest("a"), self.root, self.revision, self._digest({"tree": tree, "repository": digest("a")}))
-        self.guidance = resolve_authoritative_guidance(expectation=self.guidance_expectation, view=GuidanceView.RECOVERY_ADVISOR, task_relative_path="src/nested/task.py")
+        preliminary_expectation = AuthoritativeGuidanceExpectation(digest("a"), self.root, self.revision, self._digest({"tree": tree, "repository": digest("a")}))
+        self.guidance = resolve_authoritative_guidance(expectation=preliminary_expectation, view=GuidanceView.RECOVERY_ADVISOR, task_relative_path="src/nested/task.py", binding=preliminary_binding, git_entrypoint_control=preliminary_control)
         self.instance = DedicatedRoleInstance("recovery-136", AdvisoryRole.RECOVERY_ADVISOR, self.recovery.profile_identity, self.guidance.receipt_digest, digest("c"), "task-136", digest("d"), digest("e"), digest("f"), 1, "generation-1", "0" * 40)
         self.scope = RoleScope(frozenset({RoleCapability.READ_TRUSTED_GUIDANCE, RoleCapability.READ_ONLY_REVIEW}), (ScopedDescriptor(ScopeKind.PATH, digest("c"), "src/nested"),))
         self.authority = TrustedRoleAuthorityReceipt(digest("c"), "task-136", digest("e"), 1, digest("1"), 200, digest("2"))
         self.grant = RoleCapabilityGrant(self.authority.receipt_digest, self.instance.receipt_digest, self.scope.identity, 100, 150)
         self.record = {"schema": "roundwright-independent-role-admission/v1", "grant_reference": "grant-136", "authority": self.authority.__dict__, "instance": self.instance.__dict__, "scope": {"actions": sorted(item.value for item in self.scope.actions), "descriptors": [{"kind": item.kind.value, "root_identity": item.root_identity, "value": item.value} for item in self.scope.descriptors]}, "grant": self.grant.__dict__, "revoked": False, "revocation_readback_digest": digest("2")}
-        Path(self.root, "admission.json").write_bytes(canonical(self.record))
+        Path(self.root, "admission.json").write_bytes(canonical(self.record)); self._git("add", "admission.json"); self._git("commit", "-qm", "admission")
+        self.revision = self._git("rev-parse", "HEAD").decode().strip(); self._git("update-ref", "refs/remotes/origin/main", self.revision)
         self.expectation = RoleAdmissionExpectation(digest("3"), "sha256:" + hashlib.sha256(canonical(self.record)).hexdigest(), "grant-136", self.authority.receipt_digest, self.instance.receipt_digest, digest("c"), "task-136", digest("d"), digest("e"), digest("f"), 1, self.scope.identity, self.scope.actions, 100, 150, digest("2"))
         self.binding, self.control = self._control()
         self.store = FileRoleAdmissionStore(root=self.root, record_relative_path="admission.json", store_identity=digest("3"), binding=self.binding, git_entrypoint_control=self.control)
+        tree = self._git("rev-parse", "HEAD^{tree}").decode().strip()
+        self.guidance_expectation = AuthoritativeGuidanceExpectation(digest("a"), self.root, self.revision, self._digest({"tree": tree, "repository": digest("a")}))
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -106,19 +110,19 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         self.assertEqual(self.guidance.selected_paths, ("AGENTS.md", "src/AGENTS.md"))
         self.assertNotIn("global.md", self.guidance.selected_paths)
         with self.assertRaises(RoleCapabilityError):
-            resolve_authoritative_guidance(expectation=self.guidance_expectation, view=GuidanceView.WORKER, task_relative_path="safe/../outside.py")
+            resolve_authoritative_guidance(expectation=self.guidance_expectation, view=GuidanceView.WORKER, task_relative_path="safe/../outside.py", binding=self.binding, git_entrypoint_control=self.control)
         with self.assertRaises(RoleCapabilityError):
-            resolve_authoritative_guidance(expectation=replace(self.guidance_expectation, trusted_revision="0" * 40), view=GuidanceView.SUPERVISOR, task_relative_path="src/task.py")
+            resolve_authoritative_guidance(expectation=replace(self.guidance_expectation, trusted_revision="0" * 40), view=GuidanceView.SUPERVISOR, task_relative_path="src/task.py", binding=self.binding, git_entrypoint_control=self.control)
         with self.assertRaises(RoleCapabilityError):
-            resolve_authoritative_guidance(expectation=replace(self.guidance_expectation, tree_digest=digest("9")), view=GuidanceView.DEPENDENCY_REVIEW, task_relative_path="src/task.py")
+            resolve_authoritative_guidance(expectation=replace(self.guidance_expectation, tree_digest=digest("9")), view=GuidanceView.DEPENDENCY_REVIEW, task_relative_path="src/task.py", binding=self.binding, git_entrypoint_control=self.control)
 
     def test_admission_requires_existing_pinned_record_not_coherent_caller_objects(self) -> None:
         contract = self.verified_contract()
         self.assertEqual(contract.status(), AdvisoryRoleStatus.READY)
-        self.assertEqual(require_verified_role_admission(contract, RoleExecutionSeam.RECOVERY_ADVISOR)["capabilities"], sorted(item.value for item in self.scope.actions))
+        self.assertEqual(require_verified_role_admission(contract, RoleExecutionSeam.RECOVERY_ADVISOR, store=self.store, expectation=self.expectation, evidence_time=120)["capabilities"], sorted(item.value for item in self.scope.actions))
         for seam in (RoleExecutionSeam.WORKER, RoleExecutionSeam.SUPERVISOR, RoleExecutionSeam.DEPENDENCY_REVIEW, RoleExecutionSeam.OWNER_INTENT_INTERPRETER):
             with self.assertRaises(RoleCapabilityError):
-                require_verified_role_admission(contract, seam)
+                require_verified_role_admission(contract, seam, store=self.store, expectation=self.expectation, evidence_time=120)
         with self.assertRaises(RoleCapabilityError):
             # A caller can make coherent pieces but cannot directly construct verified admission.
             from roundwright.role_capability_policy import VerifiedRoleAdmission
@@ -129,13 +133,15 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
             FileRoleAdmissionStore(root=self.root, record_relative_path="admission.json", store_identity=digest("3"), binding=self.binding, git_entrypoint_control=object())  # type: ignore[arg-type]
         self.record["grant"]["expires_at"] = 151
         Path(self.root, "admission.json").write_bytes(canonical(self.record))
+        # Checkout mutation cannot replace the Git-blob-backed independent record.
+        self.assertEqual(read_verified_admission(expectation=self.expectation, store=self.store, evidence_time=120)[0].grant.expires_at, 150)
         with self.assertRaises(RoleCapabilityError):
-            read_verified_admission(expectation=self.expectation, store=self.store, evidence_time=120)
+            require_verified_role_admission(contract, RoleExecutionSeam.RECOVERY_ADVISOR, store=self.store, expectation=self.expectation, evidence_time=151)
 
     def test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed(self) -> None:
         with self.assertRaises(RoleCapabilityError):
             ScopedDescriptor(ScopeKind.PATH, digest("c"), "safe/../outside")
-        for unsafe in ("C:/outside", "//server/share", "safe//nested", "/outside"):
+        for unsafe in ("C:/outside", "//server/share", "safe//nested", "/outside", "CON", "nul.txt", "aux ", "COM1.log", "safe/item:stream", "safe/item."):
             with self.subTest(unsafe=unsafe), self.assertRaises(RoleCapabilityError):
                 ScopedDescriptor(ScopeKind.PATH, digest("c"), unsafe)
         with self.assertRaises(RoleCapabilityError):

@@ -16,7 +16,8 @@ authority. A readiness receipt always leaves effective repository authority
 disabled. Missing, stale, revoked, copied, reassigned, expanded, or unknown
 evidence denies the request. The admission-record reader requires the existing
 candidate/Git-entrypoint control that validates authoritative `origin/main`;
-it cannot be constructed from a role-local path alone. Guidance derives only the root-to-task
+it cannot be constructed from a role-local path alone. The shared pre-effect gate
+rereads that Git blob with current evidence time before every use. Guidance derives only the root-to-task
 `AGENTS.md` chain at the pinned tree; candidate, global, unrelated, and ambient
 instructions are prohibited. A typed pre-effect gate is defined for Worker,
 Supervisor, dependency-review, and both advisory seams. No advisory dispatch

@@ -9,11 +9,11 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"0425402992bf8e7f89ae4888bbed07be42e653b6e1e484c86767d99a48e33243"},
-      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"0856b3565ad786c974687dd8e48558063b7fff6166a79b4c74de86da946edee1"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"112bae8d8e3f896e00d1117cd29e760e353f618b32b281403293cec78e321f3e"},
-      {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"985171ce5c9aeeecfa023369e2984a7ec5951422c45d1288b135c21b92a23407"},
-      {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"fb0cc3df36b6e20990404aae7ac200ea017434508f8a43390fb424cf3829fab7"}
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"7361346a4abe53900ab857da02cd2c383df5c7ad01ce6463cd68a8bbd88de3c3"},
+      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"e5fc3093bdb284442a14382a3202ace6e319ad5bcaedf91e8b9eca98adb3fe22"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"1b4bf93ad1e6cede69072807a07f5dcf044ab0944ceb7143154db4aa48ebed2d"},
+      {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"b7b128079fb4abcd8778a5218e6aab6dd574104fb3c43c9a3c90f6c2c074c71f"},
+      {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

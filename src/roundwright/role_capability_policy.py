@@ -72,6 +72,7 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _IDENTITY = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_WINDOWS_RESERVED = frozenset({"con", "prn", "aux", "nul", *(f"com{number}" for number in range(1, 10)), *(f"lpt{number}" for number in range(1, 10))})
 _ADMISSION_SEAL = object()
 _REVIEWED_SDK_CODES = {
     RoleCapability.READ_TRUSTED_GUIDANCE: "guidance.read/v1",
@@ -111,6 +112,10 @@ def _relative_path(value: object) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or re.match(r"^[A-Za-z]:", value) or any(part in {"", ".", ".."} for part in path.parts) or path.as_posix() != value:
         raise RoleCapabilityError("relative path is invalid")
+    for part in path.parts:
+        stem = part.split(".", 1)[0].casefold()
+        if ":" in part or part.endswith((".", " ")) or stem in _WINDOWS_RESERVED:
+            raise RoleCapabilityError("relative path is invalid")
     return path.as_posix()
 
 
@@ -235,17 +240,17 @@ def _git(root: Path, *arguments: str) -> bytes:
         raise RoleCapabilityError("authoritative guidance read-back is unavailable") from error
 
 
-def resolve_authoritative_guidance(*, expectation: AuthoritativeGuidanceExpectation, view: GuidanceView, task_relative_path: str) -> TrustedGuidance:
+def resolve_authoritative_guidance(*, expectation: AuthoritativeGuidanceExpectation, view: GuidanceView, task_relative_path: str, binding: CandidateBinding, git_entrypoint_control: GitEntrypointControl) -> TrustedGuidance:
     """Read just the root-to-task ``AGENTS.md`` chain from a pinned Git tree."""
-    if type(expectation) is not AuthoritativeGuidanceExpectation or type(view) is not GuidanceView:
+    if type(expectation) is not AuthoritativeGuidanceExpectation or type(view) is not GuidanceView or type(binding) is not CandidateBinding or type(git_entrypoint_control) is not GitEntrypointControl:
         raise RoleCapabilityError("guidance context is invalid")
     relative = _relative_path(task_relative_path)
     try:
-        root = expectation.authoritative_root.resolve(strict=True)
-    except OSError as error:
+        root = _validated_authoritative_repository(expectation.authoritative_root, binding=binding, control=git_entrypoint_control)
+    except Exception as error:
         raise RoleCapabilityError("authoritative guidance root is unavailable") from error
     shown_root = Path(_git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve()
-    if shown_root != root or _git(root, "rev-parse", "HEAD").decode().strip() != expectation.trusted_revision:
+    if shown_root != root or expectation.trusted_revision != binding.candidate_sha:
         raise RoleCapabilityError("authoritative guidance revision does not match expectation")
     tree = _git(root, "rev-parse", f"{expectation.trusted_revision}^{{tree}}").decode().strip()
     if _digest({"tree": tree, "repository": expectation.repository_identity}) != expectation.tree_digest:
@@ -416,13 +421,14 @@ class FileRoleAdmissionStore:
             authoritative = _validated_authoritative_repository(root, binding=binding, control=git_entrypoint_control)
         except Exception as error:
             raise RoleCapabilityError("admission store is not rooted at authoritative control") from error
-        self._root = authoritative; self._relative = _relative_path(record_relative_path); self.store_identity = store_identity
+        self._root = authoritative; self._relative = _relative_path(record_relative_path); self.store_identity = store_identity; self._binding = binding; self._control = git_entrypoint_control
 
     def read(self) -> Mapping[str, object]:
         try:
-            path = (self._root / self._relative).resolve(strict=True); path.relative_to(self._root)
-            raw = path.read_bytes(); parsed = json.loads(raw)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+            root = _validated_authoritative_repository(self._root, binding=self._binding, control=self._control)
+            raw = _git(root, "show", f"{self._binding.candidate_sha}:{self._relative}")
+            parsed = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError, RoleCapabilityError) as error:
             raise RoleCapabilityError("independent admission record is unavailable") from error
         if type(parsed) is not dict or _canonical_record(parsed) != raw:
             raise RoleCapabilityError("independent admission record is not canonical")
@@ -505,12 +511,15 @@ def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, own
     return {"schema": "roundwright-advisory-grant-draft/v2", "role": instance.role.value, "task": instance.task_identity, "instance": instance.instance_identity, "requested_actions": sorted(item.value for item in scope.actions), "scope": [{"kind": item.kind.value, "value": item.value} for item in scope.descriptors], "budget": None if budget is None else {"max_calls": budget.max_calls, "max_duration_seconds": budget.max_duration_seconds, "max_tokens": budget.max_tokens}, "validity": {"not_before": valid_from, "not_after": valid_until}, "revocation_readback": "required" if revocation_readback_digest is None else "bound", "evidence": "independent owner/deployment record required", "reason": owner_readable_reason.strip(), "owner_action": "Select an existing independent grant reference and provide its read-back expectation."}
 
 
-def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleExecutionSeam) -> dict[str, object]:
+def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleExecutionSeam, *, store: FileRoleAdmissionStore, expectation: RoleAdmissionExpectation, evidence_time: int) -> dict[str, object]:
     if type(contract) is not AdvisoryRoleContract or type(seam) is not RoleExecutionSeam:
         raise RoleCapabilityError("role execution seam is invalid")
     allowed = {RoleExecutionSeam.RECOVERY_ADVISOR: AdvisoryRole.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: AdvisoryRole.OWNER_INTENT_INTERPRETER}
     if seam not in allowed or allowed[seam] is not contract.profile.role:
         raise RoleCapabilityError("role is not admitted for this execution seam")
+    fresh, instance = read_verified_admission(expectation=expectation, store=store, evidence_time=evidence_time)
+    if instance != contract.instance or fresh.grant.receipt_digest != contract.admission.grant.receipt_digest:
+        raise RoleCapabilityError("role admission changed after contract construction")
     receipt = contract.public_receipt()
     if receipt["status"] != AdvisoryRoleStatus.READY.value:
         raise RoleCapabilityError("advisory role is disabled without verified admission")
@@ -522,5 +531,5 @@ def default_advisory_profiles(*, recovery_advisor: ProviderProfile, owner_intent
     return (RoleCapabilityProfile(AdvisoryRole.RECOVERY_ADVISOR, recovery_advisor, shared | {RoleCapability.READ_ONLY_REVIEW}, RoleBudget(1, 60, 4000), mapping), RoleCapabilityProfile(AdvisoryRole.OWNER_INTENT_INTERPRETER, owner_intent_interpreter, shared | {RoleCapability.OWNER_COMMAND_INTERPRETATION}, RoleBudget(1, 60, 4000), mapping))
 
 
-def require_non_dispatching_production_entrypoint(contract: AdvisoryRoleContract) -> dict[str, object]:
-    return require_verified_role_admission(contract, RoleExecutionSeam.RECOVERY_ADVISOR)
+def require_non_dispatching_production_entrypoint(contract: AdvisoryRoleContract, *, store: FileRoleAdmissionStore, expectation: RoleAdmissionExpectation, evidence_time: int) -> dict[str, object]:
+    return require_verified_role_admission(contract, RoleExecutionSeam.RECOVERY_ADVISOR, store=store, expectation=expectation, evidence_time=evidence_time)

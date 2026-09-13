@@ -260,11 +260,28 @@ class DiffReviewSequenceEntry:
     def __post_init__(self) -> None:
         if (
             type(self.selection) is not DiffReviewSelection
+            or not _matching_supervisor_admission(self.advisory_execution, self.audit)
             or type(self.recovery) is not RecoveryContext
             or type(self.audit) is not ProviderHealthAuditIdentity
             or not callable(getattr(self.backend, "open_fresh_session", None))
         ):
             raise ProviderAttemptRuntimeError("provider attempt sequence entry is invalid")
+
+
+def _matching_supervisor_admission(
+    advisory_execution: object,
+    audit: ProviderHealthAuditIdentity,
+) -> bool:
+    """Reject a capsule that could authorize a different provider position."""
+
+    contract = getattr(advisory_execution, "contract", None)
+    profile = getattr(contract, "profile", None)
+    return (
+        type(audit) is ProviderHealthAuditIdentity
+        and type(advisory_execution) is SealedRoleExecution
+        and getattr(advisory_execution, "seam", None) is RoleExecutionSeam.SUPERVISOR
+        and getattr(profile, "provider_profile", None) == audit.profile
+    )
 
 
 @dataclass(frozen=True)
@@ -292,13 +309,18 @@ class DurableDiffReviewRunner:
     review_epoch: int
     review_round: int
     selection: DiffReviewSelection
+    advisory_execution: SealedRoleExecution
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
     case_id: str | None = None
     ready_at: int | None = None
 
     def _sequence_entries(self) -> tuple[DiffReviewSequenceEntry, ...]:
-        return self.sequence or (DiffReviewSequenceEntry(self.selection, self.recovery, self.audit, self.backend),)
+        return self.sequence or (
+            DiffReviewSequenceEntry(
+                self.selection, self.advisory_execution, self.recovery, self.audit, self.backend,
+            ),
+        )
 
     def validate_sequence(self) -> tuple[DiffReviewSequenceEntry, ...]:
         """Validate every bounded position without provider or store effects."""
@@ -315,7 +337,11 @@ class DurableDiffReviewRunner:
             or self.dependency_binding != CandidateBinding(self.identity.repository_id, self.identity.task_id, self.seal.candidate_sha)
             or type(entries) is not tuple
             or not entries
-            or any(type(item) is not DiffReviewSequenceEntry for item in entries)
+            or any(
+                type(item) is not DiffReviewSequenceEntry
+                or not _matching_supervisor_admission(item.advisory_execution, item.audit)
+                for item in entries
+            )
             or len(entries) > runtime.review_max_supervisor_attempts_per_round
             or tuple(item.selection.within_round_attempt for item in entries) != tuple(range(1, len(entries) + 1))
             or tuple(item.audit.profile_identity for item in entries) != runtime.supervisor_profile_identities[:len(entries)]
@@ -327,8 +353,7 @@ class DurableDiffReviewRunner:
                 or not callable(getattr(item.backend, "open_fresh_session", None))
                 for item in entries
             )
-            or type(self.advisory_execution) is not SealedRoleExecution
-            or self.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR
+            or not _matching_supervisor_admission(self.advisory_execution, self.audit)
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
         deadline = self.completion_policy.deadline()
@@ -375,8 +400,10 @@ class DurableDiffReviewRunner:
     def execute(self) -> tuple[str, ...]:
         """Dispatch one bounded sequence and return only durable attempt IDs."""
 
+        entries = self.validate_sequence()
         try:
-            self.advisory_execution.require_before_effect()
+            for entry in entries:
+                entry.advisory_execution.require_before_effect()
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
         entries = self.preflight_checkpoint_prerequisites()
@@ -403,7 +430,7 @@ class DurableDiffReviewRunner:
                     raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
         attempt_ids: list[str] = []
         for entry in entries:
-            attempt_id, accepted = self._execute_selection(entry.selection, entry.recovery, entry.audit, entry.backend)
+            attempt_id, accepted = self._execute_selection(entry)
             attempt_ids.append(attempt_id)
             if accepted:
                 return tuple(attempt_ids)
@@ -520,15 +547,10 @@ class DurableDiffReviewRunner:
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None
 
-    def _execute_selection(
-        self,
-        selection: DiffReviewSelection,
-        recovery: RecoveryContext,
-        audit: ProviderHealthAuditIdentity,
-        backend: NativeCodexSupervisorBackend,
-    ) -> tuple[str, bool]:
+    def _execute_selection(self, entry: DiffReviewSequenceEntry) -> tuple[str, bool]:
         """Use public durable APIs for exactly one observed native outcome."""
 
+        selection, recovery, audit, backend = entry.selection, entry.recovery, entry.audit, entry.backend
         runtime = recovery.runtime_binding
         try:
             existing = read_attempt(
@@ -653,7 +675,7 @@ class DurableDiffReviewRunner:
         try:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
-                advisory_execution=self.advisory_execution,
+                advisory_execution=entry.advisory_execution,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(

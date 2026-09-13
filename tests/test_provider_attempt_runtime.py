@@ -143,6 +143,38 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
         )
         return runner, backend, repository, identity, recovery, seal
 
+    def test_sequence_entry_rejects_missing_or_wrong_role_capsule_before_effects(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, _repository, _identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                DiffReviewSequenceEntry(runner.selection, None, recovery, runner.audit, backend)  # type: ignore[arg-type]
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                DiffReviewSequenceEntry(
+                    runner.selection, sealed_execution(AdvisoryRole.WORKER, runner.audit.profile),
+                    recovery, runner.audit, backend,
+                )
+            self.assertEqual(backend.calls, 0)
+
+    def test_sequence_entry_refuses_primary_capsule_for_a_fallback_profile(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, _repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            fallback = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                DiffReviewSequenceEntry(
+                    runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                    fallback, fallback.health_receipt.audit_identity, backend,
+                )
+            self.assertEqual(backend.calls, 0)
+
     def test_descriptor_accepts_only_the_closed_json_shape_and_real_anchors(self) -> None:
         descriptor = ProviderAttemptRuntimeDescriptor.parse(self.descriptor_payload())
         self.assertEqual(descriptor.candidate_sha, "b" * 40)

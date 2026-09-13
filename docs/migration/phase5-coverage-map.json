@@ -7,6 +7,13 @@
       "accepted-guidance-resolution",
       "typed-advisory-configuration",
       "public-safe-advisory-qualification"
+    ],
+    "artifacts": [
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"2dd4d17bf56cb86b53c2688c9087e573abc8a973ef9fede0a01f6cccf1470e41"},
+      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"445d158337655c1255eed9e2ec55a445ec20ac6a1eb4c39040b369ccf88048d8"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"8c9c4c17f49cc3d5e83f3e09ccb166c1b1dbeaa6b9f7c49fe4eb8ecbbe74227d"},
+      {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"fd8613fea0040c58dfb6b84cdfa24b1359e58df18ce3cf02f59d971b7f01a168"},
+      {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"fb0cc3df36b6e20990404aae7ac200ea017434508f8a43390fb424cf3829fab7"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

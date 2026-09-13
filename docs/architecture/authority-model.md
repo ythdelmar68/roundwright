@@ -5,15 +5,19 @@
 Recovery Advisor and Owner Intent Interpreter are opt-in advisory instances,
 not dispatchers. Admission requires independent authority evidence bound to the
 repository, task, deployment, epoch, expiry, revocation identity, host/state/
-fence-bound instance, accepted guidance at an exact trusted revision, and an
-allowlisted action/path/test/process/network/resource scope. The profile
-intersects that scope with a pinned SDK adapter mapping and finite budgets.
+fence-bound instance, accepted guidance at an exact trusted Git tree, and a
+root-normalized typed action/path/test/process/network/resource scope. The
+profile intersects that scope with a reviewed per-capability SDK mapping and
+finite budgets.
 
 Configuration resolves profiles only; it cannot create an admission or
 authority. A readiness receipt always leaves effective repository authority
 disabled. Missing, stale, revoked, copied, reassigned, expanded, or unknown
-evidence denies the request. Guidance uses an explicit trusted root and
-manifest-listed relative files; ambient discovery is prohibited.
+evidence denies the request. Guidance derives only the root-to-task
+`AGENTS.md` chain at the pinned tree; candidate, global, unrelated, and ambient
+instructions are prohibited. A typed pre-effect gate is defined for Worker,
+Supervisor, dependency-review, and both advisory seams. No advisory dispatch
+is enabled in those existing runtime seams today.
 
 ## Roles
 

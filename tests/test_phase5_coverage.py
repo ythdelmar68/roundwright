@@ -74,6 +74,13 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "issue 136"):
             coverage.validate(self.source, self.ledger, self.tests)
 
+    def test_rejects_issue_136_concrete_artifact_digest_drift(self) -> None:
+        document = self.document()
+        document["implementation_requirements"]["artifacts"][0]["sha256"] = "0" * 64
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
     def test_rejects_verification_drift_and_unsafe_verification_values(self) -> None:
         document = self.document()
         for verification, expected_error in (

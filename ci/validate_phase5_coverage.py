@@ -34,6 +34,13 @@ ISSUE_136_REQUIREMENTS = {
         "typed-advisory-configuration", "public-safe-advisory-qualification",
     ],
 }
+ISSUE_136_ARTIFACTS = {
+    "advisory-policy-v3": "src/roundwright/role_capability_policy.py",
+    "advisory-policy-adversarial-tests-v2": "tests/test_role_capability_policy.py",
+    "advisory-migration-v2": "docs/migration/issue-136-trusted-advisory-role-coverage.md",
+    "advisory-authority-model-v2": "docs/architecture/authority-model.md",
+    "advisory-configuration-v1": "src/roundwright/configuration.py",
+}
 
 # This is intentionally independent of the rendered map.  Adding, dropping,
 # or reassigning a selected identifier requires a reviewed code change.
@@ -214,8 +221,18 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     document = _read_json(source)
     if set(document) != {"schema", "implementation_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
         raise CoverageError("coverage map schema is invalid")
-    if document["implementation_requirements"] != ISSUE_136_REQUIREMENTS:
+    requirements = document["implementation_requirements"]
+    if type(requirements) is not dict or {key: requirements.get(key) for key in ("issue", "destinations")} != ISSUE_136_REQUIREMENTS:
         raise CoverageError("issue 136 implementation coverage has drifted")
+    artifacts = requirements.get("artifacts")
+    if type(artifacts) is not list or {item.get("identity"): item.get("path") for item in artifacts if type(item) is dict} != ISSUE_136_ARTIFACTS or len(artifacts) != len(ISSUE_136_ARTIFACTS):
+        raise CoverageError("issue 136 artifact identities have drifted")
+    for artifact in artifacts:
+        if set(artifact) != {"identity", "path", "sha256"} or type(artifact["sha256"]) is not str or not SHA256.fullmatch(artifact["sha256"]):
+            raise CoverageError("issue 136 artifact digest is invalid")
+        artifact_path = ROOT / artifact["path"]
+        if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact["sha256"]:
+            raise CoverageError("issue 136 artifact digest has drifted")
     if type(document["sources"]) is not dict or set(document["sources"]) != {"ledger_sha256", "test_disposition_sha256"}:
         raise CoverageError("coverage source bindings are invalid")
     source_bindings = document["sources"]

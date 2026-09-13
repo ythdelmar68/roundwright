@@ -452,6 +452,24 @@ class RoleAdmissionExpectation:
             raise RoleCapabilityError("role admission expectation is invalid")
 
 
+@dataclass(frozen=True)
+class ExecutionInstanceBinding:
+    """Canonical identity for one inert, pre-authorized role execution."""
+    repository_identity: str; task_identity: str; candidate_sha: str; instance_receipt_digest: str
+    host_identity: str; deployment_identity: str; authority_epoch: int; replacement_fence: str
+    role: AdvisoryRole; provider_profile: ProviderProfile; execution_identity: str; preflight_identity: str
+
+    def __post_init__(self) -> None:
+        for value in (self.repository_identity, self.instance_receipt_digest, self.host_identity, self.deployment_identity, self.preflight_identity): _require_digest(value, "execution binding")
+        if (type(self.task_identity) is not str or _IDENTITY.fullmatch(self.task_identity) is None or type(self.candidate_sha) is not str or _SHA.fullmatch(self.candidate_sha) is None or type(self.authority_epoch) is not int or self.authority_epoch < 1 or type(self.replacement_fence) is not str or _IDENTITY.fullmatch(self.replacement_fence) is None or type(self.role) is not AdvisoryRole or type(self.provider_profile) is not ProviderProfile or type(self.execution_identity) is not str or _IDENTITY.fullmatch(self.execution_identity) is None): raise RoleCapabilityError("execution binding is invalid")
+
+    @property
+    def digest(self) -> str:
+        return _digest({"schema":"roundwright-execution-instance-binding/v1","repository":self.repository_identity,"task":self.task_identity,"candidate":self.candidate_sha,"instance":self.instance_receipt_digest,"host":self.host_identity,"deployment":self.deployment_identity,"epoch":self.authority_epoch,"fence":self.replacement_fence,"role":self.role.value,"model":self.provider_profile.model,"reasoning_effort":self.provider_profile.reasoning_effort.value,"execution":self.execution_identity,"preflight":self.preflight_identity})
+
+
+
+
 class SealedRoleRuntimeContext:
     """Factory-sealed authoritative Git/control context for advisory admission."""
     __slots__ = ("root", "common_dir", "binding", "git_entrypoint_control", "tree", "task_candidate_sha", "_seal")

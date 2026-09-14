@@ -62,6 +62,9 @@ ISSUE_136_ARTIFACTS = {
     "advisory-coding-tools-v1": "src/roundwright/coding_tools.py",
     "advisory-coding-tools-tests-v1": "tests/test_coding_tools.py",
     "advisory-production-coding-runtime-tests-v1": "tests/test_production_coding_runtime.py",
+    "advisory-admission-fixture-v1": "tests/role_admission_fixture.py",
+    "advisory-qualification-validator-v1": "ci/validate_phase5_coverage.py",
+    "advisory-qualification-validator-tests-v1": "tests/test_phase5_coverage.py",
 }
 
 # This is intentionally independent of the rendered map.  Adding, dropping,

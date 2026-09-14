@@ -16,8 +16,21 @@ import signal
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+
+# Keep concrete filesystem effects on the same conservative Win32 spelling
+# boundary as admitted role scopes.  Windows resolves device stems regardless
+# of extension and aliases names with trailing dots/spaces; accepting any of
+# those spellings would let an allowlisted display path mean a different
+# filesystem object at execution time.
+_WINDOWS_RESERVED = frozenset({
+    "con", "prn", "aux", "nul", "clock$", "conin$", "conout$",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+})
 
 
 class CodingToolError(ValueError):
@@ -342,7 +355,24 @@ def _relative(value: object) -> bool:
     if type(value) is not str or not value or "\\" in value:
         return False
     path = Path(value)
-    return not path.is_absolute() and ".." not in path.parts and all(part not in {"", "."} for part in path.parts)
+    if path.is_absolute() or ".." in path.parts or any(part in {"", "."} for part in path.parts):
+        return False
+    for part in path.parts:
+        # ``NFKC`` folds compatibility characters such as full-width device
+        # names.  Reject rather than normalize: normalizing an approved
+        # string would silently widen the capability the caller selected.
+        normalized = unicodedata.normalize("NFKC", part)
+        stem = normalized.split(".", 1)[0].rstrip(". ").casefold()
+        if (
+            normalized != part
+            or ":" in part
+            or any(character in part for character in '*?<>|"')
+            or any(ord(character) < 32 for character in part)
+            or part.endswith((".", " "))
+            or stem in _WINDOWS_RESERVED
+        ):
+            return False
+    return True
 
 
 def _is_link(path: Path) -> bool:

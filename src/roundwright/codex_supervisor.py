@@ -265,7 +265,10 @@ class CodexSupervisorAdapter:
         try:
             if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != self._profile:
                 raise RoleCapabilityError("Supervisor expected execution profile has drifted")
-            require_independent_execution(advisory_execution, expected_execution)
+            def admit() -> dict[str, object]:
+                return require_independent_execution(advisory_execution, expected_execution)
+
+            admit()
         except RoleCapabilityError as error:
             raise CodexSupervisorError("Supervisor advisory admission is denied") from error
         session: NativeSupervisorSession | None = None
@@ -273,22 +276,27 @@ class CodexSupervisorAdapter:
         session_identity: str | None = None
         turn_identity: str | None = None
         try:
+            admit()
             session = self._backend.open_fresh_session(self._profile)
             session_identity = _identity(session, "session")
             try:
+                admit()
                 checkpoint_session(session_identity)
             except Exception:
                 raise CodexSupervisorCheckpointError(
                     SupervisorCheckpointStage.SESSION, session_present=True, turn_present=False,
                 ) from None
+            admit()
             turn = session.start_turn(request)
             turn_identity = _identity(turn, "turn")
             try:
+                admit()
                 checkpoint_turn(session_identity, turn_identity)
             except Exception:
                 raise CodexSupervisorCheckpointError(
                     SupervisorCheckpointStage.TURN, session_present=True, turn_present=True,
                 ) from None
+            admit()
             response = turn.read_response()
         except CodexSupervisorError:
             _abort(turn); _close(session)

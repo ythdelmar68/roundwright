@@ -144,7 +144,10 @@ class CodexDependencyReviewAdapter:
         try:
             if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != self._profile:
                 raise RoleCapabilityError("dependency review expected execution profile has drifted")
-            require_independent_execution(advisory_execution, expected_execution)
+            def admit() -> dict[str, object]:
+                return require_independent_execution(advisory_execution, expected_execution)
+
+            admit()
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         session = None
@@ -152,12 +155,17 @@ class CodexDependencyReviewAdapter:
         session_id = None
         turn_id = None
         try:
+            admit()
             session = self._backend.open_fresh_session(self._profile)
             session_id = _identity(session, "session")
+            admit()
             checkpoint_session(session_id)
+            admit()
             turn = session.start_turn(request)
             turn_id = _identity(turn, "turn")
+            admit()
             checkpoint_turn(session_id, turn_id)
+            admit()
             response = turn.read_response()
         except (CodexAdapterError, Exception):
             _abort(turn)
@@ -199,22 +207,31 @@ class DependencyReviewService:
         if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != advisory_execution.execution_binding.provider_profile:
             raise DependencyReviewDispatchError("dependency review expected execution has drifted")
         try:
-            require_independent_execution(advisory_execution, expected_execution)
+            def admit() -> dict[str, object]:
+                return require_independent_execution(advisory_execution, expected_execution)
+
+            admit()
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         store = DependencyReviewStore()
+        admit()
         attempt = store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding, source_owned_relations=source_owned_relations, supersedes_attempt_id=supersedes_attempt_id)
         request = DependencyReviewRequest(attempt.attempt_id, store.model_input(subset, attempt_id=attempt.attempt_id, profile_identity=binding.profile_identity, source_owned_relations=source_owned_relations), attempt.input_digest, binding.profile_identity)
         recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
+        admit()
         if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")
 
         def claimed_session(session_identity: str) -> None:
+            admit()
             store.claim_session(repository, attempt_id=attempt.attempt_id, session_identity=session_identity)
+            admit()
             checkpoint_session(session_identity)
 
         def claimed_turn(session_identity: str, turn_identity: str) -> None:
+            admit()
             store.claim_turn(repository, attempt_id=attempt.attempt_id, session_identity=session_identity, turn_identity=turn_identity)
+            admit()
             checkpoint_turn(session_identity, turn_identity)
 
         result = adapter.dispatch(
@@ -224,13 +241,17 @@ class DependencyReviewService:
         if result.kind is DependencyReviewResultKind.ACCEPTED:
             assert result.proposal is not None
             try:
+                admit()
                 store.accept_proposal(repository, result.proposal, binding=binding)
             except DependencyReviewError:
+                admit()
                 store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code="proposal-rejected")
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, result.session_identity, result.turn_identity, None, result.output_digest, "proposal-rejected")
         elif result.kind is DependencyReviewResultKind.AMBIGUOUS:
+            admit()
             store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
         else:
+            admit()
             store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
         return result
 

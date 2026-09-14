@@ -47,6 +47,17 @@ class BoundedCodingToolsTests(unittest.TestCase):
         with self.assertRaises(CodingToolError):
             self.tools.validate(("cmd.exe", "/c", "whoami"))
 
+    def test_win32_aliases_are_rejected_before_any_path_effect(self) -> None:
+        command = (sys.executable, "-c", "import sys; sys.exit(0)")
+        for alias in (
+            "src/aux.txt", "src/COM1", "src/allowed.txt:stream",
+            "src/allowed.txt.", "src/allowed.txt ", "src/ａｕｘ.txt",
+        ):
+            with self.subTest(alias=alias), self.assertRaises(CodingToolError):
+                BoundedCodingCapability(
+                    self.root, (alias,), ("src/allowed.txt",), (command,),
+                )
+
     def test_symlink_escape_is_denied_when_supported(self) -> None:
         target = self.foreign / "coding-tools-secret.txt"
         target.write_text("secret", encoding="utf-8")

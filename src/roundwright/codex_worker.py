@@ -439,7 +439,12 @@ class CodexWorkerAdapter:
         try:
             if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != self._profile:
                 raise RoleCapabilityError("Worker expected execution profile has drifted")
-            admission_receipt = require_independent_execution(advisory_execution, expected_execution)
+            def admit() -> dict[str, object]:
+                # The record is deliberately re-read at each effect boundary.
+                # A capsule is evidence for one binding, not a cached permit.
+                return require_independent_execution(advisory_execution, expected_execution)
+
+            admission_receipt = admit()
         except RoleCapabilityError as error:
             raise CodexWorkerError("Worker advisory admission is denied") from error
         session_identity: str | None = None
@@ -447,11 +452,13 @@ class CodexWorkerAdapter:
         session: NativeWorkerSession | None = None
         turn: NativeWorkerTurn | None = None
         try:
+            admit()
             session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity, action=request.action)
             session_identity = _identity(session, "session")
             if request.resume_session_identity is not None and session_identity != request.resume_session_identity:
                 _close_session(session)
                 return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
+            admit()
             checkpoint_session(session_identity)
         except CodexAdapterError:
             _close_session(session)
@@ -463,8 +470,10 @@ class CodexWorkerAdapter:
             _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
         try:
+            admit()
             turn = session.start_turn(request, self._tools)
             turn_identity = _identity(turn, "turn")
+            admit()
             checkpoint_turn(session_identity, turn_identity)
         except CodexAdapterError:
             _abort_turn(turn); _close_session(session)
@@ -479,11 +488,12 @@ class CodexWorkerAdapter:
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         try:
             if execute_tool_request is None:
+                admit()
                 response = turn.read_response()
             else:
                 def authorized_tool_request(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
                     try:
-                        require_worker_tool_capability(admission_receipt, tool=item.tool)
+                        require_worker_tool_capability(admit(), tool=item.tool)
                     except RoleCapabilityError:
                         # Do not hand an ungranted request to the product
                         # callback.  This is deliberately a terminal native
@@ -497,6 +507,7 @@ class CodexWorkerAdapter:
                         turn, session_identity, checkpoint_turn
                     ),
                     checkpoint_submission=checkpoint_submission,
+                    authorize_effect=admit,
                 )
                 # A coding tool result may advance the native handle.  Bind
                 # the returned terminal outcome to that actual final turn.
@@ -533,10 +544,11 @@ def _checkpoint_next_turn(
     return next_turn_identity
 
 
-def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], str], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None) -> NativeWorkerResponse:
+def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], str], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None, authorize_effect: Callable[[], object]) -> NativeWorkerResponse:
     """Consume one exact turn; malformed/uncertain tool exchange is ambiguous."""
     expected = 1
     while expected <= _MAX_TOOL_STEPS:
+        authorize_effect()
         step = turn.read_step()
         if step.response is not None:
             return step.response
@@ -550,17 +562,22 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
             # This durable intent is bound to the already checkpointed source
             # turn.  A crash from here through the provider handoff can never
             # be reconstructed as a clear delivery.
+            authorize_effect()
             checkpoint_submission(request, result, "intent", None)
         try:
+            authorize_effect()
             turn.submit_tool_result(result)
             # A coding result creates a fresh exact SDK turn.  Its identity
             # must become durable before this loop asks it for a stream.
+            authorize_effect()
             next_turn_identity = checkpoint_next_turn()
         except Exception:
             if checkpoint_submission is not None:
+                authorize_effect()
                 checkpoint_submission(request, result, "uncertain", None)
             raise
         if checkpoint_submission is not None:
+            authorize_effect()
             checkpoint_submission(request, result, "submitted", next_turn_identity)
         expected += 1
     raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)

@@ -382,7 +382,7 @@ _SEMANTIC_TESTS = (
 
 def _semantic_execution(path: Path, candidate: str) -> str:
     actual = _read_json(path)
-    payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": _SEMANTIC_TESTS, "status": "passed"}
+    payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(_SEMANTIC_TESTS), "status": "passed"}
     if actual != {**payload, "receipt_digest": _digest(_canonical(payload))}:
         raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
     return actual["receipt_digest"]

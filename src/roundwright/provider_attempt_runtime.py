@@ -256,6 +256,7 @@ class DiffReviewSequenceEntry:
     recovery: RecoveryContext
     audit: ProviderHealthAuditIdentity
     backend: NativeCodexSupervisorBackend
+    expected_execution: ExecutionInstanceBinding | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -264,6 +265,10 @@ class DiffReviewSequenceEntry:
             or type(self.recovery) is not RecoveryContext
             or type(self.audit) is not ProviderHealthAuditIdentity
             or not callable(getattr(self.backend, "open_fresh_session", None))
+            or (self.expected_execution is not None and (
+                type(self.expected_execution) is not ExecutionInstanceBinding
+                or self.expected_execution.provider_profile != self.audit.profile
+            ))
         ):
             raise ProviderAttemptRuntimeError("provider attempt sequence entry is invalid")
 
@@ -310,6 +315,7 @@ class DurableDiffReviewRunner:
     review_round: int
     selection: DiffReviewSelection
     advisory_execution: SealedRoleExecution
+    expected_execution: ExecutionInstanceBinding
     budget_ledger: DurableRoleBudgetLedger
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
@@ -355,6 +361,8 @@ class DurableDiffReviewRunner:
                 for item in entries
             )
             or not _matching_supervisor_admission(self.advisory_execution, self.audit)
+            or type(self.expected_execution) is not ExecutionInstanceBinding
+            or self.expected_execution.provider_profile != self.audit.profile
             or type(self.budget_ledger) is not DurableRoleBudgetLedger
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
@@ -405,7 +413,17 @@ class DurableDiffReviewRunner:
         entries = self.validate_sequence()
         try:
             for entry in entries:
-                require_execution_for_profile(entry.advisory_execution, entry.audit.profile)
+                expected = entry.expected_execution or (
+                    self.expected_execution if entry.selection == self.selection else None
+                )
+                if expected is not None:
+                    require_independent_execution(entry.advisory_execution, expected)
+                else:
+                    # This legacy direct-runner seam is intentionally not
+                    # reachable from hosted inputs: install_host_runtime
+                    # requires every configured sequence entry to carry an
+                    # independently host-derived expected execution.
+                    require_execution_for_profile(entry.advisory_execution, entry.audit.profile)
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
         entries = self.preflight_checkpoint_prerequisites()
@@ -685,7 +703,11 @@ class DurableDiffReviewRunner:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
                 advisory_execution=entry.advisory_execution,
-                expected_execution=entry.advisory_execution.execution_binding,
+                expected_execution=entry.expected_execution or (
+                    self.expected_execution
+                    if selection == self.selection
+                    else entry.advisory_execution.execution_binding
+                ),
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(
@@ -946,6 +968,12 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         or host.sequence[0].audit != audit
         or host.sequence[0].selection != host.selection
         or host.sequence[0].advisory_execution.execution_binding != host.expected_execution
+        or any(
+            type(item.expected_execution) is not ExecutionInstanceBinding
+            or item.expected_execution.provider_profile != item.audit.profile
+            for item in host.sequence
+        )
+        or host.sequence[0].expected_execution != host.expected_execution
     ):
         raise ProviderAttemptRuntimeError("provider attempt host sequence has drifted")
     backend = host.backend
@@ -969,6 +997,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         review_epoch=descriptor.review_epoch, review_round=descriptor.review_round,
         dependency_binding=host.dependency_binding, dispatch_control=host.dispatch_control,
         audit=audit, backend=backend, selection=host.selection, sequence=host.sequence, advisory_execution=host.advisory_execution,
+        expected_execution=host.expected_execution,
         budget_ledger=host.budget_ledger,
         completion_policy=completion_policy,
     )
@@ -1000,6 +1029,7 @@ def install_durable_diff_review_runtime(
     backend: NativeCodexSupervisorBackend,
     selection: DiffReviewSelection,
     advisory_execution: SealedRoleExecution,
+    expected_execution: ExecutionInstanceBinding,
     budget_ledger: DurableRoleBudgetLedger,
     sequence: tuple[DiffReviewSequenceEntry, ...] = (),
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY,
@@ -1014,7 +1044,7 @@ def install_durable_diff_review_runtime(
     runner = DurableDiffReviewRunner(
         repository, identity, recovery, worktree, seal, lease, dependency_binding,
         dispatch_control, audit, backend, source_digest, review_epoch, review_round,
-        selection, advisory_execution, budget_ledger, sequence, completion_policy, case_id, ready_at,
+        selection, advisory_execution, expected_execution, budget_ledger, sequence, completion_policy, case_id, ready_at,
     )
     RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
         repository, identity, recovery, lease, seal, worktree, source_digest,

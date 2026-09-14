@@ -153,6 +153,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 now + 60, "Review the immutable candidate.", ("Return a strict verdict.",),
             ),
             advisory_execution=execution,
+            expected_execution=execution.execution_binding,
             # Direct runner recovery tests use an explicit two-attempt test
             # allocation.  Hosted production inputs below retain the admitted
             # one-attempt fixture budget and exercise the shared exhaustion
@@ -362,6 +363,33 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             # no second formal acceptance can be created.
             self.assertEqual(runner.execute(), ("runtime-provider-one",))
             self.assertEqual(backend.calls, 1)
+
+    def test_host_expected_supervisor_execution_drift_blocks_before_attempt_or_backend(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, _recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            drifted = replace(runner, expected_execution=replace(
+                runner.expected_execution, candidate_sha="c" * 40,
+            ))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                before = connection.execute(
+                    "SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,),
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "advisory admission"):
+                drifted.execute()
+            self.assertEqual(backend.calls, 0)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,),
+                ).fetchone()[0], before)
+            finally:
+                connection.close()
 
     def test_invalid_then_later_accepted_result_uses_durable_recovery_without_formal_consumption(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1167,8 +1195,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "execution_context": descriptor,
                 }
                 sequence = (
-                    DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend),
-                    DiffReviewSequenceEntry(second_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                    DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding),
+                    DiffReviewSequenceEntry(second_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile).execution_binding),
                 )
                 host = ProviderAttemptHostInputs(
                     repository, identity, recovery, runner.lease, seal, runner.binding,
@@ -1302,8 +1330,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     expected_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding,
                     budget_ledger=self.budget_ledger(repository, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile)),
                     sequence=(
-                        DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend),
-                        DiffReviewSequenceEntry(second_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                        DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding),
+                        DiffReviewSequenceEntry(second_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile).execution_binding),
                     ),
                     advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
                 )
@@ -1311,8 +1339,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 preflight_request = dict(request, execution_context=preflight_descriptor)
                 duplicate_selection = replace(second_selection, provider_attempt_id=runner.selection.provider_attempt_id)
                 preflight_host = replace(host, sequence=(
-                    DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend),
-                    DiffReviewSequenceEntry(duplicate_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                    DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding),
+                    DiffReviewSequenceEntry(duplicate_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile).execution_binding),
                 ))
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
                     external_validation.run_provider_attempt_accounting_profile(

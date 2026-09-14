@@ -372,6 +372,22 @@ def _semantic_contract_digest() -> str:
     return _digest(_canonical(payload))
 
 
+_SEMANTIC_TESTS = (
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
+    "tests.test_worker_toolbox.WorkerToolboxTests.test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
+    "tests.test_coding_tools.BoundedCodingToolsTests.test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
+    "tests.test_role_capability_policy.RoleCapabilityPolicyTests.test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed",
+)
+
+def _semantic_execution(path: Path, candidate: str) -> str:
+    actual = _read_json(path)
+    payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": _SEMANTIC_TESTS, "status": "passed"}
+    if actual != {**payload, "receipt_digest": _digest(_canonical(payload))}:
+        raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
+    return actual["receipt_digest"]
+
+
 def _git_blob_sha256(relative_path: object) -> str:
     """Hash the tracked Git blob, never platform-transformed checkout bytes."""
     if type(relative_path) is not str or not relative_path or relative_path.startswith("/") or "\\" in relative_path or ".." in relative_path.split("/"):
@@ -385,19 +401,19 @@ def _git_blob_sha256(relative_path: object) -> str:
     return hashlib.sha256(result.stdout).hexdigest()
 
 
-def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path) -> None:
+def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path, semantic_receipt: Path) -> None:
     _require_current_candidate(candidate)
     document = validate(source, ledger, tests)
-    payload = {"schema": "roundwright-phase5-coverage-readback/v2", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "semantic_contract_digest": _semantic_contract_digest(), "items": document["items"]}
+    payload = {"schema": "roundwright-phase5-coverage-readback/v2", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "semantic_contract_digest": _semantic_contract_digest(), "semantic_execution_receipt": _semantic_execution(semantic_receipt,candidate), "items": document["items"]}
     receipt = {**payload, "coverage_digest": _digest(_canonical(payload))}
     output.write_bytes(_canonical(receipt) + b"\n")
 
 
-def verify(source: Path, ledger: Path, tests: Path, candidate: str, manifest: Path) -> None:
+def verify(source: Path, ledger: Path, tests: Path, candidate: str, manifest: Path, semantic_receipt: Path) -> None:
     _require_current_candidate(candidate)
     document = validate(source, ledger, tests)
     actual = _read_json(manifest)
-    payload = {"schema": "roundwright-phase5-coverage-readback/v2", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "semantic_contract_digest": _semantic_contract_digest(), "items": document["items"]}
+    payload = {"schema": "roundwright-phase5-coverage-readback/v2", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "semantic_contract_digest": _semantic_contract_digest(), "semantic_execution_receipt": _semantic_execution(semantic_receipt,candidate), "items": document["items"]}
     expected = {**payload, "coverage_digest": _digest(_canonical(payload))}
     if actual != expected:
         raise CoverageError("candidate-bound coverage manifest does not match")
@@ -412,17 +428,18 @@ def main() -> int:
     parser.add_argument("--candidate")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--semantic-receipt", type=Path)
     arguments = parser.parse_args()
     if arguments.operation == "validate":
         validate(arguments.source, arguments.ledger, arguments.tests)
     elif arguments.operation == "render":
-        if not arguments.candidate or arguments.output is None:
+        if not arguments.candidate or arguments.output is None or arguments.semantic_receipt is None:
             raise CoverageError("render requires a candidate and output")
-        render(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.output)
+        render(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.output, arguments.semantic_receipt)
     else:
-        if not arguments.candidate or arguments.manifest is None:
+        if not arguments.candidate or arguments.manifest is None or arguments.semantic_receipt is None:
             raise CoverageError("verify requires a candidate and manifest")
-        verify(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.manifest)
+        verify(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.manifest, arguments.semantic_receipt)
     return 0
 
 

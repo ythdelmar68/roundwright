@@ -26,9 +26,12 @@ class Phase5CoverageTests(unittest.TestCase):
         self.source = self.directory / "map.json"
         self.ledger = self.directory / "ledger.md"
         self.tests = self.directory / "tests.md"
+        self.semantic = self.directory / "semantic.json"
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         shutil.copy2(ROOT / "docs" / "migration" / "legacy-decision-ledger.md", self.ledger)
         shutil.copy2(ROOT / "docs" / "migration" / "test-disposition.md", self.tests)
+        candidate = coverage.current_candidate(); payload={"schema":"roundwright-phase5-semantic-execution/v1","candidate_sha":candidate,"tests":coverage._SEMANTIC_TESTS,"status":"passed"}
+        self.semantic.write_text(json.dumps({**payload,"receipt_digest":coverage._digest(coverage._canonical(payload))}),encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -44,8 +47,8 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(len(document["items"]), len(coverage.EXPECTED_OWNERS))
         manifest = self.directory / "readback.json"
         candidate = coverage.current_candidate()
-        coverage.render(self.source, self.ledger, self.tests, candidate, manifest)
-        coverage.verify(self.source, self.ledger, self.tests, candidate, manifest)
+        coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
+        coverage.verify(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
 
     def test_rejects_duplicate_unknown_and_owner_drift(self) -> None:
         document = self.document()
@@ -146,7 +149,7 @@ class Phase5CoverageTests(unittest.TestCase):
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         manifest = self.directory / "readback.json"
         candidate = coverage.current_candidate()
-        coverage.render(self.source, self.ledger, self.tests, candidate, manifest)
+        coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
         other_candidate = "0" * 40 if candidate != "0" * 40 else "1" * 40
         with self.assertRaisesRegex(coverage.CoverageError, "does not match checked-out HEAD"):
-            coverage.verify(self.source, self.ledger, self.tests, other_candidate, manifest)
+            coverage.verify(self.source, self.ledger, self.tests, other_candidate, manifest, self.semantic)

@@ -20,7 +20,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
+from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution, trusted_provider_launch_context
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -301,7 +301,12 @@ def prepare_dependency_review_host(
     if backend is None:
         from .dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend
         from .worker_toolbox import CompletionDeadline
-        backend = HarnessNativeCodexDependencyReviewBackend(cwd=repository.root, completion=CompletionDeadline(100, 600))
+        backend = HarnessNativeCodexDependencyReviewBackend(
+            cwd=repository.root, completion=CompletionDeadline(100, 600),
+            launch_context=trusted_provider_launch_context(
+                advisory_execution, expected_execution, cwd=repository.root,
+            ),
+        )
     return DependencyReviewHostInputs(
         repository, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit),
         lambda _session: None, lambda _session, _turn: None, advisory_execution,

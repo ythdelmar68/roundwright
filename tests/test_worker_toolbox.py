@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole
+from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
@@ -184,6 +184,22 @@ class WorkerToolboxTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e, _f: None)
         self.assertEqual(self.events, [])
+
+    def test_sealed_launch_context_blocks_cwd_and_profile_drift_before_client_creation(self):
+        execution = sealed_execution(AdvisoryRole.WORKER, self.profile)
+        launch = trusted_provider_launch_context(
+            execution, execution.execution_binding, cwd=ROOT,
+        )
+        launches: list[str] = []
+        backend = HarnessNativeCodexWorkerBackend(
+            cwd=ROOT / "wrong-cwd", completion=CompletionDeadline(1000, 2000),
+            codex_factory=lambda: launches.append("client") or FakeCodex(self.events),
+            approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            launch_context=launch,
+        )
+        with self.assertRaises(CodexAdapterError):
+            backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
+        self.assertEqual(launches, [])
 
     def test_native_qualification_rejects_unenforceable_abstract_tool_labels(self):
         backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)

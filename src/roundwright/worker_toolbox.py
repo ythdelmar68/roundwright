@@ -48,6 +48,7 @@ from .coding_worker_state import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError
 from .role_capability_policy import ExecutionInstanceBinding, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
 from .shadow import RecorderBinding
 from .worker_shadow import (
@@ -283,7 +284,7 @@ class HarnessExternalWorkerRecorder(ExternalWorkerRecorder):
 class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
     """Executable deny-all/read-only bridge over the reviewed native SDK API."""
 
-    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic, launch_context: TrustedProviderLaunchContext | None = None) -> None:
         if not isinstance(cwd, Path):
             raise WorkerShadowError("native Worker working directory is invalid")
         if codex_factory is None:
@@ -293,14 +294,23 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 codex_factory, approval_mode, sandbox, effort_factory = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             except Exception as error:
                 raise WorkerShadowError("reviewed native Worker SDK is unavailable") from error
-        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock):
+        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock) or (launch_context is not None and type(launch_context) is not TrustedProviderLaunchContext):
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
-        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
+        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock, self._launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
 
     def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None, action: WorkerAction) -> NativeWorkerSession:
         if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-        instructions = _NO_TOOL_INSTRUCTIONS if action is WorkerAction.PLANNING else _CODING_TOOL_INSTRUCTIONS
+        try:
+            if self._launch is not None:
+                self._launch.verify(cwd=self._cwd, profile=profile)
+        except RoleCapabilityError as error:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
+        instructions = (
+            self._launch.developer_instructions
+            if self._launch is not None
+            else _NO_TOOL_INSTRUCTIONS if action is WorkerAction.PLANNING else _CODING_TOOL_INSTRUCTIONS
+        )
         codex = self._codex_factory()
         try:
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex

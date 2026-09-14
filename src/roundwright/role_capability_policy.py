@@ -275,6 +275,73 @@ class ProviderGuidanceEvidence:
             raise RoleCapabilityError("provider guidance evidence is invalid")
 
 
+_LAUNCH_CONTEXT_SEAL = object()
+
+
+class TrustedProviderLaunchContext:
+    """Opaque native-launch facts derived only from a sealed role admission."""
+
+    __slots__ = (
+        "cwd", "expected_execution", "guidance_receipt_digest",
+        "injected_context_digest", "implicit_discovery_disabled",
+        "developer_instructions", "_seal",
+    )
+
+    def __init__(
+        self, cwd: Path, expected_execution: ExecutionInstanceBinding,
+        guidance_receipt_digest: str, injected_context_digest: str,
+        developer_instructions: str, *, _seal: object | None = None,
+    ) -> None:
+        if (
+            _seal is not _LAUNCH_CONTEXT_SEAL or not isinstance(cwd, Path)
+            or type(expected_execution) is not ExecutionInstanceBinding
+            or _DIGEST.fullmatch(guidance_receipt_digest) is None
+            or _DIGEST.fullmatch(injected_context_digest) is None
+            or type(developer_instructions) is not str or not developer_instructions
+        ):
+            raise RoleCapabilityError("trusted provider launch context is invalid")
+        self.cwd = cwd.resolve(strict=False)
+        self.expected_execution = expected_execution
+        self.guidance_receipt_digest = guidance_receipt_digest
+        self.injected_context_digest = injected_context_digest
+        self.implicit_discovery_disabled = True
+        self.developer_instructions = developer_instructions
+        self._seal = _seal
+
+    def verify(self, *, cwd: Path, profile: ProviderProfile) -> None:
+        if (
+            self._seal is not _LAUNCH_CONTEXT_SEAL
+            or not isinstance(cwd, Path) or cwd.resolve(strict=False) != self.cwd
+            or type(profile) is not ProviderProfile
+            or self.expected_execution.provider_profile != profile
+            or self.implicit_discovery_disabled is not True
+        ):
+            raise RoleCapabilityError("trusted provider launch context has drifted")
+
+
+def trusted_provider_launch_context(
+    execution: "SealedRoleExecution", expected_execution: ExecutionInstanceBinding, *, cwd: Path,
+) -> TrustedProviderLaunchContext:
+    """Create the only native SDK launch envelope from verified host state."""
+
+    if type(execution) is not SealedRoleExecution or type(expected_execution) is not ExecutionInstanceBinding or not isinstance(cwd, Path):
+        raise RoleCapabilityError("trusted provider launch context is invalid")
+    require_independent_execution(execution, expected_execution)
+    evidence = execution.guidance_evidence
+    receipt = execution.contract.guidance.receipt_digest
+    if evidence.guidance_receipt_digest != receipt or evidence.implicit_discovery_disabled is not True:
+        raise RoleCapabilityError("trusted provider guidance has drifted")
+    instructions = (
+        "Use only the explicitly injected Roundwright guidance boundary. "
+        "Do not discover ambient, global, or repository instruction files. "
+        f"Guidance receipt: {receipt}. Injected context: {evidence.injected_context_digest}."
+    )
+    return TrustedProviderLaunchContext(
+        cwd, expected_execution, receipt, evidence.injected_context_digest,
+        instructions, _seal=_LAUNCH_CONTEXT_SEAL,
+    )
+
+
 def _git(root: Path, *arguments: str) -> bytes:
     try:
         return subprocess.run(("git", "-C", str(root), *arguments), check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout

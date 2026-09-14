@@ -29,7 +29,7 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
-from .role_capability_policy import DurableRoleBudgetLedger, ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
+from .role_capability_policy import DurableRoleBudgetLedger, ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution, trusted_provider_launch_context
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
@@ -987,6 +987,10 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
             cwd=host.repository.root,
             completion=deadline,
             approval_mode=None, sandbox=None,
+            launch_context=trusted_provider_launch_context(
+                host.advisory_execution, host.expected_execution,
+                cwd=host.repository.root,
+            ),
         )
     install_durable_diff_review_runtime(
         descriptor.resource_id, repository=host.repository, identity=host.identity,

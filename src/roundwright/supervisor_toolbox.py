@@ -21,7 +21,7 @@ from .codex_supervisor import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
-from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError, require_external_production_activation
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
@@ -57,7 +57,7 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
         if type(profile) is not ProviderProfile:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
-            self._launch.verify(cwd=self._cwd, profile=profile)
+            self._launch.verify(cwd=self._cwd, profile=profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
             factory, approval, sandbox, effort = self._native_binding()
             codex = factory()
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
@@ -120,7 +120,7 @@ class _Session(NativeSupervisorSession):
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
         try:
-            self._launch.verify(cwd=self._cwd, profile=self._profile)
+            self._launch.verify(cwd=self._cwd, profile=self._profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         instruction = "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly."

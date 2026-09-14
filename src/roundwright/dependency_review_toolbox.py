@@ -15,7 +15,7 @@ from .codex_dependency_review import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
-from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError, require_external_production_activation
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
@@ -70,7 +70,7 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
             raise CodexAdapterError(CodexFailure.UNSUPPORTED_CAPABILITY)
         codex = workspace = None
         try:
-            self.launch.verify(cwd=self.cwd, profile=profile)
+            self.launch.verify(cwd=self.cwd, profile=profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
             if self.factory is None:
                 require_external_production_activation()
                 sdk = importlib.import_module("openai_codex"); generated = importlib.import_module("openai_codex.generated.v2_all")
@@ -81,12 +81,17 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
             if not callable(thread_start):
                 raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
             workspace = tempfile.TemporaryDirectory(prefix="roundwright-dependency-review-")
+            # The disposable directory is the only cwd presented to the SDK.
+            # Re-seal it before the first SDK call; the repository host cwd is
+            # never a substitute authority for this ephemeral execution.
+            launch = self.launch.for_ephemeral_cwd(Path(workspace.name))
+            launch.verify(cwd=Path(workspace.name), profile=profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
             thread = thread_start(
-                approval_mode=approval, cwd=workspace.name, developer_instructions=self.launch.developer_instructions,
+                approval_mode=approval, cwd=workspace.name, developer_instructions=launch.developer_instructions,
                 ephemeral=True, model=profile.model, sandbox=sandbox,
             )
             if not isinstance(getattr(thread, "id", None), str): raise ValueError
-            return _Session(thread, codex, self.cwd, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace, self.launch)
+            return _Session(thread, codex, Path(workspace.name), Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace, launch)
         except (CodexAdapterError, RoleCapabilityError) as error:
             if workspace is not None: workspace.cleanup()
             if codex is not None: _close(codex)
@@ -105,9 +110,9 @@ class _Session(NativeDependencyReviewSession):
         if self.started or type(request) is not DependencyReviewRequest: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self.started = True
         try:
-            # The SDK runs in an empty ephemeral workspace; only the sealed
-            # host cwd may authorize its launch, never its turn cwd.
-            self.launch.verify(cwd=self.host_cwd, profile=self.profile)
+            # The SDK runs in the sealed empty ephemeral workspace for both
+            # session creation and the turn; no host/repository cwd is trusted.
+            self.launch.verify(cwd=self.host_cwd, profile=self.profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         payload = {"schema": "roundwright-dependency-review-native/v1", "capability_contract": "behavioral-zero-tool-use/v1", "instruction": "Return only one dependency proposal for this normalized subset. Do not request or use tools, inspect repositories, request credentials, or emit prose.", "input": request.input_material}

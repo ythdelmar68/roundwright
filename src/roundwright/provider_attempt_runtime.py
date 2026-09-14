@@ -602,7 +602,9 @@ class DurableDiffReviewRunner:
             # Reserve all three reviewed dimensions before any durable attempt
             # mutation or native SDK effect.  The SQLite row is shared by every
             # pre-bound profile and survives runner reconstruction.
-            self.budget_ledger.reserve_effect()
+            self.budget_ledger.reserve_effect(
+                exposure=entry.advisory_execution.contract.profile.budget,
+            )
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
         prepared = prepare_attempt(

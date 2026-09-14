@@ -262,11 +262,15 @@ class TrustedGuidance:
     view: GuidanceView
     selected_paths: tuple[str, ...]
     guidance_digest: str
+    # These are the exact immutable bytes read from the accepted-main tree.
+    # They are intentionally retained only in the sealed in-process value;
+    # public receipts continue to contain digests, never instruction text.
+    accepted_main_guidance_bytes: bytes = b""
 
     def __post_init__(self) -> None:
         _require_digest(self.expectation_identity, "guidance expectation identity")
         _require_digest(self.guidance_digest, "guidance digest")
-        if type(self.view) is not GuidanceView or type(self.selected_paths) is not tuple or not self.selected_paths or tuple(sorted(set(self.selected_paths), key=lambda item: (item.count("/"), item))) != self.selected_paths:
+        if type(self.view) is not GuidanceView or type(self.accepted_main_guidance_bytes) is not bytes or type(self.selected_paths) is not tuple or not self.selected_paths or tuple(sorted(set(self.selected_paths), key=lambda item: (item.count("/"), item))) != self.selected_paths:
             raise RoleCapabilityError("trusted guidance selection is invalid")
         for path in self.selected_paths:
             _relative_path(path)
@@ -304,13 +308,15 @@ class TrustedProviderLaunchContext:
     __slots__ = (
         "cwd", "expected_execution", "guidance_receipt_digest",
         "injected_context_digest", "implicit_discovery_disabled",
-        "developer_instructions", "_seal",
+        "developer_instructions", "accepted_main_guidance_digest", "accepted_main_guidance_bytes",
+        "role_injected_bytes", "cwd_identity", "sdk_mapping_identity", "_seal",
     )
 
     def __init__(
         self, cwd: Path, expected_execution: ExecutionInstanceBinding,
         guidance_receipt_digest: str, injected_context_digest: str,
-        developer_instructions: str, *, _seal: object | None = None,
+        developer_instructions: str, *, accepted_main_guidance_bytes: bytes,
+        sdk_mapping_identity: str, _seal: object | None = None,
     ) -> None:
         if (
             _seal is not _LAUNCH_CONTEXT_SEAL or not isinstance(cwd, Path)
@@ -318,6 +324,8 @@ class TrustedProviderLaunchContext:
             or _DIGEST.fullmatch(guidance_receipt_digest) is None
             or _DIGEST.fullmatch(injected_context_digest) is None
             or type(developer_instructions) is not str or not developer_instructions
+            or type(accepted_main_guidance_bytes) is not bytes
+            or _DIGEST.fullmatch(sdk_mapping_identity) is None
         ):
             raise RoleCapabilityError("trusted provider launch context is invalid")
         self.cwd = cwd.resolve(strict=False)
@@ -326,17 +334,44 @@ class TrustedProviderLaunchContext:
         self.injected_context_digest = injected_context_digest
         self.implicit_discovery_disabled = True
         self.developer_instructions = developer_instructions
+        self.role_injected_bytes = developer_instructions.encode("utf-8")
+        self.accepted_main_guidance_bytes = accepted_main_guidance_bytes
+        self.accepted_main_guidance_digest = "sha256:" + hashlib.sha256(accepted_main_guidance_bytes).hexdigest()
+        self.cwd_identity = _digest({"schema": "roundwright-provider-sdk-cwd/v1", "cwd": str(self.cwd)})
+        self.sdk_mapping_identity = sdk_mapping_identity
         self._seal = _seal
 
-    def verify(self, *, cwd: Path, profile: ProviderProfile) -> None:
+    def verify(self, *, cwd: Path, profile: ProviderProfile,
+               required_capability: RoleCapability | None = None) -> None:
         if (
             self._seal is not _LAUNCH_CONTEXT_SEAL
             or not isinstance(cwd, Path) or cwd.resolve(strict=False) != self.cwd
             or type(profile) is not ProviderProfile
             or self.expected_execution.provider_profile != profile
             or self.implicit_discovery_disabled is not True
+            or self.cwd_identity != _digest({"schema": "roundwright-provider-sdk-cwd/v1", "cwd": str(self.cwd)})
+            or self.injected_context_digest != ("sha256:" + hashlib.sha256(self.role_injected_bytes).hexdigest())
+            or self.developer_instructions.encode("utf-8") != self.role_injected_bytes
+            or self.sdk_mapping_identity != reviewed_sdk_mapping().identity
+            or (required_capability is not None and (
+                type(required_capability) is not RoleCapability
+                or required_capability not in reviewed_sdk_mapping().supported_capabilities
+            ))
         ):
             raise RoleCapabilityError("trusted provider launch context has drifted")
+
+    def for_ephemeral_cwd(self, cwd: Path) -> "TrustedProviderLaunchContext":
+        """Seal the actual per-attempt empty workspace before SDK creation."""
+
+        if self._seal is not _LAUNCH_CONTEXT_SEAL or not isinstance(cwd, Path):
+            raise RoleCapabilityError("trusted provider ephemeral cwd is invalid")
+        return TrustedProviderLaunchContext(
+            cwd, self.expected_execution, self.guidance_receipt_digest,
+            self.injected_context_digest, self.developer_instructions,
+            accepted_main_guidance_bytes=self.accepted_main_guidance_bytes,
+            sdk_mapping_identity=self.sdk_mapping_identity,
+            _seal=_LAUNCH_CONTEXT_SEAL,
+        )
 
 
 def trusted_provider_launch_context(
@@ -351,14 +386,19 @@ def trusted_provider_launch_context(
     receipt = execution.contract.guidance.receipt_digest
     if evidence.guidance_receipt_digest != receipt or evidence.implicit_discovery_disabled is not True:
         raise RoleCapabilityError("trusted provider guidance has drifted")
+    accepted_bytes = execution.contract.guidance.accepted_main_guidance_bytes
     instructions = (
         "Use only the explicitly injected Roundwright guidance boundary. "
         "Do not discover ambient, global, or repository instruction files. "
-        f"Guidance receipt: {receipt}. Injected context: {evidence.injected_context_digest}."
+        f"Guidance receipt: {receipt}. Role view: {evidence.view.value}.\n"
+        + accepted_bytes.decode("utf-8", errors="strict")
     )
+    injected_digest = "sha256:" + hashlib.sha256(instructions.encode("utf-8")).hexdigest()
     return TrustedProviderLaunchContext(
-        cwd, expected_execution, receipt, evidence.injected_context_digest,
-        instructions, _seal=_LAUNCH_CONTEXT_SEAL,
+        cwd, expected_execution, receipt, injected_digest, instructions,
+        accepted_main_guidance_bytes=accepted_bytes,
+        sdk_mapping_identity=execution.contract.profile.sdk_mapping.identity,
+        _seal=_LAUNCH_CONTEXT_SEAL,
     )
 
 
@@ -390,15 +430,19 @@ def resolve_authoritative_guidance(*, expectation: AuthoritativeGuidanceExpectat
         parents.append(directory); directory = directory.parent
     candidates = tuple((parent / "AGENTS.md").as_posix() if parent.parts else "AGENTS.md" for parent in parents)
     material: list[dict[str, str]] = []
+    accepted_bytes: list[bytes] = []
     for path in candidates:
         exists = subprocess.run(("git", "-C", str(root), "cat-file", "-e", f"{expectation.trusted_revision}:{path}"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         if exists:
             content = _git(root, "show", f"{expectation.trusted_revision}:{path}")
             material.append({"path": path, "digest": "sha256:" + hashlib.sha256(content).hexdigest()})
+            # Length-prefixing preserves the exact selected files and prevents
+            # an ambiguous concatenation from becoming an instruction source.
+            accepted_bytes.append(path.encode("utf-8") + b"\0" + str(len(content)).encode("ascii") + b"\0" + content)
     if not material:
         raise RoleCapabilityError("no authoritative AGENTS.md guidance applies")
     identity = _digest({"schema": "roundwright-authoritative-guidance-expectation/v1", "repository": expectation.repository_identity, "revision": expectation.trusted_revision, "tree": expectation.tree_digest})
-    return TrustedGuidance(identity, view, tuple(item["path"] for item in material), _digest(material))
+    return TrustedGuidance(identity, view, tuple(item["path"] for item in material), _digest(material), b"".join(accepted_bytes))
 
 
 @dataclass(frozen=True)
@@ -613,6 +657,35 @@ class TrustedExecutionHostInputs:
             execution_identity, preflight_identity,
         )
 
+    def derive_for_effect(
+        self, *, role: AdvisoryRole, provider_profile: ProviderProfile,
+        request_or_attempt_identity: str, request_material: Mapping[str, object],
+        preflight_material: Mapping[str, object],
+    ) -> ExecutionInstanceBinding:
+        """Derive a non-replayable binding from the concrete effect inputs.
+
+        A caller-owned ``ExecutionInstanceBinding`` is only an admission
+        comparison value; it cannot be used as this method's source.  The
+        request/attempt identity, canonical request material, and the exact
+        preflight facts are all folded into independent values immediately
+        before the SDK or local-tool boundary.
+        """
+
+        _require_identity(request_or_attempt_identity, "effect request identity")
+        if (type(role) is not AdvisoryRole or type(provider_profile) is not ProviderProfile
+                or not isinstance(request_material, Mapping)
+                or not isinstance(preflight_material, Mapping)):
+            raise RoleCapabilityError("effect binding material is invalid")
+        request_digest = _digest({"schema": "roundwright-effect-request/v1", "identity": request_or_attempt_identity, "request": dict(request_material)})
+        preflight_digest = _digest({"schema": "roundwright-effect-preflight/v1", "request": request_digest, "preflight": dict(preflight_material)})
+        # The external identity remains safe for persisted admission records;
+        # the complete request data stays inside the digest only.
+        execution_identity = "effect-" + hashlib.sha256(request_digest.encode("ascii")).hexdigest()[:32]
+        return self.derive(
+            role=role, provider_profile=provider_profile,
+            execution_identity=execution_identity, preflight_identity=preflight_digest,
+        )
+
 
 def require_independent_execution(
     execution: "SealedRoleExecution", expected_execution: ExecutionInstanceBinding,
@@ -670,21 +743,27 @@ class DurableRoleBudgetLedger:
             and budget == self._budget
         )
 
-    def reserve_effect(self) -> RoleBudgetUsage:
+    def reserve_effect(self, *, exposure: RoleBudget | None = None) -> RoleBudgetUsage:
         """Durably reserve the admitted worst-case provider effect up front.
 
-        The native SDK has no trusted prospective token or elapsed-time
-        receipt.  A provider turn has one reviewed accounting unit in each
-        dimension, and that unit is reserved before it can create a session.
-        A crash, reconstruction, or failover therefore cannot reset any part
-        of the grant budget.
+        The caller must reserve the admitted worst case, not a nominal one
+        call/second/token.  Omitting ``exposure`` is retained only for a
+        one-unit fixture allocation; production paths pass their exact sealed
+        role budget.  A crash, reconstruction, or failover therefore cannot
+        reset or understate any part of the grant budget.
         """
 
-        return self.consume(
-            calls=1,
-            duration_seconds=1,
-            tokens=1,
-        )
+        if exposure is None:
+            exposure = RoleBudget(1, 1, 1)
+        if type(exposure) is not RoleBudget:
+            raise RoleCapabilityError("role budget exposure is invalid")
+        if (exposure.max_calls > self._budget.max_calls
+                or exposure.max_duration_seconds > self._budget.max_duration_seconds
+                or exposure.max_tokens > self._budget.max_tokens):
+            raise RoleCapabilityError("role budget exposure exceeds admission")
+        return self.consume(calls=exposure.max_calls,
+                            duration_seconds=exposure.max_duration_seconds,
+                            tokens=exposure.max_tokens)
 
     def consume(self, *, calls: int = 1, duration_seconds: int = 0,
                 tokens: int = 0) -> RoleBudgetUsage:

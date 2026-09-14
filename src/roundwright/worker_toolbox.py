@@ -48,7 +48,7 @@ from .coding_worker_state import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError, require_external_production_activation
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
 from .role_capability_policy import ExecutionInstanceBinding, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
 from .shadow import RecorderBinding
 from .worker_shadow import (
@@ -303,7 +303,7 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
         if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
-            self._launch.verify(cwd=self._cwd, profile=profile)
+            self._launch.verify(cwd=self._cwd, profile=profile, required_capability=RoleCapability.BOUNDED_CODING)
             if self._production_factory:
                 require_external_production_activation()
         except RoleCapabilityError as error:
@@ -380,7 +380,7 @@ class _HarnessWorkerSession(NativeWorkerSession):
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
         try:
-            self._launch.verify(cwd=self._cwd, profile=self._profile)
+            self._launch.verify(cwd=self._cwd, profile=self._profile, required_capability=RoleCapability.BOUNDED_CODING)
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         if request.action is not WorkerAction.PLANNING:
@@ -467,7 +467,7 @@ class _HarnessCodingWorkerTurn(NativeWorkerTurn):
 
     def _start(self, payload: Mapping[str, object]) -> None:
         try:
-            self._launch.verify(cwd=self._cwd, profile=self._profile)
+            self._launch.verify(cwd=self._cwd, profile=self._profile, required_capability=RoleCapability.BOUNDED_CODING)
             self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort_factory(self._profile.reasoning_effort.value), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
         except RoleCapabilityError as error:
             self._cleanup.close(); raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error

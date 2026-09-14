@@ -252,6 +252,48 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RoleCapabilityError, "ambiguous"):
             DurableRoleBudgetLedger(path, grant_receipt_digest=self.grant.receipt_digest, execution_binding=binding, budget=RoleBudget(3, 10, 10)).consume(tokens=1)
 
+    def test_effect_binding_and_worst_case_reservation_reject_cross_request_replay(self) -> None:
+        host = TrustedExecutionHostInputs(
+            digest("c"), "task-136", self.task_candidate,
+            self.instance.receipt_digest, digest("f"), digest("e"), 1,
+            "generation-1",
+        )
+        first = host.derive_for_effect(
+            role=AdvisoryRole.RECOVERY_ADVISOR,
+            provider_profile=self.recovery.provider_profile,
+            request_or_attempt_identity="attempt-a",
+            request_material={"attempt": "attempt-a", "candidate": self.task_candidate},
+            preflight_material={"cwd": "sha256:" + "1" * 64, "guidance": self.guidance.receipt_digest},
+        )
+        second = host.derive_for_effect(
+            role=AdvisoryRole.RECOVERY_ADVISOR,
+            provider_profile=self.recovery.provider_profile,
+            request_or_attempt_identity="attempt-b",
+            request_material={"attempt": "attempt-b", "candidate": self.task_candidate},
+            preflight_material={"cwd": "sha256:" + "1" * 64, "guidance": self.guidance.receipt_digest},
+        )
+        self.assertNotEqual(first.digest, second.digest)
+        contract = self.verified_contract()
+        evidence = ProviderGuidanceEvidence(
+            GuidanceView.RECOVERY_ADVISOR, digest("a"), True, digest("b"),
+            self.guidance.receipt_digest, self.binding.candidate_sha,
+            self.task_candidate,
+        )
+        sealed = _compose_sealed_role_execution(
+            contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store,
+            self.expectation, evidence, first,
+        )
+        with self.assertRaises(RoleCapabilityError):
+            require_independent_execution(sealed, second)
+        ledger = DurableRoleBudgetLedger(
+            self.root / "worst-case-budget.sqlite",
+            grant_receipt_digest=self.grant.receipt_digest,
+            execution_binding=first, budget=RoleBudget(2, 10, 10),
+        )
+        ledger.reserve_effect(exposure=RoleBudget(2, 10, 10))
+        with self.assertRaisesRegex(RoleCapabilityError, "exhausted"):
+            ledger.reserve_effect(exposure=RoleBudget(1, 1, 1))
+
     def test_verified_admission_and_sdk_mapping_cannot_be_mutated_after_readback(self) -> None:
         contract = self.verified_contract()
         with self.assertRaises(RoleCapabilityError):

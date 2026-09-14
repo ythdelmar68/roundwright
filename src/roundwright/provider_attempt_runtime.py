@@ -875,10 +875,10 @@ class ProviderAttemptHostInputs:
     dispatch_control: ProviderDispatchControl
     audits: tuple[ProviderHealthAuditIdentity, ...]
     selection: DiffReviewSelection
+    expected_execution: ExecutionInstanceBinding
     backend: NativeCodexSupervisorBackend | None = None
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
     advisory_execution: SealedRoleExecution | None = None
-    expected_execution: ExecutionInstanceBinding | None = None
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
 
 
@@ -894,10 +894,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     if type(host) is not ProviderAttemptHostInputs or type(host.advisory_execution) is not SealedRoleExecution or host.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
         raise ProviderAttemptRuntimeError("provider attempt host inputs are invalid")
     try:
-        if host.expected_execution is None:
-            require_execution_for_profile(host.advisory_execution, host.audits[0].profile)
-        else:
-            require_independent_execution(host.advisory_execution, host.expected_execution)
+        require_independent_execution(host.advisory_execution, host.expected_execution)
     except RoleCapabilityError as error:
         raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
     descriptor = ProviderAttemptRuntimeDescriptor.parse(descriptor_value)

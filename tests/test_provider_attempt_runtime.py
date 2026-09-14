@@ -268,6 +268,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection,
                 short_native,
                 advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                expected_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding,
             )
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "completion policy"):
                 install_host_runtime(descriptor, host)
@@ -858,6 +859,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 repository, identity, recovery, runner.lease, seal, runner.binding,
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
                 advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                expected_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding,
             ))
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -929,6 +931,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 repository, identity, recovery, runner.lease, seal, runner.binding,
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
                 advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                expected_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding,
             ))
             drifted_runner = replace(context.resources.runner, selection=replace(
                 runner.selection, implementation_attempt_id="runtime-preflight-missing-implementation",
@@ -1071,7 +1074,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     repository, identity, recovery, runner.lease, seal, runner.binding,
                     runner.dependency_binding, runner.dispatch_control,
                     (runner.audit, second_recovery.health_receipt.audit_identity), runner.selection, first_backend, sequence,
-                    advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                expected_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding,
                 )
                 store = Path(temporary) / "recorder"
                 parsed = harness.ExecutorRequest.parse(request)
@@ -1197,7 +1201,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                         DiffReviewSequenceEntry(runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile), recovery, runner.audit, first_backend),
                         DiffReviewSequenceEntry(second_selection, sealed_execution(AdvisoryRole.SUPERVISOR, second_recovery.health_receipt.audit_identity.profile), second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
                     ),
-                    advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                advisory_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                expected_execution=sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile).execution_binding,
                 )
                 preflight_descriptor = dict(descriptor, resource_id="runtime-hosted-ambiguous-preflight-45")
                 preflight_request = dict(request, execution_context=preflight_descriptor)

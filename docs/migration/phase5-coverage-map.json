@@ -14,9 +14,9 @@
       {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"1370aefb385a7d7eeff6e39b8cc9358d30bba30a848a20f3ce72619250e00be0"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
-      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"54e6219991d05accf679ca04a465f13f762a45f9140b666a6adf2efce6f6a9ff"},
-      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"3d73b364c684985fc74cdb83ac275c668e2695dbe96888491e9bd1222828d29d"},
-      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"ef7afbcde947af7403a0b5acfef7ea198012902f6542f5567fc64e24c5e5165a"}
+      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"2091d60b501a1832d3e5c0a75ffc756727527caf04521f00e3e085cfb81fd1dd"},
+      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"6308364127b5c866e0e35fe6c7373169c0bb6ac27eb6e5bf8db13f8692f9d410"},
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"c4138498397c606912209950918686ade7c5c97b9e305e54ca58abaa8e565599"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

@@ -18,7 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
+from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
 
 
 class CodexSupervisorError(ValueError):
@@ -257,13 +257,18 @@ class CodexSupervisorAdapter:
     def runtime_fingerprint(self) -> str:
         return self._audit.runtime_fingerprint
 
-    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution) -> CodexSupervisorResult:
+    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding | None = None) -> CodexSupervisorResult:
         if type(request) is not CodexSupervisorRequest or request.selected_profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexSupervisorError("Supervisor dispatch is invalid")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
             raise CodexSupervisorError("Supervisor advisory admission is unavailable")
         try:
-            require_execution_for_profile(advisory_execution, self._profile)
+            if expected_execution is None:
+                require_execution_for_profile(advisory_execution, self._profile)
+            elif expected_execution.provider_profile != self._profile:
+                raise RoleCapabilityError("Supervisor expected execution profile has drifted")
+            else:
+                require_independent_execution(advisory_execution, expected_execution)
         except RoleCapabilityError as error:
             raise CodexSupervisorError("Supervisor advisory admission is denied") from error
         session: NativeSupervisorSession | None = None

@@ -20,7 +20,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
+from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -135,14 +135,19 @@ class CodexDependencyReviewAdapter:
         return self._audit.profile_identity
 
     def dispatch(
-        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution,
+        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding | None = None,
     ) -> DependencyReviewDispatchResult:
         if type(request) is not DependencyReviewRequest or request.profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise DependencyReviewDispatchError("dependency review dispatch is invalid")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
         try:
-            require_execution_for_profile(advisory_execution, self._profile)
+            if expected_execution is None:
+                require_execution_for_profile(advisory_execution, self._profile)
+            elif expected_execution.provider_profile != self._profile:
+                raise RoleCapabilityError("dependency review expected execution profile has drifted")
+            else:
+                require_independent_execution(advisory_execution, expected_execution)
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         session = None

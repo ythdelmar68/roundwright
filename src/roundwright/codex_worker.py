@@ -23,7 +23,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_worker_tool_capability
+from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution, require_worker_tool_capability
 
 
 class CodexWorkerError(ValueError):
@@ -423,6 +423,7 @@ class CodexWorkerAdapter:
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
         checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
         advisory_execution: SealedRoleExecution,
+        expected_execution: ExecutionInstanceBinding | None = None,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -436,7 +437,11 @@ class CodexWorkerAdapter:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
             raise CodexWorkerError("Worker advisory admission is unavailable")
         try:
-            admission_receipt = require_execution_for_profile(advisory_execution, self._profile)
+            admission_receipt = (require_execution_for_profile(advisory_execution, self._profile)
+                                 if expected_execution is None
+                                 else require_independent_execution(advisory_execution, expected_execution))
+            if expected_execution is not None and expected_execution.provider_profile != self._profile:
+                raise RoleCapabilityError("Worker expected execution profile has drifted")
         except RoleCapabilityError as error:
             raise CodexWorkerError("Worker advisory admission is denied") from error
         session_identity: str | None = None

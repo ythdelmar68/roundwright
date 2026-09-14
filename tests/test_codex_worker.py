@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,15 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read"])
         self.assertEqual((result.kind, result.session_identity, result.turn_identity, result.output), (WorkerResultKind.ACCEPTED, "thread-43", "turn-43", {"status": "done"}))
         self.assertTrue(result.output_fingerprint.startswith("sha256:"))
+
+    def test_independent_execution_drift_prevents_any_provider_effect(self) -> None:
+        events: list[str] = []
+        turn = FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}), events)
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        capsule = sealed_execution(AdvisoryRole.WORKER, adapter._profile)
+        with self.assertRaises(CodexWorkerError):
+            adapter.dispatch(self.request(), checkpoint_session=lambda _: events.append("checkpoint-session"), checkpoint_turn=lambda *_: events.append("checkpoint-turn"), advisory_execution=capsule, expected_execution=replace(capsule.execution_binding, candidate_sha="b" * 40))
+        self.assertEqual(events, [])
 
     def test_each_post_tool_sdk_turn_is_checkpointed_before_consumption(self) -> None:
         events: list[str] = []

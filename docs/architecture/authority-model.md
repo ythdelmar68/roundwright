@@ -29,9 +29,12 @@ Owner Intent Interpreter retain their explicit non-dispatching gates until a
 dedicated provider route is introduced.
 
 Each capsule also carries immutable provider-guidance evidence: the matching
-role view, provider working-root identity, disabled implicit discovery, exact
-injected context digest, accepted-main identity, task candidate, and selected
-guidance receipt. A mismatched view or receipt fails before any provider call.
+role view, provider working-root identity, exact injected context digest,
+accepted-main identity, task candidate, and selected guidance receipt. A
+mismatched view or receipt fails before any hermetic fixture effect. The native
+SDK has no qualified discovery-off control, so injected prompt prose is never
+treated as disabling discovery; every real bridge remains disabled pending a
+separately reviewed external host promotion.
 
 Owner-facing grant drafts are complete canonical requests: they name bounded
 actions and descriptors together with every instance, repository, state,

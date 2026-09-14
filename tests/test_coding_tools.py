@@ -6,12 +6,18 @@ import tempfile
 import unittest
 import os
 import subprocess
+import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools, CodingToolError
+from roundwright.role_capability_policy import RoleCapability, RoleScope, ScopeKind, ScopedDescriptor
+
+
+def digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class BoundedCodingToolsTests(unittest.TestCase):
@@ -93,6 +99,22 @@ class BoundedCodingToolsTests(unittest.TestCase):
         (self.foreign / "secret.txt").write_text("secret", encoding="utf-8")
         with self.assertRaises(CodingToolError):
             self.tools.read("../foreign-worktree/secret.txt")
+
+    def test_admitted_role_scope_enforces_exact_paths_before_local_effects(self) -> None:
+        (self.root / "src" / "other.txt").write_text("other", encoding="utf-8")
+        root_identity = digest("fixture-worktree")
+        scope = RoleScope(
+            frozenset({RoleCapability.BOUNDED_CODING}),
+            (ScopedDescriptor(ScopeKind.PATH, root_identity, "src/allowed.txt"),),
+        )
+        tools = BoundedCodingTools(BoundedCodingCapability(
+            self.root, ("src/allowed.txt", "src/other.txt"), ("src/allowed.txt",),
+            ((sys.executable, "-c", "import sys; sys.exit(0)"),),
+            role_scope=scope, scope_root_identity=root_identity,
+        ))
+        self.assertEqual(tools.read("src/allowed.txt")[0], "before")
+        with self.assertRaisesRegex(CodingToolError, "admitted role scope"):
+            tools.read("src/other.txt")
 
     def test_validation_output_budget_is_enforced_while_the_process_runs(self) -> None:
         command = (sys.executable, "-c", "import sys; sys.stdout.write('x' * 4097)")

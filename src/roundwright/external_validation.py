@@ -65,6 +65,7 @@ from .provider_attempt_runtime import (
     install_host_runtime,
     prepare_context as prepare_provider_attempt_context,
 )
+from .role_capability_policy import RoleCapabilityError, require_external_production_activation
 from . import lifecycle_observation
 from .cross_environment import (
     CROSS_ENVIRONMENT_EVIDENCE_SCHEMA,
@@ -5241,6 +5242,15 @@ def run_provider_attempt_accounting_profile(
     ``run_profile_executor`` library API.
     """
 
+    # No candidate-local descriptor or hermetic HostInputs object is a native
+    # host promotion.  Deny before resolving Harness, parsing a request,
+    # creating a Recorder/store, or constructing a Supervisor runner.
+    try:
+        require_external_production_activation()
+    except RoleCapabilityError as error:
+        raise ExternalValidationAdapterError(
+            "provider attempt production activation is unavailable"
+        ) from error
     harness = _harness_executor()
     try:
         request = harness.ExecutorRequest.parse(request_value)

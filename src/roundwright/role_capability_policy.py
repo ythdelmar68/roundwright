@@ -471,6 +471,23 @@ class RoleScope:
     def identity(self) -> str:
         return _digest({"schema": "roundwright-role-capability-scope/v2", "actions": sorted(item.value for item in self.actions), "descriptors": tuple((item.kind.value, item.root_identity, item.value) for item in self.descriptors)})
 
+    def require(self, action: RoleCapability, descriptors: tuple[ScopedDescriptor, ...] = ()) -> None:
+        """Enforce an exact admitted operation and its canonical bounds.
+
+        A descriptor is an allowlist entry, not a hint or a directory prefix:
+        callers must derive its exact kind/root/value from the concrete effect
+        immediately before performing that effect.  This makes a reused scope
+        reject cross-root, cross-tool, and A-to-B path replay.
+        """
+
+        if type(action) is not RoleCapability or type(descriptors) is not tuple:
+            raise RoleCapabilityError("role scope request is invalid")
+        if action not in self.actions or any(type(item) is not ScopedDescriptor for item in descriptors):
+            raise RoleCapabilityError("role scope denies the requested action")
+        admitted = {(item.kind, item.root_identity, item.value) for item in self.descriptors}
+        if any((item.kind, item.root_identity, item.value) not in admitted for item in descriptors):
+            raise RoleCapabilityError("role scope denies the requested bound")
+
 
 @dataclass(frozen=True)
 class TrustedRoleAuthorityReceipt:

@@ -99,8 +99,10 @@ class ProductionRuntimeTests(unittest.TestCase):
             with self.assertRaises(WorkerShadowError):
                 run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
             CODING_RUNTIME_REGISTRY.install("coding-resource-1",inputs)
-            result=run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:events.append("session"),checkpoint_turn=lambda *_:events.append("turn"))
-            self.assertEqual((result.kind,Path(temp,"out.txt").read_text()),(WorkerResultKind.ACCEPTED,"ok"))
+            with self.assertRaisesRegex(WorkerShadowError, "activation is unavailable"):
+                run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:events.append("session"),checkpoint_turn=lambda *_:events.append("turn"))
+            self.assertEqual(events, [])
+            self.assertFalse(Path(temp, "out.txt").exists())
     def test_denied_write_has_no_effect(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="no.txt", content="no")
@@ -149,7 +151,7 @@ class ProductionRuntimeTests(unittest.TestCase):
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.VALIDATION_EXECUTE, command=(sys.executable,"-c","pass"))
             turn=Turn(events,(NativeWorkerTurnStep(request=request),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
             inputs=self.inputs(Path(temp),turn,events,Sandbox(b"\xff" * 65_536))
-            result=run_production_coding_worker(inputs=inputs,request=self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            result=self.runtime(Path(temp),turn,events,sandbox=Sandbox(b"\xff" * 65_536)).dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
             self.assertEqual(result.kind,WorkerResultKind.ACCEPTED)
             self.assertEqual(turn.submitted[0].outcome,"feedback-budget-exceeded")
             self.assertIsNone(turn.submitted[0].feedback)

@@ -115,6 +115,14 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
         }
 
+    def test_public_hosted_provider_entrypoint_is_not_activated_before_harness_or_store_access(self) -> None:
+        with patch("roundwright.external_validation._harness_executor") as harness:
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "production activation"):
+                external_validation.run_provider_attempt_accounting_profile(
+                    "execute", {}, Path("unreachable-recorder"), object(),
+                )
+            harness.assert_not_called()
+
     def resources(self, descriptor: ProviderAttemptRuntimeDescriptor) -> ProviderAttemptRuntimeResources:
         repository = object.__new__(RepositoryIdentity)
         object.__setattr__(repository, "root", ROOT)

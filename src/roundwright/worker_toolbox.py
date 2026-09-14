@@ -49,7 +49,7 @@ from .coding_worker_state import (
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
-from .role_capability_policy import ExecutionInstanceBinding, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect
 from .shadow import RecorderBinding
 from .worker_shadow import (
     ExternalCapturePlanReceipt,
@@ -60,6 +60,7 @@ from .worker_shadow import (
     WorkerShadowCaptureReadiness,
     WorkerShadowError,
     qualify_worker_adapter,
+    require_worker_qualification_preflight,
     require_worker_shadow_capture_readiness,
 )
 from .codex_worker import CodexWorkerAdapter
@@ -757,19 +758,35 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "capability_contract": "no-tools-self-contained/v1", "provider_instruction": "No provider tools or repository inspection are declared or required; decide only from this normalized public input.", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": []}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
-    return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, advisory_execution, expected_execution, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+    adapter = CodexWorkerAdapter(backend, profile, audit, tools)
+    require_worker_qualification_preflight(
+        adapter, request, readiness, binding, recorder, advisory_execution,
+        checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+        checkpoint_result=checkpoint_result,
+    )
+    request_material, preflight_material = adapter.effect_material(request)
+    try:
+        reservation = reserve_role_effect(
+            advisory_execution, host_inputs=execution_host,
+            ledger_path=budget_ledger_path, profile=profile,
+            request_or_attempt_identity=request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+    except RoleCapabilityError as error:
+        raise WorkerShadowError("Worker qualification budget admission is denied") from error
+    return qualify_worker_adapter(adapter, request, readiness, binding, recorder, advisory_execution, reservation, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 
 
 class ProductionCodingWorkerRuntime:
     """Candidate-bound production coding seam; CLI activation remains blocked."""
-    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding) -> None:
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path) -> None:
         if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
                 or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
                 or local_tools.capability_digest != dispatch_receipt.capability_digest
                 or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER
-                or type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != profile):
+                or type(execution_host) is not TrustedExecutionHostInputs or not isinstance(budget_ledger_path, Path)):
             raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         self._local_tools = local_tools
@@ -778,7 +795,8 @@ class ProductionCodingWorkerRuntime:
         self._candidate_probe = candidate_probe
         self._toolchain_receipt_probe = toolchain_receipt_probe
         self._advisory_execution = advisory_execution
-        self._expected_execution = expected_execution
+        self._execution_host = execution_host
+        self._budget_ledger_path = budget_ledger_path
 
     @property
     def capability_contract(self):
@@ -789,11 +807,19 @@ class ProductionCodingWorkerRuntime:
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
-        try:
-            require_independent_execution(self._advisory_execution, self._expected_execution)
-        except Exception as error:
-            raise WorkerShadowError("production coding admission is denied") from error
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
+        request_material, preflight_material = self._adapter.effect_material(request)
+        try:
+            reservation = reserve_role_effect(
+                self._advisory_execution, host_inputs=self._execution_host,
+                ledger_path=self._budget_ledger_path,
+                profile=self._adapter._profile,
+                request_or_attempt_identity=request.attempt_id,
+                request_material=request_material,
+                preflight_material=preflight_material,
+            )
+        except RoleCapabilityError as error:
+            raise WorkerShadowError("production coding budget admission is denied") from error
         try:
             if self._event_store.requires_reconciliation(request.context.task_id, request.attempt_id, frozenset()):
                 raise WorkerShadowError("coding effect requires durable reconciliation")
@@ -826,7 +852,7 @@ class ProductionCodingWorkerRuntime:
             if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution)
+        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation)
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest, acknowledged_sequences: frozenset[int]) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
@@ -916,14 +942,15 @@ class ProductionCodingWorkerEntrypointInputs:
     candidate_probe: Callable[[], str]
     toolchain_receipt_probe: Callable[[], str]
     advisory_execution: SealedRoleExecution
-    expected_execution: ExecutionInstanceBinding
+    execution_host: TrustedExecutionHostInputs
+    budget_ledger_path: Path
 
     def __post_init__(self) -> None:
         if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
                 or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
                 or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
                 or type(self.advisory_execution) is not SealedRoleExecution or self.advisory_execution.seam is not RoleExecutionSeam.WORKER
-                or type(self.expected_execution) is not ExecutionInstanceBinding or self.expected_execution.provider_profile != self.profile
+                or type(self.execution_host) is not TrustedExecutionHostInputs or not isinstance(self.budget_ledger_path, Path)
                 or not callable(getattr(self.backend, "open_session", None))):
             raise WorkerShadowError("production coding entrypoint inputs are invalid")
 
@@ -947,7 +974,7 @@ def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInpu
     return ProductionCodingWorkerRuntime(
         backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
         local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
-        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution, expected_execution=inputs.expected_execution,
+        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution, execution_host=inputs.execution_host, budget_ledger_path=inputs.budget_ledger_path,
     ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
 
 

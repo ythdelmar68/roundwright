@@ -12,6 +12,7 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
 from .configuration import ProviderProfile, RepositoryIdentity
@@ -20,7 +21,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, derive_and_require_execution_for_effect, require_external_production_activation, require_independent_execution, trusted_provider_launch_context
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -134,22 +135,35 @@ class CodexDependencyReviewAdapter:
     def profile_identity(self) -> str:
         return self._audit.profile_identity
 
+    def effect_material(self, request: DependencyReviewRequest) -> tuple[dict[str, object], dict[str, object]]:
+        """Return the exact request and adapter facts reserved by the host."""
+
+        if type(request) is not DependencyReviewRequest:
+            raise DependencyReviewDispatchError("dependency review dispatch is invalid")
+        return (
+            {"input_digest": request.input_digest, "input_material": request.input_material},
+            {"adapter_profile": self.profile_identity, "audit": self._audit.profile_identity},
+        )
+
     def dispatch(
-        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution,
+        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, effect_reservation: TrustedRoleEffectReservation,
     ) -> DependencyReviewDispatchResult:
         if type(request) is not DependencyReviewRequest or request.profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise DependencyReviewDispatchError("dependency review dispatch is invalid")
-        if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
+        if (type(advisory_execution) is not SealedRoleExecution
+                or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW
+                or type(effect_reservation) is not TrustedRoleEffectReservation):
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
         try:
+            request_material, preflight_material = self.effect_material(request)
+
             def admit() -> dict[str, object]:
-                receipt, _binding = derive_and_require_execution_for_effect(
+                return effect_reservation.require_before_effect(
                     advisory_execution, profile=self._profile,
                     request_or_attempt_identity=request.attempt_id,
-                    request_material={"input_digest": request.input_digest, "input_material": request.input_material},
-                    preflight_material={"adapter_profile": self.profile_identity, "audit": self._audit.profile_identity},
+                    request_material=request_material,
+                    preflight_material=preflight_material,
                 )
-                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -201,30 +215,47 @@ class DependencyReviewService:
         self, repository: RepositoryIdentity, subset: AffectedSubset, *, attempt_id: str,
         binding: DependencyReviewBinding, adapter: CodexDependencyReviewAdapter,
         checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution,
+        execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path,
         source_owned_relations: tuple[SourceOwnedRelation, ...] = (), supersedes_attempt_id: str | None = None,
     ) -> DependencyReviewDispatchResult:
         if type(adapter) is not CodexDependencyReviewAdapter or adapter.profile_identity != binding.profile_identity:
             raise DependencyReviewDispatchError("dependency review adapter profile has drifted")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
+        store = DependencyReviewStore()
+        input_material = store.model_input(
+            subset, attempt_id=attempt_id,
+            profile_identity=binding.profile_identity,
+            source_owned_relations=source_owned_relations,
+        )
+        request = DependencyReviewRequest(
+            attempt_id, input_material, _digest(input_material), binding.profile_identity,
+        )
+        request_material, preflight_material = adapter.effect_material(request)
         try:
+            reservation = reserve_role_effect(
+                advisory_execution, host_inputs=execution_host,
+                ledger_path=budget_ledger_path,
+                profile=advisory_execution.execution_binding.provider_profile,
+                request_or_attempt_identity=attempt_id,
+                request_material=request_material,
+                preflight_material=preflight_material,
+            )
+
             def admit() -> dict[str, object]:
-                receipt, _binding = derive_and_require_execution_for_effect(
+                return reservation.require_before_effect(
                     advisory_execution,
                     profile=advisory_execution.execution_binding.provider_profile,
                     request_or_attempt_identity=attempt_id,
-                    request_material={"attempt_id": attempt_id, "subset": subset.snapshot_id, "binding": {"candidate_sha": binding.candidate_sha, "policy_digest": binding.policy_digest, "configuration_digest": binding.configuration_digest, "profile_identity": binding.profile_identity}},
-                    preflight_material={"adapter_profile": adapter.profile_identity, "source_owned_relations": tuple(item.__dict__ for item in source_owned_relations)},
+                    request_material=request_material,
+                    preflight_material=preflight_material,
                 )
-                return receipt
-
-            admit()
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
-        store = DependencyReviewStore()
         admit()
         attempt = store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding, source_owned_relations=source_owned_relations, supersedes_attempt_id=supersedes_attempt_id)
-        request = DependencyReviewRequest(attempt.attempt_id, store.model_input(subset, attempt_id=attempt.attempt_id, profile_identity=binding.profile_identity, source_owned_relations=source_owned_relations), attempt.input_digest, binding.profile_identity)
+        if attempt.input_digest != request.input_digest:
+            raise DependencyReviewDispatchError("dependency review prepared request has drifted")
         recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
         admit()
         if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
@@ -244,7 +275,7 @@ class DependencyReviewService:
 
         result = adapter.dispatch(
             request, checkpoint_session=claimed_session, checkpoint_turn=claimed_turn,
-            advisory_execution=advisory_execution,
+            advisory_execution=advisory_execution, effect_reservation=reservation,
         )
         if result.kind is DependencyReviewResultKind.ACCEPTED:
             assert result.proposal is not None
@@ -281,7 +312,8 @@ class DependencyReviewHostInputs:
     checkpoint_session: Callable[[str], None]
     checkpoint_turn: Callable[[str, str], None]
     advisory_execution: SealedRoleExecution
-    expected_execution: ExecutionInstanceBinding
+    execution_host: TrustedExecutionHostInputs
+    budget_ledger_path: Path
     source_owned_relations: tuple[SourceOwnedRelation, ...] = ()
     supersedes_attempt_id: str | None = None
 
@@ -295,8 +327,8 @@ class DependencyReviewHostInputs:
             or not callable(self.checkpoint_turn)
             or type(self.advisory_execution) is not SealedRoleExecution
             or self.advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW
-            or type(self.expected_execution) is not ExecutionInstanceBinding
-            or self.expected_execution.provider_profile != self.advisory_execution.execution_binding.provider_profile
+            or type(self.execution_host) is not TrustedExecutionHostInputs
+            or not isinstance(self.budget_ledger_path, Path)
             or type(self.source_owned_relations) is not tuple
             or any(type(item) is not SourceOwnedRelation for item in self.source_owned_relations)
             or (self.supersedes_attempt_id is not None and not _TOKEN.fullmatch(self.supersedes_attempt_id))
@@ -309,7 +341,8 @@ class DependencyReviewHostInputs:
 def prepare_dependency_review_host(
     repository: RepositoryIdentity, subset: AffectedSubset, binding: DependencyReviewBinding,
     audit: ProviderHealthAuditIdentity, *, backend: NativeCodexDependencyReviewBackend | None = None,
-    advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding,
+    advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs,
+    budget_ledger_path: Path,
     source_owned_relations: tuple[SourceOwnedRelation, ...] = (),
     supersedes_attempt_id: str | None = None,
 ) -> DependencyReviewHostInputs:
@@ -323,28 +356,24 @@ def prepare_dependency_review_host(
     except RoleCapabilityError as error:
         raise DependencyReviewDispatchError("dependency review production activation is unavailable") from error
 
-    if type(repository) is not RepositoryIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW or type(expected_execution) is not ExecutionInstanceBinding:
+    if type(repository) is not RepositoryIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW or type(execution_host) is not TrustedExecutionHostInputs or not isinstance(budget_ledger_path, Path):
         raise DependencyReviewDispatchError("dependency review preparation inputs are invalid")
     binding.require_subset(subset)
     if audit.profile_identity != binding.profile_identity or (audit.profile.model, audit.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high"):
         raise DependencyReviewDispatchError("dependency review profile is unavailable")
-    try:
-        require_independent_execution(advisory_execution, expected_execution)
-    except RoleCapabilityError as error:
-        raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
     if backend is None:
         from .dependency_review_toolbox import HarnessNativeCodexDependencyReviewBackend
         from .worker_toolbox import CompletionDeadline
         backend = HarnessNativeCodexDependencyReviewBackend(
             cwd=repository.root, completion=CompletionDeadline(100, 600),
             launch_context=trusted_provider_launch_context(
-                advisory_execution, expected_execution, cwd=repository.root,
+                advisory_execution, cwd=repository.root,
             ),
         )
     return DependencyReviewHostInputs(
         repository, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit),
         lambda _session: None, lambda _session, _turn: None, advisory_execution,
-        expected_execution,
+        execution_host, budget_ledger_path,
         source_owned_relations, supersedes_attempt_id,
     )
 

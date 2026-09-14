@@ -18,7 +18,9 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, derive_and_require_execution_for_effect
+from pathlib import Path
+
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, reserve_role_effect
 
 
 class CodexSupervisorError(ValueError):
@@ -257,20 +259,46 @@ class CodexSupervisorAdapter:
     def runtime_fingerprint(self) -> str:
         return self._audit.runtime_fingerprint
 
-    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution) -> CodexSupervisorResult:
+    def effect_material(self, request: CodexSupervisorRequest) -> tuple[dict[str, object], dict[str, object]]:
+        """Return the exact request/attempt facts reserved by the host."""
+
+        if type(request) is not CodexSupervisorRequest:
+            raise CodexSupervisorError("Supervisor dispatch is invalid")
+        return (
+            {
+                "review_attempt_id": request.review_attempt_id,
+                "provider_attempt_id": request.provider_attempt_id,
+                "selected_profile_identity": request.selected_profile_identity,
+                "within_round_attempt": request.within_round_attempt,
+                "context": request.context.__dict__,
+                "objective": request.objective,
+                "acceptance_criteria": request.acceptance_criteria,
+                "decision_semantic": None if request.decision_semantic is None else request.decision_semantic.value,
+            },
+            {
+                "adapter_profile": self.profile_identity,
+                "runtime": self.runtime_fingerprint,
+                "response_contract": request.response_contract.value,
+            },
+        )
+
+    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, effect_reservation: TrustedRoleEffectReservation) -> CodexSupervisorResult:
         if type(request) is not CodexSupervisorRequest or request.selected_profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexSupervisorError("Supervisor dispatch is invalid")
-        if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
+        if (type(advisory_execution) is not SealedRoleExecution
+                or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR
+                or type(effect_reservation) is not TrustedRoleEffectReservation):
             raise CodexSupervisorError("Supervisor advisory admission is unavailable")
         try:
+            request_material, preflight_material = self.effect_material(request)
+
             def admit() -> dict[str, object]:
-                receipt, _binding = derive_and_require_execution_for_effect(
+                return effect_reservation.require_before_effect(
                     advisory_execution, profile=self._profile,
                     request_or_attempt_identity=request.provider_attempt_id,
-                    request_material={"input_digest": request.input_digest, "review_attempt_id": request.review_attempt_id, "within_round_attempt": request.within_round_attempt, "context": request.context.__dict__},
-                    preflight_material={"adapter_profile": self.profile_identity, "runtime": self.runtime_fingerprint, "response_contract": request.response_contract.value},
+                    request_material=request_material,
+                    preflight_material=preflight_material,
                 )
-                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -339,7 +367,7 @@ class SupervisorFailoverResult:
     exhausted: bool
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
     Only a typed invalid result or a verified terminal provider failure can
@@ -347,17 +375,27 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     remain terminal: dispatching a fallback would turn an uncertain external
     result into an unbounded second provider action.
     """
-    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
+    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     seen: set[str] = set()
     attempted: list[str] = []
     first = requests[0].context
-    for ordinal, (request, adapter, advisory_execution) in enumerate(zip(requests, adapters, advisory_executions), start=1):
+    for ordinal, (request, adapter, advisory_execution, execution_host, budget_ledger_path) in enumerate(zip(requests, adapters, advisory_executions, execution_hosts, budget_ledger_paths), start=1):
         if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != ordinal or request.selected_profile_identity != adapter.profile_identity or request.selected_profile_identity in seen or request.context != first:
             raise CodexSupervisorError("Supervisor failover profile mapping is invalid")
         seen.add(request.selected_profile_identity)
         attempted.append(request.selected_profile_identity)
-        result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution)
+        request_material, preflight_material = adapter.effect_material(request)
+        try:
+            effect_reservation = reserve_role_effect(
+                advisory_execution, host_inputs=execution_host,
+                ledger_path=budget_ledger_path, profile=adapter._profile,
+                request_or_attempt_identity=request.provider_attempt_id,
+                request_material=request_material, preflight_material=preflight_material,
+            )
+        except RoleCapabilityError as error:
+            raise CodexSupervisorError("Supervisor budget admission is denied") from error
+        result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, effect_reservation=effect_reservation)
         if checkpoint_result is not None:
             checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:

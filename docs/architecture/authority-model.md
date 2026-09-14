@@ -6,7 +6,7 @@ Recovery Advisor and Owner Intent Interpreter are opt-in advisory instances,
 not dispatchers. Admission requires independent authority evidence bound to the
 repository, task, deployment, epoch, expiry, revocation identity, host/state/
 fence-bound instance, accepted guidance at an exact trusted Git tree, and a
-root-normalized typed action/path/test/process/network/resource scope. The
+root-normalized typed action/path/process scope. The
 profile intersects that scope with a reviewed, immutable per-capability SDK
 mapping and finite budgets. Drive-qualified, UNC, traversal, repeated-separator,
 and non-canonical scope paths fail closed.

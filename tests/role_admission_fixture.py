@@ -29,7 +29,7 @@ from roundwright.role_capability_policy import (
     ExecutionInstanceBinding, ProviderGuidanceEvidence, RoleAdmissionExpectation, RoleBudget,
     RoleCapability, RoleCapabilityGrant, RoleCapabilityProfile,
     RoleExecutionSeam, RoleScope, SealedRoleExecution,
-    TrustedRoleAuthorityReceipt, read_verified_admission,
+    TrustedExecutionHostInputs, TrustedRoleAuthorityReceipt, read_verified_admission,
     _compose_sealed_role_execution, _resolve_sealed_role_runtime_context, resolve_authoritative_guidance,
     reviewed_sdk_mapping,
 )
@@ -185,4 +185,34 @@ def independent_execution(role: AdvisoryRole, profile: ProviderProfile) -> Execu
         expected.deployment_identity, expected.authority_epoch,
         expected.replacement_fence, expected.role, expected.provider_profile,
         expected.execution_identity, expected.preflight_identity,
+    )
+
+
+def trusted_execution_host(role: AdvisoryRole, profile: ProviderProfile) -> TrustedExecutionHostInputs:
+    """Return independently reconstructed static host facts for one role."""
+
+    expected = independent_execution(role, profile)
+    return TrustedExecutionHostInputs(
+        expected.repository_identity, expected.task_identity, expected.candidate_sha,
+        expected.instance_receipt_digest, expected.host_identity,
+        expected.deployment_identity, expected.authority_epoch,
+        expected.replacement_fence,
+    )
+
+
+def sealed_execution_for_effect(
+    role: AdvisoryRole, profile: ProviderProfile, *, request_identity: str,
+    request_material: dict[str, object], preflight_material: dict[str, object],
+) -> SealedRoleExecution:
+    """Seal a fixture capsule to the wrapper's exact canonical effect facts."""
+
+    base = sealed_execution(role, profile)
+    binding = trusted_execution_host(role, profile).derive_for_effect(
+        role=role, provider_profile=profile,
+        request_or_attempt_identity=request_identity,
+        request_material=request_material, preflight_material=preflight_material,
+    )
+    return _compose_sealed_role_execution(
+        base.contract, base.seam, base.store, base.expectation,
+        base.guidance_evidence, binding,
     )

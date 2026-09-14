@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 from dataclasses import replace
@@ -15,10 +16,10 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, WorkerAction, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerResultKind, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole
+from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import ExternalCapturePlanReceipt, ExternalRecorderReceipt, WORKER_ADAPTER_PROFILE, WorkerQualificationBinding, WorkerShadowDisposition, WorkerShadowError, WorkerShadowMismatchError, compare_worker_shadow_envelopes, qualify_worker_adapter, require_worker_shadow_capture_readiness, worker_adapter_shadow_profile
-from tests.role_admission_fixture import independent_execution, sealed_execution
+from tests.role_admission_fixture import sealed_execution_for_effect, trusted_execution_host
 
 
 def digest(value: object) -> str:
@@ -70,6 +71,9 @@ class WorkerShadowTests(unittest.TestCase):
     base, candidate = "a" * 40, "b" * 40
     def setUp(self):
         self.events = []
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self._reservation_index = 0
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
         self.backend = Backend(self.events, NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete", "action": "implementation"}))
@@ -80,7 +84,22 @@ class WorkerShadowTests(unittest.TestCase):
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, audit.profile_identity, context.configuration_digest, audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, self.readiness.capture_plan_digest, "implementation-complete", None, "supervisor-review")
 
     def qualify(self, readiness=None, binding=None, recorder=None):
-        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, sealed_execution(AdvisoryRole.WORKER, self.adapter._profile), independent_execution(AdvisoryRole.WORKER, self.adapter._profile), checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}:{'' if category is None else category.value}"))
+        request_material, preflight_material = self.adapter.effect_material(self.request)
+        execution = sealed_execution_for_effect(
+            AdvisoryRole.WORKER, self.adapter._profile,
+            request_identity=self.request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        self._reservation_index += 1
+        reservation = reserve_role_effect(
+            execution,
+            host_inputs=trusted_execution_host(AdvisoryRole.WORKER, self.adapter._profile),
+            ledger_path=Path(self._temporary.name) / f"budget-{self._reservation_index}.sqlite",
+            profile=self.adapter._profile,
+            request_or_attempt_identity=self.request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        return qualify_worker_adapter(self.adapter, self.request, self.readiness if readiness is None else readiness, self.binding if binding is None else binding, Recorder(self.events) if recorder is None else recorder, execution, reservation, checkpoint_session=lambda identity: self.events.append(f"session:{identity}"), checkpoint_turn=lambda session, turn: self.events.append(f"turn:{session}:{turn}"), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(f"result:{session}:{turn}:{kind.value}:{'' if diagnostic is None else diagnostic.value}:{'' if source is None else source.value}:{'' if category is None else category.value}"))
 
     def test_profile_declares_arm_before_and_recapture(self):
         profile = worker_adapter_shadow_profile()

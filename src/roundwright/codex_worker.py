@@ -23,7 +23,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, derive_and_require_execution_for_effect, require_worker_tool_capability
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedRoleEffectReservation, require_worker_tool_capability
 
 
 class CodexWorkerError(ValueError):
@@ -414,6 +414,25 @@ class CodexWorkerAdapter:
     def capability_contract(self) -> WorkerCapabilityContract:
         return self._tools.capability_contract
 
+    def effect_material(self, request: CodexWorkerRequest) -> tuple[dict[str, object], dict[str, object]]:
+        """Return the exact request and adapter facts bound by the host ledger."""
+
+        if type(request) is not CodexWorkerRequest:
+            raise CodexWorkerError("Worker dispatch is invalid")
+        return (
+            {
+                "input_digest": request.input_digest,
+                "action": request.action.value,
+                "context": request.context.__dict__,
+                "resume_session_identity": request.resume_session_identity,
+            },
+            {
+                "adapter_profile": self.profile_identity,
+                "runtime": self.runtime_fingerprint,
+                "tools": tuple(item.value for item in self._tools.tools),
+            },
+        )
+
     def dispatch(
         self,
         request: CodexWorkerRequest,
@@ -423,6 +442,7 @@ class CodexWorkerAdapter:
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
         checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
         advisory_execution: SealedRoleExecution,
+        effect_reservation: TrustedRoleEffectReservation,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -433,19 +453,23 @@ class CodexWorkerAdapter:
 
         if type(request) is not CodexWorkerRequest or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexWorkerError("Worker dispatch is invalid")
-        if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
+        if (type(advisory_execution) is not SealedRoleExecution
+                or advisory_execution.seam is not RoleExecutionSeam.WORKER
+                or type(effect_reservation) is not TrustedRoleEffectReservation):
             raise CodexWorkerError("Worker advisory admission is unavailable")
         try:
+            request_material, preflight_material = self.effect_material(request)
+
             def admit() -> dict[str, object]:
                 # The record is deliberately re-read at each effect boundary.
-                # A capsule is evidence for one binding, not a cached permit.
-                receipt, _binding = derive_and_require_execution_for_effect(
+                # The durable reservation is evidence for this exact binding,
+                # not a cached permit or a second consumption.
+                return effect_reservation.require_before_effect(
                     advisory_execution, profile=self._profile,
                     request_or_attempt_identity=request.attempt_id,
-                    request_material={"input_digest": request.input_digest, "action": request.action.value, "context": request.context.__dict__, "resume_session_identity": request.resume_session_identity},
-                    preflight_material={"adapter_profile": self.profile_identity, "runtime": self.runtime_fingerprint, "tools": tuple(item.value for item in self._tools.tools)},
+                    request_material=request_material,
+                    preflight_material=preflight_material,
                 )
-                return receipt
 
             admission_receipt = admit()
         except RoleCapabilityError as error:

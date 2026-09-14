@@ -67,10 +67,7 @@ class ExternalActivationStatus(str, Enum):
 
 class ScopeKind(str, Enum):
     PATH = "path"
-    TEST = "test"
     PROCESS = "process"
-    NETWORK = "network"
-    RESOURCE = "resource"
 
 
 class RoleExecutionSeam(str, Enum):
@@ -306,21 +303,21 @@ class TrustedProviderLaunchContext:
     """Opaque native-launch facts derived only from a sealed role admission."""
 
     __slots__ = (
-        "cwd", "expected_execution", "guidance_receipt_digest",
+        "cwd", "execution_binding", "guidance_receipt_digest",
         "injected_context_digest", "implicit_discovery_disabled",
         "developer_instructions", "accepted_main_guidance_digest", "accepted_main_guidance_bytes",
         "role_injected_bytes", "cwd_identity", "sdk_mapping_identity", "_seal",
     )
 
     def __init__(
-        self, cwd: Path, expected_execution: ExecutionInstanceBinding,
+        self, cwd: Path, execution_binding: ExecutionInstanceBinding,
         guidance_receipt_digest: str, injected_context_digest: str,
         developer_instructions: str, *, accepted_main_guidance_bytes: bytes,
         sdk_mapping_identity: str, _seal: object | None = None,
     ) -> None:
         if (
             _seal is not _LAUNCH_CONTEXT_SEAL or not isinstance(cwd, Path)
-            or type(expected_execution) is not ExecutionInstanceBinding
+            or type(execution_binding) is not ExecutionInstanceBinding
             or _DIGEST.fullmatch(guidance_receipt_digest) is None
             or _DIGEST.fullmatch(injected_context_digest) is None
             or type(developer_instructions) is not str or not developer_instructions
@@ -329,7 +326,7 @@ class TrustedProviderLaunchContext:
         ):
             raise RoleCapabilityError("trusted provider launch context is invalid")
         self.cwd = cwd.resolve(strict=False)
-        self.expected_execution = expected_execution
+        self.execution_binding = execution_binding
         self.guidance_receipt_digest = guidance_receipt_digest
         self.injected_context_digest = injected_context_digest
         self.implicit_discovery_disabled = True
@@ -347,7 +344,7 @@ class TrustedProviderLaunchContext:
             self._seal is not _LAUNCH_CONTEXT_SEAL
             or not isinstance(cwd, Path) or cwd.resolve(strict=False) != self.cwd
             or type(profile) is not ProviderProfile
-            or self.expected_execution.provider_profile != profile
+            or self.execution_binding.provider_profile != profile
             or self.implicit_discovery_disabled is not True
             or self.cwd_identity != _digest({"schema": "roundwright-provider-sdk-cwd/v1", "cwd": str(self.cwd)})
             or self.injected_context_digest != ("sha256:" + hashlib.sha256(self.role_injected_bytes).hexdigest())
@@ -366,7 +363,7 @@ class TrustedProviderLaunchContext:
         if self._seal is not _LAUNCH_CONTEXT_SEAL or not isinstance(cwd, Path):
             raise RoleCapabilityError("trusted provider ephemeral cwd is invalid")
         return TrustedProviderLaunchContext(
-            cwd, self.expected_execution, self.guidance_receipt_digest,
+            cwd, self.execution_binding, self.guidance_receipt_digest,
             self.injected_context_digest, self.developer_instructions,
             accepted_main_guidance_bytes=self.accepted_main_guidance_bytes,
             sdk_mapping_identity=self.sdk_mapping_identity,
@@ -375,12 +372,13 @@ class TrustedProviderLaunchContext:
 
 
 def trusted_provider_launch_context(
-    execution: "SealedRoleExecution", expected_execution: ExecutionInstanceBinding, *, cwd: Path,
+    execution: "SealedRoleExecution", *, cwd: Path,
 ) -> TrustedProviderLaunchContext:
     """Create the only native SDK launch envelope from verified host state."""
 
-    if type(execution) is not SealedRoleExecution or type(expected_execution) is not ExecutionInstanceBinding or not isinstance(cwd, Path):
+    if type(execution) is not SealedRoleExecution or not isinstance(cwd, Path):
         raise RoleCapabilityError("trusted provider launch context is invalid")
+    expected_execution = execution.execution_binding
     require_independent_execution(execution, expected_execution)
     evidence = execution.guidance_evidence
     receipt = execution.contract.guidance.receipt_digest
@@ -643,6 +641,16 @@ class TrustedExecutionHostInputs:
                 or _IDENTITY.fullmatch(self.replacement_fence) is None):
             raise RoleCapabilityError("trusted execution host input is invalid")
 
+    @property
+    def identity(self) -> str:
+        return _digest({
+            "schema": "roundwright-trusted-execution-host/v1",
+            "repository": self.repository_identity, "task": self.task_identity,
+            "candidate": self.candidate_sha, "instance": self.instance_receipt_digest,
+            "host": self.host_identity, "deployment": self.deployment_identity,
+            "epoch": self.authority_epoch, "fence": self.replacement_fence,
+        })
+
     def derive(
         self, *, role: AdvisoryRole, provider_profile: ProviderProfile,
         execution_identity: str, preflight_identity: str,
@@ -698,7 +706,8 @@ def require_independent_execution(
 
 
 def derive_and_require_execution_for_effect(
-    execution: "SealedRoleExecution", *, profile: ProviderProfile,
+    execution: "SealedRoleExecution", *, host_inputs: TrustedExecutionHostInputs,
+    profile: ProviderProfile,
     request_or_attempt_identity: str, request_material: Mapping[str, object],
     preflight_material: Mapping[str, object],
 ) -> tuple[dict[str, object], ExecutionInstanceBinding]:
@@ -714,25 +723,17 @@ def derive_and_require_execution_for_effect(
 
     if (
         type(execution) is not SealedRoleExecution
+        or type(host_inputs) is not TrustedExecutionHostInputs
         or type(profile) is not ProviderProfile
         or execution.execution_binding.provider_profile != profile
     ):
         raise RoleCapabilityError("trusted effect execution is invalid")
-    static = execution.execution_binding
-    host = TrustedExecutionHostInputs(
-        static.repository_identity, static.task_identity, static.candidate_sha,
-        static.instance_receipt_digest, static.host_identity,
-        static.deployment_identity, static.authority_epoch,
-        static.replacement_fence,
-    )
-    derived = host.derive_for_effect(
+    derived = host_inputs.derive_for_effect(
         role=execution.contract.profile.role, provider_profile=profile,
         request_or_attempt_identity=request_or_attempt_identity,
         request_material=request_material, preflight_material=preflight_material,
     )
-    return execution.require_before_effect(
-        expected_execution=_DerivedEffectBinding(derived, _seal=_EXECUTION_SEAL)
-    ), derived
+    return execution.require_before_effect(expected_execution=derived), derived
 
 
 @dataclass(frozen=True)
@@ -860,8 +861,152 @@ class DurableRoleBudgetLedger:
             if connection is not None:
                 connection.close()
 
+    def require_reserved(self, *, exposure: RoleBudget) -> RoleBudgetUsage:
+        """Read back the exact durable reservation without consuming again."""
+
+        if type(exposure) is not RoleBudget or not self._path.is_file():
+            raise RoleCapabilityError("role budget reservation is unavailable")
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{self._path.resolve().as_posix()}?mode=ro", uri=True,
+                timeout=5, isolation_level=None,
+            )
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT schema, grant_digest, binding_digest, calls, "
+                "duration_seconds, tokens FROM role_budget_usage WHERE ledger_key=?",
+                (self.key,),
+            ).fetchone()
+            if (row is None or len(row) != 6 or row[0] != self._schema
+                    or row[1] != self._grant or row[2] != self._binding
+                    or any(type(value) is not int or value < 0 for value in row[3:])):
+                raise RoleCapabilityError("role budget reservation is ambiguous")
+            usage = RoleBudgetUsage(row[3], row[4], row[5])
+            expected = RoleBudgetUsage(
+                exposure.max_calls, exposure.max_duration_seconds,
+                exposure.max_tokens,
+            )
+            if usage != expected:
+                raise RoleCapabilityError("role budget reservation has drifted")
+            connection.execute("COMMIT")
+            return usage
+        except RoleCapabilityError:
+            raise
+        except (OSError, sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            raise RoleCapabilityError("role budget reservation is unavailable") from error
+        finally:
+            if connection is not None:
+                connection.close()
 
 
+_EFFECT_RESERVATION_SEAL = object()
+
+
+class TrustedRoleEffectReservation:
+    """Opaque proof of one exact, durable, worst-case effect reservation."""
+
+    __slots__ = (
+        "_host_inputs", "_ledger", "_binding", "_exposure", "_profile",
+        "_request_identity", "_request_digest", "_preflight_digest", "_seal",
+    )
+
+    def __init__(
+        self, *, host_inputs: TrustedExecutionHostInputs,
+        ledger: DurableRoleBudgetLedger, binding: ExecutionInstanceBinding,
+        exposure: RoleBudget, profile: ProviderProfile, request_identity: str,
+        request_material: Mapping[str, object], preflight_material: Mapping[str, object],
+        _seal: object | None = None,
+    ) -> None:
+        if (_seal is not _EFFECT_RESERVATION_SEAL
+                or type(host_inputs) is not TrustedExecutionHostInputs
+                or type(ledger) is not DurableRoleBudgetLedger
+                or type(binding) is not ExecutionInstanceBinding
+                or type(exposure) is not RoleBudget
+                or type(profile) is not ProviderProfile):
+            raise RoleCapabilityError("trusted role effect reservation is invalid")
+        self._host_inputs = host_inputs
+        self._ledger = ledger
+        self._binding = binding
+        self._exposure = exposure
+        self._profile = profile
+        self._request_identity = request_identity
+        # Keep only canonical digests.  A shallow mapping copy would still
+        # alias nested caller-owned objects and could make a later mutation
+        # appear to match the originally reserved effect.
+        self._request_digest = _digest({
+            "schema": "roundwright-reserved-effect-request/v1",
+            "material": dict(request_material),
+        })
+        self._preflight_digest = _digest({
+            "schema": "roundwright-reserved-effect-preflight/v1",
+            "material": dict(preflight_material),
+        })
+        self._seal = _seal
+
+    @property
+    def execution_binding(self) -> ExecutionInstanceBinding:
+        return self._binding
+
+    def require_before_effect(
+        self, execution: "SealedRoleExecution", *, profile: ProviderProfile,
+        request_or_attempt_identity: str, request_material: Mapping[str, object],
+        preflight_material: Mapping[str, object],
+    ) -> dict[str, object]:
+        if (self._seal is not _EFFECT_RESERVATION_SEAL
+                or type(profile) is not ProviderProfile
+                or profile != self._profile
+                or request_or_attempt_identity != self._request_identity
+                or _digest({"schema": "roundwright-reserved-effect-request/v1",
+                            "material": dict(request_material)}) != self._request_digest
+                or _digest({"schema": "roundwright-reserved-effect-preflight/v1",
+                            "material": dict(preflight_material)}) != self._preflight_digest):
+            raise RoleCapabilityError("trusted role effect reservation has drifted")
+        receipt, binding = derive_and_require_execution_for_effect(
+            execution, host_inputs=self._host_inputs, profile=profile,
+            request_or_attempt_identity=request_or_attempt_identity,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        if binding.digest != self._binding.digest:
+            raise RoleCapabilityError("trusted role effect binding has drifted")
+        self._ledger.require_reserved(exposure=self._exposure)
+        return receipt
+
+
+def reserve_role_effect(
+    execution: "SealedRoleExecution", *, host_inputs: TrustedExecutionHostInputs,
+    ledger_path: Path, profile: ProviderProfile,
+    request_or_attempt_identity: str, request_material: Mapping[str, object],
+    preflight_material: Mapping[str, object],
+) -> TrustedRoleEffectReservation:
+    """Reserve the exact declared worst case before any effectful boundary."""
+
+    if not isinstance(ledger_path, Path):
+        raise RoleCapabilityError("role budget ledger path is invalid")
+    receipt, binding = derive_and_require_execution_for_effect(
+        execution, host_inputs=host_inputs, profile=profile,
+        request_or_attempt_identity=request_or_attempt_identity,
+        request_material=request_material, preflight_material=preflight_material,
+    )
+    if receipt.get("status") != AdvisoryRoleStatus.READY.value:
+        raise RoleCapabilityError("role effect admission is unavailable")
+    admission = execution.contract.admission
+    if admission is None:
+        raise RoleCapabilityError("role effect admission is unavailable")
+    exposure = execution.contract.profile.budget
+    ledger = DurableRoleBudgetLedger(
+        ledger_path, grant_receipt_digest=admission.grant.receipt_digest,
+        execution_binding=binding, budget=exposure,
+    )
+    ledger.reserve_effect(exposure=exposure)
+    return TrustedRoleEffectReservation(
+        host_inputs=host_inputs, ledger=ledger, binding=binding,
+        exposure=exposure, profile=profile,
+        request_identity=request_or_attempt_identity,
+        request_material=request_material, preflight_material=preflight_material,
+        _seal=_EFFECT_RESERVATION_SEAL,
+    )
 
 class SealedRoleRuntimeContext:
     """Factory-sealed authoritative Git/control context for advisory admission."""
@@ -997,7 +1142,7 @@ class SealedRoleExecution:
         if self._seal is not _EXECUTION_SEAL or type(self.execution_binding) is not ExecutionInstanceBinding:
             raise RoleCapabilityError("sealed role execution is available only from trusted composition")
 
-    def require_before_effect(self, *, expected_execution: ExecutionInstanceBinding | "_DerivedEffectBinding" | None = None) -> dict[str, object]:
+    def require_before_effect(self, *, expected_execution: ExecutionInstanceBinding | None = None) -> dict[str, object]:
         """Re-read admission before an effect and reject every binding drift.
 
         ``expected_execution`` is supplied by a production wrapper when it has
@@ -1023,45 +1168,11 @@ class SealedRoleExecution:
                     self.expectation.host_identity, self.expectation.deployment_identity,
                     self.expectation.authority_epoch, self.contract.instance.replacement_fence,
                     self.contract.profile.role, self.contract.profile.provider_profile)
-                or not self._expected_execution_matches(expected_execution, binding)):
+                or (expected_execution is not None and (
+                    type(expected_execution) is not ExecutionInstanceBinding
+                    or expected_execution.digest != binding.digest))):
             raise RoleCapabilityError("provider guidance evidence does not match the role seam")
         return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
-
-    @staticmethod
-    def _expected_execution_matches(
-        expected: ExecutionInstanceBinding | "_DerivedEffectBinding" | None,
-        binding: ExecutionInstanceBinding,
-    ) -> bool:
-        if expected is None:
-            return True
-        if type(expected) is ExecutionInstanceBinding:
-            return expected.digest == binding.digest
-        if type(expected) is not _DerivedEffectBinding or expected._seal is not _EXECUTION_SEAL:
-            return False
-        derived = expected.binding
-        return (
-            derived.repository_identity, derived.task_identity, derived.candidate_sha,
-            derived.instance_receipt_digest, derived.host_identity,
-            derived.deployment_identity, derived.authority_epoch,
-            derived.replacement_fence, derived.role, derived.provider_profile,
-        ) == (
-            binding.repository_identity, binding.task_identity, binding.candidate_sha,
-            binding.instance_receipt_digest, binding.host_identity,
-            binding.deployment_identity, binding.authority_epoch,
-            binding.replacement_fence, binding.role, binding.provider_profile,
-        )
-
-
-class _DerivedEffectBinding:
-    """Private proof that the wrapper, not its caller, derived this binding."""
-
-    __slots__ = ("binding", "_seal")
-
-    def __init__(self, binding: ExecutionInstanceBinding, *, _seal: object | None) -> None:
-        if _seal is not _EXECUTION_SEAL or type(binding) is not ExecutionInstanceBinding:
-            raise RoleCapabilityError("derived effect binding is invalid")
-        self.binding = binding
-        self._seal = _seal
 
 
 def _compose_sealed_role_execution(

@@ -11,13 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, NativeWorkerToolRequest, NativeWorkerTurnStep, WorkerAction, WorkerResultKind, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, NativeWorkerToolRequest, NativeWorkerTurnStep, WorkerAction, WorkerResultKind, WorkerTool, worker_request_digest
 from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools, CodingSandboxResult, ReviewedSandboxReceipt, ReviewedValidationSandbox
 from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole, RoleCapability, RoleScope, ScopeKind, ScopedDescriptor
-from tests.role_admission_fixture import independent_execution, sealed_execution
+from tests.role_admission_fixture import sealed_execution_for_effect, trusted_execution_host
 from roundwright.worker_toolbox import CODING_RUNTIME_REGISTRY, CodingDispatchReceipt, CodingWorkerRuntimeDescriptor, ProductionCodingWorkerEntrypointInputs, ProductionCodingWorkerRuntime, run_production_coding_worker, run_registered_production_coding_worker
 from roundwright.worker_shadow import WorkerShadowError
 
@@ -78,11 +78,21 @@ class ProductionRuntimeTests(unittest.TestCase):
         tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), (command,), output_limit=output_limit, sandbox_identity=digest("sandbox"), role_scope=scope, scope_root_identity=root_identity), validation_sandbox=sandbox or Sandbox())
         context = self.request().context
         receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
-        execution = sealed_execution(AdvisoryRole.WORKER, profile)
-        return ProductionCodingWorkerEntrypointInputs(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40, toolchain_receipt_probe=lambda: digest("toolchain"), advisory_execution=execution, expected_execution=independent_execution(AdvisoryRole.WORKER, profile))
+        backend = Backend(Session(turn, events))
+        request = self.request()
+        adapter = CodexWorkerAdapter(
+            backend, profile, audit,
+            BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)),
+        )
+        request_material, preflight_material = adapter.effect_material(request)
+        execution = sealed_execution_for_effect(
+            AdvisoryRole.WORKER, profile, request_identity=request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        return ProductionCodingWorkerEntrypointInputs(backend=backend, profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40, toolchain_receipt_probe=lambda: digest("toolchain"), advisory_execution=execution, execution_host=trusted_execution_host(AdvisoryRole.WORKER, profile), budget_ledger_path=root / "role-budget.sqlite")
     def runtime(self, root, turn, events, **kwargs):
         values=self.inputs(root,turn,events,**kwargs)
-        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe, toolchain_receipt_probe=values.toolchain_receipt_probe, advisory_execution=values.advisory_execution, expected_execution=values.expected_execution)
+        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe, toolchain_receipt_probe=values.toolchain_receipt_probe, advisory_execution=values.advisory_execution, execution_host=values.execution_host, budget_ledger_path=values.budget_ledger_path)
     def test_dispatch_writes_only_allowlisted_file_and_submits_closed_result(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")

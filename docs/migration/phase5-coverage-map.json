@@ -9,12 +9,12 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"d449b2d3608fe7ac08645eb57afb10cad8e260e954650846350088c50cb9a9ed"},
-      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"5ebb6a4a8511c0686eff81a91ac2106e83b402e4a35c75ffaad425caa39cd402"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"096fbc976ecf544754e4ed215d6fb68dfd702a92808d02dc6a6f704f3dc81108"},
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"269486d7d57914fa059123ae158217dc935b93810bee4060acac4af0670135db"},
+      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"861668cd4e3e2aaab8bfba1e85b4b9ae4887ec5a5445d1854dd9757f694dd6c7"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"1370aefb385a7d7eeff6e39b8cc9358d30bba30a848a20f3ce72619250e00be0"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
-      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"c3c3dbbc24f8b1257f063c62e04e3345de1687ef95c97f382658b213c3ae6c8a"},
+      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"54e6219991d05accf679ca04a465f13f762a45f9140b666a6adf2efce6f6a9ff"},
       {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"3d73b364c684985fc74cdb83ac275c668e2695dbe96888491e9bd1222828d29d"},
       {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"ef7afbcde947af7403a0b5acfef7ea198012902f6542f5567fc64e24c5e5165a"}
     ]

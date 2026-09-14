@@ -552,6 +552,36 @@ class DurableRoleBudgetLedger:
     def key(self) -> str:
         return _digest({"schema": self._schema, "grant": self._grant, "binding": self._binding})
 
+    def matches(self, *, grant_receipt_digest: str,
+                execution_binding: ExecutionInstanceBinding,
+                budget: RoleBudget) -> bool:
+        """Confirm that a host cannot substitute a ledger from another effect."""
+
+        return (
+            type(execution_binding) is ExecutionInstanceBinding
+            and type(budget) is RoleBudget
+            and type(grant_receipt_digest) is str
+            and grant_receipt_digest == self._grant
+            and execution_binding.digest == self._binding
+            and budget == self._budget
+        )
+
+    def reserve_effect(self) -> RoleBudgetUsage:
+        """Durably reserve the admitted worst-case provider effect up front.
+
+        The native SDK has no trusted prospective token or elapsed-time
+        receipt.  A provider turn has one reviewed accounting unit in each
+        dimension, and that unit is reserved before it can create a session.
+        A crash, reconstruction, or failover therefore cannot reset any part
+        of the grant budget.
+        """
+
+        return self.consume(
+            calls=1,
+            duration_seconds=1,
+            tokens=1,
+        )
+
     def consume(self, *, calls: int = 1, duration_seconds: int = 0,
                 tokens: int = 0) -> RoleBudgetUsage:
         if (type(calls) is not int or type(duration_seconds) is not int

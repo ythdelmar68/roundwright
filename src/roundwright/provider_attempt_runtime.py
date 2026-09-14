@@ -29,7 +29,7 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
+from .role_capability_policy import DurableRoleBudgetLedger, ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
@@ -310,6 +310,7 @@ class DurableDiffReviewRunner:
     review_round: int
     selection: DiffReviewSelection
     advisory_execution: SealedRoleExecution
+    budget_ledger: DurableRoleBudgetLedger
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
     case_id: str | None = None
@@ -354,6 +355,7 @@ class DurableDiffReviewRunner:
                 for item in entries
             )
             or not _matching_supervisor_admission(self.advisory_execution, self.audit)
+            or type(self.budget_ledger) is not DurableRoleBudgetLedger
         ):
             raise ProviderAttemptRuntimeError("provider attempt runner context has drifted")
         deadline = self.completion_policy.deadline()
@@ -587,6 +589,13 @@ class DurableDiffReviewRunner:
             within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
             lease=self.lease, now=self.dispatch_control.now,
         )
+        try:
+            # Reserve all three reviewed dimensions before any durable attempt
+            # mutation or native SDK effect.  The SQLite row is shared by every
+            # pre-bound profile and survives runner reconstruction.
+            self.budget_ledger.reserve_effect()
+        except RoleCapabilityError as error:
+            raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
         prepared = prepare_attempt(
             self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
             role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
@@ -676,6 +685,7 @@ class DurableDiffReviewRunner:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
                 advisory_execution=entry.advisory_execution,
+                expected_execution=entry.advisory_execution.execution_binding,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(
@@ -875,8 +885,9 @@ class ProviderAttemptHostInputs:
     dispatch_control: ProviderDispatchControl
     audits: tuple[ProviderHealthAuditIdentity, ...]
     selection: DiffReviewSelection
+    backend: NativeCodexSupervisorBackend | None
     expected_execution: ExecutionInstanceBinding
-    backend: NativeCodexSupervisorBackend | None = None
+    budget_ledger: DurableRoleBudgetLedger
     sequence: tuple[DiffReviewSequenceEntry, ...] = ()
     advisory_execution: SealedRoleExecution | None = None
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY
@@ -891,12 +902,19 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     existing backend protocol seam.
     """
 
-    if type(host) is not ProviderAttemptHostInputs or type(host.advisory_execution) is not SealedRoleExecution or host.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
+    if type(host) is not ProviderAttemptHostInputs or type(host.advisory_execution) is not SealedRoleExecution or host.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR or type(host.budget_ledger) is not DurableRoleBudgetLedger:
         raise ProviderAttemptRuntimeError("provider attempt host inputs are invalid")
     try:
         require_independent_execution(host.advisory_execution, host.expected_execution)
     except RoleCapabilityError as error:
         raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
+    admission = host.advisory_execution.contract.admission
+    if admission is None or not host.budget_ledger.matches(
+        grant_receipt_digest=admission.grant.receipt_digest,
+        execution_binding=host.expected_execution,
+        budget=host.advisory_execution.contract.profile.budget,
+    ):
+        raise ProviderAttemptRuntimeError("provider attempt budget ledger is not bound to the trusted host admission")
     descriptor = ProviderAttemptRuntimeDescriptor.parse(descriptor_value)
     completion_policy = ProviderAttemptCompletionPolicy.parse(descriptor.completion_policy)
     if (
@@ -927,6 +945,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         type(host.sequence) is not tuple
         or host.sequence[0].audit != audit
         or host.sequence[0].selection != host.selection
+        or host.sequence[0].advisory_execution.execution_binding != host.expected_execution
     ):
         raise ProviderAttemptRuntimeError("provider attempt host sequence has drifted")
     backend = host.backend
@@ -950,6 +969,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
         review_epoch=descriptor.review_epoch, review_round=descriptor.review_round,
         dependency_binding=host.dependency_binding, dispatch_control=host.dispatch_control,
         audit=audit, backend=backend, selection=host.selection, sequence=host.sequence, advisory_execution=host.advisory_execution,
+        budget_ledger=host.budget_ledger,
         completion_policy=completion_policy,
     )
     return prepare_context(
@@ -980,6 +1000,7 @@ def install_durable_diff_review_runtime(
     backend: NativeCodexSupervisorBackend,
     selection: DiffReviewSelection,
     advisory_execution: SealedRoleExecution,
+    budget_ledger: DurableRoleBudgetLedger,
     sequence: tuple[DiffReviewSequenceEntry, ...] = (),
     completion_policy: ProviderAttemptCompletionPolicy = PRODUCTION_COMPLETION_POLICY,
 ) -> None:
@@ -993,7 +1014,7 @@ def install_durable_diff_review_runtime(
     runner = DurableDiffReviewRunner(
         repository, identity, recovery, worktree, seal, lease, dependency_binding,
         dispatch_control, audit, backend, source_digest, review_epoch, review_round,
-        selection, advisory_execution, sequence, completion_policy, case_id, ready_at,
+        selection, advisory_execution, budget_ledger, sequence, completion_policy, case_id, ready_at,
     )
     RUNTIME_REGISTRY.install(resource_id, ProviderAttemptRuntimeResources(
         repository, identity, recovery, lease, seal, worktree, source_digest,

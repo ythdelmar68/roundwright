@@ -24,15 +24,19 @@ def digest(value: str) -> str:
 class BoundedCodingToolsTests(unittest.TestCase):
     def capability(self, root: Path, readable: tuple[str, ...], writable: tuple[str, ...], commands: tuple[tuple[str, ...], ...], **kwargs) -> BoundedCodingCapability:
         """Create an effectful fixture with its full exact role scope."""
-        root_identity = kwargs.pop("scope_root_identity", digest("scope:" + str(root.resolve())))
+        root_identity = kwargs.pop("scope_root_identity", digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(root.resolve())}, sort_keys=True, separators=(",", ":"))))
         supplied_scope = kwargs.pop("role_scope", None)
+        sandbox_identity = kwargs.get("sandbox_identity")
         descriptors = [
             *(ScopedDescriptor(ScopeKind.PATH, root_identity, value) for value in sorted(set(readable + writable))),
             *(ScopedDescriptor(ScopeKind.PROCESS, root_identity, digest(json.dumps({"command": command}, sort_keys=True, separators=(",", ":")))[7:]) for command in commands),
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, digest(json.dumps({"sandbox_identity": sandbox_identity}, sort_keys=True, separators=(",", ":")))[7:]),
+            *(ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, digest(json.dumps({"command": command}, sort_keys=True, separators=(",", ":")))[7:]) for command in commands),
         ]
         return BoundedCodingCapability(
             root, readable, writable, commands, role_scope=supplied_scope or RoleScope(
-                frozenset({RoleCapability.BOUNDED_CODING}), tuple(descriptors),
+                frozenset({RoleCapability.BOUNDED_CODING}), tuple(sorted(descriptors, key=lambda item: (item.kind.value, item.root_identity, item.value))),
             ), scope_root_identity=root_identity, **kwargs,
         )
 
@@ -117,11 +121,18 @@ class BoundedCodingToolsTests(unittest.TestCase):
 
     def test_admitted_role_scope_enforces_exact_paths_before_local_effects(self) -> None:
         (self.root / "src" / "other.txt").write_text("other", encoding="utf-8")
-        root_identity = digest("fixture-worktree")
-        scope = RoleScope(
-            frozenset({RoleCapability.BOUNDED_CODING}),
-            (ScopedDescriptor(ScopeKind.PATH, root_identity, "src/allowed.txt"),),
+        root_identity = digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(self.root.resolve())}, sort_keys=True, separators=(",", ":")))
+        process = (sys.executable, "-c", "import sys; sys.exit(0)")
+        process_identity = digest(json.dumps({"command": process}, sort_keys=True, separators=(",", ":")))[7:]
+        resource_identity = digest(json.dumps({"sandbox_identity": None}, sort_keys=True, separators=(",", ":")))[7:]
+        descriptors = (
+            ScopedDescriptor(ScopeKind.PATH, root_identity, "src/allowed.txt"),
+            ScopedDescriptor(ScopeKind.PROCESS, root_identity, process_identity),
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, resource_identity),
+            ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, process_identity),
         )
+        scope = RoleScope(frozenset({RoleCapability.BOUNDED_CODING}), tuple(sorted(descriptors, key=lambda item: (item.kind.value, item.root_identity, item.value))))
         tools = BoundedCodingTools(self.capability(
             self.root, ("src/allowed.txt", "src/other.txt"), ("src/allowed.txt",),
             ((sys.executable, "-c", "import sys; sys.exit(0)"),),
@@ -137,6 +148,12 @@ class BoundedCodingToolsTests(unittest.TestCase):
                 self.root, ("src/allowed.txt",), ("src/allowed.txt",),
                 ((sys.executable, "-c", "pass"),),
             )
+
+    def test_scope_root_label_cannot_authorize_a_different_resolved_workspace(self) -> None:
+        command = (sys.executable, "-c", "pass")
+        root_a = digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(self.foreign.resolve())}, sort_keys=True, separators=(",", ":")))
+        with self.assertRaisesRegex(CodingToolError, "scope root"):
+            self.capability(self.root, ("src/allowed.txt",), ("src/allowed.txt",), (command,), scope_root_identity=root_a)
 
     def test_validation_output_budget_is_enforced_while_the_process_runs(self) -> None:
         command = (sys.executable, "-c", "import sys; sys.stdout.write('x' * 4097)")

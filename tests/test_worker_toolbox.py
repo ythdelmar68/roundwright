@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
@@ -206,6 +206,26 @@ class WorkerToolboxTests(unittest.TestCase):
         with self.assertRaises(CodexAdapterError):
             backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         self.assertEqual(launches, [])
+
+    def test_sealed_launch_context_rejects_coherent_public_instruction_mutation(self):
+        launch = self.launch_context()
+        replacement = b"coherently replaced accepted guidance"
+        instructions = (
+            "Use only the explicitly injected Roundwright guidance boundary. "
+            "Do not discover ambient, global, or repository instruction files. "
+            f"Guidance receipt: {launch.guidance_receipt_digest}. Role view: {launch.execution_binding.role.value}.\n"
+            + replacement.decode("utf-8")
+        )
+        # Deliberately bypass normal immutability and make all visible fields
+        # self-consistent.  Verification must still authenticate them to the
+        # sealed accepted guidance payload.
+        object.__setattr__(launch, "accepted_main_guidance_bytes", replacement)
+        object.__setattr__(launch, "accepted_main_guidance_digest", "sha256:" + hashlib.sha256(replacement).hexdigest())
+        object.__setattr__(launch, "developer_instructions", instructions)
+        object.__setattr__(launch, "role_injected_bytes", instructions.encode("utf-8"))
+        object.__setattr__(launch, "injected_context_digest", "sha256:" + hashlib.sha256(instructions.encode("utf-8")).hexdigest())
+        with self.assertRaises(RoleCapabilityError):
+            launch.verify(cwd=ROOT, profile=self.profile)
 
     def test_native_worker_requires_a_sealed_launch_context_before_factory_creation(self):
         launches: list[str] = []

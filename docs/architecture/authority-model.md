@@ -6,7 +6,7 @@ Recovery Advisor and Owner Intent Interpreter are opt-in advisory instances,
 not dispatchers. Admission requires independent authority evidence bound to the
 repository, task, deployment, epoch, expiry, revocation identity, host/state/
 fence-bound instance, accepted guidance at an exact trusted Git tree, and a
-root-normalized typed action/path/process scope. The
+root-normalized typed action/path/process/test-input/network/resource scope. The
 profile intersects that scope with a reviewed, immutable per-capability SDK
 mapping and finite budgets. Drive-qualified, UNC, traversal, repeated-separator,
 and non-canonical scope paths fail closed.
@@ -31,7 +31,10 @@ dedicated provider route is introduced.
 Each capsule also carries immutable provider-guidance evidence: the matching
 role view, provider working-root identity, exact injected context digest,
 accepted-main identity, task candidate, and selected guidance receipt. A
-mismatched view or receipt fails before any hermetic fixture effect. The native
+mismatched view or receipt fails before any hermetic fixture effect. Launch
+facts are sealed transitively: every verification re-authenticates the complete
+injected instruction payload to the accepted-guidance bytes, so coordinated
+public-field mutation is not a valid launch context. The native
 SDK has no qualified discovery-off control, so injected prompt prose is never
 treated as disabling discovery; every real bridge remains disabled pending a
 separately reviewed external host promotion.

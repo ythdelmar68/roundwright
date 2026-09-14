@@ -81,6 +81,12 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
             coverage.validate(self.source, self.ledger, self.tests)
 
+    def test_rejects_semantic_boundary_contract_drift(self) -> None:
+        contracts = dict(coverage.SEMANTIC_CONTRACTS)
+        contracts["src/roundwright/worker_toolbox.py"] = ("missing-required-production-boundary",)
+        with patch.object(coverage, "SEMANTIC_CONTRACTS", contracts), self.assertRaisesRegex(coverage.CoverageError, "semantic contract"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
     def test_rejects_verification_drift_and_unsafe_verification_values(self) -> None:
         document = self.document()
         for verification, expected_error in (

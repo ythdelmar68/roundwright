@@ -28,7 +28,7 @@ from roundwright.role_capability_policy import (
     DedicatedRoleInstance, FileRoleAdmissionStore, GuidanceView,
     ExecutionInstanceBinding, ProviderGuidanceEvidence, RoleAdmissionExpectation, RoleBudget,
     RoleCapability, RoleCapabilityGrant, RoleCapabilityProfile,
-    RoleExecutionSeam, RoleScope, SealedRoleExecution,
+    RoleExecutionSeam, RoleScope, ScopeKind, ScopedDescriptor, SealedRoleExecution,
     TrustedExecutionHostInputs, TrustedRoleAuthorityReceipt, read_verified_admission,
     _compose_sealed_role_execution, _resolve_sealed_role_runtime_context, resolve_authoritative_guidance,
     reviewed_sdk_mapping,
@@ -126,7 +126,11 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
         _digest("state"), _digest("deployment"), _digest("host"), 1,
         "fixture-generation", task_candidate,
     )
-    scope = RoleScope(capabilities, ())
+    scope = RoleScope(capabilities, (
+        ScopedDescriptor(ScopeKind.NETWORK, repository_identity, "network-disabled"),
+        ScopedDescriptor(ScopeKind.RESOURCE, repository_identity, instance.receipt_digest[7:]),
+        ScopedDescriptor(ScopeKind.TEST_INPUT_SET, repository_identity, guidance.receipt_digest[7:]),
+    ))
     authority = TrustedRoleAuthorityReceipt(
         repository_identity, "task-136", _digest("deployment"), 1,
         _digest("issuer"), now + 3600, _digest("revocation"),
@@ -135,7 +139,7 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
     record = {
         "schema": "roundwright-independent-role-admission/v1", "grant_reference": "fixture-grant",
         "authority": authority.__dict__, "instance": instance.__dict__,
-        "scope": {"actions": sorted(item.value for item in scope.actions), "descriptors": []},
+        "scope": {"actions": sorted(item.value for item in scope.actions), "descriptors": [{"kind": item.kind.value, "root_identity": item.root_identity, "value": item.value} for item in scope.descriptors]},
         "grant": grant.__dict__, "revoked": False,
         "revocation_readback_digest": _digest("revocation"),
     }

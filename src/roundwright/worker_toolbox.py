@@ -780,8 +780,18 @@ def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBacken
 
 
 class ProductionCodingWorkerRuntime:
-    """Candidate-bound production coding seam; CLI activation remains blocked."""
+    """Unavailable installed production coding seam.
+
+    This class intentionally remains import-compatible for callers that need a
+    deterministic denial, but it is not a test harness.  Construction and
+    dispatch both independently require the externally issued activation
+    capability that this candidate deliberately does not contain.
+    """
     def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path) -> None:
+        try:
+            require_external_production_activation()
+        except RoleCapabilityError as error:
+            raise WorkerShadowError("production coding activation is unavailable") from error
         if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
                 or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
                 or local_tools.capability_digest != dispatch_receipt.capability_digest
@@ -805,6 +815,10 @@ class ProductionCodingWorkerRuntime:
         return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
 
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+        try:
+            require_external_production_activation()
+        except RoleCapabilityError as error:
+            raise WorkerShadowError("production coding activation is unavailable") from error
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())

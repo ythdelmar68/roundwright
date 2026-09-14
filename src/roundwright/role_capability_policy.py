@@ -68,6 +68,9 @@ class ExternalActivationStatus(str, Enum):
 class ScopeKind(str, Enum):
     PATH = "path"
     PROCESS = "process"
+    TEST_INPUT_SET = "test-input-set"
+    NETWORK = "network"
+    RESOURCE = "resource"
 
 
 class RoleExecutionSeam(str, Enum):
@@ -306,7 +309,7 @@ class TrustedProviderLaunchContext:
         "cwd", "execution_binding", "guidance_receipt_digest",
         "injected_context_digest", "implicit_discovery_disabled",
         "developer_instructions", "accepted_main_guidance_digest", "accepted_main_guidance_bytes",
-        "role_injected_bytes", "cwd_identity", "sdk_mapping_identity", "_seal",
+        "role_injected_bytes", "cwd_identity", "sdk_mapping_identity", "_authenticated_payload", "_seal",
     )
 
     def __init__(
@@ -325,30 +328,60 @@ class TrustedProviderLaunchContext:
             or _DIGEST.fullmatch(sdk_mapping_identity) is None
         ):
             raise RoleCapabilityError("trusted provider launch context is invalid")
-        self.cwd = cwd.resolve(strict=False)
-        self.execution_binding = execution_binding
-        self.guidance_receipt_digest = guidance_receipt_digest
-        self.injected_context_digest = injected_context_digest
-        self.implicit_discovery_disabled = True
-        self.developer_instructions = developer_instructions
-        self.role_injected_bytes = developer_instructions.encode("utf-8")
-        self.accepted_main_guidance_bytes = accepted_main_guidance_bytes
-        self.accepted_main_guidance_digest = "sha256:" + hashlib.sha256(accepted_main_guidance_bytes).hexdigest()
-        self.cwd_identity = _digest({"schema": "roundwright-provider-sdk-cwd/v1", "cwd": str(self.cwd)})
-        self.sdk_mapping_identity = sdk_mapping_identity
-        self._seal = _seal
+        resolved_cwd = cwd.resolve(strict=False)
+        injected_bytes = developer_instructions.encode("utf-8")
+        accepted_digest = "sha256:" + hashlib.sha256(accepted_main_guidance_bytes).hexdigest()
+        cwd_identity = _digest({"schema": "roundwright-provider-sdk-cwd/v1", "cwd": str(resolved_cwd)})
+        # Retain one private, complete authenticated payload.  Verification
+        # compares every public launch field against it, so coordinated edits
+        # to formerly mutable slots cannot manufacture self-consistency.
+        payload = {
+            "cwd": resolved_cwd, "execution_binding": execution_binding,
+            "guidance_receipt_digest": guidance_receipt_digest,
+            "injected_context_digest": injected_context_digest,
+            "implicit_discovery_disabled": True,
+            "developer_instructions": developer_instructions,
+            "role_injected_bytes": injected_bytes,
+            "accepted_main_guidance_bytes": accepted_main_guidance_bytes,
+            "accepted_main_guidance_digest": accepted_digest,
+            "cwd_identity": cwd_identity,
+            "sdk_mapping_identity": sdk_mapping_identity,
+        }
+        for name, value in payload.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_authenticated_payload", MappingProxyType(payload))
+        object.__setattr__(self, "_seal", _seal)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # Normal callers cannot mutate a sealed launch context.  ``verify``
+        # still authenticates against the private payload for adversarial
+        # object-level slot mutation in an embedding process.
+        if getattr(self, "_seal", None) is _LAUNCH_CONTEXT_SEAL:
+            raise RoleCapabilityError("trusted provider launch context is immutable")
+        object.__setattr__(self, name, value)
 
     def verify(self, *, cwd: Path, profile: ProviderProfile,
                required_capability: RoleCapability | None = None) -> None:
+        payload = self._authenticated_payload
+        expected_instructions = (
+            "Use only the explicitly injected Roundwright guidance boundary. "
+            "Do not discover ambient, global, or repository instruction files. "
+            f"Guidance receipt: {payload['guidance_receipt_digest']}. Role view: {payload['execution_binding'].role.value}.\n"
+            + payload["accepted_main_guidance_bytes"].decode("utf-8", errors="strict")
+        )
         if (
             self._seal is not _LAUNCH_CONTEXT_SEAL
+            or type(payload) is not MappingProxyType
             or not isinstance(cwd, Path) or cwd.resolve(strict=False) != self.cwd
             or type(profile) is not ProviderProfile
             or self.execution_binding.provider_profile != profile
+            or any(getattr(self, name) != value for name, value in payload.items())
             or self.implicit_discovery_disabled is not True
             or self.cwd_identity != _digest({"schema": "roundwright-provider-sdk-cwd/v1", "cwd": str(self.cwd)})
             or self.injected_context_digest != ("sha256:" + hashlib.sha256(self.role_injected_bytes).hexdigest())
             or self.developer_instructions.encode("utf-8") != self.role_injected_bytes
+            or self.developer_instructions != expected_instructions
+            or self.accepted_main_guidance_digest != ("sha256:" + hashlib.sha256(self.accepted_main_guidance_bytes).hexdigest())
             or self.sdk_mapping_identity != reviewed_sdk_mapping().identity
             or (required_capability is not None and (
                 type(required_capability) is not RoleCapability
@@ -493,7 +526,13 @@ class ScopedDescriptor:
         _require_digest(self.root_identity, "scope root identity")
         if self.kind is ScopeKind.PATH:
             _relative_path(self.value)
-        elif type(self.value) is not str or _SAFE_NAME.fullmatch(self.value) is None:
+        elif self.kind in {ScopeKind.PROCESS, ScopeKind.TEST_INPUT_SET, ScopeKind.RESOURCE}:
+            if type(self.value) is not str or re.fullmatch(r"[0-9a-f]{64}", self.value) is None:
+                raise RoleCapabilityError("scope descriptor value is invalid")
+        elif self.kind is ScopeKind.NETWORK:
+            if self.value != "network-disabled":
+                raise RoleCapabilityError("scope descriptor value is invalid")
+        else:
             raise RoleCapabilityError("scope descriptor value is invalid")
 
 
@@ -994,6 +1033,21 @@ def reserve_role_effect(
     admission = execution.contract.admission
     if admission is None:
         raise RoleCapabilityError("role effect admission is unavailable")
+    # Provider-facing seams do not get to treat a broad action grant as a
+    # network or resource grant.  These are closed, static descriptors of the
+    # accepted input, the deny-network posture, and the admitted instance;
+    # the request/preflight remain separately bound by ``binding`` above.
+    try:
+        admission.scope.require(
+            RoleCapability.BOUNDED_CODING if execution.seam is RoleExecutionSeam.WORKER else RoleCapability.READ_ONLY_REVIEW,
+            (
+                ScopedDescriptor(ScopeKind.TEST_INPUT_SET, execution.contract.instance.repository_identity, execution.contract.guidance.receipt_digest[7:]),
+                ScopedDescriptor(ScopeKind.NETWORK, execution.contract.instance.repository_identity, "network-disabled"),
+                ScopedDescriptor(ScopeKind.RESOURCE, execution.contract.instance.repository_identity, execution.contract.instance.receipt_digest[7:]),
+            ),
+        )
+    except RoleCapabilityError as error:
+        raise RoleCapabilityError("role effect descriptors are not admitted") from error
     exposure = execution.contract.profile.budget
     ledger = DurableRoleBudgetLedger(
         ledger_path, grant_receipt_digest=admission.grant.receipt_digest,

@@ -191,6 +191,15 @@ class BoundedCodingCapability:
             or re.fullmatch(r"sha256:[0-9a-f]{64}", self.scope_root_identity) is None
         ):
             raise CodingToolError("bounded coding capability is invalid")
+        try:
+            resolved = self.root.resolve(strict=True)
+        except OSError as error:
+            raise CodingToolError("selected workspace is invalid") from error
+        if not resolved.is_dir() or self.scope_root_identity != _root_identity(resolved):
+            # The scope label is never caller-selected authority.  It must be
+            # mechanically derived from the exact root that will be used for
+            # every subsequent filesystem and process effect.
+            raise CodingToolError("bounded coding scope root is invalid")
 
 
 class BoundedCodingTools:
@@ -216,6 +225,7 @@ class BoundedCodingTools:
             # for each concrete path/process effect below.  A generic mapping
             # capability is never sufficient to open a local-effect path.
             capability.role_scope.require(RoleCapability.BOUNDED_CODING)
+            self._require_static_validation_descriptors()
         except RoleCapabilityError as error:
             raise CodingToolError("bounded coding role scope is denied") from error
 
@@ -394,6 +404,28 @@ class BoundedCodingTools:
         except RoleCapabilityError as error:
             raise CodingToolError("validation process is outside the admitted role scope") from error
 
+    def _require_static_validation_descriptors(self) -> None:
+        """Require closed resource, test-input, and deny-network bounds.
+
+        The process descriptor alone describes an executable, not its test
+        input set, resource seal, or network posture.  Bind all of them before
+        the local launcher or sandbox can be reached.
+        """
+        root_identity = self._capability.scope_root_identity
+        assert root_identity is not None
+        descriptors = [
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, _resource_identity(self._capability.sandbox_identity)),
+        ]
+        descriptors.extend(
+            ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, _command_identity(command))
+            for command in self._capability.validation_commands
+        )
+        try:
+            self._capability.role_scope.require(RoleCapability.BOUNDED_CODING, tuple(descriptors))
+        except RoleCapabilityError as error:
+            raise CodingToolError("validation descriptors are outside the admitted role scope") from error
+
 
 def _relative(value: object) -> bool:
     if type(value) is not str or not value or "\\" in value:
@@ -433,6 +465,18 @@ def _digest(value: bytes) -> str:
 def _object_digest(value: object) -> str:
     import json
     return _digest(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+
+
+def _root_identity(root: Path) -> str:
+    return _object_digest({"schema": "roundwright-bounded-coding-root/v1", "root": str(root)})
+
+
+def _command_identity(command: tuple[str, ...]) -> str:
+    return _object_digest({"command": command})[7:]
+
+
+def _resource_identity(sandbox_identity: str | None) -> str:
+    return _object_digest({"sandbox_identity": sandbox_identity})[7:]
 
 
 def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, output_limit: int) -> bytes:

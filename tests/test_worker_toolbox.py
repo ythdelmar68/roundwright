@@ -22,7 +22,7 @@ from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_la
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
-from tests.role_admission_fixture import sealed_execution
+from tests.role_admission_fixture import independent_execution, sealed_execution
 
 
 def digest(value: object) -> str:
@@ -145,13 +145,19 @@ class WorkerToolboxTests(unittest.TestCase):
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, case_id="case-43", observation_identity=self.request.input_digest, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, self.readiness.capture_plan_digest, "planning-complete", None, "supervisor-review")
 
+    def launch_context(self):
+        execution = sealed_execution(AdvisoryRole.WORKER, self.profile)
+        return trusted_provider_launch_context(
+            execution, independent_execution(AdvisoryRole.WORKER, self.profile), cwd=ROOT,
+        )
+
     def test_concrete_bridge_checkpoints_then_seals_and_readbacks_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "external-store"
             service = TemporaryReviewedRecorder()
             recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), expected_execution=independent_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
         self.assertEqual(self.events[0], "enter")
         self.assertEqual(self.events[2], ("checkpoint-session", "thread-43"))
         self.assertEqual(self.events[4], ("checkpoint-turn", "thread-43", "turn-43"))
@@ -178,17 +184,17 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
         self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.attempt_id, self.binding.input_digest, self.binding.resume_session_identity, self.binding.source_digest, self.binding.repository_fingerprint, self.binding.worktree_fingerprint, self.binding.branch_fingerprint, self.binding.policy_fingerprint, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.capture_plan_digest, self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         with tempfile.TemporaryDirectory() as temporary:
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=lambda *_: None, record_capture=lambda *_: None, verify_capture=lambda *_: None)
             with self.assertRaises(Exception):
-                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e, _f: None)
+                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), expected_execution=independent_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e, _f: None)
         self.assertEqual(self.events, [])
 
     def test_sealed_launch_context_blocks_cwd_and_profile_drift_before_client_creation(self):
         execution = sealed_execution(AdvisoryRole.WORKER, self.profile)
         launch = trusted_provider_launch_context(
-            execution, execution.execution_binding, cwd=ROOT,
+            execution, independent_execution(AdvisoryRole.WORKER, self.profile), cwd=ROOT,
         )
         launches: list[str] = []
         backend = HarnessNativeCodexWorkerBackend(
@@ -201,8 +207,18 @@ class WorkerToolboxTests(unittest.TestCase):
             backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         self.assertEqual(launches, [])
 
+    def test_native_worker_requires_a_sealed_launch_context_before_factory_creation(self):
+        launches: list[str] = []
+        with self.assertRaises(TypeError):
+            HarnessNativeCodexWorkerBackend(
+                cwd=ROOT, completion=CompletionDeadline(1000, 2000),
+                codex_factory=lambda: launches.append("client") or FakeCodex(self.events),
+                approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            )
+        self.assertEqual(launches, [])
+
     def test_native_qualification_rejects_unenforceable_abstract_tool_labels(self):
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         with self.assertRaises(Exception):
             session.start_turn(self.request, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
@@ -228,10 +244,10 @@ class WorkerToolboxTests(unittest.TestCase):
                 self.events.append(("coding-turn", prompt, kwargs)); return OneShotHandle(self.events, next(replies))
         class Codex(FakeCodex):
             def thread_start(inner, **kwargs): self.events.append(("start", kwargs)); return Thread(self.events)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: Codex(self.events), approval_mode="deny-all", sandbox="reviewed-sandbox", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: Codex(self.events), approval_mode="deny-all", sandbox="reviewed-sandbox", effort_factory=lambda value: value)
         turn = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.IMPLEMENTATION).start_turn(request, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         start = next(event for event in self.events if isinstance(event, tuple) and event[0] == "start")
-        self.assertIn("workspace-read", start[1]["developer_instructions"])
+        self.assertIn("Do not discover ambient", start[1]["developer_instructions"])
         self.assertNotIn("planning observation", start[1]["developer_instructions"])
         first = turn.read_step(); self.assertEqual((first.request.sequence, first.request.tool), (1, WorkerTool.WORKSPACE_READ))
         turn.submit_tool_result(NativeWorkerToolResult(1, WorkerTool.WORKSPACE_READ, "allowed", after_digest=digest("read"), feedback="bounded"))
@@ -241,10 +257,10 @@ class WorkerToolboxTests(unittest.TestCase):
     def test_no_tool_contract_is_bound_at_adapter_readiness_and_prompt(self):
         self.assertEqual(BoundedWorkerToolSurface(()).capability_contract, WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED)
         self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)).capability_contract, WorkerCapabilityContract.ORCHESTRATION_DECLARED_ONLY)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         start = self.events[1][1]
-        self.assertIn("No provider tools", start["developer_instructions"])
+        self.assertIn("Do not discover ambient", start["developer_instructions"])
         self.assertNotIn("tools", start)
 
     def test_blocked_provider_output_cannot_become_accepted_evidence(self):
@@ -353,7 +369,7 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_resume_rebinds_full_runtime_on_a_new_client(self):
         events = []
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity="thread-43", action=WorkerAction.PLANNING)
         self.assertEqual(session.identity(), "thread-43")
         kind, identity, kwargs = events[1]
@@ -426,8 +442,8 @@ class WorkerToolboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             service = TemporaryReviewedRecorder()
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), expected_execution=independent_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
         self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
         self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None, None), events)
         self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
@@ -466,8 +482,8 @@ class WorkerToolboxTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temporary:
                     service = TemporaryReviewedRecorder()
                     recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), expected_execution=independent_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
 
                 self.assertEqual(provider_calls, ["turn"])
                 self.assertEqual((result.result.kind, result.result.session_identity, result.result.turn_identity), ("ambiguous", "thread-43", "turn-43"))
@@ -505,8 +521,8 @@ class WorkerToolboxTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temporary:
                     service = TemporaryReviewedRecorder()
                     recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, advisory_execution=sealed_execution(AdvisoryRole.WORKER, self.profile), expected_execution=independent_execution(AdvisoryRole.WORKER, self.profile), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
 
                 self.assertEqual(calls, ["turn", "stream"])
                 self.assertEqual(events[:4], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt", "client-close"])
@@ -519,7 +535,7 @@ class WorkerToolboxTests(unittest.TestCase):
 
     def test_concrete_success_closes_once_without_interrupt(self):
         events = []
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         turn = session.start_turn(self.request, BoundedWorkerToolSurface(()))
         self.assertEqual(turn.read_response().kind, "accepted")
@@ -546,7 +562,7 @@ class WorkerToolboxTests(unittest.TestCase):
             def __exit__(self, *_args): events.append("client-close")
             def thread_start(self, **_kwargs): return Thread()
 
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         turn = session.start_turn(self.request, BoundedWorkerToolSurface(()))
         self.assertEqual((session.identity(), turn.identity()), ("thread-43", "turn-43"))

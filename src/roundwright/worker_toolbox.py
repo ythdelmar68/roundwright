@@ -284,7 +284,7 @@ class HarnessExternalWorkerRecorder(ExternalWorkerRecorder):
 class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
     """Executable deny-all/read-only bridge over the reviewed native SDK API."""
 
-    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic, launch_context: TrustedProviderLaunchContext | None = None) -> None:
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, launch_context: TrustedProviderLaunchContext, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise WorkerShadowError("native Worker working directory is invalid")
         if codex_factory is None:
@@ -294,7 +294,7 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 codex_factory, approval_mode, sandbox, effort_factory = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             except Exception as error:
                 raise WorkerShadowError("reviewed native Worker SDK is unavailable") from error
-        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock) or (launch_context is not None and type(launch_context) is not TrustedProviderLaunchContext):
+        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock) or type(launch_context) is not TrustedProviderLaunchContext:
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
         self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock, self._launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
 
@@ -302,15 +302,10 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
         if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
-            if self._launch is not None:
-                self._launch.verify(cwd=self._cwd, profile=profile)
+            self._launch.verify(cwd=self._cwd, profile=profile)
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
-        instructions = (
-            self._launch.developer_instructions
-            if self._launch is not None
-            else _NO_TOOL_INSTRUCTIONS if action is WorkerAction.PLANNING else _CODING_TOOL_INSTRUCTIONS
-        )
+        instructions = self._launch.developer_instructions
         codex = self._codex_factory()
         try:
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
@@ -321,7 +316,7 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
                 thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=instructions, model=profile.model, sandbox=self._sandbox)
-            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value, self._completion, self._clock)
+            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._launch)
         except CodexAdapterError:
             _close(codex)
             raise
@@ -364,8 +359,8 @@ class _HarnessCleanupOwner:
 
 
 class _HarnessWorkerSession(NativeWorkerSession):
-    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._thread, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock, self._started = thread, approval_mode, cwd, model, sandbox, effort_factory, effort, completion, clock, False
+    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, profile: ProviderProfile, sandbox: object, effort_factory: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext) -> None:
+        self._thread, self._approval_mode, self._cwd, self._profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._started, self._launch = thread, approval_mode, cwd, profile, sandbox, effort_factory, completion, clock, False, launch_context
         self._cleanup = _HarnessCleanupOwner(codex)
 
     def identity(self) -> str:
@@ -381,18 +376,22 @@ class _HarnessWorkerSession(NativeWorkerSession):
         if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
+        try:
+            self._launch.verify(cwd=self._cwd, profile=self._profile)
+        except RoleCapabilityError as error:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         if request.action is not WorkerAction.PLANNING:
             required = {WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE}
             if set(tools.tools) != required:
                 raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock)
+            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._profile.model, self._sandbox, self._effort_factory, self._profile.reasoning_effort.value, self._completion, self._clock)
         if tools.capability_contract.value != "no-tools-self-contained/v1":
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         # The full canonical request is transient. Only the validated structured
         # lifecycle projection below can cross the SDK boundary.
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
         try:
-            handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
+            handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._profile.model, effort=self._effort_factory(self._profile.reasoning_effort.value), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
             return _HarnessWorkerTurn(handle, self._cleanup, request.action, self._completion, self._clock)
         except Exception as error:
             self._cleanup.close()
@@ -746,9 +745,9 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "capability_contract": "no-tools-self-contained/v1", "provider_instruction": "No provider tools or repository inspection are declared or required; decide only from this normalized public input.", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": []}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, advisory_execution: SealedRoleExecution, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
-    return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, advisory_execution, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+    return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, advisory_execution, expected_execution, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 
 
 class ProductionCodingWorkerRuntime:

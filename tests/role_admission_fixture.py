@@ -37,6 +37,7 @@ from roundwright.role_capability_policy import (
 
 _TEMPS: list[tempfile.TemporaryDirectory[str]] = []
 _EXECUTIONS: dict[tuple[AdvisoryRole, ProviderProfile], SealedRoleExecution] = {}
+_EXPECTED_EXECUTIONS: dict[tuple[AdvisoryRole, ProviderProfile], ExecutionInstanceBinding] = {}
 
 
 def _digest(value: object) -> str:
@@ -158,14 +159,30 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
     store = FileRoleAdmissionStore(runtime=final_runtime, record_relative_path="admission.json", store_identity=_digest("admission-store"))
     admission, verified_instance = read_verified_admission(expectation=expectation, store=store)
     contract = AdvisoryRoleContract(role_profile, guidance, verified_instance, admission)
+    expected_execution = ExecutionInstanceBinding(
+        repository_identity, "task-136", task_candidate, instance.receipt_digest,
+        _digest("host"), _digest("deployment"), 1, "fixture-generation", role,
+        role_profile.provider_profile, "fixture-execution", _digest("fixture-preflight"),
+    )
     execution = _compose_sealed_role_execution(
         contract, RoleExecutionSeam(role.value), store, expectation,
         ProviderGuidanceEvidence(view, _digest("provider-cwd"), True, _digest("injected-guidance"), guidance.receipt_digest, binding.candidate_sha, task_candidate),
-        ExecutionInstanceBinding(
-            repository_identity, "task-136", task_candidate, instance.receipt_digest,
-            _digest("host"), _digest("deployment"), 1, "fixture-generation", role,
-            role_profile.provider_profile, "fixture-execution", _digest("fixture-preflight"),
-        ),
+        expected_execution,
     )
     _EXECUTIONS[(role, profile)] = execution
+    _EXPECTED_EXECUTIONS[(role, profile)] = expected_execution
     return execution
+
+
+def independent_execution(role: AdvisoryRole, profile: ProviderProfile) -> ExecutionInstanceBinding:
+    """Reconstruct the fixture host expectation without reading a capsule."""
+
+    sealed_execution(role, profile)
+    expected = _EXPECTED_EXECUTIONS[(role, profile)]
+    return ExecutionInstanceBinding(
+        expected.repository_identity, expected.task_identity, expected.candidate_sha,
+        expected.instance_receipt_digest, expected.host_identity,
+        expected.deployment_identity, expected.authority_epoch,
+        expected.replacement_fence, expected.role, expected.provider_profile,
+        expected.execution_identity, expected.preflight_identity,
+    )

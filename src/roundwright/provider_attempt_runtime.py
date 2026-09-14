@@ -29,7 +29,7 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
-from .role_capability_policy import DurableRoleBudgetLedger, ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution, trusted_provider_launch_context
+from .role_capability_policy import DurableRoleBudgetLedger, ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_independent_execution, trusted_provider_launch_context
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
@@ -256,7 +256,7 @@ class DiffReviewSequenceEntry:
     recovery: RecoveryContext
     audit: ProviderHealthAuditIdentity
     backend: NativeCodexSupervisorBackend
-    expected_execution: ExecutionInstanceBinding | None = None
+    expected_execution: ExecutionInstanceBinding
 
     def __post_init__(self) -> None:
         if (
@@ -265,10 +265,8 @@ class DiffReviewSequenceEntry:
             or type(self.recovery) is not RecoveryContext
             or type(self.audit) is not ProviderHealthAuditIdentity
             or not callable(getattr(self.backend, "open_fresh_session", None))
-            or (self.expected_execution is not None and (
-                type(self.expected_execution) is not ExecutionInstanceBinding
-                or self.expected_execution.provider_profile != self.audit.profile
-            ))
+            or type(self.expected_execution) is not ExecutionInstanceBinding
+            or self.expected_execution.provider_profile != self.audit.profile
         ):
             raise ProviderAttemptRuntimeError("provider attempt sequence entry is invalid")
 
@@ -326,6 +324,7 @@ class DurableDiffReviewRunner:
         return self.sequence or (
             DiffReviewSequenceEntry(
                 self.selection, self.advisory_execution, self.recovery, self.audit, self.backend,
+                self.expected_execution,
             ),
         )
 
@@ -358,6 +357,8 @@ class DurableDiffReviewRunner:
                 or item.recovery.candidate_sha != self.recovery.candidate_sha
                 or item.recovery.runtime_binding != runtime
                 or not callable(getattr(item.backend, "open_fresh_session", None))
+                or type(item.expected_execution) is not ExecutionInstanceBinding
+                or item.expected_execution.provider_profile != item.audit.profile
                 for item in entries
             )
             or not _matching_supervisor_admission(self.advisory_execution, self.audit)
@@ -413,17 +414,7 @@ class DurableDiffReviewRunner:
         entries = self.validate_sequence()
         try:
             for entry in entries:
-                expected = entry.expected_execution or (
-                    self.expected_execution if entry.selection == self.selection else None
-                )
-                if expected is not None:
-                    require_independent_execution(entry.advisory_execution, expected)
-                else:
-                    # This legacy direct-runner seam is intentionally not
-                    # reachable from hosted inputs: install_host_runtime
-                    # requires every configured sequence entry to carry an
-                    # independently host-derived expected execution.
-                    require_execution_for_profile(entry.advisory_execution, entry.audit.profile)
+                require_independent_execution(entry.advisory_execution, entry.expected_execution)
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
         entries = self.preflight_checkpoint_prerequisites()
@@ -703,11 +694,7 @@ class DurableDiffReviewRunner:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
                 advisory_execution=entry.advisory_execution,
-                expected_execution=entry.expected_execution or (
-                    self.expected_execution
-                    if selection == self.selection
-                    else entry.advisory_execution.execution_binding
-                ),
+                expected_execution=entry.expected_execution,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(

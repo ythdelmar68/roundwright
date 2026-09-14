@@ -29,7 +29,7 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
@@ -403,7 +403,7 @@ class DurableDiffReviewRunner:
         entries = self.validate_sequence()
         try:
             for entry in entries:
-                entry.advisory_execution.require_before_effect()
+                require_execution_for_profile(entry.advisory_execution, entry.audit.profile)
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
         entries = self.preflight_checkpoint_prerequisites()
@@ -893,7 +893,7 @@ def install_host_runtime(descriptor_value: object, host: ProviderAttemptHostInpu
     if type(host) is not ProviderAttemptHostInputs or type(host.advisory_execution) is not SealedRoleExecution or host.advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
         raise ProviderAttemptRuntimeError("provider attempt host inputs are invalid")
     try:
-        host.advisory_execution.require_before_effect()
+        require_execution_for_profile(host.advisory_execution, host.advisory_execution.execution_binding.provider_profile)
     except RoleCapabilityError as error:
         raise ProviderAttemptRuntimeError("provider attempt advisory admission is denied") from error
     descriptor = ProviderAttemptRuntimeDescriptor.parse(descriptor_value)

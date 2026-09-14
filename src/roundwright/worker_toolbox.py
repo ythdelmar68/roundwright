@@ -48,7 +48,7 @@ from .coding_worker_state import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
 from .shadow import RecorderBinding
 from .worker_shadow import (
     ExternalCapturePlanReceipt,
@@ -767,7 +767,7 @@ class ProductionCodingWorkerRuntime:
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         try:
-            self._advisory_execution.require_before_effect()
+            require_execution_for_profile(self._advisory_execution, self._adapter._profile)
         except Exception as error:
             raise WorkerShadowError("production coding admission is denied") from error
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())

@@ -20,7 +20,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -142,7 +142,7 @@ class CodexDependencyReviewAdapter:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
         try:
-            advisory_execution.require_before_effect()
+            require_execution_for_profile(advisory_execution, self._profile)
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         session = None
@@ -194,7 +194,7 @@ class DependencyReviewService:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
         try:
-            advisory_execution.require_before_effect()
+            require_execution_for_profile(advisory_execution, advisory_execution.execution_binding.provider_profile)
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         store = DependencyReviewStore()

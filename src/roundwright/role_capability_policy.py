@@ -655,6 +655,25 @@ def _compose_sealed_role_execution(
     return SealedRoleExecution(contract, seam, store, expectation, guidance_evidence, execution_binding, _seal=_EXECUTION_SEAL)
 
 
+def require_execution_for_profile(
+    execution: SealedRoleExecution, profile: ProviderProfile,
+) -> dict[str, object]:
+    """Consume one sealed admission only at its exact provider boundary.
+
+    Callers must pass the profile they are about to hand to the native
+    backend.  This prevents a capsule from being replayed through an adapter
+    whose otherwise-qualified profile is different from the one sealed in the
+    execution binding.  The binding is deliberately passed back as the
+    expected value, rather than treating its existence as sufficient.
+    """
+
+    if (type(execution) is not SealedRoleExecution
+            or type(profile) is not ProviderProfile
+            or execution.execution_binding.provider_profile != profile):
+        raise RoleCapabilityError("sealed execution profile does not match the provider effect")
+    return execution.require_before_effect(expected_execution=execution.execution_binding)
+
+
 def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, expectation: RoleAdmissionExpectation, owner_readable_reason: str, budget: RoleBudget, valid_from: int, valid_until: int, revocation_readback_digest: str) -> dict[str, object]:
     if type(instance) is not DedicatedRoleInstance or type(scope) is not RoleScope or type(expectation) is not RoleAdmissionExpectation or type(owner_readable_reason) is not str or not owner_readable_reason.strip():
         raise RoleCapabilityError("grant draft is invalid")

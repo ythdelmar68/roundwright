@@ -18,7 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
 
 
 class CodexSupervisorError(ValueError):
@@ -263,7 +263,7 @@ class CodexSupervisorAdapter:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
             raise CodexSupervisorError("Supervisor advisory admission is unavailable")
         try:
-            advisory_execution.require_before_effect()
+            require_execution_for_profile(advisory_execution, self._profile)
         except RoleCapabilityError as error:
             raise CodexSupervisorError("Supervisor advisory admission is denied") from error
         session: NativeSupervisorSession | None = None

@@ -23,7 +23,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
 
 
 class CodexWorkerError(ValueError):
@@ -436,7 +436,7 @@ class CodexWorkerAdapter:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
             raise CodexWorkerError("Worker advisory admission is unavailable")
         try:
-            advisory_execution.require_before_effect()
+            require_execution_for_profile(advisory_execution, self._profile)
         except RoleCapabilityError as error:
             raise CodexWorkerError("Worker advisory admission is denied") from error
         session_identity: str | None = None

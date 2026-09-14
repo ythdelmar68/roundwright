@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -81,6 +82,15 @@ class RoleExecutionSeam(str, Enum):
     OWNER_INTENT_INTERPRETER = "owner-intent-interpreter"
 
 
+_SEAM_CAPABILITIES = {
+    RoleExecutionSeam.WORKER: RoleCapability.BOUNDED_CODING,
+    RoleExecutionSeam.SUPERVISOR: RoleCapability.READ_ONLY_REVIEW,
+    RoleExecutionSeam.DEPENDENCY_REVIEW: RoleCapability.READ_ONLY_REVIEW,
+    RoleExecutionSeam.RECOVERY_ADVISOR: RoleCapability.READ_ONLY_REVIEW,
+    RoleExecutionSeam.OWNER_INTENT_INTERPRETER: RoleCapability.OWNER_COMMAND_INTERPRETATION,
+}
+
+
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _IDENTITY = re.compile(r"[a-z][a-z0-9._/-]{0,127}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -97,6 +107,7 @@ _WINDOWS_RESERVED = frozenset({
 _ADMISSION_SEAL = object()
 _RUNTIME_SEAL = object()
 _EXECUTION_SEAL = object()
+_LAUNCH_PAYLOADS: "weakref.WeakKeyDictionary[TrustedProviderLaunchContext, Mapping[str, object]]" = weakref.WeakKeyDictionary()
 
 
 def require_external_production_activation() -> None:
@@ -309,7 +320,7 @@ class TrustedProviderLaunchContext:
         "cwd", "execution_binding", "guidance_receipt_digest",
         "injected_context_digest", "implicit_discovery_disabled",
         "developer_instructions", "accepted_main_guidance_digest", "accepted_main_guidance_bytes",
-        "role_injected_bytes", "cwd_identity", "sdk_mapping_identity", "_authenticated_payload", "_seal",
+        "role_injected_bytes", "cwd_identity", "sdk_mapping_identity", "_authenticated_payload", "_seal", "__weakref__",
     )
 
     def __init__(
@@ -350,6 +361,7 @@ class TrustedProviderLaunchContext:
         for name, value in payload.items():
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_authenticated_payload", MappingProxyType(payload))
+        _LAUNCH_PAYLOADS[self] = MappingProxyType(payload)
         object.__setattr__(self, "_seal", _seal)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -362,7 +374,13 @@ class TrustedProviderLaunchContext:
 
     def verify(self, *, cwd: Path, profile: ProviderProfile,
                required_capability: RoleCapability | None = None) -> None:
-        payload = self._authenticated_payload
+        # The authority anchor is deliberately outside the mutable instance.
+        # Object-level slot replacement cannot replace this module-owned
+        # identity binding.
+        try:
+            payload = _LAUNCH_PAYLOADS[self]
+        except (KeyError, TypeError) as error:
+            raise RoleCapabilityError("trusted provider launch context anchor is unavailable") from error
         expected_instructions = (
             "Use only the explicitly injected Roundwright guidance boundary. "
             "Do not discover ambient, global, or repository instruction files. "
@@ -372,6 +390,7 @@ class TrustedProviderLaunchContext:
         if (
             self._seal is not _LAUNCH_CONTEXT_SEAL
             or type(payload) is not MappingProxyType
+            or self._authenticated_payload is not payload
             or not isinstance(cwd, Path) or cwd.resolve(strict=False) != self.cwd
             or type(profile) is not ProviderProfile
             or self.execution_binding.provider_profile != profile
@@ -1039,7 +1058,7 @@ def reserve_role_effect(
     # the request/preflight remain separately bound by ``binding`` above.
     try:
         admission.scope.require(
-            RoleCapability.BOUNDED_CODING if execution.seam is RoleExecutionSeam.WORKER else RoleCapability.READ_ONLY_REVIEW,
+            _SEAM_CAPABILITIES[execution.seam],
             (
                 ScopedDescriptor(ScopeKind.TEST_INPUT_SET, execution.contract.instance.repository_identity, execution.contract.guidance.receipt_digest[7:]),
                 ScopedDescriptor(ScopeKind.NETWORK, execution.contract.instance.repository_identity, "network-disabled"),
@@ -1314,13 +1333,7 @@ def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleEx
     # READY is an admission state, not a wildcard.  Each executable seam must
     # consume the concrete capability it is about to exercise; a grant for an
     # unrelated subset cannot open a provider or local-effect path.
-    seam_capability = {
-        RoleExecutionSeam.WORKER: RoleCapability.BOUNDED_CODING,
-        RoleExecutionSeam.SUPERVISOR: RoleCapability.READ_ONLY_REVIEW,
-        RoleExecutionSeam.DEPENDENCY_REVIEW: RoleCapability.READ_ONLY_REVIEW,
-        RoleExecutionSeam.RECOVERY_ADVISOR: RoleCapability.READ_ONLY_REVIEW,
-        RoleExecutionSeam.OWNER_INTENT_INTERPRETER: RoleCapability.OWNER_COMMAND_INTERPRETATION,
-    }[seam]
+    seam_capability = _SEAM_CAPABILITIES[seam]
     if seam_capability not in contract.profile.capabilities:
         raise RoleCapabilityError("role profile does not support its execution seam")
     assert contract.admission is not None

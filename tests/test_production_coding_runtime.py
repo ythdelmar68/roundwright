@@ -6,7 +6,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -97,6 +99,12 @@ class ProductionRuntimeTests(unittest.TestCase):
     def runtime(self, root, turn, events, **kwargs):
         values=self.inputs(root,turn,events,**kwargs)
         return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe, toolchain_receipt_probe=values.toolchain_receipt_probe, advisory_execution=values.advisory_execution, execution_host=values.execution_host, budget_ledger_path=values.budget_ledger_path)
+
+    @contextmanager
+    def hermetic_runtime(self, root, turn, events, **kwargs):
+        """Test-only activation seam; no installed package can obtain it."""
+        with patch("roundwright.worker_toolbox.require_external_production_activation", lambda: None):
+            yield self.runtime(root, turn, events, **kwargs)
     def test_direct_production_runtime_construction_denies_before_provider_or_local_effect(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
@@ -114,6 +122,30 @@ class ProductionRuntimeTests(unittest.TestCase):
                 runtime.dispatch(self.request(), checkpoint_session=lambda _: events.append("session"), checkpoint_turn=lambda *_: events.append("turn"))
             self.assertEqual(events, [])
             self.assertFalse(Path(temp, "out.txt").exists())
+
+    def test_test_only_harness_preserves_allowlisted_write_and_denial_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; allowed=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
+            turn=Turn(events,(NativeWorkerTurnStep(request=allowed),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
+            with self.hermetic_runtime(Path(temp),turn,events) as runtime:
+                self.assertEqual(runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None).kind,WorkerResultKind.ACCEPTED)
+            self.assertEqual(Path(temp,"out.txt").read_text(),"ok")
+            denied=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="no.txt",content="no")
+            with self.hermetic_runtime(Path(temp),Turn([], (NativeWorkerTurnStep(request=denied),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"})))),[]) as runtime:
+                with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            self.assertFalse(Path(temp,"no.txt").exists())
+
+    def test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; runtime_events=[]
+            with self.hermetic_runtime(Path(temp),Turn(events,()),events) as runtime:
+                runtime._candidate_probe=lambda: "b" * 40
+                with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="out.txt",content="once")
+            with self.hermetic_runtime(Path(temp),Turn(runtime_events,()),runtime_events) as runtime:
+                result=runtime._execute_request(self.request(),{"session_identity":"s","turn_identity":"t"},request,frozenset())
+                self.assertEqual(result.outcome,"allowed")
+                with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
 
     def test_public_production_entrypoint_constructs_the_coding_runtime(self):
         with tempfile.TemporaryDirectory() as temp:

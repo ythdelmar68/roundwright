@@ -10,7 +10,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -224,6 +224,16 @@ class WorkerToolboxTests(unittest.TestCase):
         object.__setattr__(launch, "developer_instructions", instructions)
         object.__setattr__(launch, "role_injected_bytes", instructions.encode("utf-8"))
         object.__setattr__(launch, "injected_context_digest", "sha256:" + hashlib.sha256(instructions.encode("utf-8")).hexdigest())
+        object.__setattr__(launch, "_authenticated_payload", MappingProxyType({
+            "cwd": launch.cwd, "execution_binding": launch.execution_binding,
+            "guidance_receipt_digest": launch.guidance_receipt_digest,
+            "injected_context_digest": launch.injected_context_digest,
+            "implicit_discovery_disabled": True, "developer_instructions": instructions,
+            "role_injected_bytes": instructions.encode("utf-8"),
+            "accepted_main_guidance_bytes": replacement,
+            "accepted_main_guidance_digest": launch.accepted_main_guidance_digest,
+            "cwd_identity": launch.cwd_identity, "sdk_mapping_identity": launch.sdk_mapping_identity,
+        }))
         with self.assertRaises(RoleCapabilityError):
             launch.verify(cwd=ROOT, profile=self.profile)
 

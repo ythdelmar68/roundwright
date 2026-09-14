@@ -5350,6 +5350,7 @@ def _prepare_dependency_review_attempt_request(
             expected_execution=inputs.expected_execution,
             source_owned_relations=inputs.source_owned_relations,
             supersedes_attempt_id=inputs.supersedes_attempt_id,
+            _hermetic_preflight=True,
         )
     except (DependencyReviewDispatchError, ValueError) as error:
         raise ExternalValidationAdapterError("dependency review host preparation failed") from error

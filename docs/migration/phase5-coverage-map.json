@@ -9,14 +9,14 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"269486d7d57914fa059123ae158217dc935b93810bee4060acac4af0670135db"},
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"24a6866b5d81465cbbe876218a26cb041e2835c420f20dedf739481331d784a5"},
       {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"861668cd4e3e2aaab8bfba1e85b4b9ae4887ec5a5445d1854dd9757f694dd6c7"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"1370aefb385a7d7eeff6e39b8cc9358d30bba30a848a20f3ce72619250e00be0"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"6a5487740b31d290326832c3cc6ffb61caf821145b1b4c4ddaca7a08449ec0b2"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
       {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"2091d60b501a1832d3e5c0a75ffc756727527caf04521f00e3e085cfb81fd1dd"},
       {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"6308364127b5c866e0e35fe6c7373169c0bb6ac27eb6e5bf8db13f8692f9d410"},
-      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"c4138498397c606912209950918686ade7c5c97b9e305e54ca58abaa8e565599"}
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"226d9cb81d8846777d6ed166570c1bbc2863e35c832302d1769579af27b8ea57"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

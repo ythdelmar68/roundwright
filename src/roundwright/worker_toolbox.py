@@ -48,7 +48,7 @@ from .coding_worker_state import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
+from .role_capability_policy import ExecutionInstanceBinding, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_independent_execution
 from .shadow import RecorderBinding
 from .worker_shadow import (
     ExternalCapturePlanReceipt,
@@ -743,11 +743,12 @@ def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBacken
 
 class ProductionCodingWorkerRuntime:
     """Candidate-bound production coding seam; CLI activation remains blocked."""
-    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution) -> None:
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding) -> None:
         if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
                 or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
                 or local_tools.capability_digest != dispatch_receipt.capability_digest
-                or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER):
+                or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER
+                or type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != profile):
             raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         self._local_tools = local_tools
@@ -756,6 +757,7 @@ class ProductionCodingWorkerRuntime:
         self._candidate_probe = candidate_probe
         self._toolchain_receipt_probe = toolchain_receipt_probe
         self._advisory_execution = advisory_execution
+        self._expected_execution = expected_execution
 
     @property
     def capability_contract(self):
@@ -767,7 +769,7 @@ class ProductionCodingWorkerRuntime:
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         try:
-            require_execution_for_profile(self._advisory_execution, self._adapter._profile)
+            require_independent_execution(self._advisory_execution, self._expected_execution)
         except Exception as error:
             raise WorkerShadowError("production coding admission is denied") from error
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
@@ -803,7 +805,7 @@ class ProductionCodingWorkerRuntime:
             if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution)
+        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, expected_execution=self._expected_execution)
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest, acknowledged_sequences: frozenset[int]) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
@@ -893,12 +895,14 @@ class ProductionCodingWorkerEntrypointInputs:
     candidate_probe: Callable[[], str]
     toolchain_receipt_probe: Callable[[], str]
     advisory_execution: SealedRoleExecution
+    expected_execution: ExecutionInstanceBinding
 
     def __post_init__(self) -> None:
         if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
                 or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
                 or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
                 or type(self.advisory_execution) is not SealedRoleExecution or self.advisory_execution.seam is not RoleExecutionSeam.WORKER
+                or type(self.expected_execution) is not ExecutionInstanceBinding or self.expected_execution.provider_profile != self.profile
                 or not callable(getattr(self.backend, "open_session", None))):
             raise WorkerShadowError("production coding entrypoint inputs are invalid")
 
@@ -915,7 +919,7 @@ def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInpu
     return ProductionCodingWorkerRuntime(
         backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
         local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
-        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution,
+        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution, expected_execution=inputs.expected_execution,
     ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
 
 

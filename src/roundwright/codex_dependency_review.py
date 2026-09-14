@@ -303,22 +303,17 @@ def prepare_dependency_review_host(
     audit: ProviderHealthAuditIdentity, *, backend: NativeCodexDependencyReviewBackend | None = None,
     advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding,
     source_owned_relations: tuple[SourceOwnedRelation, ...] = (),
-    supersedes_attempt_id: str | None = None, _hermetic_preflight: bool = False,
+    supersedes_attempt_id: str | None = None,
 ) -> DependencyReviewHostInputs:
     """Construct the closed product host from exact durable identities only."""
 
-    # The production entrypoint cannot be activated in-repository.  The sole
-    # exception is the already-selected private external-validation harness
-    # preflight, which supplies a test backend and still has no provider
-    # session at this point.  It is not a native-discovery or production
-    # composition route.
-    if _hermetic_preflight is not True:
-        try:
-            require_external_production_activation()
-        except RoleCapabilityError as error:
-            raise DependencyReviewDispatchError("dependency review production activation is unavailable") from error
-    elif backend is None:
-        raise DependencyReviewDispatchError("dependency review hermetic preflight requires a backend")
+    # No local flag or supplied backend can turn this product entrypoint into
+    # a production authority.  The external-validation harness owns its
+    # separate, test-only fixture path and cannot opt this one in.
+    try:
+        require_external_production_activation()
+    except RoleCapabilityError as error:
+        raise DependencyReviewDispatchError("dependency review production activation is unavailable") from error
 
     if type(repository) is not RepositoryIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW or type(expected_execution) is not ExecutionInstanceBinding:
         raise DependencyReviewDispatchError("dependency review preparation inputs are invalid")

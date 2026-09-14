@@ -1074,6 +1074,20 @@ def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleEx
     receipt = contract.public_receipt()
     if receipt["status"] != AdvisoryRoleStatus.READY.value:
         raise RoleCapabilityError("advisory role is disabled without verified admission")
+    # READY is an admission state, not a wildcard.  Each executable seam must
+    # consume the concrete capability it is about to exercise; a grant for an
+    # unrelated subset cannot open a provider or local-effect path.
+    seam_capability = {
+        RoleExecutionSeam.WORKER: RoleCapability.BOUNDED_CODING,
+        RoleExecutionSeam.SUPERVISOR: RoleCapability.READ_ONLY_REVIEW,
+        RoleExecutionSeam.DEPENDENCY_REVIEW: RoleCapability.READ_ONLY_REVIEW,
+        RoleExecutionSeam.RECOVERY_ADVISOR: RoleCapability.READ_ONLY_REVIEW,
+        RoleExecutionSeam.OWNER_INTENT_INTERPRETER: RoleCapability.OWNER_COMMAND_INTERPRETATION,
+    }[seam]
+    if seam_capability not in contract.profile.capabilities:
+        raise RoleCapabilityError("role profile does not support its execution seam")
+    assert contract.admission is not None
+    contract.admission.scope.require(seam_capability)
     return receipt
 
 

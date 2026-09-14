@@ -58,6 +58,10 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
             self._launch.verify(cwd=self._cwd, profile=profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
+            # A caller supplied factory is not a trust boundary.  Production
+            # provider construction remains unavailable until external host
+            # composition and a native discovery-off control are reviewed.
+            require_external_production_activation()
             factory, approval, sandbox, effort = self._native_binding()
             codex = factory()
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
@@ -83,7 +87,6 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
 
         if self._factory is not None:
             return self._factory, self._approval, self._sandbox, self._effort  # type: ignore[return-value]
-        require_external_production_activation()
         try:
             sdk = importlib.import_module("openai_codex")
             generated = importlib.import_module("openai_codex.generated.v2_all")

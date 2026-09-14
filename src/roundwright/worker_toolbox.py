@@ -287,7 +287,10 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
     def __init__(self, *, cwd: Path, completion: CompletionDeadline, launch_context: TrustedProviderLaunchContext, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise WorkerShadowError("native Worker working directory is invalid")
-        production_factory = codex_factory is None
+        # A factory is an implementation detail, never evidence that the
+        # caller has authority to open a provider.  In particular, accepting
+        # an injected constructor here used to turn a test seam into a
+        # production activation bypass.
         if codex_factory is None:
             try:
                 sdk = importlib.import_module("openai_codex")
@@ -297,15 +300,18 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 raise WorkerShadowError("reviewed native Worker SDK is unavailable") from error
         if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock) or type(launch_context) is not TrustedProviderLaunchContext:
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
-        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock, self._launch, self._production_factory = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context, production_factory
+        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock, self._launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
 
     def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None, action: WorkerAction) -> NativeWorkerSession:
         if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
             self._launch.verify(cwd=self._cwd, profile=profile, required_capability=RoleCapability.BOUNDED_CODING)
-            if self._production_factory:
-                require_external_production_activation()
+            # The candidate has no independently reviewed production host or
+            # qualified provider-native discovery-off control.  This must run
+            # before *any* supplied constructor, including a real SDK factory
+            # passed through a formerly-hermetic seam.
+            require_external_production_activation()
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         instructions = self._launch.developer_instructions

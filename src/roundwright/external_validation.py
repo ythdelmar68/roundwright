@@ -245,11 +245,10 @@ from .codex_dependency_review import (
     DependencyReviewResultKind,
     DependencyReviewService,
     NativeCodexDependencyReviewBackend,
-    prepare_dependency_review_host,
 )
 from .configuration import RepositoryIdentity
 from .dependency_review import AffectedSubset, DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, SourceOwnedRelation
-from .role_capability_policy import ExecutionInstanceBinding, RoleExecutionSeam, SealedRoleExecution
+from .role_capability_policy import ExecutionInstanceBinding, RoleExecutionSeam, SealedRoleExecution, require_independent_execution
 from .provider_health import ProviderHealthAuditIdentity
 DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
     {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
@@ -5344,13 +5343,23 @@ def _prepare_dependency_review_attempt_request(
         raise ExternalValidationAdapterError("dependency review preflight inputs are invalid")
     store_root_identity = _dependency_review_store_root_identity(store_root)
     try:
-        host_inputs = prepare_dependency_review_host(
-            inputs.repository, inputs.subset, inputs.binding, inputs.audit, backend=inputs.backend,
-            advisory_execution=inputs.advisory_execution,
-            expected_execution=inputs.expected_execution,
-            source_owned_relations=inputs.source_owned_relations,
-            supersedes_attempt_id=inputs.supersedes_attempt_id,
-            _hermetic_preflight=True,
+        # This is a product-owned harness fixture assembly, not the public
+        # production host constructor.  It requires an already supplied
+        # hermetic backend and never selects, imports, or constructs a native
+        # provider client; those paths remain fail-closed in the product
+        # constructor and shipped native bridges.
+        if (
+            inputs.backend is None
+            or type(inputs.backend).__module__.startswith("roundwright.")
+        ):
+            raise DependencyReviewDispatchError("dependency review harness requires an explicit backend")
+        require_independent_execution(inputs.advisory_execution, inputs.expected_execution)
+        host_inputs = DependencyReviewHostInputs(
+            inputs.repository, inputs.subset, inputs.binding,
+            CodexDependencyReviewAdapter(inputs.backend, inputs.audit.profile, inputs.audit),
+            lambda _session: None, lambda _session, _turn: None,
+            inputs.advisory_execution, inputs.expected_execution,
+            inputs.source_owned_relations, inputs.supersedes_attempt_id,
         )
     except (DependencyReviewDispatchError, ValueError) as error:
         raise ExternalValidationAdapterError("dependency review host preparation failed") from error

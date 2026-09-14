@@ -71,8 +71,11 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
         codex = workspace = None
         try:
             self.launch.verify(cwd=self.cwd, profile=profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
+            # Constructor injection is not production authorization.  Keep
+            # the candidate fail-closed before a supplied factory, SDK import,
+            # temporary workspace, or thread start can have an effect.
+            require_external_production_activation()
             if self.factory is None:
-                require_external_production_activation()
                 sdk = importlib.import_module("openai_codex"); generated = importlib.import_module("openai_codex.generated.v2_all")
                 factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             else: factory, approval, sandbox, effort = self.factory, self.approval, self.sandbox, self.effort

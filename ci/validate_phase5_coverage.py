@@ -37,6 +37,7 @@ ISSUE_136_REQUIREMENTS = {
 ISSUE_136_ARTIFACTS = {
     "advisory-policy-v3": "src/roundwright/role_capability_policy.py",
     "advisory-policy-adversarial-tests-v2": "tests/test_role_capability_policy.py",
+    "advisory-role-budget-ledger-tests-v1": "tests/test_role_budget_ledger.py",
     "advisory-migration-v2": "docs/migration/issue-136-trusted-advisory-role-coverage.md",
     "advisory-authority-model-v2": "docs/architecture/authority-model.md",
     "advisory-configuration-v1": "src/roundwright/configuration.py",

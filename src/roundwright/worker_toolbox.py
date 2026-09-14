@@ -384,7 +384,7 @@ class _HarnessWorkerSession(NativeWorkerSession):
             required = {WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE}
             if set(tools.tools) != required:
                 raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._profile.model, self._sandbox, self._effort_factory, self._profile.reasoning_effort.value, self._completion, self._clock)
+            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._launch)
         if tools.capability_contract.value != "no-tools-self-contained/v1":
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         # The full canonical request is transient. Only the validated structured
@@ -430,9 +430,9 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
 class _HarnessCodingWorkerTurn(NativeWorkerTurn):
     """Repeated constrained SDK turns over one persistent native thread."""
 
-    def __init__(self, thread: object, cleanup: _HarnessCleanupOwner, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface, approval: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+    def __init__(self, thread: object, cleanup: _HarnessCleanupOwner, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface, approval: object, cwd: Path, profile: ProviderProfile, sandbox: object, effort_factory: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext) -> None:
         self._thread, self._cleanup, self._request, self._tools = thread, cleanup, request, tools
-        self._approval, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock = approval, cwd, model, sandbox, effort_factory, effort, completion, clock
+        self._approval, self._cwd, self._profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._launch = approval, cwd, profile, sandbox, effort_factory, completion, clock, launch_context
         self._handle: object | None = None
         self._start({"schema": "roundwright-coding-turn/v1", "request": _native_coding_payload(request, tools), "previous_result": None})
 
@@ -464,7 +464,10 @@ class _HarnessCodingWorkerTurn(NativeWorkerTurn):
 
     def _start(self, payload: Mapping[str, object]) -> None:
         try:
-            self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
+            self._launch.verify(cwd=self._cwd, profile=self._profile)
+            self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort_factory(self._profile.reasoning_effort.value), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
+        except RoleCapabilityError as error:
+            self._cleanup.close(); raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         except Exception as error:
             self._cleanup.close(); raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 

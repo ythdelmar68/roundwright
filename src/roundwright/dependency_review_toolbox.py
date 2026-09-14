@@ -15,7 +15,7 @@ from .codex_dependency_review import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
-from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError, require_external_production_activation
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
@@ -72,6 +72,7 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
         try:
             self.launch.verify(cwd=self.cwd, profile=profile)
             if self.factory is None:
+                require_external_production_activation()
                 sdk = importlib.import_module("openai_codex"); generated = importlib.import_module("openai_codex.generated.v2_all")
                 factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             else: factory, approval, sandbox, effort = self.factory, self.approval, self.sandbox, self.effort

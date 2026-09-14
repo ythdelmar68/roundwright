@@ -21,7 +21,7 @@ from .codex_supervisor import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
-from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapabilityError, require_external_production_activation
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
@@ -83,6 +83,7 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
 
         if self._factory is not None:
             return self._factory, self._approval, self._sandbox, self._effort  # type: ignore[return-value]
+        require_external_production_activation()
         try:
             sdk = importlib.import_module("openai_codex")
             generated = importlib.import_module("openai_codex.generated.v2_all")

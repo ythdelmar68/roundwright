@@ -9,7 +9,7 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"24a6866b5d81465cbbe876218a26cb041e2835c420f20dedf739481331d784a5"},
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"d2a1a3d9a93f1ca2ab9e0e8409b0fb49e528584c69ce241da7aea84c9609a950"},
       {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"861668cd4e3e2aaab8bfba1e85b4b9ae4887ec5a5445d1854dd9757f694dd6c7"},
       {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"8aacc937e881d7310aa55fa63b891a62fafc531d0cf59d02544c73c780e0b091"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
@@ -17,9 +17,9 @@
       {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"b36766a5573855344251074c458a08e9115bac9b680f835dc646ac4b432b4203"},
       {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"495ed99ecd8a45c6a5c1548422c5e2322160669c9883c1de0ce0ad961937e346"},
       {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"8ac2790744839e6a83ab5f0012dcd351bcb3640d882496260b677194f8d9d71d"},
-      {"identity":"advisory-native-supervisor-bridge-v1","path":"src/roundwright/supervisor_toolbox.py","sha256":"79f82559ce3c4769d52ca8d9b0d2182838eaea3c62ce3cabf6e954c5fbb57a5f"},
+      {"identity":"advisory-native-supervisor-bridge-v1","path":"src/roundwright/supervisor_toolbox.py","sha256":"65dc4907e9d7481f4ee9c8b079a730bc66e8eb085b97253356d1437d006674f3"},
       {"identity":"advisory-native-supervisor-bridge-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"8f2054b481e82a156b4a38c57c637388f09cdca900db839eeace70cbdca958b2"},
-      {"identity":"advisory-native-dependency-review-bridge-v1","path":"src/roundwright/dependency_review_toolbox.py","sha256":"6d65b8c5c9d63de3eb1be4fc55bcb63a5ec13e40b9074389246192bb6c82520a"},
+      {"identity":"advisory-native-dependency-review-bridge-v1","path":"src/roundwright/dependency_review_toolbox.py","sha256":"d7411601c68c0533820e52f0c9d57adba49ad096a9566eb044c753c6b8c85650"},
       {"identity":"advisory-native-dependency-review-bridge-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"fbd33c69d5991851f994881b971398ead05947526c5a6a488fe27ea6b7eb930d"}
     ]
   },

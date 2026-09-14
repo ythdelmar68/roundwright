@@ -59,6 +59,12 @@ class AdvisoryRoleStatus(str, Enum):
     READY = "ready"
 
 
+class ExternalActivationStatus(str, Enum):
+    """The only production authority state available to this candidate."""
+
+    NOT_ACTIVATED = "not-activated"
+
+
 class ScopeKind(str, Enum):
     PATH = "path"
     TEST = "test"
@@ -91,6 +97,20 @@ _WINDOWS_RESERVED = frozenset({
 _ADMISSION_SEAL = object()
 _RUNTIME_SEAL = object()
 _EXECUTION_SEAL = object()
+
+
+def require_external_production_activation() -> None:
+    """Deny real SDK effects until an external promotion supplies a verifier.
+
+    This candidate intentionally contains no owner/deployment verifier and no
+    caller-supplied verifier seam.  A local record, importable composition
+    helper, or synthetic Git repository can qualify a hermetic contract test,
+    but cannot activate a native/provider effect.
+    """
+
+    raise RoleCapabilityError(
+        "external production authority is not activated for this candidate"
+    )
 _REVIEWED_SDK_CODES = {
     RoleCapability.READ_TRUSTED_GUIDANCE: "guidance.read/v1",
     RoleCapability.RENDER_OWNER_SAFE_ADVICE: "advice.render-owner-safe/v1",

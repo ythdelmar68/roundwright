@@ -33,9 +33,9 @@
       {"identity":"advisory-external-validation-tests-v1","path":"tests/test_external_validation.py","sha256":"8dc07b59a52ef5a0ea8d581b06a76ff6030c04827d2ba322f621fd0a5a035626"},
       {"identity":"advisory-runtime-defaults-v1","path":"src/roundwright/runtime-defaults.toml","sha256":"799b958981d4a6cbe82b0255a30b8d32b5e061fdef87088b2919aa4b2d463911"},
       {"identity":"advisory-runtime-defaults-tests-v1","path":"tests/test_configuration.py","sha256":"f08c87086c68b64c870028ef1d767b7c99e0d674daeea09eebe7e4a687f49a9f"},
-      {"identity":"advisory-coding-tools-v1","path":"src/roundwright/coding_tools.py","sha256":"ef215231de7282bfb858c5228cb48561631f5bfbd68a742659861b6946b2f87e"},
-      {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"af81b906cca30e4d61ddbd05ff29ed6f8805807c0c8b2bab40d7fd4dbf482988"},
-      {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"bf7cf54413129784d796082de749e5c1e30e3f2fc685a6934ce6f1d0d219f540"},
+      {"identity":"advisory-coding-tools-v1","path":"src/roundwright/coding_tools.py","sha256":"76c2facf6cce08140480a5bdcb5d1e3fa7916c5e587a450bfc2376fc60cc7002"},
+      {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"31b70603ed96af7891b52f1f891b92de0c19e2a4c378fae345fbcfe0d913e0bc"},
+      {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"77ece90b9643e572e62028988d2b8e5dd7cf303cd59dc4e3c59a28753bdf9f7f"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"eb8d7daa1529eda601a036d038701df73f241afe805f25fd151891e38649e615"},
       {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"2b09955ad9085d7fe1605fb5cea92cf52d6ba63d845748154706f98266586ff9"},
       {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"977bb380bd6365958370dbb6160cfbb1c393c992e703a3f9bc3bca096357b8b7"}

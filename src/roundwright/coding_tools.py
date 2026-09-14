@@ -162,6 +162,9 @@ class BoundedCodingCapability:
     timeout_seconds: int = 30
     output_limit: int = 65_536
     sandbox_identity: str | None = None
+    # Every concrete local effect is additionally admitted through the role
+    # scope.  The path/command allowlists below are deliberately not a second
+    # authority source: they only narrow an already admitted operation.
     role_scope: RoleScope | None = None
     scope_root_identity: str | None = None
 
@@ -183,12 +186,9 @@ class BoundedCodingCapability:
                 for command in self.validation_commands
             )
             or (self.sandbox_identity is not None and (type(self.sandbox_identity) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.sandbox_identity)))
-            or (self.role_scope is None) != (self.scope_root_identity is None)
-            or (self.role_scope is not None and (
-                type(self.role_scope) is not RoleScope
-                or type(self.scope_root_identity) is not str
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", self.scope_root_identity) is None
-            ))
+            or type(self.role_scope) is not RoleScope
+            or type(self.scope_root_identity) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", self.scope_root_identity) is None
         ):
             raise CodingToolError("bounded coding capability is invalid")
 
@@ -211,13 +211,13 @@ class BoundedCodingTools:
         elif capability.sandbox_identity is not None:
             raise CodingToolError("reviewed validation sandbox is required")
         self._validation_sandbox = validation_sandbox
-        if capability.role_scope is not None:
-            try:
-                # The scope is bound once at construction and then checked
-                # again for each concrete path/tool effect below.
-                capability.role_scope.require(RoleCapability.BOUNDED_CODING)
-            except RoleCapabilityError as error:
-                raise CodingToolError("bounded coding role scope is denied") from error
+        try:
+            # The scope is bound once at construction and then checked again
+            # for each concrete path/process effect below.  A generic mapping
+            # capability is never sufficient to open a local-effect path.
+            capability.role_scope.require(RoleCapability.BOUNDED_CODING)
+        except RoleCapabilityError as error:
+            raise CodingToolError("bounded coding role scope is denied") from error
 
     @property
     def capability_root(self) -> Path:
@@ -251,7 +251,7 @@ class BoundedCodingTools:
             "output_limit": self._capability.output_limit,
             "sandbox_identity": self._capability.sandbox_identity,
             "sandbox_receipt": self._validation_sandbox.receipt_digest if self._validation_sandbox is not None else None,
-            "role_scope": None if self._capability.role_scope is None else self._capability.role_scope.identity,
+            "role_scope": self._capability.role_scope.identity,
             "scope_root_identity": self._capability.scope_root_identity,
         })
 
@@ -373,11 +373,8 @@ class BoundedCodingTools:
         return resolved, relative_path
 
     def _require_scope_path(self, relative_path: str) -> None:
-        scope = self._capability.role_scope
-        if scope is None:
-            return
         try:
-            scope.require(
+            self._capability.role_scope.require(
                 RoleCapability.BOUNDED_CODING,
                 (ScopedDescriptor(ScopeKind.PATH, self._capability.scope_root_identity, relative_path),),
             )
@@ -385,15 +382,12 @@ class BoundedCodingTools:
             raise CodingToolError("workspace path is outside the admitted role scope") from error
 
     def _require_scope_process(self, command: tuple[str, ...]) -> None:
-        scope = self._capability.role_scope
-        if scope is None:
-            return
         # Scope names are deliberately non-secret symbolic identifiers.  The
         # command itself stays in the sealed capability digest; its executable
         # is not widened by a display name here.
         identity = _object_digest({"command": command})[7:]
         try:
-            scope.require(
+            self._capability.role_scope.require(
                 RoleCapability.BOUNDED_CODING,
                 (ScopedDescriptor(ScopeKind.PROCESS, self._capability.scope_root_identity, identity),),
             )

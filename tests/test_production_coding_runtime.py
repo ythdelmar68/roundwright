@@ -16,7 +16,7 @@ from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools
 from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapability, RoleScope, ScopeKind, ScopedDescriptor
 from tests.role_admission_fixture import independent_execution, sealed_execution
 from roundwright.worker_toolbox import CODING_RUNTIME_REGISTRY, CodingDispatchReceipt, CodingWorkerRuntimeDescriptor, ProductionCodingWorkerEntrypointInputs, ProductionCodingWorkerRuntime, run_production_coding_worker, run_registered_production_coding_worker
 from roundwright.worker_shadow import WorkerShadowError
@@ -58,13 +58,24 @@ class Sandbox(ReviewedValidationSandbox):
     def execute(self, **_kwargs): return CodingSandboxResult(0, self.output)
 
 class ProductionRuntimeTests(unittest.TestCase):
+    def coding_scope(self, root: Path, command: tuple[str, ...]):
+        root_identity = digest("scope:" + str(root.resolve()))
+        process_identity = digest(json.dumps({"command": command}, sort_keys=True, separators=(",", ":")))[7:]
+        return RoleScope(
+            frozenset({RoleCapability.BOUNDED_CODING}),
+            (ScopedDescriptor(ScopeKind.PATH, root_identity, "out.txt"),
+             ScopedDescriptor(ScopeKind.PROCESS, root_identity, process_identity)),
+        ), root_identity
+
     def request(self):
         context = CodexWorkerContext("task-1", *(digest(x) for x in ("s","r","w","b","base","candidate","p","c")))
         return CodexWorkerRequest("attempt-1", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-1", action=WorkerAction.IMPLEMENTATION, context=context, objective="write", constraints=("bounded",), acceptance_criteria=("write",), resume_session_identity=None), context, "write", ("bounded",), ("write",))
     def inputs(self, root, turn, events, sandbox=None, output_limit=65_536):
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), output_limit=output_limit, sandbox_identity=digest("sandbox")), validation_sandbox=sandbox or Sandbox())
+        command = (sys.executable, "-c", "pass")
+        scope, root_identity = self.coding_scope(root, command)
+        tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), (command,), output_limit=output_limit, sandbox_identity=digest("sandbox"), role_scope=scope, scope_root_identity=root_identity), validation_sandbox=sandbox or Sandbox())
         context = self.request().context
         receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
         execution = sealed_execution(AdvisoryRole.WORKER, profile)

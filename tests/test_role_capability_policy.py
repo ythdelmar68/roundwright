@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -25,11 +26,12 @@ from roundwright.role_capability_policy import (
     AdvisoryRole, AdvisoryRoleContract, AdvisoryRoleStatus,
     AuthoritativeGuidanceExpectation, DedicatedRoleInstance,
     ExecutionInstanceBinding, FileRoleAdmissionStore, GuidanceView, ProviderGuidanceEvidence, RoleAdmissionExpectation, SealedRoleExecution, SealedRoleRuntimeContext,
-    RoleCapability, RoleCapabilityError, RoleCapabilityGrant, RoleExecutionSeam,
+    RoleBudget, RoleCapability, RoleCapabilityError, RoleCapabilityGrant, RoleExecutionSeam,
     RoleScope, ScopeKind, ScopedDescriptor, SdkAdapterMapping,
+    TrustedExecutionHostInputs, DurableRoleBudgetLedger,
     TrustedRoleAuthorityReceipt, default_advisory_profiles,
     _compose_sealed_role_execution, _resolve_sealed_role_runtime_context,
-    read_verified_admission, render_grant_draft, require_verified_role_admission,
+    read_verified_admission, render_grant_draft, require_independent_execution, require_verified_role_admission,
     resolve_sealed_role_runtime_context,
     resolve_authoritative_guidance, reviewed_sdk_expectation,
     validate_instance_continuity,
@@ -206,6 +208,49 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
         for field, value in (("repository_identity", digest("d")), ("task_identity", "other-task"), ("candidate_sha", "b" * 40), ("instance_receipt_digest", digest("d")), ("host_identity", digest("d")), ("deployment_identity", digest("d")), ("authority_epoch", 2), ("replacement_fence", "generation-2"), ("role", AdvisoryRole.WORKER), ("execution_identity", "other-attempt"), ("preflight_identity", digest("d"))):
             with self.subTest(field=field), self.assertRaises(RoleCapabilityError):
                 sealed.require_before_effect(expected_execution=replace(binding, **{field: value}))
+
+    def test_host_derives_exact_request_binding_without_reading_the_capsule(self) -> None:
+        contract = self.verified_contract()
+        evidence = ProviderGuidanceEvidence(GuidanceView.RECOVERY_ADVISOR, digest("a"), True, digest("b"), self.guidance.receipt_digest, self.binding.candidate_sha, self.task_candidate)
+        host = TrustedExecutionHostInputs(digest("c"), "task-136", self.task_candidate, self.instance.receipt_digest, digest("f"), digest("e"), 1, "generation-1")
+        expected = host.derive(role=AdvisoryRole.RECOVERY_ADVISOR, provider_profile=self.recovery.provider_profile, execution_identity="attempt-136", preflight_identity=digest("b"))
+        sealed = _compose_sealed_role_execution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, evidence, expected)
+        self.assertEqual(require_independent_execution(sealed, expected)["status"], "ready")
+        for field, value in (("task_identity", "other-task"), ("candidate_sha", "b" * 40), ("execution_identity", "other-attempt"), ("preflight_identity", digest("d"))):
+            with self.subTest(field=field), self.assertRaises(RoleCapabilityError):
+                require_independent_execution(sealed, replace(expected, **{field: value}))
+
+    def test_durable_budget_serializes_reconstruction_and_fails_closed_on_tampering(self) -> None:
+        binding = TrustedExecutionHostInputs(digest("c"), "task-136", self.task_candidate, self.instance.receipt_digest, digest("f"), digest("e"), 1, "generation-1").derive(role=AdvisoryRole.RECOVERY_ADVISOR, provider_profile=self.recovery.provider_profile, execution_identity="attempt-136", preflight_identity=digest("b"))
+        path = self.root / "durable-role-budget.sqlite"
+        ledger = DurableRoleBudgetLedger(path, grant_receipt_digest=self.grant.receipt_digest, execution_binding=binding, budget=RoleBudget(3, 10, 10))
+        results: list[str] = []
+        barrier = threading.Barrier(8)
+
+        def consume() -> None:
+            barrier.wait()
+            try:
+                DurableRoleBudgetLedger(path, grant_receipt_digest=self.grant.receipt_digest, execution_binding=binding, budget=RoleBudget(3, 10, 10)).consume(tokens=1, duration_seconds=1)
+                results.append("allowed")
+            except RoleCapabilityError:
+                results.append("denied")
+
+        workers = [threading.Thread(target=consume) for _ in range(8)]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join()
+        self.assertEqual(results.count("allowed"), 3)
+        self.assertEqual(results.count("denied"), 5)
+        with self.assertRaises(RoleCapabilityError):
+            ledger.consume(tokens=1)
+        import sqlite3
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("UPDATE role_budget_usage SET binding_digest='forged' WHERE ledger_key=?", (ledger.key,))
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(RoleCapabilityError, "ambiguous"):
+            DurableRoleBudgetLedger(path, grant_receipt_digest=self.grant.receipt_digest, execution_binding=binding, budget=RoleBudget(3, 10, 10)).consume(tokens=1)
 
     def test_verified_admission_and_sdk_mapping_cannot_be_mutated_after_readback(self) -> None:
         contract = self.verified_contract()

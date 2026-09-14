@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import subprocess
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -468,6 +470,146 @@ class ExecutionInstanceBinding:
         return _digest({"schema":"roundwright-execution-instance-binding/v1","repository":self.repository_identity,"task":self.task_identity,"candidate":self.candidate_sha,"instance":self.instance_receipt_digest,"host":self.host_identity,"deployment":self.deployment_identity,"epoch":self.authority_epoch,"fence":self.replacement_fence,"role":self.role.value,"profile":{"model":self.provider_profile.model,"reasoning_effort":self.provider_profile.reasoning_effort.value,"name":self.provider_profile.name},"execution":self.execution_identity,"preflight":self.preflight_identity})
 
 
+@dataclass(frozen=True)
+class TrustedExecutionHostInputs:
+    """Host-owned, immutable inputs from which one effect binding is derived.
+
+    This deliberately does not accept a :class:`SealedRoleExecution`.  A
+    composition root must retain these independently verified repository,
+    deployment and fencing values and use the actual request or attempt id
+    when deriving the expected binding immediately before an effect.
+    """
+
+    repository_identity: str; task_identity: str; candidate_sha: str
+    instance_receipt_digest: str; host_identity: str; deployment_identity: str
+    authority_epoch: int; replacement_fence: str
+
+    def __post_init__(self) -> None:
+        for value in (self.repository_identity, self.instance_receipt_digest,
+                      self.host_identity, self.deployment_identity):
+            _require_digest(value, "trusted execution host input")
+        if (type(self.task_identity) is not str or _IDENTITY.fullmatch(self.task_identity) is None
+                or type(self.candidate_sha) is not str or _SHA.fullmatch(self.candidate_sha) is None
+                or type(self.authority_epoch) is not int or self.authority_epoch < 1
+                or type(self.replacement_fence) is not str
+                or _IDENTITY.fullmatch(self.replacement_fence) is None):
+            raise RoleCapabilityError("trusted execution host input is invalid")
+
+    def derive(
+        self, *, role: AdvisoryRole, provider_profile: ProviderProfile,
+        execution_identity: str, preflight_identity: str,
+    ) -> ExecutionInstanceBinding:
+        """Bind one native effect to the actual typed request/attempt identity."""
+
+        return ExecutionInstanceBinding(
+            self.repository_identity, self.task_identity, self.candidate_sha,
+            self.instance_receipt_digest, self.host_identity,
+            self.deployment_identity, self.authority_epoch,
+            self.replacement_fence, role, provider_profile,
+            execution_identity, preflight_identity,
+        )
+
+
+def require_independent_execution(
+    execution: "SealedRoleExecution", expected_execution: ExecutionInstanceBinding,
+) -> dict[str, object]:
+    """Consume a capsule only after a host-derived binding exactly matches it."""
+
+    if type(execution) is not SealedRoleExecution or type(expected_execution) is not ExecutionInstanceBinding:
+        raise RoleCapabilityError("trusted execution expectation is invalid")
+    return execution.require_before_effect(expected_execution=expected_execution)
+
+
+@dataclass(frozen=True)
+class RoleBudgetUsage:
+    calls: int; duration_seconds: int; tokens: int
+
+
+class DurableRoleBudgetLedger:
+    """SQLite-backed, fail-closed consumption for one admitted grant/instance.
+
+    The row key includes the immutable grant receipt and execution-instance
+    digest.  ``BEGIN IMMEDIATE`` makes concurrent admissions serialize across
+    reconstructed ledger objects and processes.  Any malformed or ambiguous
+    persisted state rejects the next effect instead of resetting a budget.
+    """
+
+    _schema = "roundwright-role-budget-ledger/v1"
+
+    def __init__(self, path: Path, *, grant_receipt_digest: str,
+                 execution_binding: ExecutionInstanceBinding, budget: RoleBudget) -> None:
+        if (not isinstance(path, Path) or type(execution_binding) is not ExecutionInstanceBinding
+                or type(budget) is not RoleBudget):
+            raise RoleCapabilityError("role budget ledger inputs are invalid")
+        _require_digest(grant_receipt_digest, "role budget grant")
+        self._path = path
+        self._grant = grant_receipt_digest
+        self._binding = execution_binding.digest
+        self._budget = budget
+        self._lock = threading.RLock()
+
+    @property
+    def key(self) -> str:
+        return _digest({"schema": self._schema, "grant": self._grant, "binding": self._binding})
+
+    def consume(self, *, calls: int = 1, duration_seconds: int = 0,
+                tokens: int = 0) -> RoleBudgetUsage:
+        if (type(calls) is not int or type(duration_seconds) is not int
+                or type(tokens) is not int or calls < 0 or duration_seconds < 0
+                or tokens < 0 or calls == duration_seconds == tokens == 0):
+            raise RoleCapabilityError("role budget consumption is invalid")
+        connection: sqlite3.Connection | None = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(self._path, timeout=5, isolation_level=None)
+            with self._lock:
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS role_budget_usage ("
+                    "schema TEXT NOT NULL, ledger_key TEXT PRIMARY KEY, "
+                    "grant_digest TEXT NOT NULL, binding_digest TEXT NOT NULL, "
+                    "calls INTEGER NOT NULL, duration_seconds INTEGER NOT NULL, "
+                    "tokens INTEGER NOT NULL)"
+                )
+                row = connection.execute(
+                    "SELECT schema, grant_digest, binding_digest, calls, "
+                    "duration_seconds, tokens FROM role_budget_usage WHERE ledger_key=?",
+                    (self.key,),
+                ).fetchone()
+                if row is None:
+                    used = RoleBudgetUsage(0, 0, 0)
+                elif (len(row) != 6 or row[0] != self._schema or row[1] != self._grant
+                      or row[2] != self._binding or any(type(value) is not int or value < 0 for value in row[3:])):
+                    raise RoleCapabilityError("role budget persistence is ambiguous")
+                else:
+                    used = RoleBudgetUsage(row[3], row[4], row[5])
+                next_usage = RoleBudgetUsage(
+                    used.calls + calls, used.duration_seconds + duration_seconds,
+                    used.tokens + tokens,
+                )
+                if (next_usage.calls > self._budget.max_calls
+                        or next_usage.duration_seconds > self._budget.max_duration_seconds
+                        or next_usage.tokens > self._budget.max_tokens):
+                    raise RoleCapabilityError("role budget is exhausted")
+                connection.execute(
+                    "INSERT INTO role_budget_usage(schema, ledger_key, grant_digest, binding_digest, calls, duration_seconds, tokens) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(ledger_key) DO UPDATE SET "
+                    "calls=excluded.calls, duration_seconds=excluded.duration_seconds, tokens=excluded.tokens",
+                    (self._schema, self.key, self._grant, self._binding,
+                     next_usage.calls, next_usage.duration_seconds, next_usage.tokens),
+                )
+                connection.execute("COMMIT")
+                return next_usage
+        except RoleCapabilityError:
+            raise
+        except (OSError, sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            raise RoleCapabilityError("role budget persistence is unavailable") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+
 
 
 class SealedRoleRuntimeContext:
@@ -672,6 +814,24 @@ def require_execution_for_profile(
             or execution.execution_binding.provider_profile != profile):
         raise RoleCapabilityError("sealed execution profile does not match the provider effect")
     return execution.require_before_effect(expected_execution=execution.execution_binding)
+
+
+def require_worker_tool_capability(
+    admission_receipt: Mapping[str, object], *, tool: object,
+) -> None:
+    """Map the only Worker tool surface to its concrete admitted action.
+
+    Importing ``WorkerTool`` here would create a policy/adapter cycle, so the
+    public enum value is checked structurally.  Unknown values, including
+    platform-invalid spellings that never reach the native request parser,
+    fail closed.
+    """
+
+    value = getattr(tool, "value", None)
+    if (not isinstance(admission_receipt, Mapping)
+            or value not in {"workspace-read", "workspace-write", "validation-execute"}
+            or RoleCapability.BOUNDED_CODING.value not in admission_receipt.get("capabilities", ())):
+        raise RoleCapabilityError("Worker tool action is not granted")
 
 
 def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, expectation: RoleAdmissionExpectation, owner_readable_reason: str, budget: RoleBudget, valid_from: int, valid_until: int, revocation_readback_digest: str) -> dict[str, object]:

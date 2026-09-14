@@ -23,7 +23,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_execution_for_profile, require_worker_tool_capability
 
 
 class CodexWorkerError(ValueError):
@@ -436,7 +436,7 @@ class CodexWorkerAdapter:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
             raise CodexWorkerError("Worker advisory admission is unavailable")
         try:
-            require_execution_for_profile(advisory_execution, self._profile)
+            admission_receipt = require_execution_for_profile(advisory_execution, self._profile)
         except RoleCapabilityError as error:
             raise CodexWorkerError("Worker advisory admission is denied") from error
         session_identity: str | None = None
@@ -478,8 +478,18 @@ class CodexWorkerAdapter:
             if execute_tool_request is None:
                 response = turn.read_response()
             else:
+                def authorized_tool_request(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+                    try:
+                        require_worker_tool_capability(admission_receipt, tool=item.tool)
+                    except RoleCapabilityError:
+                        # Do not hand an ungranted request to the product
+                        # callback.  This is deliberately a terminal native
+                        # result rather than an ambient permission exception.
+                        return NativeWorkerToolResult(item.sequence, item.tool, "denied")
+                    return execute_tool_request(item)
+
                 response = _consume_steps(
-                    turn, execute_tool_request,
+                    turn, authorized_tool_request,
                     checkpoint_next_turn=lambda: _checkpoint_next_turn(
                         turn, session_identity, checkpoint_turn
                     ),

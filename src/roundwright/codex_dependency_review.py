@@ -20,7 +20,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_independent_execution, trusted_provider_launch_context
+from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_external_production_activation, require_independent_execution, trusted_provider_launch_context
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -306,6 +306,11 @@ def prepare_dependency_review_host(
     supersedes_attempt_id: str | None = None,
 ) -> DependencyReviewHostInputs:
     """Construct the closed product host from exact durable identities only."""
+
+    try:
+        require_external_production_activation()
+    except RoleCapabilityError as error:
+        raise DependencyReviewDispatchError("dependency review production activation is unavailable") from error
 
     if type(repository) is not RepositoryIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW or type(expected_execution) is not ExecutionInstanceBinding:
         raise DependencyReviewDispatchError("dependency review preparation inputs are invalid")

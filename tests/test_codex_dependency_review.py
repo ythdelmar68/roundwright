@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewRequest, DependencyReviewResultKind, DependencyReviewService,
-    NativeDependencyReviewResponse,
+    NativeDependencyReviewResponse, DependencyReviewDispatchError, prepare_dependency_review_host,
 )
 from roundwright.dependency_review_toolbox import (
     HarnessNativeCodexDependencyReviewBackend, _Turn, _schema,
@@ -509,6 +509,11 @@ class DependencyReviewServiceTests(unittest.TestCase):
             self.assertEqual(len(backend.sessions), 1)
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unavailable"):
                 external_validation.materialize_dependency_review_attempt_profile(fresh_capsule, Path(temporary).resolve())
+
+class ProductionActivationTests(unittest.TestCase):
+    def test_missing_external_root_denies_before_input_construction(self) -> None:
+        with self.assertRaisesRegex(DependencyReviewDispatchError, "activation is unavailable"):
+            prepare_dependency_review_host(None, None, None, None, advisory_execution=None, expected_execution=None)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

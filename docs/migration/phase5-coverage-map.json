@@ -11,12 +11,16 @@
     "artifacts": [
       {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"24a6866b5d81465cbbe876218a26cb041e2835c420f20dedf739481331d784a5"},
       {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"861668cd4e3e2aaab8bfba1e85b4b9ae4887ec5a5445d1854dd9757f694dd6c7"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"528c00d139a947b18ee32c5413c22f3c96f47471131ebc097b65fbbf9c95da62"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"8aacc937e881d7310aa55fa63b891a62fafc531d0cf59d02544c73c780e0b091"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
       {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"b36766a5573855344251074c458a08e9115bac9b680f835dc646ac4b432b4203"},
       {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"495ed99ecd8a45c6a5c1548422c5e2322160669c9883c1de0ce0ad961937e346"},
-      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"8ac2790744839e6a83ab5f0012dcd351bcb3640d882496260b677194f8d9d71d"}
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"8ac2790744839e6a83ab5f0012dcd351bcb3640d882496260b677194f8d9d71d"},
+      {"identity":"advisory-native-supervisor-bridge-v1","path":"src/roundwright/supervisor_toolbox.py","sha256":"79f82559ce3c4769d52ca8d9b0d2182838eaea3c62ce3cabf6e954c5fbb57a5f"},
+      {"identity":"advisory-native-supervisor-bridge-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"8f2054b481e82a156b4a38c57c637388f09cdca900db839eeace70cbdca958b2"},
+      {"identity":"advisory-native-dependency-review-bridge-v1","path":"src/roundwright/dependency_review_toolbox.py","sha256":"6d65b8c5c9d63de3eb1be4fc55bcb63a5ec13e40b9074389246192bb6c82520a"},
+      {"identity":"advisory-native-dependency-review-bridge-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"fbd33c69d5991851f994881b971398ead05947526c5a6a488fe27ea6b7eb930d"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

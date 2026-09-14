@@ -32,7 +32,7 @@ from roundwright.dependency_review import (
 )
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole
+from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution
@@ -87,6 +87,11 @@ class DependencyReviewServiceTests(unittest.TestCase):
     @staticmethod
     def expectation(profile):
         return independent_execution(AdvisoryRole.DEPENDENCY_REVIEW, profile)
+
+    def launch_context(self, repository, profile):
+        return trusted_provider_launch_context(
+            self.admission(profile), self.expectation(profile), cwd=repository.root,
+        )
 
     def repository(self, root: Path) -> RepositoryIdentity:
         repository = object.__new__(RepositoryIdentity)
@@ -154,6 +159,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
             backend = HarnessNativeCodexDependencyReviewBackend(
                 cwd=repository.root, completion=CompletionDeadline(100, 600), codex_factory=Codex,
                 approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+                launch_context=self.launch_context(repository, profile),
             )
             session = backend.open_fresh_session(profile)
             try:
@@ -164,7 +170,8 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertEqual(session_calls[0]["sandbox"], "read-only")
                 self.assertTrue(session_calls[0]["ephemeral"])
                 self.assertNotEqual(Path(session_calls[0]["cwd"]), repository.root)
-                self.assertIn("Deny all tools", session_calls[0]["developer_instructions"])
+                self.assertIn("explicitly injected Roundwright guidance", session_calls[0]["developer_instructions"])
+                self.assertIn("Guidance receipt:", session_calls[0]["developer_instructions"])
                 self.assertFalse({"tools", "tool_choice", "config"} & set(session_calls[0]))
                 prompt, controls = turn_calls[0]
                 self.assertEqual(prompt["capability_contract"], "behavioral-zero-tool-use/v1")
@@ -173,6 +180,18 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertEqual((controls["approval_mode"], controls["sandbox"], controls["cwd"]), ("deny-all", "read-only", str(session.cwd)))
             finally:
                 session.close()
+
+    def test_native_dependency_review_requires_a_sealed_launch_context_before_factory_creation(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, _subset, _binding, _profile, _audit = self.setup(Path(temporary))
+            with self.assertRaises(TypeError):
+                HarnessNativeCodexDependencyReviewBackend(
+                    cwd=repository.root, completion=CompletionDeadline(100, 600),
+                    codex_factory=lambda: calls.append("factory"),
+                    approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+                )
+        self.assertEqual(calls, [])
 
     def test_native_bridge_rejects_every_tool_event_before_accepting_schema_output(self) -> None:
         class Handle:

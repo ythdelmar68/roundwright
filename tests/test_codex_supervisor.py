@@ -26,7 +26,7 @@ from roundwright.codex_supervisor import (
 )
 from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
-from roundwright.role_capability_policy import AdvisoryRole
+from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from tests.role_admission_fixture import independent_execution, sealed_execution
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
@@ -88,6 +88,13 @@ class SupervisorTests(unittest.TestCase):
     @staticmethod
     def admission(adapter):
         return sealed_execution(AdvisoryRole.SUPERVISOR, adapter._profile)
+
+    @staticmethod
+    def launch_context(profile, *, cwd=ROOT):
+        return trusted_provider_launch_context(
+            sealed_execution(AdvisoryRole.SUPERVISOR, profile),
+            independent_execution(AdvisoryRole.SUPERVISOR, profile), cwd=cwd,
+        )
 
     def admissions(self, adapters):
         return tuple(self.admission(adapter) for adapter in adapters)
@@ -180,17 +187,23 @@ class SupervisorTests(unittest.TestCase):
         class Codex:
             def __enter__(self): return self
             def __exit__(self, *_args): events.append("closed")
-            def thread_start(self): return Thread()
+            def thread_start(self, **controls):
+                events.append(controls)
+                return Thread()
         profile = self.profiles[0]
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        backend = HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(profile), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         adapter = CodexSupervisorAdapter(backend, profile, audit)
         result = adapter.dispatch(self.request(1, adapter), checkpoint_session=lambda identity: events.append(("session", identity)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), advisory_execution=self.admission(adapter), expected_execution=independent_execution(AdvisoryRole.SUPERVISOR, adapter._profile))
         self.assertEqual((result.kind, result.verdict), ("accepted", "pass"))
-        self.assertEqual(events[0], ("session", "session-native"))
-        self.assertEqual(events[1]["approval_mode"], "deny-all")
-        self.assertEqual(events[1]["sandbox"], "read-only")
-        self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
+        self.assertEqual(events[0]["approval_mode"], "deny-all")
+        self.assertEqual(events[0]["sandbox"], "read-only")
+        self.assertTrue(events[0]["ephemeral"])
+        self.assertEqual(events[0]["cwd"], str(ROOT))
+        self.assertEqual(events[0]["model"], profile.model)
+        self.assertIn("explicitly injected Roundwright guidance", events[0]["developer_instructions"])
+        self.assertEqual(events[1], ("session", "session-native"))
+        self.assertEqual(events[3], ("turn", "session-native", "turn-native"))
         self.assertIn("closed", events)
 
     def test_concrete_native_accounting_prompt_is_prospective_and_bound(self):
@@ -214,8 +227,8 @@ class SupervisorTests(unittest.TestCase):
         class Codex:
             def __enter__(self): return self
             def __exit__(self, *_args): return None
-            def thread_start(self): return Thread()
-        adapter = CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+            def thread_start(self, **_controls): return Thread()
+        adapter = CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(profile), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
         self.assertEqual(adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None, advisory_execution=self.admission(adapter), expected_execution=independent_execution(AdvisoryRole.SUPERVISOR, adapter._profile)).kind, SupervisorResultKind.ACCEPTED)
         prompt = captured[0]
         self.assertIn("prospective pre-dispatch", prompt["instruction"])
@@ -232,6 +245,7 @@ class SupervisorTests(unittest.TestCase):
         profile = self.profiles[0]
         backend = HarnessNativeCodexSupervisorBackend(
             cwd=ROOT, completion=CompletionDeadline(100, 600),
+            launch_context=self.launch_context(profile),
             codex_factory=lambda: (_ for _ in ()).throw(RuntimeError("private factory detail")),
             approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
         )
@@ -239,6 +253,16 @@ class SupervisorTests(unittest.TestCase):
             backend.open_fresh_session(profile)
         self.assertIs(raised.exception.failure, CodexFailure.UNKNOWN)
         self.assertNotIn("private", str(raised.exception))
+
+    def test_native_supervisor_requires_a_sealed_launch_context_before_factory_creation(self):
+        calls = []
+        with self.assertRaises(TypeError):
+            HarnessNativeCodexSupervisorBackend(
+                cwd=ROOT, completion=CompletionDeadline(100, 600),
+                codex_factory=lambda: calls.append("factory"),
+                approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            )
+        self.assertEqual(calls, [])
 
     def test_exact_failed_turn_projects_only_safe_terminal_failure_metadata(self):
         class Handle:
@@ -337,10 +361,10 @@ class SupervisorTests(unittest.TestCase):
             class Codex:
                 def __enter__(self): return self
                 def __exit__(self, *_args): return None
-                def thread_start(self): return Thread()
+                def thread_start(self, **_controls): return Thread()
             profile = self.profiles[0]
             audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-            return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+            return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(profile), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
 
         cases = (
             ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None, 0),

@@ -19,7 +19,6 @@ from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
-_NO_TOOL_INSTRUCTIONS = "Deny all tools, filesystem access, network access, credential access, and repository inspection. Use only the supplied normalized input."
 _SAFE_ITEM_TYPES = frozenset({"agentMessage", "reasoning"})
 _TOOL_EVENT_TOKENS = ("tool", "command", "exec", "mcp", "filechange", "websearch")
 
@@ -61,8 +60,8 @@ def _schema() -> dict[str, object]:
 
 class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBackend):
     """Fresh deny-all/read-only native sessions; no credential crosses this API."""
-    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic, launch_context: TrustedProviderLaunchContext | None = None) -> None:
-        if not isinstance(cwd, Path) or type(completion) is not CompletionDeadline or not callable(clock) or (codex_factory is not None and (not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory))) or (launch_context is not None and type(launch_context) is not TrustedProviderLaunchContext):
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, launch_context: TrustedProviderLaunchContext, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+        if not isinstance(cwd, Path) or type(completion) is not CompletionDeadline or not callable(clock) or (codex_factory is not None and (not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory))) or type(launch_context) is not TrustedProviderLaunchContext:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self.cwd, self.completion, self.factory, self.approval, self.sandbox, self.effort, self.clock, self.launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
 
@@ -71,8 +70,7 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
             raise CodexAdapterError(CodexFailure.UNSUPPORTED_CAPABILITY)
         codex = workspace = None
         try:
-            if self.launch is not None:
-                self.launch.verify(cwd=self.cwd, profile=profile)
+            self.launch.verify(cwd=self.cwd, profile=profile)
             if self.factory is None:
                 sdk = importlib.import_module("openai_codex"); generated = importlib.import_module("openai_codex.generated.v2_all")
                 factory, approval, sandbox, effort = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
@@ -82,33 +80,33 @@ class HarnessNativeCodexDependencyReviewBackend(NativeCodexDependencyReviewBacke
             if not callable(thread_start):
                 raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
             workspace = tempfile.TemporaryDirectory(prefix="roundwright-dependency-review-")
-            developer_instructions = _NO_TOOL_INSTRUCTIONS if self.launch is None else self.launch.developer_instructions
             thread = thread_start(
-                approval_mode=approval, cwd=workspace.name, developer_instructions=developer_instructions,
+                approval_mode=approval, cwd=workspace.name, developer_instructions=self.launch.developer_instructions,
                 ephemeral=True, model=profile.model, sandbox=sandbox,
             )
             if not isinstance(getattr(thread, "id", None), str): raise ValueError
-            return _Session(thread, codex, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace, self.launch)
-        except CodexAdapterError:
+            return _Session(thread, codex, self.cwd, Path(workspace.name), profile, approval, sandbox, effort, self.completion, self.clock, workspace, self.launch)
+        except (CodexAdapterError, RoleCapabilityError) as error:
             if workspace is not None: workspace.cleanup()
             if codex is not None: _close(codex)
+            if isinstance(error, RoleCapabilityError):
+                raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
             raise
         except Exception:
             if workspace is not None: workspace.cleanup()
             if codex is not None: _close(codex)
             raise CodexAdapterError(CodexFailure.UNKNOWN) from None
 class _Session(NativeDependencyReviewSession):
-    def __init__(self, thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, workspace, launch=None): self.thread, self.codex, self.cwd, self.profile, self.approval, self.sandbox, self.effort, self.completion, self.clock, self.workspace, self.started, self.launch = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, workspace, False, launch
+    def __init__(self, thread, codex, host_cwd, cwd, profile, approval, sandbox, effort, completion, clock, workspace, launch): self.thread, self.codex, self.host_cwd, self.cwd, self.profile, self.approval, self.sandbox, self.effort, self.completion, self.clock, self.workspace, self.started, self.launch = thread, codex, host_cwd, cwd, profile, approval, sandbox, effort, completion, clock, workspace, False, launch
     def identity(self) -> str: return self.thread.id
     def close(self) -> None: _close(self.codex); self.workspace.cleanup()
     def start_turn(self, request: DependencyReviewRequest) -> NativeDependencyReviewTurn:
         if self.started or type(request) is not DependencyReviewRequest: raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self.started = True
         try:
-            if self.launch is not None:
-                # The SDK runs in an empty ephemeral workspace; only the
-                # sealed host cwd may authorize its launch, never its turn cwd.
-                self.launch.verify(cwd=self.launch.cwd, profile=self.profile)
+            # The SDK runs in an empty ephemeral workspace; only the sealed
+            # host cwd may authorize its launch, never its turn cwd.
+            self.launch.verify(cwd=self.host_cwd, profile=self.profile)
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         payload = {"schema": "roundwright-dependency-review-native/v1", "capability_contract": "behavioral-zero-tool-use/v1", "instruction": "Return only one dependency proposal for this normalized subset. Do not request or use tools, inspect repositories, request credentials, or emit prose.", "input": request.input_material}

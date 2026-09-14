@@ -43,6 +43,10 @@ ISSUE_136_ARTIFACTS = {
     "advisory-worker-seam-v1": "src/roundwright/codex_worker.py",
     "advisory-supervisor-seam-v1": "src/roundwright/codex_supervisor.py",
     "advisory-dependency-review-seam-v1": "src/roundwright/codex_dependency_review.py",
+    "advisory-native-supervisor-bridge-v1": "src/roundwright/supervisor_toolbox.py",
+    "advisory-native-supervisor-bridge-tests-v1": "tests/test_codex_supervisor.py",
+    "advisory-native-dependency-review-bridge-v1": "src/roundwright/dependency_review_toolbox.py",
+    "advisory-native-dependency-review-bridge-tests-v1": "tests/test_codex_dependency_review.py",
 }
 
 # This is intentionally independent of the rendered map.  Adding, dropping,

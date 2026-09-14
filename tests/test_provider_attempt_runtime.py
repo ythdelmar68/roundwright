@@ -35,7 +35,7 @@ from roundwright.provider_attempt_runtime import (
     install_host_runtime,
 )
 from roundwright.provider_health import CodexFailure
-from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError
+from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
     SupervisorTerminalFailure, claim_supervisor_dispatch, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
@@ -286,6 +286,10 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             }
             short_native = HarnessNativeCodexSupervisorBackend(
                 cwd=repository.root, completion=CompletionDeadline(100, 600),
+                launch_context=trusted_provider_launch_context(
+                    sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                    self.expectation(runner.audit.profile), cwd=repository.root,
+                ),
             )
             host = ProviderAttemptHostInputs(
                 repository, identity, recovery, runner.lease, seal, runner.binding,

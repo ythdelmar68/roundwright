@@ -34,7 +34,7 @@ def _schema(contract: SupervisorResponseContract = SupervisorResponseContract.VE
 class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
     """Fresh native Codex sessions with no tool, approval, or write authority."""
 
-    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic, launch_context: TrustedProviderLaunchContext | None = None) -> None:
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, launch_context: TrustedProviderLaunchContext, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise CodexSupervisorError("native Supervisor working directory is invalid")
         if (
@@ -48,7 +48,7 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
                 codex_factory is None
                 and any(item is not None for item in (approval_mode, sandbox, effort_factory))
             )
-            or (launch_context is not None and type(launch_context) is not TrustedProviderLaunchContext)
+            or type(launch_context) is not TrustedProviderLaunchContext
         ):
             raise CodexSupervisorError("reviewed native Supervisor SDK binding is invalid")
         self._cwd, self._completion, self._factory, self._approval, self._sandbox, self._effort, self._clock, self._launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
@@ -57,24 +57,22 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
         if type(profile) is not ProviderProfile:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
-            if self._launch is not None:
-                self._launch.verify(cwd=self._cwd, profile=profile)
+            self._launch.verify(cwd=self._cwd, profile=profile)
             factory, approval, sandbox, effort = self._native_binding()
             codex = factory()
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
-            if self._launch is None:
-                thread = client.thread_start()
-            else:
-                thread = client.thread_start(
-                    approval_mode=approval, cwd=str(self._cwd),
-                    developer_instructions=self._launch.developer_instructions,
-                    ephemeral=True, model=profile.model, sandbox=sandbox,
-                )
+            thread = client.thread_start(
+                approval_mode=approval, cwd=str(self._cwd),
+                developer_instructions=self._launch.developer_instructions,
+                ephemeral=True, model=profile.model, sandbox=sandbox,
+            )
             if not isinstance(getattr(thread, "id", None), str):
                 raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
             return _Session(thread, codex, self._cwd, profile, approval, sandbox, effort, self._completion, self._clock, self._launch)
-        except CodexAdapterError:
+        except (CodexAdapterError, RoleCapabilityError) as error:
             _close(locals().get("codex"))
+            if isinstance(error, RoleCapabilityError):
+                raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
             raise
         except Exception:
             _close(locals().get("codex"))
@@ -103,7 +101,7 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
 
 
 class _Session(NativeSupervisorSession):
-    def __init__(self, thread: object, codex: object, cwd: Path, profile: ProviderProfile, approval: object, sandbox: object, effort: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext | None = None) -> None:
+    def __init__(self, thread: object, codex: object, cwd: Path, profile: ProviderProfile, approval: object, sandbox: object, effort: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext) -> None:
         self._thread, self._codex, self._cwd, self._profile, self._approval, self._sandbox, self._effort, self._completion, self._clock, self._started, self._closed, self._launch = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, False, False, launch_context
 
     def identity(self) -> str:
@@ -121,8 +119,7 @@ class _Session(NativeSupervisorSession):
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
         try:
-            if self._launch is not None:
-                self._launch.verify(cwd=self._cwd, profile=self._profile)
+            self._launch.verify(cwd=self._cwd, profile=self._profile)
         except RoleCapabilityError as error:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         instruction = "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly."

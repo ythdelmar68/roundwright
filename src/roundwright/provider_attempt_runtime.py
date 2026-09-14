@@ -696,7 +696,6 @@ class DurableDiffReviewRunner:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
                 advisory_execution=entry.advisory_execution,
-                expected_execution=entry.expected_execution,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(

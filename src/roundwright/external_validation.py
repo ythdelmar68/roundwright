@@ -884,7 +884,6 @@ class DependencyReviewAttemptAdapter:
                 host.repository, host.subset, attempt_id=binding.case_id,
                 binding=host.binding, adapter=host.adapter,
                 checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn, advisory_execution=host.advisory_execution,
-                expected_execution=host.expected_execution,
                 source_owned_relations=host.source_owned_relations,
                 supersedes_attempt_id=host.supersedes_attempt_id,
             )

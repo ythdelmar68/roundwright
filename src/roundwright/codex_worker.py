@@ -23,7 +23,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_independent_execution, require_worker_tool_capability
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, derive_and_require_execution_for_effect, require_worker_tool_capability
 
 
 class CodexWorkerError(ValueError):
@@ -423,7 +423,6 @@ class CodexWorkerAdapter:
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
         checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
         advisory_execution: SealedRoleExecution,
-        expected_execution: ExecutionInstanceBinding,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -437,12 +436,16 @@ class CodexWorkerAdapter:
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER:
             raise CodexWorkerError("Worker advisory admission is unavailable")
         try:
-            if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != self._profile:
-                raise RoleCapabilityError("Worker expected execution profile has drifted")
             def admit() -> dict[str, object]:
                 # The record is deliberately re-read at each effect boundary.
                 # A capsule is evidence for one binding, not a cached permit.
-                return require_independent_execution(advisory_execution, expected_execution)
+                receipt, _binding = derive_and_require_execution_for_effect(
+                    advisory_execution, profile=self._profile,
+                    request_or_attempt_identity=request.attempt_id,
+                    request_material={"input_digest": request.input_digest, "action": request.action.value, "context": request.context.__dict__, "resume_session_identity": request.resume_session_identity},
+                    preflight_material={"adapter_profile": self.profile_identity, "runtime": self.runtime_fingerprint, "tools": tuple(item.value for item in self._tools.tools)},
+                )
+                return receipt
 
             admission_receipt = admit()
         except RoleCapabilityError as error:

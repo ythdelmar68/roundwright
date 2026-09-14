@@ -793,7 +793,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         event = SupervisorAttemptEvent(expected_receipt.record_identity, expected_receipt.source_identity, expected_receipt.observation_identity, expected_receipt.candidate_sha, expected_receipt.context_identity, expected_receipt.plan_identity, expected_receipt.capture_plan_digest, ordinal, prior.receipt_digest, request.input_digest, request.selected_profile_identity, adapters[ordinal - 1].runtime_fingerprint, result.kind.value, observed.result_identity, observed.result_identity if result.kind is SupervisorResultKind.ACCEPTED else None, observed.verdict, expected_receipt.ready_at, expected_receipt.freshness_until)
         try: prior = lifecycle.append(expected_receipt.record_identity, event, evidence_time=evidence_time)
         except Exception as error: raise SupervisorShadowError("Supervisor durable lifecycle append failed") from error
-    failover = dispatch_ordered_supervisor_attempts(requests, adapters, advisory_executions, expected_executions, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+    failover = dispatch_ordered_supervisor_attempts(requests, adapters, advisory_executions, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
     attempts = tuple(observed_attempts)
     try:
         result = failover.result

@@ -288,7 +288,7 @@ def qualify_worker_adapter(adapter: CodexWorkerAdapter, request: CodexWorkerRequ
     if (prepared.plan_digest, prepared.profile, prepared.case_id, prepared.candidate_sha, prepared.ready_at) != (readiness.capture_plan_digest, readiness.profile_id, readiness.case_id, readiness.candidate_sha, readiness.ready_at):
         raise WorkerShadowError("external Recorder capture-plan receipt drifted")
     # The adapter does not receive a clock; every outward artifact consumes the pre-bound ready_at.
-    result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, expected_execution=expected_execution)
+    result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution)
     if result.turn_identity is None: return WorkerQualificationResult(result, None, None, None)
     try:
         checkpoint_result(result.session_identity, result.turn_identity, result.kind, result.diagnostic, result.outcome_source, result.sdk_error_category)  # type: ignore[arg-type]

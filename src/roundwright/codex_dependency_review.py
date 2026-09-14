@@ -20,7 +20,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_external_production_activation, require_independent_execution, trusted_provider_launch_context
+from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, derive_and_require_execution_for_effect, require_external_production_activation, require_independent_execution, trusted_provider_launch_context
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -135,17 +135,21 @@ class CodexDependencyReviewAdapter:
         return self._audit.profile_identity
 
     def dispatch(
-        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding,
+        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution,
     ) -> DependencyReviewDispatchResult:
         if type(request) is not DependencyReviewRequest or request.profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise DependencyReviewDispatchError("dependency review dispatch is invalid")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
         try:
-            if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != self._profile:
-                raise RoleCapabilityError("dependency review expected execution profile has drifted")
             def admit() -> dict[str, object]:
-                return require_independent_execution(advisory_execution, expected_execution)
+                receipt, _binding = derive_and_require_execution_for_effect(
+                    advisory_execution, profile=self._profile,
+                    request_or_attempt_identity=request.attempt_id,
+                    request_material={"input_digest": request.input_digest, "input_material": request.input_material},
+                    preflight_material={"adapter_profile": self.profile_identity, "audit": self._audit.profile_identity},
+                )
+                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -197,18 +201,22 @@ class DependencyReviewService:
         self, repository: RepositoryIdentity, subset: AffectedSubset, *, attempt_id: str,
         binding: DependencyReviewBinding, adapter: CodexDependencyReviewAdapter,
         checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution,
-        expected_execution: ExecutionInstanceBinding,
         source_owned_relations: tuple[SourceOwnedRelation, ...] = (), supersedes_attempt_id: str | None = None,
     ) -> DependencyReviewDispatchResult:
         if type(adapter) is not CodexDependencyReviewAdapter or adapter.profile_identity != binding.profile_identity:
             raise DependencyReviewDispatchError("dependency review adapter profile has drifted")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
-        if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != advisory_execution.execution_binding.provider_profile:
-            raise DependencyReviewDispatchError("dependency review expected execution has drifted")
         try:
             def admit() -> dict[str, object]:
-                return require_independent_execution(advisory_execution, expected_execution)
+                receipt, _binding = derive_and_require_execution_for_effect(
+                    advisory_execution,
+                    profile=advisory_execution.execution_binding.provider_profile,
+                    request_or_attempt_identity=attempt_id,
+                    request_material={"attempt_id": attempt_id, "subset": subset.snapshot_id, "binding": {"candidate_sha": binding.candidate_sha, "policy_digest": binding.policy_digest, "configuration_digest": binding.configuration_digest, "profile_identity": binding.profile_identity}},
+                    preflight_material={"adapter_profile": adapter.profile_identity, "source_owned_relations": tuple(item.__dict__ for item in source_owned_relations)},
+                )
+                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -236,7 +244,7 @@ class DependencyReviewService:
 
         result = adapter.dispatch(
             request, checkpoint_session=claimed_session, checkpoint_turn=claimed_turn,
-            advisory_execution=advisory_execution, expected_execution=expected_execution,
+            advisory_execution=advisory_execution,
         )
         if result.kind is DependencyReviewResultKind.ACCEPTED:
             assert result.proposal is not None

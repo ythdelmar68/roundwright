@@ -697,6 +697,44 @@ def require_independent_execution(
     return execution.require_before_effect(expected_execution=expected_execution)
 
 
+def derive_and_require_execution_for_effect(
+    execution: "SealedRoleExecution", *, profile: ProviderProfile,
+    request_or_attempt_identity: str, request_material: Mapping[str, object],
+    preflight_material: Mapping[str, object],
+) -> tuple[dict[str, object], ExecutionInstanceBinding]:
+    """Derive and consume the exact binding at an effect wrapper.
+
+    An adapter receives only the sealed admission capsule and the concrete
+    request that it is about to hand to its backend.  It never accepts an
+    ``ExecutionInstanceBinding`` from its caller.  The host facts originate in
+    the sealed composition result, while every mutable/effect-local input is
+    digested immediately before the effect.  The resulting identity is ready
+    for a durable one-effect reservation at the outer host boundary.
+    """
+
+    if (
+        type(execution) is not SealedRoleExecution
+        or type(profile) is not ProviderProfile
+        or execution.execution_binding.provider_profile != profile
+    ):
+        raise RoleCapabilityError("trusted effect execution is invalid")
+    static = execution.execution_binding
+    host = TrustedExecutionHostInputs(
+        static.repository_identity, static.task_identity, static.candidate_sha,
+        static.instance_receipt_digest, static.host_identity,
+        static.deployment_identity, static.authority_epoch,
+        static.replacement_fence,
+    )
+    derived = host.derive_for_effect(
+        role=execution.contract.profile.role, provider_profile=profile,
+        request_or_attempt_identity=request_or_attempt_identity,
+        request_material=request_material, preflight_material=preflight_material,
+    )
+    return execution.require_before_effect(
+        expected_execution=_DerivedEffectBinding(derived, _seal=_EXECUTION_SEAL)
+    ), derived
+
+
 @dataclass(frozen=True)
 class RoleBudgetUsage:
     calls: int; duration_seconds: int; tokens: int
@@ -959,7 +997,7 @@ class SealedRoleExecution:
         if self._seal is not _EXECUTION_SEAL or type(self.execution_binding) is not ExecutionInstanceBinding:
             raise RoleCapabilityError("sealed role execution is available only from trusted composition")
 
-    def require_before_effect(self, *, expected_execution: ExecutionInstanceBinding | None = None) -> dict[str, object]:
+    def require_before_effect(self, *, expected_execution: ExecutionInstanceBinding | "_DerivedEffectBinding" | None = None) -> dict[str, object]:
         """Re-read admission before an effect and reject every binding drift.
 
         ``expected_execution`` is supplied by a production wrapper when it has
@@ -985,11 +1023,45 @@ class SealedRoleExecution:
                     self.expectation.host_identity, self.expectation.deployment_identity,
                     self.expectation.authority_epoch, self.contract.instance.replacement_fence,
                     self.contract.profile.role, self.contract.profile.provider_profile)
-                or (expected_execution is not None and (
-                    type(expected_execution) is not ExecutionInstanceBinding
-                    or expected_execution.digest != binding.digest))):
+                or not self._expected_execution_matches(expected_execution, binding)):
             raise RoleCapabilityError("provider guidance evidence does not match the role seam")
         return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
+
+    @staticmethod
+    def _expected_execution_matches(
+        expected: ExecutionInstanceBinding | "_DerivedEffectBinding" | None,
+        binding: ExecutionInstanceBinding,
+    ) -> bool:
+        if expected is None:
+            return True
+        if type(expected) is ExecutionInstanceBinding:
+            return expected.digest == binding.digest
+        if type(expected) is not _DerivedEffectBinding or expected._seal is not _EXECUTION_SEAL:
+            return False
+        derived = expected.binding
+        return (
+            derived.repository_identity, derived.task_identity, derived.candidate_sha,
+            derived.instance_receipt_digest, derived.host_identity,
+            derived.deployment_identity, derived.authority_epoch,
+            derived.replacement_fence, derived.role, derived.provider_profile,
+        ) == (
+            binding.repository_identity, binding.task_identity, binding.candidate_sha,
+            binding.instance_receipt_digest, binding.host_identity,
+            binding.deployment_identity, binding.authority_epoch,
+            binding.replacement_fence, binding.role, binding.provider_profile,
+        )
+
+
+class _DerivedEffectBinding:
+    """Private proof that the wrapper, not its caller, derived this binding."""
+
+    __slots__ = ("binding", "_seal")
+
+    def __init__(self, binding: ExecutionInstanceBinding, *, _seal: object | None) -> None:
+        if _seal is not _EXECUTION_SEAL or type(binding) is not ExecutionInstanceBinding:
+            raise RoleCapabilityError("derived effect binding is invalid")
+        self.binding = binding
+        self._seal = _seal
 
 
 def _compose_sealed_role_execution(

@@ -18,7 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from .role_capability_policy import ExecutionInstanceBinding, RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, require_independent_execution
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, derive_and_require_execution_for_effect
 
 
 class CodexSupervisorError(ValueError):
@@ -257,16 +257,20 @@ class CodexSupervisorAdapter:
     def runtime_fingerprint(self) -> str:
         return self._audit.runtime_fingerprint
 
-    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, expected_execution: ExecutionInstanceBinding) -> CodexSupervisorResult:
+    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution) -> CodexSupervisorResult:
         if type(request) is not CodexSupervisorRequest or request.selected_profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexSupervisorError("Supervisor dispatch is invalid")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR:
             raise CodexSupervisorError("Supervisor advisory admission is unavailable")
         try:
-            if type(expected_execution) is not ExecutionInstanceBinding or expected_execution.provider_profile != self._profile:
-                raise RoleCapabilityError("Supervisor expected execution profile has drifted")
             def admit() -> dict[str, object]:
-                return require_independent_execution(advisory_execution, expected_execution)
+                receipt, _binding = derive_and_require_execution_for_effect(
+                    advisory_execution, profile=self._profile,
+                    request_or_attempt_identity=request.provider_attempt_id,
+                    request_material={"input_digest": request.input_digest, "review_attempt_id": request.review_attempt_id, "within_round_attempt": request.within_round_attempt, "context": request.context.__dict__},
+                    preflight_material={"adapter_profile": self.profile_identity, "runtime": self.runtime_fingerprint, "response_contract": request.response_contract.value},
+                )
+                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -335,7 +339,7 @@ class SupervisorFailoverResult:
     exhausted: bool
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], expected_executions: tuple[ExecutionInstanceBinding, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
     Only a typed invalid result or a verified terminal provider failure can
@@ -343,17 +347,17 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     remain terminal: dispatching a fallback would turn an uncertain external
     result into an unbounded second provider action.
     """
-    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(expected_executions) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(expected_executions) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not ExecutionInstanceBinding for item in expected_executions) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
+    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     seen: set[str] = set()
     attempted: list[str] = []
     first = requests[0].context
-    for ordinal, (request, adapter, advisory_execution, expected_execution) in enumerate(zip(requests, adapters, advisory_executions, expected_executions), start=1):
+    for ordinal, (request, adapter, advisory_execution) in enumerate(zip(requests, adapters, advisory_executions), start=1):
         if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != ordinal or request.selected_profile_identity != adapter.profile_identity or request.selected_profile_identity in seen or request.context != first:
             raise CodexSupervisorError("Supervisor failover profile mapping is invalid")
         seen.add(request.selected_profile_identity)
         attempted.append(request.selected_profile_identity)
-        result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, expected_execution=expected_execution)
+        result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution)
         if checkpoint_result is not None:
             checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:

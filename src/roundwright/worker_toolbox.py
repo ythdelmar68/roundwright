@@ -929,6 +929,13 @@ def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInpu
     :func:`run_bounded_worker_adapter_qualification` with its no-tools
     capability; this entrypoint accepts only implementation or repair work.
     """
+    # No in-repository value, including a synthetically coherent sealed
+    # execution, activates this public effectful entrypoint.  Qualification
+    # exercises the explicit hermetic adapter seam instead.
+    try:
+        require_external_production_activation()
+    except RoleCapabilityError as error:
+        raise WorkerShadowError("production coding activation is unavailable") from error
     if type(inputs) is not ProductionCodingWorkerEntrypointInputs or type(request) is not CodexWorkerRequest or request.action is WorkerAction.PLANNING:
         raise WorkerShadowError("production coding entrypoint is invalid")
     return ProductionCodingWorkerRuntime(

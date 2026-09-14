@@ -85,8 +85,10 @@ class ProductionRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
             turn=Turn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            result=run_production_coding_worker(inputs=self.inputs(Path(temp),turn,events), request=self.request(), checkpoint_session=lambda _:events.append("session"), checkpoint_turn=lambda *_:events.append("turn"))
-            self.assertEqual((result.kind,Path(temp,"out.txt").read_text()),(WorkerResultKind.ACCEPTED,"ok"))
+            with self.assertRaisesRegex(WorkerShadowError, "activation is unavailable"):
+                run_production_coding_worker(inputs=self.inputs(Path(temp),turn,events), request=self.request(), checkpoint_session=lambda _:events.append("session"), checkpoint_turn=lambda *_:events.append("turn"))
+            self.assertEqual(events, [])
+            self.assertFalse(Path(temp, "out.txt").exists())
 
     def test_registered_public_lifecycle_requires_an_exact_installed_resource(self):
         with tempfile.TemporaryDirectory() as temp:

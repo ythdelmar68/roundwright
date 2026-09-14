@@ -26,7 +26,7 @@ from roundwright.git_identity import GitEntrypointControl
 from roundwright.role_capability_policy import (
     AdvisoryRole, AdvisoryRoleContract, AuthoritativeGuidanceExpectation,
     DedicatedRoleInstance, FileRoleAdmissionStore, GuidanceView,
-    ProviderGuidanceEvidence, RoleAdmissionExpectation, RoleBudget,
+    ExecutionInstanceBinding, ProviderGuidanceEvidence, RoleAdmissionExpectation, RoleBudget,
     RoleCapability, RoleCapabilityGrant, RoleCapabilityProfile,
     RoleExecutionSeam, RoleScope, SealedRoleExecution,
     TrustedRoleAuthorityReceipt, read_verified_admission,
@@ -161,6 +161,11 @@ def sealed_execution(role: AdvisoryRole, profile: ProviderProfile) -> SealedRole
     execution = _compose_sealed_role_execution(
         contract, RoleExecutionSeam(role.value), store, expectation,
         ProviderGuidanceEvidence(view, _digest("provider-cwd"), True, _digest("injected-guidance"), guidance.receipt_digest, binding.candidate_sha, task_candidate),
+        ExecutionInstanceBinding(
+            repository_identity, "task-136", task_candidate, instance.receipt_digest,
+            _digest("host"), _digest("deployment"), 1, "fixture-generation", role,
+            role_profile.provider_profile, "fixture-execution", _digest("fixture-preflight"),
+        ),
     )
     _EXECUTIONS[(role, profile)] = execution
     return execution

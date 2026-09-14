@@ -24,7 +24,7 @@ from roundwright.git_identity import GitEntrypointControl
 from roundwright.role_capability_policy import (
     AdvisoryRole, AdvisoryRoleContract, AdvisoryRoleStatus,
     AuthoritativeGuidanceExpectation, DedicatedRoleInstance,
-    FileRoleAdmissionStore, GuidanceView, ProviderGuidanceEvidence, RoleAdmissionExpectation, SealedRoleExecution, SealedRoleRuntimeContext,
+    ExecutionInstanceBinding, FileRoleAdmissionStore, GuidanceView, ProviderGuidanceEvidence, RoleAdmissionExpectation, SealedRoleExecution, SealedRoleRuntimeContext,
     RoleCapability, RoleCapabilityError, RoleCapabilityGrant, RoleExecutionSeam,
     RoleScope, ScopeKind, ScopedDescriptor, SdkAdapterMapping,
     TrustedRoleAuthorityReceipt, default_advisory_profiles,
@@ -193,10 +193,19 @@ class RoleCapabilityPolicyTests(unittest.TestCase):
     def test_execution_evidence_binds_accepted_main_and_task_candidate_separately(self) -> None:
         contract = self.verified_contract()
         evidence = ProviderGuidanceEvidence(GuidanceView.RECOVERY_ADVISOR, digest("a"), True, digest("b"), self.guidance.receipt_digest, self.binding.candidate_sha, self.task_candidate)
-        sealed = _compose_sealed_role_execution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, evidence)
+        binding = ExecutionInstanceBinding(
+            digest("c"), "task-136", self.task_candidate, self.instance.receipt_digest,
+            digest("f"), digest("e"), 1, "generation-1", AdvisoryRole.RECOVERY_ADVISOR,
+            self.recovery.provider_profile, "attempt-136", digest("b"),
+        )
+        sealed = _compose_sealed_role_execution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, evidence, binding)
         self.assertEqual(sealed.require_before_effect()["status"], "ready")
+        self.assertEqual(sealed.require_before_effect(expected_execution=binding)["status"], "ready")
         with self.assertRaises(RoleCapabilityError):
-            _compose_sealed_role_execution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, replace(evidence, task_candidate_sha="b" * 40)).require_before_effect()
+            _compose_sealed_role_execution(contract, RoleExecutionSeam.RECOVERY_ADVISOR, self.store, self.expectation, replace(evidence, task_candidate_sha="b" * 40), binding).require_before_effect()
+        for field, value in (("repository_identity", digest("d")), ("task_identity", "other-task"), ("candidate_sha", "b" * 40), ("instance_receipt_digest", digest("d")), ("host_identity", digest("d")), ("deployment_identity", digest("d")), ("authority_epoch", 2), ("replacement_fence", "generation-2"), ("role", AdvisoryRole.WORKER), ("execution_identity", "other-attempt"), ("preflight_identity", digest("d"))):
+            with self.subTest(field=field), self.assertRaises(RoleCapabilityError):
+                sealed.require_before_effect(expected_execution=replace(binding, **{field: value}))
 
     def test_verified_admission_and_sdk_mapping_cannot_be_mutated_after_readback(self) -> None:
         contract = self.verified_contract()

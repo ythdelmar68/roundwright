@@ -465,7 +465,7 @@ class ExecutionInstanceBinding:
 
     @property
     def digest(self) -> str:
-        return _digest({"schema":"roundwright-execution-instance-binding/v1","repository":self.repository_identity,"task":self.task_identity,"candidate":self.candidate_sha,"instance":self.instance_receipt_digest,"host":self.host_identity,"deployment":self.deployment_identity,"epoch":self.authority_epoch,"fence":self.replacement_fence,"role":self.role.value,"model":self.provider_profile.model,"reasoning_effort":self.provider_profile.reasoning_effort.value,"execution":self.execution_identity,"preflight":self.preflight_identity})
+        return _digest({"schema":"roundwright-execution-instance-binding/v1","repository":self.repository_identity,"task":self.task_identity,"candidate":self.candidate_sha,"instance":self.instance_receipt_digest,"host":self.host_identity,"deployment":self.deployment_identity,"epoch":self.authority_epoch,"fence":self.replacement_fence,"role":self.role.value,"profile":{"model":self.provider_profile.model,"reasoning_effort":self.provider_profile.reasoning_effort.value,"name":self.provider_profile.name},"execution":self.execution_identity,"preflight":self.preflight_identity})
 
 
 
@@ -597,20 +597,42 @@ class SealedRoleExecution:
     store: FileRoleAdmissionStore
     expectation: RoleAdmissionExpectation
     guidance_evidence: ProviderGuidanceEvidence
+    execution_binding: ExecutionInstanceBinding
     _seal: object | None = None
 
     def __post_init__(self) -> None:
-        if self._seal is not _EXECUTION_SEAL:
+        if self._seal is not _EXECUTION_SEAL or type(self.execution_binding) is not ExecutionInstanceBinding:
             raise RoleCapabilityError("sealed role execution is available only from trusted composition")
 
-    def require_before_effect(self) -> dict[str, object]:
+    def require_before_effect(self, *, expected_execution: ExecutionInstanceBinding | None = None) -> dict[str, object]:
+        """Re-read admission before an effect and reject every binding drift.
+
+        ``expected_execution`` is supplied by a production wrapper when it has
+        independently derived the one attempt it is about to perform.  The
+        capsule is never a wildcard: omitting that extra comparison still
+        verifies the sealed binding carried by the composition root.
+        """
         expected_views = {RoleExecutionSeam.WORKER: GuidanceView.WORKER, RoleExecutionSeam.SUPERVISOR: GuidanceView.SUPERVISOR, RoleExecutionSeam.DEPENDENCY_REVIEW: GuidanceView.DEPENDENCY_REVIEW, RoleExecutionSeam.RECOVERY_ADVISOR: GuidanceView.RECOVERY_ADVISOR, RoleExecutionSeam.OWNER_INTENT_INTERPRETER: GuidanceView.OWNER_INTENT_INTERPRETER}
         runtime = self.store._runtime
+        binding = self.execution_binding
         if (self.guidance_evidence.view is not expected_views[self.seam]
                 or self.guidance_evidence.guidance_receipt_digest != self.contract.guidance.receipt_digest
                 or self.guidance_evidence.accepted_main_sha != runtime.binding.candidate_sha
                 or self.guidance_evidence.task_candidate_sha != runtime.task_candidate_sha
-                or self.expectation.candidate_sha != runtime.task_candidate_sha):
+                or self.expectation.candidate_sha != runtime.task_candidate_sha
+                or (binding.repository_identity, binding.task_identity, binding.candidate_sha,
+                    binding.instance_receipt_digest, binding.host_identity,
+                    binding.deployment_identity, binding.authority_epoch,
+                    binding.replacement_fence, binding.role,
+                    binding.provider_profile)
+                != (self.expectation.repository_identity, self.expectation.task_identity,
+                    runtime.task_candidate_sha, self.contract.instance.receipt_digest,
+                    self.expectation.host_identity, self.expectation.deployment_identity,
+                    self.expectation.authority_epoch, self.contract.instance.replacement_fence,
+                    self.contract.profile.role, self.contract.profile.provider_profile)
+                or (expected_execution is not None and (
+                    type(expected_execution) is not ExecutionInstanceBinding
+                    or expected_execution.digest != binding.digest))):
             raise RoleCapabilityError("provider guidance evidence does not match the role seam")
         return require_verified_role_admission(self.contract, self.seam, store=self.store, expectation=self.expectation)
 
@@ -621,14 +643,16 @@ def _compose_sealed_role_execution(
     store: FileRoleAdmissionStore,
     expectation: RoleAdmissionExpectation,
     guidance_evidence: ProviderGuidanceEvidence,
+    execution_binding: ExecutionInstanceBinding,
 ) -> SealedRoleExecution:
     """Composition-root-only constructor; production defaults install none."""
 
     if (type(contract) is not AdvisoryRoleContract or type(seam) is not RoleExecutionSeam
             or type(store) is not FileRoleAdmissionStore or type(expectation) is not RoleAdmissionExpectation
-            or type(guidance_evidence) is not ProviderGuidanceEvidence):
+            or type(guidance_evidence) is not ProviderGuidanceEvidence
+            or type(execution_binding) is not ExecutionInstanceBinding):
         raise RoleCapabilityError("trusted role composition is invalid")
-    return SealedRoleExecution(contract, seam, store, expectation, guidance_evidence, _seal=_EXECUTION_SEAL)
+    return SealedRoleExecution(contract, seam, store, expectation, guidance_evidence, execution_binding, _seal=_EXECUTION_SEAL)
 
 
 def render_grant_draft(*, instance: DedicatedRoleInstance, scope: RoleScope, expectation: RoleAdmissionExpectation, owner_readable_reason: str, budget: RoleBudget, valid_from: int, valid_until: int, revocation_readback_digest: str) -> dict[str, object]:
@@ -650,7 +674,10 @@ def require_verified_role_admission(contract: AdvisoryRoleContract, seam: RoleEx
     if seam not in allowed or allowed[seam] is not contract.profile.role:
         raise RoleCapabilityError("role is not admitted for this execution seam")
     fresh, instance = read_verified_admission(expectation=expectation, store=store)
-    if instance != contract.instance or fresh.grant.receipt_digest != contract.admission.grant.receipt_digest:
+    if (type(contract.admission) is not VerifiedRoleAdmission
+            or contract.admission._seal is not _ADMISSION_SEAL
+            or instance != contract.instance
+            or fresh.grant.receipt_digest != contract.admission.grant.receipt_digest):
         raise RoleCapabilityError("role admission changed after contract construction")
     receipt = contract.public_receipt()
     if receipt["status"] != AdvisoryRoleStatus.READY.value:

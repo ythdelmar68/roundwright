@@ -9,9 +9,9 @@
       "public-safe-advisory-qualification"
     ],
     "artifacts": [
-      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"02b5720a45911cc223d778a36a1f1075192e31871e10072ce8cf1669ac4adaac"},
-      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"8999c3defec0cd19b5f2288bf80e37584d221ed5220366273d724587a0cf7ec1"},
-      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"c33035213b8dd651087487fbb4e00753dd468a04488a06bd300dfc97d90c84f0"},
+      {"identity":"advisory-policy-v4","path":"src/roundwright/role_capability_policy.py","sha256":"908f3e48d372e3ab5d45e2efec23a23318e1bbf9f4d46853e25191f43ca048dc"},
+      {"identity":"advisory-policy-adversarial-tests-v3","path":"tests/test_role_capability_policy.py","sha256":"5ebb6a4a8511c0686eff81a91ac2106e83b402e4a35c75ffaad425caa39cd402"},
+      {"identity":"advisory-migration-v3","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"096fbc976ecf544754e4ed215d6fb68dfd702a92808d02dc6a6f704f3dc81108"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"650928db5520b43040c14a00dedd1ddb67a29fc5ea0a7f97d69927deb947625c"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
       {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"ddcf9b9765ad30f65c999547f01ec2ea95cbf5af55c3b4b03cbf39624b7964d6"},

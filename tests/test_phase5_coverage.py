@@ -208,6 +208,7 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+            "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
@@ -251,4 +252,8 @@ class Phase5CoverageTests(unittest.TestCase):
         e1r3 = dict(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS)
         e1r3.pop("RW132-QUALIFICATION-008")
         with patch.object(coverage, "ISSUE_132_E1R3_FINDING_REQUIREMENTS", e1r3), self.assertRaisesRegex(coverage.CoverageError, "E1R3 stable finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+
+    def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:
+        with patch.object(coverage, "ISSUE_132_AFFECTED_MODULE_TESTS", {}), self.assertRaisesRegex(coverage.CoverageError, "affected-module regression inventory"):
             coverage._validate_issue_132_semantic_tests()

@@ -7,6 +7,13 @@ revocation, and same-profile format correction ordinals to one candidate-bound
 semantic receipt.  It neither activates a provider nor publishes provider
 output.
 
+The authoritative affected-module regression set also includes
+`candidate_review.py`: its within-round dispatch test supplies the exact
+preceding durable Supervisor coordinates before exercising profile 2+.
+Consequently, a fresh production history can still begin only at logical
+profile 1 / physical ordinal 0, while an established round can progress to
+its later declared profiles.
+
 | E1R2 finding | Requirement | Producer | Public-safe consuming gate |
 | --- | --- | --- | --- |
 | E1R2-01 | Production Worker preserves an authenticated typed denial, while an out-of-order tool protocol remains ambiguous and cannot mint a substitute turn | `codex_worker.py` native seam | `test_codex_worker.test_typed_denial_and_transport_failure_remain_typed` |

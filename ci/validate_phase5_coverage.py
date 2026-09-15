@@ -500,6 +500,7 @@ SEMANTIC_TESTS = (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+    "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_codex_supervisor.SupervisorTests.test_ambiguous_and_incomplete_results_stop_before_fallback",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output",
@@ -524,6 +525,9 @@ ISSUE_132_FINDING_REQUIREMENTS = {
     "E1R2-07": ("src/roundwright/failure_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified"),
     "E1R2-08": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
 }
+ISSUE_132_AFFECTED_MODULE_TESTS = {
+    "src/roundwright/candidate_review.py": "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
+}
 ISSUE_132_E1R3_TESTS = (
     "tests.test_production_coding_runtime.ProductionRuntimeTests.test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
     "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
@@ -541,7 +545,7 @@ ISSUE_132_E1R3_FINDING_REQUIREMENTS = {
     "RW132-ACCOUNTING-007": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
     "RW132-QUALIFICATION-008": ("ci/phase5_semantic_receipt.py", "tests.test_phase5_coverage.Phase5CoverageTests.test_issue_132_semantic_inventory_is_independently_pinned_and_ordered"),
 }
-ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + (
+ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + tuple(ISSUE_132_AFFECTED_MODULE_TESTS.values()) + (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
@@ -553,6 +557,10 @@ def _validate_issue_132_semantic_tests() -> None:
         raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
     if any(not (ROOT / path).is_file() for path, _test in ISSUE_132_FINDING_REQUIREMENTS.values()):
         raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
+    if ISSUE_132_AFFECTED_MODULE_TESTS != {
+        "src/roundwright/candidate_review.py": "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
+    } or any(not (ROOT / path).is_file() for path in ISSUE_132_AFFECTED_MODULE_TESTS):
+        raise CoverageError("Issue 132 affected-module regression inventory is incomplete")
     if len(ISSUE_132_E1R3_TESTS) != 5:
         raise CoverageError("Issue 132 E1R3 finding inventory is incomplete")
     if set(ISSUE_132_E1R3_FINDING_REQUIREMENTS) != {

@@ -373,6 +373,25 @@ class CandidateReviewTests(unittest.TestCase):
                     with self.assertRaises(CandidateReviewError):
                         _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                     continue
+                # A later logical profile is never a valid new ledger origin.
+                # Seed the exact preceding durable Supervisor coordinates so this
+                # fixture exercises CandidateReview's within-round mapping rather
+                # than bypassing the accounting origin invariant.
+                for position in range(1, ordinal):
+                    selected_profile_identity = context.runtime_binding.supervisor_profile_identities[position - 1]
+                    prepare_attempt(
+                        repository, identity,
+                        provider_context(
+                            review_context, identity, ProviderRole.SUPERVISOR,
+                            selected_profile_identity=selected_profile_identity,
+                        ),
+                        attempt_id=f"mapping-prior-supervisor-{position}", role=ProviderRole.SUPERVISOR,
+                        process_lease_id=f"mapping-prior-lease-{position}", process_lease_expires_at=now + 60,
+                        input_fingerprint=f"{position:x}" * 64,
+                        selected_profile_identity=selected_profile_identity,
+                        logical_profile_position=position, physical_format_output_ordinal=0,
+                        review_epoch=0, review_round=4, lease=lease, now=now,
+                    )
                 dispatch = _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                 self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).selected_profile_identity, arguments["selected_profile_identity"])
                 self.assertEqual((dispatch.within_round_attempt, dispatch.selected_profile_identity), (ordinal, arguments["selected_profile_identity"]))

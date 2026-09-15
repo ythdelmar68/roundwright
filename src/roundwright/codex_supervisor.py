@@ -412,20 +412,22 @@ class SupervisorFailoverResult:
 def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
-    Only a typed invalid result or a verified terminal provider failure can
-    advance to the next pre-bound profile.  Ambiguous and incomplete outcomes
-    remain terminal: dispatching a fallback would turn an uncertain external
-    result into an unbounded second provider action.
+    Only a typed format-invalid result may advance.  A typed ``BLOCKED`` is a
+    terminal external outcome, including a transient service result: choosing
+    another profile from a local enum would create a second effect without a
+    separately admitted recovery route.
     """
     if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
-    seen: set[str] = set()
     attempted: list[str] = []
     first = requests[0].context
+    expected_logical = 1
+    expected_physical = 0
+    current_profile: str | None = None
     for ordinal, (request, adapter, advisory_execution, execution_host, budget_ledger_path) in enumerate(zip(requests, adapters, advisory_executions, execution_hosts, budget_ledger_paths), start=1):
-        if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != ordinal or request.physical_format_output_ordinal != 0 or request.selected_profile_identity != adapter.profile_identity or request.selected_profile_identity in seen or request.context != first:
+        if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != expected_logical or request.physical_format_output_ordinal != expected_physical or request.selected_profile_identity != adapter.profile_identity or request.context != first or (current_profile is not None and expected_physical and request.selected_profile_identity != current_profile):
             raise CodexSupervisorError("Supervisor failover profile mapping is invalid")
-        seen.add(request.selected_profile_identity)
+        current_profile = request.selected_profile_identity
         attempted.append(request.selected_profile_identity)
         request_material, preflight_material = adapter.effect_material(request)
         try:
@@ -442,10 +444,16 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:
             return SupervisorFailoverResult(result, tuple(attempted), False)
-        if result.kind is SupervisorResultKind.BLOCKED and not _eligible_prebound_failover(result):
+        if result.kind is SupervisorResultKind.BLOCKED:
             return SupervisorFailoverResult(result, tuple(attempted), False)
-        if result.kind not in (SupervisorResultKind.INVALID, SupervisorResultKind.BLOCKED):
+        if result.kind is not SupervisorResultKind.INVALID:
             return SupervisorFailoverResult(result, tuple(attempted), False)
+        if expected_physical == 2:
+            expected_logical += 1
+            expected_physical = 0
+            current_profile = None
+        else:
+            expected_physical += 1
     return SupervisorFailoverResult(None, tuple(attempted), True)
 
 

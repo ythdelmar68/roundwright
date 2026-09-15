@@ -31,7 +31,7 @@ from roundwright.configuration import ConfigurationError, ConfigurationSource, F
 from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
 from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
-from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, required_provider_selections
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
@@ -97,7 +97,11 @@ def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, 
                 audit.audit.fingerprint, HealthState.READY, None, 0, 2_000_000_000, 1,
             )
             receipt = ProviderHealthReceipt(
-                identity.base_sha, context.candidate_sha, binding.case_id, 2,
+                identity.base_sha, context.candidate_sha, binding.case_id,
+                next(
+                    ordinal for ordinal, role, profile_identity in required_provider_selections(policy.runtime)
+                    if (role, profile_identity) == (ProviderRole.SUPERVISOR, audit.profile_identity)
+                ),
                 policy.runtime, ProviderRole.SUPERVISOR, audit.profile_identity,
                 health, audit,
             )

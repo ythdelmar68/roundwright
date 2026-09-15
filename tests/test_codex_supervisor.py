@@ -177,7 +177,7 @@ class Turn:
         if self._response.kind is SupervisorResultKind.ACCEPTED and "binding" not in self._response.structured_output:
             request = self._request
             value = dict(self._response.structured_output)
-            value["binding"] = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
+            value["binding"] = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "logical_profile_position": request.within_round_attempt, "physical_format_output_ordinal": request.physical_format_output_ordinal, "profile_identity": request.selected_profile_identity}
             return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, value)
         return self._response
 
@@ -552,9 +552,17 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaises(SupervisorShadowError): qualify_supervisor_attempt(adapter, request, readiness, binding, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.plans, [])
 
-    def sequence_fixture(self, responses):
-        adapters = tuple(self.adapter(profile, str(index), response) for index, (profile, response) in enumerate(zip(self.profiles, responses, strict=True), start=1))
-        requests = tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1))
+    def sequence_fixture(self, responses, *, coordinates=None):
+        if coordinates is None:
+            coordinates = tuple((profile, index, 0) for index, profile in enumerate(self.profiles, start=1))
+        adapters = tuple(
+            self.adapter(profile, str(index), response)
+            for index, ((profile, _logical, _physical), response) in enumerate(zip(coordinates, responses, strict=True), start=1)
+        )
+        requests = tuple(
+            self.request(index, adapter, logical=logical, physical=physical)
+            for index, (adapter, (_profile, logical, physical)) in enumerate(zip(adapters, coordinates, strict=True), start=1)
+        )
         configuration = self.configuration
         readiness = require_supervisor_capture_readiness(candidate_sha=self.context.candidate_sha, ready_at=101, case_id="case-44-sequence", observation_identity=supervisor_sequence_observation_identity(requests), producer_identity=configuration.trusted_floor_source_identity, exporter_identity=configuration.trusted_floor_authority_identity, comparator_identity=configuration.runtime_store_authority_identity, recorder=RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"), store_identity=digest("sequence-store"))
         binding = SupervisorSequenceBinding("case-44-sequence", self.context.candidate_sha, self.context.base_sha, self.context.task_id, tuple(item.input_digest for item in requests), tuple(item.profile_identity for item in adapters), tuple(item.runtime_fingerprint for item in adapters), self.context.review_epoch, self.context.review_round, self.context.review_mode.value, readiness.capture_plan_digest)
@@ -597,9 +605,15 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual((result.envelope.terminal, len(result.envelope.attempts), result.envelope.blocker, result.receipt, recorder.calls, durable.terminal.terminal, durable.terminal.blocker), (SupervisorSequenceTerminal(kind.value), 3, f"provider-outcome-{kind.value}", None, ["prepare"], kind.value, f"provider-outcome-{kind.value}"))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
-        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-        self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(
+            (
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}),
+            ),
+            coordinates=((self.profiles[0], 1, 0), (self.profiles[0], 1, 1)),
+        )
+        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), tuple(item.profile_identity for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), (adapters[0].profile_identity, adapters[0].profile_identity), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX) for _profile in self.profiles))

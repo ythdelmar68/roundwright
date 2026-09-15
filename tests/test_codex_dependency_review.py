@@ -320,11 +320,14 @@ class DependencyReviewServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             identity = TaskIdentity("task-116", "source-116", "repo-116", "codex/116", "C:/review-116", "a" * 40)
-            record_durable_failure(repository, identity, classify(FailureBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest, "dependency-review:" + subset.task_id, FailureRole.DEPENDENCY_REVIEW, binding.profile_identity, "prior-session", "prior-attempt"), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            # Dependency review has its own durable attempt ledger, not a
+            # provider-attempt/context admission.  An unadmitted synthetic
+            # failure record must not become an authority-bearing scope stop.
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, identity, classify(FailureBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest, "dependency-review:" + subset.task_id, FailureRole.DEPENDENCY_REVIEW, binding.profile_identity, "prior-session", "prior-attempt"), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
-            with self.assertRaisesRegex(Exception, "scope is stopped"):
-                DependencyReviewStore().start_attempt(repository, subset, attempt_id="changed-attempt", binding=binding)
+            DependencyReviewStore().start_attempt(repository, subset, attempt_id="changed-attempt", binding=binding)
             self.assertEqual(backend.sessions, [])
 
     def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:

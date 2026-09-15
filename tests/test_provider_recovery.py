@@ -33,6 +33,10 @@ from roundwright.provider_recovery import (
     record_invalid_output,
     record_session_identity,
     recover_attempt,
+    record_supervisor_terminal_failure,
+    SupervisorTerminalFailureClass,
+    SupervisorTerminalFailureSource,
+    SupervisorTerminalFailureSdkCategory,
 )
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
@@ -685,11 +689,59 @@ class ProviderRecoveryTests(unittest.TestCase):
             repository = self.repository(Path(temporary)); initialize(repository)
             lease = self.lease(repository); identity = self.identity("denied")
             self.admit(repository, identity, lease)
-            context = self.context(identity, role=ProviderRole.WORKER)
-            binding = FailureBinding(identity.base_sha, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "session-before-denial", "denial-attempt")
+            candidate = "c" * 40
+            context = self.context(identity, candidate=candidate, role=ProviderRole.WORKER)
+            prepare_attempt(repository, identity, context, attempt_id="denial-attempt", role=ProviderRole.WORKER, process_lease_id="lease-denial", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="denial-attempt", session_identity="session-before-denial", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "session-before-denial", "denial-attempt")
             record_durable_failure(repository, identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
             with self.assertRaisesRegex(ProviderRecoveryError, "scope is stopped"):
                 self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="changed-session-attempt")
+
+    def test_failure_admission_is_raw_bound_and_legacy_contexts_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("admission")
+            self.admit(repository, identity, lease)
+            candidate = "c" * 40
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(repository, identity, context, attempt_id="admitted", role=ProviderRole.SUPERVISOR, process_lease_id="lease-admitted", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="admitted", session_identity="admitted-session", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM provider_failure_admissions WHERE attempt_id = ?", ("admitted",)).fetchone(), (identity.task_id, candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, "supervisor", context.runtime_binding.supervisor_profile_identities[0], "admitted-session", "admitted"))
+            finally:
+                connection.close()
+            legacy = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "legacy-session", "legacy-attempt")
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, identity, classify(legacy, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+
+    def test_failure_admission_rejects_tamper_cross_task_and_stale_candidate_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("tamper")
+            self.admit(repository, identity, lease)
+            candidate = "c" * 40
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(repository, identity, context, attempt_id="tamper-attempt", role=ProviderRole.SUPERVISOR, process_lease_id="lease-tamper", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="tamper-attempt", session_identity="tamper-session", lease=lease)
+            record_external_turn(repository, identity, context, attempt_id="tamper-attempt", session_identity="tamper-session", external_turn_identity="tamper-turn", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "tamper-session", "tamper-attempt")
+            other_identity = self.identity("other-task")
+            self.admit(repository, other_identity, lease)
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, other_identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_failure_admissions SET configuration_digest = ? WHERE attempt_id = ?", ("sha256:" + "d" * 64, "tamper-attempt")); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            self.assertEqual(read_attempt(repository, identity, "tamper-attempt").state, AttemptState.DISPATCHED)
+            replacement = self.context(identity, candidate="d" * 40, role=ProviderRole.SUPERVISOR)
+            with self.assertRaisesRegex(ProviderRecoveryError, "drifted"):
+                record_supervisor_terminal_failure(repository, identity, replacement, attempt_id="tamper-attempt", failure_class=SupervisorTerminalFailureClass.SANDBOX_OR_APPROVAL_DENIED, outcome_source=SupervisorTerminalFailureSource.SDK_TURN_FAILED, sdk_error_category=SupervisorTerminalFailureSdkCategory.SANDBOX, lease=lease)
 
 
 if __name__ == "__main__":

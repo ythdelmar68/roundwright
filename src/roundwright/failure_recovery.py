@@ -12,6 +12,12 @@ import json
 import time
 from dataclasses import dataclass
 from enum import StrEnum
+import re
+
+
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 
 
 class FailureRecoveryError(ValueError):
@@ -90,9 +96,16 @@ class FailureBinding:
     attempt_identity: str
 
     def __post_init__(self) -> None:
-        if (not all(isinstance(value, str) and value for value in self.__dict__.values())
-                or len(self.candidate_sha) != 40
-                or not all(character in "0123456789abcdef" for character in self.candidate_sha)):
+        if (
+            not _COMMIT.fullmatch(self.candidate_sha)
+            or not _DIGEST.fullmatch(self.policy_digest)
+            or not _DIGEST.fullmatch(self.configuration_digest)
+            or not _TOKEN.fullmatch(self.authority_scope)
+            or not _DIGEST.fullmatch(self.profile_identity)
+            or not _TOKEN.fullmatch(self.session_identity)
+            or not _TOKEN.fullmatch(self.attempt_identity)
+            or type(self.role) is not FailureRole
+        ):
             raise FailureRecoveryError("failure binding is invalid")
 
 
@@ -191,6 +204,7 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
     connection = _open_writable_connection(repository) if owned_connection else connection
     try:
         _require_matching_task(connection, identity)
+        _require_attempt_admission(connection, identity, record.binding)
         current = connection.execute("SELECT task_id, record_json FROM failure_recovery_records WHERE record_digest=?", (record.digest,)).fetchone()
         expected = (identity.task_id, encoded)
         if current is None:
@@ -207,6 +221,36 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
         if owned_connection:
             connection.close()
     return record.digest
+
+
+def _require_attempt_admission(connection, identity, binding: FailureBinding) -> None:
+    """Reconcile failure identity with the trusted, session-bound admission.
+
+    Legacy attempts deliberately have no row in this forward-only table.  They
+    cannot mint a durable recovery record because fingerprints alone cannot be
+    reversed into the raw candidate or configuration identities.
+    """
+
+    row = connection.execute(
+        "SELECT admissions.task_id, admissions.candidate_sha, admissions.policy_digest, admissions.configuration_digest, admissions.authority_scope, admissions.provider_role, admissions.profile_identity, admissions.session_identity, admissions.attempt_identity, attempts.task_id, attempts.provider_role, attempts.selected_profile_identity, attempts.session_identity, contexts.task_id, contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.configuration_digest FROM provider_failure_admissions AS admissions JOIN provider_attempts AS attempts ON attempts.attempt_id = admissions.attempt_id JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = admissions.attempt_id WHERE admissions.attempt_id = ?",
+        (binding.attempt_identity,),
+    ).fetchone()
+    expected = (
+        identity.task_id, binding.candidate_sha, binding.policy_digest,
+        binding.configuration_digest, binding.authority_scope, binding.role.value,
+        binding.profile_identity, binding.session_identity, binding.attempt_identity,
+    )
+    if row is None or tuple(row[:9]) != expected:
+        raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
+    if (
+        row[9] != identity.task_id or row[10] != binding.role.value
+        or row[11] != binding.profile_identity or row[12] != binding.session_identity
+        or row[13] != identity.task_id
+        or row[14] != hashlib.sha256(binding.candidate_sha.encode()).hexdigest()
+        or row[15] != binding.policy_digest.removeprefix("sha256:")
+        or row[16] != binding.configuration_digest
+    ):
+        raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
 
 
 def read_durable_failure(repository, identity, record_digest: str) -> FailureRecord:

@@ -354,13 +354,11 @@ def prepare_attempt(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
-        try:
-            failure_role = FailureRole(role.value)
-            require_scope_open(connection, identity.task_id, failure_role.value + ":" + identity.task_id)
-        except (ValueError, Exception) as error:
-            if isinstance(error, ProviderRecoveryError):
-                raise
-            raise ProviderRecoveryError("provider dispatch scope is stopped") from error
+        if role in {ProviderRole.WORKER, ProviderRole.SUPERVISOR}:
+            try:
+                require_scope_open(connection, identity.task_id, role.value + ":" + identity.task_id)
+            except Exception as error:
+                raise ProviderRecoveryError("provider dispatch scope is stopped") from error
         if role is ProviderRole.SUPERVISOR and connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone() is not None:
             raise ProviderRecoveryError("review limit has consumed the final Worker repair")
         # The binding is first persisted only after lease and task validation,
@@ -574,8 +572,10 @@ def record_session_identity(
         if row.session_identity is not None and row.session_identity != session_identity:
             raise ProviderRecoveryError("session identity replay conflicts with committed state")
         _require_session_reuse_allowed(connection, row, session_identity)
-        if row.session_identity is None:
+        creating_session = row.session_identity is None
+        if creating_session:
             connection.execute("UPDATE provider_attempts SET session_identity = ? WHERE attempt_id = ?", (session_identity, attempt_id))
+        _persist_failure_admission(connection, identity, row, context, session_identity, create=creating_session)
         checkpoint = connection.execute(
             "SELECT task_id, session_identity, identity_fingerprint FROM provider_session_checkpoints WHERE attempt_id = ?",
             (attempt_id,),
@@ -1389,6 +1389,41 @@ def _persist_context(connection, attempt_id: str, context: RecoveryContext) -> N
         raise ProviderRecoveryError("recovery identity context has drifted")
 
 
+def _persist_failure_admission(connection, identity: TaskIdentity, row: ProviderAttempt, context: RecoveryContext, session_identity: str, *, create: bool) -> None:
+    """Seal raw failure-recovery identity only from a trusted admitted turn.
+
+    This is intentionally called from the session checkpoint transaction: the
+    provider-attempt row, opaque context, selected profile, and raw candidate
+    supplied by trusted runtime admission all still have to agree.
+    """
+
+    # Preparation and observation-only turns may legitimately predate candidate
+    # sealing.  They remain unable to create a durable failure record; do not
+    # turn that absence into a side-effecting dispatch failure.
+    if context.candidate_sha is None:
+        return
+    try:
+        failure_role = FailureRole(row.role.value)
+    except ValueError as error:
+        raise ProviderRecoveryError("failure recovery role admission is invalid") from error
+    expected = (
+        identity.task_id, context.candidate_sha, "sha256:" + context.policy_fingerprint,
+        context.runtime_binding.resolved_digest, failure_role.value + ":" + identity.task_id,
+        row.role.value, row.selected_profile_identity, session_identity, row.attempt_id,
+    )
+    existing = connection.execute(
+        "SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM provider_failure_admissions WHERE attempt_id = ?",
+        (row.attempt_id,),
+    ).fetchone()
+    if existing is None and create:
+        connection.execute(
+            "INSERT INTO provider_failure_admissions(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row.attempt_id, *expected),
+        )
+    elif existing != expected:
+        raise ProviderRecoveryError("failure recovery admission has drifted")
+
+
 def _context_matches(connection, identity: TaskIdentity, attempt_id: str, context: object) -> bool:
     """Compare all resume identities without exposing their raw values."""
 
@@ -1559,6 +1594,10 @@ def _validate_context(identity: TaskIdentity, context: RecoveryContext) -> None:
         _require_fingerprint(value, name)
     if context.candidate_fingerprint is not None:
         _require_fingerprint(context.candidate_fingerprint, "candidate fingerprint")
+        if context.candidate_sha is None or not _COMMIT.fullmatch(context.candidate_sha) or context.candidate_fingerprint != _fingerprint(context.candidate_sha):
+            raise ProviderRecoveryError("candidate admission is invalid")
+    elif context.candidate_sha is not None:
+        raise ProviderRecoveryError("candidate admission is invalid")
     if type(context.runtime_binding) is not RuntimeBinding:
         raise ProviderRecoveryError("resolved configuration binding is invalid")
 

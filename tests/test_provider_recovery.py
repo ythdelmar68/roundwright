@@ -42,7 +42,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, release_durable_recovery_route_authorization, require_scope_open
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify, commit_durable_recovery_route_successor_admission, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, release_durable_recovery_route_authorization, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -958,6 +958,31 @@ class ProviderRecoveryTests(unittest.TestCase):
                 consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
             with self.assertRaises(Exception):
                 issue_durable_recovery_route_authorization(repository, identity, **{**values, "record_digest": "sha256:" + "0" * 64})
+            release_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64)
+            reservation = "sha256:" + "3" * 64
+            self.assertTrue(begin_durable_recovery_route_reservation(repository, identity, issued, reservation_digest=reservation, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"]))
+            self.assertFalse(begin_durable_recovery_route_reservation(repository, identity, issued, reservation_digest=reservation, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"]))
+            abandon_durable_recovery_route_reservation(repository, identity, issued, reservation_digest=reservation)
+            self.assertTrue(begin_durable_recovery_route_reservation(repository, identity, issued, reservation_digest=reservation, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"]))
+            commit_durable_recovery_route_successor_admission(
+                repository, identity, issued, reservation_digest=reservation,
+                target_attempt_id="route-successor",
+                target_request_digest="sha256:" + "4" * 64,
+            )
+            # Exact restart replay is idempotent, but an admission cannot be
+            # borrowed by a different supervisor request.
+            commit_durable_recovery_route_successor_admission(
+                repository, identity, issued, reservation_digest=reservation,
+                target_attempt_id="route-successor",
+                target_request_digest="sha256:" + "4" * 64,
+            )
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT target_attempt_id, target_request_digest FROM recovery_route_successor_admissions"
+                ).fetchall(), [("route-successor", "sha256:" + "4" * 64)])
+            finally:
+                connection.close()
 
 
 if __name__ == "__main__":

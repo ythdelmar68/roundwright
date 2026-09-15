@@ -37,6 +37,9 @@ TESTS = (
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
     "tests.test_codex_supervisor.SupervisorTests.test_every_non_format_invalid_stops_before_successor",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_recovery_route_is_exact_single_use_and_restart_safe",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_recovery_route_fence_interruption_reconciles_before_successor_dispatch",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_recovery_route_fence_interruption_reconciles_before_successor_session",
+    "tests.test_codex_supervisor.SupervisorTests.test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

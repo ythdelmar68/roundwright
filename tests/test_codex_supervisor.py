@@ -28,7 +28,7 @@ from roundwright.codex_supervisor import (
 )
 from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState, prepare_attempt, record_external_turn, record_session_identity
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
-from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, reserve_role_effect, trusted_provider_launch_context
 from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, required_provider_selections
@@ -317,6 +317,44 @@ class SupervisorTests(unittest.TestCase):
         fallback = self.adapter(self.profiles[1], "failed-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
         result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.BLOCKED, (primary.profile_identity,), 1, 0))
+
+    def test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails(self):
+        """The generic dispatcher unwinds a prepared fallback before dispatch."""
+
+        primary = self.adapter(self.profiles[0], "fence-primary", NativeSupervisorResponse(
+            SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX,
+        ))
+        fallback = self.adapter(self.profiles[1], "fence-fallback", NativeSupervisorResponse(
+            SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+        ))
+        requests = (self.request(1, primary, logical=1), self.request(2, fallback, logical=1, physical=1))
+        executions = self.admissions((primary, fallback), requests)
+        route_events: list[str] = []
+        authorization = SupervisorFallbackAuthorization(
+            requests[0].input_digest, requests[1].input_digest,
+            lambda reservation: reservation.require_recovery_route(executions[1]),
+            prepare=lambda: route_events.append("prepared"),
+            abandon=lambda: route_events.append("abandoned"),
+        )
+        original_reserve = reserve_role_effect
+        calls = 0
+
+        def reserve_then_fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RoleCapabilityError("injected successor reservation failure")
+            return original_reserve(*args, **kwargs)
+
+        with patch("roundwright.codex_supervisor.reserve_role_effect", side_effect=reserve_then_fail):
+            with self.assertRaisesRegex(CodexSupervisorError, "budget admission is denied"):
+                dispatch_ordered_supervisor_attempts(
+                    requests, (primary, fallback), executions, self.execution_hosts((primary, fallback)),
+                    (self.next_budget_path(), self.next_budget_path()),
+                    checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None,
+                    authorize_fallback=lambda _source, _result, _target: authorization,
+                )
+        self.assertEqual((route_events, primary._backend.calls, fallback._backend.calls), (["prepared", "abandoned"], 1, 0))
 
     def test_security_denial_stops_before_a_prebound_profile_fallback(self):
         primary = self.adapter(self.profiles[0], "security-denial", NativeSupervisorResponse(

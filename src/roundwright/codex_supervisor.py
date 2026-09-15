@@ -418,6 +418,8 @@ class SupervisorFallbackAuthorization:
     source_request_identity: str
     target_request_identity: str
     consume: Callable[[TrustedRoleEffectReservation], None]
+    prepare: Callable[[], None] | None = None
+    abandon: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if (not _DIGEST.fullmatch(self.source_request_identity)
@@ -456,6 +458,11 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
                 request_material=request_material, preflight_material=preflight_material,
             )
         except RoleCapabilityError as error:
+            if pending_authorization is not None and pending_authorization.abandon is not None:
+                try:
+                    pending_authorization.abandon()
+                except Exception:
+                    pass
             raise CodexSupervisorError("Supervisor budget admission is denied") from error
         if pending_authorization is not None:
             if (pending_authorization.target_request_identity != request.input_digest
@@ -471,6 +478,11 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
                     effect_reservation.reject_recovery_route()
                 except RoleCapabilityError:
                     pass
+                if pending_authorization.abandon is not None:
+                    try:
+                        pending_authorization.abandon()
+                    except Exception:
+                        pass
                 raise CodexSupervisorError("Supervisor fallback route consumption is denied") from error
             pending_authorization = None
         result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, effect_reservation=effect_reservation)
@@ -496,6 +508,11 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
                     or pending_authorization.source_request_identity != request.input_digest
                     or pending_authorization.target_request_identity != requests[ordinal].input_digest):
                 raise CodexSupervisorError("Supervisor fallback route is invalid")
+            if pending_authorization.prepare is not None:
+                try:
+                    pending_authorization.prepare()
+                except Exception as error:
+                    raise CodexSupervisorError("Supervisor fallback route preparation is denied") from error
         if expected_physical == 2:
             expected_logical += 1
             expected_physical = 0

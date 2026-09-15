@@ -71,3 +71,17 @@ dispatch only for durable `SYNTAX` and `SHAPE` invalid outcomes; `CONTEXT`,
 `CANDIDATE`, `NON_FINAL`, and every unclassified invalid outcome remain
 terminal with zero successor effects. The qualification inventory pins both
 the exact route-release replay and every non-format-invalid denial case.
+
+## E1R7 fenced successor admission
+
+An eligible recovery route now moves through `issued`, `reserving`, and
+`consumed`. The route fence is durable before the separate role-budget ledger
+reservation; a restart that finds an unadmitted fence releases only its exact
+reservation (if one exists), restores the route, and then retries. A prepared
+provider or dependency-review successor instead recovers its original sealed
+reservation and commits the route idempotently, so it is never released and
+re-reserved on restart. The generic Supervisor path records a durable successor
+admission in the same transaction as its route consumption before native
+dispatch. Three injected interruption tests pin those provider-runtime,
+dependency-review, and generic-Supervisor interleavings; no successor session
+or turn is opened until the appropriate admission is durable.

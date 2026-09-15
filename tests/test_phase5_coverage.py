@@ -220,13 +220,16 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
             "tests.test_codex_supervisor.SupervisorTests.test_every_non_format_invalid_stops_before_successor",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_recovery_route_is_exact_single_use_and_restart_safe",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_recovery_route_fence_interruption_reconciles_before_successor_dispatch",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_recovery_route_fence_interruption_reconciles_before_successor_session",
+            "tests.test_codex_supervisor.SupervisorTests.test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
         self.assertEqual(tuple(coverage.ISSUE_132_FINDING_REQUIREMENTS), tuple(f"E1R2-{number:02d}" for number in range(1, 9)))
         self.assertEqual(
             tuple(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS),
-            ("RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003", "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006", "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008"),
+            ("RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003", "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006", "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008", "RW132-ROUTE-FENCE-009", "RW132-DEPENDENCY-FENCE-010", "RW132-SUPERVISOR-FENCE-011"),
         )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:

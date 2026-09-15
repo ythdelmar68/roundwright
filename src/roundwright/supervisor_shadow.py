@@ -16,10 +16,10 @@ from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, Co
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
 from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt
-from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recover_role_effect_reservation, recovery_reservation_digest
 from .state import TaskIdentity, database_path, require_runtime_binding
 from .provider_recovery import RecoveryContext
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, classify_for_role, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure, release_durable_recovery_route_authorization
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify_for_role, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -927,6 +927,9 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         source_binding, source_digest = source_pair
         target_ordinal = requests.index(target)
         target_execution = advisory_executions[target_ordinal]
+        target_adapter = adapters[target_ordinal]
+        target_host = execution_hosts[target_ordinal]
+        request_material, preflight_material = target_adapter.effect_material(target)
         target_route_digest = _hash({
             "schema": "roundwright-supervisor-fallback-target/v1",
             "source_request": source.input_digest, "target_request": target.input_digest,
@@ -964,55 +967,86 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         if authorization != issued or authorization.binding != source_binding:
             raise SupervisorShadowError("Supervisor fallback route has drifted")
 
+        try:
+            reservation_digest = recovery_reservation_digest(
+                target_execution, host_inputs=target_host, profile=target_adapter._profile,
+                request_or_attempt_identity=target.provider_attempt_id,
+                request_material=request_material, preflight_material=preflight_material,
+            )
+        except RoleCapabilityError as error:
+            raise SupervisorShadowError("Supervisor fallback reservation is unavailable") from error
+
+        def prepare() -> None:
+            """Fence before the generic dispatcher touches the budget file."""
+
+            try:
+                acquired = begin_durable_recovery_route_reservation(
+                    repository, task_identity, authorization,
+                    reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
+                    target_profile_digest=target.selected_profile_identity,
+                    target_route_digest=target_route_digest, coordinate_digest=coordinate_digest,
+                    remaining_budget_digest=remaining_budget_digest,
+                )
+                if acquired:
+                    return
+                try:
+                    recovered = recover_role_effect_reservation(
+                        target_execution, host_inputs=target_host, ledger_path=budget_ledger_path,
+                        profile=target_adapter._profile,
+                        request_or_attempt_identity=target.provider_attempt_id,
+                        request_material=request_material, preflight_material=preflight_material,
+                    )
+                    recovered.reject_recovery_route()
+                except RoleCapabilityError:
+                    pass
+                abandon_durable_recovery_route_reservation(
+                    repository, task_identity, authorization, reservation_digest=reservation_digest,
+                )
+                if not begin_durable_recovery_route_reservation(
+                    repository, task_identity, authorization,
+                    reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
+                    target_profile_digest=target.selected_profile_identity,
+                    target_route_digest=target_route_digest, coordinate_digest=coordinate_digest,
+                    remaining_budget_digest=remaining_budget_digest,
+                ):
+                    raise SupervisorShadowError("Supervisor fallback reservation is unavailable")
+            except SupervisorShadowError:
+                raise
+            except Exception as error:
+                raise SupervisorShadowError("Supervisor fallback reservation is unavailable") from error
+
         def consume(reservation: TrustedRoleEffectReservation) -> None:
             if type(reservation) is not TrustedRoleEffectReservation:
                 raise SupervisorShadowError("Supervisor fallback reservation is invalid")
-            reservation_digest: str | None = None
             try:
                 reserved_execution = reservation.require_recovery_route(target_execution)
                 if reserved_execution.digest != target_execution.execution_binding.digest:
                     raise SupervisorShadowError("Supervisor fallback reservation has drifted")
-                reservation_digest = _hash({
-                    "schema": "roundwright-supervisor-fallback-reservation/v1",
-                    "route": authorization.route_digest,
-                    "target_execution": reserved_execution.digest,
-                    "target_request": target.input_digest,
-                    "target_profile": target.selected_profile_identity,
-                })
-                consume_durable_recovery_route_authorization(
+                if reservation.recovery_digest != reservation_digest:
+                    raise SupervisorShadowError("Supervisor fallback reservation has drifted")
+                commit_durable_recovery_route_successor_admission(
                     repository, task_identity, authorization,
                     reservation_digest=reservation_digest,
-                    target_role=FailureRole.SUPERVISOR,
-                    target_profile_digest=target.selected_profile_identity,
-                    target_route_digest=target_route_digest,
-                    coordinate_digest=coordinate_digest,
-                    remaining_budget_digest=remaining_budget_digest,
+                    target_attempt_id=target.provider_attempt_id,
+                    target_request_digest=target.input_digest,
                     now=evidence_time,
                 )
                 if read_durable_recovery_route_authorization(repository, task_identity, authorization.route_digest) != authorization:
                     raise SupervisorShadowError("Supervisor fallback route read-back drifted")
             except SupervisorShadowError:
-                if reservation_digest is not None:
-                    try:
-                        release_durable_recovery_route_authorization(
-                            repository, task_identity, authorization,
-                            reservation_digest=reservation_digest,
-                        )
-                    except Exception:
-                        pass
                 raise
             except Exception as error:
-                if reservation_digest is not None:
-                    try:
-                        release_durable_recovery_route_authorization(
-                            repository, task_identity, authorization,
-                            reservation_digest=reservation_digest,
-                        )
-                    except Exception:
-                        pass
                 raise SupervisorShadowError("Supervisor fallback route consumption is unavailable") from error
 
-        return SupervisorFallbackAuthorization(source.input_digest, target.input_digest, consume)
+        def abandon() -> None:
+            try:
+                abandon_durable_recovery_route_reservation(
+                    repository, task_identity, authorization, reservation_digest=reservation_digest,
+                )
+            except Exception as error:
+                raise SupervisorShadowError("Supervisor fallback reservation is unavailable") from error
+
+        return SupervisorFallbackAuthorization(source.input_digest, target.input_digest, consume, prepare, abandon)
 
     failover = dispatch_ordered_supervisor_attempts(
         requests, adapters, advisory_executions, execution_hosts,

@@ -33,13 +33,14 @@ from .provider_health import ProviderHealthAuditIdentity
 from .failure_recovery import (
     EvidenceSource, FailureBinding, FailureClass, FailureRole,
     RecoveryAction as FailureRecoveryAction, classify,
-    consume_durable_recovery_route_authorization,
-    release_durable_recovery_route_authorization,
+    abandon_durable_recovery_route_reservation,
+    begin_durable_recovery_route_reservation,
+    commit_durable_recovery_route_reservation,
     issue_durable_recovery_route_authorization,
     native_failure_class, parse_failure_record, read_durable_failure,
 )
 from .provider_health import CodexFailure
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recovery_reservation_digest, reserve_role_effect, trusted_provider_launch_context
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recovery_reservation_digest, recover_role_effect_reservation, reserve_role_effect, trusted_provider_launch_context
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
@@ -840,6 +841,7 @@ class DurableDiffReviewRunner:
 
         selection, recovery, audit, backend = entry.selection, entry.recovery, entry.audit, entry.backend
         runtime = recovery.runtime_binding
+        existing_prepared = False
         try:
             existing = read_attempt(
                 self.repository, self.identity, selection.provider_attempt_id,
@@ -865,6 +867,7 @@ class DurableDiffReviewRunner:
                 raise ProviderAttemptRuntimeError("provider attempt session ended before a durable turn checkpoint")
             if existing.state is not AttemptState.PREPARED:
                 raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
+            existing_prepared = True
         except ProviderRecoveryError:
             pass
         context, request_material, preflight_material = provider_attempt_effect_material(
@@ -883,51 +886,81 @@ class DurableDiffReviewRunner:
             physical_format_output_ordinal=selection.physical_format_output_ordinal,
             lease=self.lease, now=self.dispatch_control.now,
         )
-        try:
-            # Reserve all three reviewed dimensions before any durable attempt
-            # mutation or native SDK effect.  Each fallback derives its own
-            # exact attempt identity while sharing only the SQLite file.
-            reservation = reserve_role_effect(
-                entry.advisory_execution, host_inputs=entry.execution_host,
-                ledger_path=self.budget_ledger_path, profile=audit.profile,
-                request_or_attempt_identity=selection.provider_attempt_id,
-                request_material=request_material,
-                preflight_material=preflight_material,
-            )
-        except RoleCapabilityError as error:
-            raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
-        consumed_reservation_digest: str | None = None
+        route_reserved = False
         if recovery_route is not None:
             route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)
             try:
-                # The persisted route names the opaque reservation identity,
-                # not merely a caller-derived route/budget projection.
-                if reservation.recovery_digest != reservation_digest:
-                    reservation.reject_recovery_route()
-                    raise ProviderAttemptRuntimeError("provider terminal recovery reservation has drifted")
-                try:
-                    reservation.require_recovery_route(entry.advisory_execution)
-                except RoleCapabilityError:
-                    reservation.reject_recovery_route()
-                    raise ProviderAttemptRuntimeError("provider terminal recovery reservation has drifted") from None
-                consume_durable_recovery_route_authorization(
-                    self.repository, self.identity, recovery_route,
-                    reservation_digest=reservation_digest,
-                    target_role=FailureRole.SUPERVISOR,
-                    target_profile_digest=audit.profile_identity,
-                    target_route_digest=route, coordinate_digest=coordinate,
-                    remaining_budget_digest=remaining, now=self.dispatch_control.now,
-                )
-                consumed_reservation_digest = reservation_digest
+                # A prepared successor is itself the durable admission.  It
+                # must recover the exact reservation and finish the route
+                # commit; attempting to acquire the route again would turn a
+                # restart into a spurious second successor reservation.
+                if not existing_prepared:
+                    route_reserved = begin_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                        target_role=FailureRole.SUPERVISOR,
+                        target_profile_digest=audit.profile_identity,
+                        target_route_digest=route, coordinate_digest=coordinate,
+                        remaining_budget_digest=remaining,
+                    )
+                if not route_reserved and not existing_prepared:
+                    # Reconcile an interruption before another reservation.
+                    try:
+                        recovered = recover_role_effect_reservation(
+                            entry.advisory_execution, host_inputs=entry.execution_host,
+                            ledger_path=self.budget_ledger_path, profile=audit.profile,
+                            request_or_attempt_identity=selection.provider_attempt_id,
+                            request_material=request_material, preflight_material=preflight_material,
+                        )
+                        recovered.reject_recovery_route()
+                    except RoleCapabilityError:
+                        pass
+                    abandon_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                    )
+                    route_reserved = begin_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
+                        target_profile_digest=audit.profile_identity, target_route_digest=route,
+                        coordinate_digest=coordinate, remaining_budget_digest=remaining,
+                    )
             except Exception as error:
-                # Consumption rejection happens before any successor attempt
-                # checkpoint.  Refund only this untouched exact reservation;
-                # a failed refund is itself ambiguous and remains fail-closed.
-                try:
-                    reservation.reject_recovery_route()
-                except RoleCapabilityError:
-                    pass
                 raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
+        reservation = None
+        try:
+            # The durable route fence is written before the separate budget
+            # file.  Restart sees and reconciles that fence before it can
+            # create another reservation.
+            reservation = (
+                recover_role_effect_reservation(
+                    entry.advisory_execution, host_inputs=entry.execution_host,
+                    ledger_path=self.budget_ledger_path, profile=audit.profile,
+                    request_or_attempt_identity=selection.provider_attempt_id,
+                    request_material=request_material, preflight_material=preflight_material,
+                )
+                if recovery_route is not None and existing_prepared and not route_reserved
+                else reserve_role_effect(
+                    entry.advisory_execution, host_inputs=entry.execution_host,
+                    ledger_path=self.budget_ledger_path, profile=audit.profile,
+                    request_or_attempt_identity=selection.provider_attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+            )
+            if recovery_route is not None:
+                if reservation.recovery_digest != reservation_digest:
+                    raise ProviderAttemptRuntimeError("provider terminal recovery reservation has drifted")
+                reservation.require_recovery_route(entry.advisory_execution)
+        except (RoleCapabilityError, ProviderAttemptRuntimeError) as error:
+            if recovery_route is not None and route_reserved:
+                try:
+                    if reservation is not None:
+                        reservation.reject_recovery_route()
+                    abandon_durable_recovery_route_reservation(self.repository, self.identity, recovery_route, reservation_digest=reservation_digest)
+                except Exception:
+                    pass
+            raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
         try:
             prepared = prepare_attempt(
                 self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
@@ -940,18 +973,26 @@ class DurableDiffReviewRunner:
                 lease=self.lease, now=self.dispatch_control.now,
             )
         except Exception:
-            if recovery_route is not None and consumed_reservation_digest is not None:
+            if recovery_route is not None and route_reserved:
                 try:
-                    release_durable_recovery_route_authorization(
-                        self.repository, self.identity, recovery_route,
-                        reservation_digest=consumed_reservation_digest,
-                    )
                     reservation.reject_recovery_route()
+                    abandon_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                    )
                 except Exception:
                     pass
             raise
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+        if recovery_route is not None:
+            try:
+                commit_durable_recovery_route_reservation(
+                    self.repository, self.identity, recovery_route,
+                    reservation_digest=reservation_digest, now=self.dispatch_control.now,
+                )
+            except Exception as error:
+                raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
         try:
             claim_supervisor_dispatch(
                 self.repository, self.identity, recovery,

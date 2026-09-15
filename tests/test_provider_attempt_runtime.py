@@ -34,6 +34,7 @@ from roundwright.provider_attempt_runtime import (
     ProviderAttemptRuntimeResources, ProviderAttemptCompletionPolicy, PRODUCTION_COMPLETION_POLICY,
     install_host_runtime, provider_attempt_effect_material,
 )
+import roundwright.provider_attempt_runtime as provider_attempt_runtime
 from roundwright.provider_health import CodexFailure
 from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
@@ -548,6 +549,71 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             ))
             self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
             self.assertEqual((primary.calls, fallback.calls), (1, 1))
+
+    def test_recovery_route_fence_interruption_reconciles_before_successor_dispatch(self) -> None:
+        """A crash after the route fence cannot strand or duplicate a successor."""
+
+        with TemporaryDirectory() as temporary:
+            runner, primary, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+            )
+            successor_recovery = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            successor = DiffReviewSelection(
+                "runtime-fence-review-two", runner.selection.implementation_attempt_id,
+                "runtime-fence-provider-two", "runtime-fence-message-two", "runtime-fence-lease-two",
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.",
+                ("Return a strict verdict.",), 2,
+            )
+            fallback = Backend("runtime-fence-two", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), [])
+            restarted = replace(runner, sequence=(
+                self.sequence_entry(runner, backend=primary),
+                self.sequence_entry(
+                    runner, selection=successor, recovery=successor_recovery,
+                    audit=successor_recovery.health_receipt.audit_identity, backend=fallback,
+                ),
+            ))
+            original_begin = provider_attempt_runtime.begin_durable_recovery_route_reservation
+
+            def interrupt_after_fence(*args, **kwargs):
+                original_begin(*args, **kwargs)
+                raise RuntimeError("injected interruption after durable route fence")
+
+            with patch("roundwright.provider_attempt_runtime.begin_durable_recovery_route_reservation", side_effect=interrupt_after_fence):
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "recovery route is unavailable"):
+                    restarted.execute()
+            self.assertEqual((primary.calls, fallback.calls), (1, 0))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("reserving",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id = ?",
+                    (successor.provider_attempt_id,),
+                ).fetchall(), [])
+            finally:
+                connection.close()
+            # Restart first abandons the fence with no matching budget row,
+            # then admits exactly one prepared successor and commits the route.
+            self.assertEqual(restarted.execute(), (runner.selection.provider_attempt_id, successor.provider_attempt_id))
+            self.assertEqual((primary.calls, fallback.calls), (1, 1))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("consumed",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id = ?",
+                    (successor.provider_attempt_id,),
+                ).fetchall(), [("accepted",)])
+            finally:
+                connection.close()
             connection = sqlite3.connect(shared_path)
             try:
                 rows = connection.execute(

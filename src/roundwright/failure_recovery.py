@@ -447,6 +447,201 @@ def consume_durable_recovery_route_authorization(repository, identity, authoriza
     finally: connection.close()
 
 
+def begin_durable_recovery_route_reservation(
+    repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
+    reservation_digest: str, target_role: FailureRole,
+    target_profile_digest: str, target_route_digest: str,
+    coordinate_digest: str, remaining_budget_digest: str,
+) -> bool:
+    """Durably fence one successor before its separate budget reservation.
+
+    ``True`` means this caller acquired an issued route.  ``False`` means an
+    interrupted predecessor already fenced the *same* exact reservation and
+    must be reconciled before another reservation is attempted.
+    """
+
+    from .state import _open_writable_connection, _require_matching_task
+    if (type(authorization) is not DurableRecoveryRouteAuthorization
+            or type(target_role) is not FailureRole
+            or not all(_DIGEST.fullmatch(value) for value in (
+                reservation_digest, target_profile_digest, target_route_digest,
+                coordinate_digest, remaining_budget_digest,
+            ))):
+        raise FailureRecoveryError("durable recovery route reservation is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        row = connection.execute(
+            "SELECT repository_id, record_digest, binding_json, target_role, "
+            "target_profile_digest, target_route_digest, coordinate_digest, "
+            "remaining_budget_digest, state, reservation_digest "
+            "FROM recovery_route_authorizations WHERE route_digest=? AND task_id=?",
+            (authorization.route_digest, identity.task_id),
+        ).fetchone()
+        encoded = json.dumps(_binding_payload(authorization.binding), sort_keys=True, separators=(",", ":"))
+        common = (identity.repository_id, authorization.record_digest, encoded,
+                  authorization.target_role.value, authorization.target_profile_digest,
+                  authorization.target_route_digest, authorization.coordinate_digest,
+                  authorization.remaining_budget_digest)
+        if (row is None or row[:8] != common or
+                (target_role, target_profile_digest, target_route_digest,
+                 coordinate_digest, remaining_budget_digest) != (
+                    authorization.target_role, authorization.target_profile_digest,
+                    authorization.target_route_digest, authorization.coordinate_digest,
+                    authorization.remaining_budget_digest)):
+            raise FailureRecoveryError("durable recovery route reservation has drifted")
+        _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
+        if row[8:] == ("issued", None):
+            if connection.execute(
+                "UPDATE recovery_route_authorizations SET state='reserving', "
+                "reservation_digest=? WHERE route_digest=? AND task_id=? AND state='issued'",
+                (reservation_digest, authorization.route_digest, identity.task_id),
+            ).rowcount != 1:
+                raise FailureRecoveryError("durable recovery route reservation is unavailable")
+            connection.commit()
+            return True
+        if row[8:] == ("reserving", reservation_digest):
+            connection.commit()
+            return False
+        raise FailureRecoveryError("durable recovery route is already admitted")
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def commit_durable_recovery_route_reservation(
+    repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
+    reservation_digest: str, now: int | None = None,
+) -> None:
+    """Commit a fenced route only after a durable successor exists."""
+
+    from .state import _open_writable_connection, _require_matching_task
+    observed = int(time.time()) if now is None else now
+    if (type(authorization) is not DurableRecoveryRouteAuthorization
+            or not _DIGEST.fullmatch(reservation_digest)
+            or type(observed) is not int or observed <= 0):
+        raise FailureRecoveryError("durable recovery route commit is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
+        updated = connection.execute(
+            "UPDATE recovery_route_authorizations SET state='consumed', consumed_at=? "
+            "WHERE route_digest=? AND task_id=? AND state='reserving' AND reservation_digest=?",
+            (observed, authorization.route_digest, identity.task_id, reservation_digest),
+        ).rowcount
+        if updated != 1:
+            row = connection.execute(
+                "SELECT state, reservation_digest FROM recovery_route_authorizations "
+                "WHERE route_digest=? AND task_id=?", (authorization.route_digest, identity.task_id),
+            ).fetchone()
+            if row != ("consumed", reservation_digest):
+                raise FailureRecoveryError("durable recovery route commit has drifted")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def commit_durable_recovery_route_successor_admission(
+    repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
+    reservation_digest: str, target_attempt_id: str, target_request_digest: str,
+    now: int | None = None,
+) -> None:
+    """Atomically record a supervisor successor admission and consume its route.
+
+    The generic supervisor dispatcher has no provider-attempt row before it
+    invokes its adapter.  Its recovery route therefore cannot be committed on
+    its own: a process death in that gap would leave a spent budget with no
+    durable successor.  This admission row is the comparable pre-dispatch
+    successor record and is committed in the same repository transaction as
+    the route transition.  A replay with the exact same sealed material is
+    idempotent; every other replay fails closed.
+    """
+
+    from .state import _open_writable_connection, _require_matching_task
+    observed = int(time.time()) if now is None else now
+    if (type(authorization) is not DurableRecoveryRouteAuthorization
+            or not _DIGEST.fullmatch(reservation_digest)
+            or not isinstance(target_attempt_id, str) or not target_attempt_id
+            or not _DIGEST.fullmatch(target_request_digest)
+            or type(observed) is not int or observed <= 0):
+        raise FailureRecoveryError("durable recovery successor admission is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
+        expected = (authorization.route_digest, identity.task_id, identity.repository_id,
+                    reservation_digest, target_attempt_id, target_request_digest)
+        row = connection.execute(
+            "SELECT route_digest, task_id, repository_id, reservation_digest, target_attempt_id, target_request_digest "
+            "FROM recovery_route_successor_admissions WHERE route_digest=?",
+            (authorization.route_digest,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO recovery_route_successor_admissions("
+                "route_digest, task_id, repository_id, reservation_digest, target_attempt_id, target_request_digest, admitted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (*expected, observed),
+            )
+        elif row != expected:
+            raise FailureRecoveryError("durable recovery successor admission has drifted")
+        updated = connection.execute(
+            "UPDATE recovery_route_authorizations SET state='consumed', consumed_at=? "
+            "WHERE route_digest=? AND task_id=? AND state='reserving' AND reservation_digest=?",
+            (observed, authorization.route_digest, identity.task_id, reservation_digest),
+        ).rowcount
+        if updated != 1:
+            route = connection.execute(
+                "SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=? AND task_id=?",
+                (authorization.route_digest, identity.task_id),
+            ).fetchone()
+            if route != ("consumed", reservation_digest):
+                raise FailureRecoveryError("durable recovery successor admission has drifted")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def abandon_durable_recovery_route_reservation(
+    repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
+    reservation_digest: str,
+) -> None:
+    """Restore only a fenced, not-yet-admitted route during reconciliation."""
+
+    from .state import _open_writable_connection, _require_matching_task
+    if type(authorization) is not DurableRecoveryRouteAuthorization or not _DIGEST.fullmatch(reservation_digest):
+        raise FailureRecoveryError("durable recovery route abandonment is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        updated = connection.execute(
+            "UPDATE recovery_route_authorizations SET state='issued', reservation_digest=NULL "
+            "WHERE route_digest=? AND task_id=? AND state='reserving' AND reservation_digest=?",
+            (authorization.route_digest, identity.task_id, reservation_digest),
+        ).rowcount
+        if updated != 1:
+            raise FailureRecoveryError("durable recovery route abandonment has drifted")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def release_durable_recovery_route_authorization(
     repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
     reservation_digest: str,

@@ -24,14 +24,16 @@ from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAudi
 from .failure_recovery import (
     DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
     FailureClass, FailureRole, FailureRecord, RecoveryAction,
-    classify_native_failure, consume_durable_recovery_route_authorization,
-    release_durable_recovery_route_authorization,
+    abandon_durable_recovery_route_reservation,
+    begin_durable_recovery_route_reservation,
+    commit_durable_recovery_route_reservation,
+    classify_native_failure,
     issue_durable_recovery_route_authorization, parse_failure_record,
     read_durable_failure, read_durable_recovery_route_authorization,
     record_durable_failure,
 )
 from .state import TaskIdentity, _open_writable_connection
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recovery_reservation_digest, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recovery_reservation_digest, recover_role_effect_reservation, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -264,7 +266,7 @@ class DependencyReviewService:
         connection = _open_writable_connection(repository)
         try:
             existing_attempt = connection.execute(
-                "SELECT 1 FROM dependency_review_attempts WHERE attempt_id = ?",
+                "SELECT state FROM dependency_review_attempts WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()
         finally:
@@ -281,31 +283,20 @@ class DependencyReviewService:
             advisory_execution, execution_host, adapter,
         )
         request_material, preflight_material = adapter.effect_material(request)
-        consumed_reservation_digest: str | None = None
-        try:
-            reservation = reserve_role_effect(
-                advisory_execution, host_inputs=execution_host,
-                ledger_path=budget_ledger_path,
-                profile=advisory_execution.execution_binding.provider_profile,
-                request_or_attempt_identity=attempt_id,
-                request_material=request_material,
-                preflight_material=preflight_material,
+        route_reserved = False
+        if recovery_route is not None:
+            route, coordinate, remaining, reservation_digest = self._recovery_route_material(
+                request, binding, supersedes_attempt_id, advisory_execution,
+                execution_host, adapter,
             )
-            if recovery_route is not None:
-                route, coordinate, remaining, reservation_digest = self._recovery_route_material(
-                    request, binding, supersedes_attempt_id, advisory_execution,
-                    execution_host, adapter,
-                )
-                if reservation.recovery_digest != reservation_digest:
-                    reservation.reject_recovery_route()
-                    raise DependencyReviewDispatchError("dependency review recovery reservation has drifted")
-                try:
-                    reservation.require_recovery_route(advisory_execution)
-                except RoleCapabilityError:
-                    reservation.reject_recovery_route()
-                    raise DependencyReviewDispatchError("dependency review recovery reservation has drifted") from None
-                try:
-                    consume_durable_recovery_route_authorization(
+            try:
+                # ``prepared`` is the successor admission.  On restart keep
+                # its exact reservation and only complete the route commit;
+                # never release/re-reserve a durable successor merely because
+                # the process stopped between preparation and commit.
+                existing_prepared = existing_attempt == ("prepared",)
+                if not existing_prepared:
+                    route_reserved = begin_durable_recovery_route_reservation(
                         repository, task_identity, recovery_route,
                         reservation_digest=reservation_digest,
                         target_role=FailureRole.DEPENDENCY_REVIEW,
@@ -313,15 +304,61 @@ class DependencyReviewService:
                         target_route_digest=route, coordinate_digest=coordinate,
                         remaining_budget_digest=remaining,
                     )
-                    consumed_reservation_digest = reservation_digest
-                except Exception:
+                if not route_reserved and not existing_prepared:
                     try:
-                        reservation.reject_recovery_route()
+                        recovered = recover_role_effect_reservation(
+                            advisory_execution, host_inputs=execution_host,
+                            ledger_path=budget_ledger_path,
+                            profile=advisory_execution.execution_binding.provider_profile,
+                            request_or_attempt_identity=attempt_id,
+                            request_material=request_material,
+                            preflight_material=preflight_material,
+                        )
+                        recovered.reject_recovery_route()
                     except RoleCapabilityError:
                         pass
-                    raise DependencyReviewDispatchError(
-                        "dependency review transient recovery route is unavailable"
-                    ) from None
+                    abandon_durable_recovery_route_reservation(
+                        repository, task_identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                    )
+                    route_reserved = begin_durable_recovery_route_reservation(
+                        repository, task_identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                        target_role=FailureRole.DEPENDENCY_REVIEW,
+                        target_profile_digest=binding.profile_identity,
+                        target_route_digest=route, coordinate_digest=coordinate,
+                        remaining_budget_digest=remaining,
+                    )
+            except Exception as error:
+                raise DependencyReviewDispatchError("dependency review transient recovery route is unavailable") from error
+        reservation = None
+        try:
+            reservation = (
+                recover_role_effect_reservation(
+                    advisory_execution, host_inputs=execution_host,
+                    ledger_path=budget_ledger_path,
+                    profile=advisory_execution.execution_binding.provider_profile,
+                    request_or_attempt_identity=attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+                if recovery_route is not None and existing_attempt == ("prepared",)
+                else reserve_role_effect(
+                    advisory_execution, host_inputs=execution_host,
+                    ledger_path=budget_ledger_path,
+                    profile=advisory_execution.execution_binding.provider_profile,
+                    request_or_attempt_identity=attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+            )
+            if recovery_route is not None:
+                if reservation.recovery_digest != reservation_digest:
+                    raise DependencyReviewDispatchError("dependency review recovery reservation has drifted")
+                try:
+                    reservation.require_recovery_route(advisory_execution)
+                except RoleCapabilityError:
+                    raise DependencyReviewDispatchError("dependency review recovery reservation has drifted") from None
 
             def admit() -> dict[str, object]:
                 return reservation.require_before_effect(
@@ -331,7 +368,17 @@ class DependencyReviewService:
                     request_material=request_material,
                     preflight_material=preflight_material,
                 )
-        except RoleCapabilityError as error:
+        except (RoleCapabilityError, DependencyReviewDispatchError) as error:
+            if recovery_route is not None and route_reserved:
+                try:
+                    if reservation is not None:
+                        reservation.reject_recovery_route()
+                    abandon_durable_recovery_route_reservation(
+                        repository, task_identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                    )
+                except Exception:
+                    pass
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         # Do not materialize a successor lineage row before its exact recovery
         # route and sealed budget reservation agree.  In particular, a route
@@ -344,18 +391,26 @@ class DependencyReviewService:
                 supersedes_attempt_id=supersedes_attempt_id,
             )
         except Exception:
-            if recovery_route is not None and consumed_reservation_digest is not None:
+            if recovery_route is not None and route_reserved:
                 try:
-                    release_durable_recovery_route_authorization(
-                        repository, task_identity, recovery_route,
-                        reservation_digest=consumed_reservation_digest,
-                    )
                     reservation.reject_recovery_route()
+                    abandon_durable_recovery_route_reservation(
+                        repository, task_identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                    )
                 except Exception:
                     pass
             raise
         if attempt.input_digest != request.input_digest:
             raise DependencyReviewDispatchError("dependency review prepared request has drifted")
+        if recovery_route is not None:
+            try:
+                commit_durable_recovery_route_reservation(
+                    repository, task_identity, recovery_route,
+                    reservation_digest=reservation_digest,
+                )
+            except Exception as error:
+                raise DependencyReviewDispatchError("dependency review transient recovery route is unavailable") from error
         recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
         if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")

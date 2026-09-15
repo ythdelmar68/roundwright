@@ -19,6 +19,7 @@ from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewRequest, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse, DependencyReviewDispatchError, prepare_dependency_review_host,
 )
+import roundwright.codex_dependency_review as codex_dependency_review
 from roundwright.dependency_review_toolbox import (
     HarnessNativeCodexDependencyReviewBackend, _Turn, _schema,
     dependency_review_native_control_contract, dependency_review_native_control_digest,
@@ -363,6 +364,93 @@ class DependencyReviewServiceTests(unittest.TestCase):
             )
             record = read_durable_failure(repository, identity, expected.digest)
             self.assertEqual((record.binding.role, record.failure), (FailureRole.DEPENDENCY_REVIEW, FailureClass.HOST_SECURITY_DENIAL))
+
+    def test_recovery_route_fence_interruption_reconciles_before_successor_session(self) -> None:
+        """A successor restart clears a fence without a budget row before it opens a session."""
+
+        class OutageTurn(Turn):
+            def read_response(self):
+                raise CodexAdapterError(CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE)
+
+        class OutageSession(Session):
+            def start_turn(self, request):
+                self.requests.append(request)
+                return OutageTurn(self.response, self._turn_identity)
+
+        class OutageBackend(Backend):
+            def open_fresh_session(self, profile):
+                session = OutageSession(self.response, self.session_identity, self.turn_identity)
+                self.sessions.append(session)
+                return session
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            source_backend = OutageBackend(NativeDependencyReviewResponse(DependencyReviewResultKind.BLOCKED))
+            source = CodexDependencyReviewAdapter(source_backend, profile, audit)
+            source_result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=source,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity,
+                **self.effect_kwargs(repository, subset, binding, source, attempt_id="attempt-116"),
+            )
+            self.assertEqual((source_result.kind, source_result.reason_code), (
+                DependencyReviewResultKind.BLOCKED, "sdk-turn-failed",
+            ))
+            successor_subset = replace(subset, snapshot_id="subset-117", creation_reason="transient-retry")
+            successor_binding = DependencyReviewBinding(
+                successor_subset.candidate_sha, successor_subset.policy_digest,
+                successor_subset.configuration_digest, binding.profile_identity,
+            )
+            successor_backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-117"),
+            ))
+            successor = CodexDependencyReviewAdapter(successor_backend, profile, audit)
+            effect = self.effect_kwargs(
+                repository, successor_subset, successor_binding, successor, attempt_id="attempt-117",
+            )
+            original_begin = codex_dependency_review.begin_durable_recovery_route_reservation
+
+            def interrupt_after_fence(*args, **kwargs):
+                original_begin(*args, **kwargs)
+                raise RuntimeError("injected interruption after durable route fence")
+
+            with patch("roundwright.codex_dependency_review.begin_durable_recovery_route_reservation", side_effect=interrupt_after_fence):
+                with self.assertRaisesRegex(DependencyReviewDispatchError, "recovery route is unavailable"):
+                    DependencyReviewService().run(
+                        repository, successor_subset, attempt_id="attempt-117", binding=successor_binding,
+                        adapter=successor, checkpoint_session=lambda _session: None,
+                        checkpoint_turn=lambda _session, _turn: None, task_identity=identity,
+                        supersedes_attempt_id="attempt-116", **effect,
+                    )
+            self.assertEqual(successor_backend.sessions, [])
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("reserving",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-117'"
+                ).fetchall(), [])
+            finally:
+                connection.close()
+            result = DependencyReviewService().run(
+                repository, successor_subset, attempt_id="attempt-117", binding=successor_binding,
+                adapter=successor, checkpoint_session=lambda _session: None,
+                checkpoint_turn=lambda _session, _turn: None, task_identity=identity,
+                supersedes_attempt_id="attempt-116", **effect,
+            )
+            self.assertEqual((result.kind, len(successor_backend.sessions)), (DependencyReviewResultKind.ACCEPTED, 1))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("consumed",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-117'"
+                ).fetchall(), [("accepted",)])
+            finally:
+                connection.close()
 
     def test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

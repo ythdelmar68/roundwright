@@ -956,6 +956,23 @@ MIGRATIONS = (
         ),
         (("recovery_route_authorizations", "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))"),),
     ),
+    Migration(
+        77,
+        (
+            "ALTER TABLE recovery_route_authorizations RENAME TO recovery_route_authorizations_v76",
+            "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'reserving', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'reserving' AND reservation_digest IS NOT NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))",
+            "INSERT INTO recovery_route_authorizations SELECT route_digest, task_id, repository_id, record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest, state, reservation_digest, issued_at, consumed_at FROM recovery_route_authorizations_v76",
+            "DROP TABLE recovery_route_authorizations_v76",
+        ),
+        (("recovery_route_authorizations", "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'reserving', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'reserving' AND reservation_digest IS NOT NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))"),),
+    ),
+    Migration(
+        78,
+        (
+            "CREATE TABLE recovery_route_successor_admissions (route_digest TEXT PRIMARY KEY REFERENCES recovery_route_authorizations(route_digest), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, reservation_digest TEXT NOT NULL, target_attempt_id TEXT NOT NULL, target_request_digest TEXT NOT NULL, admitted_at INTEGER NOT NULL CHECK(admitted_at > 0), UNIQUE(task_id, target_attempt_id), UNIQUE(task_id, target_request_digest))",
+        ),
+        (("recovery_route_successor_admissions", "CREATE TABLE recovery_route_successor_admissions (route_digest TEXT PRIMARY KEY REFERENCES recovery_route_authorizations(route_digest), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, reservation_digest TEXT NOT NULL, target_attempt_id TEXT NOT NULL, target_request_digest TEXT NOT NULL, admitted_at INTEGER NOT NULL CHECK(admitted_at > 0), UNIQUE(task_id, target_attempt_id), UNIQUE(task_id, target_request_digest))"),),
+    ),
 )
 
 

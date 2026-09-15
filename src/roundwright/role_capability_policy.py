@@ -1190,6 +1190,44 @@ def reserve_role_effect(
         _seal=_EFFECT_RESERVATION_SEAL,
     )
 
+
+def recover_role_effect_reservation(
+    execution: "SealedRoleExecution", *, host_inputs: TrustedExecutionHostInputs,
+    ledger_path: Path, profile: ProviderProfile,
+    request_or_attempt_identity: str, request_material: Mapping[str, object],
+    preflight_material: Mapping[str, object],
+) -> TrustedRoleEffectReservation:
+    """Reconstruct one exact already-reserved effect without spending again.
+
+    This is intentionally for durable recovery routes only.  The caller must
+    first prove a matching ``reserving`` route state; this function merely
+    authenticates and reads that exact budget row so reconciliation can either
+    commit an existing successor or release the stranded reservation.
+    """
+
+    if not isinstance(ledger_path, Path):
+        raise RoleCapabilityError("role budget ledger path is invalid")
+    receipt, binding = derive_and_require_execution_for_effect(
+        execution, host_inputs=host_inputs, profile=profile,
+        request_or_attempt_identity=request_or_attempt_identity,
+        request_material=request_material, preflight_material=preflight_material,
+    )
+    if receipt.get("status") != AdvisoryRoleStatus.READY.value or execution.contract.admission is None:
+        raise RoleCapabilityError("role effect admission is unavailable")
+    exposure = execution.contract.profile.budget
+    ledger = DurableRoleBudgetLedger(
+        ledger_path, grant_receipt_digest=execution.contract.admission.grant.receipt_digest,
+        execution_binding=binding, budget=exposure,
+    )
+    ledger.require_reserved(exposure=exposure)
+    return TrustedRoleEffectReservation(
+        host_inputs=host_inputs, ledger=ledger, binding=binding,
+        exposure=exposure, profile=profile,
+        request_identity=request_or_attempt_identity,
+        request_material=request_material, preflight_material=preflight_material,
+        _seal=_EFFECT_RESERVATION_SEAL,
+    )
+
 class SealedRoleRuntimeContext:
     """Factory-sealed authoritative Git/control context for advisory admission."""
     __slots__ = ("root", "common_dir", "binding", "git_entrypoint_control", "tree", "task_candidate_sha", "_seal")

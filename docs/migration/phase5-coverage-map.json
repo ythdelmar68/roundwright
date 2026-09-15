@@ -39,7 +39,7 @@
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"9bd568eb38fa438017077c28f43dbc68a044d8ef172fcf17a81e1f5314b6450e"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
       {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"bda7c12c112bd0e29bec8db56f9b6e90c78e03d17fc1b319602a744f84671990"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"c8a6e3f545c812414e4706e750bb36b0c011131fb7c39e2e7851f862d12ed8db"},
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"ca95a478d2fef9346b325e94295c64c681c1a0648061571c4b951a06b1773731"},
       {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"98736db057804664dc15a9ee86bac232d6538eee860aab41ff046686d3a7d781"}
     ]
   },
@@ -65,7 +65,7 @@
       {"identity":"failure-recovery-candidate-review-tests-v1","path":"tests/test_candidate_review.py","sha256":"053241bdc335947e1a81af1ff35f6667d333116c95c4374c9b51352d243e4700"},
       {"identity":"failure-recovery-state-tests-v1","path":"tests/test_state.py","sha256":"2b3a764a028bf6e75af22bf6e7ad330ae0018ab9705af80c60b3be0aeb3f622c"},
       {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"bda7c12c112bd0e29bec8db56f9b6e90c78e03d17fc1b319602a744f84671990"},
-      {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"c8a6e3f545c812414e4706e750bb36b0c011131fb7c39e2e7851f862d12ed8db"},
+      {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"ca95a478d2fef9346b325e94295c64c681c1a0648061571c4b951a06b1773731"},
       {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"98736db057804664dc15a9ee86bac232d6538eee860aab41ff046686d3a7d781"},
       {"identity":"failure-recovery-roadmap-v1","path":"docs/operations/dogfood-promotion-roadmap.md","sha256":"b6acdaa1d6e1580d13899757ce836b419beb19e4bbc5d1d8424546c56d86be0b"}
     ]

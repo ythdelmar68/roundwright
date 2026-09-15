@@ -196,7 +196,7 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         events: list[str] = []
         turn = FakeTurn("turn-43", CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED), events)
         result = self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events), self.request(), events)
-        self.assertEqual((result.kind, result.failure, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, None, "thread-43", "turn-43"))
+        self.assertEqual((result.kind, result.failure, result.session_identity, result.turn_identity), (WorkerResultKind.BLOCKED, CodexFailure.SANDBOX_OR_APPROVAL_DENIED, "thread-43", "turn-43"))
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read", "abort", "close"])
 
     def test_generic_read_failure_aborts_then_closes_once_without_a_second_turn(self) -> None:

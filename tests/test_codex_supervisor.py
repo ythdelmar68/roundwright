@@ -208,6 +208,16 @@ class SupervisorTests(unittest.TestCase):
         result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.ACCEPTED, (primary.profile_identity, fallback.profile_identity), 1, 1))
 
+    def test_security_denial_stops_before_a_prebound_profile_fallback(self):
+        primary = self.adapter(self.profiles[0], "security-denial", NativeSupervisorResponse(
+            SupervisorResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+            outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+            sdk_error_category=SupervisorSdkTurnErrorCategory.SANDBOX,
+        ))
+        fallback = self.adapter(self.profiles[1], "must-not-run", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+        result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.BLOCKED, (primary.profile_identity,), 0))
+
     def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
         adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index, profile in enumerate(self.profiles, start=1))
         result = self.dispatch_ordered(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)

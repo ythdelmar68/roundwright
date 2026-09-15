@@ -30,6 +30,7 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
+from .failure_recovery import EvidenceSource, FailureClass, native_failure_class
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect, trusted_provider_launch_context
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
@@ -512,7 +513,7 @@ class DurableDiffReviewRunner:
                 else:
                     raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
         attempt_ids: list[str] = []
-        for entry in entries:
+        for position, entry in enumerate(entries):
             attempt_id, accepted = self._execute_selection(entry)
             attempt_ids.append(attempt_id)
             if accepted:
@@ -523,6 +524,22 @@ class DurableDiffReviewRunner:
             stored = read_attempt(self.repository, self.identity, attempt_id, context=self.recovery)
             if stored.state is AttemptState.AMBIGUOUS:
                 raise ProviderAttemptRuntimeError("ambiguous provider attempt blocks the bounded sequence")
+            terminal = read_supervisor_terminal_failure(
+                self.repository, self.identity, attempt_id,
+            )
+            if terminal is not None:
+                failure, evidence = native_failure_class(terminal.failure_class)
+                if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
+                    raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
+                if position + 1 >= len(entries):
+                    raise ProviderAttemptRuntimeError("provider terminal failure has no pre-bound fallback")
+                successor = entries[position + 1].selection
+                if (
+                    successor.resolved_logical_profile_position
+                    != entry.selection.resolved_logical_profile_position + 1
+                    or successor.physical_format_output_ordinal != 0
+                ):
+                    raise ProviderAttemptRuntimeError("provider terminal failure cannot use a format correction route")
             if stored.state is not AttemptState.INVALIDATED:
                 raise ProviderAttemptRuntimeError("provider attempt recovery is incomplete")
         return tuple(attempt_ids)
@@ -647,10 +664,14 @@ class DurableDiffReviewRunner:
             if existing.state is AttemptState.ACCEPTED:
                 return (existing.attempt_id, True)
             if existing.state is AttemptState.INVALIDATED:
-                if read_supervisor_terminal_failure(
+                terminal = read_supervisor_terminal_failure(
                     self.repository, self.identity, existing.attempt_id,
-                ) is not None:
-                    raise ProviderAttemptRuntimeError("provider terminal failure is not format-correctable")
+                )
+                if terminal is not None:
+                    failure, evidence = native_failure_class(terminal.failure_class)
+                    if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
+                        raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
+                    return (existing.attempt_id, False)
                 if selection.physical_format_output_ordinal == 2:
                     raise ProviderAttemptFormatCorrectionExhausted(
                         "Supervisor format correction allowance is exhausted"
@@ -827,10 +848,13 @@ class DurableDiffReviewRunner:
                     max_attempts=runtime.review_max_supervisor_attempts_per_round,
                     lease=self.lease, now=self.dispatch_control.now,
                 )
-                # Provider denials and classified transport failures are not
-                # malformed format output.  They neither consume a correction
-                # slot nor authorize a different configured profile.
-                raise ProviderAttemptRuntimeError("provider terminal failure is not format-correctable")
+                failure, evidence = native_failure_class(result.failure)
+                if failure is FailureClass.TRANSIENT_SERVICE and evidence is EvidenceSource.VERIFIED_SERVICE:
+                    # The outer ordered sequence independently verifies that
+                    # the next entry is the next logical pre-bound profile.
+                    # A terminal SDK failure never consumes a format slot.
+                    return (selection.provider_attempt_id, False)
+                raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
             if result.kind is SupervisorResultKind.INCOMPLETE:
                 if result.terminal_blocker is None:
                     raise ProviderAttemptRuntimeError("provider accounting terminal decision is invalid")

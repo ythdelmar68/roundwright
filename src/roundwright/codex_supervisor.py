@@ -18,7 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role, native_failure_class
 from pathlib import Path
 
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, reserve_role_effect
@@ -126,6 +126,30 @@ class SupervisorSdkTurnErrorCategory(StrEnum):
     STREAM = "stream"
     CONNECTION = "connection"
     MISSING_OR_UNKNOWN = "missing-or-unknown"
+
+
+def _sdk_error_category(failure: CodexFailure) -> SupervisorSdkTurnErrorCategory:
+    if failure is CodexFailure.SANDBOX_OR_APPROVAL_DENIED:
+        return SupervisorSdkTurnErrorCategory.SANDBOX
+    if failure in {CodexFailure.AUTH_MISSING, CodexFailure.AUTH_EXPIRED, CodexFailure.AUTH_REJECTED}:
+        return SupervisorSdkTurnErrorCategory.UNAUTHORIZED
+    if failure in {CodexFailure.PROVIDER_OUTAGE, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE}:
+        return SupervisorSdkTurnErrorCategory.CONNECTION
+    return SupervisorSdkTurnErrorCategory.MISSING_OR_UNKNOWN
+
+
+def _eligible_prebound_failover(result: "CodexSupervisorResult") -> bool:
+    """Only independently classified transient SDK failures may advance."""
+
+    if (
+        type(result) is not CodexSupervisorResult
+        or result.kind is not SupervisorResultKind.BLOCKED
+        or result.failure is None
+        or result.outcome_source is not SupervisorOutcomeSource.SDK_TURN_FAILED
+    ):
+        return False
+    failure, evidence = native_failure_class(result.failure)
+    return failure is FailureClass.TRANSIENT_SERVICE and evidence is EvidenceSource.VERIFIED_SERVICE
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
@@ -341,7 +365,17 @@ class CodexSupervisorAdapter:
         except CodexSupervisorError:
             _abort(turn); _close(session)
             raise
-        except (CodexAdapterError, Exception):
+        except CodexAdapterError as error:
+            _abort(turn); _close(session)
+            if session_identity is not None and turn_identity is not None:
+                return CodexSupervisorResult(
+                    SupervisorResultKind.BLOCKED, session_identity, turn_identity,
+                    failure=error.failure,
+                    outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                    sdk_error_category=_sdk_error_category(error.failure),
+                )
+            return CodexSupervisorResult(SupervisorResultKind.AMBIGUOUS, session_identity, turn_identity)
+        except Exception:
             _abort(turn); _close(session)
             return CodexSupervisorResult(SupervisorResultKind.AMBIGUOUS, session_identity, turn_identity)
         finally:
@@ -407,6 +441,8 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         if checkpoint_result is not None:
             checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:
+            return SupervisorFailoverResult(result, tuple(attempted), False)
+        if result.kind is SupervisorResultKind.BLOCKED and not _eligible_prebound_failover(result):
             return SupervisorFailoverResult(result, tuple(attempted), False)
         if result.kind not in (SupervisorResultKind.INVALID, SupervisorResultKind.BLOCKED):
             return SupervisorFailoverResult(result, tuple(attempted), False)

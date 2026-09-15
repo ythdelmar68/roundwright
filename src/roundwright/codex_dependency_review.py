@@ -191,7 +191,16 @@ class CodexDependencyReviewAdapter:
             checkpoint_turn(session_id, turn_id)
             admit()
             response = turn.read_response()
-        except (CodexAdapterError, Exception):
+        except CodexAdapterError as error:
+            _abort(turn)
+            if session_id is not None and turn_id is not None:
+                return DependencyReviewDispatchResult(
+                    DependencyReviewResultKind.BLOCKED, session_id, turn_id, None,
+                    _digest({"attempt_id": request.attempt_id, "status": "sdk-turn-failed", "failure": error.failure.value}),
+                    "sdk-turn-failed",
+                )
+            return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "session": session_id, "turn": turn_id, "status": "ambiguous"}), "uncertain-provider-turn")
+        except Exception:
             _abort(turn)
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "session": session_id, "turn": turn_id, "status": "ambiguous"}), "uncertain-provider-turn")
         finally:

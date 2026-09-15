@@ -610,17 +610,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
             ))
             first_only = replace(runner, sequence=(runner.sequence[0],))
-            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "not format-correctable"):
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
                 first_only.execute()
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
             self.assertIsNotNone(checkpoint_failure)
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
-            # A restart preserves the terminal denial and cannot use a later
-            # logical profile as a disguised format correction.
-            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "not format-correctable"):
-                runner.execute()
+            # A restart resumes only the already-selected successor profile.
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             terminal = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
@@ -630,8 +628,10 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 (terminal.failure_class, terminal.outcome_source, terminal.sdk_error_category),
                 (SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorTerminalFailureSource.SDK_TURN_FAILED, SupervisorTerminalFailureSdkCategory.OVERLOAD),
             )
-            with self.assertRaises(ProviderRecoveryError):
-                read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery)
+            self.assertEqual(
+                read_attempt(repository, identity, second_selection.provider_attempt_id, context=second_recovery).state,
+                AttemptState.ACCEPTED,
+            )
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute(
@@ -642,7 +642,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 ).fetchone(), (1, 0))
             finally:
                 connection.close()
-            self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
+            self.assertEqual((first_backend.calls, second_backend.calls), (1, 1))
             descriptor = ProviderAttemptRuntimeDescriptor.parse({
                 "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-terminal-45",
                 "repository_id": identity.repository_id, "task_id": identity.task_id,

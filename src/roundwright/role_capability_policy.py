@@ -1031,6 +1031,21 @@ class TrustedRoleEffectReservation:
         self._ledger.require_reserved(exposure=self._exposure)
         return receipt
 
+    def require_recovery_route(self, execution: "SealedRoleExecution") -> ExecutionInstanceBinding:
+        """Revalidate the exact reservation before it can authorize a retry route.
+
+        Recovery must not treat a previously returned admission receipt as a
+        transferable fallback grant.  The target effect remains tied to this
+        reservation's sealed execution binding and its already-reserved
+        worst-case budget.
+        """
+
+        if self._seal is not _EFFECT_RESERVATION_SEAL or type(execution) is not SealedRoleExecution:
+            raise RoleCapabilityError("trusted recovery route reservation is invalid")
+        execution.require_before_effect(expected_execution=self._binding)
+        self._ledger.require_reserved(exposure=self._exposure)
+        return self._binding
+
 
 def reserve_role_effect(
     execution: "SealedRoleExecution", *, host_inputs: TrustedExecutionHostInputs,

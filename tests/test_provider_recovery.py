@@ -37,6 +37,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -678,6 +679,17 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="f" * 64, lease=lease), first_invalid)
             with self.assertRaises(ProviderRecoveryError):
                 record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="a" * 64, lease=lease)
+
+    def test_restart_rejects_changed_worker_attempt_after_durable_scope_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("denied")
+            self.admit(repository, identity, lease)
+            context = self.context(identity, role=ProviderRole.WORKER)
+            binding = FailureBinding(identity.base_sha, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "session-before-denial", "denial-attempt")
+            record_durable_failure(repository, identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            with self.assertRaisesRegex(ProviderRecoveryError, "scope is stopped"):
+                self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="changed-session-attempt")
 
 
 if __name__ == "__main__":

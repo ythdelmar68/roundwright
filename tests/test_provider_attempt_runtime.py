@@ -458,6 +458,32 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(accepted.execute(), ("runtime-provider-one", "runtime-provider-two"))
             self.assertEqual(read_attempt(repository, identity, "runtime-provider-two", context=recovery).state, AttemptState.ACCEPTED)
 
+    def test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            entries = []
+            for ordinal in range(3):
+                selection = runner.selection if ordinal == 0 else DiffReviewSelection(
+                    f"runtime-format-review-{ordinal}", runner.selection.implementation_attempt_id,
+                    f"runtime-format-provider-{ordinal}", f"runtime-format-message-{ordinal}",
+                    f"runtime-format-lease-{ordinal}", runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 1,
+                    logical_profile_position=1, physical_format_output_ordinal=ordinal,
+                )
+                backend = Backend(f"runtime-format-{ordinal}", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), [])
+                entries.append(self.sequence_entry(runner, selection=selection, backend=backend))
+            exhausted = replace(runner, sequence=tuple(entries))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
+                exhausted.execute()
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE task_id = ? AND (attempt_id = ? OR attempt_id LIKE 'runtime-format-provider-%') ORDER BY attempt_number", (identity.task_id, runner.selection.provider_attempt_id)).fetchall(), [(1, 0), (1, 1), (1, 2)])
+            finally:
+                connection.close()
+
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(

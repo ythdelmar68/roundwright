@@ -386,7 +386,10 @@ class DependencyReviewServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             identity = self.bind_current_authority(repository, binding)
-            source_backend = OutageBackend(NativeDependencyReviewResponse(DependencyReviewResultKind.BLOCKED))
+            source_backend = OutageBackend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.BLOCKED,
+                failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+            ))
             source = CodexDependencyReviewAdapter(source_backend, profile, audit)
             source_result = DependencyReviewService().run(
                 repository, subset, attempt_id="attempt-116", binding=binding, adapter=source,

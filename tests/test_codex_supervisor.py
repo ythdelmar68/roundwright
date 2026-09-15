@@ -324,7 +324,10 @@ class SupervisorTests(unittest.TestCase):
         primary = self.adapter(self.profiles[0], "fence-primary", NativeSupervisorResponse(
             SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX,
         ))
-        fallback = self.adapter(self.profiles[1], "fence-fallback", NativeSupervisorResponse(
+        # A format repair stays on the current profile at physical ordinal 1.
+        # Use that valid sequence coordinate so the injected budget denial is
+        # the first rejected boundary.
+        fallback = self.adapter(self.profiles[0], "fence-fallback", NativeSupervisorResponse(
             SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
         ))
         requests = (self.request(1, primary, logical=1), self.request(2, fallback, logical=1, physical=1))

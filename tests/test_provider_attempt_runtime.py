@@ -549,6 +549,18 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             ))
             self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
             self.assertEqual((primary.calls, fallback.calls), (1, 1))
+            connection = sqlite3.connect(shared_path)
+            try:
+                rows = connection.execute(
+                    "SELECT binding_digest, calls, duration_seconds, tokens FROM role_budget_usage"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len({row[0] for row in rows}), 2)
+            self.assertEqual({row[1:] for row in rows}, {(1, 60, 4_000)})
+            self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
+            self.assertEqual((primary.calls, fallback.calls), (1, 1))
 
     def test_recovery_route_fence_interruption_reconciles_before_successor_dispatch(self) -> None:
         """A crash after the route fence cannot strand or duplicate a successor."""
@@ -556,7 +568,12 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(
                 Path(temporary) / "repository",
-                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+                NativeSupervisorResponse(
+                    SupervisorResultKind.BLOCKED,
+                    failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                    outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                    sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+                ),
             )
             successor_recovery = provider_context(
                 recovery, identity, ProviderRole.SUPERVISOR,
@@ -599,6 +616,13 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 ).fetchall(), [])
             finally:
                 connection.close()
+            connection = sqlite3.connect(restarted.budget_ledger_path)
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM role_budget_usage"
+                ).fetchone(), (1,))
+            finally:
+                connection.close()
             # Restart first abandons the fence with no matching budget row,
             # then admits exactly one prepared successor and commits the route.
             self.assertEqual(restarted.execute(), (runner.selection.provider_attempt_id, successor.provider_attempt_id))
@@ -614,18 +638,13 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 ).fetchall(), [("accepted",)])
             finally:
                 connection.close()
-            connection = sqlite3.connect(shared_path)
+            connection = sqlite3.connect(restarted.budget_ledger_path)
             try:
-                rows = connection.execute(
-                    "SELECT binding_digest, calls, duration_seconds, tokens FROM role_budget_usage"
-                ).fetchall()
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM role_budget_usage"
+                ).fetchone(), (2,))
             finally:
                 connection.close()
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(len({row[0] for row in rows}), 2)
-            self.assertEqual({row[1:] for row in rows}, {(1, 60, 4_000)})
-            self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
-            self.assertEqual((primary.calls, fallback.calls), (1, 1))
 
     def test_shared_budget_final_slot_reservations_serialize(self) -> None:
         with TemporaryDirectory() as temporary:

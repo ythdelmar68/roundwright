@@ -478,6 +478,10 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             exhausted = replace(runner, sequence=tuple(entries))
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
                 exhausted.execute()
+            calls = tuple(entry.backend.calls for entry in entries)
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
+                exhausted.execute()
+            self.assertEqual(tuple(entry.backend.calls for entry in entries), calls)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE task_id = ? AND (attempt_id = ? OR attempt_id LIKE 'runtime-format-provider-%') ORDER BY attempt_number", (identity.task_id, runner.selection.provider_attempt_id)).fetchall(), [(1, 0), (1, 1), (1, 2)])

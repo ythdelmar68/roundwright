@@ -886,6 +886,7 @@ class DependencyReviewAttemptAdapter:
                 execution_host=host.execution_host, budget_ledger_path=host.budget_ledger_path,
                 source_owned_relations=host.source_owned_relations,
                 supersedes_attempt_id=host.supersedes_attempt_id,
+                task_identity=host.task_identity,
             )
             if result.session_identity is None or result.turn_identity is None:
                 raise DependencyReviewError("dependency review durable turn claim is unavailable")
@@ -939,7 +940,7 @@ class DependencyReviewAttemptAdapter:
             raise ExternalValidationAdapterError("dependency review durable readback has drifted")
         try:
             return DependencyReviewStore().terminal_snapshot(
-                host.repository, attempt_id=binding.case_id, binding=host.binding,
+                host.repository, attempt_id=binding.case_id, binding=host.binding, task_identity=host.task_identity,
             )
         except ValueError as error:
             raise ExternalValidationAdapterError("dependency review durable readback has drifted") from error
@@ -5354,7 +5355,7 @@ def _prepare_dependency_review_attempt_request(
         ):
             raise DependencyReviewDispatchError("dependency review harness requires an explicit backend")
         host_inputs = DependencyReviewHostInputs(
-            inputs.repository, inputs.subset, inputs.binding,
+            inputs.repository, None, inputs.subset, inputs.binding,
             CodexDependencyReviewAdapter(inputs.backend, inputs.audit.profile, inputs.audit),
             lambda _session: None, lambda _session, _turn: None,
             inputs.advisory_execution, inputs.execution_host,

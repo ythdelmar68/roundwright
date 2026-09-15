@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .configuration import RepositoryIdentity
-from .state import _open_writable_connection
+from .state import TaskIdentity, _open_writable_connection, _require_matching_task
 from .failure_recovery import FailureRecoveryError, require_scope_open
 
 
@@ -625,15 +625,17 @@ class DependencyReviewStore:
             connection.close()
 
     def terminal_snapshot(
-        self, repository: RepositoryIdentity, *, attempt_id: str, binding: DependencyReviewBinding,
+        self, repository: RepositoryIdentity, *, attempt_id: str, binding: DependencyReviewBinding, task_identity: TaskIdentity | None = None,
     ) -> dict[str, object]:
         """Independently reread one complete, terminal review attempt."""
 
-        if not _token(attempt_id) or type(binding) is not DependencyReviewBinding:
+        if not _token(attempt_id) or type(binding) is not DependencyReviewBinding or (task_identity is not None and type(task_identity) is not TaskIdentity):
             raise DependencyReviewError("dependency review snapshot is invalid")
         connection = _open_writable_connection(repository)
         try:
             row, subset = self._read_attempt(connection, attempt_id)
+            if task_identity is not None:
+                self._require_current_authority(connection, task_identity, subset, binding)
             binding.require_subset(subset)
             if (row[2], row[3]) != (binding.profile_identity, binding.configuration_digest) or row[6] == "prepared":
                 raise DependencyReviewError("dependency review snapshot is unavailable")
@@ -663,25 +665,83 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
-    def claim_session(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str) -> None:
-        if not _token(attempt_id) or not _opaque_identity(session_identity):
+    def claim_session(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, task_identity: TaskIdentity | None = None, binding: DependencyReviewBinding | None = None) -> None:
+        if not _token(attempt_id) or not _opaque_identity(session_identity) or (task_identity is None) != (binding is None) or (task_identity is not None and type(task_identity) is not TaskIdentity) or (binding is not None and type(binding) is not DependencyReviewBinding):
             raise DependencyReviewError("dependency review dispatch claim is invalid")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row, _ = self._read_attempt(connection, attempt_id)
+            row, subset = self._read_attempt(connection, attempt_id)
+            if task_identity is not None:
+                assert binding is not None
+                self._require_current_authority(connection, task_identity, subset, binding)
             if row[6] != "prepared":
                 raise DependencyReviewError("dependency review dispatch claim is unavailable")
             existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
             if existing is not None:
                 raise DependencyReviewError("dependency review dispatch claim is already consumed")
             connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, ?, NULL, 'session-opened')", (attempt_id, session_identity))
+            if task_identity is not None:
+                assert binding is not None
+                admission = (
+                    task_identity.task_id, binding.candidate_sha, binding.policy_digest,
+                    binding.configuration_digest, "dependency-review:" + task_identity.task_id,
+                    "dependency-review", binding.profile_identity, session_identity, attempt_id,
+                )
+                existing_admission = connection.execute(
+                    "SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM dependency_review_failure_admissions WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if existing_admission is None:
+                    connection.execute(
+                        "INSERT INTO dependency_review_failure_admissions(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (attempt_id, *admission),
+                    )
+                elif tuple(existing_admission) != admission:
+                    raise DependencyReviewError("dependency review failure admission has drifted")
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def require_current_authority(repository: RepositoryIdentity, task_identity: TaskIdentity, subset: AffectedSubset, binding: DependencyReviewBinding) -> None:
+        if type(task_identity) is not TaskIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding:
+            raise DependencyReviewError("dependency review current authority is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN")
+            DependencyReviewStore._require_current_authority(connection, task_identity, subset, binding)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _require_current_authority(connection: object, task_identity: TaskIdentity, subset: AffectedSubset, binding: DependencyReviewBinding) -> None:
+        """Revalidate the caller-provided task seal and runtime receipt in one snapshot."""
+
+        _require_matching_task(connection, task_identity)
+        binding.require_subset(subset)
+        seal = connection.execute(
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id = ?",
+            (task_identity.task_id,),
+        ).fetchone()
+        runtime = connection.execute(
+            "SELECT schema_version, resolved_digest FROM runtime_configuration_bindings WHERE task_id = ?",
+            (task_identity.task_id,),
+        ).fetchone()
+        if (
+            seal is None or seal[0] != task_identity.base_sha or seal[1] != binding.candidate_sha
+            or type(seal[2]) is not str or not seal[2]
+            or runtime != ("roundwright-runtime/v1", binding.configuration_digest)
+            or subset.task_id != task_identity.task_id
+        ):
+            raise DependencyReviewError("dependency review current authority is unavailable or has drifted")
 
     def claim_turn(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str) -> None:
         if not _token(attempt_id) or not _opaque_identity(session_identity) or not _opaque_identity(turn_identity):

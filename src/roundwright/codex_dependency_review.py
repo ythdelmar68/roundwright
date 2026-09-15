@@ -21,7 +21,8 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role, classify_native_failure, record_durable_failure
+from .state import TaskIdentity
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
 
 
@@ -109,6 +110,7 @@ class DependencyReviewDispatchResult:
     proposal: DependencyProposal | None
     output_digest: str
     reason_code: str
+    failure: CodexFailure | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -119,6 +121,7 @@ class DependencyReviewDispatchResult:
             or not _DIGEST.fullmatch(self.output_digest)
             or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", self.reason_code)
             or (self.kind is DependencyReviewResultKind.ACCEPTED) != (self.proposal is not None)
+            or ((self.kind is DependencyReviewResultKind.BLOCKED) != (type(self.failure) is CodexFailure))
         ):
             raise DependencyReviewDispatchError("dependency review result is invalid")
 
@@ -197,7 +200,7 @@ class CodexDependencyReviewAdapter:
                 return DependencyReviewDispatchResult(
                     DependencyReviewResultKind.BLOCKED, session_id, turn_id, None,
                     _digest({"attempt_id": request.attempt_id, "status": "sdk-turn-failed", "failure": error.failure.value}),
-                    "sdk-turn-failed",
+                    "sdk-turn-failed", error.failure,
                 )
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "session": session_id, "turn": turn_id, "status": "ambiguous"}), "uncertain-provider-turn")
         except Exception:
@@ -220,7 +223,7 @@ class CodexDependencyReviewAdapter:
             else "uncertain-provider-turn" if response.kind is DependencyReviewResultKind.AMBIGUOUS
             else "malformed-response"
         )
-        return DependencyReviewDispatchResult(response.kind, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "status": response.kind.value, "failure": None if response.failure is None else response.failure.value, "reason_code": reason}), reason)
+        return DependencyReviewDispatchResult(response.kind, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "status": response.kind.value, "failure": None if response.failure is None else response.failure.value, "reason_code": reason}), reason, response.failure)
 
 
 class DependencyReviewService:
@@ -232,7 +235,10 @@ class DependencyReviewService:
         checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution,
         execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path,
         source_owned_relations: tuple[SourceOwnedRelation, ...] = (), supersedes_attempt_id: str | None = None,
+        task_identity: TaskIdentity | None = None,
     ) -> DependencyReviewDispatchResult:
+        if task_identity is not None and type(task_identity) is not TaskIdentity:
+            raise DependencyReviewDispatchError("dependency review task identity is unavailable")
         if type(adapter) is not CodexDependencyReviewAdapter or adapter.profile_identity != binding.profile_identity:
             raise DependencyReviewDispatchError("dependency review adapter profile has drifted")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
@@ -246,6 +252,14 @@ class DependencyReviewService:
         request = DependencyReviewRequest(
             attempt_id, input_material, _digest(input_material), binding.profile_identity,
         )
+        if task_identity is not None:
+            store.require_current_authority(repository, task_identity, subset, binding)
+        attempt = store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding, source_owned_relations=source_owned_relations, supersedes_attempt_id=supersedes_attempt_id)
+        if attempt.input_digest != request.input_digest:
+            raise DependencyReviewDispatchError("dependency review prepared request has drifted")
+        recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
+        if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
+            return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")
         request_material, preflight_material = adapter.effect_material(request)
         try:
             reservation = reserve_role_effect(
@@ -268,17 +282,13 @@ class DependencyReviewService:
         except RoleCapabilityError as error:
             raise DependencyReviewDispatchError("dependency review advisory admission is denied") from error
         admit()
-        attempt = store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding, source_owned_relations=source_owned_relations, supersedes_attempt_id=supersedes_attempt_id)
-        if attempt.input_digest != request.input_digest:
-            raise DependencyReviewDispatchError("dependency review prepared request has drifted")
-        recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
-        admit()
-        if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
-            return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")
 
         def claimed_session(session_identity: str) -> None:
             admit()
-            store.claim_session(repository, attempt_id=attempt.attempt_id, session_identity=session_identity)
+            store.claim_session(
+                repository, attempt_id=attempt.attempt_id, session_identity=session_identity,
+                task_identity=task_identity, binding=binding if task_identity is not None else None,
+            )
             admit()
             checkpoint_session(session_identity)
 
@@ -301,7 +311,23 @@ class DependencyReviewService:
                 admit()
                 store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code="proposal-rejected")
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, result.session_identity, result.turn_identity, None, result.output_digest, "proposal-rejected")
-        elif result.kind in {DependencyReviewResultKind.AMBIGUOUS, DependencyReviewResultKind.BLOCKED}:
+        elif result.kind is DependencyReviewResultKind.BLOCKED:
+            if task_identity is not None and (result.session_identity is None or result.failure is None):
+                raise DependencyReviewDispatchError("dependency review typed terminal failure is incomplete")
+            if task_identity is not None:
+                assert result.session_identity is not None and result.failure is not None
+                failure_binding = FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + task_identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, result.session_identity, attempt.attempt_id,
+                )
+                record_durable_failure(
+                    repository, task_identity,
+                    classify_native_failure(FailureRole.DEPENDENCY_REVIEW, failure_binding, result.failure),
+                )
+            admit()
+            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
+        elif result.kind is DependencyReviewResultKind.AMBIGUOUS:
             admit()
             store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
         else:
@@ -321,6 +347,7 @@ class DependencyReviewHostInputs:
     """
 
     repository: RepositoryIdentity
+    task_identity: TaskIdentity | None
     subset: AffectedSubset
     binding: DependencyReviewBinding
     adapter: CodexDependencyReviewAdapter
@@ -335,6 +362,7 @@ class DependencyReviewHostInputs:
     def __post_init__(self) -> None:
         if (
             type(self.repository) is not RepositoryIdentity
+            or (self.task_identity is not None and type(self.task_identity) is not TaskIdentity)
             or type(self.subset) is not AffectedSubset
             or type(self.binding) is not DependencyReviewBinding
             or type(self.adapter) is not CodexDependencyReviewAdapter
@@ -348,13 +376,14 @@ class DependencyReviewHostInputs:
             or any(type(item) is not SourceOwnedRelation for item in self.source_owned_relations)
             or (self.supersedes_attempt_id is not None and not _TOKEN.fullmatch(self.supersedes_attempt_id))
             or self.adapter.profile_identity != self.binding.profile_identity
+            or (self.task_identity is not None and self.task_identity.task_id != self.subset.task_id)
         ):
             raise DependencyReviewDispatchError("dependency review host inputs are invalid")
         self.binding.require_subset(self.subset)
 
 
 def prepare_dependency_review_host(
-    repository: RepositoryIdentity, subset: AffectedSubset, binding: DependencyReviewBinding,
+    repository: RepositoryIdentity, task_identity: TaskIdentity, subset: AffectedSubset, binding: DependencyReviewBinding,
     audit: ProviderHealthAuditIdentity, *, backend: NativeCodexDependencyReviewBackend | None = None,
     advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs,
     budget_ledger_path: Path,
@@ -371,7 +400,7 @@ def prepare_dependency_review_host(
     except RoleCapabilityError as error:
         raise DependencyReviewDispatchError("dependency review production activation is unavailable") from error
 
-    if type(repository) is not RepositoryIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW or type(execution_host) is not TrustedExecutionHostInputs or not isinstance(budget_ledger_path, Path):
+    if type(repository) is not RepositoryIdentity or type(task_identity) is not TaskIdentity or type(subset) is not AffectedSubset or type(binding) is not DependencyReviewBinding or type(audit) is not ProviderHealthAuditIdentity or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW or type(execution_host) is not TrustedExecutionHostInputs or not isinstance(budget_ledger_path, Path):
         raise DependencyReviewDispatchError("dependency review preparation inputs are invalid")
     binding.require_subset(subset)
     if audit.profile_identity != binding.profile_identity or (audit.profile.model, audit.profile.reasoning_effort.value) != ("gpt-5.6-terra", "high"):
@@ -386,7 +415,7 @@ def prepare_dependency_review_host(
             ),
         )
     return DependencyReviewHostInputs(
-        repository, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit),
+        repository, task_identity, subset, binding, CodexDependencyReviewAdapter(backend, audit.profile, audit),
         lambda _session: None, lambda _session, _turn: None, advisory_execution,
         execution_host, budget_ledger_path,
         source_owned_relations, supersedes_attempt_id,

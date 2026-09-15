@@ -920,6 +920,15 @@ MIGRATIONS = (
             ("supervisor_attempt_coordinates", "CREATE TABLE supervisor_attempt_coordinates (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), review_epoch INTEGER NOT NULL CHECK(review_epoch >= 0), review_round INTEGER NOT NULL CHECK(review_round >= 1), logical_profile_position INTEGER NOT NULL CHECK(logical_profile_position >= 1), physical_format_output_ordinal INTEGER NOT NULL CHECK(physical_format_output_ordinal BETWEEN 0 AND 2), profile_identity TEXT NOT NULL, UNIQUE(task_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal))"),
         ),
     ),
+    Migration(
+        74,
+        (
+            "CREATE TABLE dependency_review_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'dependency-review'), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))",
+        ),
+        (
+            ("dependency_review_failure_admissions", "CREATE TABLE dependency_review_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'dependency-review'), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))"),
+        ),
+    ),
 )
 
 

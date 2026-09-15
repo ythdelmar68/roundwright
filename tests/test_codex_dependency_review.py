@@ -33,8 +33,9 @@ from roundwright.dependency_review import (
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
+from roundwright.runtime_binding import RuntimeBinding
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, read_durable_failure, record_durable_failure
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
@@ -134,6 +135,28 @@ class DependencyReviewServiceTests(unittest.TestCase):
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile, binding.profile_identity)
         return repository, subset, binding, profile, audit
+
+    def task_identity(self) -> TaskIdentity:
+        return TaskIdentity("task-116", "source-116", "repo-116", "codex/116", "C:/review-116", "a" * 40)
+
+    def bind_current_authority(self, repository: RepositoryIdentity, binding: DependencyReviewBinding) -> TaskIdentity:
+        """Seed the production-only authority chain independently of the adapter."""
+
+        identity = self.task_identity()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute(
+                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                (identity.task_id, identity.base_sha, binding.candidate_sha, "authority-116"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        record_runtime_binding(
+            repository, identity,
+            RuntimeBinding("roundwright-runtime/v1", binding.configuration_digest, digest("8"), (digest("9"),)),
+        )
+        return identity
 
     def proposal(self, attempt_id: str) -> dict[str, object]:
         relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
@@ -313,6 +336,51 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("blocked",))
             finally:
                 connection.close()
+
+    def test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, _audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, ProviderHealthAuditIdentity(
+                CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile, binding.profile_identity,
+            ))
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
+            )
+            self.assertEqual(result.kind, DependencyReviewResultKind.BLOCKED)
+            expected = classify(
+                FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, "session-116", "attempt-116",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST,
+            )
+            record = read_durable_failure(repository, identity, expected.digest)
+            self.assertEqual((record.binding.role, record.failure), (FailureRole.DEPENDENCY_REVIEW, FailureClass.HOST_SECURITY_DENIAL))
+
+    def test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="attempt-116", binding=binding)
+            store.claim_session(repository, attempt_id="attempt-116", session_identity="session-116", task_identity=identity, binding=binding)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116")
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity, **effect,
+            )
+            self.assertEqual((result.kind, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, 0))
+            self.assertFalse(effect["budget_ledger_path"].exists())
 
     def test_restart_after_persisted_session_claim_blocks_without_a_second_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

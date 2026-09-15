@@ -485,6 +485,9 @@ def _require_attempt_admission(connection, identity, binding: FailureBinding) ->
     reversed into the raw candidate or configuration identities.
     """
 
+    if binding.role is FailureRole.DEPENDENCY_REVIEW:
+        _require_dependency_review_admission(connection, identity, binding)
+        return
     row = connection.execute(
         "SELECT admissions.task_id, admissions.candidate_sha, admissions.policy_digest, admissions.configuration_digest, admissions.authority_scope, admissions.provider_role, admissions.profile_identity, admissions.session_identity, admissions.attempt_identity, attempts.task_id, attempts.provider_role, attempts.selected_profile_identity, attempts.session_identity, contexts.task_id, contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.configuration_digest FROM provider_failure_admissions AS admissions JOIN provider_attempts AS attempts ON attempts.attempt_id = admissions.attempt_id JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = admissions.attempt_id WHERE admissions.attempt_id = ?",
         (binding.attempt_identity,),
@@ -506,6 +509,64 @@ def _require_attempt_admission(connection, identity, binding: FailureBinding) ->
     ):
         raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
     _require_current_admission_authority(connection, identity, binding)
+
+
+def _require_dependency_review_admission(connection, identity, binding: FailureBinding) -> None:
+    """Authenticate a dependency-review session claim against current task authority.
+
+    Dependency review intentionally has no ``provider_attempts`` row.  Its
+    separate durable attempt, dispatch-claim, and admission rows must all
+    agree before a typed SDK failure can enter the shared recovery ledger.
+    """
+
+    row = connection.execute(
+        "SELECT admissions.task_id, admissions.candidate_sha, admissions.policy_digest, "
+        "admissions.configuration_digest, admissions.authority_scope, admissions.provider_role, "
+        "admissions.profile_identity, admissions.session_identity, admissions.attempt_identity, "
+        "attempts.task_id, attempts.profile_identity, attempts.configuration_digest, "
+        "claims.session_identity, claims.state, subsets.task_id, subsets.candidate_sha, "
+        "subsets.policy_digest, subsets.configuration_digest "
+        "FROM dependency_review_failure_admissions AS admissions "
+        "JOIN dependency_review_attempts AS attempts ON attempts.attempt_id = admissions.attempt_id "
+        "JOIN dependency_review_dispatch_claims AS claims ON claims.attempt_id = admissions.attempt_id "
+        "JOIN dependency_review_subsets AS subsets ON subsets.snapshot_id = attempts.snapshot_id "
+        "WHERE admissions.attempt_id = ?",
+        (binding.attempt_identity,),
+    ).fetchone()
+    expected = (
+        identity.task_id, binding.candidate_sha, binding.policy_digest,
+        binding.configuration_digest, binding.authority_scope, binding.role.value,
+        binding.profile_identity, binding.session_identity, binding.attempt_identity,
+    )
+    if row is None or tuple(row[:9]) != expected:
+        raise FailureRecoveryError("dependency review failure admission is unavailable or has drifted")
+    if (
+        row[9] != identity.task_id or row[10] != binding.profile_identity
+        or row[11] != binding.configuration_digest or row[12] != binding.session_identity
+        or row[13] not in {"session-opened", "turn-dispatched"}
+        or row[14] != identity.task_id or row[15] != binding.candidate_sha
+        or row[16] != binding.policy_digest or row[17] != binding.configuration_digest
+    ):
+        raise FailureRecoveryError("dependency review failure admission is unavailable or has drifted")
+    _require_current_dependency_review_authority(connection, identity, binding)
+
+
+def _require_current_dependency_review_authority(connection, identity, binding: FailureBinding) -> None:
+    """Require the exact still-current candidate seal and resolved configuration."""
+
+    row = connection.execute(
+        "SELECT seals.base_sha, seals.candidate_sha, seals.state_identity, runtime.schema_version, "
+        "runtime.resolved_digest FROM candidate_seals AS seals "
+        "JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = seals.task_id "
+        "WHERE seals.task_id = ?",
+        (identity.task_id,),
+    ).fetchone()
+    if (
+        row is None or row[0] != identity.base_sha or row[1] != binding.candidate_sha
+        or type(row[2]) is not str or not row[2]
+        or row[3] != "roundwright-runtime/v1" or row[4] != binding.configuration_digest
+    ):
+        raise FailureRecoveryError("dependency review failure authority is unavailable or has drifted")
 
 
 def _require_current_admission_authority(connection, identity, binding: FailureBinding) -> None:

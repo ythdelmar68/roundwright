@@ -58,7 +58,7 @@
       {"identity":"failure-recovery-dependency-boundary-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"12fe5d38c53bd2aa71245dceb156bde6d6d68a35be62dd6ddeabdb15c760fde3"},
       {"identity":"failure-recovery-candidate-review-v1","path":"src/roundwright/candidate_review.py","sha256":"4580c70197043a5500b106f65e8b59c08f07456a6906bafddd8d88d1025841a3"},
       {"identity":"failure-recovery-supervisor-runtime-tests-v1","path":"tests/test_provider_attempt_runtime.py","sha256":"e74d4eef47027c837ad2f2096e3e0eea2c673824766c98fa3542d5658ff5d30e"},
-      {"identity":"failure-recovery-runtime-tests-v1","path":"tests/test_provider_recovery.py","sha256":"be7dfd91b4638edba3aec28888003f778b2a0520a88938f48278d34580e36ae2"},
+      {"identity":"failure-recovery-runtime-tests-v1","path":"tests/test_provider_recovery.py","sha256":"ee666cdca07aa424faf6b2e2b593e38b63c6e28df5e4150a526fef753704b1ab"},
       {"identity":"failure-recovery-supervisor-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"1b966dfdf8fd327e5042b8006c676412689ff8a40fb5dcd9d496629d37f9f881"},
       {"identity":"failure-recovery-worker-tests-v1","path":"tests/test_codex_worker.py","sha256":"4d31cec09249d07f03a4fa9dd56088fa8a589ea39e7d24fcff1d44287216f9d0"},
       {"identity":"failure-recovery-dependency-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"287616cd582e16169925e3b0dabbc307da534e465ba5cbf0473954801906215b"},

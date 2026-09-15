@@ -38,8 +38,8 @@
       {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"3de5d104f99b399c7b5ab28af8aef9de8ec08dfd058023923590f5a0973423b0"},
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"ff0d8d185c4083c8fe8beaff1c28cb5f066b5cabc57c864f23a1f927934db246"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
-      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"82c8d996495139f4b0e6b7bb9054f36df1b572811b22fb8e7a824072521f1528"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"63cab5eca6b2291a6cf5f0456b27d80a7b3b996550194c78c6080a528571ee26"},
+      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"9ea5087e73784946cc4d0365fc4b7a957dd8512e25c09a5a0e552809c5f3094d"},
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"6b8f9777a5837bb9724850848a80a68fa5756d40b57387b93a78d3c72716d01f"},
       {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"62b18c546f0e33c89201c77b3313b0f53e2c924c7927626522737d37bbd076f7"}
     ]
   },
@@ -64,8 +64,8 @@
       {"identity":"failure-recovery-dependency-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"5ffb4a1c8865a68f4877c46cd7fcf52d123c67cf9133b43f06b3f24559d643b3"},
       {"identity":"failure-recovery-candidate-review-tests-v1","path":"tests/test_candidate_review.py","sha256":"053241bdc335947e1a81af1ff35f6667d333116c95c4374c9b51352d243e4700"},
       {"identity":"failure-recovery-state-tests-v1","path":"tests/test_state.py","sha256":"2b3a764a028bf6e75af22bf6e7ad330ae0018ab9705af80c60b3be0aeb3f622c"},
-      {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"82c8d996495139f4b0e6b7bb9054f36df1b572811b22fb8e7a824072521f1528"},
-      {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"63cab5eca6b2291a6cf5f0456b27d80a7b3b996550194c78c6080a528571ee26"},
+      {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"9ea5087e73784946cc4d0365fc4b7a957dd8512e25c09a5a0e552809c5f3094d"},
+      {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"6b8f9777a5837bb9724850848a80a68fa5756d40b57387b93a78d3c72716d01f"},
       {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"62b18c546f0e33c89201c77b3313b0f53e2c924c7927626522737d37bbd076f7"},
       {"identity":"failure-recovery-roadmap-v1","path":"docs/operations/dogfood-promotion-roadmap.md","sha256":"b6acdaa1d6e1580d13899757ce836b419beb19e4bbc5d1d8424546c56d86be0b"}
     ]
